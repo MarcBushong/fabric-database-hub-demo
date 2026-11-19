@@ -1348,17 +1348,21 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         It 'reads T5''s metrics for the history right before the run, and sends them as COSMOS_METRICS; nothing without -SaveHistory (2026-11-18)' {
             $script:stopConfig['t5Enabled'] = $true
             Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $true; State = 'Succeeded'; FreeTier = $true; Account = $null; Error = '' } }
-            Mock -ModuleName DbHubDemo -CommandName Get-DemoT5StopResult -MockWith { New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not supported' -Message 'An Azure Cosmos DB account has no stop.' }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5ContainerStop -MockWith { $script:order.Add('T5ContainerStop'); New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s container was deleted.' }
             Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { $script:order.Add(('CosmosCapture:{0}:{1}:{2}' -f $CheckId, $DeploymentId, $WindowMinutes)); [pscustomobject]@{ Json = '{"version":1,"accounts":[{"target":"T5"}]}'; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status 'Pass' -Message 'captured') } }
             Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $CosmosMetrics); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false } }
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -SaveHistoryWindowMinutes 240 -Confirm:$false
             $capture = $script:order.IndexOf('CosmosCapture:STOP.T5.HISTORY:abc123:240')
             $capture | Should -BeGreaterOrEqual 0
             $capture | Should -BeLessThan $script:order.IndexOf('SaveHistory:{"version":1,"accounts":[{"target":"T5"}]}')
+            # T5's container (2026-11-19) goes only after its metrics were read and sent with the history.
+            $script:order.IndexOf('T5ContainerStop') | Should -BeGreaterThan $script:order.IndexOf('SaveHistory:{"version":1,"accounts":[{"target":"T5"}]}')
             ($results | Where-Object { $_.checkId -eq 'STOP.T5.HISTORY' }).status | Should -Be 'Pass'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T5' }).status | Should -Be 'Pass'
             $script:order.Clear()
             Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
             @($script:order | Where-Object { $_ -like 'CosmosCapture:*' }) | Should -BeNullOrEmpty
+            $script:order | Should -Contain 'T5ContainerStop'
         }
     }
 }

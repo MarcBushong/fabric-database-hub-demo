@@ -41,6 +41,8 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $true; Reason = 'the nightly safety stop is in place'; Missing = ''; Fix = '' } }
         # T5's free tier (2026-11-18, ADR 0027), read the same way.
         Mock -ModuleName DbHubDemo Get-DemoT5FreeTierStatus { $true }
+        # T5's container lifecycle (2026-11-19, ADR 0027): the resource group's DbHubT5Container tag.
+        Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $true; T5Container = 'Session' } }
         Mock Get-DemoCostEstimate {
             [pscustomobject]@{
                 Results = @(); Components = @(); HourlyRunning = 1.0; BastionHourly = 0.2; SessionCost = 5.0; IdleMonthly = 30.0; LightUseMonthly = 40.0
@@ -87,5 +89,32 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Get-DemoDefenderPlan -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5FreeTierStatus -Times 0 -Exactly
+        Should -Invoke Get-DemoDeploymentState -Times 0 -Exactly
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('T5ContainerLifecycle') } -Because 'the estimate''s default, Session, applies'
+    }
+
+    It 'prices T5''s container as the environment has it: <Case> is <Expected> (2026-11-19, ADR 0027)' -ForEach @(
+        @{ Case = 'DbHubT5Container Session'; Exists = $true; Tag = 'Session'; Expected = 'Session' }
+        @{ Case = 'DbHubT5Container AlwaysOn'; Exists = $true; Tag = 'AlwaysOn'; Expected = 'AlwaysOn' }
+        @{ Case = 'an existing group without the tag, deployed before then'; Exists = $true; Tag = ''; Expected = 'AlwaysOn' }
+        @{ Case = 'no group yet'; Exists = $false; Tag = ''; Expected = 'Session' }
+    ) {
+        $state = [pscustomobject]@{ Exists = $Exists; T5Container = $Tag }
+        Mock Get-DemoDeploymentState { $state }
+        Invoke-TestEstimate
+        Should -Invoke Get-DemoDeploymentState -Times 1 -Exactly
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq $Expected }
+        Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+    }
+
+    It 'prices -T5ContainerLifecycle as given, without reading the environment''s, and assumes Session when the tag can''t be read (2026-11-19)' {
+        $null = & $script:entry -ConfigPath (New-TestConfigFile) -NetworkMode private -T5ContainerLifecycle AlwaysOn -OutputPath (Join-Path -Path $TestDrive -ChildPath 'estimate.jsonl')
+        Should -Invoke Get-DemoDeploymentState -Times 0 -Exactly
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' }
+
+        Mock Get-DemoDeploymentState { throw 'AuthorizationFailed' }
+        Invoke-TestEstimate
+        Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq 'T5''s container lifecycle couldn''t be read, so the estimate assumes the container exists only during a session. AuthorizationFailed' }
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('T5ContainerLifecycle') }
     }
 }

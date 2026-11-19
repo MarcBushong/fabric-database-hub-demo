@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "4787711489008152169"
+      "templateHash": "2962892496199047135"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -117,10 +117,10 @@
     },
     "monthlyCeilingUsd": {
       "type": "int",
-      "defaultValue": 375,
+      "defaultValue": 390,
       "minValue": 1,
       "metadata": {
-        "description": "Monthly budget amount in USD: the hard monthly ceiling, 375 by default since 2026-11-04 (user-directed, for the 4-core T4; ADR 0016, C2)."
+        "description": "Monthly budget amount in USD: the hard monthly ceiling, 390 by default for a new configuration since 2026-11-19 (375 since 2026-11-04; ADR 0016, C2)."
       }
     },
     "budgetStartDate": {
@@ -670,7 +670,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "8377656193456662086"
+              "templateHash": "16425786594711647420"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -1279,7 +1279,7 @@
               "verifiedOn": "2026-10-23"
             },
             "$fxv#4": {
-              "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. It has no stop: its throughput bills every hour (ADR 0027).",
+              "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. An account has no stop, so since 2026-11-19 the container, the only part whose throughput bills by the hour, exists only during a session once the session control's role can create it (the resource group's DbHubT5Container tag is Session): start-demo.ps1 and Run all create it, and stop-demo.ps1, the session's end, and the nightly safety stop delete it; the account, the database (no throughput of its own), the private endpoint, and the DNS zone stay (ADR 0027).",
               "accountNamePrefix": "cosmos01",
               "databaseName": "contosocare",
               "containerName": "patient-events",
@@ -1291,6 +1291,25 @@
               "dataContributorRoleDefinitionId": "00000000-0000-0000-0000-000000000002",
               "privateDnsZoneName": "privatelink.documents.azure.com",
               "privateEndpointGroupId": "Sql",
+              "containerNote": "The container's definition, in one place (2026-11-19, ADR 0027): infra/modules/cosmos01.bicep creates it from these values, and since the container exists only during a session, the scripts (New-DemoT5Container) and the session control's runbooks (New-DbHubT5Container) create it again through Azure Resource Manager with the same body (Sql Resources - Create Update Sql Container). Hash partitioning, version 2; every path indexed except the documents' payload filler and _etag.",
+              "partitionKeyVersion": 2,
+              "indexingPolicy": {
+                "indexingMode": "consistent",
+                "automatic": true,
+                "includedPaths": [
+                  {
+                    "path": "/*"
+                  }
+                ],
+                "excludedPaths": [
+                  {
+                    "path": "/payload/?"
+                  },
+                  {
+                    "path": "/\"_etag\"/?"
+                  }
+                ]
+              },
               "metrics": {
                 "note": "The Azure Monitor metrics Database Hub's Cosmos DB views chart (monitor-cosmos-db, checked 2026-11-18): Normalized RU Consumption (Maximum), Total Request Units (Total), Throttled Requests (TotalRequests filtered to StatusCode 429, Count), Provisioned throughput (Maximum), Avg Latency (ServerSideLatencyDirect, Average: direct mode only, so the runner's gateway requests leave it empty), and Availability (ServiceAvailability, Average, hourly). Read by status.ps1, validate.ps1, and the history snapshot with az monitor metrics list.",
                 "hub": [
@@ -1313,6 +1332,9 @@
                 "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
                 "metrics": "https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-documentdb-databaseaccounts-metrics",
                 "restAuthorization": "https://learn.microsoft.com/rest/api/cosmos-db/access-control-on-cosmosdb-resources",
+                "createContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/create-update-sql-container",
+                "deleteContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/delete-sql-container",
+                "provisionThroughput": "https://learn.microsoft.com/azure/cosmos-db/set-throughput",
                 "pricing": "https://azure.microsoft.com/pricing/details/cosmos-db/autoscale-provisioned/"
               },
               "verifiedOn": "2026-11-18"
@@ -10232,6 +10254,12 @@
                   "partitionKeyPath": {
                     "value": "[variables('cosmos').partitionKeyPath]"
                   },
+                  "partitionKeyVersion": {
+                    "value": "[variables('cosmos').partitionKeyVersion]"
+                  },
+                  "indexingPolicy": {
+                    "value": "[variables('cosmos').indexingPolicy]"
+                  },
                   "throughput": {
                     "value": "[variables('cosmos').throughputRUs]"
                   },
@@ -10261,7 +10289,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "13442784420812004356"
+                      "templateHash": "2303203040589875174"
                     },
                     "description": "T5 cosmos01: an Azure Cosmos DB for NoSQL account with local (key) authentication off, the contosocare database, and the patient-events container at 400 RU/s, reached through a private endpoint in snet-pe in both network modes (ADR 0027)."
                   },
@@ -10306,6 +10334,23 @@
                       "type": "string",
                       "metadata": {
                         "description": "The container's partition key path."
+                      }
+                    },
+                    "partitionKeyVersion": {
+                      "type": "int",
+                      "defaultValue": 2,
+                      "allowedValues": [
+                        1,
+                        2
+                      ],
+                      "metadata": {
+                        "description": "The container's partition key version: 2, hash partitioning with keys up to 2 KB (config/versions.json)."
+                      }
+                    },
+                    "indexingPolicy": {
+                      "type": "object",
+                      "metadata": {
+                        "description": "The container's indexing policy (config/versions.json, which the scripts and the session control's runbooks create the container with too)."
                       }
                     },
                     "throughput": {
@@ -10410,25 +10455,9 @@
                               "[parameters('partitionKeyPath')]"
                             ],
                             "kind": "Hash",
-                            "version": 2
+                            "version": "[parameters('partitionKeyVersion')]"
                           },
-                          "indexingPolicy": {
-                            "indexingMode": "consistent",
-                            "automatic": true,
-                            "includedPaths": [
-                              {
-                                "path": "/*"
-                              }
-                            ],
-                            "excludedPaths": [
-                              {
-                                "path": "/payload/?"
-                              },
-                              {
-                                "path": "/\"_etag\"/?"
-                              }
-                            ]
-                          }
+                          "indexingPolicy": "[parameters('indexingPolicy')]"
                         },
                         "options": {
                           "throughput": "[parameters('throughput')]"

@@ -444,9 +444,32 @@ Describe 'Invoke-DemoPreflight' {
         $capability.evidence.startSku | Should -BeNullOrEmpty
     }
 
+    It 'counts the nightly safety stop that this run sets up only when the deployer can assign its role, and prices T5 for a session''s hours, for an Owner and a Contributor (2026-11-19, the coordinator''s option 2 and fix 1)' {
+        Set-HappyAzMock
+        $script:permission = [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -MockWith { $script:permission }
+        $owner = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $restart = $owner | Where-Object checkId -EQ 'PREFLIGHT.COST.T4RESTART'
+        $restart.status | Should -Be 'Pass'
+        $restart.message | Should -Match 'and deploy\.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role, so the monthly ceiling counts each restart as about a day'
+        $restart.message | Should -Match 'If its setup then doesn''t put it in place, the run says so \(DEPLOY\.COST\.T4RESTART\)'
+        $restart.evidence['plan']['planned'] | Should -BeTrue
+        # Its own estimate and the 2-vCore fallback's both count it.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T4RestartCoverage.Counts -and $T4RestartCoverage.Planned -and $T4RestartCoverage.WithoutReason -match 'isn''t in place yet' -and $T5ContainerLifecycle -eq 'Session' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts }
+        # A Contributor, the documented minimum: the rest of the month, as before, and T5 still for a session's hours, since
+        # its session control has no role, so Run all can't start a session (fix 1).
+        $script:permission = [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' }
+        $contributor = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $warned = $contributor | Where-Object checkId -EQ 'PREFLIGHT.COST.T4RESTART'
+        $warned.status | Should -Be 'Warning'
+        $warned.evidence['plan']['planned'] | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { -not $T4RestartCoverage.Counts -and $T4RestartCoverage.Missing -eq 'SafetyStop' -and $T5ContainerLifecycle -eq 'Session' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 2 -Exactly -Because 'preflight reads the deployer''s permissions once a run'
+    }
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
         Set-HappyAzMock
-        # Its numbers are set against a 250 USD ceiling, kept here (the default is 375 since 2026-11-04).
+        # Its numbers are set against a 250 USD ceiling, kept here (the default is 390 for a new configuration since 2026-11-19).
         $copy = [ordered]@{}
         foreach ($key in $config.Keys) { $copy[$key] = $config[$key] }
         $copy['monthlyCeilingUsd'] = 250
@@ -541,7 +564,7 @@ Describe 'Invoke-DemoPreflight' {
         @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
         # 2026-11-09: T4 is part of every deployment, so a 2-vCore start over a ceiling is a Warning, T4 is created anyway,
         # and no estimate without T4 is made (one would throw here).
-        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'Standard_D2ds_v5'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(375\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
+        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'Standard_D2ds_v5'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(390\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
         @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
     ) {
         Set-HappyAzMock

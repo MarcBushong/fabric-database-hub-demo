@@ -20,10 +20,20 @@ internal static class CosmosAccount
 
     private const int TransientRetries = 3;
 
-    /// <summary>Reads the container's definition; a 429 or a transient error is tried again a few times, and anything else throws a <see cref="CosmosException"/>.</summary>
+    /// <summary>
+    /// Reads the container's definition; a 429 or a transient error is tried again a few times, and anything else throws a
+    /// <see cref="CosmosException"/>: a 404 (any substatus, 1013 too while a create is still in progress) throws
+    /// <see cref="CosmosFailure.NotFound"/> with <see cref="CosmosEndpoint.ContainerMissingMessage"/>, because the
+    /// container exists only during a session.
+    /// </summary>
     public static async Task<CosmosContainerInfo> ReadContainerAsync(CosmosRestClient client, string tag, TimeProvider time, CancellationToken cancellationToken)
     {
         var response = await ReadContainerResponseAsync(client, tag, time, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == 404)
+        {
+            throw new CosmosException(CosmosFailure.NotFound, CosmosEndpoint.ContainerMissingMessage, response.StatusCode, response.SubStatus, response.ActivityId);
+        }
+
         return response.IsSuccess ? Parse(response, client) : throw response.ToException("Reading T5's container", client.Endpoint.Host);
     }
 
@@ -31,6 +41,7 @@ internal static class CosmosAccount
     /// warmup on T5: a Microsoft Entra token, the container's definition, then an upsert and a point read of the warmup
     /// document (<c>{ id: "warmup", patientId: "p-warmup" }</c>). Pass with the time it took and the request units it
     /// cost; a Warning when T5 kept throttling the writes for 20 seconds (access works then, but the throughput is used up).
+    /// A container that doesn't exist now throws with <see cref="CosmosEndpoint.ContainerMissingMessage"/>.
     /// </summary>
     public static async Task<CheckRecord> WarmupAsync(CosmosRestClient client, TimeProvider time, CancellationToken cancellationToken)
     {
@@ -61,13 +72,16 @@ internal static class CosmosAccount
             $"T5 answered in {elapsed.TotalSeconds:0.0} s: a Microsoft Entra token, the container's definition (partition key {container.DescribePartitionKey()}), and an upsert and a point read of the warmup document ({upsert.RequestCharge + read.RequestCharge:0.##} RU)."));
     }
 
-    /// <summary>setup's check of the container: it exists, partitioned on <c>/patientId</c>. The runner never creates or changes it; the template does.</summary>
+    /// <summary>
+    /// setup's check of the container: it exists, partitioned on <c>/patientId</c>. The runner never creates or changes it:
+    /// it exists only during a session, and start-demo.ps1 (or deploy.ps1) creates it through Azure Resource Manager.
+    /// </summary>
     public static async Task<(CheckRecord Check, CosmosContainerInfo? Container)> VerifyContainerAsync(CosmosRestClient client, string tag, TimeProvider time, CancellationToken cancellationToken)
     {
         var response = await ReadContainerResponseAsync(client, tag, time, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == 404)
         {
-            return (new CheckRecord("container", "Fail", $"T5 ({client.Endpoint.Host}) has no container {CosmosEndpoint.DatabaseName}/{CosmosEndpoint.ContainerName} (HTTP 404). The template creates the database and the container, and the runner never does: run deploy.ps1."), null);
+            return (new CheckRecord("container", "Fail", $"T5 ({client.Endpoint.Host}) has no container {CosmosEndpoint.DatabaseName}/{CosmosEndpoint.ContainerName} now (HTTP 404): it exists only during a session, so ./scripts/start-demo.ps1 (or deploy.ps1) creates it, through Azure Resource Manager. The runner never does."), null);
         }
 
         if (!response.IsSuccess)
@@ -204,8 +218,9 @@ internal static class CosmosAccount
 /// reset on T5 (no sessions to kill): every Running run is marked Cancelled, reset waits for their runners to record their
 /// end (each ru-storm run deletes its storm documents first), closes the records of runners whose process is gone,
 /// checks that no run is left Running, and deletes any ru-storm document left over, for example after T1 was deallocated
-/// mid-storm (<see cref="StormCleanup"/>). The rest of the data stays: healthy-baseline and setup only overwrite bounded sets
-/// of documents (database/cosmosdb/README.md). Idempotent.
+/// mid-storm (<see cref="StormCleanup"/>); when T5's container doesn't exist now (it exists only during a session), no
+/// storm document is left, which is a Pass. The rest of the data stays: healthy-baseline and setup only overwrite bounded
+/// sets of documents (database/cosmosdb/README.md). Idempotent.
 /// </summary>
 internal static class CosmosReset
 {
@@ -268,12 +283,22 @@ internal static class CosmosReset
     private static List<CosmosRunEntry> Open(CosmosRunStoreDocument document) => [.. document.Runs!.Where(r => r.EndedAt is null)];
 }
 
-/// <summary>What deleting ru-storm's documents did.</summary>
-internal sealed record StormCleanupResult(int Deleted, bool Complete, double RequestCharge, TimeSpan Elapsed, string? Error)
+/// <summary>What deleting ru-storm's documents did. <paramref name="ContainerMissing"/>: T5's container doesn't exist now (it exists only during a session), so there was nothing to delete.</summary>
+internal sealed record StormCleanupResult(int Deleted, bool Complete, double RequestCharge, TimeSpan Elapsed, string? Error, bool ContainerMissing = false)
 {
+    /// <summary>The check's message when the container doesn't exist now.</summary>
+    public const string ContainerMissingMessage = "T5's container doesn't exist now (it exists only during a session), so no storm document is left.";
+
     public CheckRecord ToCheck(string checkId)
     {
         var partitions = RuStorm.PartitionName(1) + " to " + RuStorm.PartitionName(RuStorm.MaximumHotPartitions);
+        if (ContainerMissing)
+        {
+            return new CheckRecord(checkId, "Pass", Deleted == 0
+                ? ContainerMissingMessage
+                : string.Create(CultureInfo.InvariantCulture, $"Deleted {Deleted} ru-storm document(s) from {partitions}; then {ContainerMissingMessage}"));
+        }
+
         if (Complete)
         {
             return new CheckRecord(checkId, "Pass", Deleted == 0
@@ -292,7 +317,9 @@ internal sealed record StormCleanupResult(int Deleted, bool Complete, double Req
 /// documents tagged <c>kind: "ru-storm"</c> (100 at most per partition, 400 in all), and each is deleted (Delete Document).
 /// The deletes are paced by their own request charge to 200 RU/s, half the container's 400, so neither the cleanup nor the
 /// baseline beside it is throttled; a 429 waits the server's retry-after. With nothing left it costs four small queries,
-/// so it's idempotent and cheap to repeat. It stops at its time limit and reports what may be left.
+/// so it's idempotent and cheap to repeat. It stops at its time limit and reports what may be left. A container that
+/// doesn't exist now (404 with substatus 1003: it exists only during a session) holds no storm document, so the cleanup
+/// is complete.
 /// </summary>
 internal static class StormCleanup
 {
@@ -354,6 +381,8 @@ internal static class StormCleanup
 
         StormCleanupResult Result(bool complete, string? error) => new(deleted, complete, Math.Round(charge, 2), time.GetUtcNow() - started, error);
 
+        StormCleanupResult NoContainer() => Result(true, null) with { ContainerMissing = true };
+
         try
         {
             for (var number = 1; number <= RuStorm.MaximumHotPartitions; number++)
@@ -366,6 +395,11 @@ internal static class StormCleanup
                     if (query is null)
                     {
                         return Result(false, null);
+                    }
+
+                    if (query.IsContainerMissing)
+                    {
+                        return NoContainer();
                     }
 
                     if (!query.IsSuccess)
@@ -386,6 +420,10 @@ internal static class StormCleanup
                         if (response.IsSuccess)
                         {
                             deleted++;
+                        }
+                        else if (response.IsContainerMissing)
+                        {
+                            return NoContainer();
                         }
                         else if (response.StatusCode != 404)
                         {
@@ -452,22 +490,37 @@ internal sealed record CosmosLiveTotals(double RequestsPerSecond, double RuPerSe
     }
 }
 
-/// <summary>What <c>status --target T5</c> shows of the account: whether its container answers, its partition key, and the live rates.</summary>
+/// <summary>
+/// What <c>status --target T5</c> shows of the account: whether its container answers, its partition key, and the live
+/// rates; or, when the account answers that the container doesn't exist now (<see cref="ContainerMissing"/>), that it
+/// exists only during a session, which isn't an error.
+/// </summary>
 internal sealed record CosmosAccountStatus(string Endpoint, bool Reachable, CosmosContainerInfo? Container, string? Error, CosmosLiveTotals Live)
 {
+    /// <summary>What status says when T5's container doesn't exist now.</summary>
+    public const string ContainerMissingNote = "T5's container doesn't exist now: it exists only during a session (./scripts/start-demo.ps1 or the control notebook's Run all creates it).";
+
+    /// <summary>True when the account answered that T5's container doesn't exist now: it exists only during a session.</summary>
+    public bool ContainerMissing { get; init; }
+
     public static async Task<CosmosAccountStatus> ReadAsync(CosmosRestClient client, IEnumerable<CosmosRunEntry> runs, TimeProvider time, CancellationToken cancellationToken)
     {
         CosmosContainerInfo? container = null;
         string? error = null;
+        var missing = false;
         try
         {
             container = await CosmosAccount.ReadContainerAsync(client, SessionNames.ForControl("status"), time, cancellationToken).ConfigureAwait(false);
+        }
+        catch (CosmosException ex) when (ex.Failure == CosmosFailure.NotFound)
+        {
+            missing = true;
         }
         catch (CosmosException ex)
         {
             error = Redactor.Redact(ex.Message);
         }
 
-        return new CosmosAccountStatus(client.Endpoint.Host, container is not null, container, error, CosmosLiveTotals.Sum(runs, time.GetUtcNow()));
+        return new CosmosAccountStatus(client.Endpoint.Host, container is not null || missing, container, error, CosmosLiveTotals.Sum(runs, time.GetUtcNow())) { ContainerMissing = missing };
     }
 }

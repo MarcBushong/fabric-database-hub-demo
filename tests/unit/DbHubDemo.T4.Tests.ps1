@@ -101,6 +101,10 @@ BeforeAll {
                 }
                 return (New-AzResult -Json @{ value = @() })
             }
+            if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/(administrators|databases|configurations)\b' -and $script:t4.ReadErrors.Contains($Matches[1])) {
+                # A child read that fails: a stopped server's ServerStoppedError (live, 2026-11-18), or a missing database.
+                return (New-AzResult -ExitCode 1 -StdErr $script:t4.ReadErrors[$Matches[1]])
+            }
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/administrators\?') {
                 return (New-AzResult -Json @{ value = @(@{ properties = @{ objectId = '77777777-7777-7777-7777-777777777777'; principalName = 'DbHub T3 admins'; principalType = 'Group' } }) })
             }
@@ -131,7 +135,7 @@ BeforeAll {
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0 }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0; ReadErrors = @{} }
         $script:events = [System.Collections.Generic.List[string]]::new()
     }
 }
@@ -244,6 +248,63 @@ Describe 'Test-DemoT4' {
         $check.message | Should -Match $Pattern
         $check.evidence.wanted | Should -Be '50'
         @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads; deploy.ps1 restarts'
+    }
+
+    It 'says what a <State> T4 can''t answer, and how it comes back, instead of failing (live, 2026-11-18)' -ForEach @(
+        @{ State = 'Stopped'; Why = 'Stopped between sessions'; Answer = 'ERROR: Bad Request({"error":{"code":"ServerStoppedError","message":"Server ''pgflex01-abc123'' is in ''Stopped'' state. Start the server ..."}})' }
+        @{ State = 'Starting'; Why = 'Starting'; Answer = 'ERROR: Bad Request({"error":{"message":"Server ''pgflex01-abc123'' is in ''Starting'' state ..."}})' }
+    ) {
+        # Live, 2026-11-18, after a session had stopped T4: T4.DATABASE was validate.ps1's one Fail ("wasn't found:
+        # ... ServerStoppedError"), and T4.ENHANCEDMETRICS called the metrics off because the setting couldn't be read.
+        $script:t4.State = $State
+        foreach ($child in 'administrators', 'databases', 'configurations') {
+            $script:t4.ReadErrors[$child] = $Answer
+        }
+        $results = @(Test-DemoT4 -Config (New-TestConfig) -IncludeMetrics)
+        @($results | Where-Object status -EQ 'Fail' | ForEach-Object { $_.checkId }) | Should -BeNullOrEmpty
+        $database = $results | Where-Object checkId -EQ 'T4.DATABASE'
+        $database.status | Should -Be 'Warning'
+        $database.message | Should -Be ('T4 (pgflex01-abc123) is {0}, so its database contosocare can''t be read.' -f $Why)
+        $database.remediation | Should -Be './scripts/start-demo.ps1 or the control notebook''s Run all starts T4; the check runs then (./scripts/validate.ps1 -Area T4).'
+        $database.evidence.state | Should -Be $State
+        $database.evidence.error | Should -Match ([regex]::Escape(('is in ''{0}'' state' -f $State)))
+        foreach ($id in 'T4.ADMIN', 'T4.ENHANCEDMETRICS', 'T4.MAXCONNECTIONS') {
+            $check = $results | Where-Object checkId -EQ $id
+            $check.status | Should -Be 'Warning' -Because $id
+            $check.message | Should -Match ('^T4 \(pgflex01-abc123\) is {0}, so its .+ can''t be read\.$' -f $Why) -Because $id
+            $check.remediation | Should -Be $database.remediation -Because $id
+        }
+        ($results | Where-Object checkId -EQ 'T4.ENHANCEDMETRICS').message | Should -Not -Match '\boff\b' -Because 'a setting that couldn''t be read isn''t off'
+    }
+
+    It 'reads a T4 that stopped after its state read Ready as stopped, and still fails a running T4''s missing database' {
+        $stopped = 'ERROR: Bad Request({"error":{"code":"ServerStoppedError","message":"Server ''pgflex01-abc123'' is in ''Stopped'' state. Start the server ..."}})'
+        $script:t4.ReadErrors['databases'] = $stopped
+        $results = @(Test-DemoT4 -Config (New-TestConfig))
+        ($results | Where-Object checkId -EQ 'T4.SERVER').status | Should -Be 'Pass'
+        $database = $results | Where-Object checkId -EQ 'T4.DATABASE'
+        $database.status | Should -Be 'Warning'
+        $database.message | Should -Be 'T4 (pgflex01-abc123) is Stopped between sessions, so its database contosocare can''t be read.'
+
+        # A running T4 keeps its real failures: a database that isn't there, or a read that failed another way.
+        $script:t4.ReadErrors['databases'] = '(ResourceNotFound) The Resource was not found.'
+        $database = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.DATABASE'
+        $database.status | Should -Be 'Fail'
+        $database.message | Should -Be 'T4''s database contosocare wasn''t found.'
+        $database.remediation | Should -Be 'Redeploy with scripts/deploy.ps1 -Resume.'
+        $script:t4.ReadErrors['databases'] = 'ERROR: (AuthorizationFailed) A fake read error'
+        $database = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.DATABASE'
+        $database.status | Should -Be 'Fail'
+        $database.message | Should -Be 'T4''s database contosocare wasn''t found: ERROR: (AuthorizationFailed) A fake read error.'
+    }
+
+    It 'doesn''t call the enhanced metrics off when their setting couldn''t be read on a running T4' {
+        $script:t4.ReadErrors['configurations'] = 'A fake read error.'
+        $results = @(Test-DemoT4 -Config (New-TestConfig))
+        $enhanced = $results | Where-Object checkId -EQ 'T4.ENHANCEDMETRICS'
+        $enhanced.status | Should -Be 'Warning'
+        $enhanced.message | Should -Be 'Whether the enhanced metrics are on (metrics.collector_database_activity) couldn''t be read: A fake read error.'
+        ($results | Where-Object checkId -EQ 'T4.MAXCONNECTIONS').message | Should -Be 'T4''s max_connections couldn''t be read: A fake read error.'
     }
 }
 

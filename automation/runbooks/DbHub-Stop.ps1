@@ -11,16 +11,19 @@ publishes it to the nightly safety stop's own account in the demo resource group
 
 - Scope All: started by the one-time schedule dbhub-autostop, which DbHub-Control creates at each run's end plus
   10 minutes. It does exactly what Stop now does: removes that schedule and the run's monitoring re-checks,
-  deallocates both VMs, and stops T4, through Azure Resource Manager only. T5, the Azure Cosmos DB account (ADR 0027),
-  has no stop: when its account is there, the result says it's left running and that its throughput keeps billing.
-  Scope Nightly leaves T5 alone and says nothing of it.
+  deallocates both VMs, stops T4, and deletes T5's container, through Azure Resource Manager only. T5, the Azure Cosmos
+  DB account (ADR 0027), has no stop, so its container, whose provisioned throughput bills every hour it exists, lives
+  only during a session (2026-11-19): it's deleted when its lifecycle is Session (the demo resource group's
+  DbHubT5Container tag), and otherwise kept, and the result says why.
 - Scope T4: started by the control's daily schedule dbhub-t4-safety-stop. It stops T4 only when it's running, because
   a stopped flexible server starts itself after 7 days
   (https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server). A cost guardrail, not an
-  activity schedule.
+  activity schedule. While sqlvm01 doesn't run, it also deletes T5's container, as a fallback for a night the safety
+  stop couldn't (2026-11-19).
 - Scope Nightly: started by the daily schedule dbhub-safety-stop at the VMs' auto-shutdown time, in every deployment.
-  It deallocates each VM that isn't deallocated (their DevTest Labs auto-shutdown may hold them already) and stops
-  T4 when it runs, waiting up to 10 minutes for one that's starting.
+  It deallocates each VM that isn't deallocated (their DevTest Labs auto-shutdown may hold them already), stops
+  T4 when it runs, waiting up to 10 minutes for one that's starting, and deletes T5's container when a session's stop
+  didn't (2026-11-19).
 - Scope T3Check: started by the daily schedule dbhub-safety-t3check after the stop. It reads T3's status through Azure
   Resource Manager only, which never resumes a paused serverless database
   (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor), and says whether it paused. Then it

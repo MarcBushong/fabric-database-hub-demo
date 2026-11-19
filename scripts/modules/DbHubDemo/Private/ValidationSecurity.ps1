@@ -34,25 +34,34 @@ function Invoke-DemoValidationSecurity {
         $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message 'There''s no local output to scan: out/ doesn''t exist and no -ScanPath was given.' -Remediation 'Save a run''s output in out/ (for example Start-Transcript -Path ./out/run.log, or gh run view <run-id> --log > ./out/actions.log), then run validate.ps1 -Area Security.' -DocUrl $outputDoc))
     }
     else {
+        # Dependency trees and package caches (node_modules, __pycache__, and the like) anywhere under out/ and -ScanPath are
+        # left out without being walked (2026-11-18): out/fabric-app/node_modules alone held 114,315 third-party files after
+        # the Insights app's build, and reading them kept this area busy for more than 37 minutes.
         $scan = Find-DemoSecretLeak -Path $roots
         $scanned = @($scan.Scanned)
+        $prunedCount = [int](Get-DemoMemberValue -InputObject $scan -Name 'PrunedCount')
+        $prunedList = Get-DemoMemberValue -InputObject $scan -Name 'Pruned'
+        $prunedShown = @($prunedList | Where-Object { $_ } | Select-Object -First 5 | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path ([string]$_) })
         $evidence = [ordered]@{
-            roots           = @($roots | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path $_ })
-            filesScanned    = $scanned.Count
-            filesSkipped    = @($scan.Skipped).Count
-            skipped         = @($scan.Skipped | Select-Object -First 10 | ForEach-Object { '{0} ({1})' -f (ConvertTo-DemoValidationRelativePath -Path $_.Source), $_.Reason })
-            rules           = @($script:RedactionRules | ForEach-Object { $_.Name })
-            registeredCount = $script:DemoSecrets.Count
+            roots             = @($roots | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path $_ })
+            filesScanned      = $scanned.Count
+            filesSkipped      = @($scan.Skipped).Count
+            skipped           = @($scan.Skipped | Select-Object -First 10 | ForEach-Object { '{0} ({1})' -f (ConvertTo-DemoValidationRelativePath -Path $_.Source), $_.Reason })
+            directoriesPruned = $prunedCount
+            pruned            = $prunedShown
+            rules             = @($script:RedactionRules | ForEach-Object { $_.Name })
+            registeredCount   = $script:DemoSecrets.Count
         }
+        $notScanned = ' Dependency trees (node_modules and package caches) aren''t scanned{0}.' -f $(if ($prunedCount -gt 0) { ' ({0} left out: {1}{2})' -f $prunedCount, ($prunedShown -join ', '), $(if ($prunedCount -gt $prunedShown.Count) { ', ...' } else { '' }) } else { '' })
         if (@($scan.Findings).Count -gt 0) {
             $evidence['findings'] = @(ConvertTo-DemoValidationFindingEvidence -Finding $scan.Findings)
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Fail' -Message ('{0} secret or token pattern match(es) in {1}: {2}.' -f @($scan.Findings).Count, ($evidence['roots'] -join ', '), (Format-DemoValidationFindingSummary -Finding $scan.Findings)) -Evidence $evidence -Remediation ('Delete the files, rotate any real credential they hold, and find the script that wrote it: output must go through Write-DemoLog and Export-DemoResult ({0}). Excerpts in the evidence are redacted.' -f $adr) -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Fail' -Message ('{0} secret or token pattern match(es) in {1}: {2}.{3}' -f @($scan.Findings).Count, ($evidence['roots'] -join ', '), (Format-DemoValidationFindingSummary -Finding $scan.Findings), $notScanned) -Evidence $evidence -Remediation ('Delete the files, rotate any real credential they hold, and find the script that wrote it: output must go through Write-DemoLog and Export-DemoResult ({0}). Excerpts in the evidence are redacted.' -f $adr) -DocUrl $outputDoc))
         }
         elseif ($scanned.Count -eq 0) {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message ('There''s no readable text output to scan in {0}.' -f ($evidence['roots'] -join ', ')) -Evidence $evidence -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message ('There''s no readable text output to scan in {0}.{1}' -f ($evidence['roots'] -join ', '), $notScanned) -Evidence $evidence -DocUrl $outputDoc))
         }
         else {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Pass' -Message ('No secret or token pattern, and no value registered in this session, in {0} file(s) under {1}.' -f $scanned.Count, ($evidence['roots'] -join ', ')) -Evidence $evidence -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Pass' -Message ('No secret or token pattern, and no value registered in this session, in {0} file(s) under {1}.{2}' -f $scanned.Count, ($evidence['roots'] -join ', '), $notScanned) -Evidence $evidence -DocUrl $outputDoc))
         }
     }
     if (-not $Context.GroupExists) {

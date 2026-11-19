@@ -16,6 +16,16 @@ internal sealed record CosmosResponse(int StatusCode, double RequestCharge, Time
     /// <summary>A 404 on a point read: the document isn't there (a normal miss), unless the substatus says its container isn't (1003).</summary>
     public bool IsDocumentMiss => StatusCode == (int)HttpStatusCode.NotFound && SubStatus is null or 0;
 
+    /// <summary>
+    /// A 404 with substatus 1003 (the owner resource doesn't exist) on a document request: T5's container, which exists
+    /// only during a session, or its database, isn't there (https://learn.microsoft.com/azure/cosmos-db/troubleshoot-not-found).
+    /// The container's own read means the same with a 404 of any substatus (<see cref="CosmosAccount.ReadContainerAsync"/>).
+    /// </summary>
+    public bool IsContainerMissing => StatusCode == (int)HttpStatusCode.NotFound && SubStatus == OwnerResourceNotFound;
+
+    /// <summary>The substatus of a 404 whose owner resource (the container or the database) doesn't exist.</summary>
+    internal const int OwnerResourceNotFound = 1003;
+
     /// <summary>HTTP 408, 410, 449, and 5xx: the service asks the client to try again.</summary>
     public bool IsTransient => StatusCode is 408 or 410 or 449 or >= 500;
 
@@ -35,7 +45,7 @@ internal sealed record CosmosResponse(int StatusCode, double RequestCharge, Time
                 ActivityId),
             404 => new CosmosException(
                 CosmosFailure.NotFound,
-                $"{what} found nothing ({status}): T5 ({host}) has no database '{CosmosEndpoint.DatabaseName}' with a container '{CosmosEndpoint.ContainerName}'. The template creates them; run deploy.ps1.{activity}",
+                $"{what} found nothing ({status}): {CosmosEndpoint.ContainerMissingMessage}{activity}",
                 StatusCode,
                 SubStatus,
                 ActivityId),

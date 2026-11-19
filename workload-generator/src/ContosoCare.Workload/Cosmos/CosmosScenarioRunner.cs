@@ -13,14 +13,15 @@ namespace ContosoCare.Workload.Cosmos;
 /// Runs one bounded scenario on T5, Azure Cosmos DB for NoSQL, with the same bounds and result as the other runners. T5
 /// has no database-side control tables, so the run is registered in T1's run store (<see cref="CosmosRunStore"/>), which
 /// refuses a second Running run of a scenario and a fifth Running run, as demo.usp_run_begin does. The runner first reads
-/// the container, so an account it can't reach or a data-plane role that isn't effective yet is a refusal the profile host
-/// tries again. Then its writers send tagged REST requests (User-Agent <c>ContosoCare.Demo/&lt;scenario&gt;/&lt;run&gt;</c>) to
-/// <c>contosocare/patient-events</c> only, until the deadline or a stop: the runner reads its run's status every 2
-/// seconds (a stop marks it Cancelled) and records its counters and rates every 5. Each request may take 30 seconds;
-/// 60 seconds after the deadline the runner cancels the requests still in flight, and 15 seconds later it records the
-/// run as TimedOut and stops waiting. There are no server-side sessions to end. Both scenarios write bounded, fixed sets
-/// of documents; ru-storm deletes its own when it ends, however it ends (<see cref="StormCleanup"/>), so every run
-/// starts from the same data.
+/// the container, so an account it can't reach, a data-plane role that isn't effective yet, or a container that doesn't
+/// exist now (it exists only during a session, <see cref="CosmosEndpoint.ContainerMissingMessage"/>) is a refusal the
+/// profile host tries again. Then its writers send tagged REST requests (User-Agent
+/// <c>ContosoCare.Demo/&lt;scenario&gt;/&lt;run&gt;</c>) to <c>contosocare/patient-events</c> only, until the deadline or a
+/// stop: the runner reads its run's status every 2 seconds (a stop marks it Cancelled) and records its counters and rates
+/// every 5. Each request may take 30 seconds; 60 seconds after the deadline the runner cancels the requests still in
+/// flight, and 15 seconds later it records the run as TimedOut and stops waiting. There are no server-side sessions to
+/// end. Both scenarios write bounded, fixed sets of documents; ru-storm deletes its own when it ends, however it ends
+/// (<see cref="StormCleanup"/>), so every run starts from the same data.
 /// </summary>
 internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunStore store, RunnerLog log, TimeProvider time) : IScenarioExecutor, IOrphanedRunRecovery
 {
@@ -89,7 +90,9 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
         }
         catch (CosmosException ex)
         {
-            return Refused(plan, runId, parameters, ex.Message, checks, ex.RefusalReason);
+            // A container that doesn't exist now is a "request" refusal that passes all the same: it exists only during a
+            // session, whose start creates it, so the profile host tries the activity again.
+            return Refused(plan, runId, parameters, ex.Message, checks, ex.RefusalReason, passes: ex.Failure == CosmosFailure.NotFound);
         }
 
         RunRegistration registration;
@@ -136,7 +139,7 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
         if (recovered.Any(r => r.ScenarioId == RuStorm.ScenarioId))
         {
             var cleanup = await StormCleanup.RunAsync(client, SessionNames.ForControl("profile-recover"), time, StormCleanupLimit, cancellationToken).ConfigureAwait(false);
-            log.Info("run.cleanup", "Deleted the documents of a storm whose runner ended mid-run.", ("deleted", cleanup.Deleted), ("complete", cleanup.Complete), ("requestCharge", cleanup.RequestCharge), ("error", cleanup.Error));
+            log.Info("run.cleanup", "Deleted the documents of a storm whose runner ended mid-run.", ("deleted", cleanup.Deleted), ("complete", cleanup.Complete), ("containerMissing", cleanup.ContainerMissing), ("requestCharge", cleanup.RequestCharge), ("error", cleanup.Error));
         }
 
         return [.. recovered.Select(r => r.RunId)];
@@ -313,9 +316,11 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
         else
         {
             var cleanup = await StormCleanup.RunAsync(client, tag, time, cancelledByCaller ? StormCleanupOnShutdown : StormCleanupLimit, CancellationToken.None).ConfigureAwait(false);
-            log.Info("run.cleanup", "Deleted the storm's documents.", ("runId", runId), ("deleted", cleanup.Deleted), ("complete", cleanup.Complete), ("requestCharge", cleanup.RequestCharge), ("elapsed", cleanup.Elapsed), ("error", cleanup.Error));
+            log.Info("run.cleanup", "Deleted the storm's documents.", ("runId", runId), ("deleted", cleanup.Deleted), ("complete", cleanup.Complete), ("containerMissing", cleanup.ContainerMissing), ("requestCharge", cleanup.RequestCharge), ("elapsed", cleanup.Elapsed), ("error", cleanup.Error));
             checks.Add(cleanup.ToCheck("auto-cleanup"));
-            outcome += string.Create(CultureInfo.InvariantCulture, $" Cleanup: {cleanup.Deleted} storm document(s) deleted ({cleanup.RequestCharge:0.#} RU){(cleanup.Complete ? string.Empty : ", some may be left")}.");
+            outcome += cleanup.ContainerMissing
+                ? " Cleanup: " + StormCleanupResult.ContainerMissingMessage
+                : string.Create(CultureInfo.InvariantCulture, $" Cleanup: {cleanup.Deleted} storm document(s) deleted ({cleanup.RequestCharge:0.#} RU){(cleanup.Complete ? string.Empty : ", some may be left")}.");
         }
 
         await TryAsync(() => store.EndRunAsync(runId, status, outcome, totals.ToCounters(), CancellationToken.None), "end").ConfigureAwait(false);
@@ -562,7 +567,7 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
         }
     }
 
-    private RunResult Refused(RunPlan plan, string runId, Dictionary<string, string> parameters, string reason, List<CheckRecord> checks, string refusalReason)
+    private RunResult Refused(RunPlan plan, string runId, Dictionary<string, string> parameters, string reason, List<CheckRecord> checks, string refusalReason, bool passes = false)
     {
         log.Error("run.refused", "The run didn't start.", ("runId", runId), ("scenario", plan.Scenario.Id), ("target", plan.Target), ("reason", reason));
         return new RunResult
@@ -581,6 +586,7 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
             Checks = checks,
             ExpectedSymptoms = plan.Scenario.ExpectedSymptoms,
             RefusalReason = refusalReason,
+            RefusalPasses = passes,
         };
     }
 

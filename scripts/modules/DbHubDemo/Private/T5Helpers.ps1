@@ -1,10 +1,27 @@
 # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>. Its names, its reads through the
-# documented REST APIs, the subscription's free tier, its Azure Monitor metrics, and the DEPLOY.T5 lines of deploy.ps1.
+# documented REST APIs, the subscription's free tier, its Azure Monitor metrics, its container's lifecycle, and the DEPLOY.T5
+# lines of deploy.ps1.
 
 # The account's provisioning states while it's there (Database Accounts - Get, provisioningState): Succeeded once created,
 # Updating while a change applies, Creating while Azure creates it. Deleting means it isn't T5 any more.
 # https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/database-accounts/get (checked 2026-11-18)
 $script:T5DeployedStates = @('Succeeded', 'Updating', 'Creating')
+
+# T5's container lifecycle (2026-11-19, ADR 0027), the demo resource group's DbHubT5Container tag. A container's provisioned
+# throughput can't be taken away, only deleted with it, so the container exists only during a session once the session
+# control's role can create it again (Session): the stop paths delete it, and the start paths create it. While it can't
+# (AlwaysOn), or in an environment deployed before then (no tag), nothing deletes it, so a session never runs without it.
+# The session control's runbooks read the same tag (Get-DbHubT5Lifecycle).
+$script:T5LifecycleSession = 'Session'
+$script:T5LifecycleAlwaysOn = 'AlwaysOn'
+# What the session control's role needs to create T5's container again after a stop deletes it, and to delete it (in
+# ActivityControlHelpers.ps1's approved list since 2026-11-19).
+# https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
+$script:T5ContainerControlActions = @(
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
+)
 
 function Test-DemoT5Enabled {
     # True unless the configuration turns T5 off (t5Enabled false; ADR 0027). Internal.
@@ -305,12 +322,16 @@ function Test-DemoT5FreeTierRefusal {
     <#
     .SYNOPSIS
     True when a failed deployment's error says Azure refused T5's free tier: the subscription's offer doesn't include it
-    ("Free tier is not supported for Internal subscriptions", live 2026-11-18), or another account took it meanwhile.
-    Internal.
+    ("Free tier is not supported for Internal subscriptions", live 2026-11-18), or another account took it meanwhile
+    ("Free tier has already been applied to another Azure Cosmos DB account in this subscription"). Internal.
 
     .DESCRIPTION
-    Microsoft Learn lists no error code for it, so the match needs an error that names the free tier, as
-    Resolve-DemoT3FreeOfferError does for T3's free offer.
+    Microsoft Learn lists no error code for it, so the match needs an error detail that names the free tier and is Azure
+    Cosmos DB's (review, 2026-11-19): the text around "free tier", from the error target that precedes it to the next
+    one, names Cosmos DB, its resource provider (Microsoft.DocumentDB, Microsoft.Azure.Documents), or T5's nested
+    deployment (cosmos01). Invoke-DemoTemplateDeployment checks T5's refusal before T3's free offer, so an Azure SQL error
+    that says "free tier" never costs T5 the free tier, which Azure sets only when an account is created. Validated by
+    unit tests with Azure's own texts: every subscription the live tests use is internal, where T5 never asks for it.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -319,7 +340,29 @@ function Test-DemoT5FreeTierRefusal {
         [string] $Text = ''
     )
 
-    return ($Text -match '(?i)free[ -]?tier')
+    $cosmosPattern = '(?i)cosmos|documentdb|Microsoft\.Azure\.Documents|documents\.azure\.com'
+    $targetPattern = '(?i)"target"\s*:|\bTarget:\s'
+    $flat = ($Text -replace '\\r\\n|\\n|\\r|\\"', ' ') -replace '\s+', ' '
+    foreach ($phrase in [regex]::Matches($flat, '(?i)free[ -]?tier')) {
+        # The phrase's error detail: from the error target before it (at most 600 characters back) to the next one (at
+        # most 300 characters on). JSON details name their target first, the Azure CLI's "Target:" lines before their
+        # inner details.
+        $from = [Math]::Max(0, $phrase.Index - 600)
+        $before = $flat.Substring($from, $phrase.Index - $from)
+        $targets = [regex]::Matches($before, $targetPattern)
+        if ($targets.Count -gt 0) {
+            $before = $before.Substring($targets[$targets.Count - 1].Index)
+        }
+        $after = $flat.Substring($phrase.Index, [Math]::Min(300, $flat.Length - $phrase.Index))
+        $next = [regex]::Match($after, $targetPattern)
+        if ($next.Success) {
+            $after = $after.Substring(0, $next.Index)
+        }
+        if (($before + $after) -match $cosmosPattern) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-DemoT5FreeTierRefusalReason {
@@ -336,6 +379,9 @@ function Get-DemoT5FreeTierRefusalReason {
     $match = [regex]::Match($flat, '(?i)free[ -]?tier is not supported for ([A-Za-z]+) subscriptions')
     if ($match.Success) {
         return ('"Free tier is not supported for {0} subscriptions": the subscription''s offer doesn''t include it' -f $match.Groups[1].Value)
+    }
+    if ($flat -match '(?i)free[ -]?tier has already been applied to another (?:Azure )?Cosmos DB account') {
+        return '"Free tier has already been applied to another Azure Cosmos DB account in this subscription": the subscription''s one free-tier account is taken'
     }
     return 'the subscription''s one free-tier account is taken, or its offer doesn''t include the free tier'
 }
@@ -361,6 +407,11 @@ function Get-DemoT5MissingResult {
     if (-not (Test-DemoT5Enabled -Config $Config)) {
         return $null
     }
+    # An earlier run recorded that Azure didn't create the account (DbHubT5Refused; review, 2026-11-19): a resume leaves T5
+    # out (Resolve-DemoT5LeftOut) instead of starting from preflight, which would fail the same way.
+    if ([string](Get-DemoMemberValue -InputObject $State -Name 'T5Refused')) {
+        return $null
+    }
     $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
     $deploymentId = ''
     if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) {
@@ -378,9 +429,189 @@ function Get-DemoT5MissingResult {
     return (New-DemoResult -CheckId 'DEPLOY.T5.MISSING' -Area 't5' -Target 'T5' -Status 'Pass' -Message $message -Evidence ([ordered]@{ accountName = $accountName; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage'); state = [string]$current.State }) -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))
 }
 
+# T5's nested deployments, the module names in infra/modules/demo.bicep (Get-DemoT5OnlyFailure; review, 2026-11-19).
+$script:T5DeploymentNames = @('cosmos01', 'cosmos01-access')
+
+function Get-DemoT5OnlyFailure {
+    <#
+    .SYNOPSIS
+    Whether a failed template deployment failed in T5's resources alone (review, 2026-11-19): every innermost error of its
+    failed operations (Get-DemoDeploymentFailure's Errors) is T5's or, when Azure refused the deployment before it ran,
+    every resource a policy disallowed is. Returns T5Only and Text (Azure's reason, redacted). Pure. Internal.
+
+    .DESCRIPTION
+    T5's resources (infra/modules/cosmos01.bicep and cosmos01-access.bicep): the Microsoft.DocumentDB types, the nested
+    deployments cosmos01 and cosmos01-access, the private endpoint pe-<prefix>-<environment>-cosmos01 with its DNS zone
+    group, and the private DNS zone privatelink.documents.azure.com with its link. A failure without an error that names
+    a resource is never T5's alone.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Cause,
+
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $ErrorText = ''
+    )
+
+    $names = Get-DemoT5Name -Config $Config -NoLookup
+    $prefix = [string](Get-DemoCosmosSetting)['accountNamePrefix']
+    $isT5 = {
+        param([string] $Type, [string] $Name)
+        $first = ($Name -split '/')[0]
+        if ($Type -like 'Microsoft.DocumentDB/*') {
+            return $true
+        }
+        if ($Type -eq 'Microsoft.Resources/deployments') {
+            return ($first -in $script:T5DeploymentNames)
+        }
+        if ($Type -like 'Microsoft.Network/privateEndpoints*') {
+            return ($first -eq $names.PrivateEndpointName)
+        }
+        if ($Type -like 'Microsoft.Network/privateDnsZones*') {
+            return ($first -eq $names.PrivateDnsZoneName)
+        }
+        if (-not $Type) {
+            return ($first -like ('{0}-*' -f $prefix) -or $first -eq $names.PrivateEndpointName -or $first -eq $names.PrivateDnsZoneName)
+        }
+        return $false
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $causeErrors = Get-DemoMemberValue -InputObject $Cause -Name 'Errors'
+    $errors = @(@($causeErrors) | Where-Object { $null -ne $_ })
+    if ($errors.Count -gt 0) {
+        $t5 = @($errors | Where-Object { & $isT5 ([string]$_.ResourceType) ([string]$_.ResourceName) })
+        return [pscustomobject]@{ T5Only = ($t5.Count -eq $errors.Count); Text = [string](Get-DemoMemberValue -InputObject $Cause -Name 'Text') }
+    }
+    # Refused before it ran (InvalidTemplateDeployment): a policy names each resource it disallowed.
+    $text = [string]$ErrorText
+    $disallowed = @([regex]::Matches($text, '(?i)Resource ''([^'']+)'' was disallowed by policy') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    if ($disallowed.Count -gt 0 -and $text -match '(?i)\bRequestDisallowedByPolicy\b') {
+        $t5 = @($disallowed | Where-Object { & $isT5 '' $_ })
+        return [pscustomobject]@{ T5Only = ($t5.Count -eq $disallowed.Count); Text = (Protect-DemoText -Text ('RequestDisallowedByPolicy: Azure Policy disallowed {0}' -f ($disallowed -join ', '))) }
+    }
+    return [pscustomobject]@{ T5Only = $false; Text = '' }
+}
+
+function Copy-DemoT5OffConfig {
+    # A copy of the configuration with T5 left out of this run (review, 2026-11-19): t5Enabled false, and t5LeftOut, why, so
+    # the run says T5 is left out rather than off in the configuration (New-DemoT5OffResult). The file isn't changed. Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $Reason = ''
+    )
+
+    $copy = [ordered]@{}
+    foreach ($key in $Config.Keys) {
+        $copy[$key] = $Config[$key]
+    }
+    $copy['t5Enabled'] = $false
+    $copy['t5LeftOut'] = if ($Reason) { $Reason } else { 'Azure didn''t create its account' }
+    return $copy
+}
+
+function New-DemoT5LeftOutResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T5, a Warning (review, 2026-11-19): this run leaves T5 out because Azure didn't create its account, from the
+    template's failure (-Cause, Azure's reason) or, in a resume, from an earlier run's record (-RecordedUtc,
+    DbHubT5Refused). Its evidence's leftOut tells DONE not to wait for T5's checks (Test-DemoT5LeftOut). Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $Cause = '',
+
+        [AllowEmptyString()]
+        [string] $RecordedUtc = ''
+    )
+
+    $message = if ($Cause) {
+        'Azure didn''t create T5''s Azure Cosmos DB account ({0}), and nothing else failed, so the template was deployed again without T5: this run finishes the rest, and Database Hub shows T1 to T4.' -f $Cause.TrimEnd('.')
+    }
+    else {
+        'Azure didn''t create T5''s Azure Cosmos DB account in an earlier run of this deployment ({0}), so this resume leaves T5 out too, and Database Hub shows T1 to T4.' -f $(if ($RecordedUtc) { 'recorded ' + $RecordedUtc } else { 'recorded on the resource group' })
+    }
+    $remediation = 'Nothing to do when it was temporary: the next ./scripts/deploy.ps1 that deploys the template (one that isn''t a resume) tries T5 again. When Azure keeps refusing it (a region without capacity for new Azure Cosmos DB accounts, or a policy that denies them), set "t5Enabled": false in config/demo.config.json, or deploy the demo in another region.'
+    return (New-DemoResult -CheckId 'DEPLOY.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message $message -Evidence ([ordered]@{ leftOut = $true; cause = $Cause; recordedUtc = $RecordedUtc }) -Remediation $remediation -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))
+}
+
+function Test-DemoT5LeftOut {
+    # True when this run left T5 out (DEPLOY.T5 with leftOut, New-DemoT5LeftOutResult): DONE doesn't wait for T5's checks
+    # then, though the configuration has T5 on (review, 2026-11-19). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    foreach ($item in @($Result)) {
+        if ($null -ne $item -and [string](Get-DemoMemberValue -InputObject $item -Name 'checkId') -eq 'DEPLOY.T5' -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name 'leftOut')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Resolve-DemoT5LeftOut {
+    <#
+    .SYNOPSIS
+    A resume after an earlier run of this deployment left T5 out because Azure didn't create its account (DbHubT5Refused;
+    review, 2026-11-19): returns Config (Copy-DemoT5OffConfig) and Result (DEPLOY.T5, a Warning) when T5 is on, the record
+    is there, this run doesn't deploy the template, and the account doesn't exist; otherwise $null, and a run that deploys
+    the template tries T5 again. An account that can't be read keeps T5 on. A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State,
+
+        [switch] $TemplateRuns
+    )
+
+    if ($TemplateRuns -or -not (Test-DemoT5Enabled -Config $Config)) {
+        return $null
+    }
+    $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Refused')
+    if (-not $recorded) {
+        return $null
+    }
+    $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+    $deploymentId = if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) { [string]$tags['deploymentId'] } else { '' }
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return $null
+    }
+    $current = Get-DemoT5State -Config $Config -DeploymentId $deploymentId
+    if ($current.Exists -or [string]$current.State -eq 'Unknown') {
+        return $null
+    }
+    $result = New-DemoT5LeftOutResult -RecordedUtc $recorded
+    return [pscustomobject]@{ Config = (Copy-DemoT5OffConfig -Config $Config -Reason ('Azure didn''t create its account in an earlier run ({0})' -f $recorded)); Result = $result }
+}
+
 function New-DemoT5OffResult {
     # DEPLOY.T5.OFF: the configuration turns T5 off (t5Enabled false), so this run neither creates nor checks it, and an
-    # existing account stays as it is; $null when T5 is on. Internal.
+    # existing account stays as it is; $null when T5 is on, or when this run left it out (t5LeftOut, DEPLOY.T5 says why).
+    # Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -389,7 +620,7 @@ function New-DemoT5OffResult {
         [System.Collections.IDictionary] $Config
     )
 
-    if (Test-DemoT5Enabled -Config $Config) {
+    if ((Test-DemoT5Enabled -Config $Config) -or [string]$Config['t5LeftOut']) {
         return $null
     }
     return (New-DemoResult -CheckId 'DEPLOY.T5.OFF' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 (Azure Cosmos DB) is off in this configuration (t5Enabled is false), so this run neither creates nor checks it, and Database Hub shows T1 to T4 only. An account an earlier run created stays as it is, and keeps billing its throughput.' -Remediation 'To add T5, remove t5Enabled from the configuration (or set it to true) and run ./scripts/deploy.ps1. To remove an existing account, ./scripts/destroy.ps1 removes it with the resource group.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))
@@ -427,29 +658,600 @@ function Get-DemoT5FreeTierStatus {
     }
 }
 
-function Get-DemoT5StopResult {
+function Get-DemoT5ContainerPath {
+    # T5's container under its account: sqlDatabases/<database>/containers/<container> (config/versions.json). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $cosmos = Get-DemoCosmosSetting
+    return ('sqlDatabases/{0}/containers/{1}' -f $cosmos['databaseName'], $cosmos['containerName'])
+}
+
+function Get-DemoT5CostLifecycle {
     <#
     .SYNOPSIS
-    STOP.T5 (2026-11-18, ADR 0027): an Azure Cosmos DB account has no stop or pause, so stop-demo.ps1 turns its activity off
-    and says what bills on between sessions: its provisioned throughput (nothing on the free tier), its storage, and its
-    private endpoint and DNS zone. Not supported, never a Fail; Not selected when the account doesn't exist. Internal.
+    How the cost estimate prices T5's throughput (Get-DemoCostEstimate -T5ContainerLifecycle; 2026-11-19, ADR 0027):
+    Session, for the running hours only, unless the environment exists and its DbHubT5Container tag isn't Session (an
+    environment whose session control can't create the container yet, or one deployed before then), whose container stays
+    between sessions: AlwaysOn, all month. Never throws: a state that can't be read is Session. Internal.
+
+    .DESCRIPTION
+    -ThisRunDeploys (deploy.ps1's preflight, 2026-11-19, the coordinator's gap fix): what this run's lifecycle step will
+    record, unless the tag is Session already: Session when the session control will be able to create the container (its
+    role has the container's actions, or the deployer can write them, and its identity holds it, or the deployer can
+    assign it) or will have no role at all (the deployer can't assign it: Run all can't start a session then); AlwaysOn
+    when it will hold a role without the actions, or when that can't be read (fail safe).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        # Get-DemoDeploymentState's result; read when it isn't given.
+        [AllowNull()]
+        [object] $State = $null,
+
+        [switch] $ThisRunDeploys,
+
+        # Get-DemoDeployerRolePermission's answer, for -ThisRunDeploys; read when it isn't given.
+        [AllowNull()]
+        [object] $Permission = $null
+    )
+
+    try {
+        if ($null -eq $State) {
+            $State = Get-DemoDeploymentState -Config $Config
+        }
+        $exists = [bool](Get-DemoMemberValue -InputObject $State -Name 'Exists')
+        $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Container')
+        if ($ThisRunDeploys -and $recorded -cne $script:T5LifecycleSession) {
+            if ($null -eq $Permission) {
+                $Permission = Get-DemoDeployerRolePermission -Config $Config
+            }
+            $control = Get-DemoT5ControlRoleState -Config $Config
+            if ($control.Mode -eq 'Unknown') {
+                return $script:T5LifecycleAlwaysOn
+            }
+            # The run writes the control's role to exactly its approved actions ($script:ActivityControlRoleActions), so a
+            # deployer who can write it adds the container's actions only while they're approved there.
+            $approved = @($script:T5ContainerControlActions | Where-Object { $_ -notin $script:ActivityControlRoleActions }).Count -eq 0
+            $willHaveActions = @($control.Lacking).Count -eq 0 -or ([bool]$Permission.CanDefine -and $approved)
+            $willHold = [bool]$control.HoldsRole -or [bool]$Permission.CanAssign
+            if ($willHold -and -not $willHaveActions) {
+                return $script:T5LifecycleAlwaysOn
+            }
+            if (-not $willHold -and [bool]$control.HoldsOther) {
+                return $script:T5LifecycleAlwaysOn
+            }
+            return $script:T5LifecycleSession
+        }
+        if ($exists -and $recorded -cne $script:T5LifecycleSession) {
+            return $script:T5LifecycleAlwaysOn
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('T5''s container lifecycle wasn''t read for the estimate, so it''s priced as Session: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    return $script:T5LifecycleSession
+}
+
+function Get-DemoT5ContainerBody {
+    <#
+    .SYNOPSIS
+    The body that creates T5's container through Azure Resource Manager (2026-11-19, ADR 0027): config/versions.json's
+    partition key, indexing policy, and throughput, exactly as infra/modules/cosmos01.bicep deploys them, and the demo
+    resource group's own tags (the names the safety stop's resources carry), which a tenant's tag policy may require.
+    Pure. Internal.
+    Source: https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/create-update-sql-container
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $GroupTag = $null
+    )
+
+    $cosmos = Get-DemoCosmosSetting
+    $tags = [ordered]@{}
+    if ($null -ne $GroupTag) {
+        foreach ($key in $script:SafetyStopTagNames) {
+            if ($GroupTag.Contains($key) -and [string]$GroupTag[$key]) {
+                $tags[$key] = [string]$GroupTag[$key]
+            }
+        }
+    }
+    return [ordered]@{
+        tags       = $tags
+        properties = [ordered]@{
+            resource = [ordered]@{
+                id             = [string]$cosmos['containerName']
+                partitionKey   = [ordered]@{ paths = @([string]$cosmos['partitionKeyPath']); kind = 'Hash'; version = [int]$cosmos['partitionKeyVersion'] }
+                indexingPolicy = $cosmos['indexingPolicy']
+            }
+            options  = [ordered]@{ throughput = [int]$cosmos['throughputRUs'] }
+        }
+    }
+}
+
+function Wait-DemoT5Container {
+    <#
+    .SYNOPSIS
+    Reads T5's container every -PollSeconds until it's there (-Present) or gone (without it), for at most -TimeoutSeconds.
+    Returns Reached, Found, Error, and Seconds. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [string] $AccountId,
+
+        [switch] $Present,
+
+        [ValidateRange(0, 3600)]
+        [int] $TimeoutSeconds = 300,
+
+        [ValidateRange(1, 300)]
+        [int] $PollSeconds = 10
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $read = Get-DemoT5Resource -Config $Config -AccountId $AccountId -Child (Get-DemoT5ContainerPath)
+        $reached = if ($Present) { [bool]$read.Found } else { [bool]$read.NotFound }
+        if ($reached -or ($watch.Elapsed.TotalSeconds + $PollSeconds) -gt $TimeoutSeconds) {
+            return [pscustomobject]@{ Reached = $reached; Found = [bool]$read.Found; Error = [string]$read.Error; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds) }
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function New-DemoT5Container {
+    <#
+    .SYNOPSIS
+    Makes sure T5's container exists before T5's activity starts (2026-11-19, ADR 0027): when it's missing, creates it
+    through Azure Resource Manager with config/versions.json's definition and waits until Azure reads it back. Returns
+    -CheckId's result: Pass when it was there or was created, Fail when it couldn't be (with the fix), Not selected when
+    T5 is off or its account isn't there. Internal.
+
+    .DESCRIPTION
+    The container exists only during a session once its lifecycle is Session (the DbHubT5Container tag): stop-demo.ps1,
+    the session's end, and the nightly safety stop delete it, so start-demo.ps1, deploy.ps1 (whose template creates it
+    too, but a resumed run skips the template), and demo-control.ps1 create it before T5's activity. The account, the
+    database, and T1's data-plane role (scoped to the account) stay, so a new container needs nothing else. Azure refuses a
+    container's name for a moment while it still deletes the last one (a conflict), so the create is tried again every
+    -PollSeconds until -WaitMinutes pass. Sources (checked 2026-11-19):
+    https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/create-update-sql-container,
+    https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/get-sql-container
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        # Get-DemoT5State's result; read when it isn't given.
+        [AllowNull()]
+        [object] $State = $null,
+
+        [ValidatePattern('^$|^[a-z0-9]{6}$')]
+        [string] $DeploymentId = '',
+
+        [ValidatePattern('^[A-Z][A-Z0-9_.]+$')]
+        [string] $CheckId = 'START.T5.CONTAINER',
+
+        [ValidateRange(1, 30)]
+        [int] $WaitMinutes = 5,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 10
+    )
+
+    $cosmos = Get-DemoCosmosSetting
+    $docs = $cosmos['docUrls']
+    $resultCheckId = $CheckId
+    if ($null -eq $State) {
+        $State = Get-DemoT5State -Config $Config -DeploymentId $DeploymentId
+    }
+    $names = $State.Names
+    $evidence = [ordered]@{ account = [string]$names.AccountName; database = [string]$names.DatabaseName; container = [string]$names.ContainerName; throughputRUs = [int]$names.Throughput; action = 'none' }
+    $result = {
+        param([string] $Status, [string] $Message, [string] $Remediation = '', [string] $DocUrl = '')
+        New-DemoResult -CheckId $resultCheckId -Area 't5' -Target 'T5' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $DocUrl
+    }
+    if (-not $names.Enabled) {
+        return (& $result 'Not selected' 'T5 is off in this configuration (t5Enabled is false).')
+    }
+    if (-not $State.Exists) {
+        return (& $result 'Not selected' ('T5''s account ({0}) isn''t there, so its container wasn''t created.' -f $(if ($names.AccountName) { $names.AccountName } else { 'cosmos01-<deploymentId>' })) 'Run ./scripts/deploy.ps1: it creates T5.' $docs['hubMonitor'])
+    }
+    $path = Get-DemoT5ContainerPath
+    $read = Get-DemoT5Resource -Config $Config -AccountId $names.AccountId -Child $path
+    if ($read.Found) {
+        return (& $result 'Pass' ('T5''s container {0} is there, with its {1} RU/s.' -f $names.ContainerName, $names.Throughput))
+    }
+    if (-not $read.NotFound) {
+        $evidence['action'] = 'unread'
+        return (& $result 'Fail' ('T5''s container {0} couldn''t be read, so it wasn''t created: {1}' -f $names.ContainerName, $read.Error) 'Run the same command again in a few minutes.' $docs['createContainer'])
+    }
+    if (-not $PSCmdlet.ShouldProcess(('{0}/{1}' -f $names.AccountName, $path), ('Create T5''s container with {0} RU/s' -f $names.Throughput))) {
+        $evidence['action'] = 'whatif'
+        return (& $result 'Not selected' ('What if: T5''s container {0} would be created, with {1} RU/s.' -f $names.ContainerName, $names.Throughput))
+    }
+    $groupTag = $null
+    try {
+        $groupTag = Get-DemoResourceGroupTag -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName $names.ResourceGroup
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The demo resource group''s tags weren''t read for T5''s container: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $url = 'https://management.azure.com{0}/{1}?api-version={2}' -f $names.AccountId, $path, (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.DocumentDB/databaseAccounts')
+    $body = Get-DemoT5ContainerBody -GroupTag $groupTag
+    $evidence['action'] = 'create'
+    $limit = $WaitMinutes * 60
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempts = 0
+    $accepted = $false
+    $errorText = ''
+    while ($true) {
+        $attempts++
+        $put = Invoke-DemoActivityControlArm -SubscriptionId ([string]$Config['subscriptionId']) -Method put -Url $url -Body $body
+        if ($put.Ok) {
+            $accepted = $true
+            break
+        }
+        $errorText = [string]$put.Error
+        # Azure refuses the name while the last container with it is still being deleted.
+        $conflict = $errorText -match '(?i)\b(409|412)\b|Conflict|PreconditionFailed|being deleted|in progress|another operation'
+        if (-not $conflict -or ($watch.Elapsed.TotalSeconds + $PollSeconds) -gt $limit) {
+            break
+        }
+        Write-DemoLog -Message ('T5: Azure doesn''t take the container {0} yet ({1}); trying again in {2} seconds.' -f $names.ContainerName, $errorText, $PollSeconds)
+        Start-Sleep -Seconds $PollSeconds
+    }
+    $evidence['attempts'] = $attempts
+    $fix = 'Run ./scripts/start-demo.ps1 again. If it keeps failing, run ./scripts/deploy.ps1, whose template creates the container.'
+    if (-not $accepted) {
+        $evidence['seconds'] = [int][System.Math]::Round($watch.Elapsed.TotalSeconds)
+        return (& $result 'Fail' ('T5''s container {0} couldn''t be created, so T5''s activity can''t start: {1}' -f $names.ContainerName, $errorText) $fix $docs['createContainer'])
+    }
+    $waited = Wait-DemoT5Container -Config $Config -AccountId $names.AccountId -Present -TimeoutSeconds ([int][System.Math]::Max(30, $limit - $watch.Elapsed.TotalSeconds)) -PollSeconds $PollSeconds
+    $seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds)
+    $evidence['seconds'] = $seconds
+    if (-not $waited.Reached) {
+        return (& $result 'Fail' ('T5''s container {0} was requested, but Azure didn''t show it within {1} minutes{2}.' -f $names.ContainerName, $WaitMinutes, $(if ($waited.Error) { ': ' + $waited.Error } else { '' })) $fix $docs['createContainer'])
+    }
+    return (& $result 'Pass' ('T5''s container {0} wasn''t there, so it was created, with {1} RU/s, in {2} seconds.' -f $names.ContainerName, $names.Throughput, $seconds) '' $docs['createContainer'])
+}
+
+function Remove-DemoT5Container {
+    <#
+    .SYNOPSIS
+    Deletes T5's container through Azure Resource Manager (2026-11-19, ADR 0027), so its provisioned throughput stops
+    billing until a session creates it again; the account, the database, the private endpoint, and the DNS zone stay.
+    Returns Outcome (Deleted, Missing, Failed, or WhatIf), Seconds, and Error. It doesn't check the lifecycle:
+    Invoke-DemoT5ContainerStop does. Internal.
+    Source: https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/delete-sql-container
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        # Get-DemoT5Name's result.
+        [Parameter(Mandatory)]
+        [object] $Names,
+
+        [ValidateRange(0, 30)]
+        [int] $WaitMinutes = 5,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 10
+    )
+
+    $path = Get-DemoT5ContainerPath
+    if (-not $PSCmdlet.ShouldProcess(('{0}/{1}' -f $Names.AccountName, $path), 'Delete T5''s container')) {
+        return [pscustomobject]@{ Outcome = 'WhatIf'; Seconds = 0; Error = '' }
+    }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    # Read first: Azure can answer a delete of a container that isn't there with success, so only a read tells "already
+    # gone" from "deleted now".
+    $before = Get-DemoT5Resource -Config $Config -AccountId $Names.AccountId -Child $path
+    if (-not $before.Found -and $before.NotFound) {
+        return [pscustomobject]@{ Outcome = 'Missing'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = '' }
+    }
+    $url = 'https://management.azure.com{0}/{1}?api-version={2}' -f $Names.AccountId, $path, (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.DocumentDB/databaseAccounts')
+    $delete = Invoke-DemoActivityControlArm -SubscriptionId ([string]$Config['subscriptionId']) -Method delete -Url $url
+    if (-not $delete.Ok) {
+        $outcome = if ($delete.Missing) { 'Missing' } else { 'Failed' }
+        return [pscustomobject]@{ Outcome = $outcome; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = $(if ($delete.Missing) { '' } else { [string]$delete.Error }) }
+    }
+    if ($WaitMinutes -le 0) {
+        return [pscustomobject]@{ Outcome = 'Deleted'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = '' }
+    }
+    $waited = Wait-DemoT5Container -Config $Config -AccountId $Names.AccountId -TimeoutSeconds ($WaitMinutes * 60) -PollSeconds $PollSeconds
+    if ($waited.Reached) {
+        return [pscustomobject]@{ Outcome = 'Deleted'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = '' }
+    }
+    return [pscustomobject]@{ Outcome = 'Failed'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = ('it was still there {0} minutes after its deletion was accepted{1}' -f $WaitMinutes, $(if ($waited.Error) { ' (' + $waited.Error + ')' } else { '' })) }
+}
+
+function Get-DemoT5ControlRoleState {
+    <#
+    .SYNOPSIS
+    What the session control can do with T5's container (2026-11-19, ADR 0027), read once: Mode, Why, RoleName, and the
+    facts behind them (RoleExists, Lacking, IdentityExists, HoldsRole, HoldsOther). Internal.
+
+    .DESCRIPTION
+    Mode:
+    - Control: its custom role has the container's actions ($script:T5ContainerControlActions), and its identity holds it at
+      the demo resource group, so Run all creates the container at a session's start.
+    - NoRole: its identity holds no role at the demo resource group (or doesn't exist yet), so Run all can't start a session
+      at all, and only start-demo.ps1 and demo-control.ps1 do, which create the container with the person's own rights (the
+      coordinator's fix 1, 2026-11-19).
+    - Lacking: its identity holds its role, which doesn't have the container's actions (an earlier grant, and a deployer who
+      can't write the role), or holds another role there: Run all could start a session that couldn't create the container.
+    - Unknown: the role or the assignments couldn't be read.
+    Reads: the role definitions, the identity, and its role assignments at the demo resource group (at, above, or below).
+    https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $name = Get-DemoActivityControlName -Config $Config
+    $answer = [ordered]@{ Mode = 'Unknown'; Why = ''; RoleName = $name.RoleName; RoleExists = $false; Lacking = @($script:T5ContainerControlActions); IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+    try {
+        $role = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $name.RoleName -WithActions
+        $answer.RoleExists = [bool]$role.Id
+        $answer.Lacking = @(if ($role.Id) { $script:T5ContainerControlActions | Where-Object { $_ -notin @($role.Actions) } } else { $script:T5ContainerControlActions })
+        $principalId = Get-DemoActivityControlPrincipalId -Name $name
+        $answer.IdentityExists = [bool]$principalId
+        if ($principalId) {
+            $held = Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId ([string]$role.Id)
+            if ([string]$held.Error -and -not [bool]$held.Missing) {
+                $answer.Why = 'the session control''s role assignments couldn''t be read: {0}' -f $held.Error
+                return [pscustomobject]$answer
+            }
+            $answer.HoldsRole = [bool]$held.Exists
+            $answer.HoldsOther = [bool](Get-DemoMemberValue -InputObject $held -Name 'Other')
+        }
+    }
+    catch {
+        $answer.Why = 'the session control''s role couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message)
+        return [pscustomobject]$answer
+    }
+    if ($answer.HoldsRole -and $answer.Lacking.Count -eq 0) {
+        $answer.Mode = 'Control'
+    }
+    elseif ($answer.HoldsRole) {
+        $answer.Mode = 'Lacking'
+        $answer.Why = 'the session control''s custom role "{0}" doesn''t have {1} yet' -f $name.RoleName, ($answer.Lacking -join ', ')
+    }
+    elseif ($answer.HoldsOther) {
+        $answer.Mode = 'Lacking'
+        $answer.Why = 'the session control''s identity {0} holds another role at {1}, not "{2}"' -f $name.Identity, $name.DemoResourceGroup, $name.RoleName
+    }
+    else {
+        $answer.Mode = 'NoRole'
+        $answer.Why = if (-not $answer.IdentityExists) { 'the session control''s identity {0} doesn''t exist yet' -f $name.Identity } else { '{0} holds no role at {1} yet' -f $name.Identity, $name.DemoResourceGroup }
+    }
+    return [pscustomobject]$answer
+}
+
+function Resolve-DemoT5ContainerLifecycle {
+    <#
+    .SYNOPSIS
+    Whether T5's container can exist only during a session (2026-11-19, ADR 0027), recorded on the demo resource group's
+    DbHubT5Container tag when it changes. Returns Lifecycle (Session or AlwaysOn), Recorded (the tag before), Changed,
+    Known, and Why (what keeps it AlwaysOn). Internal.
+
+    .DESCRIPTION
+    A stop deletes the container only when a session can't run without it (the owner's condition, 2026-11-19): the
+    session control can create it at a session's start (Get-DemoT5ControlRoleState's Control: its custom role has the
+    container's actions, and its identity holds it at the demo resource group), or it has no role there at all (NoRole,
+    the coordinator's fix 1, 2026-11-19): Run all can't start a session then, and start-demo.ps1 and demo-control.ps1 create
+    the container with the person's own rights. A control that holds a role without the container's actions (Lacking)
+    keeps the container between sessions. -Purpose says what may change the tag:
+    - Deploy (deploy.ps1, right after the session control's setup, which updates the role for an Owner and publishes the
+      runbooks that create the container): Session for Control or NoRole, AlwaysOn otherwise.
+    - Grant (grant-safety-stop.ps1, after an Owner's grants): AlwaysOn becomes Session when the control can now; an
+      environment without the tag (deployed before 2026-11-19, whose runbooks can't create the container) keeps none,
+      because deploy.ps1 sets it up.
+    - Stop (stop-demo.ps1, before it deletes the container): Session becomes AlwaysOn when the control holds a role that
+      can't any more (a shared role that another deployment changed back, for example); nothing becomes Session.
+    When the role can't be read, the recorded value stands. -WhatIf reads, and records nothing. Mode says which case.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateSet('Deploy', 'Grant', 'Stop')]
+        [string] $Purpose = 'Deploy',
+
+        # Get-DemoDeploymentState's result; read when it isn't given.
         [AllowNull()]
         [object] $State = $null
     )
 
+    if ($null -eq $State) {
+        $State = Get-DemoDeploymentState -Config $Config
+    }
+    $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Container')
+    $control = Get-DemoT5ControlRoleState -Config $Config
+    $known = $control.Mode -ne 'Unknown'
+    $able = $control.Mode -in 'Control', 'NoRole'
+    $why = [string]$control.Why
+    $session = $script:T5LifecycleSession
+    $alwaysOn = $script:T5LifecycleAlwaysOn
+    $lifecycle = switch ($Purpose) {
+        'Deploy' { if (-not $known) { if ($recorded -ceq $session) { $session } else { $alwaysOn } } elseif ($able) { $session } else { $alwaysOn } }
+        'Grant' { if ($known -and $able -and $recorded -ceq $alwaysOn) { $session } elseif ($known -and -not $able -and $recorded -ceq $session) { $alwaysOn } else { $recorded } }
+        default { if ($known -and -not $able -and $recorded -ceq $session) { $alwaysOn } else { $recorded } }
+    }
+    $changed = $lifecycle -cne $recorded
+    if ($changed -and $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), ('Record T5''s container lifecycle: {0}' -f $lifecycle))) {
+        try {
+            Set-DemoDeploymentStateLocked -Config $Config -Value @{ T5Container = $lifecycle } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('T5''s container lifecycle ({0}) wasn''t recorded on the resource group: {1}' -f $lifecycle, (Protect-DemoText -Text $_.Exception.Message))
+            $why = ('{0}{1}it wasn''t recorded on the resource group' -f $why, $(if ($why) { '; ' } else { '' }))
+            $lifecycle = $recorded
+            $changed = $false
+        }
+    }
+    return [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $recorded; Changed = $changed; Known = $known; Why = $why; RoleName = $control.RoleName; Mode = $control.Mode }
+}
+
+function Get-DemoT5LifecycleText {
+    <#
+    .SYNOPSIS
+    What T5's container lifecycle (Resolve-DemoT5ContainerLifecycle) means, for a result: Status, Text (a sentence that
+    starts with "T5's container"), and Fix. Session is a Pass; AlwaysOn a Warning with the grant command, and none (an
+    environment deployed before 2026-11-19) a Warning with deploy.ps1, both a Pass on the free tier, where an always-on
+    container costs nothing. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Lifecycle,
+
+        [bool] $FreeTier = $false,
+
+        [string] $ConfigPath = ''
+    )
+
+    $ru = [int](Get-DemoCosmosSetting)['throughputRUs']
+    $value = [string]$Lifecycle.Lifecycle
+    if ($value -ceq $script:T5LifecycleSession -and [string](Get-DemoMemberValue -InputObject $Lifecycle -Name 'Mode') -eq 'NoRole') {
+        # The coordinator's fix 1 (2026-11-19): with no role, Run all can't start a session, and the person's own scripts
+        # create and delete the container.
+        $text = 'T5''s container exists only during a session{0}: start-demo.ps1 creates it with your own rights, and stop-demo.ps1 deletes it, so its {1} RU/s bill only while the demo runs. The session control has no role yet ({2}), so Run all can''t start a session; once an Owner runs, once, {3}, Run all creates the container at each session''s start, and the nightly safety stop deletes it too.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.Why, (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath)
+        return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
+    }
+    if ($value -ceq $script:T5LifecycleSession) {
+        $text = 'T5''s container exists only during a session{0}: start-demo.ps1 and Run all create it, and stop-demo.ps1, the session''s end, and the nightly safety stop delete it, so its {1} RU/s bill only while the demo runs. The session control''s role ("{2}") can create it again, and the account, its database, private endpoint, and DNS zone stay, so Database Hub keeps T5 in its estate.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.RoleName
+        return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
+    }
+    $cost = if ($FreeTier) { 'which costs nothing on the free tier' } else { 'so its {0} RU/s bill around the clock (estimate-cost.ps1 prices them)' -f $ru }
+    if ($value -ceq $script:T5LifecycleAlwaysOn) {
+        $text = 'T5''s container stays between sessions, {0}: a stop deletes it only when Run all can create it again, and {1}.' -f $cost, $(if ($Lifecycle.Why) { $Lifecycle.Why } else { 'the session control''s role can''t yet' })
+        $fix = 'Run ./scripts/deploy.ps1 as an Owner of the subscription, or an Owner runs, once: {0}. From then on the container exists only during a session.' -f (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath)
+    }
+    else {
+        $text = 'T5''s container stays between sessions, {0}: this environment was deployed before 2026-11-19, when the container started to exist only during a session, so nothing deletes it yet.' -f $cost
+        $fix = 'Run ./scripts/deploy.ps1: it sets the container''s lifecycle up, with nothing else to do.'
+    }
+    if ($FreeTier) {
+        return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
+    }
+    return [pscustomobject]@{ Status = 'Warning'; Text = $text; Fix = $fix }
+}
+
+function Get-DemoT5LifecycleResult {
+    # -CheckId's result for T5's container lifecycle (Get-DemoT5LifecycleText): DEPLOY.T5.LIFECYCLE and the grant's. Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Lifecycle,
+
+        [ValidatePattern('^[A-Z][A-Z0-9_.]+$')]
+        [string] $CheckId = 'DEPLOY.T5.LIFECYCLE',
+
+        [bool] $FreeTier = $false,
+
+        [string] $ConfigPath = ''
+    )
+
+    $said = Get-DemoT5LifecycleText -Lifecycle $Lifecycle -FreeTier $FreeTier -ConfigPath $ConfigPath
+    $evidence = [ordered]@{ lifecycle = [string]$Lifecycle.Lifecycle; recorded = [string]$Lifecycle.Recorded; changed = [bool]$Lifecycle.Changed; known = [bool]$Lifecycle.Known; mode = [string](Get-DemoMemberValue -InputObject $Lifecycle -Name 'Mode'); role = [string]$Lifecycle.RoleName; freeTier = $FreeTier }
+    return (New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $said.Status -Message $said.Text -Evidence $evidence -Remediation $said.Fix -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['provisionThroughput']))
+}
+
+function Invoke-DemoT5ContainerStop {
+    <#
+    .SYNOPSIS
+    STOP.T5 (2026-11-19, ADR 0027): after a session, deletes T5's container when its lifecycle is Session (checked again
+    first: Resolve-DemoT5ContainerLifecycle -Purpose Stop), so its provisioned throughput stops billing until the next
+    session creates it again; otherwise keeps it, and says why and what bills. Not selected when T5 isn't deployed; never
+    a Fail. Internal.
+
+    .DESCRIPTION
+    An Azure Cosmos DB account has no stop or pause, and a container's throughput can't be taken away, only deleted with
+    it. The account, its database (no throughput of its own), its private endpoint and DNS zone, and T1's data-plane role
+    (scoped to the account) stay, so Database Hub keeps T5 in its estate, and its Azure Monitor metrics stay readable.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        # Get-DemoT5State's result.
+        [AllowNull()]
+        [object] $State = $null,
+
+        # Get-DemoDeploymentState's result; read when it isn't given.
+        [AllowNull()]
+        [object] $DeploymentState = $null,
+
+        [string] $ConfigPath = '',
+
+        [ValidateRange(0, 30)]
+        [int] $WaitMinutes = 5,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 10
+    )
+
     $cosmos = Get-DemoCosmosSetting
+    $ru = [int]$cosmos['throughputRUs']
     if ($null -eq $State -or -not [bool](Get-DemoMemberValue -InputObject $State -Name 'Exists')) {
         return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 (Azure Cosmos DB) isn''t deployed, so nothing of it bills.' -DocUrl ([string]$cosmos['docUrls']['hubMonitor']))
     }
     $names = Get-DemoMemberValue -InputObject $State -Name 'Names'
     $free = [bool](Get-DemoMemberValue -InputObject $State -Name 'FreeTier')
-    $throughputText = if ($free) { 'its {0} RU/s of throughput cost nothing on the free tier' -f $cosmos['throughputRUs'] } else { 'its {0} RU/s of throughput bill every hour' -f $cosmos['throughputRUs'] }
-    $message = 'T5 ({0}) has no stop: an Azure Cosmos DB account can''t be stopped or paused. Its activity is off and nothing sends it requests, but {1}, and its storage, private endpoint, and private DNS zone bill too (estimate-cost.ps1 prices them). destroy.ps1 deletes it with the resource group.' -f [string](Get-DemoMemberValue -InputObject $names -Name 'AccountName'), $throughputText
-    return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not supported' -Message $message -Evidence ([ordered]@{ account = [string](Get-DemoMemberValue -InputObject $names -Name 'AccountName'); freeTier = $free; throughputRUs = [int]$cosmos['throughputRUs'] }) -DocUrl ([string]$cosmos['docUrls']['pricing']))
+    $lifecycle = Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose Stop -State $DeploymentState -WhatIf:$WhatIfPreference
+    $evidence = [ordered]@{ account = [string]$names.AccountName; container = [string]$names.ContainerName; lifecycle = [string]$lifecycle.Lifecycle; freeTier = $free; throughputRUs = $ru }
+    $stays = 'its private endpoint and private DNS zone bill between sessions (estimate-cost.ps1 prices them)'
+    if ([string]$lifecycle.Lifecycle -cne $script:T5LifecycleSession) {
+        $said = Get-DemoT5LifecycleText -Lifecycle $lifecycle -FreeTier $free -ConfigPath $ConfigPath
+        $evidence['outcome'] = 'Kept'
+        $message = 'T5''s activity is off, and its container {0} was kept: {1}' -f $names.ContainerName, ($said.Text -replace '^T5''s container ', 'it ')
+        return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status $said.Status -Message $message -Evidence $evidence -Remediation $said.Fix -DocUrl ([string]$cosmos['docUrls']['provisionThroughput']))
+    }
+    $removed = Remove-DemoT5Container -Config $Config -Names $names -WaitMinutes $WaitMinutes -PollSeconds $PollSeconds
+    $evidence['outcome'] = [string]$removed.Outcome
+    $evidence['seconds'] = [int]$removed.Seconds
+    $doc = [string]$cosmos['docUrls']['deleteContainer']
+    switch ([string]$removed.Outcome) {
+        'Deleted' {
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} was deleted ({1} seconds), so its {2} RU/s stop billing until the next session creates it again (start-demo.ps1 or Run all). The account stays, so Database Hub keeps T5 in its estate, and only {3}.' -f $names.ContainerName, $removed.Seconds, $ru, $stays) -Evidence $evidence -DocUrl $doc)
+        }
+        'Missing' {
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} isn''t there (an earlier stop deleted it), so nothing of T5 bills but {1}.' -f $names.ContainerName, $stays) -Evidence $evidence -DocUrl $doc)
+        }
+        'WhatIf' {
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message ('What if: T5''s container {0} would be deleted; the next session creates it again.' -f $names.ContainerName) -Evidence $evidence -DocUrl $doc)
+        }
+        default {
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5''s container {0} wasn''t deleted: {1}. Its {2} RU/s keep billing until it is.' -f $names.ContainerName, $removed.Error, $ru) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1 again; the nightly safety stop deletes it tonight too.' -DocUrl $doc)
+        }
+    }
 }
 
 function Get-DemoT5Access {

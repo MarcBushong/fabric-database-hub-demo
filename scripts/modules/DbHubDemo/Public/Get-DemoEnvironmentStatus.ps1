@@ -44,9 +44,10 @@ function Get-DemoEnvironmentStatus {
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
     - STATUS.T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account's state and its Azure Monitor metrics from the last 15
-      minutes (requests, throttled requests (429), request units, normalized RU consumption), with whether it has the free
-      tier; it has no stop, so its throughput bills every hour without it. A demo deployed before T5 gets a Warning with
-      the upgrade's command. STATUS.PROFILE_T5 is its activity profile (T1's runner runs T5's workload).
+      minutes (requests, throttled requests (429), request units, normalized RU consumption), with whether its container
+      is there and what that bills: since 2026-11-19 the container exists only during a session once its lifecycle is
+      Session, and a Warning says when it stays between sessions instead, with the fix. A demo deployed before T5 gets a
+      Warning with the upgrade's command. STATUS.PROFILE_T5 is its activity profile (T1's runner runs T5's workload).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
       T1, Pass with the engine only and a Warning while associated services are still listed; and T1.SQLVM.MONITORING while sqlvm01
       runs (an extension that's Updating after a redeployment is a Warning).
@@ -336,7 +337,8 @@ function Get-DemoEnvironmentStatus {
     }
 
     # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account, with its Azure Monitor metrics from the last 15 minutes (the
-    # ones Database Hub's Cosmos DB views chart). It has no stop: its throughput bills every hour unless it has the free tier.
+    # ones Database Hub's Cosmos DB views chart). It has no stop; its container, which holds the throughput that bills by the
+    # hour, exists only during a session once its lifecycle is Session (2026-11-19), so the row says whether it's there.
     $t5 = $null
     if (-not (Test-DemoT5Enabled -Config $Config)) {
         $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 is off in this configuration (t5Enabled is false).'))
@@ -352,12 +354,38 @@ function Get-DemoEnvironmentStatus {
         }
         else {
             $snapshot = Get-DemoT5MetricSnapshot -Config $Config -AccountId $t5.Names.AccountId -Minutes 15
-            $billing = if ($t5.FreeTier) { 'it has the free tier, so its {0} RU/s cost nothing' -f $t5.Names.Throughput } else { 'it has no stop, so its {0} RU/s bill every hour' -f $t5.Names.Throughput }
+            $container = Get-DemoT5Resource -Config $Config -AccountId $t5.Names.AccountId -Child (Get-DemoT5ContainerPath)
+            $lifecycle = [string](Get-DemoMemberValue -InputObject $state -Name 'T5Container')
+            $session = $lifecycle -ceq 'Session'
+            $t5Status = if ($t5.State -eq 'Succeeded') { 'Pass' } else { 'Warning' }
+            $t5Fix = ''
+            if (-not $container.Found -and $container.NotFound) {
+                $billing = 'its container {0} isn''t there now{1}, so its throughput doesn''t bill' -f $t5.Names.ContainerName, $(if ($session) { ' (it exists only during a session: start-demo.ps1 and Run all create it)' } else { '' })
+                if (-not $session) {
+                    $t5Status = 'Warning'
+                    $t5Fix = 'Run ./scripts/start-demo.ps1 or ./scripts/deploy.ps1, which create it.'
+                }
+            }
+            elseif (-not $container.Found) {
+                $billing = 'its container couldn''t be read: {0}' -f $container.Error
+            }
+            elseif ($t5.FreeTier) {
+                $billing = 'its container {0} is there, and the free tier makes its {1} RU/s cost nothing' -f $t5.Names.ContainerName, $t5.Names.Throughput
+            }
+            elseif ($session) {
+                $billing = 'its container {0} is there, so its {1} RU/s bill until a stop deletes it (it exists only during a session)' -f $t5.Names.ContainerName, $t5.Names.Throughput
+            }
+            else {
+                $said = Get-DemoT5LifecycleText -Lifecycle ([pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $lifecycle; Changed = $false; Known = $true; Why = ''; RoleName = (Get-DemoActivityControlName -Config $Config).RoleName }) -FreeTier $false
+                $billing = 'its container {0} is there, and {1}' -f $t5.Names.ContainerName, ($said.Text -replace '^T5''s container ', 'it ')
+                $billing = $billing.TrimEnd('.')
+                $t5Status = 'Warning'
+                $t5Fix = $said.Fix
+            }
             $metricText = if ($snapshot.Succeeded) { Format-DemoT5MetricText -Snapshot $snapshot } else { 'its metrics couldn''t be read: {0}' -f $snapshot.Error }
             $message = '{0} is {1}: {2} (Azure Monitor; Database Hub''s Cosmos DB views chart the same metrics); {3}.' -f $t5.Names.AccountName, $t5.State, $metricText, $billing
-            $evidence = [ordered]@{ state = $t5.State; freeTier = [bool]$t5.FreeTier; throughput = $t5.Names.Throughput; requests = $snapshot.Requests; throttled = $snapshot.Throttled; requestUnits = $snapshot.RequestUnits; peakNormalizedRuPercent = $snapshot.PeakNormalizedRu; latestNormalizedRuPercent = $snapshot.LatestNormalizedRu }
-            $t5Status = if ($t5.State -eq 'Succeeded') { 'Pass' } else { 'Warning' }
-            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status $t5Status -Message $message -Evidence $evidence -DocUrl ([string]$t5Docs['hubMonitor'])))
+            $evidence = [ordered]@{ state = $t5.State; freeTier = [bool]$t5.FreeTier; throughput = $t5.Names.Throughput; container = [bool]$container.Found; lifecycle = $lifecycle; requests = $snapshot.Requests; throttled = $snapshot.Throttled; requestUnits = $snapshot.RequestUnits; peakNormalizedRuPercent = $snapshot.PeakNormalizedRu; latestNormalizedRuPercent = $snapshot.LatestNormalizedRu }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status $t5Status -Message $message -Evidence $evidence -Remediation $t5Fix -DocUrl ([string]$t5Docs['hubMonitor'])))
         }
     }
 

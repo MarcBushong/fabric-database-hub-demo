@@ -6,7 +6,7 @@ Estimates demo cost per profile from live Azure retail prices (ADR 0016).
 .DESCRIPTION
 Queries the public Azure Retail Prices API. For each profile it reports running cost per hour, one
 demo-day session, idle cost per month, and a light-use month, and compares them with the ceilings in the
-configuration. The monthly ceiling (monthlyCeilingUsd, 375 USD by default since 2026-11-04) is hard: a light-use month
+configuration. The monthly ceiling (monthlyCeilingUsd, 390 USD by default for a new configuration since 2026-11-19) is hard: a light-use month
 above it is Fail and the script exits with code 1. A session above sessionCeilingUsd is a Warning.
 
 T4's 7-day automatic restart: when signed in, the script also reads whether a safety stop is fully in place
@@ -16,10 +16,13 @@ otherwise, and when not signed in, the worst case counts the rest of the month.
 T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and stop-demo.ps1 deletes
 it, so its compute (at T4's size), storage, and Defender plans are in the running hours (the Replica session column), and
 no automatic restart applies to it. A Burstable T4 has no replica.
-T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so its 400 RU/s of throughput, its storage, its private
-endpoint, and its private DNS zone are in the idle month, and Defender for Azure Cosmos DB when its plan is on Standard. When
-signed in, the script reads whether T5 has, or would get, the subscription's free tier (the first 1000 RU/s and 25 GB of one
-account per subscription), which prices its throughput and storage at zero; otherwise they're at list price, an upper bound.
+T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so its private endpoint and private DNS zone are in the
+idle month. Its container exists only during a session since 2026-11-19, once the session control's role can create it: its
+400 RU/s of throughput, its storage, and Defender for Azure Cosmos DB when its plan is on Standard are then in the running
+hours. -T5ContainerLifecycle AlwaysOn prices the container all month, as while that role can't create it; when signed in and
+without it, the script reads the environment's own lifecycle. When signed in, the script also reads whether T5 has, or would
+get, the subscription's free tier (the first 1000 RU/s and 25 GB of one account per subscription), which prices its
+throughput and storage at zero; otherwise they're at list price, an upper bound.
 Prices are list prices in USD on the day you run it: estimates, not quotes.
 
 Microsoft Defender for Cloud: when the Azure CLI is already signed in to the configured subscription, the
@@ -53,6 +56,12 @@ Running hours in a light-use month. Defaults to config/profiles.json.
 .PARAMETER NetworkMode
 The effective network mode, public or private.
 
+.PARAMETER T5ContainerLifecycle
+When T5's container exists (2026-11-19, ADR 0027): Session, only during a session (start-demo.ps1 and Run all create it,
+the stops delete it), or AlwaysOn, between sessions too, as while the session control's role can't create it. Without it,
+the script reads the environment's own when signed in (the resource group's DbHubT5Container tag; AlwaysOn when it says so,
+or when an existing environment doesn't have it yet), and assumes Session otherwise.
+
 .PARAMETER Detailed
 Show every priced component and its meter.
 
@@ -82,6 +91,9 @@ param(
 
     [ValidateSet('public', 'private')]
     [string] $NetworkMode,
+
+    [ValidateSet('Session', 'AlwaysOn')]
+    [string] $T5ContainerLifecycle,
 
     [switch] $Detailed,
 
@@ -120,6 +132,7 @@ $t3UseFreeLimit = $null
 $goldenSnapshots = @()
 $t4RestartCoverage = $null
 $t5FreeTier = $null
+$t5Lifecycle = if ($T5ContainerLifecycle) { $T5ContainerLifecycle } else { '' }
 if ($config['subscriptionId'] -eq '00000000-0000-0000-0000-000000000000') {
     Write-DemoLog -Level Warning -Message 'The configuration has no subscription yet, so the estimate excludes Defender for Cloud and prices T3 as regular serverless.'
 }
@@ -171,6 +184,20 @@ else {
         if ($null -ne $t5FreeTier) {
             Write-DemoLog -Message ('T5''s free tier: {0} (ADR 0027).' -f $(if ($t5FreeTier) { 'yes, so its throughput costs nothing' } else { 'no, so its throughput is at list price' }))
         }
+        # T5's container lifecycle (2026-11-19, ADR 0027), unless -T5ContainerLifecycle gives it: the resource group's
+        # DbHubT5Container tag (read-only). AlwaysOn when it says so, while the session control's role can't create the
+        # container, and when an existing environment doesn't have the tag yet (deployed before then: nothing deletes it).
+        if (-not $t5Lifecycle -and (& $module { param($Settings) Test-DemoT5Enabled -Config $Settings } $config)) {
+            try {
+                $state = Get-DemoDeploymentState -Config $config
+                $t5Lifecycle = if ($state.Exists -and [string]$state.T5Container -cne 'Session') { 'AlwaysOn' } else { 'Session' }
+                Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, so its throughput bills all month' } elseif ($state.Exists) { 'it exists only during a session, so its throughput bills only while the demo runs' } else { 'no environment yet, so the estimate assumes it exists only during a session' }))
+            }
+            catch {
+                $t5Lifecycle = ''
+                Write-DemoLog -Level Warning -Message ('T5''s container lifecycle couldn''t be read, so the estimate assumes the container exists only during a session. {0}' -f $_.Exception.Message)
+            }
+        }
     }
 }
 
@@ -193,6 +220,9 @@ $summary = foreach ($name in $profileNames) {
     }
     if ($null -ne $t5FreeTier) {
         $parameters['T5FreeTier'] = $t5FreeTier
+    }
+    if ($t5Lifecycle) {
+        $parameters['T5ContainerLifecycle'] = $t5Lifecycle
     }
     $estimate = Get-DemoCostEstimate @parameters
     foreach ($result in $estimate.Results) {

@@ -724,12 +724,30 @@ function Invoke-DemoPreflight {
     }
     # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # What deploy.ps1 can set up in this run (2026-11-19, the coordinator's option 2 and gap fix): the nightly safety stop's
+    # and the session control's roles need the deployer to assign them, and to write them when they aren't current.
+    $deployer = Get-DemoDeployerRolePermission -Config $Config
+    # T5's container lifecycle (2026-11-19): its throughput bills for the running hours only, as this run's lifecycle step
+    # will record it (Get-DemoT5CostLifecycle -ThisRunDeploys), unless the container stays between sessions.
+    $costParameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config -ThisRunDeploys -Permission $deployer
     # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
-    # a first deployment the nightly safety stop doesn't exist yet: this run sets it up after the template.
+    # a first deployment the nightly safety stop doesn't exist yet, and deploy.ps1 sets it up in this run, after its
+    # template: it counts as in place when the deployer can assign its role (Get-DemoSafetyStopPlan; 2026-11-19, the
+    # coordinator's option 2), and DEPLOY.COST.T4RESTART says so again if its setup then doesn't put it in place.
     if ($t4On) {
-        $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+        $coverage = Get-DemoT4RestartCoverage -Config $Config
+        if (-not $coverage.Counts -and [string]$coverage.Missing -in 'SafetyStop', 'Role' -and [string](Get-DemoMemberValue -InputObject $coverage.Evidence -Name 'nightly') -in 'Missing', 'NotScheduled', 'NoRole') {
+            $plan = Get-DemoSafetyStopPlan -Config $Config -Permission $deployer
+            $coverage.Evidence['plan'] = $plan.Evidence
+            if ($plan.Planned) {
+                $coverage.Evidence['counts'] = $true
+                $coverage.Evidence['missing'] = ''
+                $coverage = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = $plan.Reason; Fix = ''; Evidence = $coverage.Evidence; WithoutReason = $coverage.Reason; WithoutFix = $coverage.Fix }
+            }
+        }
+        $costParameters['T4RestartCoverage'] = $coverage
     }
     $results.Add((New-DemoT4RestartCoverageResult -Config $Config -Coverage $(if ($t4On) { $costParameters['T4RestartCoverage'] } else { $null }) -CheckPrefix 'PREFLIGHT'))
     $estimate = $null

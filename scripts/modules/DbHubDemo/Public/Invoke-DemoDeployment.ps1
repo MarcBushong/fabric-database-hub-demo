@@ -331,6 +331,15 @@ function Invoke-DemoDeployment {
     # the template.
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
+    # A resume after an earlier run left T5 out because Azure didn't create its account (DbHubT5Refused; review, 2026-11-19):
+    # this run leaves it out too, with DEPLOY.T5; a run that deploys the template tries T5 again.
+    $t5Resume = if ($whatIf) { $null } else { Resolve-DemoT5LeftOut -Config $Config -State $state -TemplateRuns:($startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex) }
+    if ($null -ne $t5Resume) {
+        $Config = $t5Resume.Config
+        $results.Add($t5Resume.Result)
+        Write-DemoLog -Level Warning -Message ([string]$t5Resume.Result.message)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message ([string]$t5Resume.Result.message)
+    }
     # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them as
     # PREFLIGHT.T4.TUNING does, so a t4SkuName that can't run the tuning t4AutonomousTuning asks for is a Fail before
     # anything changes.
@@ -555,21 +564,43 @@ function Invoke-DemoDeployment {
                         $Config = if ([bool]$deployedT4 -and $deployedSku) { Copy-DemoT4Config -Config $Config -Source deployed -SkuName $deployedSku } else { Copy-DemoT4Config -Config $Config -Source deployed -Off }
                     }
                 }
+                # T5 left out because Azure didn't create its account (review, 2026-11-19): the later stages go on without
+                # it, the Bootstraps stage's template included, and its rows say why.
+                $t5LeftOutText = ''
+                $deployedT5 = Get-DemoMemberValue -InputObject $deployment -Name 'T5Enabled'
+                if ($null -ne $deployedT5 -and -not [bool]$deployedT5 -and (Test-DemoT5Enabled -Config $Config)) {
+                    $t5LeftOutText = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T5LeftOut')
+                    $Config = Copy-DemoT5OffConfig -Config $Config -Reason $t5LeftOutText
+                    $t5Warning = @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T5' }) | Select-Object -Last 1
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message $(if ($null -ne $t5Warning) { [string]$t5Warning.message } else { 'T5 is left out of this run: Azure didn''t create its account.' })
+                }
                 & $recordStage 'Infrastructure' @{ NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName }
                 $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
                 # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the stage is a Warning.
                 $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
                 $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
-                & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
+                & $stageResult 'Infrastructure' $(if ($overCeiling -or $t5LeftOutText) { 'Warning' } else { 'Pass' }) ((@($(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' }), $(if ($t5LeftOutText) { 'T5 is left out of this run: Azure didn''t create its account (DEPLOY.T5 says why, with the fix).' })) | Where-Object { $_ }) -join ' ')
                 if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                     # Opt-in, and only start-demo.ps1 -Interactive needs it, so a vault Fail is reported (it
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
                     & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
                 }
                 # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
-                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                $safetyResults = @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                & $addAll $safetyResults
+                # Preflight counted this safety stop (2026-11-19, option 2): when its setup didn't put it in place, the worst case
+                # without it, on the console and the Infrastructure row (DEPLOY.COST.T4RESTART).
+                $planResult = New-DemoSafetyStopPlanResult -Result $results.ToArray() -SetupResult $safetyResults -Config $Config -ConfigPath $ConfigPath
+                if ($null -ne $planResult) {
+                    $results.Add($planResult)
+                    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                    Add-DemoProgressStepNote -Path $ProgressPath -Id 'Infrastructure' -Status 'Warning' -Note ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                }
                 # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
+                # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
+                # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -716,6 +747,20 @@ function Invoke-DemoDeployment {
                 & $stageResult 'T3' 'Pass' 'T3 is configured from T1 and checked.'
             }
             'T4' {
+                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
+                # DB account's checks, then T1's access through the runner's warmup. First, so a configuration with t4Enabled
+                # false still checks it (review, 2026-11-19). A T5 failure doesn't stop the stage; DONE needs HUB.ESTATE.T5 and
+                # METRICS.T5.
+                if (Test-DemoT5Enabled -Config $Config) {
+                    # The container exists only during a session (2026-11-19): a resumed run skips the template, which creates it.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
+                    $t5Checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $t5Checks
+                    $t5Current = Get-DemoDeploymentState -Config $Config
+                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
+                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
+                    }
+                }
                 # T4 (Phase 24, ADR 0019): the server's checks, then T1 sets it up through the P6 group (already
                 # joined in the T3 stage), then its Azure Monitor metrics. A T4 failure doesn't stop the run.
                 if (-not (Test-DemoT4Enabled -Config $Config)) {
@@ -756,17 +801,6 @@ function Invoke-DemoDeployment {
                     $results.Add((Test-DemoT4ReplicaServer -Config $Config))
                     $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
                     $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
-                }
-                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
-                # DB account's checks, then T1's access through the runner's warmup. A T5 failure doesn't stop the stage; DONE
-                # needs HUB.ESTATE.T5 and METRICS.T5.
-                if (Test-DemoT5Enabled -Config $Config) {
-                    $t5Checks = @(Test-DemoT5 -Config $Config)
-                    & $addAll $t5Checks
-                    $t5Current = Get-DemoDeploymentState -Config $Config
-                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
-                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
-                    }
                 }
                 & $recordStage 'T4'
                 if ((& $hasStatus $t4Checks 'Fail') -or ($null -ne $t4Enable -and $t4Enable.status -eq 'Fail')) {

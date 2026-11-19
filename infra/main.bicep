@@ -60,9 +60,9 @@ param autoShutdownTimeZone string = 'Pacific Standard Time'
 @maxLength(10)
 param expiresOn string = ''
 
-@description('Monthly budget amount in USD: the hard monthly ceiling, 375 by default since 2026-11-04 (user-directed, for the 4-core T4; ADR 0016, C2).')
+@description('Monthly budget amount in USD: the hard monthly ceiling, 390 by default for a new configuration since 2026-11-19 (375 since 2026-11-04; ADR 0016, C2).')
 @minValue(1)
-param monthlyCeilingUsd int = 375
+param monthlyCeilingUsd int = 390
 
 @description('First day of the budget period (yyyy-MM-01). deploy.ps1 passes the existing value on re-runs.')
 @minLength(10)

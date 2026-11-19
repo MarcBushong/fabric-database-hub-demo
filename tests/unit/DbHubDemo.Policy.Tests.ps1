@@ -364,6 +364,47 @@ Describe 'Get-DemoPolicyConstraint' {
         $check.status | Should -Be 'Fail'
         $check.message | Should -Match 'Microsoft.Network/bastionHosts \(Not allowed resource types\)'
         $check.evidence.denied.Count | Should -Be 1
+        $check.remediation | Should -Not -Match 't5Enabled'
+    }
+
+    It 'fails a policy that denies only Azure Cosmos DB with the fix: t5Enabled false (review, 2026-11-19)' {
+        $script:definitions = New-DefinitionSet -NotAllowedTypes @('Microsoft.DocumentDB/databaseAccounts')
+        $check = Get-Check (Get-DemoPolicyConstraint -Config (New-TestConfig)) 'RESOURCETYPES'
+        $check.status | Should -Be 'Fail'
+        $check.message | Should -Match 'all of them T5''s \(Azure Cosmos DB\): Microsoft.DocumentDB/databaseAccounts \(Not allowed resource types\)'
+        $check.remediation | Should -Match '^Set "t5Enabled": false in config/demo.config.json'
+        $check.remediation | Should -Match 'DEPLOY\.T5\.OFF'
+    }
+
+    It 'passes the same policy when t5Enabled is false, which leaves T5''s types out (review, 2026-11-19)' {
+        $script:definitions = New-DefinitionSet -NotAllowedTypes @('Microsoft.DocumentDB/databaseAccounts', 'microsoft.documentdb/databaseaccounts/sqldatabases')
+        $all = & (Get-Module -Name DbHubDemo) { $script:DemoResourceTypes.Count }
+        $check = Get-Check (Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ t5Enabled = $false })) 'RESOURCETYPES'
+        $check.status | Should -Be 'Pass'
+        $check.message | Should -Match 't5Enabled is false'
+        $check.evidence.demoResourceTypes | Should -Be ($all - 4)
+        $check.evidence.t5Enabled | Should -BeFalse
+        $check.evidence.denied.Count | Should -Be 0
+    }
+
+    It 'names T5''s types among others a policy denies, and how to leave them out' {
+        $script:definitions = New-DefinitionSet -NotAllowedTypes @('Microsoft.DocumentDB/databaseAccounts', 'Microsoft.Network/bastionHosts')
+        $check = Get-Check (Get-DemoPolicyConstraint -Config (New-TestConfig)) 'RESOURCETYPES'
+        $check.status | Should -Be 'Fail'
+        $check.evidence.denied.Count | Should -Be 2
+        $check.remediation | Should -Match '^Ask for a policy exemption'
+        $check.remediation | Should -Match 'T5''s Azure Cosmos DB types are among them: "t5Enabled": false in config/demo.config.json leaves those out'
+    }
+
+    It 'counts a rule for Azure Cosmos DB alone as unrelated, and keys the cache on it, when t5Enabled is false' {
+        $on = New-TestConfig
+        $off = New-TestConfig -Override @{ t5Enabled = $false }
+        InModuleScope DbHubDemo -Parameters @{ On = $on; Off = $off } {
+            $rule = [pscustomobject]@{ AssignmentName = 'cosmos-network'; Policy = 'Cosmos DB accounts get a firewall (example)'; Effect = 'Modify'; Types = @('Microsoft.DocumentDB/databaseAccounts'); AnyType = $false; HasTypeCondition = $true; Fields = @('Microsoft.DocumentDB/databaseAccounts/isVirtualNetworkFilterEnabled'); Condition = @{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' }; Then = @{ effect = 'Modify'; details = @{ operations = @() } }; Parameters = @{} }
+            Get-DemoPolicyRuleCategory -Rule $rule -ResourceType (Get-DemoResourceTypeList -Config $On) | Should -Be 'OTHER'
+            Get-DemoPolicyRuleCategory -Rule $rule -ResourceType (Get-DemoResourceTypeList -Config $Off) | Should -Be 'UNRELATED'
+            (Get-DemoPolicyInventoryFingerprint -Assignment @() -Config $On -CodeText 'code') | Should -Not -Be (Get-DemoPolicyInventoryFingerprint -Assignment @() -Config $Off -CodeText 'code')
+        }
     }
 
     It 'warns, skips the other checks, and assumes private mode when the assignments cannot be read' {

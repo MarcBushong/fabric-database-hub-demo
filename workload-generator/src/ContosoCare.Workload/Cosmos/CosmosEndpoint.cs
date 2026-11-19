@@ -18,11 +18,18 @@ internal sealed partial record CosmosEndpoint(string Host, string? ManagedIdenti
     /// <summary>The only database the runner ever works in on T5 (the template creates it).</summary>
     public const string DatabaseName = "contosocare";
 
-    /// <summary>The only container the runner ever writes to on T5 (the template creates it).</summary>
+    /// <summary>The only container the runner ever writes to on T5. It exists only during a session (<see cref="ContainerMissingMessage"/>).</summary>
     public const string ContainerName = "patient-events";
 
     /// <summary>The container's partition key (Hash, version 2).</summary>
     public const string PartitionKeyPath = "/patientId";
+
+    /// <summary>
+    /// What the runner says when T5's container doesn't exist: to cut T5's idle cost, it exists only during a session,
+    /// created through Azure Resource Manager when one starts and deleted when it ends (the operator scripts and the control
+    /// runbooks do both; data-plane access can't), while the account and the database stay.
+    /// </summary>
+    public const string ContainerMissingMessage = $"T5's container {DatabaseName}/{ContainerName} doesn't exist now: it exists only during a session, so ./scripts/start-demo.ps1 or the control notebook's Run all creates it first.";
 
     /// <summary>The scope a token falls back to when Microsoft Entra ID doesn't know the account's own resource URI (AADSTS500011), as the SDK's scope provider does.</summary>
     public const string FallbackScope = "https://cosmos.azure.com/.default";
@@ -81,7 +88,10 @@ internal enum CosmosFailure
     /// <summary>HTTP 401 or 403: the identity has no data-plane role on the account, or a new assignment isn't effective yet.</summary>
     Forbidden,
 
-    /// <summary>HTTP 404: the database or the container doesn't exist.</summary>
+    /// <summary>
+    /// HTTP 404 on the container's read, or 404 with substatus 1003 on a document request: the container (or its database)
+    /// doesn't exist. T5's container exists only during a session (<see cref="CosmosEndpoint.ContainerMissingMessage"/>).
+    /// </summary>
     NotFound,
 
     /// <summary>HTTP 429: request rate too large.</summary>
@@ -109,6 +119,8 @@ internal sealed class CosmosException(CosmosFailure failure, string message, int
     /// <summary>
     /// A run's refusal reason: <c>connect</c>, which the profile host tries again (the account can't be reached yet, or
     /// T1's data-plane role isn't effective yet), or <c>request</c> when the container is missing or the request is wrong.
+    /// A missing container's refusal passes by itself all the same (<see cref="Runs.RunResult.RefusalPasses"/>): a
+    /// session's start creates the container.
     /// </summary>
     public string RefusalReason => Failure is CosmosFailure.NotFound or CosmosFailure.Request ? "request" : "connect";
 }

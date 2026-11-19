@@ -62,7 +62,9 @@ function Start-DemoEnvironment {
        already at once, and one that was stopped once it's Ready. So a deploy.ps1 run that ends during the session leaves
        it (a Warning, START.T4.REPLICA.HOLD, when the mark couldn't be written).
     4c. T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so nothing starts it: START.T5 says whether
-       it's ready (a Warning with deploy.ps1's command for a demo deployed before T5), and its profile is set with T1's.
+       it's ready (a Warning with deploy.ps1's command for a demo deployed before T5). Its container exists only during a
+       session (2026-11-19): when a stop deleted it, it's created again here, while the VMs boot (START.T5.CONTAINER,
+       New-DemoT5Container, about a minute), and T5's profile is set with T1's once it's there.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
        2026-11-03) on T1, T3, T4, T5, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
@@ -276,14 +278,18 @@ function Start-DemoEnvironment {
     }
     $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
     $t4Request = if ($t4On) { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 0 -CheckPrefix START } else { $null }
-    # T5 (2026-11-18, ADR 0027) has no stop, so there's nothing to start: START.T5 says whether it's there, and its activity
-    # profile is set with T1's below.
+    # T5 (2026-11-18, ADR 0027) has no stop, so its account was running already: START.T5 says whether it's there. Its
+    # container exists only during a session (2026-11-19): it's created here when a stop deleted it, while the VMs boot
+    # (START.T5.CONTAINER), and T5's activity profile is set with T1's below only once it's there.
     $t5Ready = $false
     if (Test-DemoT5Enabled -Config $Config) {
         $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $t5Ready = [bool]$t5.Exists -and [string]$t5.State -eq 'Succeeded'
         if ($t5Ready) {
-            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5 ({0}) is ready: an Azure Cosmos DB account has no stop, so it was running already{1}.' -f $t5.Names.AccountName, $(if ($t5.FreeTier) { ', on the free tier' } else { ', and its throughput bills every hour' }))))
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5 ({0}) is ready: an Azure Cosmos DB account has no stop, so it was running already{1}.' -f $t5.Names.AccountName, $(if ($t5.FreeTier) { ', on the free tier' } else { '' }))))
+            $container = New-DemoT5Container -Config $Config -State $t5 -CheckId 'START.T5.CONTAINER' -Confirm:$false
+            $results.Add($container)
+            $t5Ready = [string]$container.status -eq 'Pass'
         }
         elseif ($t5.State -eq 'NotFound') {
             $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) doesn''t exist yet: a demo deployed before 2026-11-18 doesn''t have it, so this session has no Azure Cosmos DB.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1: it adds T5, with nothing else to do.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor'])))
@@ -460,7 +466,7 @@ function Start-DemoEnvironment {
             $skip = 'sqlvm01 isn''t running.'
         }
         elseif ($target -eq 'T5' -and -not $t5Ready) {
-            $skip = 'T5 isn''t ready (START.T5 says why), so its activity wasn''t started.'
+            $skip = 'T5 isn''t ready (START.T5 or START.T5.CONTAINER says why), so its activity wasn''t started.'
         }
         elseif ($target -eq 'T4' -and $SkipT4) {
             $skip = 'T4 was left alone (-SkipT4).'

@@ -378,7 +378,8 @@ function Get-DemoValidationQuietReason {
     <#
     .SYNOPSIS
     Why a target sends no telemetry by design right now, or an empty string: its VM isn't running, or T3 is
-    paused or removed. T5 has no stop, so its reason is sqlvm01's, whose runner sends its requests (ADR 0027). Internal.
+    paused or removed. T5's requests come from sqlvm01's runner (ADR 0027; its container exists only during a session since
+    2026-11-19), so its reason is sqlvm01's. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]

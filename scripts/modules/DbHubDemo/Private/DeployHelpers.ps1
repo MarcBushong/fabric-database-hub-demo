@@ -111,6 +111,11 @@ function Get-DemoDeploymentStateTagName {
         # zone the last replica was created with ("Standard_D4ds_v5@any"), where the next one starts while it still fits T4.
         T4Replica                = 'DbHubT4Replica'
         T4ReplicaSize            = 'DbHubT4ReplicaSize'
+        # 2026-11-19 (ADR 0027): T5's container lifecycle. Session once deploy.ps1 (or grant-safety-stop.ps1, start-demo.ps1,
+        # stop-demo.ps1) found that the session control's role can create the container, so the stop paths delete it and the
+        # start paths create it again; AlwaysOn while it can't, so nothing deletes it (a session never runs without it); empty
+        # in an environment deployed before then, where nothing deletes it either. The runbooks read it (Get-DbHubT5Lifecycle).
+        T5Container              = 'DbHubT5Container'
         # 2026-11-14: the busy marker (BusyMarkerHelpers.ps1). Until when a deploy.ps1 run, or a session, that's still going
         # keeps the nightly stop waiting (ISO 8601 UTC; empty when none), and who set it: deploy, deploy-grace (a run the
         # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
@@ -121,6 +126,10 @@ function Get-DemoDeploymentStateTagName {
         # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
         FabricWorkspaceId        = 'DbHubFabricWorkspaceId'
         ControlWorkspaceId       = 'DbHubControlWorkspaceId'
+        # 2026-11-19 (review of T5): when Azure didn't create T5's account and deploy.ps1 deployed the rest without it (UTC),
+        # so a resume leaves T5 out instead of starting from preflight (Resolve-DemoT5LeftOut); a template run that creates
+        # T5 clears it.
+        T5Refused                = 'DbHubT5Refused'
     }
 }
 

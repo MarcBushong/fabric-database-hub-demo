@@ -154,4 +154,52 @@ Describe 'Find-DemoSecretLeak (Phase 14 secret scan)' {
         (Find-DemoSecretLeak -Text 'password=secret' -Source 's').Findings | Should -BeNullOrEmpty
         @((Find-DemoSecretLeak -Text ('Server=x;Password={0};' -f ('Pw1-' + [guid]::NewGuid().ToString('N').Substring(0, 10))) -Source 's').Findings).Rule | Should -Be 'connection-password'
     }
+
+    It 'leaves dependency trees and package caches out, anywhere under a folder, and names them; generated output stays in (2026-11-18)' {
+        # Live, 2026-11-18: out/fabric-app/node_modules held 114,315 files after the Insights app's build, and the Security
+        # area read them for more than 37 minutes. The same token in each file: only the demo's own output may count.
+        $out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
+        $at = { param([string] $Relative) [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath $Relative)) }
+        $files = [ordered]@{
+            Package = & $at 'fabric-app/node_modules/pkg/index.js'
+            Cache   = & $at 'tools/scripts/__pycache__/helper.txt'
+            Log     = & $at 'logs/run.log'
+            Env     = & $at 'fabric-app/rayfin/.env'
+        }
+        foreach ($key in $files.Keys) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $files[$key] -Parent) -Force | Out-Null
+            $line = if ($key -eq 'Env') { 'VITE_APP_NAME=insights' } else { 'token={0}' -f $script:jwt }
+            Set-Content -LiteralPath $files[$key] -Value @('first line', $line) -Encoding utf8NoBOM
+        }
+        $scan = Find-DemoSecretLeak -Path $out
+        @($scan.Scanned) | Should -Be @($files['Env'], $files['Log']) -Because 'generated output, such as the app''s .env, is still scanned'
+        @($scan.Findings | ForEach-Object { '{0}:{1}:{2}' -f $_.Source, $_.Line, $_.Rule }) | Should -Be @('{0}:2:jwt' -f $files['Log'])
+        @($scan.Skipped).Count | Should -Be 0
+        $scan.PrunedCount | Should -Be 2
+        @($scan.Pruned) | Should -Be @((& $at 'fabric-app/node_modules'), (& $at 'tools/scripts/__pycache__'))
+        ($scan | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:jwt))
+        # A file or folder named on purpose is scanned, even inside such a tree.
+        @((Find-DemoSecretLeak -Path $files['Package']).Findings).Rule | Should -Contain 'jwt'
+        @((Find-DemoSecretLeak -Path (& $at 'tools/scripts/__pycache__')).Scanned) | Should -Be @($files['Cache'])
+    }
+
+    It 'never lists the files of a deep dependency tree: 3,000 files under node_modules, with nested ones, are one pruned folder' {
+        $out = Join-Path -Path $TestDrive -ChildPath ('deep-' + [guid]::NewGuid().ToString('N'))
+        $modules = [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath 'fabric-app/node_modules'))
+        foreach ($package in 1..30) {
+            $folder = Join-Path -Path $modules -ChildPath ('pkg{0}/node_modules/dep/lib/esm' -f $package)
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            foreach ($index in 1..100) {
+                [System.IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath ('m{0}.js' -f $index)), ('export const token = "{0}";' -f $script:jwt))
+            }
+        }
+        $log = [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath 'deploy.jsonl'))
+        Set-Content -LiteralPath $log -Value '{"checkId":"DEPLOY.DONE","status":"Pass"}' -Encoding utf8NoBOM
+        $scan = Find-DemoSecretLeak -Path $out
+        @($scan.Scanned) | Should -Be @($log)
+        @($scan.Findings).Count | Should -Be 0
+        @($scan.Skipped).Count | Should -Be 0
+        $scan.PrunedCount | Should -Be 1 -Because 'nothing under the top node_modules is walked, so its nested ones aren''t seen'
+        @($scan.Pruned) | Should -Be @($modules)
+    }
 }

@@ -17,8 +17,17 @@
 #   2026-11-18 it reads T5's (ADR 0027) too, at the same demo resource group: no new action.
 # - Microsoft.Resources/tags/write: the busy marker and the session's ID on the demo resource group (the safety stop
 #   honors the marker); it could change any tag in the demo resource group, the deploymentId included.
+# 2026-11-19 (ADR 0027, approved for the user by the coordinator, who reviews it with the owner before any merge): T5's
+# container exists only during a session, because its provisioned throughput bills every hour it exists and an Azure
+# Cosmos DB account has no stop, so the session's start creates it and its stop deletes it, at the demo resource group only
+# (A1), with what each could touch there:
+# - Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, /write, and /delete: read, create, and delete
+#   T5's container contosocare/patient-events; they could read, change, or delete any Azure Cosmos DB for NoSQL container
+#   in the demo resource group, where T5's account is the only account, and the runbook touches that one container only.
+#   Nothing of the account itself, its keys, its network, or its data plane: documents stay with T1's own data-plane role.
+#   https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
 $script:ActivityControlRoleName = 'DbHub Demo Activity Operator'
-$script:ActivityControlRoleDescription = 'Start, deallocate, and run commands on the Database Hub demo''s VMs, start and stop its PostgreSQL server, create and delete its read replica, read their metrics, mark the demo busy, and manage the demo control account''s own one-time stop schedules. Assigned only at the demo resource group and at the control Automation account.'
+$script:ActivityControlRoleDescription = 'Start, deallocate, and run commands on the Database Hub demo''s VMs, start and stop its PostgreSQL server, create and delete its read replica, create and delete its Azure Cosmos DB container for a session, read their metrics, mark the demo busy, and manage the demo control account''s own one-time stop schedules. Assigned only at the demo resource group and at the control Automation account.'
 $script:ActivityControlRoleActions = @(
     'Microsoft.Resources/subscriptions/resourceGroups/read'
     'Microsoft.Compute/virtualMachines/read'
@@ -36,6 +45,9 @@ $script:ActivityControlRoleActions = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/write'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
     'Microsoft.Insights/metrics/read'
     'Microsoft.Resources/tags/write'
     'Microsoft.Automation/automationAccounts/read'
@@ -58,15 +70,19 @@ $script:SessionWriterRoleActions = @(
     'Microsoft.KeyVault/vaults/secrets/read'
     'Microsoft.KeyVault/vaults/secrets/write'
 )
-# What each action added on 2026-11-14 could touch, for the grant's output (ADR 0026, docs/permissions.md).
+# What each action added on 2026-11-14 and 2026-11-19 could touch, for the grant's output (ADR 0026, ADR 0027,
+# docs/permissions.md).
 $script:ActivityControlActionReach = [ordered]@{
-    'Microsoft.DBforPostgreSQL/flexibleServers/write'                 = 'creates T4''s read replica; it could also change T4, which the runbook never does'
-    'Microsoft.DBforPostgreSQL/flexibleServers/delete'                = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
-    'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'  = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
-    'Microsoft.Insights/metrics/read'                                 = 'reads T4''s, the replica''s, and T5''s Azure Monitor metrics for the history; read-only'
-    'Microsoft.Resources/tags/write'                                  = 'marks the demo busy for the nightly stop and records the session; it could change any tag in the demo resource group'
-    'Microsoft.KeyVault/vaults/secrets/read'                          = 'reads the session secrets'' properties (never their values through Azure Resource Manager); at those two secrets only'
-    'Microsoft.KeyVault/vaults/secrets/write'                         = 'writes the session''s status and metrics; it could overwrite those two secrets'' values, at those two secrets only'
+    'Microsoft.DBforPostgreSQL/flexibleServers/write'                      = 'creates T4''s read replica; it could also change T4, which the runbook never does'
+    'Microsoft.DBforPostgreSQL/flexibleServers/delete'                     = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
+    'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'       = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'   = 'reads whether T5''s container is there; it could read any Azure Cosmos DB container''s settings in the demo resource group, where T5''s account is the only account, never its documents'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'  = 'creates T5''s container for a session, so its throughput bills only then; it could change any container in the demo resource group, which the runbook never does (it creates contosocare/patient-events only)'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete' = 'deletes T5''s container after a session; it could delete any container in the demo resource group, which the runbook never does (it deletes contosocare/patient-events only); nothing of the account, its keys, its network, or its data plane'
+    'Microsoft.Insights/metrics/read'                                      = 'reads T4''s, the replica''s, and T5''s Azure Monitor metrics for the history; read-only'
+    'Microsoft.Resources/tags/write'                                       = 'marks the demo busy for the nightly stop and records the session; it could change any tag in the demo resource group'
+    'Microsoft.KeyVault/vaults/secrets/read'                               = 'reads the session secrets'' properties (never their values through Azure Resource Manager); at those two secrets only'
+    'Microsoft.KeyVault/vaults/secrets/write'                              = 'writes the session''s status and metrics; it could overwrite those two secrets'' values, at those two secrets only'
 }
 # Key Vault Secrets User (built-in): https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/security#key-vault-secrets-user
 $script:VaultReaderRoleGuid = '4633458b-17de-408a-b874-0445c86b69e6'
@@ -421,8 +437,8 @@ function Get-DemoActivityControlProfile {
     .SYNOPSIS
     The activity profiles the control runs as a whole (2026-11-04: showcase, Run all's default), from
     scenarios/activity-profiles.json: each one's maximum and default minutes, its cycle, the targets it has incidents for,
-    and T5's slots in a cycle (2026-11-18). off isn't one: the runbook takes it as its own word, which turns a target's
-    activity off. Internal.
+    and T5's slots in a cycle (2026-11-18), with their recoveryMinutes (2026-11-19). off isn't one: the runbook takes it as
+    its own word, which turns a target's activity off. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -433,14 +449,15 @@ function Get-DemoActivityControlProfile {
     foreach ($name in @('showcase')) {
         $definition = $definitions['profiles'][$name]
         # cycleMinutes (2026-11-14): a session cut short by the VMs' auto-shutdown ends after whole cycles, so no beat is cut.
-        # t5Slots (2026-11-18, ADR 0027): T5's slots in a cycle, so the runbook ends T5's showcase at its baseline, with no
-        # ru-storm still running (Set-DbHubT5ShowcaseMinute).
+        # t5Slots (2026-11-18, ADR 0027): T5's slots in a cycle, with each one's recoveryMinutes (2026-11-19, risk R896; null
+        # when it has none), so the runbook says when T5 is back at its baseline after its last ru-storm, as the runner plans
+        # it (Get-DbHubT5LastStormEnd).
         $profiles[$name] = [ordered]@{
             maxMinutes     = [int]$definition['maxDurationMinutes']
             defaultMinutes = [int]$definition['defaultDurationMinutes']
             cycleMinutes   = [int]$definition['cycleMinutes']
             targets        = @($definition['incidents'] | ForEach-Object { [string]$_['target'] } | Sort-Object -Unique)
-            t5Slots        = @($definition['incidents'] | Where-Object { [string]$_['target'] -eq 'T5' } | ForEach-Object { [ordered]@{ startMinute = [int]$_['startMinute']; durationMinutes = [int]$_['durationMinutes'] } })
+            t5Slots        = @($definition['incidents'] | Where-Object { [string]$_['target'] -eq 'T5' } | ForEach-Object { [ordered]@{ startMinute = [int]$_['startMinute']; durationMinutes = [int]$_['durationMinutes']; recoveryMinutes = $(if ($null -ne $_['recoveryMinutes']) { [int]$_['recoveryMinutes'] } else { $null }) } })
         }
     }
     return $profiles
@@ -453,8 +470,9 @@ function Get-DemoActivityControlRunbookSetting {
     catalog and the activity profiles the control runs as a whole (showcase), how long the VM-side control waits for
     each target (readySeconds), how T1's monitoring plugin is looked after, the pinned API versions, and the VM-side
     workload-control template. T5 (2026-11-18, ADR 0027) is a target when it's on and the catalog has a scenario for it,
-    and t5AccountPrefix names its account while it's on. Nothing in it is secret; it holds the subscription ID and the
-    identity's client ID, which live in Azure only. Internal.
+    t5AccountPrefix names its account while it's on, and t5Container (2026-11-19) defines its container, which a session
+    creates and its stop deletes. Nothing in it is secret; it holds the subscription ID and the identity's client ID, which
+    live in Azure only. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -472,7 +490,9 @@ function Get-DemoActivityControlRunbookSetting {
 
     $versions = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
     $apiVersions = [ordered]@{}
-    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Compute/virtualMachines/runCommands', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforPostgreSQL/flexibleServers/configurations', 'Microsoft.KeyVault/vaults', 'Microsoft.Resources/tags', 'Microsoft.Insights/metrics') {
+    # Microsoft.DocumentDB/databaseAccounts (2026-11-19, ADR 0027): T5's container, which a session creates and its stop
+    # deletes.
+    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Compute/virtualMachines/runCommands', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforPostgreSQL/flexibleServers/configurations', 'Microsoft.KeyVault/vaults', 'Microsoft.Resources/tags', 'Microsoft.Insights/metrics', 'Microsoft.DocumentDB/databaseAccounts') {
         $apiVersions[$type] = [string]$versions['apiVersions'][$type]
         if (-not $apiVersions[$type]) {
             throw ('config/versions.json has no API version for {0}.' -f $type)
@@ -493,6 +513,20 @@ function Get-DemoActivityControlRunbookSetting {
     $readySeconds = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
     if ($targets.Contains('T5')) {
         $readySeconds['T5'] = 600
+    }
+    # T5's container (2026-11-19, ADR 0027): config/versions.json's definition, from which a session creates it again, as
+    # infra/modules/cosmos01.bicep does; $null when T5 is off.
+    $t5Container = $null
+    if ($t5On) {
+        $cosmos = Get-DemoCosmosSetting
+        $t5Container = [ordered]@{
+            databaseName        = [string]$cosmos['databaseName']
+            containerName       = [string]$cosmos['containerName']
+            partitionKeyPath    = [string]$cosmos['partitionKeyPath']
+            partitionKeyVersion = [int]$cosmos['partitionKeyVersion']
+            throughput          = [int]$cosmos['throughputRUs']
+            indexingPolicy      = $cosmos['indexingPolicy']
+        }
     }
     $guest = Import-PowerShellDataFile -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/dsc/guest.psd1')
     $sqlVm = (Get-DemoArcSetting).SqlVm
@@ -531,6 +565,9 @@ function Get-DemoActivityControlRunbookSetting {
         }
         # T5's account is <t5AccountPrefix><deploymentId> (2026-11-18, ADR 0027); empty when T5 is off.
         t5AccountPrefix        = $(if ($t5On) { '{0}-' -f (Get-DemoCosmosSetting)['accountNamePrefix'] } else { '' })
+        # T5's container (2026-11-19): a session creates it, and the stops delete it while the demo resource group's
+        # DbHubT5Container tag is Session.
+        t5Container            = $t5Container
         # The session's status and the history's metrics (2026-11-14): written to these secrets of the control vault through
         # Azure Resource Manager, for the control notebook to read.
         controlVault           = $Name.KeyVault
@@ -760,7 +797,8 @@ function Get-DemoActivityControlPrincipalId {
 function Test-DemoActivityControlAssignment {
     <#
     .SYNOPSIS
-    Whether a principal holds a role definition at exactly a scope. Returns Exists and Error. Internal.
+    Whether a principal holds a role definition at exactly a scope. Returns Exists, Other (it holds another role at the scope
+    or above it, 2026-11-19, for Get-DemoT5ControlRoleState), Missing, and Error. Internal.
     https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
     #>
     [CmdletBinding()]
@@ -775,23 +813,30 @@ function Test-DemoActivityControlAssignment {
         [Parameter(Mandatory)]
         [string] $PrincipalId,
 
+        # Empty when the role doesn't exist: then only Other can be true.
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string] $RoleId
     )
 
     $read = Invoke-DemoActivityControlArm -SubscriptionId $SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments' -f $Scope) -Query ([ordered]@{ '$filter' = ("principalId eq '{0}'" -f $PrincipalId); 'api-version' = '2022-04-01' })
     if (-not $read.Ok) {
-        return [pscustomobject]@{ Exists = $false; Missing = $read.Missing; Error = $read.Error }
+        return [pscustomobject]@{ Exists = $false; Other = $false; Missing = $read.Missing; Error = $read.Error }
     }
+    $exists = $false
+    $other = $false
     foreach ($assignment in @(Get-DemoActivityControlList -InputObject $read.Value -Name 'value')) {
         $properties = Get-DemoMemberValue -InputObject $assignment -Name 'properties'
         $role = [string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')
         $at = [string](Get-DemoMemberValue -InputObject $properties -Name 'scope')
-        if ($role.EndsWith('/' + $RoleId, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($at, $Scope, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
+        if ($RoleId -and $role.EndsWith('/' + $RoleId, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($at, $Scope, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $exists = $true
+        }
+        elseif ($at -and $Scope.StartsWith($at, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $other = $true
         }
     }
-    return [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' }
+    return [pscustomobject]@{ Exists = $exists; Other = $other; Missing = $false; Error = '' }
 }
 
 function Get-DemoActivityControlGrantPlan {
@@ -1606,10 +1651,10 @@ function Get-DemoActivityControlShowcase {
     <#
     .SYNOPSIS
     The showcase's beats for the control notebook's guide (2026-11-14), from scenarios/activity-profiles.json: its cycle,
-    each incident slot as the runner reads it (target, scenario, startMinute, durationMinutes, and cycles, tier, and
-    replica when set; and for the Database Agent beat, 2026-11-18, its respondPercent, goodPercent, and agentBeat), and each
-    scenario's title and the first Database Hub signal it fills for the SQL targets, T4, and T5 (scenarios/<id>/scenario.json).
-    Internal and pure.
+    each incident slot as the runner reads it (target, scenario, startMinute, durationMinutes, and cycles, tier, replica,
+    and recoveryMinutes (2026-11-19) when set; and for the Database Agent beat, 2026-11-18, its respondPercent, goodPercent,
+    and agentBeat), and each scenario's title and the first Database Hub signal it fills for the SQL targets, T4, and T5
+    (scenarios/<id>/scenario.json). Internal and pure.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -1627,6 +1672,11 @@ function Get-DemoActivityControlShowcase {
         }
         if ($incident.ContainsKey('replica')) {
             $slot['replica'] = [bool]$incident['replica']
+        }
+        # A slot that runs only whole, with its recovery before the profile's end (T5's ru-storm, 2026-11-19, risk R896), so
+        # the guide lists only what the runner runs.
+        if ($incident.ContainsKey('recoveryMinutes') -and $null -ne $incident['recoveryMinutes']) {
+            $slot['recoveryMinutes'] = [int]$incident['recoveryMinutes']
         }
         # The Database Agent beat (2026-11-18): the run's own response, at respondPercent of the run, and the switch to the
         # regressed plan at goodPercent, so the guide can give their times.
@@ -2159,10 +2209,18 @@ function Test-DemoActivityControlRole {
     $roleId = [string]$operator.Id
     if ($roleId -and ('A1' -in $Assignment -or 'A2' -in $Assignment)) {
         # An environment set up before 2026-11-14 has the role with its first 22 actions: the session then runs without its
-        # read replica, the busy marker, and the history's metrics, and says so.
+        # read replica, the busy marker, and the history's metrics, and says so. One set up before 2026-11-19 lacks T5's
+        # container actions: its container then stays between sessions (DbHubT5Container AlwaysOn), and its throughput bills.
         $lacking = @($script:ActivityControlRoleActions | Where-Object { $_ -notin @($operator.Actions) })
         if ($lacking.Count -gt 0) {
-            & $missing 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" lacks {1} of its approved actions ({2}), so a session in the control notebook runs without T4''s read replica, the busy marker, or the history''s metrics.' -f $name.RoleName, $lacking.Count, ($lacking -join ', '))
+            $without = [System.Collections.Generic.List[string]]::new()
+            if (@($lacking | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' }).Count -gt 0) {
+                $without.Add('a session in the control notebook runs without T4''s read replica, the busy marker, or the history''s metrics')
+            }
+            if (@($lacking | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count -gt 0) {
+                $without.Add('T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing')
+            }
+            & $missing 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" lacks {1} of its approved actions ({2}), so {3}.' -f $name.RoleName, $lacking.Count, ($lacking -join ', '), ($without -join '; and '))
         }
     }
     $principalId = Get-DemoActivityControlPrincipalId -Name $name
