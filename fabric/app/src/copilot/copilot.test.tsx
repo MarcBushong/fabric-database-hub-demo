@@ -71,7 +71,7 @@ function fetchStub(routes: Record<string, unknown>) {
 }
 
 const queryClient: QueryClient = {
-    run: vi.fn(async (spec) => ({ spec, columns: [], rows: [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0) })),
+    run: vi.fn(async (spec) => ({ spec, columns: [], rows: [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0), provenance: "history" as const })),
     peek: () => undefined,
     clear: () => undefined,
 };

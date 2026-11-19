@@ -19,8 +19,8 @@ export interface CopilotContextValue {
     dock: CopilotDockState;
     account: CopilotAccountState;
     attached: AttachedContext | null;
-    /** The conversation and its actions, for the dock. */
-    chat: ChatController | null;
+    /** The conversation and its actions, for the dock; absent where only the shell's contract is provided (tests). */
+    chat?: ChatController | null;
 }
 
 export const CopilotContext = createContext<CopilotContextValue | null>(null);
