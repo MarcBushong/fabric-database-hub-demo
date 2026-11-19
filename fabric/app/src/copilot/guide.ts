@@ -22,6 +22,7 @@ export function buildSystemMessage(options: GuideOptions): string {
 # The estate
 - T1: SQL Server 2022 on an Azure VM. T2: Arc-enabled SQL Server in a nested Hyper-V guest. T3: Azure SQL Database. T4: Azure Database for PostgreSQL flexible server, with a read replica (T4-replica) during a session.
 - T5, when the configuration deploys it: an Azure Cosmos DB account. Its history is its Azure Monitor metrics (analysis cosmosdb), saved by captures (a session's end, deploy.ps1, stop-demo.ps1 -SaveHistory), and read with the measures in the Cosmos DB folder; [Has Cosmos DB Bins] is 1 once there's any.
+- T5's container (patient-events), the only part with throughput, usually exists only during a session: the session's start creates it, empty, and its end deletes it. So outside a session T5 has no RU, requests, or throttling, and its metrics have gaps between sessions, as the stopped VMs' do: that's expected, not a fault. Where the container can't be deleted between sessions, it stays and bills all month; the status page's T5.Lifecycle row says which applies.
 - A workload runner drives activity, and bounded incidents (blocking, CPU, IO, log rate) run at fixed minutes past each UTC hour.
 
 # Your data sources
