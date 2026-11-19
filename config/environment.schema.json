@@ -190,7 +190,7 @@
       "default": "demo"
     },
     "monthlyCeilingUsd": {
-      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where the on-demand control's daily T4 safety stop is fully in place, otherwise the rest of the month. 415 by default for a new configuration since 2026-11-19 (the owner's decision: room for T5, the Azure Cosmos DB account, in a Contributor's first deployment's worst case; a value already in your configuration is never changed); 375 from 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. When the estimate is over it, raise it: preflight names the amount. A T4 size you didn't choose never makes it a Fail by itself (2026-11-09): when only a size deploy.ps1's fallback chose, because Azure refused the one t4SkuName sets, or T4's default with exactly 250, which init.ps1 wrote from 2026-10-27 to 2026-11-04, puts the month over it, and the month would fit at the size asked for (Standard_B1ms for 250), it's a Warning, and this value stays as it is (ADR 0016).",
+      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where a safety stop is fully in place (the nightly safety stop that every deployment sets up, or the session control's daily T4 safety stop), otherwise the rest of the month. 415 by default for a new configuration since 2026-11-19 (the owner's decision: room for T5, the Azure Cosmos DB account, in a Contributor's first deployment's worst case; a value already in your configuration is never changed); 375 from 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. When the estimate is over it, raise it: preflight names the amount. A T4 size you didn't choose never makes it a Fail by itself (2026-11-09): when only a size deploy.ps1's fallback chose, because Azure refused the one t4SkuName sets, or T4's default with exactly 250, which init.ps1 wrote from 2026-10-27 to 2026-11-04, puts the month over it, and the month would fit at the size asked for (Standard_B1ms for 250), it's a Warning, and this value stays as it is (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
       "default": 415
@@ -239,7 +239,7 @@
       "default": 4
     },
     "keyVault": {
-      "description": "Opt-in Azure Key Vault for the one-time T2 host password, so a Bastion session needs no clipboard on the machine that runs start-demo.ps1 (ADR 0009). Off by default: the default path creates no vault and no role assignment. enabled requires assignRoles, because access to the vault is a role assignment on the vault only (ADR 0008).",
+      "description": "Opt-in Azure Key Vault for the one-time T2 host password, so a Bastion session needs no clipboard on the machine that runs start-demo.ps1 (ADR 0009). Off by default: no vault in the demo resource group (the session control has its own, in rg-<prefix>-control, for its webhook URL and session status). enabled requires assignRoles, because access to the vault is a role assignment on the vault only (ADR 0008).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -298,7 +298,7 @@
           "default": true
         },
         "vaultNetworkMode": {
-          "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in a separate DBHub Control workspace with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
+          "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in its own workspace, control.fabricWorkspaceName or \"<fabric.workspaceName> Control\" by default, with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
           "enum": ["auto", "public", "private"],
           "default": "auto"
         },
@@ -430,7 +430,7 @@
           "default": "LH_DatabaseHub"
         },
         "capacityName": {
-          "description": "The Fabric capacity's display name, used only to create the workspace or to assign one that has no capacity. It must be an F or Trial capacity you're a contributor or administrator of, and Active. The scripts never create, resume, pause, or scale a capacity. Empty: an existing workspace keeps its capacity, and a missing one is Manual action required.",
+          "description": "The Fabric capacity's display name, used only to create the workspace or to assign one that has no capacity. It must be an F or Trial capacity you're a contributor or administrator of, and Active. The scripts never create or scale a capacity, and resume or pause one only with fabric.manageCapacity. Empty: an existing workspace keeps its capacity, and a missing one is Manual action required.",
           "type": "string",
           "maxLength": 256,
           "default": ""

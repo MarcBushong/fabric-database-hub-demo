@@ -2275,7 +2275,7 @@ function Get-DemoT4ControlRestartCoverage {
     It counts only when all three hold:
     - the schedule dbhub-t4-safety-stop exists, is enabled, and is linked to DbHub-Stop (Get-DemoT4SafetyStopState);
     - A1, the control identity's custom role on the demo's resource group, is assigned: DbHub-Stop can't stop T4 without
-      it, and destroy deletes it with the group, so only assignRoles or -GrantRole grants it again;
+      it, and destroy deletes it with the group, so only an Owner's deploy.ps1 or grant-safety-stop.ps1 grants it again;
     - the last DbHub-Stop job that ended completed, and its own result line (DBHUB-STOP, Get-DemoSafetyStopJobResult) says
       it stopped what ran (Stopped), had nothing to stop (Skipped, NoEnvironment), or left a run in progress alone
       (Deferred): a Partial (Azure refused T4's stop, and the job still completed), an Error, or a line that can't be read
@@ -2291,8 +2291,9 @@ function Get-DemoT4ControlRestartCoverage {
         [string] $ConfigPath = ''
     )
 
-    $grant = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
-    $setup = $grant -replace ' -GrantRole$', ''
+    # Since 2026-11-14 (ADR 0026) deploy.ps1 sets the control up, and an Owner's grant-safety-stop.ps1 grants its roles.
+    $grant = Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath
+    $setup = if ($ConfigPath) { './scripts/deploy.ps1 -ConfigPath {0}' -f $ConfigPath } else { './scripts/deploy.ps1' }
     $missing = {
         param([string] $Piece, [string] $Reason, [string] $Fix, [System.Collections.IDictionary] $Evidence)
         $Evidence['counts'] = $false
@@ -2303,7 +2304,7 @@ function Get-DemoT4ControlRestartCoverage {
     try {
         if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
             $evidence['control'] = 'off'
-            return (& $missing 'Control' 'the on-demand activity control isn''t set up (control.enabled is false), so nothing here stops T4 after Azure starts it again' ('Set control.enabled to true and run {0}; an Owner then runs {1} once (ADR 0020).' -f $setup, $grant) $evidence)
+            return (& $missing 'Control' 'the on-demand activity control isn''t set up (control.enabled is false), so nothing here stops T4 after Azure starts it again' ('Run {0}, which sets the session control up in every deployment (ADR 0026); an Owner then runs {1} once.' -f $setup, $grant) $evidence)
         }
         $state = [string](Get-DemoT4SafetyStopState -Config $Config).State
         $evidence['schedule'] = $state
@@ -2319,7 +2320,7 @@ function Get-DemoT4ControlRestartCoverage {
         if ($evidence['a1'] -ne 'assigned') {
             $what = if ($evidence['a1'] -eq 'unread') { 'couldn''t be read, so it''s taken as missing' } else { 'isn''t assigned' }
             $reason = 'A1, {0}''s "{1}" role on {2}, {3}: without it DbHub-Stop can''t stop T4, and destroy deletes it with the group' -f $name.Identity, $name.RoleName, $name.DemoResourceGroup, $what
-            return (& $missing 'A1' $reason ('An Owner runs {0}, or set assignRoles to true and run ./scripts/deploy.ps1, which grants A1 again after the template.' -f $grant) $evidence)
+            return (& $missing 'A1' $reason ('An Owner runs {0} once, or {1} as an Owner, which grants A1 again.' -f $grant, $setup) $evidence)
         }
         $job = Get-DemoT4LastStopJob -Name $name
         if (-not $job.Ok) {

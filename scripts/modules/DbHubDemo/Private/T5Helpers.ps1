@@ -303,23 +303,23 @@ function Resolve-DemoT5FreeTier {
         if ($current.FreeTier) {
             return (& $make $true 'Pass' ('T5 ({0}) has the subscription''s free tier, so its {1} RU/s cost nothing.' -f $accountName, $cosmos['throughputRUs']) 'Existing')
         }
-        return (& $make $false 'Pass' ('T5 ({0}) exists without the free tier, which Azure sets only when an account is created, so it keeps that: its {1} RU/s are billed every hour (estimate-cost.ps1 prices them).' -f $accountName, $cosmos['throughputRUs']) 'Existing')
+        return (& $make $false 'Pass' ('T5 ({0}) exists without the free tier, which Azure sets only when an account is created, so it keeps that: its {1} RU/s bill at list price while its container exists (DEPLOY.T5.LIFECYCLE says when; estimate-cost.ps1 prices them).' -f $accountName, $cosmos['throughputRUs']) 'Existing')
     }
     if (-not (Test-DemoT5FreeTierWanted -Config $Config)) {
-        return (& $make $false 'Pass' 't5UseFreeTier is false in the configuration, so T5 is created without the free tier: its throughput is billed every hour (estimate-cost.ps1 prices it).' 'Configured')
+        return (& $make $false 'Pass' 't5UseFreeTier is false in the configuration, so T5 is created without the free tier: its throughput bills at list price while its container exists (DEPLOY.T5.LIFECYCLE says when; estimate-cost.ps1 prices it).' 'Configured')
     }
     $quotaId = Get-DemoSubscriptionQuotaId -Config $Config
     if (-not (Test-DemoT5FreeTierOffered -QuotaId $quotaId)) {
-        return (& $make $false 'Warning' ('Azure Cosmos DB''s free tier isn''t offered to this subscription (an internal subscription, {0}: Azure refuses it there), so T5 is created without it: its {1} RU/s are billed every hour (estimate-cost.ps1 prices them).' -f $quotaId, $cosmos['throughputRUs']) 'Offer' '' 'Nothing to do. In a subscription that isn''t internal, T5 gets the free tier when it''s created there and no other account has it.')
+        return (& $make $false 'Warning' ('Azure Cosmos DB''s free tier isn''t offered to this subscription (an internal subscription, {0}: Azure refuses it there), so T5 is created without it: its {1} RU/s bill at list price while its container exists (DEPLOY.T5.LIFECYCLE says when; estimate-cost.ps1 prices them).' -f $quotaId, $cosmos['throughputRUs']) 'Offer' '' 'Nothing to do. In a subscription that isn''t internal, T5 gets the free tier when it''s created there and no other account has it.')
     }
     $holders = Get-DemoT5FreeTierHolder -Config $Config
     if (-not $holders.Succeeded) {
-        return (& $make $false 'Warning' ('Azure Resource Graph couldn''t be read to find whether another account has the subscription''s free tier ({0}), so T5 is created without it: its throughput is billed every hour.' -f $holders.Error) 'Unread' '' 'Nothing to do. The free tier can only be set when an account is created.')
+        return (& $make $false 'Warning' ('Azure Resource Graph couldn''t be read to find whether another account has the subscription''s free tier ({0}), so T5 is created without it: its throughput bills at list price while its container exists.' -f $holders.Error) 'Unread' '' 'Nothing to do. The free tier can only be set when an account is created.')
     }
     $other = @($holders.Accounts | Where-Object { $_.Name -ine $accountName }) | Select-Object -First 1
     if ($null -ne $other) {
         $holder = '{0} (resource group {1})' -f $other.Name, $other.ResourceGroup
-        return (& $make $false 'Warning' ('The subscription''s one free-tier Azure Cosmos DB account is {0}, so T5 is created without it: its throughput is billed every hour (estimate-cost.ps1 prices it).' -f $holder) 'Holder' $holder 'Nothing to do. To have T5 use the free tier, delete that account before T5 is created; once created, T5 keeps what it has.')
+        return (& $make $false 'Warning' ('The subscription''s one free-tier Azure Cosmos DB account is {0}, so T5 is created without it: its throughput bills at list price while its container exists (estimate-cost.ps1 prices it).' -f $holder) 'Holder' $holder 'Nothing to do. To have T5 use the free tier, delete that account before T5 is created; once created, T5 keeps what it has.')
     }
     return (& $make $true 'Pass' ('No account in the subscription has the free tier, so T5 is created with it: the first {0} RU/s and {1} GB are free, which covers T5''s {2} RU/s.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $cosmos['throughputRUs']) 'Free')
 }

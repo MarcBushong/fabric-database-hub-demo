@@ -254,10 +254,10 @@ function Invoke-DemoValidationSecurity {
     elseif (-not $vaultOptIn.Enabled) {
         $names = @(@($vaults.Value) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
         if ($names.Count -gt 0) {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('A Key Vault is in {0} ({1}), but the demo creates none while keyVault.enabled is false: VM passwords are used only at creation, and nothing secret is stored.' -f $group, ($names -join ', ')) -Evidence @{ vaults = $names; keyVaultOptIn = $false } -Remediation 'Check who added it and what it holds. The optional P9 GitHub token belongs in a vault you own outside the demo resource group; a vault the Key Vault opt-in left behind goes with keyVault.enabled set back to true or with the resource group (ADR 0009).' -DocUrl $vaultDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('A Key Vault is in {0} ({1}), but the demo creates none while keyVault.enabled is false: VM passwords are used only at creation, and nothing secret is stored.' -f $group, ($names -join ', ')) -Evidence @{ vaults = $names; keyVaultOptIn = $false } -Remediation 'Check who added it and what it holds: the session control''s vault is in rg-<prefix>-control, not here. A vault the Key Vault opt-in left behind goes with keyVault.enabled set back to true, or with the resource group (ADR 0009).' -DocUrl $vaultDoc))
         }
         else {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('No Key Vault in {0}: the default deployment stores no secret, so Contributor needs no data-plane role (ADR 0008, ADR 0009).' -f $group) -Evidence @{ keyVaultOptIn = $false } -DocUrl $vaultDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('No Key Vault in {0}: the demo resource group stores no secret, so Contributor needs no data-plane role (ADR 0008, ADR 0009).' -f $group) -Evidence @{ keyVaultOptIn = $false } -DocUrl $vaultDoc))
         }
     }
     else {

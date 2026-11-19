@@ -1,7 +1,7 @@
 # The nightly safety stop (ADR 0024), part of every deployment: deploy.ps1 sets it up after the template
 # (Invoke-DemoSafetyStopSetup), scripts/grant-safety-stop.ps1 assigns its role for an Owner, and status.ps1
 # (STATUS.SAFETYSTOP), validate.ps1 (COST.SAFETYSTOP), the cost estimate's T4 restart worst case, and stop-demo.ps1's and
-# status.ps1's T4 texts read it. It doesn't depend on the optional on-demand activity control (ADR 0020): its own
+# status.ps1's T4 texts read it. It doesn't depend on the session control (ADR 0020, ADR 0026), which every deployment has too: its own
 # identity, Automation account, and schedules live in the demo resource group and go with it, and they run the same
 # DbHub-Stop runbook code (automation/runbooks) with its own settings. Internal.
 
