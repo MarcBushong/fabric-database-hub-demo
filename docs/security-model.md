@@ -205,6 +205,14 @@ Until 2026-11-09, one more token reached the guest outside the scripts: in `Payg
 - **Network:** virtual network integration with no public access, TLS verified by host name (`VerifyFull`), and port 5432 open only from T1's subnet.
 - **Hub posture:** Hub evaluates four PostgreSQL assessments; T4 is built to pass Entra authentication enabled and enforced and public network access disabled; customer-managed keys stay a suggestion (service-managed encryption) ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)).
 
+## T5, the Azure Cosmos DB account (2026-11-18)
+
+- **No secret exists:** local (key) authentication is off (`disableLocalAuth`), and key-based metadata writes too, so no account key works for data and nothing stores one; Microsoft Entra is the only way in ([ADR 0027](adr/0027-t5-cosmos-db.md), [role-based access control](https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control)).
+- **No token travels:** T1's runner asks its own managed identity for a token for the account (the `https://<account>.documents.azure.com` audience), sends it in each request's `Authorization` header over HTTPS, and keeps it in memory only; nothing is written to disk, a log, or a Run Command. The operator's token is never sent to T1 for T5.
+- **Least privilege for the workload:** T1's identity has Cosmos DB Built-in Data Contributor on the account only (a data-plane role assignment, not an Azure role), and the runner acts only in `contosocare`/`patient-events`, on documents it wrote: a bounded set it deletes after `ru-storm`.
+- **Network:** public network access is off in both network modes; a private endpoint in `snet-pe` with the `privatelink.documents.azure.com` zone is the only way in, and `snet-pe`'s network security group allows TCP 443 from T1's subnet only.
+- **Hub posture:** Database Hub's Security page evaluates Microsoft Entra-only access, public network access, and customer-managed keys for Cosmos DB; T5 is built to pass the first two, and customer-managed keys stay a suggestion (service-managed encryption) ([monitor Azure Cosmos DB](https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db)).
+
 ## The on-demand activity control (Phase 25c)
 
 The session control behind the control notebook's **Run all**: part of every deployment since 2026-11-14 ([ADR 0026](adr/0026-one-run-all-session.md)); optional and off by default before ([ADR 0020](adr/0020-on-demand-activity-control.md)). What protects it:

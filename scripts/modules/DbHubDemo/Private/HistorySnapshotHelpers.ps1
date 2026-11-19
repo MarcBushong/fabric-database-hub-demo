@@ -395,7 +395,12 @@ function Invoke-DemoHistorySnapshotStep {
     catch {
         Write-DemoLog -Level Warning -Message ('T4''s metrics weren''t captured for the history snapshot: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
-    $sent = [ordered]@{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = $WindowMinutes; KEY_VAULT_URL = ''; POSTGRES_METRICS = $(if ($parameters.Contains('POSTGRES_METRICS')) { 'sent' } else { '' }) }
+    # T5's (2026-11-18, ADR 0027), the same way (COSMOS_METRICS); Get-DemoCosmosHistoryCapture never throws.
+    $cosmosCapture = Get-DemoCosmosHistoryCapture -Config $Config -WindowMinutes $WindowMinutes -CheckId 'DEPLOY.FABRIC.HISTORY.T5'
+    if ($null -ne $cosmosCapture -and [string]$cosmosCapture.Json) {
+        $parameters['COSMOS_METRICS'] = [string]$cosmosCapture.Json
+    }
+    $sent = [ordered]@{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = $WindowMinutes; KEY_VAULT_URL = ''; POSTGRES_METRICS = $(if ($parameters.Contains('POSTGRES_METRICS')) { 'sent' } else { '' }); COSMOS_METRICS = $(if ($parameters.Contains('COSMOS_METRICS')) { 'sent' } else { '' }) }
     $modelChecked = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.*' }).Count -gt 0
     try {
         Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State 'Running' -Message ('{0} runs once, analyze-only (CONFIRM false: no activity request), and saves the last {1} minutes to the lakehouse; Spark''s start and the analysis take about 2 to 5 minutes, at most {2} here. Then the history model is refreshed. It doesn''t block DONE.' -f $script:HistorySnapshotNotebook, $WindowMinutes, $TimeoutMinutes)

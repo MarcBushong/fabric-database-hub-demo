@@ -1,0 +1,23 @@
+# RU storm (request rate too large)
+
+A T5 incident (Azure Cosmos DB for NoSQL): a bedside-monitor integration stuck in a retry loop floods one patient's partition, uses up the container's throughput, and gets throttled.
+
+- **Definition:** [`scenario.json`](scenario.json) (10 minutes by default, 30 at most; 8 writers; intensity 7).
+- **Requests:** the runner's Cosmos DB REST client, over HTTPS to the account's gateway with T1's managed identity, every request's User-Agent starting `ContosoCare.Demo/ru-storm/<run>`. Only `contosocare/patient-events` ([data model](../../database/cosmosdb/README.md)).
+- **Waves:** from the run's start, each wave writes for `stormSeconds` (150 by default): every writer upserts bedside-monitor readings to a hot partition, `p-storm-01` (with `hotPartitions` 2 to 4, the writers take `p-storm-01` to `p-storm-04` in turn), as fast as the pacing allows. Then a calm of `calmSeconds` (90 by default) with no storm writes. It repeats until the run ends; `calmSeconds` 0 makes one continuous storm. These partitions are ru-storm's own: no other scenario writes there.
+- **What happens:** the container has 400 RU/s of manual throughput, and one logical partition can use all of it. During a wave the writes cost more than that, so **Normalized RU Consumption** reaches 100% and Cosmos DB answers 429 (request rate too large) with `x-ms-retry-after-ms`. In the calm, normalized RU falls back to the baseline's level and the 429s stop ([request rate too large](https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large), [normalized RU consumption](https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units)). Every client of the container is throttled during a wave, the baseline included.
+- **Bounds:**
+  - Each writer sends 100 requests a second at most, and after a 429 it waits the server's retry-after, at least 10 ms and at most 2 seconds, before its next write, so it never hammers without bound.
+  - `intensity` paces the writers: at 10 they never pause; at 1 each waits about 200 ms between writes.
+  - Writes are upserts over a fixed set of documents, never new ones: `storm-01-000` to `storm-01-099` in `p-storm-01` (100 per hot partition, 400 at most), each about `documentKb` KB (2 by default, 16 at most) and tagged `"kind": "ru-storm"`. The data can't grow from run to run: 6.4 MB at most, and only until the run ends.
+  - The writes end within the run's own duration (30 minutes at most); a stop ends them within a few seconds.
+- **In the profiles:** `business-day` runs it on T5 at :25 for 8 minutes, and `showcase` twice in each 30-minute cycle, from minute 3 for 10 minutes and from minute 18 for 8, with calm time between them ([activity profiles](../activity-profiles.json)).
+- **Proven live:** not yet.
+- **Expected signals:** Database Hub shows T5's Azure Monitor metrics: **Normalized RU Consumption** at 100% during each wave, and **Total Requests** split by status code with 429s. **Availability** stays at 100%, because 429s aren't availability errors. Between waves, normalized RU falls back.
+- **Evidence:** `ContosoCare.Workload status --target T5` shows requests, RU, and 429s per second; the account's **Insights** in the Azure portal show throughput and requests by status code.
+- **Cleanup:** when the run ends, however it ends (its deadline, a stop, Ctrl+C, or the profile host stopping), it deletes its storm documents before it records its end: in each of `p-storm-01` to `p-storm-04`, a query for `kind` `ru-storm`, then Delete Document for each, paced by each request's charge to 200 RU/s, half the container's throughput, so neither the cleanup nor the baseline beside it is throttled. A delete costs about what the write did, so the default run's 100 documents of 2 KB take a few seconds, and the most a run can write, 400 of 16 KB, well under a minute. The cleanup stops after 2 minutes (20 seconds when its caller is stopping), and the run's `auto-cleanup` check says if documents may be left. `--no-auto-cleanup` keeps them.
+- **Reset:** when T1 stopped mid-storm (deallocated, for example), the profile host that starts next ends the run and deletes its documents. `reset --target T5` deletes any storm document left over the same way, and is idempotent: with nothing left, it costs four small queries. The next ru-storm run's cleanup deletes leftovers too. Nothing else changes: the baseline's documents stay as they are.
+
+```powershell
+ContosoCare.Workload run --target T5 --server <account host> --scenario ru-storm --duration 10m --param stormSeconds=120 --param calmSeconds=60
+```

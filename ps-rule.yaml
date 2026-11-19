@@ -79,3 +79,11 @@ suppression:
     - pgflex01-16cc7e
   Azure.PostgreSQL.MaintenanceWindow:
     - pgflex01-16cc7e
+  # T5 (ADR 0027): one Azure Cosmos DB for NoSQL account with synthetic data and no availability target. Availability
+  # zones multiply standard provisioned throughput by 1.25 (Azure Cosmos DB pricing), which the demo's 400 RU/s doesn't
+  # need; continuous backup's point-in-time restore isn't part of the demo, whose runner writes its data again, so the
+  # default periodic backup applies.
+  Azure.Cosmos.AvailabilityZone:
+    - cosmos01-16cc7e
+  Azure.Cosmos.ContinuousBackup:
+    - cosmos01-16cc7e

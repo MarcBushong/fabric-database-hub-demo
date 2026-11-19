@@ -7,13 +7,14 @@ BeforeAll {
     # here it's there, and adds no record, unless a test says otherwise.
     Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
 
-    function New-TestConfig([switch] $WithT4) {
+    function New-TestConfig([switch] $WithT4, [switch] $WithT5) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $config['t3AdminGroupObjectId'] = '77777777-7777-7777-7777-777777777777'
-        # T4 (Phase 24) has its own tests below; the others keep their focus with T4 off.
+        # T4 (Phase 24) has its own tests below; the others keep their focus with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = [bool]$WithT4
+        $config['t5Enabled'] = [bool]$WithT5
         return $config
     }
 
@@ -55,16 +56,17 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Preflight | Should -BeTrue
         $plan.Infrastructure | Should -BeTrue
         $plan.Validation | Should -BeTrue
-        $plan.Tracks['T1'] | Should -Be @('T3Setup', 'Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry')
+        $plan.Tracks['T1'] | Should -Be @('T3Setup', 'Artifacts', 'Bootstraps', 'T3', 'T4', 'T5', 'Activity', 'Monitoring', 'Telemetry')
         $plan.Tracks['T2'] | Should -Be @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry')
         # T4's read replica (ADR 0025) between T4's server and its telemetry.
         $plan.Tracks['T4'] | Should -Be @('Server', 'Replica', 'Telemetry')
         $plan.Tracks['Fabric'] | Should -Be @('Fabric')
     }
 
-    It 'maps -FromStage T4 onto T1''s T4 step and the T4 track, and leaves the T4 track empty with -SkipT4' {
+    It 'maps -FromStage T4 onto T1''s T4 and T5 steps and the T4 track, and leaves the T4 track empty with -SkipT4' {
+        # T5's step (2026-11-18, ADR 0027) is in stage T4, so -FromStage T4 runs it too.
         $plan = InModuleScope DbHubDemo { Resolve-DemoTrackPlan -FromStage 'T4' -StopAfter 'T4' }
-        $plan.Tracks['T1'] | Should -Be @('T4')
+        $plan.Tracks['T1'] | Should -Be @('T4', 'T5')
         $plan.Tracks['T4'] | Should -Be @('Server', 'Replica')
         @((InModuleScope DbHubDemo { Resolve-DemoTrackPlan -SkipT4 }).Tracks['T4']).Count | Should -Be 0
     }
@@ -104,7 +106,7 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }
         $plan.Preflight | Should -BeFalse
         $plan.Infrastructure | Should -BeFalse
-        $plan.Tracks['T1'] | Should -Be @('T4', 'Activity', 'Monitoring', 'Telemetry')
+        $plan.Tracks['T1'] | Should -Be @('T4', 'T5', 'Activity', 'Monitoring', 'Telemetry')
         $plan.Tracks['T2'] | Should -Be @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry')
         $plan.Tracks['T4'] | Should -Be @('Replica', 'Telemetry')
         @($plan.Tracks['Fabric']).Count | Should -Be 0
@@ -146,7 +148,7 @@ Describe 'Resolve-DemoTrackPlan' {
 
         # T1's finished track goes back to its Artifacts step too, with every step after it; T3Setup stays done.
         $both = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T1', 'T2' }
-        $both.Tracks['T1'] | Should -Be @('Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry')
+        $both.Tracks['T1'] | Should -Be @('Artifacts', 'Bootstraps', 'T3', 'T4', 'T5', 'Activity', 'Monitoring', 'Telemetry')
         $both.Resend | Should -Be @('T1', 'T2')
         @($both.Tracks['Fabric']).Count | Should -Be 0
     }
@@ -1898,7 +1900,7 @@ Describe 'Invoke-DemoParallelDeployment' {
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
         $script:calls | Should -Contain 'template disk=golden'
-        $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
         $script:calls | Should -Contain 'track T2: Restore,Artifacts,Bootstraps,T2,Telemetry'
         $script:calls | Should -Contain 'track Fabric: Fabric'
         $script:calls | Should -Contain 'estate T1,T3,T2,T4'
@@ -1933,7 +1935,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
         # Preflight, the template, and every track ran while it was still open.
         $calls | Should -Contain 'template disk=golden'
-        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
         $calls | Should -Contain 'track Fabric: Fabric'
         [array]::IndexOf($calls, 'app sign-in final') | Should -BeGreaterThan ([array]::IndexOf($calls, 'track Fabric: Fabric'))
         $calls | Should -Contain 'app sign-in stop'
@@ -2033,7 +2035,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         # Both VMs already ran, so they got the interim baseline before the tracks' Run Commands, without waiting.
         $quiet = [array]::IndexOf($calls, 'switch T1,T3,T4,T2=baseline wait=0')
         $quiet | Should -BeGreaterOrEqual 0
-        $quiet | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+        $quiet | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'))
         $switch = [array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180')
         $switch | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s reads come first'
         [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
@@ -2186,7 +2188,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Not -Contain 'preflight'
-        $script:calls | Should -Contain 'track T1: T3,T4,Activity,Monitoring,Telemetry'
+        $script:calls | Should -Contain 'track T1: T3,T4,T5,Activity,Monitoring,Telemetry'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'continues it, as deploy\.ps1 -Resume does' }
 
         $script:calls.Clear()
@@ -2226,7 +2228,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($calls, 't3 scale check') | Should -BeGreaterOrEqual 0
         [array]::IndexOf($calls, 'preflight') | Should -BeGreaterThan ([array]::IndexOf($calls, 't3 scale check'))
         $calls | Should -Contain 'template disk=golden'
-        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
         @($results | Where-Object { $_.checkId -eq 'DEPLOY.T3.SCALE' }).Count | Should -Be 1
 
         # T3 at the profile's maximum changes nothing: the run continues as recorded.
@@ -2331,7 +2333,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume -ProgressPath $Path })
         $script:calls | Should -Not -Contain 'preflight'
-        $script:calls | Should -Contain 'track T1: Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $script:calls | Should -Contain 'track T1: Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
         $script:calls | Should -Contain 'track T2: Artifacts,Bootstraps,T2,Telemetry'
         @($script:calls | Where-Object { $_ -like 'track Fabric*' }) | Should -BeNullOrEmpty -Because 'the Fabric track has nothing to do with the bundle'
         # The records go back before any track writes, so a stop before the Artifacts step sends them again next time.
@@ -2481,7 +2483,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $reset = [array]::IndexOf($calls, 'state TrackFabric=,TrackT1=,TrackT2=')
             $reset | Should -BeGreaterThan ([array]::IndexOf($calls, 'preflight')) -Because 'a run that starts over clears every record once preflight passed'
             $reset | Should -BeLessThan ([array]::IndexOf($calls, 'template disk=golden')) -Because 'the template carries the group''s tags it reads at its start'
-            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'))
             $script:tags['TrackFabric'] | Should -Be ''
             $script:tags['Stage'] | Should -Be 'Monitoring'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Not -Be 'Pass'
@@ -2512,7 +2514,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Clear()
             $script:failStep = ''
             $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
-            $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+            $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
             $script:tags['TrackT1'] | Should -Be 'Telemetry'
             $script:tags['Stage'] | Should -Be 'Validation'
 

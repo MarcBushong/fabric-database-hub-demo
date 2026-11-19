@@ -41,8 +41,8 @@ internal sealed class SqlProfileStore(SqlConnectionOpener opener) : IProfileStor
 }
 
 /// <summary>
-/// T3 and T4: a JSON file on T1 (ADR 0010, ADR 0019), so polling the profile never connects to a remote database: T3's
-/// serverless database can auto-pause and a stopped T4 isn't retried while the profile is off. Writes go to a
+/// T3, T4, and T5: a JSON file on T1 (ADR 0010, ADR 0019), so polling the profile never connects to a remote database:
+/// T3's serverless database can auto-pause, and a stopped T4 or T5 isn't retried while the profile is off. Writes go to a
 /// temporary file that replaces the old one, under an exclusive lock file, so two writers can't both pass the
 /// compare-and-set of stamped requests; the replace is tried again briefly while a reader has the file open (FileReplace).
 /// </summary>
@@ -58,11 +58,16 @@ internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null
     /// <summary>T3's profile file (the default for every command that takes --profile-file).</summary>
     public static string DefaultPath => DefaultPathFor(DemoTarget.T3);
 
-    /// <summary>T3 keeps activity.json; T4 (Phase 24) has its own file, activity-t4.json, next to it.</summary>
+    /// <summary>T3 keeps activity.json; T4 (Phase 24) and T5 have their own files, activity-t4.json and activity-t5.json, next to it.</summary>
     public static string DefaultPathFor(DemoTarget target) => System.IO.Path.Combine(
         OperatingSystem.IsWindows() ? Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData) : "/var/lib",
         "DbHubDemo",
-        target == DemoTarget.T4 ? "activity-t4.json" : "activity.json");
+        target switch
+        {
+            DemoTarget.T4 => "activity-t4.json",
+            DemoTarget.T5 => "activity-t5.json",
+            _ => "activity.json",
+        });
 
     public string FilePath => path;
 
@@ -174,7 +179,7 @@ internal interface ILaneWork
     Task<IReadOnlyList<string>?> RecoverOrphanedRunsAsync(DateTimeOffset startedBefore, CancellationToken cancellationToken);
 }
 
-/// <summary>A lane's real work: the target's scenario executor for runs and resets (SQL Server or, since Phase 24, PostgreSQL), and the recovery of runs an earlier host left Running where the executor supports it (SQL Server).</summary>
+/// <summary>A lane's real work: the target's scenario executor for runs and resets (SQL Server, PostgreSQL since Phase 24, or Cosmos DB for T5), and the recovery of runs an earlier host left Running where the executor supports it (SQL Server and T5).</summary>
 internal sealed class ExecutorLaneWork(IScenarioExecutor executor) : ILaneWork
 {
     public Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken) => executor.RunAsync(plan, cancellationToken);

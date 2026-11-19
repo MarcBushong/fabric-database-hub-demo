@@ -4,7 +4,7 @@ What each Database Hub visual shows during a demo session, which scenario fills 
 
 ## What fills each Database Hub visual, and when
 
-**Run all** in the Fabric notebook `NB_DatabaseHub_Control` starts the **showcase** on all four targets for 90 minutes (120 at most):
+**Run all** in the Fabric notebook `NB_DatabaseHub_Control` starts the **showcase** on all five targets for 90 minutes (120 at most):
 
 - the steady Contoso Care baseline, plus a 30-minute rotation of bounded incidents, at most two at a time per target ([`activity-profiles.json`](../scenarios/activity-profiles.json));
 - it repeats every 30 minutes, and each target's clock starts when its activity starts;
@@ -55,6 +55,21 @@ Database Hub shows T4's Azure Monitor metrics only: "Query Store-backed top quer
 | **Security** | Microsoft Entra authentication enabled (issue); customer-managed keys, Microsoft Entra enforced, public network access disabled (suggestions) | Configuration | On the assessment's schedule | A control already met |
 | **Alerts** | Activator alerting over these PostgreSQL metrics "isn't currently supported" ([FAQ](https://learn.microsoft.com/fabric/database/hub/faq)) | Nothing | Never | Always |
 
+### Azure Cosmos DB: T5 (`cosmos01-<deploymentId>`, since 2026-11-18)
+
+Database Hub shows T5 through its Azure Monitor platform metrics, which every account sends with no setup, at an hourly grain in its charts ([monitor Azure Cosmos DB](https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db), checked 2026-11-18; [ADR 0027](adr/0027-t5-cosmos-db.md)). An account has no stop, so T5 is always there; its requests come from T1's runner, so they stop while `sqlvm01` is deallocated.
+
+| Visual | Metric | Filled by | Populates | Stays empty when |
+|---|---|---|---|---|
+| **Estate** and **Overview** | The account, from Azure Resource Graph | The deployment | Already there (`HUB.ESTATE.T5`) | No Reader |
+| **Normalized RU Consumption** | `NormalizedRUConsumption` (Maximum): the busiest partition key range's share of the provisioned RU/s each minute | `healthy-baseline` keeps it low; **`ru-storm`** writes to one hot partition until it reaches **100%**, in waves, then a calm phase lets it fall back: business-day at :25 each hour for 8 minutes, and Run all's showcase twice ([ru-storm](../scenarios/ru-storm/README.md)) | Minutes after a wave starts, in the hour it falls in | T1 deallocated (no requests) |
+| **Throttled Requests** | `TotalRequests` with `StatusCode` 429 (Count) | `ru-storm`'s waves: requests past 100% are rate-limited with 429, on purpose; none between the waves or after the storm | The same | No storm in the window |
+| **Total Request Units** | `TotalRequestUnits` (Total) | Every request; `ru-storm` peaks at about 400 RU/s, the provisioned throughput | A few minutes | No requests |
+| **Provisioned Throughput** | `ProvisionedThroughput` (Maximum, at a 5-minute grain or coarser) | The container's 400 RU/s | Always | Never |
+| **Availability** | `ServiceAvailability` (Average, hourly) | The account's own | Hourly | The current hour, until it ends |
+| **Avg Latency** | `ServerSideLatencyDirect` (Average): direct-mode connections only | Nothing: the runner uses the gateway (HTTPS through the private endpoint) | Never | Always |
+| **Security** | Microsoft Entra only, public network access, customer-managed keys | Configuration: T5 passes the first two; customer-managed keys stay a suggestion | On the assessment's schedule | A control already met |
+
 ### Recommendations and optimizations
 
 | Recommendation | Where it shows | What triggers it | How long it takes | Within one session? |
@@ -81,6 +96,7 @@ Database Hub shows T4's Azure Monitor metrics only: "Query Store-backed top quer
 | T1 `sqlvm01`, T2 `arcsql01` | 2 | 3 | Low, flat CPU; steady `Batch Requests/sec` and `Transactions/sec`; `Processes blocked` at 0 |
 | T3 `ContosoCare` | 1 | 2 | The same, lighter. It also keeps the serverless database awake, which bills vCore-seconds, inside the free monthly allowance first when T3 has the free offer |
 | T4 `contosocare` | 1 | 2 | The same lookups, a work-item update, and an audit row; low CPU and connections |
+| T5 `contosocare`/`patient-events` | 1 | 2 | Point reads and small upserts over a fixed set of patient documents, so normalized RU stays low and the data stays the same size |
 
 - **The quiet profile:** set `"activityProfile": "baseline"` for a demo without incidents; the default since 2026-11-03 is `business-day`, which runs the baseline under bounded incidents every hour.
 - **Under the incidents:** `business-day` and the showcase run it beneath their incidents.

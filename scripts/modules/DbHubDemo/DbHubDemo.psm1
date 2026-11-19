@@ -112,6 +112,11 @@ $script:DemoResourceTypes = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/administrators'
     'Microsoft.DBforPostgreSQL/flexibleServers/databases'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations'
+    # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB for NoSQL account, its database and container, and T1's data-plane role.
+    'Microsoft.DocumentDB/databaseAccounts'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers'
+    'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments'
     'Microsoft.DevTestLab/schedules'
     'Microsoft.Consumption/budgets'
     'Microsoft.Authorization/locks'

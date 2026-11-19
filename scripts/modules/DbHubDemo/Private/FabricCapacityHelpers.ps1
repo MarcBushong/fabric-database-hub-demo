@@ -467,8 +467,9 @@ function Save-DemoFabricHistory {
     all sent an activity request through GitHub, CONFIRM and STOP_ACTIVITY false and no Key Vault, which today's notebook
     doesn't have (ADR 0026). It writes only the lakehouse's history tables. T4's metrics go with the run only when the
     workspace's notebook knows POSTGRES_METRICS (Test-DemoFabricNotebookParameter, 2026-11-16); otherwise it's a Warning
-    that says so, with PostgresDropped. Returns Result, StillRunning (the run hadn't finished when the wait ended, so the
-    capacity mustn't be paused under it), and PostgresDropped.
+    that says so, with PostgresDropped. T5's (2026-11-18, ADR 0027) go only when it knows COSMOS_METRICS; otherwise the
+    message says so, and they stay in Azure Monitor for a later run (CosmosDropped). Returns Result, StillRunning (the run
+    hadn't finished when the wait ended, so the capacity mustn't be paused under it), PostgresDropped, and CosmosDropped.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -485,7 +486,12 @@ function Save-DemoFabricHistory {
         # T4's and its read replica's Azure Monitor metrics as JSON (2026-11-13, ADR 0025; Get-DemoPostgresHistoryCapture),
         # captured before stop-demo.ps1 deleted the replica, for the notebook's POSTGRES_METRICS parameter; '' sends none.
         [AllowEmptyString()]
-        [string] $PostgresMetrics = ''
+        [string] $PostgresMetrics = '',
+
+        # T5's Azure Monitor metrics as JSON (2026-11-18, ADR 0027; Get-DemoCosmosHistoryCapture), for the notebook's
+        # COSMOS_METRICS parameter; '' sends none.
+        [AllowEmptyString()]
+        [string] $CosmosMetrics = ''
     )
 
     $checkId = 'STOP.FABRIC.SAVEHISTORY'
@@ -493,12 +499,15 @@ function Save-DemoFabricHistory {
     # T4's metrics that a copy of the notebook from before 2026-11-13 would ignore (2026-11-16): the run doesn't send them,
     # and PostgresDropped tells stop-demo.ps1 to keep them in out/history-pending.
     $postgresWithheld = ''
+    # T5's, for a copy from before 2026-11-18: Azure Monitor keeps them, so nothing needs keeping.
+    $cosmosWithheld = ''
     $answer = {
         param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '', [bool] $StillRunning = $false)
         [pscustomobject]@{
             Result          = (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $doc['NotebookRun'])
             StillRunning    = $StillRunning
             PostgresDropped = [bool]$postgresWithheld
+            CosmosDropped   = [bool]$cosmosWithheld
         }
     }
     # Since 2026-11-14 the notebook changes no activity (ADR 0026), so its Run all only analyzes and saves.
@@ -549,6 +558,16 @@ function Save-DemoFabricHistory {
             $parameters['POSTGRES_METRICS'] = $PostgresMetrics
         }
     }
+    if ($CosmosMetrics) {
+        # T5's (2026-11-18, ADR 0027), the same way: a copy of the notebook from before T5's history would ignore them.
+        $knowsCosmos = Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $resolved['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'COSMOS_METRICS' -Token $token
+        if ($knowsCosmos.Known -and -not $knowsCosmos.Has) {
+            $cosmosWithheld = 'the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them; Azure Monitor keeps them, and a run with the updated notebook adds them'
+        }
+        else {
+            $parameters['COSMOS_METRICS'] = $CosmosMetrics
+        }
+    }
     $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name 'NB_DatabaseHub_LiveActivity' -Parameter $parameters -Token $token -TimeoutMinutes $TimeoutMinutes
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')
     $stillRunning = $run.status -eq 'Warning' -and $jobStatus -notin 'Completed', 'Failed', 'Cancelled', 'Deduped', ''
@@ -556,11 +575,19 @@ function Save-DemoFabricHistory {
     if ($postgresWithheld) {
         $evidence['postgresMetrics'] = 'withheld'
     }
+    if ($cosmosWithheld) {
+        $evidence['cosmosMetrics'] = 'withheld'
+    }
+    $cosmosNote = if ($cosmosWithheld) { ' T5''s metrics weren''t sent: {0}.' -f $cosmosWithheld } else { '' }
     if ($run.status -eq 'Pass' -and $postgresWithheld) {
         # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
         # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
         $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
-        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.' -f $WindowMinutes, $postgresWithheld) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
+        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}' -f $WindowMinutes, $postgresWithheld, $cosmosNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
+    }
+    if ($run.status -eq 'Pass' -and $cosmosWithheld) {
+        $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' }
+        return (& $answer 'Warning' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}{2}' -f $WindowMinutes, $run.message, $cosmosNote) $evidence ('{0}; then ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor.' -f $updateFix))
     }
     if ($run.status -eq 'Pass') {
         return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}' -f $WindowMinutes, $run.message) $evidence)

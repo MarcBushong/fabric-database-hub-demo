@@ -9,7 +9,8 @@
     "intensity": 3,
     "byTarget": {
       "T3": { "concurrency": 1, "intensity": 2 },
-      "T4": { "concurrency": 1, "intensity": 2 }
+      "T4": { "concurrency": 1, "intensity": 2 },
+      "T5": { "concurrency": 1, "intensity": 2 }
     }
   },
   "profiles": {
@@ -20,7 +21,7 @@
       "baseline": true
     },
     "business-day": {
-      "description": "The baseline plus bounded incidents at fixed minutes past each UTC hour: blocking and long transactions on T1; CPU, missing index, IO, and inefficient queries on T2; the CPU cap and log-rate pressure on T3; a connection surge, idle-in-transaction blockers, and CPU at its ceiling on T4.",
+      "description": "The baseline plus bounded incidents at fixed minutes past each UTC hour: blocking and long transactions on T1; CPU, missing index, IO, and inefficient queries on T2; the CPU cap and log-rate pressure on T3; a connection surge, idle-in-transaction blockers, and CPU at its ceiling on T4; an RU storm on T5, whose 429s stop between its waves.",
       "defaultDurationMinutes": 480,
       "maxDurationMinutes": 720,
       "baseline": true,
@@ -36,11 +37,12 @@
         { "target": "T3", "scenario": "log-rate-pressure", "startMinute": 45, "durationMinutes": 5 },
         { "target": "T4", "scenario": "connection-surge", "startMinute": 8, "durationMinutes": 4, "parameters": { "holdSeconds": "90" } },
         { "target": "T4", "scenario": "idle-in-transaction", "startMinute": 22, "durationMinutes": 8 },
-        { "target": "T4", "scenario": "cpu-pressure", "startMinute": 42, "durationMinutes": 6 }
+        { "target": "T4", "scenario": "cpu-pressure", "startMinute": 42, "durationMinutes": 6 },
+        { "target": "T5", "scenario": "ru-storm", "startMinute": 25, "durationMinutes": 8, "parameters": { "stormSeconds": "120", "calmSeconds": "60" } }
       ]
     },
     "showcase": {
-      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate; in the second cycle, the Database Agent beat: the visit lookup regresses with automatic plan correction held off for about 22 minutes, until Database Agents raises its issue, then the run forces the last good plan, and T3 stays quiet for about 9 minutes while CPU falls and the issue closes (2026-11-18). T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, IO, and, on General Purpose, the missing-index lookups autonomous tuning can recommend indexes for and, in even cycles when the host has T4's read replica, replica-lag in their place (Read replica lag climbs to about 3 minutes, twice). Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
+      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate; in the second cycle, the Database Agent beat: the visit lookup regresses with automatic plan correction held off for about 22 minutes, until Database Agents raises its issue, then the run forces the last good plan, and T3 stays quiet for about 9 minutes while CPU falls and the issue closes (2026-11-18). T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, IO, and, on General Purpose, the missing-index lookups autonomous tuning can recommend indexes for and, in even cycles when the host has T4's read replica, replica-lag in their place (Read replica lag climbs to about 3 minutes, twice). T5: an RU storm twice per cycle, from minute 3 and from minute 18, so normalized RU reaches 100% with 429s, and recovers in between. Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
       "defaultDurationMinutes": 90,
       "maxDurationMinutes": 120,
       "baseline": true,
@@ -73,7 +75,9 @@
         { "target": "T4", "scenario": "io-pressure", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 6, "parameters": { "scratchMb": "1024" } },
         { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose", "cycles": "odd" },
         { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose", "replica": false, "cycles": "even" },
-        { "target": "T4", "scenario": "replica-lag", "startMinute": 20, "durationMinutes": 9, "concurrency": 1, "intensity": 5, "tier": "GeneralPurpose", "replica": true, "cycles": "even", "parameters": { "holdSeconds": "180", "pauseSeconds": "60" } }
+        { "target": "T4", "scenario": "replica-lag", "startMinute": 20, "durationMinutes": 9, "concurrency": 1, "intensity": 5, "tier": "GeneralPurpose", "replica": true, "cycles": "even", "parameters": { "holdSeconds": "180", "pauseSeconds": "60" } },
+        { "target": "T5", "scenario": "ru-storm", "startMinute": 3, "durationMinutes": 10, "concurrency": 8, "intensity": 8, "parameters": { "stormSeconds": "150", "calmSeconds": "90" } },
+        { "target": "T5", "scenario": "ru-storm", "startMinute": 18, "durationMinutes": 8, "concurrency": 10, "intensity": 8, "parameters": { "stormSeconds": "120", "calmSeconds": "60", "documentKb": "4" } }
       ]
     },
     "incident": {

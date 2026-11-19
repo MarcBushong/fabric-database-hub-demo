@@ -33,7 +33,7 @@ public sealed partial class CatalogTests
             [
                 "blocking-chain", "capacity-max", "connection-surge", "cpu-pressure", "deadlock-storm", "healthy-baseline", "idle-in-transaction", "inefficient-query", "io-pressure",
                 "locking-blocking", "log-flush-waits", "log-rate-pressure", "memory-grant-pressure", "missing-index", "parallel-scans", "plan-regression", "replica-lag", "resource-governance",
-                "slow-consumer", "tempdb-contention",
+                "ru-storm", "slow-consumer", "tempdb-contention",
             ],
             ids);
     }
@@ -65,14 +65,16 @@ public sealed partial class CatalogTests
     {
         // The Database Agent's target coverage is undocumented (ADR 0013), so every SQL Server scenario runs on T1, T2,
         // and T3, except one that needs a feature only Azure SQL Database has (plan-regression: automatic tuning, which
-        // SQL Server 2022 Standard lacks). T4 (PostgreSQL, ADR 0019) runs exactly the scenarios it has step functions for.
+        // SQL Server 2022 Standard lacks). T4 (PostgreSQL, ADR 0019) runs exactly the scenarios it has step functions for,
+        // and T5 (Cosmos DB for NoSQL) exactly the ones its runner's REST client has workloads for.
         var scenario = ScenarioCatalog.Default.Get(id);
-        var sqlTargets = scenario.Targets.Applicable.Where(t => t != "T4").Order(StringComparer.Ordinal).ToList();
+        var sqlTargets = scenario.Targets.Applicable.Where(t => t is not ("T4" or "T5")).Order(StringComparer.Ordinal).ToList();
 
         Assert.True(
             sqlTargets.Count == 0 || sqlTargets.SequenceEqual(["T1", "T2", "T3"]) || (AzureSqlOnlyScenarioIds.Contains(id) && sqlTargets.SequenceEqual(["T3"])),
             $"{id} runs on some SQL Server targets but not all.");
         Assert.Equal(PostgresScenarioIds.Contains(id), scenario.AppliesTo(DemoTarget.T4));
+        Assert.Equal(CosmosScenarioIds.Contains(id), scenario.AppliesTo(DemoTarget.T5));
     }
 
     /// <summary>The scenarios that run on T3 only, because they need an Azure SQL Database feature (the showcase).</summary>
@@ -80,6 +82,16 @@ public sealed partial class CatalogTests
 
     /// <summary>The scenarios T4 runs: database/postgresql/120-scenario-functions.sql has their steps (missing-index's only checks its run; the runner sends its lookups, 2026-11-04; replica-lag's report runs on T4's read replica, 2026-11-13).</summary>
     internal static readonly HashSet<string> PostgresScenarioIds = new(["connection-surge", "cpu-pressure", "healthy-baseline", "idle-in-transaction", "io-pressure", "locking-blocking", "missing-index", "replica-lag"], StringComparer.Ordinal);
+
+    /// <summary>The scenarios T5 runs: the runner's Cosmos DB REST client has their workloads (Cosmos/CosmosScenarioRunner.cs).</summary>
+    internal static readonly HashSet<string> CosmosScenarioIds = new(["healthy-baseline", "ru-storm"], StringComparer.Ordinal);
+
+    [Fact]
+    public void T5sScenariosAreTheOnesItsRunnerHasWorkloadsFor()
+    {
+        Assert.Equal(CosmosScenarioIds.Order(StringComparer.Ordinal), ContosoCare.Workload.Cosmos.CosmosScenarioRunner.Scenarios.Order(StringComparer.Ordinal));
+        Assert.Equal(CosmosScenarioIds.Order(StringComparer.Ordinal), ScenarioCatalog.Default.All.Where(s => s.AppliesTo(DemoTarget.T5)).Select(s => s.Id));
+    }
 
     [Fact]
     public void TheSchemaRejectsABadScenario()
@@ -199,6 +211,27 @@ public sealed partial class CatalogTests
                     }
                 }
             }
+        }
+    }
+
+    [Fact]
+    public void T5StormsInEveryShowcaseCycleWithCalmTimeBetweenStorms()
+    {
+        // T5 has one incident, ru-storm: every cycle has at least one, and its storms never run back to back, so normalized
+        // RU falls back and the 429s stop between them, within a cycle and across the cycle's end.
+        var profile = ActivityProfilesDefinition.Default.Profiles["showcase"];
+        for (var cycle = 1; cycle <= profile.MaxDurationMinutes / profile.CycleMinutes; cycle++)
+        {
+            var storms = profile.Incidents.Where(s => s.Target == "T5" && s.RunsInCycle(cycle)).OrderBy(s => s.StartMinute).ToList();
+            Assert.NotEmpty(storms);
+            Assert.All(storms, s => Assert.Equal("ru-storm", s.Scenario));
+            for (var i = 1; i < storms.Count; i++)
+            {
+                Assert.True(storms[i - 1].StartMinute + storms[i - 1].DurationMinutes < storms[i].StartMinute, $"T5's storms at minutes {storms[i - 1].StartMinute} and {storms[i].StartMinute} have no calm between them.");
+            }
+
+            Assert.True(storms[^1].StartMinute + storms[^1].DurationMinutes < profile.CycleMinutes + storms[0].StartMinute, "T5's last storm runs into the next cycle's first.");
+            Assert.All(storms, s => Assert.True(int.Parse(s.Parameters.GetValueOrDefault("calmSeconds", "90"), System.Globalization.CultureInfo.InvariantCulture) > 0, "Each storm run has calm periods between its waves."));
         }
     }
 

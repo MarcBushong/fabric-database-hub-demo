@@ -74,7 +74,7 @@ function Get-DemoBusinessDaySchedule {
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
     param(
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $Target = @()
     )
 
@@ -123,7 +123,7 @@ function Format-DemoBusinessDaySchedule {
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target = ''
     )
 
@@ -243,7 +243,7 @@ function Get-DemoProfileStatusNote {
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [AllowEmptyString()]
@@ -331,9 +331,9 @@ function Get-DemoActivitySwitchTarget {
     <#
     .SYNOPSIS
     The targets a run switches from the interim baseline: those of the VMs it noted (Get-DemoActivitySwitchVm) that the
-    configuration has (T1, T3, and T4 when t4Enabled on sqlvm01; T2 on archost01 in the nested mode), except a target
-    whose <CheckPrefix>.PROFILE_<target> in -Result is Not selected: the run skipped it on purpose (not set up yet, or
-    left alone). Pure. Internal.
+    configuration has (T1, T3, T4 when t4Enabled, and T5 when t5Enabled on sqlvm01; T2 on archost01 in the nested mode),
+    except a target whose <CheckPrefix>.PROFILE_<target> in -Result is Not selected: the run skipped it on purpose (not
+    set up yet, or left alone). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -358,11 +358,14 @@ function Get-DemoActivitySwitchTarget {
         if (Test-DemoT4Enabled -Config $Config) {
             $targets.Add('T4')
         }
+        if (Test-DemoT5Enabled -Config $Config) {
+            $targets.Add('T5')
+        }
     }
     if ('archost01' -in $VmName -and (Get-DemoHostVmName -Config $Config) -eq 'archost01') {
         $targets.Add('T2')
     }
-    $skipped = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -match ('^{0}\.PROFILE_T[1-4]$' -f $CheckPrefix) -and [string]$_.status -eq 'Not selected' } | ForEach-Object { ([string]$_.checkId).Substring(([string]$_.checkId).Length - 2) })
+    $skipped = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -match ('^{0}\.PROFILE_T[1-5]$' -f $CheckPrefix) -and [string]$_.status -eq 'Not selected' } | ForEach-Object { ([string]$_.checkId).Substring(([string]$_.checkId).Length - 2) })
     return @($targets | Where-Object { $_ -notin $skipped })
 }
 
@@ -379,7 +382,7 @@ function Get-DemoProfileRunCommandScript {
     tried again that many seconds apart until the runner sets it, until it says the target isn't set up, or until
     -NotAfterUtc (review of PR 16, 2026-11-04): on a VM that has just booted, T1's and T2's profiles live in a SQL Server
     that's still starting, and T2's behind a guest that boots after its host, and the runner retries only transient
-    errors. T3's and T4's profiles are files on T1 (CommandLine.cs, Store), so with -RetrySeconds they're set first,
+    errors. T3's, T4's, and T5's profiles are files on T1 (CommandLine.cs, Store), so with -RetrySeconds they're set first,
     before T1's retries, and only the last target is ever tried again. Each line's evidence has the attempts. Windows
     PowerShell 5.1. Pure. Internal.
 
@@ -395,7 +398,7 @@ function Get-DemoProfileRunCommandScript {
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $Target,
 
         [Parameter(Mandatory)]
@@ -438,7 +441,7 @@ function Get-DemoProfileRunCommandScript {
     }
     $lines.Add('}')
     $lines.Add('else {')
-    $order = if ($RetrySeconds -gt 0) { @($Target | Where-Object { $_ -in 'T3', 'T4' }) + @($Target | Where-Object { $_ -in 'T1', 'T2' }) } else { $Target }
+    $order = if ($RetrySeconds -gt 0) { @($Target | Where-Object { $_ -in 'T3', 'T4', 'T5' }) + @($Target | Where-Object { $_ -in 'T1', 'T2' }) } else { $Target }
     foreach ($item in $order) {
         $arguments = @('profile', 'set', '--name', $ProfileName, '--requested-by', $RequestedBy)
         if ($ProfileName -ne 'off') {
@@ -478,7 +481,7 @@ function Get-DemoProfileRunCommandScript {
             $lines.Add('if ($null -ne $dbhubResult) { $dbhubState = [string]$dbhubResult.status; $dbhubSaid = [string]$dbhubResult.message }')
             $lines.Add('if ($null -ne $dbhubResult -and $null -ne $dbhubResult.PSObject.Properties[''evidence''] -and $null -ne $dbhubResult.evidence -and $null -ne $dbhubResult.evidence.PSObject.Properties[''golden'']) { $dbhubHeld = [string]$dbhubResult.evidence.golden }')
             $lines.Add('if ($dbhubState -eq ''Pass'' -or $dbhubState -eq ''Warning'') { break }')
-            $lines.Add('if ($dbhubSaid -match ''(?i)not installed|no workload runner|isn.t set up yet|no valid module file|has no T3 server|has no T4 server'') { break }')
+            $lines.Add('if ($dbhubSaid -match ''(?i)not installed|no workload runner|isn.t set up yet|no valid module file|has no T3 server|has no T4 server|has no T5 account'') { break }')
             # A guest the golden capture holds off, or one that isn't running, stays off until someone acts: no retry.
             $held = @(Get-DemoT2GuestHoldReason | ForEach-Object { '$dbhubHeld -eq ''{0}''' -f $_ }) -join ' -or '
             $lines.Add(('if ({0} -or $dbhubSaid -match ''(?i)is not in running state'') {{ break }}' -f $held))
@@ -580,7 +583,7 @@ function Send-DemoProfileRunCommand {
     <#
     .SYNOPSIS
     Sets the activity profile of several targets at once through one managed Run Command per VM, DbHubDemo-Profile (T1,
-    T3, and T4 on sqlvm01; T2 through archost01), and waits for both VMs together, at most -WaitSeconds (ADR 0010).
+    T3, T4, and T5 on sqlvm01; T2 through archost01), and waits for both VMs together, at most -WaitSeconds (ADR 0010).
     Returns one record per target, in -Target's order: Target, VmName, Outcome, Detail, Data, and Seconds. Internal.
 
     .DESCRIPTION
@@ -612,7 +615,7 @@ function Send-DemoProfileRunCommand {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $Target,
 
         [Parameter(Mandatory)]
@@ -1050,7 +1053,7 @@ function Invoke-DemoActivityQuiet {
         [string[]] $VmName = @(),
 
         [AllowEmptyCollection()]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $Target = @(),
 
         [Parameter(Mandatory)]
@@ -1254,7 +1257,7 @@ function Get-DemoScheduledIncident {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $Target,
 
         [datetime] $NowUtc = [System.DateTime]::UtcNow,
@@ -1310,7 +1313,7 @@ function Test-DemoLoadFailureText {
     if ([string]::IsNullOrWhiteSpace($value)) {
         return $false
     }
-    $fixed = '(?i)\bis missing\b|not installed|no workload runner|isn''t set up yet|no valid module file|bootstrap bundle|has no T[34] server|login failed|password authentication failed|\b28P01\b|\b28000\b|permission denied|access (is )?denied|AuthorizationFailed|not authori[sz]ed|\bForbidden\b|OperationNotAllowed|isn''t running|not running|deallocat|does not exist|doesn''t exist|could not be found|\bnot found\b|NotFound|cannot open (database|server)'
+    $fixed = '(?i)\bis missing\b|not installed|no workload runner|isn''t set up yet|no valid module file|bootstrap bundle|has no T[34] server|has no T5 account|login failed|password authentication failed|\b28P01\b|\b28000\b|permission denied|access (is )?denied|AuthorizationFailed|not authori[sz]ed|\bForbidden\b|OperationNotAllowed|isn''t running|not running|deallocat|does not exist|doesn''t exist|could not be found|\bnot found\b|NotFound|cannot open (database|server)'
     if ($value -match $fixed) {
         return $false
     }
@@ -1388,7 +1391,7 @@ function ConvertTo-DemoIncidentAwareResult {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string[]] $IncidentTarget,
 
         [Parameter(Mandatory)]
@@ -1451,7 +1454,7 @@ function ConvertTo-DemoIncidentAwareResult {
     else {
         '{0} It failed the way load makes a read fail (a time-out or a busy VM) during business-day''s {1} incident on {2} ({3}), so it''s a Warning, not a Fail.' -f $base, $incident.Scenario, $incident.Target, $window
     }
-    $targetOption = if ([string]$Result.target -in 'T1', 'T2', 'T3', 'T4') { ' -Target {0}' -f $Result.target } else { '' }
+    $targetOption = if ([string]$Result.target -in 'T1', 'T2', 'T3', 'T4', 'T5') { ' -Target {0}' -f $Result.target } else { '' }
     $remediation = 'Run ./scripts/validate.ps1 -Area {0}{1} again after {2} UTC, once the incident has ended; a Fail then is a fault.' -f $ValidationArea, $targetOption, $incident.ClearUtc.ToString('HH:mm', $invariant)
     if ([string]$Result.remediation) {
         $remediation += ' ' + [string]$Result.remediation

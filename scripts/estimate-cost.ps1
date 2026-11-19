@@ -16,6 +16,10 @@ otherwise, and when not signed in, the worst case counts the rest of the month.
 T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and stop-demo.ps1 deletes
 it, so its compute (at T4's size), storage, and Defender plans are in the running hours (the Replica session column), and
 no automatic restart applies to it. A Burstable T4 has no replica.
+T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so its 400 RU/s of throughput, its storage, its private
+endpoint, and its private DNS zone are in the idle month, and Defender for Azure Cosmos DB when its plan is on Standard. When
+signed in, the script reads whether T5 has, or would get, the subscription's free tier (the first 1000 RU/s and 25 GB of one
+account per subscription), which prices its throughput and storage at zero; otherwise they're at list price, an upper bound.
 Prices are list prices in USD on the day you run it: estimates, not quotes.
 
 Microsoft Defender for Cloud: when the Azure CLI is already signed in to the configured subscription, the
@@ -115,6 +119,7 @@ $defenderPlans = $null
 $t3UseFreeLimit = $null
 $goldenSnapshots = @()
 $t4RestartCoverage = $null
+$t5FreeTier = $null
 if ($config['subscriptionId'] -eq '00000000-0000-0000-0000-000000000000') {
     Write-DemoLog -Level Warning -Message 'The configuration has no subscription yet, so the estimate excludes Defender for Cloud and prices T3 as regular serverless.'
 }
@@ -160,6 +165,12 @@ else {
             $t4RestartCoverage = $null
             Write-DemoLog -Level Warning -Message ('Whether a safety stop covers T4''s 7-day restart couldn''t be read, so the estimate counts it for the rest of the month. {0}' -f $_.Exception.Message)
         }
+        # T5's free tier (2026-11-18, ADR 0027): the account's own when it exists, otherwise whether the subscription's one
+        # free-tier Azure Cosmos DB account is free (Azure Resource Graph, read-only).
+        $t5FreeTier = & $module { param($Settings) Get-DemoT5FreeTierStatus -Config $Settings } $config
+        if ($null -ne $t5FreeTier) {
+            Write-DemoLog -Message ('T5''s free tier: {0} (ADR 0027).' -f $(if ($t5FreeTier) { 'yes, so its throughput costs nothing' } else { 'no, so its throughput is at list price' }))
+        }
     }
 }
 
@@ -179,6 +190,9 @@ $summary = foreach ($name in $profileNames) {
     $parameters['GoldenSnapshots'] = $goldenSnapshots
     if ($null -ne $t4RestartCoverage) {
         $parameters['T4RestartCoverage'] = $t4RestartCoverage
+    }
+    if ($null -ne $t5FreeTier) {
+        $parameters['T5FreeTier'] = $t5FreeTier
     }
     $estimate = Get-DemoCostEstimate @parameters
     foreach ($result in $estimate.Results) {

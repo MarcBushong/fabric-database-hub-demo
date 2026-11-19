@@ -9,7 +9,8 @@ function Get-DemoVmWorkloadSetting {
     .SYNOPSIS
     The workload part of settings.json: the runner's SHA-256 and chunk count, the activity profile and
     whether the VM sets it at boot (profileOnBoot, default false), the auto-shutdown schedule, and (on T1)
-    T3's and T4's names, with T4's read replica's FQDN when the settings have one (ADR 0025).
+    T3's and T4's names, with T4's read replica's FQDN when the settings have one (ADR 0025), and T5's Cosmos DB
+    account (ADR 0027).
 
     .DESCRIPTION
     The template writes these into the loader's settings (infra/modules/demo.bicep). Selected is true only
@@ -120,6 +121,33 @@ function Get-DemoVmWorkloadSetting {
         }
     }
 
+    # T5 (ADR 0027): the Azure Cosmos DB account T1's identity reads and writes with its data-plane role. A name that
+    # isn't an account's documents host is left out.
+    $t5 = $null
+    if ($Settings.Contains('t5') -and $null -ne $Settings['t5']) {
+        $t5Settings = $Settings['t5']
+        $accountHost = ''
+        if ($t5Settings.Contains('accountHost')) {
+            $accountHost = ([string]$t5Settings['accountHost']).ToLowerInvariant()
+        }
+        if ($accountHost -match '^[a-z0-9][a-z0-9-]{1,42}[a-z0-9]\.documents\.azure\.com$') {
+            $t5DatabaseName = 'contosocare'
+            if ($t5Settings.Contains('databaseName') -and $t5Settings['databaseName']) {
+                $t5DatabaseName = [string]$t5Settings['databaseName']
+            }
+            $containerName = 'patient-events'
+            if ($t5Settings.Contains('containerName') -and $t5Settings['containerName']) {
+                $containerName = [string]$t5Settings['containerName']
+            }
+            $t5 = @{
+                AccountName   = [string]$t5Settings['accountName']
+                AccountHost   = $accountHost
+                DatabaseName  = $t5DatabaseName
+                ContainerName = $containerName
+            }
+        }
+    }
+
     return @{
         Selected             = ($sha -match '^[0-9a-f]{64}$' -and $count -ge 1)
         RunnerSha256         = $sha
@@ -130,6 +158,7 @@ function Get-DemoVmWorkloadSetting {
         AutoShutdownTimeZone = $timeZone
         T3                   = $t3
         T4                   = $t4
+        T5                   = $t5
     }
 }
 
@@ -1188,6 +1217,11 @@ function New-DemoVmWorkloadRecord {
         }
         $t4 = [ordered]@{ serverName = $Workload.T4.ServerName; serverFqdn = $Workload.T4.ServerFqdn; replicaServerFqdn = $replicaFqdn; databaseName = $Workload.T4.DatabaseName; runnerRole = $Workload.T4.RunnerRole }
     }
+    # T5 (ADR 0027): the control's Runner relay passes accountHost to T5's commands as --server.
+    $t5 = $null
+    if ($PrimaryTarget -eq 'T1' -and $Workload.Contains('T5') -and $null -ne $Workload.T5) {
+        $t5 = [ordered]@{ accountName = $Workload.T5.AccountName; accountHost = $Workload.T5.AccountHost; databaseName = $Workload.T5.DatabaseName; containerName = $Workload.T5.ContainerName }
+    }
     return [ordered]@{
         schemaVersion        = 1
         primaryTarget        = $PrimaryTarget
@@ -1202,14 +1236,15 @@ function New-DemoVmWorkloadRecord {
         autoShutdownTimeZone = $Workload.AutoShutdownTimeZone
         t3                   = $t3
         t4                   = $t4
+        t5                   = $t5
         setup                = [ordered]@{}
         installedUtc         = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
     }
 }
 
 function Test-DemoVmWorkloadRecord {
-    # True when workload-install.json matches the wanted runner, runtime, profile, schedule, and T3 and T4 servers,
-    # T4's read replica included, so a replica that the settings gain or lose rewrites the record.
+    # True when workload-install.json matches the wanted runner, runtime, profile, schedule, and T3, T4, and T5 targets,
+    # T4's read replica included, so a replica, or a T5 account, that the settings gain or lose rewrites the record.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -1254,6 +1289,17 @@ function Test-DemoVmWorkloadRecord {
         if ($wanted -ne $recorded) {
             return $false
         }
+    }
+    $wantedT5 = ''
+    if ($Expected.Contains('t5') -and $null -ne $Expected['t5'] -and $Expected['t5'].Contains('accountHost')) {
+        $wantedT5 = [string]$Expected['t5']['accountHost']
+    }
+    $recordedT5 = ''
+    if ($Record.Contains('t5') -and $null -ne $Record['t5'] -and $Record['t5'].Contains('accountHost')) {
+        $recordedT5 = [string]$Record['t5']['accountHost']
+    }
+    if ($wantedT5 -ne $recordedT5) {
+        return $false
     }
     $setup = $Record['setup']
     if ($null -eq $setup -or -not $setup.Contains($Expected['primaryTarget'])) {
