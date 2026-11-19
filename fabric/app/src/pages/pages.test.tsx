@@ -352,7 +352,7 @@ describe("Manage", () => {
     });
 
     it("lets an operator send a bounded action, and says a new session replaces the one running", async () => {
-        const send = vi.fn(async () => ({ started: true, jobInstance: "0d5c1f00-0000-4000-8000-000000000000", reason: "", requestedBy: "app/ops@contoso.example" }));
+        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example" }));
         const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: { startedAt: "2026-10-21T20:00:00.000Z" }, send } });
         expect(await screen.findByText("You can run these actions, as ops@contoso.example.")).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
@@ -360,7 +360,7 @@ describe("Manage", () => {
         expect(within(dialog).getByText("It replaces the session that's running.")).toBeInTheDocument();
         fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
         await waitFor(() => expect(send).toHaveBeenCalledWith({ action: "session", durationMinutes: 90 }));
-        expect(notify).toHaveBeenCalledWith("Start a 90-minute session: NB_DatabaseHub_Control started as app/ops@contoso.example (run 0d5c1f00)", "success");
+        expect(notify).toHaveBeenCalledWith("Start a 90-minute session: NB_DatabaseHub_Control started as app/ops@contoso.example (run 00000000)", "success");
     });
 
     it("lists what the control ran", async () => {

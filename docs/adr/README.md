@@ -44,6 +44,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0024](0024-nightly-safety-stop.md) | The nightly safety stop: every database stopped or checked each night, with a stop-only role | User-directed (2026-11-05, 2026-11-09), with engineering detail; an owner-approved exception to ADR 0008 | Accepted; ran live from 2026-11-06; amended 2026-11-09 (each link's scope read by its ID, and T4 stopped at the T3 check), unit-tested |
 | [0025](0025-t4-read-replica.md) | T4's read replica, created for each session | User-directed (2026-11-13, "Postgres HA/DR"), with the lifecycle chosen from a live probe and approved within the owner's delegated scope | Accepted; probe live on 2026-11-13; live deployment results in the ADR |
 | [0026](0026-one-run-all-session.md) | One Run all for a whole demo session | User-directed (2026-11-14: one notebook, one thing to run; no GitHub Actions for a demo), with the design and the control identity's grant approved for the user by the coordinator | Accepted; live validation in the ADR |
+| [0027](0027-insights-app-dba-console.md) | The Insights app as a DBA console: Fluent 2, the DBA's information architecture, history and live, and bounded Manage actions | User-directed (2026-11-18: "a DBA's dream app", the in-app Copilot, demo it yourself); Manage's write path decided for the user by the coordinator (A, with C as the fallback) | Proposed; Manage's sending mode waits on the identity proof |
 
 ## Template
 

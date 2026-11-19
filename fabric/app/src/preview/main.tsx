@@ -65,7 +65,7 @@ const theme = params.get("theme");
 // manage=operator (or on): actions run from the app; manage=viewer: read-only with the reason; manage=running: an operator
 // while a session runs; otherwise the copy mode of a deployment without the Manage function.
 const manageParam = params.get("manage");
-const sampleSend: ManageAccess["send"] = async (request) => ({ started: true, jobInstance: "5a1e0000-0000-4000-8000-000000000000", reason: "", requestedBy: `app/presenter@contoso.example (${request.action})`.split(" ")[0] });
+const sampleSend: ManageAccess["send"] = async (request) => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: `app/presenter@contoso.example (${request.action})`.split(" ")[0] });
 const manage: ManageAccess =
     manageParam === "operator" || manageParam === "on" || manageParam === "running"
         ? { mode: "run", canRun: true, reason: "", who: "presenter@contoso.example", running: manageParam === "running" ? { startedAt: new Date(Date.now() - 25 * 60000).toISOString() } : null, send: sampleSend }

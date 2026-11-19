@@ -1,0 +1,82 @@
+# ADR 0027: The Insights app as a DBA console
+
+- **Status:** Proposed (2026-11-18). The design system, the information architecture, the live data, and Manage's copy mode are built and tested; Manage's sending mode waits on [the identity proof](#validation).
+- **Date:** 2026-11-18
+- **Decision source:** User-directed (2026-11-18): "Adjust the Fabric Rayfin App to really be a DBA's dream app to manage and view their estate with the conversational analytics", "more professional, and functional and clean/modern", and "The GitHub Copilot chat interface right in the App is a must and a gamechanger"; "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible". The coordinator decided Manage's write path for the user: A, with C as the automatic fallback, under the conditions [below](#manage-bounded-confirmed-actions).
+- **Related:** [ADR 0012](0012-validation-model.md) (statuses), [ADR 0020](0020-on-demand-activity-control.md) (the control), [ADR 0026](0026-one-run-all-session.md) (one Run all), [ADR 0025](0025-t4-read-replica.md) (T4's history), [ADR 0013](0013-agent-experience.md) (the Database Agent first), [the app's README](../../fabric/app/README.md)
+
+## Context
+
+- **Before:** the Insights app (Phase 19b, `APP_DatabaseHub_Insights`) was a read-only showcase over the history model: five pages under a top tab bar, a dark "glass" theme with web fonts, eight decorative d3 visuals with motion, and a label that said "History, not live". It answered "what does the history look like", not "what needs my attention, and what do I do about it".
+- **Database Hub became generally available on 2026-11-17** ([overview](https://learn.microsoft.com/fabric/database/hub/overview)), with Overview, Optimization, the real-time dashboards, and the Database Agent loop, which the demo now shows in every Run all ([ADR 0026](0026-one-run-all-session.md), the agent loop's beat). The app had to sit next to that as a DBA's console, not a gallery.
+- **The app runs inside Fabric's item frame** on a laptop screen, often with a chat panel beside it, and it's a [Fabric Apps (preview)](https://learn.microsoft.com/fabric/apps/overview) item: React and Vite on the Rayfin SDK, signed in through Fabric, with connectors and functions as its only backend.
+- **Anyone who deploys the demo demos it themselves,** repeatably, with no per-user setup.
+
+## Decision
+
+### The design system: Fluent 2
+
+The app uses [Fluent UI React v9](https://react.fluentui.dev/) (`@fluentui/react-components` 9.75.2 and `@fluentui/react-icons` 2.0.346, MIT, pinned exactly):
+
+- **Why Fluent 2:** it's the design language of Microsoft Fabric and Microsoft 365, so the app reads as part of Fabric, not as a third-party site. It brings accessible components (tab lists, menus, dialogs, tables, tooltips, message bars, spin buttons) with keyboard support and ARIA built in, and light, dark, and high-contrast themes from tokens. It supports React 19, and its license passes `npm run check:licenses`.
+- **Alternatives:** Material UI and Ant Design look foreign in Fabric. Tailwind with a headless kit (Radix, shadcn) would mean building accessibility and theming ourselves. Keeping the custom CSS would keep the "glass" look the user asked to replace.
+- **Themes:** light, dark, and high contrast, from a Fabric-teal brand ramp (`#117865` at 80). The app follows the system until the viewer picks one, and every status, target, and chart color keeps 4.5:1 (text) or 3:1 (marks) on each surface (`src/lib/app.test.ts`).
+- **One chart language:** `src/visuals/ChartView.tsx` draws every chart, the app's and the Copilot dock's `show_chart`, from a `ChartSpec`: line, area, bar, stacked bar, scatter, table, and KPI, with the app's annotations (incident bands, thresholds, markers), keyboard reading, and labels that fit a narrow frame. The decorative visuals (constellation, activity clock, ridgelines, Sankey, rings) are gone; the incident replay stays, restyled.
+- **No web fonts:** Segoe UI from the system, like Fabric. Framer Motion, lucide, d3-sankey, and d3-hierarchy are removed.
+
+### The information architecture: what a DBA asks, in order
+
+Left navigation (with a rail mode), a global target and period filter, and drill-down from the estate to an engine, a target, and an incident:
+
+| Page | What it answers |
+|---|---|
+| **Overview** | What needs attention now: Database Hub live (resources, high usage, security warnings, Cosmos DB), then the history (each target's health, incidents, findings, readiness, the last session). On the first run, the one action that fills it: Run all in NB_DatabaseHub_Control |
+| **Estate** | Every engine and target: SQL Server on an Azure VM (T1), Arc-enabled SQL Server (T2), Azure SQL Database (T3), PostgreSQL (T4) with its read replica, and Azure Cosmos DB (T5) when present; each target's page |
+| **Performance** | CPU, waits, throughput, and their distribution, per target and engine |
+| **Incidents** | The timeline, the replay, what changed, the Database Agent loop on T3 (detect, evidence, respond, verify), and prompts for the agent |
+| **Findings** | Performance, availability, security, optimization, capacity, and telemetry: security and optimization live from Database Hub, the history's findings beside them |
+| **Readiness** | Is the demo ready, and the next step |
+| **Trends** | The history past the telemetry's 7 days, week over week |
+| **Manage** | Bounded, confirmed actions through the demo's own control |
+| **Live views** | Database Hub, the real-time dashboards, and the history report |
+
+Every visual and table has **Ask Copilot**, and every anomaly **Ask why**: both hand the in-app Copilot the title, the rows (at most 200), and the DAX or the Database Hub API calls behind them (`src/copilot/contract.ts`). The chat, its GitHub sign-in, and its tools are documented with their code ([the app's guide](../../fabric/app/README.md#copilot-in-the-app)).
+
+### History and live, said everywhere
+
+- **History** is the lakehouse through `SM_DatabaseHub_History` and the read-only `history` connector, as the viewer. **Live** is Database Hub's own read-only routes through the app's function (`src/copilot/estate.ts`, the chat session's), scoped to the demo's resource groups and cached for a minute.
+- Every visual says which it shows: **History** with the newest snapshot's age, **Live, as of** a UTC time with its API calls, or **Sample data** in the local preview. When the live source isn't there, a page says why in one line and shows the history.
+- The data layer (`src/data/query-client.ts`) takes any `DataSource`, so a live source plugs in without changing a page.
+
+### Manage: bounded, confirmed actions
+
+Run all in NB_DatabaseHub_Control stays the demo's one action ([ADR 0026](0026-one-run-all-session.md)); the app's actions come in addition to it and do the same things: start a session, run an incident on a target, stop now, and reset.
+
+- **Every action** says what it does and what bounds it, shows the control request, and asks for confirmation. Values outside the control's allow-lists and caps can't be confirmed (`src/lib/control.ts`, tested against `scenarios/*/scenario.json`).
+- **No secret in the browser:** the control's webhook URL stays in Key Vault, read by the control notebook. The app never sees it.
+- **A, sending (decided by the coordinator, 2026-11-18):** the app's function `manage.ts`, in the shared functions project, runs NB_DatabaseHub_Control through the Fabric job API ([Run on demand Item Job](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job), `jobType=RunNotebook`, [notebook APIs](https://learn.microsoft.com/fabric/data-engineering/notebook-public-api)) with the request's parameters. Its conditions:
+  1. The caller's identity comes only from the Rayfin runtime: the caller's Rayfin token, which the app backend checks before any function runs (no token: 403; a forged one: 401) and the function checks again against the app's own JWKS, at the app's API pinned at deploy time. Nothing the browser sends names the caller.
+  2. Operators are the deployer and the members of the demo's admin group, which `deploy.ps1` resolves into the app's settings at every deploy; when it can't read the members, the deployer only, with a **Warning**. Everyone else sees Manage read-only, with the reason.
+  3. Only the documented actions and values, checked against the control's allow-lists and caps; REQUESTED_BY is the verified identity.
+  4. Sessions run with `WAIT_FOR_END = True`, like Run all. When the control is running a request, the confirmation says a new session replaces it: the control follows the newest request.
+- **C, copying (the automatic fallback):** when the function isn't deployed, each action copies its request as lines for a new cell under the control notebook's parameters cell, and opens the notebook, where Run all sends it with the same checks.
+
+## Consequences
+
+- **Easier:** a DBA starts at what needs attention, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts from the same app, all inside Fabric's frame and in the theme they use.
+- **Harder:** the app depends on Fluent's releases (pinned, with the license check), and the bundle grew: about 410 KB gzip in all, from about 245 KB, far under Fabric Apps' limits. Pages load lazily.
+- **Accepted:** Manage's sending mode needs the shared functions project and the identity proof; until both, every deployment runs Manage in copy mode, which needs nothing new.
+
+## Validation
+
+- **Built and tested (2026-11-18):** `npm run verify` (typecheck, lint, Vitest's unit, page, chart, and contrast tests, the license check, and the build); the deploy-time check runs every catalog query (`FABRIC.APP.QUERIES`); before-and-after screenshots of every page in light and dark from the sample-data preview.
+- **The identity proof (pending):** a probe app with functions in a test workspace deployed and ran on the shared capacity: `rayfin up` with `services.functions` succeeded, and the backend refused an anonymous call (403) and a forged token (401). What a function sees of a signed-in caller needs one person in a browser, since no script can create an app session (the external Entra exchange refuses the Azure CLI's tokens). Until it passes, Manage runs in copy mode.
+
+## Sources
+
+Checked 2026-11-18.
+
+- [Fabric Apps overview](https://learn.microsoft.com/fabric/apps/overview), [hosting](https://learn.microsoft.com/fabric/apps/hosting), [connectors](https://learn.microsoft.com/fabric/apps/connectors), [Fabric authentication](https://learn.microsoft.com/fabric/apps/fabric-authentication)
+- [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)
+- [Manage and execute Fabric notebooks with public APIs](https://learn.microsoft.com/fabric/data-engineering/notebook-public-api) and [Job Scheduler - Run On Demand Item Job](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job)
+- [Fluent UI React v9](https://react.fluentui.dev/)

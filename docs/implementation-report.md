@@ -3128,3 +3128,39 @@ The work:
 - **Live:** the live test follows, in a test environment of its own: deploy `main`, upgrade it with this branch, then Run all, `validate.ps1`, the agent loop, and T2's assessment. Until then, [limitations](limitations.md#not-proven-live-yet) lists what isn't proven live.
 
 **Risks.** None new: the agent loop's preview dependencies are in [limitations](limitations.md#preview-disclosures).
+
+### The Insights app as a DBA console (2026-11-18)
+
+**Why.** The user, on `ignite-updates`: "Adjust the Fabric Rayfin App to really be a DBA's dream app to manage and view their estate with the conversational analytics", "more professional, and functional and clean/modern", and "The GitHub Copilot chat interface right in the App is a must and a gamechanger"; then "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible". A separate session builds the Copilot chat; this entry is the app around it ([ADR 0027](adr/0027-insights-app-dba-console.md)).
+
+**Decisions.**
+
+- **Fluent 2** (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT): Fabric's own design language, accessible components, light, dark, and high-contrast themes from tokens, and React 19 support. The decorative visuals, Framer Motion, lucide, d3-sankey, d3-hierarchy, d3-interpolate, and the web fonts are gone.
+- **A DBA's information architecture:** Overview, Estate (T1 to T5, with T4's read replica), Performance, Incidents, Findings, Readiness, Trends, Manage, and Live views, under a left navigation and a global target and period filter.
+- **The Copilot contract first** (`src/copilot/contract.ts`, 935eeed): `AskContext`, `ChartSpec`, and `CopilotApi`, so the chat session and the pages built on it at once. `ChartView` draws every chart, the dock's too.
+- **History and live, labeled everywhere:** the live estate comes from the chat session's function (the coordinator's decision 3), loaded through `import.meta.glob`, so the app builds without it and pages say why there's no live data.
+- **Manage (the coordinator's decision for the user):** A, the app's Manage function, with C, copying the request for Run all, as the automatic fallback; the conditions are in ADR 0027.
+
+**Work summary.**
+
+- **Shell** (`src/shell/`, `src/App.tsx`, `src/main.tsx`, `src/theme/`): the top bar with the GitHub and Fabric account chips, the left navigation with a rail mode, the global filter with the History, Live, or Sample badge, the dock's region (resizable, full screen), and the Fabric-teal themes.
+- **Pages** (`src/pages/`): the nine pages; T5's page from the Cosmos DB session's history contract; the Database Agent loop on Incidents from the agent loop's `database_agent` findings; Security and Optimization read Database Hub live; Overview's **Live now**.
+- **Components** (`src/components/`): `VisualCard` (Ask Copilot, the data, the DAX or the Database Hub API calls, CSV, focus), `DataGrid` (sort, filter, CSV), KPI and health tiles, badges, and empty states.
+- **Data** (`src/data/`): a `DataSource` behind the query client; the catalog's new queries `scenario-runs`, `daily-trend`, `agent-loop`, `cosmos-series`, and `cosmos-findings` (21 in all), with `mayBeEmpty`; the parsers for sessions, days, agent beats, and T5's captures.
+- **Manage** (`src/lib/control.ts`, `src/lib/manage-client.ts`, `src/pages/ManagePage.tsx`): the actions, their bounds, the confirmation, the request's parameters, mode detection, and the copied lines for Run all.
+- **The deploy-time check** (`Test-DemoFabricApp.ps1`): queries marked `mayBeEmpty` are said, not warned about; a Pester case.
+- **`package-lock.json`:** every package from `registry.npmjs.org` with SHA-512. The Fluent packages had resolved through a mirror, which `DbHubDemo.FabricApp.Tests.ps1` caught; the hashes came from `npm pack`, matched npmjs's in public lock files, and `npm ci` verified them.
+- **The preview** (`npm run dev:sample`, `src/preview/`): sample history and live answers, for design work and screenshots.
+- **Docs:** the app's guide (Demo it yourself, pages, Copilot, Manage, update and delete), ADR 0027, and the app's parts of the presentation page and the walkthrough.
+
+**Validation.**
+
+- `npm run verify` (2026-11-18): typecheck, lint, Vitest (151 tests: 150 passed, and 1 failed, the scenario catalog test, below), the license check (136 production packages), and the build. The failure isn't this change's: the agent loop raised the plan-regression scenario's maximum to 30 minutes in `scenario.json`, and the fix to `src/lib/scenarios.ts` is another session's, already under way.
+- `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, FabricApp, Markdown`: Pass. `DbHubDemo.FabricApp.Tests.ps1`: 85 passed. `Docs.Walkthrough.Tests.ps1`: 68 passed.
+- Screenshots of every page, light and dark, before and after, from the sample-data preview.
+- **Manage's sending mode, live (pending):** a probe app with functions, in a test workspace of its own on the shared capacity, deployed with `rayfin up`; its backend refused an anonymous call (403) and a forged token (401). What a function sees of a signed-in caller needs one person in a browser: no script can create an app session.
+
+**Risks.**
+
+- Manage runs in copy mode until the shared functions project and the identity proof land.
+- The bundle grew to about 410 KB gzip, from about 245 KB; pages load lazily, far under Fabric Apps' limits.
