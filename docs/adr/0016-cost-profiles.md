@@ -301,8 +301,10 @@ Prices here are dated examples: list prices in USD for West US 3 from the Azure 
 | The example configuration, a new deployment by a Contributor, at 52df9bd | All month | $397.34; $373.73 on the free tier | $375 | −$22.34 (**Fail**); +$1.27 |
 | The same, after (no role for the session control, so T5 is session-only; the restart counts 720 hours) | Each session | $370.60; $370.27 on the free tier | $390 | +$19.40; +$19.73 |
 
-  If the safety stop that an Owner's first deployment counts isn't put in place after all, that run's worst case is $370.60 ($370.27 on the free tier), within $390, and the run says so. Without the session control's fix, a Contributor's new deployment would price T5 all month: $397.34, over $390.
+If the safety stop that an Owner's first deployment counts isn't put in place after all, that run's worst case is $370.60 ($370.27 on the free tier), within $390, and the run says so. Without the session control's fix, a Contributor's new deployment would price T5 all month: $397.34, over $390.
+
 - **Validation:** unit-tested (`tests/unit/DbHubDemo.SafetyStop.Tests.ps1`: the permissions an Owner, a Contributor, and a Role Based Access Control Administrator have, a group that doesn't exist yet, a read that fails, a role that's current or one action short, and `DEPLOY.COST.T4RESTART` over and within the ceiling; `DbHubDemo.Preflight.Tests.ps1`: an Owner's and a Contributor's first deployment; `DbHubDemo.Cost.Tests.ps1`: the planned case's figures and message; `DbHubDemo.T5.Tests.ps1`: T5's price for a new environment, an update from `main`, and each deployer; `DbHubDemo.Progress.Tests.ps1`; `DbHubDemo.Config.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`: the 390 default). `azuredeploy.json` was rebuilt with the pinned Bicep 0.47.16. Live: see the implementation report.
+
 ## Validation
 
 - **Phase 4 (static):** Pester tests for `estimate-cost.ps1` against recorded API responses, including `Global` meters and the `t2ArcBillableCores` parameter.
