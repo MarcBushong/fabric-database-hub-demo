@@ -718,9 +718,10 @@ function Get-DemoT5CostLifecycle {
         [switch] $Detail
     )
 
+    $asDetail = [bool]$Detail
     $reply = {
         param([string] $Lifecycle, [string] $Reason)
-        if ($Detail) {
+        if ($asDetail) {
             return [pscustomobject]@{ Lifecycle = $Lifecycle; Reason = $Reason; ManualDeleteOnly = ($Reason -ceq 'NoAutoDelete') }
         }
         return $Lifecycle
