@@ -289,6 +289,55 @@ Describe 'Get-DemoCostEstimate' {
         $overMonthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of 50\.00 USD\. It counts idle plus 10 hours of use, {2} USD; T4''s automatic restart for 720 hours, 129\.60 USD; and T5''s container all month \(AlwaysOn\)\. ' -f (& $text $overWorst), (& $text ($overWorst - 50)), (& $text $over.LightUseMonthly))
     }
 
+    It 'warns, and never fails, when only T5''s container priced all month while nothing automatic deletes it puts the month over the ceiling, as at 375 and 390 for a Contributor''s update (the re-review of 0590bbe)' {
+        # A Contributor's environment: no nightly safety stop (T4's restart for the rest of the month), and no role to delete
+        # T5's container after a session, so only stop-demo.ps1 does (-T5ManualDeleteOnly).
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5'; t5Enabled = $true }
+        $estimate = {
+            param([double] $Ceiling, [string] $Lifecycle, [bool] $ManualOnly)
+            $config['monthlyCeilingUsd'] = $Ceiling
+            Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 0 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle $Lifecycle -T5ManualDeleteOnly:$ManualOnly
+        }
+        $money = { param([double] $Value) [regex]::Escape($Value.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+        $sessionMonth = (& $estimate 10000 'Session' $false).MonthlyWorstCase
+        $always = & $estimate 10000 'AlwaysOn' $true
+        $alwaysMonth = $always.MonthlyWorstCase
+        $extra = [double]$always.T5AlwaysOnExtraMonthly
+        $extra | Should -BeGreaterThan 1
+        # Two ceilings between the two worst cases, as 375 and 390 lie between a Contributor's 371.48 and 398.23 at the
+        # 2026-11-19 list prices (ADR 0016).
+        foreach ($share in 0.13, 0.69) {
+            $ceiling = [System.Math]::Round($sessionMonth + $extra * $share, 2)
+            $monthly = (& $estimate $ceiling 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+            $monthly.status | Should -Be 'Warning' -Because ('a ceiling of {0} fits the month with the container for the running hours only' -f $ceiling)
+            $exception = $monthly.evidence.t5CeilingException
+            [System.Math]::Abs($exception.sessionMonthlyUsd - $sessionMonth) | Should -BeLessOrEqual 0.011
+            $exception.t5AlwaysOnExtraMonthly | Should -Be $extra
+            # After an Owner's grant: T4's restart about a day each (96 hours) instead of the rest of the month (720), at 0.18 an hour.
+            [System.Math]::Abs($exception.grantMonthlyUsd - ($exception.sessionMonthlyUsd - 0.18 * 720 + 0.18 * 96)) | Should -BeLessOrEqual 0.011
+            $monthly.evidence.t4AutoRestartWorstCaseMonthly | Should -Be 129.6
+            $monthly.evidence.t4AutoRestartWithSafetyStopMonthly | Should -Be 17.28 -Because 'DEPLOY.T5.LIFECYCLE names the same month after a grant'
+            $monthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of {2} USD\.' -f (& $money $alwaysMonth), (& $money ($alwaysMonth - $ceiling)), (& $money $ceiling))
+            $monthly.message | Should -Match 'its container exists only during a session, but only \./scripts/stop-demo\.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t'
+            $monthly.message | Should -Match ('This is a Warning, not a Fail: T5''s container is priced all month, {0} USD more than for the running hours only, because no role can delete it automatically after a session \(the session control has no role, and the nightly safety stop''s role can''t delete it\), so only \./scripts/stop-demo\.ps1 does; with it deleted after each session, the month would be {1} USD, within the ceiling\.$' -f (& $money $extra), (& $money $exception.sessionMonthlyUsd))
+            $monthly.remediation | Should -Match ('^deploy\.ps1 and start-demo\.ps1 go on\. To clear it, any one of these: an Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json, which gives the session control and the nightly safety stop their roles, so the worst case falls to about {0} USD; or raise monthlyCeilingUsd to at least {1} in your configuration' -f (& $money $exception.grantMonthlyUsd), [System.Math]::Ceiling($alwaysMonth))
+            $monthly.remediation | Should -Match 'or set t5Enabled to false, which leaves T5 out\. Until then, run \./scripts/stop-demo\.ps1 after each session: it deletes T5''s container\.$'
+            $monthly.evidence.ceilingWarning | Should -Match ('^The month''s worst case is {0} USD, {1} USD over the hard ceiling of {2} USD\. This is a Warning, not a Fail: ' -f (& $money $alwaysMonth), (& $money ($alwaysMonth - $ceiling)), (& $money $ceiling))
+            $config['monthlyCeilingUsd'] | Should -Be $ceiling -Because 'the configured ceiling never changes'
+        }
+        # Over the ceiling even with the container for the running hours only: still a Fail.
+        $over = (& $estimate ([System.Math]::Round($sessionMonth - 1, 2)) 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $over.status | Should -Be 'Fail'
+        $over.message | Should -Not -Match 'This is a Warning'
+        $over.evidence.Contains('t5CeilingException') | Should -BeFalse
+        # All month for another reason (a session-control role without the container's actions, so no stop deletes it): a Fail.
+        $kept = (& $estimate ([System.Math]::Round($sessionMonth + $extra * 0.5, 2)) 'AlwaysOn' $false).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $kept.status | Should -Be 'Fail'
+        $kept.message | Should -Match 'its container stays between sessions until the session control''s role can create it'
+        # Within the ceiling: a Pass, which says nothing of a Warning.
+        ((& $estimate ([System.Math]::Ceiling($alwaysMonth) + 1) 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
+    }
+
     It 'counts no Bastion hour by default, since a default deployment and session have none, and -BastionHours counts it (2026-11-19, the docs audit)' {
         # Only start-demo.ps1 -Interactive deploys Bastion, and its cost guardrail passes -BastionHours.
         $default = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -NetworkMode public

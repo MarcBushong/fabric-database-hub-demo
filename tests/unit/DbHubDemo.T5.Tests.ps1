@@ -865,6 +865,32 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Get-Priced -State $script:fromMain -Permission $null | Should -Be 'AlwaysOn'
         Get-Priced -State $script:new -Permission $null | Should -Be 'Session'
     }
+
+    It 'says why with -Detail, and ManualDeleteOnly only where nothing automatic deletes the container while stop-demo.ps1 does (the re-review of 0590bbe)' {
+        $detail = {
+            param([object] $State, [object] $Permission, [bool] $Deploys)
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $State; Permission = $Permission; Deploys = $Deploys } { Get-DemoT5CostLifecycle -Config $Config -State $State -Permission $Permission -ThisRunDeploys:$Deploys -Detail }
+        }
+        $reason = { param([object] $Answer) '{0}/{1}/{2}' -f $Answer.Lifecycle, $Answer.Reason, $Answer.ManualDeleteOnly }
+        # A Contributor's update of an environment from main whose session control never got a role, and that environment
+        # afterwards (its recorded Session, which start-demo.ps1 reads): only stop-demo.ps1 deletes the container.
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $false; HoldsOther = $false }
+        & $reason (& $detail $script:fromMain $script:contributor $true) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) $null $false) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail $script:new $script:contributor $true) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail $script:fromMain $script:owner $true) | Should -Be 'Session/Session/False'
+        # All month for another reason: no stop deletes the container, or the environment predates its lifecycle, or the
+        # role can't be read.
+        $script:control = $script:older
+        & $reason (& $detail $script:fromMain $script:contributor $true) | Should -Be 'AlwaysOn/Lacking/False'
+        & $reason (& $detail ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) $null $false) | Should -Be 'AlwaysOn/Lacking/False'
+        & $reason (& $detail $script:fromMain $null $false) | Should -Be 'AlwaysOn/NotRecorded/False'
+        $script:control = [pscustomobject]@{ Mode = 'Unknown'; Why = 'the role couldn''t be read'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        & $reason (& $detail $script:new $script:owner $true) | Should -Be 'AlwaysOn/Unknown/False'
+        & $reason (& $detail $script:new $null $false) | Should -Be 'Session/NoEnvironment/False'
+        # Without -Detail, the lifecycle alone, as before.
+        Get-Priced -State $script:new -Permission $null | Should -BeOfType [string]
+    }
 }
 
 Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when the run records what preflight didn''t price' {
@@ -901,14 +927,51 @@ Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when th
         $manual.evidence['lifecycle'] | Should -Be 'Session' -Because 'stop-demo.ps1 still deletes it'
         $manual.evidence['price'] | Should -Be 'AlwaysOn'
         $manual.message | Should -Match '^T5''s container is deleted only when you run \./scripts/stop-demo\.ps1'
-        $manual.message | Should -Match 'the month''s worst case is about 22\.32 USD more than its estimate: 422\.32 USD, over monthlyCeilingUsd \(415\.00 USD\)\.$'
-        $manual.remediation | Should -Match 'stop-demo\.ps1 after each session'
-        $manual.remediation | Should -Match 'raise monthlyCeilingUsd to at least 423'
+        # Over the ceiling only because nothing automatic deletes the container: said as PREFLIGHT.COST.MONTHLY says it (the
+        # re-review of 0590bbe).
+        $manual.message | Should -Match 'the month''s worst case is about 22\.32 USD more than its estimate: 422\.32 USD, over monthlyCeilingUsd \(415\.00 USD\)\. This is a Warning, not a Fail: T5''s container is priced all month, 22\.32 USD more than for the running hours only, because no role can delete it automatically after a session \(the session control has no role, and the nightly safety stop''s role can''t delete it\), so only \./scripts/stop-demo\.ps1 does; with it deleted after each session, the month would be 400\.00 USD, within the ceiling\.$'
+        $manual.remediation | Should -Match '^deploy\.ps1 and start-demo\.ps1 go on\. To clear it, any one of these: an Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json, which gives the session control and the nightly safety stop their roles, so the worst case falls to about 400\.00 USD; or raise monthlyCeilingUsd to at least 423 in your configuration'
+        $manual.remediation | Should -Match 'or set t5Enabled to false, which leaves T5 out\. Until then, run \./scripts/stop-demo\.ps1 after each session: it deletes T5''s container\.$'
+        $manual.evidence['t5CeilingException']['sessionMonthlyUsd'] | Should -Be 400
         # With the nightly safety stop deleting it, nothing changes.
         Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $true; Price = 'Session' } }
         $nightly = Update-Lifecycle -Prior @(New-Priced 'Session' 400.00)
         $nightly.status | Should -Be 'Pass'
         $nightly.message | Should -Not -Match 'Preflight priced'
+    }
+
+    It 'counts T4''s restart for the rest of the month too when DEPLOY.COST.T4RESTART says the safety stop preflight counted isn''t in place, at <Ceiling> USD (the re-review of 0590bbe)' -ForEach @(
+        @{ Ceiling = 415; Over = $false; Exception = $false }
+        @{ Ceiling = 390; Over = $true; Exception = $true }
+        @{ Ceiling = 360; Over = $true; Exception = $false }
+    ) {
+        # An Owner whose role writes a policy refused: preflight counted the safety stop and the session control this run sets
+        # up (149.34 USD), DEPLOY.COST.T4RESTART says 371.48 without the stop, and the control ends with no role, so only
+        # stop-demo.ps1 deletes T5's container: 26.74 USD more, 398.22 USD (ADR 0016's figures, 2026-11-19 list prices).
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $false; Price = 'AlwaysOn' } }
+        $priced = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t5ContainerLifecycle = 'Session'; t5AlwaysOnExtraMonthly = 26.74; monthlyWorstCase = 149.34; t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 371.48; t4AutoRestartWorstCaseMonthly = 34.18; t4AutoRestartWithSafetyStopMonthly = 34.18 })
+        $restart = New-DemoResult -CheckId 'DEPLOY.COST.T4RESTART' -Area 'infra' -Target 'T4' -Status 'Warning' -Message 'Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place.' -Evidence ([ordered]@{ worstCaseWithoutSafetyStop = 371.48; monthlyCeilingUsd = $Ceiling; overCeiling = (371.48 -gt $Ceiling) })
+        $result = Update-Lifecycle -Prior @($priced, $restart) -Ceiling $Ceiling
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match ('Preflight priced its throughput for a session''s hours only, so the month''s worst case is about 26\.74 USD more than DEPLOY\.COST\.T4RESTART''s, which counts T4''s restart for the rest of the month: 398\.22 USD, {0} monthlyCeilingUsd \({1}\.00 USD\)\.' -f $(if ($Over) { 'over' } else { 'within' }), $Ceiling)
+        $result.evidence['monthlyWorstCase'] | Should -Be 398.22
+        $result.evidence['worstCaseBasis'] | Should -Be 'WithoutSafetyStop'
+        if ($Exception) {
+            $result.message | Should -Match 'This is a Warning, not a Fail: T5''s container is priced all month, 26\.74 USD more than for the running hours only, because no role can delete it automatically after a session.*the month would be 371\.48 USD, within the ceiling\.$'
+            $result.remediation | Should -Match 'so the worst case falls to about 149\.34 USD; or raise monthlyCeilingUsd to at least 399 in your configuration'
+            $result.evidence['t5CeilingException']['grantMonthlyUsd'] | Should -Be 149.34
+        }
+        else {
+            $result.message | Should -Not -Match 'This is a Warning, not a Fail'
+            $result.evidence.Contains('t5CeilingException') | Should -BeFalse
+        }
+        if ($Over -and -not $Exception) {
+            $result.remediation | Should -Match 'Or raise monthlyCeilingUsd to at least 399 in your configuration\.$' -Because 'over the ceiling with T5 for the running hours too: T4''s restart, not T5, puts it over'
+        }
+        # Without DEPLOY.COST.T4RESTART, preflight's own worst case.
+        $planned = Update-Lifecycle -Prior @($priced) -Ceiling $Ceiling
+        $planned.message | Should -Match 'about 26\.74 USD more than its estimate: 176\.08 USD, within monthlyCeilingUsd'
+        $planned.evidence['worstCaseBasis'] | Should -Be 'Preflight'
     }
 
     It 'says it''s within the ceiling, and adds nothing when preflight priced AlwaysOn already or didn''t run' {

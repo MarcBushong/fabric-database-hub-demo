@@ -705,7 +705,6 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlName -MockWith {
             [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; Identity = 'id-dbhub-automation'; RoleName = 'DbHub Demo Activity Operator'; DemoResourceGroup = 'rg-dbhub-demo'; DemoResourceGroupId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo'; AutomationAccount = 'aa-dbhub-control'; AutomationAccountId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-control/providers/Microsoft.Automation/automationAccounts/aa-dbhub-control'; StopRunbook = 'DbHub-Stop'; SafetyStopSchedule = 'dbhub-t4-safety-stop' }
         }
-        $script:control = $true
         $script:schedule = 'Scheduled'
         $script:roleId = 'dddddddd-0000-0000-0000-000000000009'
         $script:a1 = [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
@@ -713,7 +712,7 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         # Each DbHub-Stop job's own result line (Job - Get Output; #23), by job ID: Stopped unless a test says otherwise, and
         # $null for output without the line.
         $script:stopResults = @{}
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlSetting -MockWith { [pscustomobject]@{ Enabled = $script:control } }
+
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:schedule; NextRunUtc = $null } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlRoleId -MockWith { $script:roleId }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { 'dddddddd-0000-0000-0000-000000000004' }
@@ -751,7 +750,8 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         @{ Case = 'it hasn''t run yet'; Run = $null; Reason = 'it hasn''t run yet$'; LastRun = 'none' }
         @{ Case = 'its last run stopped what ran'; Run = @('Completed', 'Stopped'); Reason = 'its last run didn''t fail$'; LastRun = 'Completed \(Stopped\)' }
     ) {
-        $script:control = $false
+        # The session control's daily T4 safety stop isn't in place, so only the nightly one can count.
+        $script:schedule = 'NotScheduled'
         $script:nightly = New-NightlyState -State 'InPlace'
         if ($null -ne $Run) {
             $script:nightlyRuns = New-NightlyRun -JobStatus $Run[0] -ResultStatus $Run[1]
@@ -774,7 +774,7 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         @{ Case = 'its runs couldn''t be read'; Setup = { $script:nightly = New-NightlyState -State 'InPlace'; $script:nightlyRuns = [pscustomobject]@{ Ok = $false; Error = 'HTTP 429'; Stop = $null; Check = $null } }; Missing = 'StopJob'; Reason = 'couldn''t be read \(HTTP 429\), so it''s taken as failed'; Fix = 'status\.ps1' }
         @{ Case = 'a read throws'; Setup = { Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { throw 'The connection was reset.' } }; Missing = 'SafetyStop'; Reason = 'couldn''t be checked \(The connection was reset\.\), so it''s taken as missing'; Fix = 'then run this again' }
     ) {
-        $script:control = $false
+        $script:schedule = 'NotScheduled'
         & $Setup
         $coverage = & $script:coverage
         $coverage.Counts | Should -BeFalse
@@ -783,6 +783,65 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         $coverage.Fix | Should -Match $Fix
         $coverage.Evidence.counts | Should -BeFalse
         $coverage.Evidence.missing | Should -Be $Missing
+    }
+
+    It 'counts a nightly run from runbooks older than t5Status that was Partial only because of T5''s container, its job Failed for that alone (the re-review of 0590bbe)' {
+        # An environment whose runbooks predate 2026-11-19's t5Status (R910): DbHub-Stop -Scope Nightly fails a Partial job.
+        $script:schedule = 'NotScheduled'
+        $script:nightly = New-NightlyState -State 'InPlace'
+        $notGranted = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        $script:nightlyRuns = New-NightlyRun -JobStatus 'Failed' -ResultStatus 'Partial'
+        $script:nightlyRuns.Stop.Result['failed'] = @($notGranted)
+        $script:nightlyRuns.Stop.Result['t5'] = $notGranted
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeTrue -Because 'the VMs and T4 were stopped'
+        $coverage.Evidence.nightlyLastRun | Should -Be 'Failed (Partial, only T5''s container)'
+        # Anything else in its failed list: T4 may not have been stopped.
+        $script:nightlyRuns.Stop.Result['failed'] = @('pgflex01-abc123 not stopped: HTTP 409; the nightly safety stop stops it tonight', $notGranted)
+        (& $script:coverage).Counts | Should -BeFalse
+        # Today's runbooks keep T5 apart (t5Status), so their Partial is never T5's alone.
+        $script:nightlyRuns.Stop.Result['failed'] = @($notGranted)
+        $script:nightlyRuns.Stop.Result['t5Status'] = 'NotGranted'
+        (& $script:coverage).Counts | Should -BeFalse
+    }
+
+    It 'counts the control''s last DbHub-Stop job from runbooks older than t5Status when only T5''s container made it Partial: <Case> (the re-review of 0590bbe)' -ForEach @(
+        @{ Case = 'the auto-stop'; Counts = $true; Line = @{ action = 'stop-all'; status = 'Partial'; message = 'Auto-stop: auto-stop removed, sqlvm01 deallocating, pgflex01-abc123 stopping; failed: T5''s container not deleted: HTTP 429.'; done = @('auto-stop removed', 'sqlvm01 deallocating', 'pgflex01-abc123 stopping'); failed = @('T5''s container not deleted: HTTP 429') } }
+        @{ Case = 'the daily T4 job'; Counts = $true; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 (pgflex01-abc123) was Ready; its stop was accepted. T5''s container not deleted: HTTP 429.'; replica = ''; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the daily T4 job, T4 already stopped'; Counts = $true; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 is Stopped. T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once.'; replica = ''; t5 = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once' } }
+        @{ Case = 'the daily T4 job whose T4 stop failed too'; Counts = $false; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 (pgflex01-abc123) was Ready; its stop was failed. T5''s container not deleted: HTTP 429.'; replica = ''; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the daily T4 job whose replica wasn''t stopped'; Counts = $false; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 is Stopped. T4''s read replica pgflex01-abc123-replica (a session left it behind) not stopped: HTTP 409; ./scripts/stop-demo.ps1 deletes it. T5''s container not deleted: HTTP 429.'; replica = 'T4''s read replica pgflex01-abc123-replica (a session left it behind) not stopped: HTTP 409; ./scripts/stop-demo.ps1 deletes it'; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the auto-stop whose T4 stop failed too'; Counts = $false; Line = @{ action = 'stop-all'; status = 'Partial'; message = 'Auto-stop: auto-stop removed; failed: pgflex01-abc123, T5''s container not deleted: HTTP 429.'; done = @('auto-stop removed'); failed = @('pgflex01-abc123', 'T5''s container not deleted: HTTP 429') } }
+    ) {
+        $script:jobs.Value = @{ value = @(New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z') }
+        $script:stopResults['job-Completed'] = $Line
+        $coverage = & $script:controlCoverage
+        $coverage.Counts | Should -Be $Counts
+        $coverage.Evidence.lastStopJob | Should -Be $(if ($Counts) { 'Completed (Partial, only T5''s container)' } else { 'Completed (Partial)' })
+    }
+
+    It 'counts the session control''s daily T4 safety stop whatever an older configuration''s control.enabled says, as deploy.ps1 sets it up anyway (DEPLOY.CONTROL.ON; the docs audit, 2026-11-19)' {
+        # An older configuration that still says "enabled": false, where the nightly safety stop isn't in place but the
+        # control's daily T4 safety stop is.
+        $config = New-TestConfig
+        $config['control']['enabled'] = $false
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityControlSetting -Config $Config }).LegacyOff | Should -BeTrue
+        $read = { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4RestartCoverage -Config $Config -ConfigPath './config/demo.config.json' } }
+        $coverage = & $read
+        $coverage.Counts | Should -BeTrue -Because 'the configuration''s setting reads as on since 2026-11-14 (Get-DemoActivityControlSetting)'
+        $coverage.Reason | Should -Be 'the on-demand control''s daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'
+        # Even a setting that reads off: only the control's state decides, never control.enabled.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlSetting -MockWith { [pscustomobject]@{ Enabled = $false; LegacyOff = $true } }
+        (& $read).Counts | Should -BeTrue -Because 'the coverage reads no longer ask control.enabled'
+        $control = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4ControlRestartCoverage -Config $Config -ConfigPath './config/demo.config.json' }
+        $control.Counts | Should -BeTrue
+        $control.Evidence.Contains('control') | Should -BeFalse -Because 'nothing says the control is off'
+        # A control whose daily T4 safety stop isn't in place: the fix sets it up again, and never says to set control.enabled.
+        $script:schedule = 'NotScheduled'
+        $missing = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4ControlRestartCoverage -Config $Config -ConfigPath './config/demo.config.json' }
+        $missing.Missing | Should -Be 'Schedule'
+        $missing.Fix | Should -Not -Match 'control\.enabled'
+        (& $read).Fix | Should -Not -Match 'control\.enabled'
     }
 
     It 'counts the on-demand control''s daily T4 safety stop when the nightly one isn''t in place, and names the nightly one''s gap when neither counts' {
@@ -841,7 +900,7 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
     }
 
     It 'the control''s own doesn''t count, and names the missing piece and its exact fix: <Case>' -ForEach @(
-        @{ Case = 'the control isn''t set up'; Setup = { $script:control = $false }; Missing = 'Control'; Reason = 'control\.enabled is false'; Fix = 'Set control\.enabled to true and run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json; an Owner then runs \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json -GrantRole once' }
+
         @{ Case = 'the schedule isn''t in place'; Setup = { $script:schedule = 'NotScheduled' }; Missing = 'Schedule'; Reason = 'missing, disabled, or not linked to DbHub-Stop'; Fix = '^Run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json, which schedules it again\.$' }
         @{ Case = 'the schedule couldn''t be read'; Setup = { $script:schedule = 'Unknown' }; Missing = 'Schedule'; Reason = 'couldn''t be read, so it''s taken as missing'; Fix = 'schedules it again' }
         @{ Case = 'the custom role doesn''t exist'; Setup = { $script:roleId = '' }; Missing = 'A1'; Reason = 'isn''t assigned: without it DbHub-Stop can''t stop T4'; Fix = '-GrantRole, or set assignRoles to true and run \./scripts/deploy\.ps1, which grants A1 again after the template\.$' }
@@ -864,7 +923,7 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
 
     It 'reports which worst case the monthly ceiling counts: a Pass with a safety stop, a Warning with the fix without one, Not selected without T4' {
         $config = New-TestConfig
-        $script:control = $false
+        $script:schedule = 'NotScheduled'
         $script:nightly = New-NightlyState -State 'InPlace'
         $counted = & $script:coverage
         $pass = InModuleScope DbHubDemo -Parameters @{ Config = $config; Coverage = $counted } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $Coverage -CheckPrefix 'START' }
