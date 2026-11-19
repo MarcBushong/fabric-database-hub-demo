@@ -620,19 +620,76 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.LastIndexOf('health')
     }
 
-    It 'with -Force, goes ahead once PassWaitMinutes is over, and says the pass hadn''t reported (#65 follow-up)' {
+    It 'with -Force, goes on waiting while the pass converges a step after its generation reported, and probes only once it''s Ready (#65 follow-up review)' {
+        # An existing golden copy keeps its Arc marker, so after an update its pass's first step that converges is WorkloadRunner,
+        # whose install stops the workload in the guest over PowerShell Direct: health.json then reports InProgress with the new
+        # generation, so generationPending is gone, but the pass isn't over.
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        $script:reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            $script:sequence.Add(('health {0}' -f $script:reads))
+            if ($script:reads -eq 1) { [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generationPending = $true } }
+            elseif ($script:reads -le 3) { [pscustomobject]@{ state = 'InProgress'; currentStep = 'WorkloadRunner'; message = 'Step WorkloadRunner is converging (attempt 1 of 3).' } }
+            else { [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.' } }
+        }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.evidence.hostState | Should -Be 'Ready'
+        $result.evidence.PSObject.Properties['passPending'] | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 4 -Exactly
+        $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.IndexOf('health 4')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'runs its bootstrap pass \(InProgress, step WorkloadRunner\); onboarding waits until the pass ends' }
+    }
+
+    It 'with -Force, also waits through a restart and a host with no report yet, and not at all where a pass ends (#65 follow-up review)' {
         $script:probe.agentStatus = 'Connected'
         $script:probe.agentResourceName = 'arcsql01'
         $script:probe.agentResourceGroup = 'rg-dbhub-demo'
         $script:machine = New-TestMachine
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ state = 'InProgress'; generationPending = $true } }
-        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PassWaitMinutes 0 -PollIntervalSeconds 1
-        $result.status | Should -Be 'Pass'
-        $result.evidence.passPending | Should -BeTrue
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 1 -Exactly
-        @($script:runs | Where-Object { $_.Name -eq 'DbHubDemo-ArcProbe' }).Count | Should -Be 1
-        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'still checks its new bootstrap generation' }
+        $script:passReads = [System.Collections.Generic.Queue[object]]::new()
+        foreach ($state in 'RebootPending', 'NotStarted', 'Ready') {
+            $script:passReads.Enqueue([pscustomobject]@{ state = $state; currentStep = 'ConfigureSql' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:sequence.Add('health'); $script:passReads.Dequeue() }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $result.evidence.hostState | Should -Be 'Ready'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 3 -Exactly
+        $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.LastIndexOf('health')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'runs its bootstrap pass \(RebootPending, step ConfigureSql\)' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'hasn''t reported a bootstrap pass yet \(NotStarted\)' }
+        # Where a pass ends, there's nothing to wait for: one read each, and no wait in the evidence.
+        foreach ($state in 'WaitingForArcOnboarding', 'ManualActionRequired', 'Failed', 'WaitingForProductKey', 'WaitingForGuestSql') {
+            $script:passReads.Enqueue([pscustomobject]@{ state = $state; currentStep = 'WorkloadRunner' })
+            $ended = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+            $ended.evidence.hostState | Should -Be $state
+            $ended.evidence.PSObject.Properties['passWaitSeconds'] | Should -BeNullOrEmpty -Because $state
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 8 -Exactly
+    }
+
+    It 'with -Force, goes ahead once PassWaitMinutes is over, and says the pass hadn''t ended (#65 follow-up)' {
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:passHealth }
+        foreach ($read in @([pscustomobject]@{ state = 'InProgress'; generationPending = $true }, [pscustomobject]@{ state = 'InProgress'; currentStep = 'WorkloadRunner' })) {
+            $script:passHealth = $read
+            $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PassWaitMinutes 0 -PollIntervalSeconds 1
+            $result.status | Should -Be 'Pass'
+            $result.evidence.passPending | Should -BeTrue
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 2 -Exactly
+        @($script:runs | Where-Object { $_.Name -eq 'DbHubDemo-ArcProbe' }).Count | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'still checks every step again for its new bootstrap generation \(starting\) after 0 minutes' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'still runs its bootstrap pass \(InProgress, step WorkloadRunner\) after 0 minutes' }
     }
 
     It 'gives the host the run''s recovery key, and keeps a guest restart the probe made in the evidence (issue #65)' {

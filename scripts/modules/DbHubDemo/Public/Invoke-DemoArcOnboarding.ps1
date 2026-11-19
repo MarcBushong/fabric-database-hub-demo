@@ -10,6 +10,7 @@ function Invoke-DemoArcOnboarding {
        while the host reports WaitingForArcOnboarding, or with -Force; otherwise the host's state is reported
        and nothing changes. In PaygWizard mode the host waits there right after the SQL Server media step,
        before the setup wizard; in ProductKey and Developer modes, after the unattended install (ADR 0003).
+       With -Force it first waits, up to -PassWaitMinutes, while the host's bootstrap pass runs (#65 follow-up).
     2. Probes the guest through vm/bootstrap/Invoke-DemoArcOnboard.ps1 -Action Probe (read-only): PowerShell
        Direct reachability, isolation from IMDS and the wire server (ADR 0004), DNS, and 'azcmagent show -j'.
     3. Reads Microsoft.HybridCompute/machines/arcsql01 and applies the decision table
@@ -79,8 +80,10 @@ function Invoke-DemoArcOnboarding {
     Seconds between reads while waiting.
 
     .PARAMETER PassWaitMinutes
-    With -Force, how long onboarding waits while the host's pass checks a new bootstrap generation (the health read's
-    generationPending, #65 follow-up) before its PowerShell Direct sessions go into the guest. 0 doesn't wait.
+    With -Force, how long onboarding waits while the host's bootstrap pass runs, before its PowerShell Direct sessions go
+    into the guest (#65 follow-up): a new generation that hasn't reported yet (the health read's generationPending), a step
+    it converges (InProgress), a restart (RebootPending), or no report yet (NotStarted). Any other state ends the wait. 0
+    doesn't wait.
 
     .EXAMPLE
     Invoke-DemoArcOnboarding -Config (Get-DemoConfig -Path ./config/demo.config.json)
@@ -153,14 +156,33 @@ function Invoke-DemoArcOnboarding {
         return (& $newResult 'Not selected' 'What if: nothing ran. Onboarding reads the host''s health, probes the guest, and onboards it while the host waits for it.')
     }
     # #65 follow-up: after a new bundle, the host's pass checks every step again, and PowerShell Direct sessions that
-    # deploy.ps1 started while it ran broke (the user's update, 2026-11-18). The health read reports that pass
-    # (generationPending); without -Force the host's state already holds onboarding back, so -Force (a golden copy, a
-    # repair) waits for the pass here, up to PassWaitMinutes, before its probe and marker go into the guest.
-    if ($Force -and [bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')) {
+    # deploy.ps1 started while it ran broke (the user's update, 2026-11-18). Without -Force the host's state already holds
+    # onboarding back, so -Force (a golden copy, a repair) waits here, up to PassWaitMinutes, before its probe and marker go
+    # into the guest, for as long as a pass runs: a generation that hasn't reported yet (the health read's generationPending),
+    # and then the step that pass converges, which it reports as InProgress (the follow-up's review: an existing golden copy
+    # keeps its Arc marker, so its pass goes on to WorkloadRunner, whose install stops the workload in the guest), a restart
+    # (RebootPending), and no report yet (NotStarted). Any other state is where a pass ends: WaitingForArcOnboarding, Ready,
+    # ManualActionRequired, Failed, WaitingForProductKey, or another wait.
+    $passRunning = {
+        param([object] $Read)
+        [bool](Get-DemoMemberValue -InputObject $Read -Name 'generationPending') -or [string](Get-DemoMemberValue -InputObject $Read -Name 'state') -in 'InProgress', 'RebootPending', 'NotStarted'
+    }
+    $passText = {
+        param([object] $Read)
+        $passStep = [string](Get-DemoMemberValue -InputObject $Read -Name 'currentStep')
+        $passState = [string](Get-DemoMemberValue -InputObject $Read -Name 'state')
+        if ([bool](Get-DemoMemberValue -InputObject $Read -Name 'generationPending')) {
+            return ('checks every step again for its new bootstrap generation ({0})' -f $(if ($passStep) { 'step {0}' -f $passStep } else { 'starting' }))
+        }
+        if ($passState -eq 'NotStarted') {
+            return 'hasn''t reported a bootstrap pass yet (NotStarted)'
+        }
+        return ('runs its bootstrap pass ({0}{1})' -f $passState, $(if ($passStep) { ', step {0}' -f $passStep } else { '' }))
+    }
+    if ($Force -and (& $passRunning $health)) {
         $passClock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ([bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending') -and $passClock.Elapsed.TotalMinutes -lt $PassWaitMinutes) {
-            $passStep = [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')
-            Write-DemoLog -Message ('{0} checks every step again for its new bootstrap generation ({1}); onboarding waits for that pass, so its PowerShell Direct sessions into {2} don''t overlap it ({3} of at most {4} minutes).' -f $target.HostVmName, $(if ($passStep) { 'step {0}' -f $passStep } else { 'starting' }), $target.MachineName, [int]$passClock.Elapsed.TotalMinutes, $PassWaitMinutes)
+        while ((& $passRunning $health) -and $passClock.Elapsed.TotalMinutes -lt $PassWaitMinutes) {
+            Write-DemoLog -Message ('{0} {1}; onboarding waits until the pass ends, so its PowerShell Direct sessions into {2} don''t overlap it ({3} of at most {4} minutes).' -f $target.HostVmName, (& $passText $health), $target.MachineName, [int]$passClock.Elapsed.TotalMinutes, $PassWaitMinutes)
             Start-Sleep -Seconds $PollIntervalSeconds
             try {
                 $again = Get-DemoVmHealth -Config $Config -VmName $target.HostVmName -View Summary
@@ -173,9 +195,9 @@ function Invoke-DemoArcOnboarding {
             }
         }
         $evidence['passWaitSeconds'] = [int]$passClock.Elapsed.TotalSeconds
-        if ([bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')) {
+        if (& $passRunning $health) {
             $evidence['passPending'] = $true
-            Write-DemoLog -Level Warning -Message ('{0} still checks its new bootstrap generation after {1} minutes; onboarding goes ahead, and a PowerShell Direct channel that breaks is recovered (issue #65).' -f $target.HostVmName, $PassWaitMinutes)
+            Write-DemoLog -Level Warning -Message ('{0} still {1} after {2} minutes; onboarding goes ahead, and a PowerShell Direct channel that breaks is recovered (issue #65).' -f $target.HostVmName, (& $passText $health), $PassWaitMinutes)
         }
     }
     $hostState = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
