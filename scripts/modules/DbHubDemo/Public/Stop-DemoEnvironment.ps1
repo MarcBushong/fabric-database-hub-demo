@@ -82,6 +82,23 @@ function Stop-DemoEnvironment {
     How long the profiles' off waits for both VMs together before the stop goes on anyway, and how long the guest's clean
     shutdown may take (default 180).
 
+    .PARAMETER SkipFabric
+    Leave Fabric alone (2026-11-19): no history save, not even with fabric.saveHistoryOnStop, and no pause of the Fabric
+    capacity. deploy.ps1's stop at the end of an update uses it (Invoke-DemoUpdateEndStop): that run took its own history
+    snapshot, which goes on in Fabric and must not be cancelled by a pause.
+
+    .PARAMETER UpdateEnd
+    deploy.ps1's stop at the end of an update (2026-11-19, Invoke-DemoUpdateEndStop; the review of the stop, findings 1, 2,
+    and 4). A session that uses the demo (Get-DemoUpdateStopSession) ends the stop: checked before its first change, which
+    stops nothing (STOP.SESSION, Not selected), and again before T2's guest and the VMs, which keep running (STOP.SESSION, a
+    Warning, because the activity is off already). The nightly stop is settled last, and only once the VMs, T4, and T5's
+    container are stopped (Resolve-DemoUpdateStopNightly), so a stop cut short (Ctrl+C) or one that failed leaves tonight's
+    stop in place. Not with -ParkT2.
+
+    .PARAMETER RunStartedUtc
+    With -UpdateEnd: when the run began, so a start-demo.ps1 session from before then, which the nightly stop ended, doesn't
+    count, and one that started since then does.
+
     .EXAMPLE
     Stop-DemoEnvironment -Config $config -RemoveT3
     #>
@@ -105,7 +122,14 @@ function Stop-DemoEnvironment {
         [int] $SaveHistoryWindowMinutes = 720,
 
         [ValidateRange(30, 900)]
-        [int] $ProfileOffWaitSeconds = 180
+        [int] $ProfileOffWaitSeconds = 180,
+
+        [switch] $SkipFabric,
+
+        [switch] $UpdateEnd,
+
+        [AllowNull()]
+        [object] $RunStartedUtc = $null
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -160,13 +184,24 @@ function Stop-DemoEnvironment {
     if ($RemoveBastionOnly) {
         return $results.ToArray()
     }
+    # deploy.ps1's stop at the end of an update (2026-11-19): a session that started since the end's last check keeps the
+    # demo, before anything that a session uses changes.
+    $updateEnd = $UpdateEnd -and -not $ParkT2
+    if ($updateEnd) {
+        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
+        if ([bool]$session.Held) {
+            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage Before))
+            return $results.ToArray()
+        }
+    }
     if (-not $ParkT2 -and (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
         $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
     }
-    if (-not $ParkT2) {
+    if (-not $ParkT2 -and -not $updateEnd) {
         # The busy marker (2026-11-14): everything stops now, so nothing waits for the nightly stop any more; a deferred
         # pass goes, and the VMs' auto-shutdown comes back to autoShutdownTime (STOP.NIGHTLYSTOP, when something changed).
+        # The stop at the end of an update settles it last instead (Resolve-DemoUpdateStopNightly).
         foreach ($item in @(Resolve-DemoBusyNightlyStop -Config $Config -State $state -Purpose Stop -Confirm:$false)) {
             $results.Add($item)
         }
@@ -254,7 +289,7 @@ function Stop-DemoEnvironment {
         }
         else {
             $capacitySettingEarly = Get-DemoFabricCapacitySetting -Config $Config
-            if ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop) {
+            if (-not $SkipFabric -and ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop)) {
                 $postgresHistory = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
                 if ($null -ne $postgresHistory -and $null -ne $postgresHistory.Result) {
                     $results.Add($postgresHistory.Result)
@@ -281,6 +316,14 @@ function Stop-DemoEnvironment {
         $tuningRelease = Invoke-DemoT3AutoTuningRelease -Config $Config -T3 $t3Tuning -DeploymentId ([string]$state.Tags['deploymentId'])
     }
 
+    if ($updateEnd) {
+        # Again before T2's guest and the VMs (2026-11-19): a session that started while the activity went off keeps its VMs.
+        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
+        if ([bool]$session.Held) {
+            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage During -ReplicaDeleting:$replicaDeleting))
+            return $results.ToArray()
+        }
+    }
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
         # action (ShutDown) shuts it down when the host deallocates otherwise.
@@ -339,9 +382,10 @@ function Stop-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))
     }
 
-    if (-not $ParkT2) {
+    if (-not $ParkT2 -and -not $SkipFabric) {
         # Phase 26b (ADR 0023): the session's history first, then the capacity the demo resumed, because a pause would
-        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called.
+        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called. -SkipFabric (deploy.ps1's stop
+        # at the end of an update, 2026-11-19) leaves both alone.
         $capacitySetting = Get-DemoFabricCapacitySetting -Config $Config
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
@@ -387,6 +431,12 @@ function Stop-DemoEnvironment {
     # billing until the next session creates it again. It's kept when Run all couldn't create it again; STOP.T5 says why.
     if (-not $ParkT2 -and (Test-DemoT5Enabled -Config $Config)) {
         $results.Add((Invoke-DemoT5ContainerStop -Config $Config -State $(if ($t5Missing) { $null } else { $t5Read }) -DeploymentState $state -Confirm:$false))
+    }
+    if ($updateEnd) {
+        # The stop at the end of an update settles the nightly stop last, once everything is stopped (2026-11-19).
+        foreach ($item in @(Resolve-DemoUpdateStopNightly -Config $Config -Result $results.ToArray())) {
+            $results.Add($item)
+        }
     }
 
     if ($RemoveT3) {

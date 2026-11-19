@@ -928,7 +928,8 @@ function Get-DemoGoldenCaptureControlResult {
     .DESCRIPTION
     - Not selected when the control is off (control.enabled false).
     - Fail, and nothing is captured, while a DbHub-Control or DbHub-Stop job is queued or running, while the auto-stop
-      dbhub-autostop is pending (its time hasn't come), or when either can't be read.
+      dbhub-autostop is pending (its time hasn't come), or when either can't be read. A start-demo.ps1 session's auto-stop
+      (its description's marker, 2026-11-19) says so, with ./scripts/stop-demo.ps1 first as the fix.
     - Pass otherwise, also when the control's Automation account doesn't exist.
     #>
     [CmdletBinding()]
@@ -966,9 +967,16 @@ function Get-DemoGoldenCaptureControlResult {
         return (& $new 'Fail' ('The on-demand auto-stop {0} couldn''t be read ({1}), so a run may be active. Nothing was captured.' -f $name.AutoStopSchedule, $schedule.Error) $evidence 'Run capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).')
     }
     if ($schedule.Ok) {
-        $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+        $properties = Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties'
+        $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
         if ($null -ne $stopUtc -and $stopUtc -gt $NowUtc.ToUniversalTime()) {
             $evidence['autoStopUtc'] = $stopUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+            # start-demo.ps1's own auto-stop (2026-11-19, the review's finding 8): a session from the PC, which
+            # stop-demo.ps1 ends; the capture starts archost01 itself.
+            if (([string](Get-DemoMemberValue -InputObject $properties -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)) {
+                $evidence['startDemo'] = $true
+                return (& $new 'Fail' ('A start-demo.ps1 session runs, and its auto-stop ({0}) deallocates archost01 at {1:yyyy-MM-dd HH:mm} UTC, which would cut into the capture.' -f $name.AutoStopSchedule, $stopUtc) $evidence 'Nothing was captured. Run ./scripts/stop-demo.ps1 first: it ends the session and removes its auto-stop, and the capture starts archost01 itself. Then run capture-t2-golden.ps1 again.')
+            }
             return (& $new 'Fail' ('An on-demand run is active until {0:yyyy-MM-dd HH:mm} UTC: its auto-stop ({1}) deallocates archost01 then, which would cut into the capture, and its start of T2 waits for the capture.' -f $stopUtc, $name.AutoStopSchedule) $evidence $wait)
         }
     }

@@ -60,7 +60,8 @@ The Azure region (default westus3). Preflight checks that Database Hub supports 
 
 .PARAMETER Prefix
 The resource name prefix (default dbhub). When rg-<prefix>-demo exists and is yours, the configuration is written from
-what's deployed; when it isn't yours, nothing is written.
+what's deployed; when it isn't yours, nothing is written. Without it, -Force keeps the prefix of the configuration it
+replaces (2026-11-19).
 
 .PARAMETER T2SqlInstallMode
 JumpstartImage or Developer, to choose T2's mode on purpose; without it, JumpstartImage, the default, with no question
@@ -98,7 +99,8 @@ machine's).
 Write fabric.manageCapacity true (a capacity that's yours alone).
 
 .PARAMETER Force
-Replace an existing configuration, after a copy to out/config-backup.
+Replace an existing configuration, after a copy to out/config-backup. Without -Prefix, the new one keeps that
+configuration's prefix and environment, so a rerun never moves the file to another environment; INIT.CONFIG says so.
 
 .PARAMETER NonInteractive
 Never ask; an ambiguous choice is Manual action required.

@@ -462,3 +462,96 @@ function Get-DemoSignedInUser {
         DisplayName       = [string](Get-DemoMemberValue -InputObject $me -Name 'displayName')
     }
 }
+
+function Get-DemoConfigFileIdentity {
+    <#
+    .SYNOPSIS
+    The prefix and environment a configuration file holds, for an init.ps1 run that overwrites it (2026-11-19, the final
+    tests' F7): Prefix and Environment, each empty unless config/environment.schema.json allows it, and Read, false when
+    the file isn't a JSON object. Reads only the file. Internal.
+
+    .DESCRIPTION
+    Without them, init.ps1 -Force with no -Prefix wrote the example's prefix, dbhub, over a second environment's file, so
+    the next deploy.ps1 updated the first environment.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $identity = [pscustomobject]@{ Read = $false; Prefix = ''; Environment = '' }
+    try {
+        $held = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -Depth 64 -ErrorAction Stop
+    }
+    catch {
+        # Not JSON: nothing is kept, and the run goes on as for a file without a prefix.
+        return $identity
+    }
+    if ($held -isnot [System.Collections.IDictionary]) {
+        return $identity
+    }
+    $identity.Read = $true
+    if ([string]$held['prefix'] -cmatch '^[a-z][a-z0-9]{2,7}$') {
+        $identity.Prefix = [string]$held['prefix']
+    }
+    if ([string]$held['environment'] -cmatch '^[a-z][a-z0-9]{1,7}$') {
+        $identity.Environment = [string]$held['environment']
+    }
+    return $identity
+}
+
+function Resolve-DemoInitCommandText {
+    <#
+    .SYNOPSIS
+    A text init.ps1 prints (a result's remediation, a next step, a line it logs) with every command it tells you to run
+    written for this run (2026-11-19, from the final tests' F5): each init.ps1 command as ./scripts/init.ps1 with the run's
+    -Prefix when that isn't the default and the command names none, then, through Resolve-DemoDeployCommandText, which NOT
+    DONE uses, the run's -ConfigPath on every ./scripts/*.ps1 and deploy.ps1 command. Pure. Internal.
+
+    .DESCRIPTION
+    Without them, a fix that said "init.ps1 -Force ..." wrote the default prefix's configuration, in config/demo.config.json,
+    for a second environment, and the next deploy.ps1 updated the first one. An init.ps1 mention is a command when ./scripts/
+    comes before it, when "run" comes right before it, or when a parameter follows it; "init.ps1's" and other mentions in
+    passing stay as they are. A command's own parameters run to the end of its clause (a period, comma, colon, semicolon,
+    or parenthesis outside quotes), where -Prefix is looked for, so the text can go through again unchanged. A run with
+    the default prefix and the default configuration file changes nothing.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text,
+
+        [AllowEmptyString()]
+        [string] $Prefix = '',
+
+        [string] $DefaultPrefix = 'dbhub',
+
+        [AllowEmptyString()]
+        [string] $ConfigPath = ''
+    )
+
+    if (-not $Text) {
+        return [string]$Text
+    }
+    $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
+    $addPrefix = [bool]$Prefix -and $Prefix -cne $DefaultPrefix
+    if (-not $addPrefix -and $command -eq './scripts/deploy.ps1') {
+        return $Text
+    }
+    $source = $Text
+    $rewritten = [regex]::Replace($Text, '(?<![\w./\\-])(?<path>(?:\./)?scripts/)?init\.ps1(?![\w''])', {
+            param($Match)
+            $before = $source.Substring(0, $Match.Index)
+            $after = $source.Substring($Match.Index + $Match.Length)
+            if (-not ($Match.Groups['path'].Success -or $after -match '^[ ]+-[A-Za-z]' -or $before -match '(?i)\brun\s+$')) {
+                return $Match.Value
+            }
+            $named = $after -match '^(?:"[^"]*"|[^.;:,()"])*?\s-Prefix\b'
+            return ('./scripts/init.ps1{0}' -f $(if ($addPrefix -and -not $named) { ' -Prefix ' + $Prefix } else { '' }))
+        })
+    return [string](Resolve-DemoDeployCommandText -Text $rewritten -Command $command).Text
+}

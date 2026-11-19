@@ -337,7 +337,9 @@ function Wait-DemoStoppedStart {
     re-review of PR 16). On the T2 host the golden source's release comes first, so the interim never waits for a guest a
     capture left off; when the release leaves it off (a capture in progress there, or a release that failed),
     DEPLOY.INTERIM_T2 is Not selected and nothing is sent or waited for there (Get-DemoGoldenHeldInterimResult, review of
-    PR 17, 2026-11-04). Internal.
+    PR 17, 2026-11-04). DEPLOY.VMSTART's evidence also says what the run found (2026-11-19): running, the VMs that ran when
+    it began, and before, each stopped VM's power state then and T4's, so the run's end stops again what it started when the
+    demo was stopped (Invoke-DemoUpdateEndStop). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -426,6 +428,17 @@ function Wait-DemoStoppedStart {
     $vms = @($Request.Vms.Keys)
     $t4Started = $null -ne $t4 -and [string]$t4.status -eq 'Pass'
     $evidence = [ordered]@{ vms = $vms; started = $issued.ToArray(); notRunning = $notRunning.ToArray(); t4 = $(if ($null -ne $t4) { [string]$t4.status } else { '' }); minutes = $minutes }
+    # What the run found (2026-11-19), for its end: a demo that was stopped is stopped again (Invoke-DemoUpdateEndStop).
+    $before = [ordered]@{}
+    foreach ($vm in $vms) {
+        $before[$vm] = ([string](Get-DemoMemberValue -InputObject $Request.Vms[$vm] -Name 'Before')).Split('/')[-1]
+    }
+    if ($null -ne $Request.T4) {
+        $before['T4'] = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Request.T4 -Name 'evidence') -Name 'stateBefore')
+    }
+    $foundRunning = Get-DemoMemberValue -InputObject $Request -Name 'Running'
+    $evidence['running'] = @(@($foundRunning) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $evidence['before'] = $before
     # Remembered for the ending's line about what bills: what this run started and now runs, and T4 when it started it.
     Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($issued | Where-Object { $_ -notin $notRunning }) + @(if ($t4Started) { 'T4' }))
     $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }

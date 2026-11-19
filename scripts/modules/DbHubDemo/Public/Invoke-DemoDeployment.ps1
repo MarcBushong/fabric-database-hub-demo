@@ -61,6 +61,9 @@ function Invoke-DemoDeployment {
         does. It never stops the run or keeps it from DONE.
     12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
         parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
+    13. Not here: once deploy.ps1 judges the run DONE, its ending stops again what the run started when it found the demo
+        stopped (2026-11-19; Complete-DemoDeploymentRun, Invoke-DemoUpdateEndStop, DEPLOY.ENDSTOP), from DEPLOY.VMSTART's
+        evidence of what ran when the run began. Both paths record it the same way (Wait-DemoStoppedStart).
 
     A Fail stops the run, and nothing after it runs but the switch and the replica's end. Manual action required never
     stops it and is never hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass

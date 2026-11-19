@@ -76,8 +76,9 @@ Describe 'The progress model (Phase 28, brief item 11)' {
 
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
         $model = New-TestModel
-        # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), come last, with or without Fabric.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control')
+        # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), then the stop at the end of an
+        # update (2026-11-19), come last, with or without Fabric.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control', 'EndStop')
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['nonBlocking'] | Should -BeTrue
         $history['state'] | Should -Be 'Pending'
@@ -89,7 +90,17 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'NightlyStop' }) | Should -Be 'nightly stop'
         $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
         Get-TestStep -Model $skipFabric -Id 'Fabric.History' | Should -BeNullOrEmpty
-        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'NightlyStop', 'Control')
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'NightlyStop', 'Control', 'EndStop')
+    }
+
+    It 'shows the stop at the end of an update last, after T4''s read replica, as not blocking DONE, labeled with -KeepRunning (2026-11-19)' {
+        $catalog = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T4Enabled -T5Enabled) }
+        @(($catalog['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] })[-2..-1] | Should -Be @('T4ReplicaEnd', 'EndStop')
+        $endStop = Get-TestStep -Model $catalog -Id 'EndStop'
+        $endStop['nonBlocking'] | Should -BeTrue
+        $endStop['state'] | Should -Be 'Pending'
+        $endStop['label'] | Should -Match '-KeepRunning'
+        (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'EndStop' }) | Should -Be 'stop at the end'
     }
 
     It 'takes the snapshot again on a resumed run that has nothing left to do, never "finished in an earlier run", and skips it on a run without the validation (2026-11-06)' {

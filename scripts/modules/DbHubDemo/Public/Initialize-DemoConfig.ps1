@@ -58,7 +58,10 @@ function Initialize-DemoConfig {
        -ManageCapacity.
 
     Results use the ADR 0012 statuses. Messages name the subscription, workspace, capacity, and group; their IDs are
-    only in the evidence and the file. Returns Results, Config, Path, Written, BackupPath, NextSteps, and Existing (Kind:
+    only in the evidence and the file. Every command a result, its fix, or a next step tells you to run names this run's
+    -Prefix when it isn't the default, and its -ConfigPath when it isn't config/demo.config.json (Resolve-DemoInitCommandText,
+    2026-11-19), so it never writes the default prefix's configuration for another environment. Returns Results, Config,
+    Path, Written, BackupPath, NextSteps, and Existing (Kind:
     New, Recovered, NewPrefix, NotYours, or Unreadable; Prefix, ResourceGroup, Signal, and Note, the line deploy.ps1's
     banner and status page show).
 
@@ -88,7 +91,8 @@ function Initialize-DemoConfig {
 
     .PARAMETER Prefix
     The resource name prefix (default dbhub). When its environment exists and isn't yours, nothing is written (issue 60);
-    without it, a first run picks a free prefix by itself.
+    without it, a first run picks a free prefix by itself, and a run over an existing configuration keeps the prefix it
+    holds, as if -Prefix named it (2026-11-19).
 
     .PARAMETER T2SqlInstallMode
     JumpstartImage or Developer, to choose T2's mode on purpose; empty gives JumpstartImage, the default, without a
@@ -126,7 +130,8 @@ function Initialize-DemoConfig {
     what it resumed. Only for a capacity that's yours alone.
 
     .PARAMETER Force
-    Replace an existing configuration, after a backup.
+    Replace an existing configuration, after a backup. Without -Prefix, the new one keeps the old one's prefix and
+    environment (Get-DemoConfigFileIdentity), so it stays that environment's; INIT.CONFIG says so.
 
     .PARAMETER NonInteractive
     Never ask: ambiguous choices become Manual action required.
@@ -212,6 +217,10 @@ function Initialize-DemoConfig {
     $fullPath = Resolve-DemoUserPath -Path $Path
     $dryRun = [bool]$WhatIfPreference
     $interactive = -not $NonInteractive -and (Test-DemoInteractiveSession)
+    # How a fix says to choose where this run couldn't ask (the final tests' F6): without -NonInteractive only when it was
+    # given here, where a person could answer; otherwise the terminal couldn't take input (CI, an assistant, redirected
+    # input, or deploy.ps1's first run there).
+    $chooseHow = if ($NonInteractive -and (Test-DemoInteractiveSession)) { 'without -NonInteractive' } else { 'in a terminal that can take input' }
     $docs = @{
         AccountList   = 'https://learn.microsoft.com/cli/azure/account#az-account-list'
         SignIn        = 'https://learn.microsoft.com/cli/azure/authenticate-azure-cli-interactively'
@@ -229,8 +238,18 @@ function Initialize-DemoConfig {
         $results.Add((New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl))
     }
     $existingSummary = $null
+    # The prefix the commands this run prints name (Resolve-DemoInitCommandText): -Prefix until the run resolves its own.
+    $commandPrefix = $Prefix
+    $commandDefaultPrefix = 'dbhub'
     $finish = {
         param([bool] $Written, [string] $BackupPath = '', $Config = $null)
+        # Every command a result, its fix, or a next step tells you to run names this run's -Prefix and -ConfigPath
+        # (2026-11-19), so it never writes the default prefix's configuration, or config/demo.config.json, for another
+        # environment, nor runs another script on it.
+        foreach ($item in $results) {
+            $item.message = Protect-DemoText -Text (Resolve-DemoInitCommandText -Text ([string]$item.message) -Prefix $commandPrefix -DefaultPrefix $commandDefaultPrefix -ConfigPath $fullPath)
+            $item.remediation = Protect-DemoText -Text (Resolve-DemoInitCommandText -Text ([string]$item.remediation) -Prefix $commandPrefix -DefaultPrefix $commandDefaultPrefix -ConfigPath $fullPath)
+        }
         [pscustomobject]@{
             PSTypeName = 'DbHubDemo.InitResult'
             Results    = $results.ToArray()
@@ -238,7 +257,7 @@ function Initialize-DemoConfig {
             Path       = $fullPath
             Written    = $Written
             BackupPath = $BackupPath
-            NextSteps  = $nextSteps.ToArray()
+            NextSteps  = @($nextSteps | ForEach-Object { Resolve-DemoInitCommandText -Text $_ -Prefix $commandPrefix -DefaultPrefix $commandDefaultPrefix -ConfigPath $fullPath })
             Existing   = $existingSummary
         }
     }
@@ -249,6 +268,16 @@ function Initialize-DemoConfig {
         return (& $finish $false)
     }
     $exists = Test-Path -LiteralPath $fullPath -PathType Leaf
+    # The environment the file is for (2026-11-19, the final tests' F7): a run that overwrites it without -Prefix keeps its
+    # prefix, as if -Prefix named it, and its environment (Defaults), never the example's dbhub, so whatever command is
+    # followed, the file never moves to another environment. An explicit -Prefix still wins.
+    $held = if ($exists) { Get-DemoConfigFileIdentity -Path $fullPath } else { $null }
+    $keptPrefix = ''
+    if ($null -ne $held -and $held.Prefix -and -not $Prefix) {
+        $keptPrefix = $held.Prefix
+        $Prefix = $keptPrefix
+        $commandPrefix = $Prefix
+    }
     if ($exists -and -not $Force -and -not $dryRun) {
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Not selected' ('{0} already exists, so nothing was changed.' -f $fullPath) @{ path = $fullPath } 'To write it again from your sign-in, run init.ps1 -Force: it keeps a copy of the old file in out/config-backup first.'
         $nextSteps.Add('./scripts/preflight.ps1')
@@ -297,7 +326,7 @@ function Initialize-DemoConfig {
         $chosen = $candidates[(Read-DemoChoice -Title 'Which subscription should the demo deploy into? (Contributor is enough.)' -Option $labels -Default 0)]
     }
     else {
-        & $add 'INIT.SUBSCRIPTION' 'preflight' 'subscription' 'Manual action required' ('The Azure CLI has {0} subscriptions, and init.ps1 doesn''t guess one without asking.' -f $candidates.Count) ([ordered]@{ subscriptions = @($candidates | ForEach-Object { $_.Name }) }) 'Run init.ps1 -SubscriptionId <id> (''az account list --output table'' lists them), or run it without -NonInteractive to choose.' $docs.AccountList
+        & $add 'INIT.SUBSCRIPTION' 'preflight' 'subscription' 'Manual action required' ('The Azure CLI has {0} subscriptions, and init.ps1 doesn''t guess one without asking.' -f $candidates.Count) ([ordered]@{ subscriptions = @($candidates | ForEach-Object { $_.Name }) }) ('Run init.ps1 -SubscriptionId <id> (''az account list --output table'' lists them), or run init.ps1 {0}, to choose.' -f $chooseHow) $docs.AccountList
         return (& $finish $false)
     }
     $subscription = [string]$chosen.SubscriptionId
@@ -359,8 +388,15 @@ function Initialize-DemoConfig {
     $example = Get-Content -LiteralPath $ExamplePath -Raw | ConvertFrom-Json -AsHashtable -Depth 32
     $schemaDefaults = Get-DemoSchemaDefault -Node (Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64)
     $defaultPrefix = if ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
+    $commandDefaultPrefix = $defaultPrefix
     $effectivePrefix = if ($Prefix) { $Prefix } else { $defaultPrefix }
     $environment = if ($example['environment']) { [string]$example['environment'] } else { 'demo' }
+    $keptEnvironment = ''
+    if ($null -ne $held -and $held.Environment -and $held.Prefix -ceq $effectivePrefix -and $held.Environment -cne $environment) {
+        # The file's environment stays with its prefix, so rg-<prefix>-<environment> stays the group it's for (F7).
+        $environment = $held.Environment
+        $keptEnvironment = $environment
+    }
     $exampleFabric = if ($example['fabric'] -is [System.Collections.IDictionary]) { $example['fabric'] } else { @{} }
     $defaultWorkspace = if ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
     $workspace = if ($WorkspaceName) { $WorkspaceName.Trim() } else { $defaultWorkspace }
@@ -383,6 +419,7 @@ function Initialize-DemoConfig {
         return (& $finish $false)
     }
     $effectivePrefix = [string]$existing.Prefix
+    $commandPrefix = $effectivePrefix
     if ($existing.Kind -in 'New', 'NewPrefix' -and -not $WorkspaceName -and $effectivePrefix -cne $defaultPrefix) {
         # A new environment's own workspace, so it never shares another environment's: "Database Hub Demo <prefix>" for every
         # prefix but the default, whether -Prefix named it or the run picked it. Before 2026-11-19 an explicit -Prefix kept
@@ -535,7 +572,7 @@ function Initialize-DemoConfig {
             $capacity = $capacities[$index]
         }
         else {
-            & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Manual action required' ('You can assign {0} Fabric capacities ({1}), and init.ps1 doesn''t guess one without asking.' -f $capacities.Count, $visible) @{} 'Run init.ps1 -Force -CapacityName <name>, or without -NonInteractive to choose.' $docs.Capacities
+            & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Manual action required' ('You can assign {0} Fabric capacities ({1}), and init.ps1 doesn''t guess one without asking.' -f $capacities.Count, $visible) @{} ('Run init.ps1 -Force -CapacityName <name>, or run init.ps1 -Force {0}, to choose.' -f $chooseHow) $docs.Capacities
         }
         if ($null -ne $capacity) {
             $capacityChosen = [string](Get-DemoMemberValue -InputObject $capacity -Name 'displayName')
@@ -724,7 +761,7 @@ function Initialize-DemoConfig {
     }
     elseif (-not $mode) {
         $mode = 'JumpstartImage'
-        Write-DemoLog -Message 'T2 gets SQL Server from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage, the default): unattended, so nobody signs in to a VM. To choose another mode on purpose, run init.ps1 -Force -T2SqlInstallMode Developer (T2 in Database Hub''s Estate only), or set ProductKey in the configuration (prerequisite P10).'
+        Write-DemoLog -Message (Resolve-DemoInitCommandText -Text 'T2 gets SQL Server from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage, the default): unattended, so nobody signs in to a VM. To choose another mode on purpose, run init.ps1 -Force -T2SqlInstallMode Developer (T2 in Database Hub''s Estate only), or set ProductKey in the configuration (prerequisite P10).' -Prefix $effectivePrefix -DefaultPrefix $defaultPrefix -ConfigPath $fullPath)
     }
     else {
         Write-DemoLog -Message ('T2 gets SQL Server in t2SqlInstallMode {0}, as -T2SqlInstallMode asked.' -f $mode)
@@ -777,6 +814,7 @@ function Initialize-DemoConfig {
         $config['location'] = $Location
     }
     $config['prefix'] = $effectivePrefix
+    $config['environment'] = $environment
     $config['t2SqlInstallMode'] = $mode
     $config['t3AdminGroupObjectId'] = $groupId
     $config['owner'] = $ownerTag
@@ -840,8 +878,11 @@ function Initialize-DemoConfig {
     $json = $config | ConvertTo-Json -Depth 32
     $validationErrors = @()
     $valid = Test-Json -Json $json -SchemaFile $SchemaPath -ErrorVariable validationErrors -ErrorAction SilentlyContinue
-    $written = @(@('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', 'fabric') + @($(if ($recovered) { @($existing.Values.Keys | ForEach-Object { ([string]$_).Split('.')[0] }) })) + @($(if ($controlWorkspace) { 'control' })) | Where-Object { $_ } | Select-Object -Unique)
+    $written = @(@('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', $(if ($keptEnvironment) { 'environment' }), 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', 'fabric') + @($(if ($recovered) { @($existing.Values.Keys | ForEach-Object { ([string]$_).Split('.')[0] }) })) + @($(if ($controlWorkspace) { 'control' })) | Where-Object { $_ } | Select-Object -Unique)
     $summary = 'subscription "{0}", region {1}, prefix {2}, network {3}, T2 {4}, the workspace "{5}" on "{6}", and the P6 group {7}' -f $chosen.Name, $config['location'], $effectivePrefix, $config['networkMode'], $mode, $workspace, $(if ($capacityChosen) { $capacityChosen } else { '(none yet)' }), $(if ($groupId -ne $zeroGuid) { '"' + $groupName + '"' } else { '(none yet)' })
+    # What the run kept from the file it overwrites, so it's still that environment's (the final tests' F7).
+    $keptWhat = @($(if ($keptPrefix) { 'the prefix ' + $keptPrefix }), $(if ($keptEnvironment) { 'the environment ' + $keptEnvironment }) | Where-Object { $_ }) -join ' and '
+    $keptNote = if ($keptWhat) { ' {0} {1} from the configuration it {2}{3}, so the file is still for rg-{4}-{5}.' -f $(if ($dryRun) { 'It would keep' } else { 'It kept' }), $keptWhat, $(if ($dryRun) { 'overwrites' } else { 'overwrote' }), $(if ($keptPrefix) { ' (no -Prefix was given)' } else { '' }), $effectivePrefix, $environment } else { '' }
     if (-not $valid) {
         $details = ($validationErrors | ForEach-Object { $_.Exception.Message } | Select-Object -Unique) -join '; '
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Fail' ('The configuration doesn''t match config/environment.schema.json, so it wasn''t written: {0}' -f $details) @{} 'Check the values you passed to init.ps1 and run it again.' $docs.Schema
@@ -849,7 +890,7 @@ function Initialize-DemoConfig {
     }
     $backupPath = ''
     if ($dryRun -or -not $PSCmdlet.ShouldProcess($fullPath, 'Write the demo configuration')) {
-        & $add 'INIT.CONFIG' 'preflight' 'repo' 'Not selected' ('What if: {0} would be written ({1}){2}, validated against the schema.{3}' -f $fullPath, $summary, $(if ($exists -and -not $Force) { '; it exists, so init.ps1 needs -Force to replace it' } else { '' }), $zoneNote) ([ordered]@{ path = $fullPath; keys = @($written) }) '' ''
+        & $add 'INIT.CONFIG' 'preflight' 'repo' 'Not selected' ('What if: {0} would be written ({1}){2}, validated against the schema.{3}{4}' -f $fullPath, $summary, $(if ($exists -and -not $Force) { '; it exists, so init.ps1 needs -Force to replace it' } else { '' }), $zoneNote, $keptNote) ([ordered]@{ path = $fullPath; keys = @($written) }) '' ''
     }
     else {
         try {
@@ -869,7 +910,7 @@ function Initialize-DemoConfig {
             & $add 'INIT.CONFIG' 'preflight' 'repo' 'Fail' ('The configuration couldn''t be written: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) @{} 'Check that the folder is writable, then run init.ps1 again.' ''
             return (& $finish $false $backupPath $config)
         }
-        $message = 'Wrote {0}: {1}. It''s Git-ignored and holds no secrets, and it matches the schema.{2}{3}' -f $fullPath, $summary, $(if ($backupPath) { ' The old file is in ' + $backupPath + '.' } else { '' }), $zoneNote
+        $message = 'Wrote {0}: {1}. It''s Git-ignored and holds no secrets, and it matches the schema.{2}{3}{4}' -f $fullPath, $summary, $(if ($backupPath) { ' The old file is in ' + $backupPath + '.' } else { '' }), $zoneNote, $keptNote
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Pass' $message ([ordered]@{ path = $fullPath; backupPath = $backupPath; keys = @($written) }) '' ''
     }
     #endregion 9. The configuration
