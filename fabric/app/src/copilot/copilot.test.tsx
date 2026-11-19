@@ -12,10 +12,17 @@ import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 const fakeToken = () => ["gho", "D".repeat(36)].join("_");
 const RELAY = "https://relay.example";
 
+// The app's estate function, as the dock reads it (estate.ts), for the live view's tests.
+const estateMock = vi.hoisted(() => ({ readEstate: vi.fn() }));
+vi.mock("./estate", () => ({ readEstate: estateMock.readEstate }));
+
 class FakeSocket {
     static last: FakeSocket | null = null;
+    static all: FakeSocket[] = [];
     /** When set, the relay refuses the start with this fatal error. */
     static startError: { code: string; message: string } | null = null;
+    /** When set, plays the relay's side of the conversation instead of the default script: it gets each question and tool answer. */
+    static script: ((socket: FakeSocket, message: Record<string, unknown>) => void) | null = null;
     readyState = 0;
     closed = false;
     sent: Array<Record<string, unknown>> = [];
@@ -25,6 +32,7 @@ class FakeSocket {
     onerror: ((ev: Event) => unknown) | null = null;
     constructor(readonly url: string) {
         FakeSocket.last = this;
+        FakeSocket.all.push(this);
         setTimeout(() => {
             this.readyState = 1;
             this.onopen?.(new Event("open"));
@@ -36,6 +44,10 @@ class FakeSocket {
         if (message.type === "start") {
             if (FakeSocket.startError) this.emit({ type: "error", ...FakeSocket.startError, fatal: true });
             else this.emit({ type: "ready", sessionId: "ask-1", model: null, login: "octo", plan: "enterprise" });
+        }
+        if (FakeSocket.script && (message.type === "user" || message.type === "tool_result")) {
+            FakeSocket.script(this, message);
+            return;
         }
         if (message.type === "user") this.emit({ type: "tool_call", callId: "c1", name: "run_dax", arguments: { query: "EVALUATE ROW(\"CpuPct\", 88.2)", purpose: "Peak CPU" } });
         if (message.type === "tool_result") {
@@ -50,6 +62,11 @@ class FakeSocket {
     close() {
         this.readyState = 3;
         this.closed = true;
+    }
+    /** The relay closing the conversation's socket (its session ended). */
+    drop() {
+        this.readyState = 3;
+        this.onclose?.({ code: 1000, reason: "" } as CloseEvent);
     }
 }
 
@@ -96,10 +113,10 @@ const queryClient: QueryClient = {
     clear: () => undefined,
 };
 
-function renderDock(initialOpen = true) {
+function renderDock(initialOpen = true, estate = false) {
     return render(
         <QueryClientContext.Provider value={queryClient}>
-            <CopilotProvider initialOpen={initialOpen} settings={{ relayUrl: RELAY, estate: false }}>
+            <CopilotProvider initialOpen={initialOpen} settings={{ relayUrl: RELAY, estate }}>
                 <Harness />
             </CopilotProvider>
         </QueryClientContext.Provider>,
@@ -109,6 +126,9 @@ function renderDock(initialOpen = true) {
 beforeEach(() => {
     hasCosmos = 0;
     FakeSocket.startError = null;
+    FakeSocket.script = null;
+    FakeSocket.all = [];
+    estateMock.readEstate.mockReset();
     vi.mocked(queryClient.run).mockClear();
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -300,5 +320,175 @@ describe("the Copilot dock", () => {
         expect(await screen.findByRole("button", { name: /Sign in with GitHub/ })).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Close Copilot" }));
         expect(screen.getByText("closed")).toBeInTheDocument();
+    });
+});
+
+// R925 (2026-11-19): a live turn ended with its query rows and no answer, silently. Each way the relay can deliver the
+// model's text after the rows is scripted here, and so is a model that writes none.
+describe("the end of a turn (R925)", () => {
+    const ANSWER = "T2 needs attention first: CPU above 90% for 14 minutes.";
+    const QUESTION = "How is my estate doing right now?";
+    const dax = (callId: string) => ({ type: "tool_call", callId, name: "run_dax", arguments: { query: 'EVALUATE ROW("CpuPct", 88.2)', purpose: "Peak CPU" } });
+
+    function signedIn() {
+        window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+    }
+    async function ask(question = QUESTION) {
+        await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo"));
+        const box = screen.getByRole("textbox", { name: "Message Copilot" });
+        fireEvent.change(box, { target: { value: question } });
+        fireEvent.keyDown(box, { key: "Enter" });
+    }
+    const resultOf = (socket: FakeSocket, callId: string) => socket.sent.find((m) => m.type === "tool_result" && m.callId === callId);
+    const follows = (first: HTMLElement, second: HTMLElement) => Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+    it("renders a final answer that comes as a new message after the query rows", async () => {
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit(dax("c1"));
+            else {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock();
+        await ask();
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        expect(screen.queryByText("Copilot didn't write an answer")).not.toBeInTheDocument();
+    });
+
+    it("renders an answer that comes only as deltas after the query rows", async () => {
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit(dax("c1"));
+            else {
+                s.emit({ type: "delta", messageId: "m2", text: "T2 needs attention first: " });
+                s.emit({ type: "delta", messageId: "m2", text: "CPU above 90% for 14 minutes." });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock();
+        await ask();
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        await waitFor(() => expect(screen.getByRole("button", { name: /Show the source/ })).toBeInTheDocument());
+        expect(screen.queryByText("Copilot didn't write an answer")).not.toBeInTheDocument();
+    });
+
+    it("renders the last message when the turn's end arrives before it", async () => {
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit(dax("c1"));
+            else {
+                s.emit({ type: "idle" });
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+            }
+        };
+        signedIn();
+        renderDock();
+        await ask();
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        expect(screen.queryByText("Copilot didn't write an answer")).not.toBeInTheDocument();
+    });
+
+    it("says Copilot didn't write an answer, with Retry, which asks the same conversation and fills the same turn", async () => {
+        let questions = 0;
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") {
+                questions += 1;
+                if (questions === 1) {
+                    s.emit({ type: "message", messageId: "m1", text: "I'll check the history." });
+                    s.emit(dax("c1"));
+                } else {
+                    s.emit({ type: "message", messageId: "m3", text: ANSWER });
+                    s.emit({ type: "idle" });
+                }
+            } else if (m.callId === "c1") s.emit({ type: "tool_call", callId: "c2", name: "suggest_followups", arguments: { questions: ["Why T2?"] } });
+            else if (m.callId === "c2") s.emit({ type: "idle" });
+        };
+        signedIn();
+        renderDock();
+        await ask();
+        expect(await screen.findByText("Copilot didn't write an answer")).toBeInTheDocument();
+        const socket = FakeSocket.last!;
+        // The follow-ups' answer reminds Copilot that it hasn't written the answer since its last query.
+        expect(String(resultOf(socket, "c2")?.result)).toMatch(/haven't written the answer itself yet/);
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        expect(screen.queryByText("Copilot didn't write an answer")).not.toBeInTheDocument();
+        const asked = socket.sent.filter((m) => m.type === "user").map((m) => String(m.text));
+        expect(asked).toHaveLength(2);
+        expect(asked[1]).toContain(`You didn't write an answer to my last question: "${QUESTION}"`);
+        expect(document.querySelectorAll(".copilot-user")).toHaveLength(1);
+        expect(document.querySelectorAll(".copilot-answer")).toHaveLength(1);
+    });
+
+    it("gives Copilot one plain sentence when the live view isn't available, and doesn't offer it again in the conversation", async () => {
+        const sentence = "Database Hub's live view isn't available to the app";
+        estateMock.readEstate.mockResolvedValue({
+            view: "health",
+            source: [],
+            scope: { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroup: "rg-test" },
+            data: {},
+            errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized"],
+            unavailable: sentence,
+            at: "2026-11-19T21:48:48Z",
+        });
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") {
+                if (s === FakeSocket.all[0]) s.emit({ type: "tool_call", callId: "e1", name: "estate_overview", arguments: { view: "health" } });
+                else {
+                    s.emit({ type: "message", messageId: `n${FakeSocket.all.length}`, text: "From the history: T2 needs attention first." });
+                    s.emit({ type: "idle" });
+                }
+            } else if (m.callId === "e1") s.emit({ type: "tool_call", callId: "e2", name: "estate_overview", arguments: { view: "inventory" } });
+            else if (m.callId === "e2") {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await ask();
+        await screen.findByText(ANSWER);
+        const first = FakeSocket.all[0];
+        expect((first.sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
+        const told = String(resultOf(first, "e1")?.result);
+        expect(resultOf(first, "e1")).toMatchObject({ ok: false });
+        expect(told).toContain(sentence);
+        expect(told).not.toMatch(/HTTP|401|filtered-summary|\/health/);
+        // The second live call in the conversation doesn't reach the function.
+        expect(String(resultOf(first, "e2")?.result)).toMatch(/Don't call estate_overview again/);
+        expect(estateMock.readEstate).toHaveBeenCalledTimes(1);
+        fireEvent.click(screen.getByRole("button", { name: /Live estate from Database Hub: health/ }));
+        expect(screen.getByText(new RegExp(`^${sentence}`))).toBeInTheDocument();
+        expect(screen.queryByText(/401|HTTP/)).not.toBeInTheDocument();
+
+        // A new session in the same conversation (the relay closed the last one) doesn't offer the live view at all.
+        await act(async () => first.drop());
+        await ask("And now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
+        await screen.findByText("From the history: T2 needs attention first.");
+        const second = FakeSocket.all[1];
+        expect((second.sent[0].tools as Array<{ name: string }>).map((t) => t.name)).not.toContain("estate_overview");
+        expect(String(second.sent[0].systemMessage)).toContain(`LIVE estate: ${sentence}`);
+
+        // A new chat tries the live view again.
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        await ask("How is my estate doing now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(3));
+        expect((FakeSocket.all[2].sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
     });
 });
