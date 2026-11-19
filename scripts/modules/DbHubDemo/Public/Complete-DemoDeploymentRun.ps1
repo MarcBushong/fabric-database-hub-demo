@@ -24,6 +24,13 @@ function Complete-DemoDeploymentRun {
     one line: what was stopped, or what bills an hour, until when, and how to stop it now. A stopped demo needs no nightly
     stop tonight, so DONE leaves out DEPLOY.NIGHTLYSTOP's note then. The run's minutes count the stop.
 
+    What an earlier run of this deployment found that this run didn't check again (F10, 2026-11-19; Get-DemoCarriedRunResult):
+    a resumed run's DONE and status page still list it (under "Please confirm", in what didn't work, and in DONE's mention of
+    the Insights app), with one note that says from which run. A fresh result always wins, and a carried one never changes
+    whether the run is DONE. Before the stop at the end, the ending saves this run's for the next run of the deployment
+    (Complete-DemoCarriedRunResult), and Added gets DEPLOY.CARRIED when it showed any. Not for a what-if, a stopped run, or
+    a run in GitHub Actions.
+
     .PARAMETER Run
     What Start-DemoDeploymentRun returned.
 
@@ -156,6 +163,9 @@ function Complete-DemoDeploymentRun {
             $model = $null
         }
     }
+    # What an earlier run of this deployment found that this run didn't check again (F10, 2026-11-19): a resumed run's DONE
+    # and status page still list it, and a fresh result always wins. Never judged.
+    $carry = Get-DemoCarriedRunResult -Run $Run -Config $Config -Result @($Result) -State $judgedState -SkipFabric:$SkipFabric -WhatIfRun:$WhatIfRun -Stopped:$wasStopped
     try {
         $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
         # T4 at a fallback size is said with its hourly list price (ADR 0019): this run's, or read
@@ -197,7 +207,7 @@ function Complete-DemoDeploymentRun {
                 $t4Notice = [string]$change.message
             }
         }
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why -T4Notice $t4Notice
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why -T4Notice $t4Notice -CarriedResult @($carry.Shown)
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; NonBlocking = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
@@ -213,6 +223,12 @@ function Complete-DemoDeploymentRun {
     $endStopProgress = @{ Phase = ''; Started = '' }
     $endStopEnded = $false
     try {
+        # What this run found, saved for the next run before the stop at the end, so Ctrl+C there doesn't lose it (F10): DONE's
+        # note, the Insights app's and Ask's rows, and DEPLOY.CARRIED, which lists what DONE shows from an earlier run.
+        $carried = Complete-DemoCarriedRunResult -Carry $carry -Config $Config -Result @($Result) -Outcome $outcome -RunStartedUtc (Get-DemoMemberValue -InputObject $Run -Name 'StartedUtc') -ProgressPath ([string]$Run.ProgressPath) -Model $model
+        if ($null -ne $carried) {
+            $added.Add($carried)
+        }
         try {
             $endStop = Invoke-DemoUpdateEndStop -Config $Config -Result @($Result) -Model $model -State $judgedState -OutcomeKind ([string]$outcome.Kind) -KeepRunning:$KeepRunning -Stopped:$wasStopped -ProgressPath ([string]$Run.ProgressPath) -RunStartedUtc (Get-DemoMemberValue -InputObject $Run -Name 'StartedUtc') -Progress $endStopProgress -Confirm:$false
         }

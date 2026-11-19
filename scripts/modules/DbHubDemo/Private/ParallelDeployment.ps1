@@ -1365,9 +1365,11 @@ function Invoke-DemoParallelDeployment {
             $status = Invoke-DemoWorkloadCommand -Config $Config -Target 'T1' -ArgumentList 'status', '--json' -TimeoutSeconds 300 -Confirm:$false
             $results.Add($status.Result)
         }
-        if ($t1Done) {
+        if (& $trackFinished 'T1' ([string]@((Get-DemoTrackStep -Track 'T1').Keys)[-1])) {
             # The Database Agent loop's one manual step, once per deployment (2026-11-18): under "Please confirm" on the
-            # status page and in the run's summary, with Database Hub's link and T3's exact database (HUB.AGENT.T3).
+            # status page and in the run's summary, with Database Hub's link and T3's exact database (HUB.AGENT.T3). Also when
+            # an earlier run finished T1, so a resumed run's DONE still lists it (F10, 2026-11-19); it's pure, so nothing
+            # more runs for it.
             $agentItem = Get-DemoT3AgentSetupItem -Config $Config -ServerName ('azuresql01-{0}' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Tags') -Name 'deploymentId'))
             if ($null -ne $agentItem) {
                 $results.Add($agentItem)
