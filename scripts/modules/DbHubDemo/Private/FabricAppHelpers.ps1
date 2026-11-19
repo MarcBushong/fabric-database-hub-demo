@@ -598,6 +598,93 @@ function Get-DemoFabricAppDeploymentRecord {
     }
 }
 
+function Remove-DemoFabricAppStaleDeployment {
+    <#
+    .SYNOPSIS
+    Drops the records of other Fabric workspaces from the deploy stage's rayfin/.deployments.json, so rayfin up and the
+    demo's own reads of it find only the target workspace's. Returns what it dropped: Key, WorkspaceId, and ItemName,
+    never the publishable key. Internal.
+
+    .DESCRIPTION
+    rayfin up takes the record under the slug of the target workspace's name and reuses its item, without checking the
+    record's workspace (Rayfin CLI 1.36.2: resolveExistingDeployment in dist/commands/up/up.js). destroy.ps1 deletes the
+    demo's workspace, and the next deploy creates one with the same name: with the old record, rayfin up would deploy to
+    the deleted app's ID in the new workspace, and fail. 'active' moves to the target's record, or goes when there's none,
+    because Manage's settings and the Ask relay read the active record before rayfin up. A missing, unreadable, or empty
+    registry stays as it is, and the file is written the way the CLI writes it: two-space JSON and a newline.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $StagePath,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string] $WorkspaceId
+    )
+
+    $path = Join-Path -Path $StagePath -ChildPath 'rayfin/.deployments.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return @()
+    }
+    try {
+        $registry = [System.Text.Json.Nodes.JsonNode]::Parse([System.IO.File]::ReadAllText($path))
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The stage''s rayfin/.deployments.json wasn''t read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return @()
+    }
+    if ($registry -isnot [System.Text.Json.Nodes.JsonObject] -or $registry['deployments'] -isnot [System.Text.Json.Nodes.JsonObject]) {
+        return @()
+    }
+    $deployments = $registry['deployments'].AsObject()
+    $dropped = [System.Collections.Generic.List[object]]::new()
+    $kept = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in @($deployments | ForEach-Object { $_.Key })) {
+        $record = $deployments[$key]
+        $recordWorkspace = if ($record -is [System.Text.Json.Nodes.JsonObject]) { [string]$record['fabricWorkspaceId'] } else { '' }
+        if (-not $recordWorkspace) {
+            # The CLI skips a record without a workspace.
+            continue
+        }
+        if ([string]::Equals($recordWorkspace, $WorkspaceId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $kept.Add($key)
+        }
+        else {
+            $dropped.Add([pscustomobject]@{ Key = $key; WorkspaceId = $recordWorkspace; ItemName = [string]$record['itemName'] })
+        }
+    }
+    if ($dropped.Count -eq 0 -or -not $PSCmdlet.ShouldProcess($path, ('Drop the records of {0} other Fabric workspace(s)' -f $dropped.Count))) {
+        return @()
+    }
+    foreach ($entry in $dropped) {
+        $null = $deployments.Remove($entry.Key)
+    }
+    $active = if ($null -ne $registry['active']) { [string]$registry['active'] } else { '' }
+    if (-not $active -or -not $deployments.ContainsKey($active)) {
+        if ($kept.Count -gt 0) {
+            $registry['active'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$kept[0])
+        }
+        else {
+            $null = $registry.AsObject().Remove('active')
+        }
+    }
+    $options = [System.Text.Json.JsonSerializerOptions]::new()
+    $options.WriteIndented = $true
+    $options.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($registry.ToJsonString($options).Replace("`r`n", "`n") + "`n")
+    # Truncate, not WriteAllText: Windows refuses to overwrite a hidden file, which a dot-file can be.
+    $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Truncate, [System.IO.FileAccess]::Write)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    return $dropped.ToArray()
+}
+
 function Get-DemoFabricAppFileHash {
     <#
     .SYNOPSIS

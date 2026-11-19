@@ -150,10 +150,11 @@ function Get-DemoFabricDemoItem {
     .SYNOPSIS
     The items the demo creates in its Fabric workspace, by type and name: the lakehouse and its SQL analytics endpoint,
     each notebook in fabric/notebooks (Get-DemoFabricNotebookName), the control notebook, the Real-Time Dashboard, the
-    history model and report, and the Insights app with its connector. destroy.ps1 deletes the demo's workspace only when
-    everything in it is among these (Get-DemoDestroyFabricPlan), and a first run that recovers an environment updates the
-    workspace's notebooks then too (issue 60, Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each.
-    Internal.
+    history model and report, and the Insights app with what its backend creates beside it: the user data functions of
+    its connectors and of its functions (config/versions.json fabricApp.backendItems; the functions' since 2026-11-18).
+    destroy.ps1 deletes the demo's workspace only when everything in it is among these (Get-DemoDestroyFabricPlan), and a
+    first run that recovers an environment updates the workspace's notebooks then too (issue 60,
+    Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -176,7 +177,9 @@ function Get-DemoFabricDemoItem {
     $items.Add([pscustomobject]@{ Type = 'SemanticModel'; Name = [string]$app['semanticModelName'] })
     $items.Add([pscustomobject]@{ Type = 'Report'; Name = [string]$app['reportName'] })
     $items.Add([pscustomobject]@{ Type = [string]$app['itemType']; Name = [string]$app['itemName'] })
-    $items.Add([pscustomobject]@{ Type = 'UserDataFunction'; Name = ('{0}_connector' -f [string]$app['itemName']) })
+    foreach ($backendItem in @($app['backendItems']['items'])) {
+        $items.Add([pscustomobject]@{ Type = [string]$backendItem['type']; Name = ([string]$backendItem['name']).Replace('{itemName}', [string]$app['itemName']) })
+    }
     return $items.ToArray()
 }
 
