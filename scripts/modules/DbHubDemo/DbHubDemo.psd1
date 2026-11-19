@@ -104,6 +104,7 @@
         'Set-DemoArcSqlConfiguration'
         'Set-DemoArcSqlProductKey'
         'Set-DemoDeploymentState'
+        'Set-DemoFabricAppManageSetting'
         'Set-DemoHostPasswordSecret'
         'Set-DemoPresenterAccess'
         'Set-DemoVmLocalPassword'

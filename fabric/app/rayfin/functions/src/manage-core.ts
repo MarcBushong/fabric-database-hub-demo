@@ -1,12 +1,12 @@
-// The Manage function's checks, pure, so the app's tests run them (ADR 0028): who the caller is, from their Rayfin
-// token verified with the app's own keys; whether they're an operator; and whether a request is one the session control
-// accepts. manage.ts runs NB_DatabaseHub_Control with the result. No Node.js or SDK import: Web Crypto and fetch only.
+// The Manage function's checks and answers, pure, so the app's tests run them (ADR 0029): who the caller is, from their
+// Rayfin token verified with the app's own keys; whether they're an operator; whether a request is one the session
+// control accepts; and NB_DatabaseHub_Control's run through the Fabric job API. manage.ts registers them with the
+// Rayfin runtime's context. No Node.js or SDK import: Web Crypto and fetch only.
 
-/** What deploy.ps1 writes for the function (manage.generated.ts in the stage): never a secret. */
+/** What configure-fabric-app.ps1 writes for the function (manage.generated.ts in the stage): IDs and names, never a secret. */
 export interface ManageSettings {
-    /** The app's own Rayfin API (rayfinApiUrl), pinned at deploy time: its keys come only from here, never from a request. */
+    /** The app's own Rayfin API (its deployment record's fabricApiUrl), pinned at deploy time: its keys come only from here. */
     apiUrl: string;
-    publishableKey: string;
     /** NB_DatabaseHub_Control: the workspace and the item the Fabric job API runs. */
     controlWorkspaceId: string;
     controlNotebookId: string;
@@ -66,7 +66,7 @@ const reject = (reason: string): RejectedCaller => ({ verified: false, reason })
  * public `.well-known/jwks.json`, or the auth service's), then its expiry, subject, and audience. The token comes from the
  * Rayfin runtime (the function's context); nothing the browser sends names the caller.
  */
-export async function verifyCaller(token: string, settings: Pick<ManageSettings, "apiUrl" | "publishableKey">, deps: { fetch: typeof fetch; now?: () => number }): Promise<Caller> {
+export async function verifyCaller(token: string, settings: { apiUrl: string; publishableKey: string }, deps: { fetch: typeof fetch; now?: () => number }): Promise<Caller> {
     const parts = token.split(".");
     if (parts.length !== 3) return reject("the caller's token isn't a JWT");
     const header = json(parts[0]);
@@ -233,5 +233,173 @@ export function jobParameters(request: ManageRequest, requestedBy: string): Reco
             return { STOP_NOW: { value: true, type: "bool" }, ...who };
         case "reset":
             return { RESET_NOW: { value: true, type: "bool" }, RESET_TARGETS: { value: JSON.stringify(request.targets), type: "string" }, ...who };
+    }
+}
+
+/** What manageAccess says about the signed-in viewer (the app's src/lib/manage-client.ts reads it). */
+export interface ManageAccessAnswer {
+    /** False when this deployment's function has no settings: the app copies each request for Run all instead (C). */
+    configured: boolean;
+    /** True when the verified caller is an operator: the deployer or a member of the demo's admin group. */
+    operator: boolean;
+    /** Why not, in one sentence, when they aren't, or when the function isn't set up. */
+    reason: string;
+    /** The verified caller's name, or "" when they weren't verified. */
+    who: string;
+    /** The control's run in progress, read for operators: a new session replaces it (the control follows the newest request). */
+    running: { startedAt: string; invokeType?: string } | null;
+}
+
+export interface ManageRequestAnswer {
+    started: boolean;
+    /** The Fabric job instance of NB_DatabaseHub_Control, when it started. */
+    jobInstance: string;
+    reason: string;
+    /** How the control records the caller (REQUESTED_BY), once they're verified. */
+    requestedBy: string;
+}
+
+export interface ManageJobAnswer {
+    /** The job API's status (NotStarted, InProgress, Completed, Failed, Cancelled, or Deduped), or Unknown when it can't be read. */
+    status: string;
+    startedAt?: string | null;
+    endedAt?: string | null;
+    failureReason?: string | null;
+}
+
+/** What a call brings from the function's Rayfin context: never anything the browser names. */
+export interface ManageCall {
+    /** The caller's Rayfin token (ctx.accessToken), which the app's backend checked before the function ran. */
+    token: string;
+    /** The app's publishable key (ctx.publishableKey), which the app's API asks for with its keys. */
+    publishableKey: string;
+    /** The Fabric token the runtime minted for the function (ctx.Tokens.Fabric), read only to call the job API; it throws when there's none. */
+    fabricToken: () => string;
+}
+
+export interface ManageDeps {
+    fetch: typeof fetch;
+    now?: () => number;
+}
+
+/** The Fabric REST API's job scheduler (https://learn.microsoft.com/rest/api/fabric/core/job-scheduler). */
+const FABRIC_API = "https://api.fabric.microsoft.com/v1";
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NOT_OPERATOR = "Only the demo's operators send actions from the app: the deployer and the members of its admin group. A redeploy refreshes the list.";
+
+/** Why this deployment's function can't send requests, or "" when its settings are complete. */
+export function settingsProblem(settings: ManageSettings): string {
+    if (!/^https:\/\//i.test(settings.apiUrl)) return "it has no pinned API to check callers with";
+    if (!GUID.test(settings.controlWorkspaceId) || !GUID.test(settings.controlNotebookId)) return "NB_DatabaseHub_Control wasn't found when the app was deployed";
+    if (settings.operators.length === 0) return "it has no operators";
+    return "";
+}
+
+/** An error's message as a clause: one line, at most 300 characters, without its closing period (the answer adds one). */
+const messageOf = (error: unknown): string => clause(error instanceof Error ? error.message : String(error));
+const clause = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 300).replace(/[.\s]+$/, "");
+
+/** Fabric's job times are UTC, often without a zone: one with no zone gets a Z, so browsers don't read it as local time. */
+function utc(value: unknown): string | null {
+    if (typeof value !== "string" || value === "") return null;
+    return /^\d{4}-\d{2}-\d{2}T[\d:.]+$/.test(value) ? `${value}Z` : value;
+}
+
+type Gate = { ok: true; caller: VerifiedCaller } | { ok: false; reason: string; caller?: VerifiedCaller };
+
+/** The verified operator behind a call, or why there's none. Nothing runs before this passes. */
+async function gate(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<Gate> {
+    const problem = settingsProblem(settings);
+    if (problem) return { ok: false, reason: `This deployment's Manage function isn't set up: ${problem}.` };
+    const caller = await verifyCaller(call.token, { apiUrl: settings.apiUrl, publishableKey: call.publishableKey }, deps);
+    if (!caller.verified) return { ok: false, reason: `Manage couldn't confirm who you are: ${caller.reason}.` };
+    if (!isOperator(caller, settings)) return { ok: false, reason: NOT_OPERATOR, caller };
+    return { ok: true, caller };
+}
+
+const jobsPath = (settings: ManageSettings) => `/workspaces/${settings.controlWorkspaceId.toLowerCase()}/items/${settings.controlNotebookId.toLowerCase()}/jobs/instances`;
+
+function fabric(call: ManageCall, deps: ManageDeps, path: string, init: { method?: string; body?: string } = {}): Promise<Response> {
+    const headers: Record<string, string> = { Authorization: `Bearer ${call.fabricToken()}` };
+    if (init.body !== undefined) headers["Content-Type"] = "application/json";
+    return deps.fetch(`${FABRIC_API}${path}`, { ...init, headers });
+}
+
+/** The job API's refusal in one line: its status, and its errorCode and message when it sent them. */
+async function refusal(response: Response): Promise<string> {
+    let detail = "";
+    try {
+        const body = (await response.json()) as { errorCode?: unknown; message?: unknown };
+        detail = [body.errorCode, body.message].filter((v): v is string => typeof v === "string" && v.trim() !== "").join(": ");
+    } catch {
+        // No JSON body: the status says it.
+    }
+    return `HTTP ${response.status}${detail ? `, ${clause(detail)}` : ""}`;
+}
+
+/** NB_DatabaseHub_Control's run that's queued or in progress, from the job API's list; null when there's none or it can't be read. */
+async function runningJob(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageAccessAnswer["running"]> {
+    try {
+        const response = await fabric(call, deps, jobsPath(settings));
+        if (!response.ok) return null;
+        const body = (await response.json()) as { value?: unknown };
+        const jobs = Array.isArray(body.value) ? (body.value as Array<Record<string, unknown>>) : [];
+        const job = jobs.find((j) => j.status === "InProgress" || j.status === "NotStarted");
+        if (!job) return null;
+        return { startedAt: utc(job.startTimeUtc) ?? new Date((deps.now ?? Date.now)()).toISOString(), ...(typeof job.invokeType === "string" ? { invokeType: job.invokeType } : {}) };
+    } catch {
+        return null;
+    }
+}
+
+/** manageAccess: whether the signed-in viewer can send actions from the app, and the control's run in progress. */
+export async function answerAccess(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageAccessAnswer> {
+    const problem = settingsProblem(settings);
+    if (problem) return { configured: false, operator: false, reason: `This deployment's Manage function isn't set up (${problem}), so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.`, who: "", running: null };
+    const g = await gate(call, settings, deps);
+    if (!g.ok) return { configured: true, operator: false, reason: g.reason, who: g.caller?.display ?? "", running: null };
+    return { configured: true, operator: true, reason: "", who: g.caller.display, running: await runningJob(call, settings, deps) };
+}
+
+/**
+ * manageRequest: runs NB_DatabaseHub_Control through the Fabric job API (Run On Demand Item Job, jobType RunNotebook)
+ * with a checked request's parameters, and REQUESTED_BY from the verified caller, never from the request.
+ */
+export async function answerRequest(input: unknown, call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageRequestAnswer> {
+    const refuse = (reason: string, requestedBy = ""): ManageRequestAnswer => ({ started: false, jobInstance: "", reason, requestedBy });
+    const g = await gate(call, settings, deps);
+    if (!g.ok) return refuse(g.reason);
+    const checked = checkRequest(input);
+    if (!checked.ok) return refuse(checked.reason);
+    const requestedBy = requestedByOf(g.caller);
+    try {
+        const response = await fabric(call, deps, `${jobsPath(settings)}?jobType=RunNotebook`, {
+            method: "POST",
+            body: JSON.stringify({ executionData: { parameters: jobParameters(checked.request, requestedBy) } }),
+        });
+        if (!response.ok) return refuse(`Fabric didn't start NB_DatabaseHub_Control (${await refusal(response)}).`, requestedBy);
+        // 202 Accepted: the Location header is the new job instance's URL.
+        const id = (response.headers.get("location") ?? "").replace(/\/+$/, "").split("/").pop() ?? "";
+        return { started: true, jobInstance: GUID.test(id) ? id.toLowerCase() : "", reason: "", requestedBy };
+    } catch (error) {
+        return refuse(`NB_DatabaseHub_Control wasn't started: ${messageOf(error)}.`, requestedBy);
+    }
+}
+
+/** manageJob: one run of NB_DatabaseHub_Control, as the job API has it (Get Item Job Instance). */
+export async function answerJob(jobInstance: unknown, call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageJobAnswer> {
+    const unknown = (reason: string): ManageJobAnswer => ({ status: "Unknown", startedAt: null, endedAt: null, failureReason: reason });
+    const g = await gate(call, settings, deps);
+    if (!g.ok) return unknown(g.reason);
+    if (typeof jobInstance !== "string" || !GUID.test(jobInstance)) return unknown("That isn't a job instance ID.");
+    try {
+        const response = await fabric(call, deps, `${jobsPath(settings)}/${jobInstance.toLowerCase()}`);
+        if (!response.ok) return unknown(`Fabric didn't return the run (${await refusal(response)}).`);
+        const body = (await response.json()) as Record<string, unknown>;
+        const failure = body.failureReason && typeof body.failureReason === "object" ? (body.failureReason as Record<string, unknown>) : null;
+        const failureText = failure ? [failure.errorCode, failure.message].filter((v): v is string => typeof v === "string" && v.trim() !== "").join(": ") : "";
+        return { status: typeof body.status === "string" ? body.status : "Unknown", startedAt: utc(body.startTimeUtc), endedAt: utc(body.endTimeUtc), failureReason: failureText || null };
+    } catch (error) {
+        return unknown(`The run couldn't be read: ${messageOf(error)}.`);
     }
 }

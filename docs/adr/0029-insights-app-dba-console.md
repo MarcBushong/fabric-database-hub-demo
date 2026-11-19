@@ -1,6 +1,6 @@
-# ADR 0028: The Insights app as a DBA console
+# ADR 0029: The Insights app as a DBA console
 
-- **Status:** Proposed (2026-11-18). The design system, the information architecture, the live data, and Manage's copy mode are built and tested; Manage's sending mode waits on [the identity proof](#validation).
+- **Status:** Proposed (2026-11-18). The design system, the information architecture, the live data, and Manage, both its copy mode and its sending mode (the function `manage.ts` and its deploy-time settings), are built and tested; Manage's sending mode is confirmed live once [the identity proof](#validation) passes.
 - **Date:** 2026-11-18
 - **Decision source:** User-directed (2026-11-18): "Adjust the Fabric Rayfin App to really be a DBA's dream app to manage and view their estate with the conversational analytics", "more professional, and functional and clean/modern", and "The GitHub Copilot chat interface right in the App is a must and a gamechanger"; "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible". The coordinator decided Manage's write path for the user: A, with C as the automatic fallback, under the conditions [below](#manage-bounded-confirmed-actions).
 - **Related:** [ADR 0012](0012-validation-model.md) (statuses), [ADR 0020](0020-on-demand-activity-control.md) (the control), [ADR 0026](0026-one-run-all-session.md) (one Run all), [ADR 0025](0025-t4-read-replica.md) (T4's history), [ADR 0013](0013-agent-experience.md) (the Database Agent first), [the app's README](../../fabric/app/README.md)
@@ -59,18 +59,24 @@ Run all in NB_DatabaseHub_Control stays the demo's one action ([ADR 0026](0026-o
   2. Operators are the deployer and the members of the demo's admin group, which `deploy.ps1` resolves into the app's settings at every deploy; when it can't read the members, the deployer only, with a **Warning**. Everyone else sees Manage read-only, with the reason.
   3. Only the documented actions and values, checked against the control's allow-lists and caps; REQUESTED_BY is the verified identity.
   4. Sessions run with `WAIT_FOR_END = True`, like Run all. When the control is running a request, the confirmation says a new session replaces it: the control follows the newest request.
+- **How A is built (2026-11-18, the owner asked that everything be completed on the current assumptions):**
+  - **The function:** `manage.ts` registers `manageAccess`, `manageRequest`, and `manageJob` with `registerManage(udf)` in the shared functions project; their checks and answers are in `manage-core.ts`, which the app's tests run. The caller's token is `ctx.accessToken`, verified again with the app's keys at the API pinned at deploy time; the job API call uses the Fabric token the runtime mints for the function (`ctx.Tokens.Fabric`, the app item's owner's, as the live estate function uses it). The job API's answer, a refusal included, comes back as a sentence; nothing is retried.
+  - **Its settings:** `configure-fabric-app.ps1` writes `manage.generated.ts` into the deploy stage: the app's API (the deployment record's `fabricApiUrl`), `NB_DatabaseHub_Control`'s IDs, and the operators (`FABRIC.APP.OPERATORS`), never a secret. The app's first `rayfin up` records its API, so a first deploy writes the settings again and deploys once more, about a minute, once. `FABRIC.APP.ACTIONS` says which way Manage works.
+  - **The control:** `NB_DatabaseHub_Control` has a `REQUESTED_BY` parameter, `"notebook"` for Run all, which the job API sets to `app/<who>`; every request it builds carries it, within the runbook's name rule.
+  - **Its fallback:** a function without complete settings answers that it isn't set up, and the app copies each request for Run all (C), with the reason. Viewers who aren't operators see Manage read-only.
 - **C, copying (the automatic fallback):** when the function isn't deployed, each action copies its request as lines for a new cell under the control notebook's parameters cell, and opens the notebook, where Run all sends it with the same checks.
 
 ## Consequences
 
 - **Easier:** a DBA starts at what needs attention, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts from the same app, all inside Fabric's frame and in the theme they use.
 - **Harder:** the app depends on Fluent's releases (pinned, with the license check), and the bundle grew: about 410 KB gzip in all, from about 245 KB, far under Fabric Apps' limits. Pages load lazily.
-- **Accepted:** Manage's sending mode needs the shared functions project and the identity proof; until both, every deployment runs Manage in copy mode, which needs nothing new.
+- **Accepted:** until the identity proof passes, Manage's sending mode rests on two assumptions: that a caller's Rayfin token names them by an Entra object ID or a sign-in name, and that `ctx.Tokens.Fabric` may run the control notebook. If either fails, only `manage.ts` and `manage-core.ts` change, and copy mode keeps working meanwhile.
 
 ## Validation
 
 - **Built and tested (2026-11-18):** `npm run verify` (typecheck, lint, Vitest's unit, page, chart, and contrast tests, the license check, and the build); the deploy-time check runs every catalog query (`FABRIC.APP.QUERIES`); before-and-after screenshots of every page in light and dark from the sample-data preview.
-- **The identity proof (pending):** a probe app with functions in a test workspace deployed and ran on the shared capacity: `rayfin up` with `services.functions` succeeded, and the backend refused an anonymous call (403) and a forged token (401). What a function sees of a signed-in caller needs one person in a browser, since no script can create an app session (the external Entra exchange refuses the Azure CLI's tokens). Until it passes, Manage runs in copy mode.
+- **The identity proof (pending):** a probe app with functions in a test workspace deployed and ran on the shared capacity: `rayfin up` with `services.functions` succeeded, and the backend refused an anonymous call (403) and a forged token (401). What a function sees of a signed-in caller needs one person in a browser, since no script can create an app session (the external Entra exchange refuses the Azure CLI's tokens). Until it passes, sending is built and tested but not seen live.
+- **Manage's function, tested (2026-11-18):** Vitest runs `manage-core.ts`'s answers against a stand-in for the app's keys and the job API: a forged or expired token, a viewer who isn't an operator, and an action or value outside the caps are refused before any Fabric call; the job API's refusal, an unreachable API, and a missing Fabric token each come back as a reason; an incomplete deployment falls back to copy mode. `manage.ts` compiles with the SDK beside the live estate function, and the SDK's own parser registers its three functions with their context. Pester covers the settings writer, the first deploy's second `rayfin up`, and `REQUESTED_BY` in the control notebook.
 
 ## Sources
 

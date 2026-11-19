@@ -127,7 +127,7 @@ function Resolve-DemoFabricAppItem {
             $links['t2MigrationAssessment'] = $migration
         }
     }
-    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlNotebookId = $controlNotebookId; links = $links }
+    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlWorkspaceId = $controlWorkspaceId; controlNotebookId = $controlNotebookId; links = $links }
     if ($problems.Count -gt 0) {
         $evidence['problems'] = @($problems)
     }

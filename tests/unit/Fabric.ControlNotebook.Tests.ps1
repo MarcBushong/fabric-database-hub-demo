@@ -581,13 +581,26 @@ for action, kwargs in cases:
         out.append({"ok": True, "body": json.dumps(build_request(action, catalog=catalog, **kwargs), separators=(",", ":"))})
     except ValueError as error:
         out.append({"ok": False, "error": str(error)})
+# From the Insights app's Manage (ADR 0029): the Fabric job API sets REQUESTED_BY, and every request carries it.
+REQUESTED_BY = "app/ops@contoso.example"
+for action, kwargs in [("session", dict(session_id=sid, duration_minutes=90)), ("reset", dict(reset_targets=["T1"]))]:
+    out.append({"ok": True, "body": json.dumps(build_request(action, catalog=catalog, **kwargs), separators=(",", ":"))})
+REQUESTED_BY = "app/Ops Person"
+try:
+    out.append({"ok": True, "body": json.dumps(build_request("stop", catalog=catalog))})
+except ValueError as error:
+    out.append({"ok": False, "error": str(error)})
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false)
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false, $true, $true, $false)
+        # Run from the Insights app's Manage (ADR 0029): REQUESTED_BY names the verified caller, within the runbook's name rule.
+        $results[31].body | Should -BeExactly '{"action":"session","requestedBy":"app/ops@contoso.example","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":90}'
+        $results[32].body | Should -BeExactly '{"action":"reset","requestedBy":"app/ops@contoso.example","targets":["T1"]}'
+        $results[33].error | Should -Match 'requested_by must be 1-64 letters, digits'
         # A list parameter passed as JSON text, as the Fabric job API and pipelines pass it, builds the same request.
         $results[13].body | Should -BeExactly $results[12].body
         $results[14].body | Should -BeExactly '{"action":"reset","requestedBy":"notebook","targets":["T1","T3"]}'

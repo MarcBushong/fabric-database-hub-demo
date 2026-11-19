@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type Compone
 import { MessageBar, MessageBarBody, Spinner, Toast, ToastTitle, Toaster, useId, useToastController } from "@fluentui/react-components";
 
 import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess, type NotifyIntent } from "./app-context";
-import type { ManageApi } from "./lib/manage-client";
+import { manageAccessOf, type ManageApi } from "./lib/manage-client";
 import type { DataProvenance } from "./copilot/contract";
 import { toMeta } from "./data/model";
 import { metaQuery, type Filters } from "./data/queries";
@@ -59,7 +59,7 @@ function useManageAccess(fixed: ManageAccess | undefined, api: ManageApi | undef
         let alive = true;
         api.access().then(
             (a) => {
-                if (alive) setDetected({ mode: "run", canRun: a.operator, reason: a.operator ? "" : a.reason, who: a.who, running: a.running, send: (r) => api.request(r) });
+                if (alive) setDetected(manageAccessOf(a, api));
             },
             () => {
                 if (alive) setDetected(MANAGE_READ_ONLY);

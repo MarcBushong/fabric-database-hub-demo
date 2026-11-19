@@ -127,7 +127,7 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
         setSending(true);
         try {
             const answer = await manage.send(draft);
-            if (answer.started) notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy} (run ${answer.jobInstance.slice(0, 8)})`, "success");
+            if (answer.started) notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy}${answer.jobInstance ? ` (run ${answer.jobInstance.slice(0, 8)})` : ""}`, "success");
             else notify(`${summary.title} wasn't sent: ${answer.reason}`, "error");
             onClose();
         } catch (error) {

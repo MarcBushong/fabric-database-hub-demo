@@ -561,7 +561,8 @@ function Get-DemoFabricAppDeploymentRecord {
     <#
     .SYNOPSIS
     Reads the active deployment that 'rayfin up' recorded in the stage (rayfin/.deployments.json): item name and ID,
-    workspace, hosting URL, and the portal deep link. Never returns the publishable key. Null when there is none.
+    workspace, hosting URL, the app's API (fabricApiUrl, which the Manage function checks callers' keys at), and the
+    portal deep link. Never returns the publishable key. Null when there is none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -592,6 +593,7 @@ function Get-DemoFabricAppDeploymentRecord {
         WorkspaceId = [string]$record['fabricWorkspaceId']
         TenantId    = [string]$record['fabricTenantId']
         HostingUrl  = [string]$record['hostingUrl']
+        ApiUrl      = [string]$record['fabricApiUrl']
         ItemUrl     = [string]$record['fabricDeepLink']
     }
 }

@@ -1,12 +1,13 @@
 // @vitest-environment node
-// The Manage function's checks (rayfin/functions/src/manage-core.ts, ADR 0028), run with Node's Web Crypto: a token
+// The Manage function's checks (rayfin/functions/src/manage-core.ts, ADR 0029), run with Node's Web Crypto: a token
 // signed with a key of the test's own, its JWKS served by a stand-in for the app's API.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { checkRequest, isOperator, jobParameters, requestedByOf, SCENARIO_RULES, SESSION_BOUNDS, verifyCaller, type ManageRequest, type VerifiedCaller } from "../../rayfin/functions/src/manage-core";
+import { answerAccess, answerJob, answerRequest, checkRequest, isOperator, jobParameters, requestedByOf, SCENARIO_RULES, SESSION_BOUNDS, verifyCaller, type ManageRequest, type ManageSettings, type VerifiedCaller } from "../../rayfin/functions/src/manage-core";
 import { notebookParameters, type ControlRequest } from "./control";
+import { functionsManageApi, manageAccessOf } from "./manage-client";
 import { SESSION_MINUTES } from "./scenarios";
 
 const API = "https://example.invalid/v1/workspaces/w/appbackends/a/BaaSService/";
@@ -119,5 +120,135 @@ describe("the Manage function's requests", () => {
             expect(REQUESTED_BY).toEqual({ value: "app/ops@contoso.example", type: "string" });
             expect(rest).toEqual(notebookParameters(request));
         }
+    });
+});
+
+describe("the Manage function's answers", () => {
+    const SETTINGS: ManageSettings = { apiUrl: API, controlWorkspaceId: ZERO, controlNotebookId: ZERO, operators: [{ objectId: ZERO, names: ["ops@contoso.example"] }] };
+    const JOBS = `https://api.fabric.microsoft.com/v1/workspaces/${ZERO}/items/${ZERO}/jobs/instances`;
+    const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const accepted = () => new Response(null, { status: 202, headers: { location: `${JOBS}/${ZERO}` } });
+    // A viewer with no object ID in their token, so only their name could make them an operator.
+    const viewer = { email: "viewer@contoso.example", oid: undefined };
+
+    /** A stand-in for the app's API (its keys) and Fabric's job API; it records every Fabric call. */
+    async function world(run: () => Response | Promise<Response> = accepted) {
+        const { jwk, sign } = await signer();
+        const fabric: Array<{ url: string; init?: RequestInit }> = [];
+        const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+            const u = String(url);
+            if (u.startsWith(API)) return json({ keys: [jwk] }, u.endsWith("/.well-known/jwks.json") && !u.includes("/api/auth/") ? 200 : 404);
+            fabric.push({ url: u, init });
+            if (u === `${JOBS}?jobType=RunNotebook`) return run();
+            if (u === JOBS) return json({ value: [{ id: ZERO, status: "Completed" }, { id: ZERO, status: "InProgress", invokeType: "Manual", startTimeUtc: "2026-11-18T11:30:00.1234567" }] });
+            if (u === `${JOBS}/${ZERO}`) return json({ id: ZERO, status: "Failed", startTimeUtc: "2026-11-18T11:30:00", endTimeUtc: "2026-11-18T11:31:00", failureReason: { errorCode: "NotebookFailed", message: "The webhook refused it." } });
+            return json({}, 404);
+        });
+        const fabricToken = vi.fn(() => "fabric-token-from-the-runtime");
+        const call = async (extra: Record<string, unknown> = {}) => ({ token: await sign(claims(extra)), publishableKey: "pk-test", fabricToken });
+        return { fabric, fabricToken, call, sign, deps: { fetch, now: () => NOW } };
+    }
+
+    it("runs NB_DatabaseHub_Control for a verified operator, with REQUESTED_BY from the verified caller", async () => {
+        const w = await world();
+        const answer = await answerRequest({ action: "run", scenario: "ru-storm", target: "T5", durationMinutes: 10 }, await w.call(), SETTINGS, w.deps);
+        expect(answer).toEqual({ started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example" });
+        expect(w.fabric).toHaveLength(1);
+        const [{ url, init }] = w.fabric;
+        expect(url).toBe(`${JOBS}?jobType=RunNotebook`);
+        expect(init?.method).toBe("POST");
+        expect(init?.headers).toEqual({ Authorization: "Bearer fabric-token-from-the-runtime", "Content-Type": "application/json" });
+        expect(JSON.parse(String(init?.body))).toEqual({
+            executionData: {
+                parameters: {
+                    MODE: { value: "activities", type: "string" },
+                    ACTIVITIES: { value: '[{"target":"T5","scenario":"ru-storm"}]', type: "string" },
+                    DURATION_MINUTES: { value: 10, type: "int" },
+                    WATCH_MINUTES: { value: 0, type: "int" },
+                    REQUESTED_BY: { value: "app/ops@contoso.example", type: "string" },
+                },
+            },
+        });
+        // The browser can't name the caller: a request that tries is refused before anything runs.
+        expect(await answerRequest({ action: "stop", requestedBy: "app/someone-else" }, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, reason: "Unknown fields: requestedBy." });
+        expect(w.fabric).toHaveLength(1);
+    });
+
+    it("refuses a forged or expired token, and a viewer who isn't an operator, before any Fabric call", async () => {
+        const w = await world();
+        const good = await w.call();
+        const [h, , s] = good.token.split(".");
+        const forged = { ...good, token: `${h}.${b64url(JSON.stringify(claims({ email: "intruder@contoso.example" })))}.${s}` };
+        expect(await answerRequest({ action: "stop" }, forged, SETTINGS, w.deps)).toEqual({ started: false, jobInstance: "", reason: "Manage couldn't confirm who you are: the caller's token isn't signed by the app.", requestedBy: "" });
+        expect(await answerRequest({ action: "stop" }, await w.call({ exp: NOW / 1000 - 1 }), SETTINGS, w.deps)).toMatchObject({ started: false, reason: "Manage couldn't confirm who you are: the caller's token has expired." });
+        const notOperator = await answerRequest({ action: "stop" }, await w.call(viewer), SETTINGS, w.deps);
+        expect(notOperator).toMatchObject({ started: false, reason: expect.stringMatching(/^Only the demo's operators send actions from the app/) });
+        expect(await answerAccess(await w.call(viewer), SETTINGS, w.deps)).toEqual({ configured: true, operator: false, reason: notOperator.reason, who: "viewer@contoso.example", running: null });
+        expect(await answerJob(ZERO, forged, SETTINGS, w.deps)).toMatchObject({ status: "Unknown", failureReason: expect.stringMatching(/^Manage couldn't confirm who you are/) });
+        expect(w.fabric).toHaveLength(0);
+        expect(w.fabricToken).not.toHaveBeenCalled();
+    });
+
+    it("refuses an action or a value outside the control's allow-lists and caps, before any Fabric call", async () => {
+        const w = await world();
+        const call = await w.call();
+        const refused = async (request: unknown) => (await answerRequest(request, call, SETTINGS, w.deps)).reason;
+        expect(await refused({ action: "deploy" })).toBe("The action must be session, run, stop, or reset.");
+        expect(await refused({ action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 31 })).toBe("cpu-pressure runs 5 to 30 minutes.");
+        expect(await refused({ action: "run", scenario: "ru-storm", target: "T1" })).toBe("ru-storm runs on T5.");
+        expect(await refused({ action: "session", durationMinutes: 240 })).toBe("A session runs 30 to 120 minutes.");
+        expect(await refused({ action: "reset", targets: ["T6"] })).toBe("Reset applies to T1, T2, T3, T4, and T5.");
+        expect(w.fabric).toHaveLength(0);
+    });
+
+    it("says why when the job API refuses the run, can't be reached, or the runtime gave no Fabric token", async () => {
+        const stop = { action: "stop" };
+        let w = await world(() => json({ errorCode: "InsufficientPrivileges", message: "The caller does not have  permission." }, 403));
+        expect(await answerRequest(stop, await w.call(), SETTINGS, w.deps)).toEqual({ started: false, jobInstance: "", reason: "Fabric didn't start NB_DatabaseHub_Control (HTTP 403, InsufficientPrivileges: The caller does not have permission).", requestedBy: "app/ops@contoso.example" });
+        w = await world(() => new Response("upstream timeout", { status: 504 }));
+        expect((await answerRequest(stop, await w.call(), SETTINGS, w.deps)).reason).toBe("Fabric didn't start NB_DatabaseHub_Control (HTTP 504).");
+        w = await world(() => Promise.reject(new TypeError("fetch failed")));
+        expect((await answerRequest(stop, await w.call(), SETTINGS, w.deps)).reason).toBe("NB_DatabaseHub_Control wasn't started: fetch failed.");
+        w = await world();
+        w.fabricToken.mockImplementation(() => {
+            throw new Error("No token was minted for the audience Fabric.");
+        });
+        expect(await answerRequest(stop, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, reason: "NB_DatabaseHub_Control wasn't started: No token was minted for the audience Fabric." });
+        expect(w.fabric).toHaveLength(0);
+    });
+
+    it("reads the control's run in progress for an operator, and one run's outcome, in UTC", async () => {
+        const w = await world();
+        expect(await answerAccess(await w.call(), SETTINGS, w.deps)).toEqual({ configured: true, operator: true, reason: "", who: "ops@contoso.example", running: { startedAt: "2026-11-18T11:30:00.1234567Z", invokeType: "Manual" } });
+        expect(await answerJob(ZERO, await w.call(), SETTINGS, w.deps)).toEqual({ status: "Failed", startedAt: "2026-11-18T11:30:00Z", endedAt: "2026-11-18T11:31:00Z", failureReason: "NotebookFailed: The webhook refused it." });
+        expect(await answerJob("../../items", await w.call(), SETTINGS, w.deps)).toEqual({ status: "Unknown", startedAt: null, endedAt: null, failureReason: "That isn't a job instance ID." });
+        expect(w.fabric.map((c) => c.url)).toEqual([JOBS, `${JOBS}/${ZERO}`]);
+    });
+
+    it("tells the app to copy requests for Run all when this deployment's function isn't set up", async () => {
+        const w = await world();
+        const access = await answerAccess(await w.call(), { ...SETTINGS, apiUrl: "" }, w.deps);
+        expect(access).toEqual({ configured: false, operator: false, reason: "This deployment's Manage function isn't set up (it has no pinned API to check callers with), so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.", who: "", running: null });
+        expect(await answerRequest({ action: "stop" }, await w.call(), { ...SETTINGS, controlNotebookId: "" }, w.deps)).toMatchObject({ started: false, reason: "This deployment's Manage function isn't set up: NB_DatabaseHub_Control wasn't found when the app was deployed." });
+        expect(await answerRequest({ action: "stop" }, await w.call(), { ...SETTINGS, operators: [] }, w.deps)).toMatchObject({ started: false, reason: "This deployment's Manage function isn't set up: it has no operators." });
+        expect(w.deps.fetch).not.toHaveBeenCalled();
+
+        const api = { request: vi.fn(async () => ({ started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example" })) };
+        expect(manageAccessOf(access, api)).toMatchObject({ mode: "copy", canRun: false, reason: access.reason });
+        const operator = manageAccessOf({ configured: true, operator: true, reason: "", who: "ops@contoso.example", running: null }, api);
+        expect(operator).toMatchObject({ mode: "run", canRun: true, who: "ops@contoso.example" });
+        await operator.send?.({ action: "stop" });
+        expect(api.request).toHaveBeenCalledWith({ action: "stop" });
+        expect(manageAccessOf({ configured: true, operator: false, reason: "Read-only.", who: "viewer@contoso.example", running: null }, api)).toMatchObject({ mode: "run", canRun: false, reason: "Read-only." });
+    });
+
+    it("reaches the functions through the app's Rayfin client, and rejects when this deployment has none", async () => {
+        await expect(functionsManageApi({}).access()).rejects.toThrow("This deployment has no Manage function.");
+        const invoke = vi.fn(async (input?: unknown) => JSON.stringify(input === undefined ? { configured: true, operator: true, reason: "", who: "ops@contoso.example", running: null } : { started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example" }));
+        const api = functionsManageApi({ functions: { manageAccess: { invoke }, manageRequest: { invoke } } });
+        expect(await api.access()).toMatchObject({ operator: true });
+        expect(await api.request({ action: "reset", targets: ["T5"] })).toMatchObject({ started: true });
+        expect(invoke).toHaveBeenLastCalledWith({ request: { action: "reset", targets: ["T5"] } }, { timeoutMs: 60_000 });
+        await expect(api.job(ZERO)).rejects.toThrow("This deployment has no Manage function.");
     });
 });

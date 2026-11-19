@@ -1,6 +1,6 @@
 # Database Hub Insights: the Fabric App (preview)
 
-`APP_DatabaseHub_Insights` is the demo's DBA console: a [Fabric app](https://learn.microsoft.com/fabric/apps/overview) where a DBA sees what needs attention across the estate, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts through the demo's own session control ([ADR 0028](../../docs/adr/0028-insights-app-dba-console.md)). Fabric Apps is a **preview**.
+`APP_DatabaseHub_Insights` is the demo's DBA console: a [Fabric app](https://learn.microsoft.com/fabric/apps/overview) where a DBA sees what needs attention across the estate, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts through the demo's own session control ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md)). Fabric Apps is a **preview**.
 
 It reads two sources and says which one every visual shows:
 
@@ -87,7 +87,7 @@ Run all in `NB_DatabaseHub_Control` stays the demo's one action ([ADR 0026](../.
 
 Every action says what it does and what bounds it, shows the control request, and asks for confirmation; a value outside the control's allow-lists and caps can't be confirmed. No secret reaches the browser: the control's webhook URL stays in Key Vault, read by the control notebook. Manage works one of two ways, which the app finds out by itself:
 
-- **Sending from the app** (when the app's Manage function, `rayfin/functions/src/manage.ts`, is deployed): the function takes who you are only from your Fabric sign-in, never from what the browser sends, and sends only for operators: the deployer and the members of the demo's admin group, which `deploy.ps1` writes into the app's settings at every deploy (a redeploy refreshes the list; when it can't read the group's members, the deployer only, with a **Warning**). It runs `NB_DatabaseHub_Control` through the Fabric job API with the request's parameters, and the control records who sent it. Everyone else sees Manage read-only, with the reason. When the control is running a request, a new session's confirmation says it replaces it: the control follows the newest request.
+- **Sending from the app** (when the app's Manage function, `rayfin/functions/src/manage.ts`, is deployed and set up): the function takes who you are only from your Fabric sign-in, never from what the browser sends, and sends only for operators: the deployer and the members of the demo's admin group, which `deploy.ps1` writes into the app's settings at every deploy (a redeploy refreshes the list; when it can't read the group's members, the deployer only, with a **Warning**). It runs `NB_DatabaseHub_Control` through the Fabric job API with the request's parameters, and the control records who sent it (`REQUESTED_BY`, `app/<you>`). Everyone else sees Manage read-only, with the reason. When the control is running a request, a new session's confirmation says it replaces it: the control follows the newest request. The deploy writes the function's settings (the app's API, the control notebook's IDs, and the operators, never a secret) and says which way Manage works (`FABRIC.APP.ACTIONS`); an app's first deploy deploys once more, about a minute, because only then does it know the app's API.
 - **Copying for Run all** (otherwise): each action copies its request as lines for a new cell under the control notebook's parameters cell and opens the notebook, where Run all sends it with the same checks.
 
 **What the control ran** lists every session plan and activity request the notebooks recorded, newest first.
@@ -98,7 +98,7 @@ Every action says what it does and what bounds it, shows the control request, an
 |---|---|
 | Template | The Fabric Apps data app template, `microsoft/fabric-apps-analytic-templates` at commit `239b2c7` (MIT), recorded in `config/versions.json` (`fabricApp.template`) |
 | Runtime | React 19 and Vite, the Rayfin SDK 1.36.2 (`@microsoft/rayfin-client`, `-auth-provider-fabric`, `-connector-fabric-semanticmodel`) |
-| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0028](../../docs/adr/0028-insights-app-dba-console.md)) |
+| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md)) |
 | Charts | One chart component, `ChartView`: hand-built SVG with d3-scale and d3-shape (line, area, bar, stacked bar, scatter, table, and KPI, with incident bands, thresholds, and markers), which the Copilot dock's charts use too; the incident replay, a heatmap, and sparklines. No charting library and no CDN |
 | Fonts | Segoe UI from the system, like Fabric; no web fonts |
 | Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)). Live data from the app's function (`src/copilot/estate.ts`), through `src/data/live-estate.ts` |
@@ -236,7 +236,7 @@ To run the app locally against the deployed backend, work in the stage (`out/fab
 | T4's or T5's page says there's no history yet | A session's end (Run all), `./scripts/stop-demo.ps1 -SaveHistory`, or `./scripts/deploy.ps1` captures their Azure Monitor metrics and passes them to the notebook. A notebook you run by hand has none to pass; a deployment without Cosmos DB has no T5 |
 | T4's page has no Read replica lag | The latest capture had no read replica: it exists only during a session, so capture before `stop-demo.ps1` deletes it (its `-SaveHistory` does) |
 | A page says **Live · unavailable** | The app's live estate function isn't deployed, or Database Hub didn't answer: the line beside it says which. The page shows the history, and Database Hub has the live view |
-| Manage says each action copies its request | The app's Manage function isn't deployed: paste the copied lines into a new cell under the control notebook's parameters cell, then Run all. With the function, operators send from the app |
+| Manage says each action copies its request | The app's Manage function isn't deployed, or it isn't set up, which the message says (`FABRIC.APP.ACTIONS` says why, for example when the session control's notebook wasn't found): paste the copied lines into a new cell under the control notebook's parameters cell, then Run all. With the function set up, operators send from the app |
 | Manage is read-only for you | You aren't one of the demo's operators: the deployer and the members of its admin group. Ask an operator, or one of them redeploys after adding you to the group (`./scripts/deploy.ps1` refreshes the list) |
 | A Real-Time Dashboard link opens the wrong page | The portal path for dashboards isn't documented; use the workspace link and open `RTD_DatabaseHub_LiveView` |
 

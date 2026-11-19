@@ -4,35 +4,13 @@
 // app copies the request's parameters and opens the notebook, where Run all sends it. No secret reaches the browser in
 // either: the control's webhook URL stays in Key Vault, read by the notebook.
 
+import type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer } from "../../rayfin/functions/src/manage-core";
+import { MANAGE_READ_ONLY, type ManageAccess } from "../app-context";
 import type { ControlRequest, NotebookParameter } from "./control";
 import { notebookParameters } from "./control";
 
-/** What the Manage function says about the signed-in viewer. */
-export interface ManageAccessAnswer {
-    /** True when the verified caller is an operator: the deployer or a member of the demo's admin group. */
-    operator: boolean;
-    /** Why not, in one sentence, when they aren't. */
-    reason: string;
-    /** The verified caller, as the control records them (REQUESTED_BY). */
-    who: string;
-    /** The control's run in progress, when there is one: a new session replaces it (the newest request wins). */
-    running: { startedAt: string; invokeType?: string } | null;
-}
-
-export interface ManageRequestAnswer {
-    started: boolean;
-    /** The Fabric job instance of NB_DatabaseHub_Control, when it started. */
-    jobInstance: string;
-    reason: string;
-    requestedBy: string;
-}
-
-export interface ManageJobAnswer {
-    status: string;
-    startedAt?: string | null;
-    endedAt?: string | null;
-    failureReason?: string | null;
-}
+// The Manage function's answers, defined once beside its checks.
+export type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer };
 
 /** The Manage function's schema, for `client.functions` (the shared functions project registers it in manage.ts). */
 export type ManageFunctionsSchema = {
@@ -47,18 +25,42 @@ export interface ManageApi {
     job(jobInstance: string): Promise<ManageJobAnswer>;
 }
 
-interface FunctionClients {
-    functions: { [K in keyof ManageFunctionsSchema]: { invoke(input?: ManageFunctionsSchema[K]["input"]): Promise<ManageFunctionsSchema[K]["output"]> } };
+type Invoke = (input?: unknown, options?: { timeoutMs?: number }) => Promise<unknown>;
+
+/** One of the app's functions, or null when this deployment doesn't have it. */
+function functionOf(client: unknown, name: keyof ManageFunctionsSchema): Invoke | null {
+    try {
+        const fn = (client as { functions?: Record<string, { invoke?: Invoke } | undefined> }).functions?.[name];
+        return fn && typeof fn.invoke === "function" ? fn.invoke.bind(fn) : null;
+    } catch {
+        return null;
+    }
 }
 
-/** The Manage API over the app's Rayfin client; its calls reject when the function isn't deployed. */
+/** The Manage API over the app's Rayfin client; its calls reject when the function isn't deployed or can't be reached. */
 export function functionsManageApi(client: unknown): ManageApi {
-    const fns = (client as FunctionClients).functions;
-    return {
-        access: () => fns.manageAccess.invoke(),
-        request: (request) => fns.manageRequest.invoke({ request }),
-        job: (jobInstance) => fns.manageJob.invoke({ jobInstance }),
+    const call = async <T>(name: keyof ManageFunctionsSchema, input?: unknown): Promise<T> => {
+        const invoke = functionOf(client, name);
+        if (!invoke) throw new Error("This deployment has no Manage function.");
+        const raw = await invoke(input, { timeoutMs: 60_000 });
+        const answer = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+        if (!answer || typeof answer !== "object") throw new Error("The Manage function returned an unexpected answer.");
+        return answer as T;
     };
+    return {
+        access: () => call<ManageAccessAnswer>("manageAccess"),
+        request: (request) => call<ManageRequestAnswer>("manageRequest", { request }),
+        job: (jobInstance) => call<ManageJobAnswer>("manageJob", { jobInstance }),
+    };
+}
+
+/**
+ * Which way Manage sends actions, from the function's answer about the viewer: copy mode (C), with the function's reason,
+ * when this deployment's function isn't set up; otherwise the app sends, or it's read-only for a viewer who isn't an operator.
+ */
+export function manageAccessOf(answer: ManageAccessAnswer, api: Pick<ManageApi, "request">): ManageAccess {
+    if (answer.configured === false) return { ...MANAGE_READ_ONLY, reason: answer.reason || MANAGE_READ_ONLY.reason };
+    return { mode: "run", canRun: answer.operator, reason: answer.operator ? "" : answer.reason, who: answer.who, running: answer.running, send: (r) => api.request(r) };
 }
 
 function literal(name: string, p: NotebookParameter): string {
