@@ -44,7 +44,7 @@ Everything goes to two places, which the scripts find by name and create when th
 - **During a session:** the VMs' compute and their pay-as-you-go SQL Server licenses (T1 by the hour, T2 per core-hour through Azure Arc), T3's compute while it's active, T4 and its read replica, T5's container (about $0.032 an hour at list price, nothing on the free tier), and Bastion, when you started one for interactive access.
 - **Close to nothing:** the two Automation accounts (their jobs fit in the 500 job minutes a month that Azure Automation includes), the Key Vault's operations, the identities, the role definitions, and the budget.
 - **Outside the estimate:** the Fabric capacity, which bills while it runs, and licenses.
-- **The ceilings:** $20 a session (`sessionCeilingUsd`; $15 before 2026-11-18, and a configuration that still says 15 gets 20), a **Warning** above it, and $375 a month (`monthlyCeilingUsd`), a hard ceiling that preflight fails above. The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
+- **The ceilings:** $20 a session (`sessionCeilingUsd`; $15 before 2026-11-18, and a configuration that still says 15 gets 20), a **Warning** above it, and $390 a month (`monthlyCeilingUsd`; $375 before 2026-11-19, which a configuration that says so keeps), a hard ceiling that preflight fails above. The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
 - **The figures:** `./scripts/estimate-cost.ps1` prices it from Azure's list prices at run time, with no sign-in; [cost management](docs/cost-management.md#at-a-glance) has dated examples.
 
 ## Quick start

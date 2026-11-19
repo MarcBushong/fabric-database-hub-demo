@@ -6,7 +6,7 @@ Estimates demo cost per profile from live Azure retail prices (ADR 0016).
 .DESCRIPTION
 Queries the public Azure Retail Prices API. For each profile it reports running cost per hour, one
 demo-day session, idle cost per month, and a light-use month, and compares them with the ceilings in the
-configuration. The monthly ceiling (monthlyCeilingUsd, 375 USD by default since 2026-11-04) is hard: a light-use month
+configuration. The monthly ceiling (monthlyCeilingUsd, 390 USD by default for a new configuration since 2026-11-19) is hard: a light-use month
 above it is Fail and the script exits with code 1. A session above sessionCeilingUsd is a Warning.
 
 T4's 7-day automatic restart: when signed in, the script also reads whether a safety stop is fully in place

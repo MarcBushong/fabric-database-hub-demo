@@ -26,7 +26,7 @@ Every value is a parameter, and the profile only sets defaults.
 
 ### Ceilings
 
-- `monthlyCeilingUsd` defaults to 375 and `sessionCeilingUsd` to 20 (monthly default revised 2026-10-20 and 2026-11-04, session default 2026-11-18 from 15; see below).
+- `monthlyCeilingUsd` defaults to 390 for a new configuration and `sessionCeilingUsd` to 20 (monthly default revised 2026-10-20, 2026-11-04, and 2026-11-19, session default 2026-11-18 from 15; see below).
 - The monthly ceiling is **hard**: `preflight.ps1` and `estimate-cost.ps1` report **Fail** when the light-use monthly estimate is above it. A session estimate above `sessionCeilingUsd` is a **Warning**. `status.ps1` and `start-demo.ps1` follow the same rules.
 - The Azure budget amount is `monthlyCeilingUsd`, with alerts at 50%, 80%, and 100% (C2).
 - Every default stays the cheapest working option, whatever the ceiling, except T4's size since 2026-11-04 (user-directed; [below](#2026-11-04-user-directed-the-4-vcore-t4-default-and-a-375-ceiling)).

@@ -22,7 +22,7 @@
   "owner": "your-alias",
   "ownerEmail": "you@example.com",
   "costCenter": "demo",
-  "monthlyCeilingUsd": 375,
+  "monthlyCeilingUsd": 390,
   "sessionCeilingUsd": 20,
   "autoShutdownTime": "1900",
   "autoShutdownTimeZone": "Pacific Standard Time",
