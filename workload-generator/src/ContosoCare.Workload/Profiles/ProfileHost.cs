@@ -227,7 +227,8 @@ internal sealed record ProfileHostOptions
 
     /// <summary>
     /// The wait before an activity that was refused is tried again: another run of its scenario was still Running
-    /// (demo.usp_run_begin's error 50108), the database already ran four runs (50109), or the target couldn't be reached.
+    /// (demo.usp_run_begin's error 50108), the database already ran four runs (50109), the target couldn't be reached, or
+    /// T5's container doesn't exist now (it exists only during a session, so it appears when the session's start creates it).
     /// </summary>
     public TimeSpan RefusedRetryDelay { get; init; } = TimeSpan.FromSeconds(30);
 

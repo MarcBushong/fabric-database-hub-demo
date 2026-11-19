@@ -22,6 +22,8 @@ The relay holds no Azure, Fabric, or GitHub credential and runs no tool. The pag
 
 Every route but `/healthz` serves only the origins in `ALLOWED_ORIGINS`: the app's hosting origin, which `configure-fabric-app.ps1` sets after each deployment of the app. Requests are rate-limited per client, and messages, tools, and results have size limits.
 
+A client is the address Container Apps' ingress appends as the last `X-Forwarded-For` entry, never one the client wrote. It holds at most 4 sockets and runs one new Copilot check (`/auth/copilot`) at a time, 4 in all. A socket must send its `start` within 10 seconds; only started conversations count against `MAX_SESSIONS`, and a start that fails closes its socket. The relay reads request paths as text, and it logs an unexpected error instead of exiting (the security review, 2026-11-19).
+
 ## Settings
 
 All from environment variables, and none is a secret. `infra/ask/ask-relay.bicep` sets the first two.
@@ -39,11 +41,11 @@ All from environment variables, and none is a secret. `infra/ask/ask-relay.bicep
 | `DEFAULT_MODEL` | empty | The model when the page names none; empty lets Copilot choose |
 | `PORT` | 8080 | The HTTP port |
 
-A conversation also ends after 15 minutes without a message; the page closes an idle one after 5. Container Apps then scales the relay to zero.
+A conversation also ends after 15 minutes without a message from either side (pings don't count); the page closes an idle one after 5. Container Apps then scales the relay to zero.
 
 ## The image
 
-`.github/workflows/ask-relay-image.yml` builds it on a push to `main` or `ignite-updates` that changes `ask-relay/**` or the workflow (in a public repository, or with the repository variable `ASK_RELAY_IMAGE_ENABLED` set to `true`), or when run by hand; never on a pull request, and never in a fork. It type-checks and tests the relay, then builds the `Dockerfile` and pushes `ghcr.io/<owner>/<repository>/ask-relay:<commit SHA>`, with the digest in the run's summary and annotations. Its token can only read the repository; only the job that publishes can write packages. GitHub creates the package private: the repository's owner makes it public once (it can't be made private again) and pins its digest in `config/versions.json` (`askRelay.image`); `deploy.ps1` pulls exactly that digest, without credentials. Until then, the relay isn't deployed: a **Warning** that says why, and **DONE** stays. Deployers never run the workflow.
+`.github/workflows/ask-relay-image.yml` builds it on a push to `main` or `ignite-updates` that changes `ask-relay/**` or the workflow (in a public repository, or with the repository variable `ASK_RELAY_IMAGE_ENABLED` set to `true`), or when run by hand; never on a pull request, and never in a fork. It type-checks and tests the relay, then builds the `Dockerfile` and pushes `ghcr.io/<owner>/<repository>/ask-relay:<commit SHA>`, with the digest in the run's summary and annotations. Its token can only read the repository; only the job that publishes can write packages. The first publish from this public repository makes the package public; a fork's or a private copy's package follows its own repository's visibility. `config/versions.json` pins the digest (`askRelay.image`), and `deploy.ps1` pulls exactly that digest, without credentials. When an image can't be pulled, the relay isn't deployed: a **Warning** that says why, and **DONE** stays. Deployers never run the workflow.
 
 - **Base images:** Microsoft's Azure Linux Node.js images from `mcr.microsoft.com`, pinned by digest (`askRelay.buildImage` and `askRelay.runtimeImage`): the build stage has npm; the runtime is distroless, with no shell or package manager, and runs as a non-root user.
 - **Dependencies:** `npm ci` from `package-lock.json`, with no install scripts; every version is exact.

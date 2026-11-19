@@ -448,6 +448,63 @@ Describe 'Sync-DemoFabricAppStage' {
         $null = New-Item -ItemType Directory -Path $empty
         (Sync-DemoFabricAppStage -SourcePath $empty -StagePath $script:stage -Confirm:$false).status | Should -Be 'Fail'
     }
+
+    It 'drops rayfin up''s records of other workspaces, which a destroyed environment leaves, and keeps the target''s' {
+        # rayfin up finds its record by the workspace name's slug and reuses its item: after destroy.ps1, a new workspace
+        # with the same name would get the deleted one's app. Fake IDs; the kept record's link has a '&', which the CLI
+        # writes as is.
+        $deleted = '22222222-2222-2222-2222-222222222222'
+        # The target in lowercase, its record in uppercase: Fabric's IDs are GUIDs, compared without case.
+        $target = 'abcdef12-1111-1111-1111-111111111111'
+        $path = Join-Path -Path $script:stage -ChildPath 'rayfin/.deployments.json'
+        $link = 'https://app.fabric.microsoft.com/groups/x/appbackends/y?ctid=z&experience=fabric-developer'
+        $registry = [ordered]@{
+            deployments = [ordered]@{
+                'database-hub-demo' = [ordered]@{ fabricItemId = '99999999-9999-9999-9999-999999999999'; itemName = 'APP_DatabaseHub_Insights'; fabricWorkspaceId = $deleted; publishableKey = $script:fakeKey }
+                'database-hub-demo-renamed' = [ordered]@{ fabricItemId = $script:itemId; itemName = 'APP_DatabaseHub_Insights'; fabricWorkspaceId = $target.ToUpperInvariant(); publishableKey = $script:fakeKey; fabricDeepLink = $link }
+            }
+            active = 'database-hub-demo'
+        }
+        Set-Content -LiteralPath $path -Value ($registry | ConvertTo-Json -Depth 5) -Encoding utf8NoBOM
+        Set-TestDotItemHidden -Path $path
+        $results = @(Sync-DemoFabricAppStage -SourcePath $script:source -StagePath $script:stage -WorkspaceId $target -SkipInstall -Confirm:$false)
+        $stage = $results | Where-Object checkId -EQ 'FABRIC.APP.STAGE'
+        $stage.status | Should -Be 'Pass'
+        $stage.message | Should -Match 'dropped rayfin up''s record of 1 other Fabric workspace\(s\) \(database-hub-demo\)'
+        $stage.evidence['droppedDeployments'][0]['workspaceId'] | Should -Be $deleted
+        ($stage | ConvertTo-Json -Depth 10) | Should -Not -Match ([regex]::Escape($script:fakeKey))
+        $text = [System.IO.File]::ReadAllText($path)
+        $text | Should -Not -Match "`r"
+        $text | Should -Match ([regex]::Escape('?ctid=z&experience=fabric-developer"'))
+        $text.EndsWith("}`n") | Should -BeTrue
+        $after = $text | ConvertFrom-Json -AsHashtable
+        @($after['deployments'].Keys) | Should -Be @('database-hub-demo-renamed')
+        $after['active'] | Should -Be 'database-hub-demo-renamed'
+        $after['deployments']['database-hub-demo-renamed']['publishableKey'] | Should -Be $script:fakeKey
+
+        # Only the deleted workspace's record: none stays, and nothing is active.
+        Set-Content -LiteralPath $path -Value '{"deployments":{"database-hub-demo":{"fabricItemId":"99999999-9999-9999-9999-999999999999","fabricWorkspaceId":"22222222-2222-2222-2222-222222222222"}},"active":"database-hub-demo"}' -Encoding utf8NoBOM
+        $alone = @(Sync-DemoFabricAppStage -SourcePath $script:source -StagePath $script:stage -WorkspaceId $script:workspaceId -SkipInstall -Confirm:$false)
+        ($alone | Where-Object checkId -EQ 'FABRIC.APP.STAGE').status | Should -Be 'Pass'
+        $empty = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json -AsHashtable
+        $empty['deployments'].Count | Should -Be 0
+        $empty.ContainsKey('active') | Should -BeFalse
+    }
+
+    It 'leaves rayfin up''s records as they are without another workspace''s, without -WorkspaceId, and when it can''t read them' {
+        $path = Join-Path -Path $script:stage -ChildPath 'rayfin/.deployments.json'
+        $own = '{"deployments":{"database-hub-demo":{"fabricItemId":"55555555-5555-5555-5555-555555555555","fabricWorkspaceId":"11111111-1111-1111-1111-111111111111"}},"active":"database-hub-demo"}'
+        $other = '{"deployments":{"database-hub-demo":{"fabricItemId":"99999999-9999-9999-9999-999999999999","fabricWorkspaceId":"22222222-2222-2222-2222-222222222222"}},"active":"database-hub-demo"}'
+        foreach ($case in @(@{ Text = $own; Id = $script:workspaceId }, @{ Text = $other; Id = '' }, @{ Text = $other; Id = '00000000-0000-0000-0000-000000000000' }, @{ Text = '{}'; Id = $script:workspaceId }, @{ Text = 'not json'; Id = $script:workspaceId })) {
+            Set-Content -LiteralPath $path -Value $case.Text -Encoding utf8NoBOM -NoNewline
+            $results = @(Sync-DemoFabricAppStage -SourcePath $script:source -StagePath $script:stage -WorkspaceId $case.Id -SkipInstall -Confirm:$false)
+            $stage = $results | Where-Object checkId -EQ 'FABRIC.APP.STAGE'
+            $stage.status | Should -Be 'Pass' -Because $case.Text
+            $stage.message | Should -Not -Match 'dropped'
+            $stage.evidence.Contains('droppedDeployments') | Should -BeFalse
+            [System.IO.File]::ReadAllText($path) | Should -BeExactly $case.Text
+        }
+    }
 }
 
 Describe 'Test-DemoFabricAppPrerequisite' {
@@ -1214,6 +1271,11 @@ Describe 'Set-DemoFabricAppManageSetting' {
 Describe 'configure-fabric-app.ps1' {
     BeforeAll {
         $script:passResult = { param([string] $CheckId, [hashtable] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ok' -Evidence $Evidence }
+        # Ask's relay has its own tests (DbHubDemo.Ask.Tests.ps1). Here its setup answers as it does without a pinned image,
+        # so these tests reach no Azure CLI whatever config/versions.json pins (2026-11-19).
+        Mock -CommandName Invoke-DemoAskRelaySetup -MockWith {
+            [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'ASK.RELAY' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'Ask''s chat relay wasn''t deployed: no relay image is pinned yet (a test stub).'); Endpoint = ''; AllowedOrigins = ''; ClientIdSource = 'pinned' }
+        }
     }
 
     It 'validates the source and plans every step under -WhatIf without a token, a CLI call, or a request' {
@@ -1265,7 +1327,7 @@ Describe 'configure-fabric-app.ps1' {
         }
         ($records | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').status | Should -Be 'Manual action required'
         Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { $ItemName -eq 'APP_DatabaseHub_Insights' -and $WorkspaceId -eq $script:workspaceId -and $TenantId -eq $script:tenantId }
-        Should -Invoke -CommandName Sync-DemoFabricAppStage -Times 1 -Exactly -ParameterFilter { $EnvValues['DBHUB_SEMANTIC_MODEL_ID'] -eq $script:modelId -and $DeployFile['links']['report'] -match '/reports/' }
+        Should -Invoke -CommandName Sync-DemoFabricAppStage -Times 1 -Exactly -ParameterFilter { $EnvValues['DBHUB_SEMANTIC_MODEL_ID'] -eq $script:modelId -and $DeployFile['links']['report'] -match '/reports/' -and $PesterBoundParameters['WorkspaceId'] -eq $script:workspaceId }
         Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $HostingUrl -eq $script:hosting }
         # The Azure CLI's Fabric token goes to rayfin up (2026-11-09); a -FabricToken the caller passed means the script ran
         # no guard of its own, so it asks the Azure CLI for no Power BI token.

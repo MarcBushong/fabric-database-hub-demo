@@ -727,8 +727,8 @@ Describe 'Cost area' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
         $script:schedule = @{ properties = @{ status = 'Enabled'; dailyRecurrence = @{ time = '1900' }; timeZoneId = 'Pacific Standard Time' } }
         $script:costResponse = Get-TestAzResponse
-        # The budget at monthlyCeilingUsd's default, 375 since 2026-11-04 (ADR 0016).
-        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '375.0'; timeGrain = 'Monthly' })
+        # The budget at monthlyCeilingUsd's default, 390 for a new configuration since 2026-11-19 (ADR 0016).
+        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '390.0'; timeGrain = 'Monthly' })
         $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()
@@ -827,6 +827,24 @@ Describe 'Security area' {
         $output.message | Should -Match 'jwt'
         ($output.evidence.findings | Where-Object { $_.rule -eq 'jwt' }).line | Should -Be 2
         ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
+    }
+
+    It 'leaves dependency trees out of the output scan, and says which, in its message and evidence (2026-11-18)' {
+        # Live, 2026-11-18: out/fabric-app/node_modules held 114,315 third-party files, which kept this area busy for more
+        # than 37 minutes, and some of them match the patterns (a Bearer challenge in a package's comments).
+        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd('=') }
+        $token = '{0}.{1}.{2}' -f (& $encode '{"alg":"HS256"}'), (& $encode ('{"oid":"' + [guid]::NewGuid().ToString() + '"}')), (& $encode ([guid]::NewGuid().ToString('N')))
+        $package = Join-Path -Path $script:scanFolder -ChildPath 'fabric-app/node_modules/pkg'
+        New-Item -ItemType Directory -Path $package -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path -Path $package -ChildPath 'index.js') -Value ('// Authorization: Bearer {0}' -f $token) -Encoding utf8NoBOM
+        $context = New-TestContext
+        $output = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder } { param($X, $P) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' }
+        $output.status | Should -Be 'Pass'
+        $output.message | Should -Match '^No secret or token pattern, and no value registered in this session, in 1 file\(s\) under .+\. Dependency trees \(node_modules and package caches\) aren''t scanned \(1 left out: .+fabric-app[\\/]node_modules\)\.$'
+        $output.evidence.filesScanned | Should -Be 1
+        $output.evidence.directoriesPruned | Should -Be 1
+        @($output.evidence.pruned).Count | Should -Be 1
+        @($output.evidence.pruned)[0] | Should -Match 'fabric-app[\\/]node_modules$'
     }
 
     It 'warns on role assignments the demo never creates and on a Key Vault, and fails on a public IP or an open inbound rule' {

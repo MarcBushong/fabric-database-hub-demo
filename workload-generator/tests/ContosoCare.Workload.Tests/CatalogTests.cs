@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Runs;
@@ -109,6 +110,42 @@ public sealed partial class CatalogTests
         var result = ProfilesSchema.Value.Evaluate(document.RootElement, new EvaluationOptions { OutputFormat = OutputFormat.List });
 
         Assert.True(result.IsValid, Describe(result));
+    }
+
+    [Theory]
+    [InlineData(-1, false)]
+    [InlineData(0, true)]
+    [InlineData(2, true)]
+    [InlineData(30, true)]
+    [InlineData(31, false)]
+    public void ASlotsRecoveryMinutesAreZeroToThirtyInTheSchemaAndWhenTheRunnerLoadsThem(int minutes, bool valid)
+    {
+        var profiles = JsonNode.Parse(File.ReadAllText(RepositoryPaths.Combine("scenarios", "activity-profiles.json")))!;
+        profiles["profiles"]!["showcase"]!["incidents"]!.AsArray().First(s => s!["target"]!.GetValue<string>() == "T5")!["recoveryMinutes"] = minutes;
+        var json = profiles.ToJsonString();
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Equal(valid, ProfilesSchema.Value.Evaluate(document.RootElement).IsValid);
+        if (valid)
+        {
+            Assert.Equal(minutes, ActivityProfilesDefinition.Parse(json).Profiles["showcase"].Incidents.First(s => s.Target == "T5").RecoveryMinutes);
+        }
+        else
+        {
+            var error = Assert.Throws<InvalidOperationException>(() => ActivityProfilesDefinition.Parse(json));
+            Assert.Equal($"Activity profile 'showcase' has an invalid recoveryMinutes ({minutes}) on its T5 ru-storm slot at minute 3: it must be 0 to 30.", error.Message);
+        }
+    }
+
+    [Fact]
+    public void EveryT5SlotLeavesTimeToRecoverBeforeTheProfileEnds()
+    {
+        // R896: every T5 ru-storm slot, in every profile, runs whole with 2 minutes for normalized RU to fall back under 100%
+        // and the 429s to stop before the profile ends, so no session ends mid-storm.
+        var slots = ActivityProfilesDefinition.Default.Profiles.Values.SelectMany(p => p.Incidents).Where(s => s.Target == "T5").ToList();
+
+        Assert.NotEmpty(slots);
+        Assert.All(slots, s => Assert.Equal(2, s.RecoveryMinutes));
     }
 
     [Fact]

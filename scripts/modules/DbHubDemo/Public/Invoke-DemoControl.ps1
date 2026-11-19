@@ -16,8 +16,9 @@ function Invoke-DemoControl {
     runner clamps everything to the scenario's limits. An incident on 'all' runs on the scenario's default
     target (scenarios/<id>/scenario.json), as the notebook does. A target whose runner isn't installed yet
     (T2 before its guest has SQL Server) reports Warning, not Fail. 'all' includes T4 when t4Enabled and T5, the Azure
-    Cosmos DB account (2026-11-18, ADR 0027), when t5Enabled; T5 has no stop or start, so its activity needs only
-    sqlvm01.
+    Cosmos DB account (2026-11-18, ADR 0027), when t5Enabled; T5 has no stop or start, so its activity needs sqlvm01 and,
+    since 2026-11-19, its container, which exists only during a session: it's created first when a stop deleted it
+    (CONTROL.T5.CONTAINER, New-DemoT5Container).
 
     Returns one CONTROL.<target> result per target.
 
@@ -109,6 +110,18 @@ function Invoke-DemoControl {
     if ('T5' -in $targets -and -not (Test-DemoT5Enabled -Config $Config)) {
         $results.Add((New-DemoResult -CheckId 'CONTROL.T5' -Area 'workload' -Target 'T5' -Status 'Not selected' -Message 'T5 (Azure Cosmos DB) is off in this configuration (t5Enabled is false), so its activity wasn''t changed.' -Remediation 'To add T5, remove t5Enabled from the configuration (or set it to true) and run ./scripts/deploy.ps1.'))
         $targets = @($targets | Where-Object { $_ -ne 'T5' })
+    }
+    # T5's container exists only during a session (2026-11-19, ADR 0027): an activity on T5 needs it, so it's created first
+    # when a stop deleted it; without it, nothing is sent to T5 (CONTROL.T5.CONTAINER says why).
+    if ('T5' -in $targets -and $Scenario -ne 'off' -and $PSCmdlet.ShouldProcess('T5', 'Make sure T5''s container exists')) {
+        $container = New-DemoT5Container -Config $Config -CheckId 'CONTROL.T5.CONTAINER' -Confirm:$false
+        if ([string]$container.status -ne 'Pass') {
+            $results.Add($container)
+            $targets = @($targets | Where-Object { $_ -ne 'T5' })
+        }
+        elseif ([string](Get-DemoMemberValue -InputObject $container.evidence -Name 'action') -eq 'create') {
+            $results.Add($container)
+        }
     }
     # replica-lag (ADR 0025) needs T4 and its read replica running: checked here first, because 'profile set' only stores the
     # profile, and T1's profile host refuses the run later where only its log says so (live, 2026-11-13: CONTROL.T4 said Pass

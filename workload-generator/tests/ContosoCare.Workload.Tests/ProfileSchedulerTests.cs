@@ -494,4 +494,94 @@ public sealed class ProfileSchedulerTests
         Assert.Equal("60", storm.Parameters["calmSeconds"]);
         Assert.All(ProfileScheduler.Plan(State("business-day"), DemoTarget.T5, new DateTimeOffset(2026, 10, 20, 16, 40, 0, TimeSpan.Zero), Definitions, Catalog, null), a => Assert.True(a.IsBaseline));
     }
+
+    [Theory]
+    [InlineData(84)]
+    [InlineData(87)]
+    public void AStormWhoseRecoveryWouldCrossTheProfilesEndIsSkippedNotClipped(int endMinute)
+    {
+        // R896: T5's last showcase storm, minutes 78 to 86, can't end with its 2 recovery minutes before a profile that ends
+        // at minute 84 (it would be cut mid-storm) or 87 (normalized RU would still be falling), so T5 runs its baseline to
+        // the end instead.
+        var state = State("showcase", SetAt.AddMinutes(endMinute));
+
+        var activities = ProfileScheduler.Plan(state, DemoTarget.T5, SetAt.AddMinutes(80), Definitions, Catalog, null);
+
+        Assert.Contains(activities, a => a.IsBaseline && a.End == SetAt.AddMinutes(endMinute));
+        Assert.DoesNotContain(activities, a => !a.IsBaseline);
+    }
+
+    [Fact]
+    public void EveryStormThatFitsWithItsRecoveryRunsWhole()
+    {
+        // Through each session, every T5 storm the showcase plans runs its whole slot and ends with its recovery minutes
+        // before the profile does; the earlier cycles' storms all run, and only one that can't fit is left out.
+        var showcase = Definitions.Profiles["showcase"];
+        foreach (var (endMinute, starts) in new[] { (84, new[] { 3, 18, 33, 48, 63 }), (87, new[] { 3, 18, 33, 48, 63 }), (88, new[] { 3, 18, 33, 48, 63, 78 }), (90, new[] { 3, 18, 33, 48, 63, 78 }) })
+        {
+            var end = SetAt.AddMinutes(endMinute);
+            var storms = new Dictionary<string, PlannedActivity>(StringComparer.Ordinal);
+            for (var second = 0; second < endMinute * 60; second += 30)
+            {
+                foreach (var storm in ProfileScheduler.Plan(State("showcase", end), DemoTarget.T5, SetAt.AddSeconds(second), Definitions, Catalog, null).Where(a => !a.IsBaseline))
+                {
+                    storms[storm.Key] = storm;
+                }
+            }
+
+            Assert.Equal(starts.Select(m => SetAt.AddMinutes(m)), storms.Values.Select(s => s.Start).Order());
+            foreach (var storm in storms.Values)
+            {
+                var slot = showcase.Incidents.Single(s => s.Target == "T5" && s.StartMinute == (int)(storm.Start - SetAt).TotalMinutes % showcase.CycleMinutes);
+                Assert.Equal(TimeSpan.FromMinutes(slot.DurationMinutes), storm.End - storm.Start);
+                Assert.True(storm.End + TimeSpan.FromMinutes(slot.RecoveryMinutes!.Value) <= end, $"The storm from {storm.Start:HH:mm} has no time to recover before {end:HH:mm}.");
+            }
+        }
+    }
+
+    [Fact]
+    public void AStormWhoseWindowBeganBeforeTheProfileWasSetIsntStartedPartWay()
+    {
+        // business-day counts its cycles from UTC midnight, so a profile set at 16:27 lands inside T5's 16:25 storm: that
+        // storm isn't started part-way, and the next hour's runs whole. A slot without recoveryMinutes (T2's CPU at :05)
+        // still starts part-way.
+        var setAt = new DateTimeOffset(2026, 10, 20, 16, 27, 0, TimeSpan.Zero);
+        var state = new ProfileState("business-day", setAt, "test", setAt.AddHours(8), null);
+
+        var now = ProfileScheduler.Plan(state, DemoTarget.T5, setAt.AddMinutes(1), Definitions, Catalog, null);
+        var next = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T5, new DateTimeOffset(2026, 10, 20, 17, 26, 0, TimeSpan.Zero), Definitions, Catalog, null), a => !a.IsBaseline);
+        var lateSetAt = new DateTimeOffset(2026, 10, 20, 16, 7, 0, TimeSpan.Zero);
+        var cpu = Assert.Single(ProfileScheduler.Plan(state with { SetAt = lateSetAt }, DemoTarget.T2, lateSetAt.AddMinutes(1), Definitions, Catalog, null), a => !a.IsBaseline);
+
+        Assert.Contains(now, a => a.IsBaseline);
+        Assert.DoesNotContain(now, a => !a.IsBaseline);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 17, 25, 0, TimeSpan.Zero), next.Start);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 17, 33, 0, TimeSpan.Zero), next.End);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 16, 5, 0, TimeSpan.Zero), cpu.Start);
+    }
+
+    [Fact]
+    public void ASlotWithoutRecoveryMinutesIsStillClippedAtTheProfilesEnd()
+    {
+        // Only a slot with recoveryMinutes is skipped: the same storm without it is clipped at the profile's end, as every
+        // other slot still is (T1's cpu-pressure, minutes 82 to 89).
+        var showcase = Definitions.Profiles["showcase"];
+        var withoutRecovery = Definitions with
+        {
+            Profiles = new Dictionary<string, ProfileDefinition>(Definitions.Profiles, StringComparer.Ordinal)
+            {
+                ["showcase"] = showcase with { Incidents = [.. showcase.Incidents.Select(s => s with { RecoveryMinutes = null })] },
+            },
+        };
+        var state = State("showcase", SetAt.AddMinutes(84));
+
+        var clipped = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T5, SetAt.AddMinutes(80), withoutRecovery, Catalog, null), a => !a.IsBaseline);
+        var cpu = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T1, SetAt.AddMinutes(83), Definitions, Catalog, null), a => a.ScenarioId == "cpu-pressure");
+
+        Assert.Equal(SetAt.AddMinutes(78), clipped.Start);
+        Assert.Equal(SetAt.AddMinutes(84), clipped.End);
+        Assert.DoesNotContain(ProfileScheduler.Plan(state, DemoTarget.T5, SetAt.AddMinutes(80), Definitions, Catalog, null), a => !a.IsBaseline);
+        Assert.Equal(SetAt.AddMinutes(82), cpu.Start);
+        Assert.Equal(SetAt.AddMinutes(84), cpu.End);
+    }
 }

@@ -145,6 +145,15 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan.Demo.Guard | Should -BeNullOrEmpty
     }
 
+    It 'deletes the demo''s workspace with the Insights app''s functions item, which its deployment makes since 2026-11-18' {
+        # dbhubc6, 2026-11-19: destroy.ps1 kept the workspace for "UserDataFunction APP_DatabaseHub_Insights", the app's
+        # functions, which its backend makes under the app's own name (rayfin.yml services.functions).
+        $script:items['demo-ws'] = @(New-DemoWorkspaceItem) + @(New-FabricItem 'UserDataFunction' 'APP_DatabaseHub_Insights')
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        $plan.Demo.Delete | Should -BeTrue
+        $plan.Demo.Reason | Should -Be 'everything in it is the demo''s (10 item(s))'
+    }
+
     It 'keeps a workspace another environment records as its own, and names it; the other workspace still goes (the shared-workspace guard)' {
         $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhubfd-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfd-demo'; Tagged = $true; Claims = @('demo-ws', '0a0a0a0a-0000-0000-0000-000000000001') }) }
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
@@ -198,6 +207,24 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
         $plan.Ok | Should -BeFalse
         $plan.Kind | Should -Be 'CapacityInactive'
+    }
+}
+
+Describe 'Get-DemoFabricDemoItem: what the Insights app''s deployment makes beside the app (2026-11-19)' {
+    It 'lists an item for each service the app''s rayfin.yml enables, and rayfin.yml enables none that makes another' {
+        # The app's backend makes a user data function for its connectors (<app>_connector) and one for its functions (the
+        # app's name); the data and storage services would make a SQL database or a lakehouse that destroy.ps1 doesn't know.
+        $yml = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/rayfin/rayfin.yml') -Raw
+        $enabled = { param([string] $Service) $yml -match ('(?m)^  {0}:[ \t]*\r?\n(?:    .*\r?\n)*?    enabled:[ \t]*true\b' -f $Service) }
+        $listed = @(InModuleScope DbHubDemo { Get-DemoFabricDemoItem -LakehouseName 'LH_DatabaseHub' } | ForEach-Object { '{0} {1}' -f $_.Type, $_.Name })
+        $listed | Should -Contain 'AppBackend APP_DatabaseHub_Insights'
+        (& $enabled 'functions') | Should -BeTrue
+        $listed | Should -Contain 'UserDataFunction APP_DatabaseHub_Insights'
+        $yml | Should -Match '(?m)^connectors:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?  - name:'
+        $listed | Should -Contain 'UserDataFunction APP_DatabaseHub_Insights_connector'
+        foreach ($service in 'data', 'storage') {
+            (& $enabled $service) | Should -BeFalse -Because "services.$service would make an item destroy.ps1 doesn't list"
+        }
     }
 }
 

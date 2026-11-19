@@ -13,7 +13,9 @@ export interface GitHubSession {
     login: string | null;
 }
 
-const KEY = "dbhub-insights.github.v1";
+/** The key the sign-in is kept under; a change to it from another tab arrives as a storage event. */
+export const SESSION_KEY = "dbhub-insights.github.v1";
+const KEY = SESSION_KEY;
 const TOKEN = /^[A-Za-z0-9_]{20,255}$/;
 /** Renew when less than this is left, so a conversation never starts on a token about to lapse. */
 export const REFRESH_MARGIN_MS = 2 * 60 * 60 * 1000;
@@ -69,4 +71,117 @@ export function sessionState(session: GitHubSession, now: number): SessionState 
     if (session.expiresAt === null || session.expiresAt - now > REFRESH_MARGIN_MS) return "valid";
     if (session.refreshToken && (session.refreshExpiresAt === null || session.refreshExpiresAt > now)) return "refresh";
     return session.expiresAt > now ? "valid" : "expired";
+}
+
+/** What renewing a sign-in came to. Only "expired" means the viewer must sign in again. */
+export type Renewal =
+    | { kind: "ok"; session: GitHubSession }
+    /** GitHub refused the refresh token (it's used, revoked, or past its 6 months), or there's none left. */
+    | { kind: "expired" }
+    /** Another tab signed out. */
+    | { kind: "signed-out" }
+    /** The relay or GitHub couldn't renew it just now; the sign-in stays, and a later try can renew it. */
+    | { kind: "unavailable"; message: string };
+
+export interface LockManagerLike {
+    request<T>(name: string, callback: () => Promise<T>): Promise<T>;
+}
+
+export interface RenewOptions {
+    storage: (Pick<Storage, "getItem" | "setItem">) | undefined;
+    /** The sign-in this tab holds. */
+    current: GitHubSession;
+    refresh: (refreshToken: string) => Promise<DevicePoll>;
+    now: () => number;
+    /** Renew even a token that looks valid: GitHub just refused it. */
+    force?: boolean;
+    /** Serializes renewals across this browser's tabs; navigator.locks where the browser has it. */
+    locks?: LockManagerLike | null;
+}
+
+const RENEW_LOCK = "dbhub-insights.github.renew";
+
+function browserLocks(): LockManagerLike | null {
+    const locks = typeof navigator !== "undefined" ? (navigator as Navigator & { locks?: LockManagerLike }).locks : undefined;
+    return locks && typeof locks.request === "function" ? locks : null;
+}
+
+/**
+ * Renews the viewer's GitHub sign-in through the relay, one tab at a time. A refresh token works once, so another tab
+ * may have renewed since this one read storage: storage is read again first, and again after GitHub refuses a refresh
+ * token. The sign-in ends only when GitHub refuses it for good.
+ */
+export async function renewSession(options: RenewOptions): Promise<Renewal> {
+    const locks = options.locks === undefined ? browserLocks() : options.locks;
+    return locks ? locks.request(RENEW_LOCK, () => renewNow(options)) : renewNow(options);
+}
+
+async function renewNow({ storage, current, refresh, now, force = false }: RenewOptions): Promise<Renewal> {
+    // Without storage (a locked-down frame), this tab's own sign-in is the only one.
+    const stored = storage ? loadSession(storage) : current;
+    if (!stored) return { kind: "signed-out" };
+    const t = now();
+    if (stored.accessToken !== current.accessToken && sessionState(stored, t) === "valid") return { kind: "ok", session: stored };
+    if (!force && sessionState(stored, t) === "valid") return { kind: "ok", session: stored };
+    const refreshToken = stored.refreshToken && (stored.refreshExpiresAt === null || stored.refreshExpiresAt > t) ? stored.refreshToken : null;
+    if (!refreshToken) return force || sessionState(stored, t) === "expired" ? { kind: "expired" } : { kind: "ok", session: stored };
+    let renewed: DevicePoll;
+    try {
+        renewed = await refresh(refreshToken);
+    } catch (err) {
+        return { kind: "unavailable", message: err instanceof Error ? err.message : String(err) };
+    }
+    if (renewed.status === "ok") {
+        const next = fromPoll(renewed, now(), stored.login);
+        saveSession(storage, next);
+        return { kind: "ok", session: next };
+    }
+    if (renewed.status === "expired") {
+        const again = storage ? loadSession(storage) : null;
+        if (again && again.accessToken !== stored.accessToken) return { kind: "ok", session: again };
+        return { kind: "expired" };
+    }
+    return { kind: "unavailable", message: renewed.status === "error" ? renewed.message : renewed.status };
+}
+
+export type DeviceOutcome = Extract<DevicePoll, { status: "ok" | "denied" | "expired" | "error" }> | { status: "cancelled" };
+
+export interface DeviceWaitOptions {
+    poll: () => Promise<DevicePoll>;
+    sleep: (ms: number) => Promise<void>;
+    now: () => number;
+    /** When GitHub's code expires (epoch milliseconds). */
+    expiresAt: number;
+    /** Seconds between polls, as GitHub asked. */
+    interval: number;
+    cancelled: () => boolean;
+    /** Whether a failed poll is worth trying again (the relay starting, a network blip), not a refusal. */
+    isTransient: (err: unknown) => boolean;
+}
+
+/**
+ * Polls GitHub's device flow until the viewer authorizes, refuses, or the code expires. A poll that fails on the way
+ * counts as still pending, with a longer wait, so a blip doesn't end a sign-in the viewer is finishing.
+ */
+export async function waitForDeviceToken(options: DeviceWaitOptions): Promise<DeviceOutcome> {
+    let interval = Math.max(5, options.interval);
+    while (!options.cancelled() && options.now() < options.expiresAt) {
+        await options.sleep(interval * 1000);
+        if (options.cancelled()) return { status: "cancelled" };
+        let poll: DevicePoll;
+        try {
+            poll = await options.poll();
+        } catch (err) {
+            if (!options.isTransient(err)) return { status: "error", message: err instanceof Error ? err.message : String(err) };
+            interval = Math.min(interval + 5, 30);
+            continue;
+        }
+        if (poll.status === "pending") continue;
+        if (poll.status === "slow_down") {
+            interval = Math.max(interval + 5, poll.interval);
+            continue;
+        }
+        return poll;
+    }
+    return options.cancelled() ? { status: "cancelled" } : { status: "expired" };
 }

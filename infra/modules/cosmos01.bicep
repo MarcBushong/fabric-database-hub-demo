@@ -24,6 +24,16 @@ param containerName string
 @description('The container\'s partition key path.')
 param partitionKeyPath string
 
+@description('The container\'s partition key version: 2, hash partitioning with keys up to 2 KB (config/versions.json).')
+@allowed([
+  1
+  2
+])
+param partitionKeyVersion int = 2
+
+@description('The container\'s indexing policy (config/versions.json, which the scripts and the session control\'s runbooks create the container with too).')
+param indexingPolicy object
+
 @description('The container\'s manual throughput in RU/s; 400 is the minimum for a container.')
 @minValue(400)
 param throughput int
@@ -93,6 +103,9 @@ resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2025-10-15
 
 // The throughput is the container's own (dedicated), so the whole 400 RU/s serves the one container, and ru-storm's hot
 // partition can use all of it. Every path is indexed except the documents' payload filler, which the runner never queries.
+// The container exists only during a session once the session control's role can create it (2026-11-19, ADR 0027): a
+// container's throughput can't be taken away, only deleted with it, so stop-demo.ps1, the session's end, and the nightly
+// safety stop delete it, and start-demo.ps1, Run all, and this template create it again from config/versions.json.
 resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-10-15' = {
   parent: database
   name: containerName
@@ -105,25 +118,9 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
           partitionKeyPath
         ]
         kind: 'Hash'
-        version: 2
+        version: partitionKeyVersion
       }
-      indexingPolicy: {
-        indexingMode: 'consistent'
-        automatic: true
-        includedPaths: [
-          {
-            path: '/*'
-          }
-        ]
-        excludedPaths: [
-          {
-            path: '/payload/?'
-          }
-          {
-            path: '/"_etag"/?'
-          }
-        ]
-      }
+      indexingPolicy: indexingPolicy
     }
     options: {
       throughput: throughput

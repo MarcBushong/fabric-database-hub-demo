@@ -46,6 +46,21 @@
     },
     "itemName": "APP_DatabaseHub_Insights",
     "itemType": "AppBackend",
+    "backendItems": {
+      "note": "2026-11-19: what the app's backend creates in the demo's workspace beside the app item (itemType, itemName), by type and display name; {itemName} is itemName. It creates a user data function for the app's connectors when rayfin up applies their configuration ({itemName}_connector, seen live on 2026-11-17), and one for its functions when rayfin up deploys services.functions ({itemName}, the app's own name: the live estate and Manage, since 2026-11-18). Seen live on 2026-11-19: the probe app APP_InsightsProbe's workspace held AppBackend and UserDataFunction APP_InsightsProbe, and dbhubc6's destroy kept its workspace for UserDataFunction APP_DatabaseHub_Insights. destroy.ps1 deletes the demo's workspace only when everything in it is the demo's (Get-DemoFabricDemoItem reads this list), so a backend item missing here keeps every workspace. The pinned CLI (Rayfin CLI 1.36.2) creates nothing else: no Fabric connection, Microsoft Entra app, or service principal, and a lakehouse or SQL database only for services.data or services.storage, which rayfin.yml leaves off; a Pester test holds this list to rayfin.yml.",
+      "items": [
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}_connector",
+          "for": "connectors"
+        },
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}",
+          "for": "functions"
+        }
+      ]
+    },
     "connectorName": "history",
     "assetAccess": "protected",
     "semanticModelName": "SM_DatabaseHub_History",
@@ -261,7 +276,7 @@
     "verifiedOn": "2026-10-23"
   },
   "cosmosdb": {
-    "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. It has no stop: its throughput bills every hour (ADR 0027).",
+    "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. An account has no stop, so since 2026-11-19 the container, the only part whose throughput bills by the hour, exists only during a session once the session control's role can create it (the resource group's DbHubT5Container tag is Session): start-demo.ps1 and Run all create it, and stop-demo.ps1, the session's end, and the nightly safety stop delete it; the account, the database (no throughput of its own), the private endpoint, and the DNS zone stay (ADR 0027).",
     "accountNamePrefix": "cosmos01",
     "databaseName": "contosocare",
     "containerName": "patient-events",
@@ -273,6 +288,25 @@
     "dataContributorRoleDefinitionId": "00000000-0000-0000-0000-000000000002",
     "privateDnsZoneName": "privatelink.documents.azure.com",
     "privateEndpointGroupId": "Sql",
+    "containerNote": "The container's definition, in one place (2026-11-19, ADR 0027): infra/modules/cosmos01.bicep creates it from these values, and since the container exists only during a session, the scripts (New-DemoT5Container) and the session control's runbooks (New-DbHubT5Container) create it again through Azure Resource Manager with the same body (Sql Resources - Create Update Sql Container). Hash partitioning, version 2; every path indexed except the documents' payload filler and _etag.",
+    "partitionKeyVersion": 2,
+    "indexingPolicy": {
+      "indexingMode": "consistent",
+      "automatic": true,
+      "includedPaths": [
+        {
+          "path": "/*"
+        }
+      ],
+      "excludedPaths": [
+        {
+          "path": "/payload/?"
+        },
+        {
+          "path": "/\"_etag\"/?"
+        }
+      ]
+    },
     "metrics": {
       "note": "The Azure Monitor metrics Database Hub's Cosmos DB views chart (monitor-cosmos-db, checked 2026-11-18): Normalized RU Consumption (Maximum), Total Request Units (Total), Throttled Requests (TotalRequests filtered to StatusCode 429, Count), Provisioned throughput (Maximum), Avg Latency (ServerSideLatencyDirect, Average: direct mode only, so the runner's gateway requests leave it empty), and Availability (ServiceAvailability, Average, hourly). Read by status.ps1, validate.ps1, and the history snapshot with az monitor metrics list.",
       "hub": [
@@ -295,6 +329,9 @@
       "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
       "metrics": "https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-documentdb-databaseaccounts-metrics",
       "restAuthorization": "https://learn.microsoft.com/rest/api/cosmos-db/access-control-on-cosmosdb-resources",
+    "createContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/create-update-sql-container",
+    "deleteContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/delete-sql-container",
+    "provisionThroughput": "https://learn.microsoft.com/azure/cosmos-db/set-throughput",
       "pricing": "https://azure.microsoft.com/pricing/details/cosmos-db/autoscale-provisioned/"
     },
     "verifiedOn": "2026-11-18"
@@ -525,8 +562,8 @@
     }
   },
   "askRelay": {
-    "note": "The Insights app's Copilot dock (Ask, ADR 0028). 'image' is the chat relay's container image, built by .github/workflows/ask-relay-image.yml from ask-relay/ and pinned here by digest; deploy.ps1 runs exactly this digest, and while it's empty Ask isn't deployed (a Warning, never a Fail). 'githubClientId' is the public client ID of the GitHub OAuth App 'Database Hub Insights Ask' (owned by MarcBushong; device flow, no client secret), so a deployer registers nothing. demo.config.json overrides both: 'ask.image' (an image Container Apps can pull without credentials) and 'ask.githubClientId'. 'buildImage' and 'runtimeImage' are ask-relay/Dockerfile's MCR bases (the runtime is distroless and non-root), and 'copilotSdk' its @microsoft/copilot-sdk; a Pester test keeps them in step.",
-    "verifiedOn": "2026-11-18",
+    "note": "The Insights app's Copilot dock (Ask, ADR 0028). 'image' is the chat relay's container image, built by .github/workflows/ask-relay-image.yml from ask-relay/ and pinned here by digest (the first publish from this public repository makes its package public, and a fork's or a private copy's package follows its own repository's visibility); deploy.ps1 runs exactly this digest, and while it's empty or can't be pulled Ask isn't deployed (a Warning, never a Fail). 'githubClientId' is the public client ID of the GitHub OAuth App 'Database Hub Insights Ask' (owned by MarcBushong; device flow, no client secret), so a deployer registers nothing. demo.config.json overrides both: 'ask.image' (an image Container Apps can pull without credentials) and 'ask.githubClientId'. 'buildImage' and 'runtimeImage' are ask-relay/Dockerfile's MCR bases (the runtime is distroless and non-root), and 'copilotSdk' its @microsoft/copilot-sdk; a Pester test keeps them in step.",
+    "verifiedOn": "2026-11-19",
     "image": "",
     "imageRepository": "ghcr.io/marcbushong/fabric-database-hub-demo/ask-relay",
     "githubClientId": "Ov23li4Z8nL4XtaoR4s8",

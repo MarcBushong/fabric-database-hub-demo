@@ -182,8 +182,9 @@ def running_status(session_id, accepted, minutes):
             "message": "The session runs until %s UTC." % iso(end)}
 
 
-def with_t5(status, dispatch, minutes=78):
-    """T5 in the session (2026-11-18): its account, its showcase sent with sqlvm01's, and when it ends at its baseline."""
+def with_t5(status, dispatch, minutes=75):
+    """T5 in the session (2026-11-18): its account, its showcase sent with sqlvm01's, and when it's back at its baseline after
+    its last ru-storm (2026-11-19: the runbook's t5.endUtc, here 75 minutes after its dispatch for a session that ends 86 after)."""
     status["names"]["t5Account"] = "cosmos01-abc123"
     status["dispatchUtc"]["T5"] = iso(dispatch)
     status["t5"] = {"endUtc": iso(dispatch + real_dt.timedelta(minutes=minutes))}
@@ -1010,17 +1011,17 @@ print(json.dumps(out))
         $report.printed | Should -Match ([regex]::Escape('The targets: T1 sqlvm01 | T2 arcsql01 | T3 azuresql01-abc123/ContosoCare | T4 pgflex01-abc123 | T4''s read replica pgreplica01-abc123 | T5 cosmos01-abc123'))
         $report.printed | Should -Match 'Estate: View Microsoft SQL, then View PostgreSQL, then View Azure Cosmos DB \| Performance: the real-time dashboards for Microsoft SQL and PostgreSQL, and Azure Cosmos DB with T5''s account selected \| Optimization: '
         # The user (2026-11-18): every Run all leaves T5 back at its baseline, with no ru-storm still running, at its end.
-        $report.printed | Should -Match 'T5: its last ru-storm ends, and T5 is back at its baseline with no throttled requests \(429s\), by 15:22, before the session ends at 15:30; every Run all repeats its storms from the first\.'
+        $report.printed | Should -Match 'T5: its last ru-storm ends, and T5 is back at its baseline with no throttled requests \(429s\), by 15:19, before the session ends at 15:30; every Run all repeats its storms from the first\.'
         $report.printed | Should -Match 'T5 is Azure Cosmos DB: show it in Estate \(View: Azure Cosmos DB, cosmos01-abc123\) and on Performance: Peak Norm RU % at 100% and Throttled Requests \(429s\) during each ru-storm'
         $report.printed | Should -Match '(?m)^  14:07-14:17  T5  RU storm \(request rate too from about 14:08  Performance: T5: Normalized RU consumption'
         $report.printed | Should -Match 'Now: T5 RU storm \(request rate too large\), until 14:17; in Database Hub from about 14:08\.'
         $report.printed | Should -Match 'The history''s metrics: Azure Monitor metrics for the history\.'
-        # Its beats: two ru-storms in each 30-minute cycle from its dispatch at 14:04, none past its own end at 15:22.
+        # Its beats: two ru-storms in each 30-minute cycle from its dispatch at 14:04, the last one back at its baseline by 15:19.
         $job = $report.refs[0].args
         $storms = @(($job.SESSION_PLAN | ConvertFrom-Json).beats | Where-Object target -EQ 'T5')
         @($storms | ForEach-Object { ([datetime]$_.startUtc).ToUniversalTime().ToString('HH:mm') }) | Should -Be @('14:07', '14:22', '14:37', '14:52', '15:07')
         @($storms | ForEach-Object scenario | Select-Object -Unique) | Should -Be @('ru-storm')
-        ([datetime]$storms[-1].endUtc).ToUniversalTime() | Should -BeLessOrEqual ([datetime]::new(2026, 11, 14, 15, 22, 0, [System.DateTimeKind]::Utc))
+        ([datetime]$storms[-1].endUtc).ToUniversalTime() | Should -BeLessOrEqual ([datetime]::new(2026, 11, 14, 15, 19, 0, [System.DateTimeKind]::Utc))
         # T5's metrics go as their own parameter, and T4's without them.
         $cosmos = $job.COSMOS_METRICS | ConvertFrom-Json
         $cosmos.sessionId | Should -Be $job.SESSION_ID
@@ -1055,6 +1056,8 @@ def storms(target_ends):
             for beat in ns["showcase_beats"](showcase, {"T5": anchor}, end, "", False, target_ends=target_ends)]
 out["full"] = storms(None)
 out["cut"] = storms({"T5": anchor + dt.timedelta(minutes=78)})
+# A ru-storm runs only whole, with its 2 minutes of recovery before the profile's end, as the runner plans it (2026-11-19).
+out["fits"] = {str(minutes): [int((beat["startUtc"] - anchor).total_seconds() // 60) for beat in ns["showcase_beats"](showcase, {"T5": anchor}, anchor + dt.timedelta(minutes=minutes))] for minutes in (87, 88)}
 out["signal"] = ns["showcase_beats"](showcase, {"T5": anchor}, end)[0]["signal"]
 status = {"acceptedUtc": "2026-11-14T14:00:00Z", "runEndUtc": "2026-11-14T15:30:00Z", "dispatchUtc": {"T5": "2026-11-14T14:00:00Z"},
           "t5": {"endUtc": "2026-11-14T15:18:00Z"}}
@@ -1071,6 +1074,8 @@ print(json.dumps(out))
         @($t5.request | ForEach-Object target) | Should -Be @('T1', 'T2', 'T3', 'T4')
         @($t5.full) | Should -Be @('ru-storm@3', 'ru-storm@18', 'ru-storm@33', 'ru-storm@48', 'ru-storm@63', 'ru-storm@78')
         @($t5.cut) | Should -Be @('ru-storm@3', 'ru-storm@18', 'ru-storm@33', 'ru-storm@48', 'ru-storm@63') -Because 'T5''s showcase ends at minute 78, where its sixth storm would start'
+        @($t5.fits.'87' | ForEach-Object { [int]$_ }) | Should -Be @(3, 18, 33, 48, 63) -Because 'the sixth storm, minutes 78 to 86, and its 2 minutes of recovery don''t end by minute 87, so the runner skips it rather than clip it'
+        @($t5.fits.'88' | ForEach-Object { [int]$_ }) | Should -Be @(3, 18, 33, 48, 63, 78)
         $t5.signal | Should -Match '^T5: Normalized RU consumption'
         @($t5.status) | Should -Be @('ru-storm@14:03', 'ru-storm@14:18', 'ru-storm@14:33', 'ru-storm@14:48', 'ru-storm@15:03') -Because 'the status''s t5.endUtc, 15:18, ends T5''s beats'
         @($t5.shows) | Should -Be @(3, 1, 1)

@@ -8,7 +8,10 @@ function Test-DemoT5 {
 
     .DESCRIPTION
     Reads only, with the documented REST APIs through 'az rest --method get'. Results: T5.ACCOUNT, T5.ENTRAONLY,
-    T5.NETWORK, T5.CONTAINER, T5.FREETIER, T5.ACCESS, and METRICS.T5. Database Hub monitors a Cosmos DB account through
+    T5.NETWORK, T5.CONTAINER, T5.LIFECYCLE (with -IncludeLifecycle), T5.FREETIER, T5.ACCESS, and METRICS.T5. Since
+    2026-11-19 the container exists only during a session once its lifecycle is Session (the demo resource group's
+    DbHubT5Container tag): a missing container is then a Pass while sqlvm01 is stopped, and one that's there while it's
+    stopped is a Warning (its throughput bills until a stop deletes it). Database Hub monitors a Cosmos DB account through
     Azure Monitor platform metrics, which every account sends with no setup, so METRICS.T5 passing is what its Cosmos DB
     views need; seeing T5 on the Estate page stays a manual check (HUB.ESTATE.T5 checks Resource Graph). Its Security page
     evaluates the same three settings T5.ENTRAONLY and T5.NETWORK read, plus customer-managed keys, which the demo leaves
@@ -28,6 +31,10 @@ function Test-DemoT5 {
     .PARAMETER IncludeMetrics
     Also read the last 15 minutes of T5's Azure Monitor metrics (METRICS.T5).
 
+    .PARAMETER IncludeLifecycle
+    Also report T5's container lifecycle, as the demo resource group records it (T5.LIFECYCLE, 2026-11-19): whether the
+    container exists only during a session. validate.ps1 and status.ps1 use it; deploy.ps1 reports DEPLOY.T5.LIFECYCLE.
+
     .EXAMPLE
     Test-DemoT5 -Config $config -IncludeMetrics
     #>
@@ -42,6 +49,8 @@ function Test-DemoT5 {
 
         [switch] $IncludeMetrics,
 
+        [switch] $IncludeLifecycle,
+
         [ValidateRange(5, 1440)]
         [int] $MetricMinutes = 15
     )
@@ -54,7 +63,7 @@ function Test-DemoT5 {
         $area = if ($CheckId -like 'METRICS.*') { 'hub' } else { 't5' }
         $results.Add((New-DemoResult -CheckId $CheckId -Area $area -Target 'T5' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl))
     }
-    $later = @('T5.ENTRAONLY', 'T5.NETWORK', 'T5.CONTAINER', 'T5.FREETIER', 'T5.ACCESS') + @(if ($IncludeMetrics) { 'METRICS.T5' })
+    $later = @('T5.ENTRAONLY', 'T5.NETWORK', 'T5.CONTAINER') + @(if ($IncludeLifecycle) { 'T5.LIFECYCLE' }) + @('T5.FREETIER', 'T5.ACCESS') + @(if ($IncludeMetrics) { 'METRICS.T5' })
 
     $names = Get-DemoT5Name -Config $Config -DeploymentId $DeploymentId
     if (-not $names.Enabled) {
@@ -75,7 +84,7 @@ function Test-DemoT5 {
     $state = [string]$current.State
     $accountEvidence = [ordered]@{ account = $names.AccountName; resourceId = $names.AccountId; provisioningState = $state; documentEndpoint = [string](Get-DemoMemberValue -InputObject $properties -Name 'documentEndpoint'); kind = [string](Get-DemoMemberValue -InputObject $current.Account -Name 'kind') }
     if ($state -eq 'Succeeded') {
-        & $add 'T5.ACCOUNT' 'Pass' ('T5 ({0}) is an Azure Cosmos DB for NoSQL account, and it''s ready (Succeeded). It has no stop: its throughput bills every hour.' -f $names.AccountName) $accountEvidence
+        & $add 'T5.ACCOUNT' 'Pass' ('T5 ({0}) is an Azure Cosmos DB for NoSQL account, and it''s ready (Succeeded). An account has no stop: what bills by the hour is its container''s throughput (T5.CONTAINER).' -f $names.AccountName) $accountEvidence
     }
     else {
         & $add 'T5.ACCOUNT' 'Warning' ('T5 ({0}) is {1}.' -f $names.AccountName, $state) $accountEvidence 'Check again in a few minutes.' $docs['hubMonitor']
@@ -106,15 +115,31 @@ function Test-DemoT5 {
         & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is {0}; the demo keeps it off and uses the private endpoint, so Database Hub''s Security page would list it as an issue.' -f $(if ($public) { $public } else { 'not set' })) $networkEvidence 'Run ./scripts/deploy.ps1, which turns public network access off.' $docs['privateEndpoint']
     }
 
-    $containerPath = 'sqlDatabases/{0}/containers/{1}' -f $names.DatabaseName, $names.ContainerName
+    $containerPath = Get-DemoT5ContainerPath
     $container = Get-DemoT5Resource -Config $Config -AccountId $names.AccountId -Child $containerPath
-    $throughput = Get-DemoT5Resource -Config $Config -AccountId $names.AccountId -Child ('{0}/throughputSettings/default' -f $containerPath)
+    $throughput = if ($container.Found) { Get-DemoT5Resource -Config $Config -AccountId $names.AccountId -Child ('{0}/throughputSettings/default' -f $containerPath) } else { [pscustomobject]@{ Found = $false; NotFound = $true; Value = $null; Error = '' } }
     $resource = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $container.Value -Name 'properties') -Name 'resource'
     $paths = @(foreach ($path in (Get-DemoMemberList -InputObject (Get-DemoMemberValue -InputObject $resource -Name 'partitionKey') -Name 'paths')) { [string]$path })
     $ru = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $throughput.Value -Name 'properties') -Name 'resource') -Name 'throughput'
-    $containerEvidence = [ordered]@{ database = $names.DatabaseName; container = $names.ContainerName; partitionKeyPaths = @($paths); throughput = $ru; expectedThroughput = $names.Throughput }
-    if (-not $container.Found) {
-        & $add 'T5.CONTAINER' 'Fail' ('T5''s container {0} in {1} wasn''t found{2}.' -f $names.ContainerName, $names.DatabaseName, $(if ($container.NotFound) { '' } else { ': ' + $container.Error })) $containerEvidence 'Run ./scripts/deploy.ps1, which creates the database and the container.' $docs['hubMonitor']
+    # The container's lifecycle (2026-11-19): with Session it exists only during a session, so whether it should be there
+    # depends on whether the demo runs (sqlvm01, whose runner sends T5's requests, is running).
+    $lifecycle = [string](Get-DemoMemberValue -InputObject (Get-DemoDeploymentState -Config $Config) -Name 'T5Container')
+    $session = $lifecycle -ceq $script:T5LifecycleSession
+    $demoRunning = $null
+    if ($session) {
+        $power = Get-DemoVmPowerState -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName $names.ResourceGroup -VmName $names.T1VmName
+        $demoRunning = [string]$power -in 'PowerState/running', 'PowerState/starting'
+    }
+    $containerEvidence = [ordered]@{ database = $names.DatabaseName; container = $names.ContainerName; partitionKeyPaths = @($paths); throughput = $ru; expectedThroughput = $names.Throughput; lifecycle = $lifecycle; demoRunning = $demoRunning }
+    $between = 'it exists only during a session: start-demo.ps1 and Run all create it, and stop-demo.ps1, the session''s end, and the nightly safety stop delete it'
+    if (-not $container.Found -and $container.NotFound -and $session -and -not $demoRunning) {
+        & $add 'T5.CONTAINER' 'Pass' ('T5''s container {0} isn''t there now, because {1}, so its throughput doesn''t bill between sessions.' -f $names.ContainerName, $between) $containerEvidence '' $docs['provisionThroughput']
+    }
+    elseif (-not $container.Found -and $container.NotFound -and $session) {
+        & $add 'T5.CONTAINER' 'Warning' ('T5''s container {0} isn''t there while {1} runs, so T5''s activity has nothing to write to: {2}.' -f $names.ContainerName, $names.T1VmName, $between) $containerEvidence 'Run ./scripts/start-demo.ps1, which creates it, or start a session with Run all in the control notebook.' $docs['createContainer']
+    }
+    elseif (-not $container.Found) {
+        & $add 'T5.CONTAINER' 'Fail' ('T5''s container {0} in {1} wasn''t found{2}.' -f $names.ContainerName, $names.DatabaseName, $(if ($container.NotFound) { '' } else { ': ' + $container.Error })) $containerEvidence 'Run ./scripts/start-demo.ps1 or ./scripts/deploy.ps1, which create the container.' $docs['hubMonitor']
     }
     elseif ($paths -notcontains $names.PartitionKeyPath) {
         & $add 'T5.CONTAINER' 'Fail' ('T5''s container {0} has the partition key {1}, not {2}, which the runner writes by.' -f $names.ContainerName, ($paths -join ', '), $names.PartitionKeyPath) $containerEvidence 'A partition key can''t change: delete the container, then run ./scripts/deploy.ps1 to create it again.' $docs['hubMonitor']
@@ -125,8 +150,17 @@ function Test-DemoT5 {
     elseif ([int]$ru -ne $names.Throughput) {
         & $add 'T5.CONTAINER' 'Warning' ('T5''s container {0} has {1} RU/s, not {2}: ru-storm drives normalized RU to 100% at {2} RU/s, and more throughput bills more.' -f $names.ContainerName, $ru, $names.Throughput) $containerEvidence 'Run ./scripts/deploy.ps1, which sets it back.' $docs['normalizedRu']
     }
+    elseif ($session -and -not $demoRunning -and -not $current.FreeTier) {
+        & $add 'T5.CONTAINER' 'Warning' ('T5''s container {0} is there while the demo is stopped ({1} isn''t running), so its {2} RU/s bill until a stop deletes it: {3}.' -f $names.ContainerName, $names.T1VmName, $ru, $between) $containerEvidence 'Run ./scripts/stop-demo.ps1, which deletes it; the next session creates it again.' $docs['provisionThroughput']
+    }
     else {
         & $add 'T5.CONTAINER' 'Pass' ('T5''s container {0} in {1} is partitioned by {2}, at {3} RU/s of manual throughput.' -f $names.ContainerName, $names.DatabaseName, $names.PartitionKeyPath, $ru) $containerEvidence
+    }
+    if ($IncludeLifecycle) {
+        # As recorded on the demo resource group (DbHubT5Container); deploy.ps1, grant-safety-stop.ps1, and stop-demo.ps1 set it.
+        $recorded = [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $lifecycle; Changed = $false; Known = $true; Why = ''; RoleName = (Get-DemoActivityControlName -Config $Config).RoleName }
+        $said = Get-DemoT5LifecycleText -Lifecycle $recorded -FreeTier ([bool]$current.FreeTier)
+        & $add 'T5.LIFECYCLE' $said.Status $said.Text ([ordered]@{ lifecycle = $lifecycle; freeTier = [bool]$current.FreeTier }) $said.Fix $docs['provisionThroughput']
     }
 
     $freeEvidence = [ordered]@{ enableFreeTier = [bool]$current.FreeTier; t5UseFreeTier = (Test-DemoT5FreeTierWanted -Config $Config) }
@@ -134,7 +168,7 @@ function Test-DemoT5 {
         & $add 'T5.FREETIER' 'Pass' ('T5 has the subscription''s free tier: the first {0} RU/s and {1} GB are free, so its {2} RU/s cost nothing.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $names.Throughput) $freeEvidence '' $docs['freeTier']
     }
     else {
-        & $add 'T5.FREETIER' 'Pass' ('T5 doesn''t have the free tier (another account in the subscription has it, the subscription is internal, where Azure doesn''t offer it, t5UseFreeTier is false, or it was created without it), so its {0} RU/s bill every hour; estimate-cost.ps1 prices them. Azure sets the free tier only when an account is created.' -f $names.Throughput) $freeEvidence '' $docs['freeTier']
+        & $add 'T5.FREETIER' 'Pass' ('T5 doesn''t have the free tier (another account in the subscription has it, the subscription is internal, where Azure doesn''t offer it, t5UseFreeTier is false, or it was created without it), so its container''s {0} RU/s bill every hour it exists; estimate-cost.ps1 prices them. Azure sets the free tier only when an account is created.' -f $names.Throughput) $freeEvidence '' $docs['freeTier']
     }
 
     $principalId = Get-DemoT1PrincipalId -Config $Config

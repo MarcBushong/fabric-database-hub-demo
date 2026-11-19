@@ -965,6 +965,13 @@ function Invoke-DemoDeploymentTrack {
                 if ($t4Notice) {
                     $Context['T4Notice'] = $t4Notice
                 }
+                # T5 left out of this run because Azure didn't create its account (review, 2026-11-19), for T1's T5 step and
+                # the activity.
+                $t5Value = Get-DemoMemberValue -InputObject $value -Name 'T5Enabled'
+                if ($null -ne $t5Value -and -not [bool]$t5Value -and (Test-DemoT5Enabled -Config $Config)) {
+                    $Config['t5Enabled'] = $false
+                    $Config['t5LeftOut'] = [string](Get-DemoMemberValue -InputObject $value -Name 'T5LeftOut')
+                }
             }
         }
         return [bool](Get-DemoMemberValue -InputObject $shared['Infrastructure'] -Name 'Succeeded')
@@ -1433,9 +1440,19 @@ function Invoke-DemoDeploymentTrack {
                     # is reported, and keeps the run from DONE (HUB.ESTATE.T5, METRICS.T5), but doesn't stop T1's track, so
                     # T1 to T4 still get their activity and checks.
                     if (-not (Test-DemoT5Enabled -Config $Config)) {
-                        & $note 'T5.ACCOUNT' 'T5' 'Not selected' 'T5 is off in this configuration (t5Enabled is false).'
+                        if ([string]$Config['t5LeftOut']) {
+                            # Left out of this run because Azure didn't create its account (review, 2026-11-19): T5's row says
+                            # why; DEPLOY.T5 has the fix.
+                            & $note 'T5.ACCOUNT' 'T5' 'Warning' ('T5 is left out of this run: Azure didn''t create its account ({0}). DEPLOY.T5 says what to do.' -f ([string]$Config['t5LeftOut']).TrimEnd('.'))
+                        }
+                        else {
+                            & $note 'T5.ACCOUNT' 'T5' 'Not selected' 'T5 is off in this configuration (t5Enabled is false).'
+                        }
                         break
                     }
+                    # The container exists only during a session (2026-11-19): the template creates it, but a resumed run skips
+                    # the template, and a stop since may have deleted it, so it's made sure of before the checks and the warmup.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
                     $checks = @(Test-DemoT5 -Config $Config)
                     & $addAll $checks
                     if (& $hasStatus $checks 'Fail') {

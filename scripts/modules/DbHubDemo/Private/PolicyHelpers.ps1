@@ -579,23 +579,47 @@ function Get-DemoPolicyRuleFact {
     }
 }
 
+function Get-DemoResourceTypeList {
+    <#
+    .SYNOPSIS
+    The resource types this configuration's deployment creates, for the policy checks: every type the demo creates
+    ($script:DemoResourceTypes), without T5's Azure Cosmos DB types when t5Enabled is false (review, 2026-11-19). The
+    schema tells a subscription whose policy denies Cosmos DB to set t5Enabled false, so those types must not stop it.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $Config = $null
+    )
+
+    if ($null -ne $Config -and -not (Test-DemoT5Enabled -Config $Config)) {
+        return [string[]]@($script:DemoResourceTypes | Where-Object { $_ -notin $script:DemoT5ResourceTypes })
+    }
+    return [string[]]@($script:DemoResourceTypes)
+}
+
 function Test-DemoPolicyTypeMatch {
     <#
     .SYNOPSIS
-    Tests whether a kept policy rule can apply to a resource type the demo creates.
+    Tests whether a kept policy rule can apply to a resource type the demo creates: -ResourceType, every type by default
+    (Get-DemoResourceTypeList gives a configuration's).
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
         [Parameter(Mandatory)]
-        [pscustomobject] $Rule
+        [pscustomobject] $Rule,
+
+        [string[]] $ResourceType = $script:DemoResourceTypes
     )
 
     if ($Rule.AnyType) {
         return $true
     }
     foreach ($pattern in @($Rule.Types)) {
-        foreach ($type in $script:DemoResourceTypes) {
+        foreach ($type in $ResourceType) {
             if ($type -like $pattern) {
                 return $true
             }
@@ -611,13 +635,16 @@ function Get-DemoPolicyRuleCategory {
 
     .DESCRIPTION
     Internal. Returns MFA, SQLPUBLIC, SQLENTRAONLY, DEFENDER, EXTENSIONS, PUBLICIP, STORAGE, VMSIZE,
-    RESOURCETYPES, OTHER (any other rule that can apply to a resource type the demo creates), or UNRELATED.
+    RESOURCETYPES, OTHER (any other rule that can apply to a resource type the demo creates: -ResourceType, every type
+    by default), or UNRELATED.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [pscustomobject] $Rule
+        [pscustomobject] $Rule,
+
+        [string[]] $ResourceType = $script:DemoResourceTypes
     )
 
     $effect = $Rule.Effect
@@ -685,7 +712,7 @@ function Get-DemoPolicyRuleCategory {
     if ($effect -eq 'Deny' -and $Rule.HasTypeCondition -and $fields.Count -eq 0) {
         return 'RESOURCETYPES'
     }
-    if (Test-DemoPolicyTypeMatch -Rule $Rule) {
+    if (Test-DemoPolicyTypeMatch -Rule $Rule -ResourceType $ResourceType) {
         return 'OTHER'
     }
     return 'UNRELATED'

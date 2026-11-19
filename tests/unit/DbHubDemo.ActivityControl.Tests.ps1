@@ -28,6 +28,10 @@ BeforeAll {
         'Microsoft.DBforPostgreSQL/flexibleServers/write'
         'Microsoft.DBforPostgreSQL/flexibleServers/delete'
         'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+        # T5's container, which exists only during a session (2026-11-19, ADR 0027).
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
         'Microsoft.Insights/metrics/read'
         'Microsoft.Resources/tags/write'
         'Microsoft.Automation/automationAccounts/read'
@@ -581,9 +585,16 @@ Describe 'The runbooks'' settings' {
         $setting['profiles']['showcase']['maxMinutes'] | Should -Be 120
         $setting['profiles']['showcase']['defaultMinutes'] | Should -Be 90
         @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
-        # T5's ru-storm slots in each cycle, which the runbook cuts T5's showcase back to (user-directed, 2026-11-18).
-        @($setting['profiles']['showcase']['t5Slots'] | ForEach-Object { '{0}+{1}' -f $_['startMinute'], $_['durationMinutes'] }) | Should -Be @('3+10', '18+8')
+        # T5's ru-storm slots in each cycle, with their recovery (2026-11-19, risk R896), from which the runbook says when T5 is back at its baseline after its last one.
+        @($setting['profiles']['showcase']['t5Slots'] | ForEach-Object { '{0}+{1}+{2}' -f $_['startMinute'], $_['durationMinutes'], $_['recoveryMinutes'] }) | Should -Be @('3+10+2', '18+8+2')
         $setting['t5AccountPrefix'] | Should -Be 'cosmos01-'
+        # T5's container (2026-11-19, ADR 0027): config/versions.json's definition, which a session creates it again from.
+        $cosmos = InModuleScope -ModuleName DbHubDemo { Get-DemoCosmosSetting }
+        $container = $setting['t5Container']
+        @($container.Keys) | Should -Be @('databaseName', 'containerName', 'partitionKeyPath', 'partitionKeyVersion', 'throughput', 'indexingPolicy')
+        '{0}/{1} {2} v{3} {4}' -f $container['databaseName'], $container['containerName'], $container['partitionKeyPath'], $container['partitionKeyVersion'], $container['throughput'] | Should -Be 'contosocare/patient-events /patientId v2 400'
+        (ConvertTo-Json -InputObject $container['indexingPolicy'] -Depth 6 -Compress) | Should -Be (ConvertTo-Json -InputObject $cosmos['indexingPolicy'] -Depth 6 -Compress)
+        $setting['apiVersions']['Microsoft.DocumentDB/databaseAccounts'] | Should -Be '2025-10-15'
         $setting['minDurationMinutes'] | Should -Be 5
         $setting['maxDurationMinutes'] | Should -Be 120
         $setting['maxBodyBytes'] | Should -Be 4096
@@ -621,11 +632,13 @@ Describe 'The runbooks'' settings' {
         @($setting['targets'].Keys) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $setting['readySeconds'].Contains('T5') | Should -BeFalse
         $setting['t5AccountPrefix'] | Should -Be ''
+        $setting['t5Container'] | Should -BeNullOrEmpty
     }
 
     It 'give the guide each scenario''s Database Hub signal for T5 apart from the SQL targets'' and T4''s (2026-11-18)' {
         $showcase = InModuleScope -ModuleName DbHubDemo { Get-DemoActivityControlShowcase }
-        @($showcase['incidents'] | Where-Object { $_['target'] -eq 'T5' } | ForEach-Object { '{0}@{1}+{2}' -f $_['scenario'], $_['startMinute'], $_['durationMinutes'] }) | Should -Be @('ru-storm@3+10', 'ru-storm@18+8')
+        @($showcase['incidents'] | Where-Object { $_['target'] -eq 'T5' } | ForEach-Object { '{0}@{1}+{2}+{3}' -f $_['scenario'], $_['startMinute'], $_['durationMinutes'], $_['recoveryMinutes'] }) | Should -Be @('ru-storm@3+10+2', 'ru-storm@18+8+2') -Because 'the guide lists a ru-storm only when it and its recovery fit, as the runner runs it (2026-11-19)'
+        @($showcase['incidents'] | Where-Object { $_['target'] -ne 'T5' -and $_.Contains('recoveryMinutes') }) | Should -BeNullOrEmpty
         $storm = $showcase['scenarios']['ru-storm']
         $storm['t5']['signal'] | Should -Match '^T5: Normalized RU consumption'
         $storm['t5']['surface'] | Should -Be 'Performance'
@@ -692,6 +705,8 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         }
         # The grant's output says what each action added on 2026-11-14 could touch.
         ($results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION').message | Should -Match 'flexibleServers/delete: deletes T4''s read replica after a session; it could also delete T4'
+        # And each one added on 2026-11-19 for T5's container (ADR 0027).
+        ($results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION').message | Should -Match 'sqlDatabases/containers/delete: deletes T5''s container after a session; it could delete any container in the demo resource group, which the runbook never does'
         ($results | Where-Object checkId -EQ 'CONTROL.ROLE.WRITER').message | Should -Match 'at those two secrets only'
         foreach ($file in $script:bodyFiles) {
             Test-Path -LiteralPath $file | Should -BeFalse -Because 'each request body''s private file is deleted'
@@ -1019,7 +1034,12 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
     It 'runs on both deploy paths: the Azure part beside the nightly safety stop, the notebook after the Fabric track, a status page row, and DONE''s line' {
         foreach ($file in 'Public/Invoke-DemoDeployment.ps1', 'Private/ParallelDeployment.ps1') {
             $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
-            $text | Should -Match 'Invoke-DemoSafetyStopSetup -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false\)\s+(#[^\n]*\n\s+)*(Write-DemoLog[^\n]*\n\s+)?& \$addAll @\(Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Azure' -Because $file
+            $between = [regex]::Matches($text, '(?s)\$safetyResults = @\(Invoke-DemoSafetyStopSetup -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false\)\s+& \$addAll \$safetyResults(.*?)& \$addAll @\(Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Azure')
+            $between.Count | Should -BeGreaterThan 0 -Because $file
+            foreach ($match in $between) {
+                # Only the safety stop's plan Warning comes between them (2026-11-19, the coordinator's option 2).
+                @([regex]::Matches($match.Groups[1].Value, '\b[A-Z][a-z]+-Demo[A-Za-z]+') | ForEach-Object { $_.Value } | Sort-Object -Unique) | Should -Be @('Add-DemoProgressStepNote', 'New-DemoSafetyStopPlanResult', 'Write-DemoLog') -Because $file
+            }
             $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath' -Because $file
             $text | Should -Not -Match 'Invoke-DemoActivityControlRegrant' -Because $file
             # Since Phase 28 both paths build DEPLOY.SUMMARY in one place.
@@ -1531,6 +1551,15 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $a4.status | Should -Be 'Warning'
         $a4.message | Should -Match 'dbhub-session-metrics'
         $a4.remediation | Should -Match 'grant-safety-stop\.ps1'
+    }
+
+    It 'reports an operator role from before 2026-11-19, without T5''s container actions: its container stays between sessions and bills' {
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Be 'The custom role "DbHub Demo Activity Operator" lacks 3 of its approved actions (Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete), so T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing.'
+        $definition.remediation | Should -Match 'grant-safety-stop\.ps1'
     }
 
     It 'warns 14 days before the webhook expires, and needs a rotation once it has' -ForEach @(

@@ -25,8 +25,8 @@ function Get-DemoPolicyConstraint {
     MFA, and OTHER. Call Assert-DemoAzContext first.
 
     .PARAMETER Config
-    Configuration from Get-DemoConfig. Uses subscriptionId, networkMode, profile, t1Priority, and
-    hostPriority.
+    Configuration from Get-DemoConfig. Uses subscriptionId, networkMode, profile, t1Priority, hostPriority, and
+    t5Enabled: with T5 off, T5's Azure Cosmos DB types aren't checked (Get-DemoResourceTypeList; review, 2026-11-19).
 
     .PARAMETER CacheHours
     Reuse the last complete inventory when it's at most this many hours old and nothing it depends on
@@ -69,6 +69,8 @@ function Get-DemoPolicyConstraint {
     $network = @{ Error = ''; Skipped = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
     $cachePath = ''
     $fingerprint = ''
+    # The resource types this configuration creates: without T5's when t5Enabled is false.
+    $demoTypes = Get-DemoResourceTypeList -Config $Config
 
     function Read-PolicyDefinition([string] $Id) {
         if (-not $definitions.ContainsKey($Id)) {
@@ -254,7 +256,7 @@ function Get-DemoPolicyConstraint {
                 Parameters       = $parameters
                 Category         = ''
             }
-            $rule.Category = Get-DemoPolicyRuleCategory -Rule $rule
+            $rule.Category = Get-DemoPolicyRuleCategory -Rule $rule -ResourceType $demoTypes
             $rules.Add($rule)
         }
     }
@@ -396,16 +398,20 @@ function Get-DemoPolicyConstraint {
             Add-PolicyResult 'VMSIZE' 'Pass' ('No enforced policy restricts VM sizes{0}, so the {1} profile''s sizes are allowed: {2}.' -f $incompleteNote, $profileName, ($checkedSizes -join ' and ')) $sizeEvidence '' $sizeDoc
         }
 
-        # RESOURCETYPES: every resource type the demo creates against type-only deny rules.
+        # RESOURCETYPES: every resource type this configuration creates against type-only deny rules.
         $typeRules = & $category 'RESOURCETYPES'
         $deniedTypes = [System.Collections.Generic.List[string]]::new()
+        $deniedT5 = [System.Collections.Generic.List[string]]::new()
         $unknownTypes = [System.Collections.Generic.List[string]]::new()
-        foreach ($type in $script:DemoResourceTypes) {
+        foreach ($type in $demoTypes) {
             foreach ($typeRule in $typeRules) {
                 $outcome = Test-DemoPolicyCondition -Condition $typeRule.Condition -Fact @{ type = $type } -Parameter $typeRule.Parameters
                 if ($outcome -is [bool]) {
                     if ($outcome) {
                         $deniedTypes.Add(('{0} ({1})' -f $type, $typeRule.Policy))
+                        if ($type -in $script:DemoT5ResourceTypes) {
+                            $deniedT5.Add($type)
+                        }
                     }
                 }
                 else {
@@ -413,15 +419,21 @@ function Get-DemoPolicyConstraint {
                 }
             }
         }
-        $typeEvidence = @{ demoResourceTypes = $script:DemoResourceTypes.Count; policies = @($typeRules | ForEach-Object { $_.Policy }); denied = $deniedTypes.ToArray() }
-        if ($deniedTypes.Count -gt 0) {
-            Add-PolicyResult 'RESOURCETYPES' 'Fail' ('Azure Policy denies resource types the demo creates: {0}.' -f ($deniedTypes -join '; ')) $typeEvidence 'Ask for a policy exemption for the demo resource group or subscription, or use a subscription without this policy.' $sizeDoc
+        $typeEvidence = @{ demoResourceTypes = @($demoTypes).Count; t5Enabled = (Test-DemoT5Enabled -Config $Config); policies = @($typeRules | ForEach-Object { $_.Policy }); denied = $deniedTypes.ToArray() }
+        if ($deniedTypes.Count -gt 0 -and $deniedT5.Count -eq $deniedTypes.Count) {
+            # Only T5's Azure Cosmos DB types: the configuration can leave T5 out, and everything else deploys (ADR 0027).
+            Add-PolicyResult 'RESOURCETYPES' 'Fail' ('Azure Policy denies resource types the demo creates, all of them T5''s (Azure Cosmos DB): {0}.' -f ($deniedTypes -join '; ')) $typeEvidence 'Set "t5Enabled": false in config/demo.config.json and run ./scripts/deploy.ps1 again: T5 is then left out (DEPLOY.T5.OFF), Database Hub shows T1 to T4, and everything else deploys. Or ask for a policy exemption for the demo resource group.' $sizeDoc
+        }
+        elseif ($deniedTypes.Count -gt 0) {
+            $t5Note = if ($deniedT5.Count -gt 0) { ' T5''s Azure Cosmos DB types are among them: "t5Enabled": false in config/demo.config.json leaves those out.' } else { '' }
+            Add-PolicyResult 'RESOURCETYPES' 'Fail' ('Azure Policy denies resource types the demo creates: {0}.' -f ($deniedTypes -join '; ')) $typeEvidence ('Ask for a policy exemption for the demo resource group or subscription, or use a subscription without this policy.{0}' -f $t5Note) $sizeDoc
         }
         elseif ($unknownTypes.Count -gt 0) {
             Add-PolicyResult 'RESOURCETYPES' 'Warning' ('These resource type policies couldn''t be evaluated: {0}.' -f ((@($unknownTypes) | Select-Object -First 5) -join '; ')) $typeEvidence 'Review the policies; the what-if check catches a denial before anything is deployed.' $sizeDoc
         }
         else {
-            Add-PolicyResult 'RESOURCETYPES' 'Pass' ('No enforced policy denies the {0} resource types the demo creates. Checked {1} resource type rule(s){2}.' -f $script:DemoResourceTypes.Count, $typeRules.Count, $incompleteNote) $typeEvidence '' $sizeDoc
+            $offNote = if (Test-DemoT5Enabled -Config $Config) { '' } else { ' T5''s Azure Cosmos DB types aren''t checked: t5Enabled is false.' }
+            Add-PolicyResult 'RESOURCETYPES' 'Pass' ('No enforced policy denies the {0} resource types the demo creates. Checked {1} resource type rule(s){2}.{3}' -f @($demoTypes).Count, $typeRules.Count, $incompleteNote, $offNote) $typeEvidence '' $sizeDoc
         }
 
         # DEFENDER: Defender plans deployed by policy show up in the cost estimate.

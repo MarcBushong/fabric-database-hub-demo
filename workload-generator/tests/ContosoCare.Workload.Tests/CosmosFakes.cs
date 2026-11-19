@@ -104,6 +104,7 @@ internal sealed class FakeCosmosAccount(TimeProvider? time = null) : HttpMessage
     private readonly ConcurrentDictionary<(string Partition, string Id), JsonObject> documents = new();
     private int stormWrites;
     private int throttled;
+    private bool containerMissing;
 
     public ConcurrentQueue<RecordedRequest> Requests { get; } = new();
 
@@ -114,7 +115,15 @@ internal sealed class FakeCosmosAccount(TimeProvider? time = null) : HttpMessage
 
     public string PartitionKeyPath { get; init; } = "/patientId";
 
-    public bool ContainerMissing { get; init; }
+    /// <summary>
+    /// When true, the container doesn't exist (it exists only during a session): its read answers 404, and every document
+    /// request 404 with substatus 1003 (the owner resource doesn't exist). A test can create or delete it mid-run.
+    /// </summary>
+    public bool ContainerMissing
+    {
+        get => Volatile.Read(ref containerMissing);
+        set => Volatile.Write(ref containerMissing, value);
+    }
 
     /// <summary>When set, every request answers this status (403 for a data-plane role that isn't effective yet).</summary>
     public HttpStatusCode? FailWith { get; set; }
@@ -151,6 +160,11 @@ internal sealed class FakeCosmosAccount(TimeProvider? time = null) : HttpMessage
             return ContainerMissing
                 ? Respond(HttpStatusCode.NotFound, """{"code":"NotFound","message":"Resource Not Found."}""", 1, subStatus: 1003)
                 : Respond(HttpStatusCode.OK, $$$"""{"id":"patient-events","partitionKey":{"paths":["{{{PartitionKeyPath}}}"],"kind":"Hash","version":2},"indexingPolicy":{"excludedPaths":[{"path":"/payload/*"}]}}""", 1);
+        }
+
+        if (ContainerMissing && recorded.Path.StartsWith(DocumentsPath, StringComparison.Ordinal))
+        {
+            return Respond(HttpStatusCode.NotFound, """{"code":"NotFound","message":"Message: {\"Errors\":[\"Owner resource does not exist\"]}"}""", 1, subStatus: 1003);
         }
 
         var partition = recorded.PartitionKey;

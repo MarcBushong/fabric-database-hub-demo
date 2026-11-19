@@ -14,8 +14,9 @@ internal static partial class CommandLine
 {
     /// <summary>
     /// T5's live view: the activity profile, recent runs and stop requests from T1's run store, the account (whether its
-    /// container answers, and its partition key), the live requests, request units, and 429s per second that its Running
-    /// runs report, and the profile host's lane last. The run store is local, so this works while the account doesn't answer.
+    /// container answers, and its partition key, or that the container doesn't exist now: it exists only during a session),
+    /// the live requests, request units, and 429s per second that its Running runs report, and the profile host's lane
+    /// last. The run store is local, so this works while the account doesn't answer.
     /// </summary>
     private static async Task<int> StatusT5Async(ParseResult parseResult, CosmosEndpoint endpoint, CosmosRunStore store, int runCount, string? profileFile, string? hostStateFile, bool json, CancellationToken cancellationToken)
     {
@@ -73,12 +74,18 @@ internal static partial class CommandLine
         ["host"] = status.Host.ToNode(),
     };
 
+    /// <summary>
+    /// <c>status --target T5 --json</c>'s account: <c>reachable</c> when the account answered, <c>containerExists</c>
+    /// (null when it didn't), the container's partition key, the <c>error</c> when it didn't answer, and a <c>note</c> when
+    /// the container doesn't exist now, which isn't an error: it exists only during a session.
+    /// </summary>
     internal static JsonObject AccountNode(CosmosAccountStatus account) => new()
     {
         ["endpoint"] = account.Endpoint,
         ["database"] = CosmosEndpoint.DatabaseName,
         ["container"] = CosmosEndpoint.ContainerName,
         ["reachable"] = account.Reachable,
+        ["containerExists"] = account.Container is not null ? true : account.ContainerMissing ? false : (bool?)null,
         ["partitionKey"] = account.Container is { } container
             ? new JsonObject
             {
@@ -88,6 +95,7 @@ internal static partial class CommandLine
             }
             : null,
         ["error"] = account.Error is null ? null : Redactor.Redact(account.Error),
+        ["note"] = account.ContainerMissing ? CosmosAccountStatus.ContainerMissingNote : null,
         ["live"] = new JsonObject
         {
             ["requestsPerSecond"] = account.Live.RequestsPerSecond,
@@ -98,16 +106,18 @@ internal static partial class CommandLine
         },
     };
 
-    private static void WriteStatusT5Text(TextWriter output, T5Status status)
+    internal static void WriteStatusT5Text(TextWriter output, T5Status status)
     {
         var account = status.Account;
         var live = account.Live;
         output.WriteLine($"Target:   {status.Endpoint.Describe()}");
         output.WriteLine($"Profile:  {status.ProfileDescription}");
         output.WriteLine($"Host:     [{status.Host.Status}] {status.Host.Message}");
-        output.WriteLine(account.Reachable
-            ? $"Account:  {account.Endpoint} answers; {CosmosEndpoint.DatabaseName}/{CosmosEndpoint.ContainerName} is partitioned on {account.Container!.DescribePartitionKey()}"
-            : $"Account:  {account.Endpoint} doesn't answer: {account.Error}");
+        output.WriteLine(account.Container is { } container
+            ? $"Account:  {account.Endpoint} answers; {CosmosEndpoint.DatabaseName}/{CosmosEndpoint.ContainerName} is partitioned on {container.DescribePartitionKey()}"
+            : account.ContainerMissing
+                ? $"Account:  {account.Endpoint} answers; {CosmosAccountStatus.ContainerMissingNote}"
+                : $"Account:  {account.Endpoint} doesn't answer: {account.Error}");
         output.WriteLine(live.UpdatedAt is { } updated
             ? string.Create(CultureInfo.InvariantCulture, $"Live:     {live.RequestsPerSecond:0.0} requests/s, {live.RuPerSecond:0.0} RU/s, {live.ThrottledPerSecond:0.0} throttled (429)/s; {live.ThrottledLastMinute} throttled in the last minute (updated {DemoDatabase.Format(updated)})")
             : "Live:     no Running run is reporting rates");
@@ -132,9 +142,10 @@ internal static partial class CommandLine
     }
 
     /// <summary>
-    /// T5's setup: it checks the container the template created (contosocare/patient-events, partitioned on /patientId) and,
-    /// with --seed-scale, upserts the patient profile documents. It creates nothing else: no database, container, or
-    /// role (the template and deploy.ps1 do), and there are no scripts. Idempotent.
+    /// T5's setup: it checks the container (contosocare/patient-events, partitioned on /patientId), which exists only during
+    /// a session (start-demo.ps1 or deploy.ps1 creates it, so its check fails between sessions), and, with --seed-scale,
+    /// upserts the patient profile documents. It creates nothing else: no database, container, or role (the template,
+    /// the operator scripts, and deploy.ps1 do), and there are no scripts. Idempotent.
     /// </summary>
     private static async Task<int> SetupT5Async(ParseResult parseResult, CosmosEndpoint endpoint, int? seedScale, bool json, CancellationToken cancellationToken)
     {

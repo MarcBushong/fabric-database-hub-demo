@@ -457,6 +457,8 @@ module cosmos01 'cosmos01.bicep' = if (t5Enabled) {
     databaseName: cosmos.databaseName
     containerName: cosmos.containerName
     partitionKeyPath: cosmos.partitionKeyPath
+    partitionKeyVersion: cosmos.partitionKeyVersion
+    indexingPolicy: cosmos.indexingPolicy
     throughput: cosmos.throughputRUs
     enableFreeTier: t5FreeTier
     privateEndpointSubnetId: network.outputs.subnetIds[2]

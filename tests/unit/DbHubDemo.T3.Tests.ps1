@@ -495,6 +495,8 @@ Describe 'Resolve-DemoT3FreeOfferError' {
         @{ Name = 'deployment JSON'; Text = '{"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare","message":"The resource write operation failed.","details":[{"code":"FreeDatabaseLimitReached","message":"The subscription has reached its free database limit."}]}]}}'; Code = 'FreeDatabaseLimitReached' }
         @{ Name = 'property name'; Text = 'ERROR: (InvalidParameterValue) Invalid value given for parameter useFreeLimit. Specify a valid parameter value.'; Code = 'InvalidParameterValue' }
         @{ Name = 'free offer region'; Text = 'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3 for this subscription.'; Code = 'ProvisioningDisabled' }
+        # Azure SQL's real refusal (Microsoft Q&A 6001016, 2026-09): it names a "free limit database", never a "free tier".
+        @{ Name = 'Azure SQL''s real refusal (Microsoft Q&A)'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]}]}}'; Code = 'ProvisioningDisabled' }
     ) {
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText $Text
         $verdict.IsFreeOfferError | Should -BeTrue
@@ -511,10 +513,22 @@ Describe 'Resolve-DemoT3FreeOfferError' {
         @{ Name = 'unrelated free text'; Text = 'ERROR: (SubnetIsFull) Subnet snet-pe has no free IP addresses left.' }
         @{ Name = 'conflict'; Text = 'ERROR: (Conflict) Another operation is in progress on server azuresql01-abc123.' }
         @{ Name = 'empty'; Text = '' }
+        # Azure Cosmos DB refusing T5's free tier (review, 2026-11-19): never T3's free offer.
+        @{ Name = 'T5''s free tier, internal subscription (live 2026-11-18)'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}]}}' }
+        @{ Name = 'T5''s free tier, taken by another account'; Text = 'ERROR: (BadRequest) Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account.' }
+        @{ Name = 'a Cosmos DB detail that names a free offer'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"BadRequest","message":"The free offer for Azure Cosmos DB accounts is not available."}]}}' }
     ) {
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText $Text
         $verdict.IsFreeOfferError | Should -BeFalse
         $verdict.Result | Should -BeNullOrEmpty
+    }
+
+    It 'still recognizes T3''s own refusal next to a Cosmos DB refusal in the same error (review, 2026-11-19)' {
+        $text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]},{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]}]}}'
+        $verdict = Resolve-DemoT3FreeOfferError -ErrorText $text
+        $verdict.IsFreeOfferError | Should -BeTrue
+        $verdict.Code | Should -Be 'ProvisioningDisabled'
+        $verdict.Message | Should -Be 'Provisioning of free limit database is not supported for provided service level objective or region'
     }
 
     It 'redacts and shortens the message it reports' {
