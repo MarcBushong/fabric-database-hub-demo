@@ -25,7 +25,9 @@ function Invoke-DemoPreflight {
       or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing, which
       the demo assumes since 2026-11-14 (Test-DemoFabricViewerLicense, Not selected, nothing read); and P12 and P13, the tenant settings the Insights
       app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
-      Warning when one is off or can't be read; 2026-11-05).
+      Warning when one is off or can't be read; 2026-11-05). A workspace that exists and that another demo environment
+      records, while this one doesn't, is a Fail before anything is created (DEPLOY.FABRIC.SHARED, Get-DemoFabricSharedResult;
+      2026-11-19): one Azure Resource Graph query.
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
       verified for the configured tenant (Invoke-DemoRestRequest). The group's display name is in the
       evidence (groupDisplayName), for T3's administrator login.
@@ -552,6 +554,14 @@ function Invoke-DemoPreflight {
     $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'PREFLIGHT.P4.HUBSETTING'))
     $fabricCheck = Test-DemoFabricResolution -Config $Config
     $results.Add($fabricCheck.Result)
+    # 2026-11-19: the workspace P5 found, when another demo environment records it and this one doesn't, is a Fail here,
+    # before anything is created, so a second environment never puts its items in another's workspace
+    # (DEPLOY.FABRIC.SHARED, Get-DemoFabricSharedResult); one this environment shares already is a Warning, and its update
+    # goes on. Nothing when the workspace is nobody else's or doesn't exist yet.
+    $sharedCheck = Get-DemoFabricSharedResult -Config $Config -WorkspaceId ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $fabricCheck.Result -Name 'evidence') -Name 'workspaceId'))
+    if ($null -ne $sharedCheck) {
+        $results.Add($sharedCheck)
+    }
     # P11 (optional): Power BI viewer licenses are assumed since 2026-11-14 (the user), so it's Not selected and reads
     # nothing; it used to warn on every deployment below F64.
     $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config))

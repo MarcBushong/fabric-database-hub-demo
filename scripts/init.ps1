@@ -20,8 +20,11 @@ What it does, in order:
    subscription or signs you in.
 2. Runs the subscription guard for that subscription, then reads, through it: you (Microsoft Graph), your permissions
    on the subscription (P1), the Fabric capacities you can assign (it asks when there's more than one), and whether
-   the Fabric workspace "Database Hub Demo" exists. A new workspace gets fabric.importNotebooks true, and deploy.ps1
-   creates it with its lakehouse.
+   the Fabric workspace exists: "Database Hub Demo" for the default prefix, and "Database Hub Demo <prefix>" for a new
+   environment with any other (2026-11-19), so a second environment gets its own. A workspace that another demo
+   environment records is never this one's: init.ps1 gives a default name way to the environment's own, and a
+   -WorkspaceName that names one is Manual action required (INIT.FABRIC.WORKSPACE). A new workspace gets
+   fabric.importNotebooks true, and deploy.ps1 creates it with its lakehouse.
 3. Finds the Microsoft Entra security group for T3's and T4's administrators (P6) by name, by default
    <prefix>-<environment>-sql-admins. With -CreateAdminGroup it creates it with you as the owner when it's missing; a
    tenant that doesn't allow that gets Manual action required with the steps for an administrator.
@@ -64,7 +67,9 @@ JumpstartImage or Developer, to choose T2's mode on purpose; without it, Jumpsta
 (2026-11-09). ProductKey is set in the configuration file (prerequisite P10).
 
 .PARAMETER WorkspaceName
-The Fabric workspace's name (default "Database Hub Demo"). deploy.ps1 creates it when it's missing.
+The Fabric workspace's name (default "Database Hub Demo", and "Database Hub Demo <prefix>" for a new environment whose
+-Prefix isn't the default). deploy.ps1 creates it when it's missing. One that another demo environment records is Manual
+action required.
 
 .PARAMETER LakehouseName
 The lakehouse's name (default LH_DatabaseHub).

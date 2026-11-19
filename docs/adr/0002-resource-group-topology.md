@@ -112,6 +112,14 @@ Option 2.
 - **Live (2026-11-17, on 8d20501):** fd, a fresh clone's environment, and mn, `main`'s environment upgraded, each recorded both workspace IDs on its group when `deploy.ps1` updated itself and ran (`DEPLOY.FABRIC.SHARED` **Pass**). nu, deployed by an earlier version, then ran `destroy.ps1 -Force` (19.6 minutes, exit 0): it kept both its workspaces, each a **Warning** that named only the owner's `rg-dbhub-demo`, which runs `main`'s code and records none, and deleted everything else. The kept workspaces were intact (9 items; the control notebook with its managed private endpoint) and were deleted by hand. The owner's roles (22 and 7 actions), `rg-dbhub-demo`, `rg-dbhub-control`, and the workspaces "Database Hub Demo" and "DBHub Control" were unchanged.
 - **Sources (checked 2026-11-17):** Resource Graph's [query scope](https://learn.microsoft.com/azure/governance/resource-graph/concepts/query-language#query-scope), "If a management group or a subscription list isn't defined, the query scope is all resources"; Fabric's [retention and recovery](https://learn.microsoft.com/fabric/admin/portal-workspaces#retention-and-recovery): a deleted collaborative workspace can be restored by a Fabric administrator during its retention period, 7 days by default, configurable from 7 to 90.
 
+## Amendment (2026-11-19): a new environment never takes another's workspace
+
+**Decision** (the coordinator, from the final tests' F5): following the README's directions for a second environment, `init.ps1 -Prefix <prefix>`, gave it "Database Hub Demo", the first environment's workspace, and the warning above came only after `deploy.ps1` had put the new environment's items there.
+
+- **`init.ps1`** gives a new environment "Database Hub Demo `<prefix>`" for every prefix but the default, and never a **Pass** for a workspace that another demo environment records, with the same Resource Graph query: a default name gives way to the environment's own, and a `-WorkspaceName` that names one is **Manual action required**.
+- **`deploy.ps1`** checks the workspace its configuration names before it creates anything, in preflight and, for a resumed run, before any track: one that another environment records and this one doesn't is `DEPLOY.FABRIC.SHARED` **Fail**, with the fix. This one's own record, or a Fabric step that an earlier run of it finished without a record (deployed before 2026-11-17), keeps its workspace: the **Warning** above, with how to move, so an update never breaks. A Resource Graph that can't answer is a **Warning**, and the run goes on.
+- **Consequence:** sharing a workspace is now only what two environments did before this change, which each keeps until its configuration names one of its own.
+
 ## Sources (checked 2026-10-19)
 
 - Subscription-scope deployments: <https://learn.microsoft.com/azure/azure-resource-manager/bicep/deploy-to-subscription>

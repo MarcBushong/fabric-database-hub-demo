@@ -327,7 +327,9 @@ function Invoke-DemoParallelDeployment {
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
-       Fail stops here. -WhatIf adds the template's what-if, then stops.
+       Fail stops here. -WhatIf adds the template's what-if, then stops. A run without preflight (a resume) checks the
+       Fabric workspace as preflight does before any track starts (Get-DemoFabricSharedResult -Resolve; 2026-11-19): one
+       that another demo environment records, and this one doesn't, stops it (DEPLOY.FABRIC.SHARED Fail).
     2. The tracks (Invoke-DemoDeploymentTrack) start, each in a background job a few seconds apart, so their
        subscription guards run while the template deploys; each waits for this process's word that the
        template succeeded. Meanwhile T1 joins the T3 group (Microsoft Graph only), and a T2 restored from the
@@ -638,6 +640,20 @@ function Invoke-DemoParallelDeployment {
                 Write-DemoLog -Level Warning -Message ([string]$tuning.message)
                 Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
                 return $results.ToArray()
+            }
+        }
+        # The Fabric workspace that another demo environment records (2026-11-19), as preflight checks it, before any track
+        # writes to Fabric: a configuration edited by hand since the earlier run stops here (DEPLOY.FABRIC.SHARED).
+        if (-not $SkipFabric) {
+            $sharedCheck = Get-DemoFabricSharedResult -Config $Config -Resolve
+            if ($null -ne $sharedCheck) {
+                $results.Add($sharedCheck)
+                if ([string]$sharedCheck.status -eq 'Fail') {
+                    Stop-DemoRayfinSignInStatus -Status $signInCheck
+                    Write-DemoLog -Level Warning -Message ([string]$sharedCheck.message)
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Items' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $sharedCheck.message, $sharedCheck.remediation) -MaxLength 1200
+                    return $results.ToArray()
+                }
             }
         }
     }
