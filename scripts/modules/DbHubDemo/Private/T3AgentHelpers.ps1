@@ -381,12 +381,13 @@ function Test-DemoT3AgentReadiness {
 function Get-DemoT3AgentSetupItem {
     <#
     .SYNOPSIS
-    HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one manual step, which no API offers, as a Manual action required
-    that only a person confirms (Test-DemoConfirmOnlyResult): deploy.ps1's ending and the status page list it under
-    "Please confirm", with Database Hub's link, the exact database to select, and the Agent policy options. It's once
-    per deployment: the selection stays across sessions and upgrades, unless T3 is recreated (stop-demo.ps1 -RemoveT3).
-    Database Agents also needs T3 in the supported region associated with the Fabric tenant's home region, which no API
-    reads, so it's named here too. Returns $null when T3 doesn't exist. Pure. Internal.
+    HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one manual step, optional (the owner's decision, 2026-11-19), which
+    no API offers, as a Manual action required that only a person confirms (Test-DemoConfirmOnlyResult): deploy.ps1's
+    ending and the status page list it under "Please confirm", with Database Hub's link, the exact database to select, and
+    the Agent policy options. It's once per deployment: the selection stays across sessions and upgrades, unless T3 is
+    recreated (stop-demo.ps1 -RemoveT3). Only the Database Agent loop on T3 needs it. Database Agents also needs T3 in the
+    supported region associated with the Fabric tenant's home region, which no API reads, so it's named here too. Returns
+    $null when T3 doesn't exist. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -412,6 +413,6 @@ function Get-DemoT3AgentSetupItem {
     $link = '{0}/workloads/fdh/databaseHub{1}' -f $portal, $(if ($tenant) { '?ctid=' + $tenant } else { '' })
     $database = '{0}/ContosoCare' -f $ServerName
     $where = if ($Region) { $Region } else { [string]$Config['location'] }
-    $message = 'Database Agents on T3, once per deployment (the Database Agent loop; it stays across sessions and upgrades, unless T3 is recreated): open {0}, select Manage agents, then Database agent settings; turn Enabled on, select {1}, and under Agent policy turn on {2}; select Apply, then Save (about 30 seconds). T3 must be awake: right after deploy.ps1, or during a session. Database Agents needs T3''s region ({3}) to be the one associated with your Fabric tenant''s home region (Fabric: ? > About Fabric).' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $where
+    $message = 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment (it stays selected across sessions and upgrades, unless T3 is recreated). Open {0}, select Manage agents, then Database agent settings; turn Enabled on, select {1}, and under Agent policy turn on {2}; select Apply, then Save (about 30 seconds). T3 must be awake: right after deploy.ps1, or during a session. Database Agents needs T3''s region ({3}) to be the one associated with your Fabric tenant''s home region (Fabric: ? > About Fabric).' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $where
     return (New-DemoResult -CheckId 'HUB.AGENT.T3' -Area 'hub' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database; policy = @($script:DemoAgentPolicy); region = $where; oncePerDeployment = $true }) -Remediation ('In Database Hub, Manage agents > Database agent settings: Enabled, {0}, Apply, Save; the walkthrough''s Database Agent loop shows the rest.' -f $database) -DocUrl $script:DemoAgentDocUrl)
 }

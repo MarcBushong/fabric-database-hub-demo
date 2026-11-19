@@ -225,11 +225,11 @@ Describe 'What Database Agents needs from T3 (Test-DemoT3AgentReadiness, 2026-11
 }
 
 Describe 'The one-time agent selection deploy.ps1 lists under "Please confirm" (Get-DemoT3AgentSetupItem, 2026-11-18)' {
-    It 'gives Database Hub''s link in the demo''s tenant, the exact database, the Agent policy, T3''s region, and that it''s once per deployment' {
+    It 'gives Database Hub''s link in the demo''s tenant, the exact database, the Agent policy, T3''s region, and that it''s optional and once per deployment' {
         $item = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoT3AgentSetupItem -Config $C -ServerName 'azuresql01-abc123' -Region 'westus3' }
         $item.checkId | Should -Be 'HUB.AGENT.T3'
         $item.status | Should -Be 'Manual action required'
-        $item.message | Should -Match '^Database Agents on T3, once per deployment \(the Database Agent loop; it stays across sessions and upgrades, unless T3 is recreated\): open https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=66666666-7777-8888-9999-000000000000, select Manage agents, then Database agent settings; turn Enabled on, select azuresql01-abc123/ContosoCare, and under Agent policy turn on Flag long-running queries, Force last known good plans, Flag high CPU; select Apply, then Save'
+        $item.message | Should -Match '^Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment \(it stays selected across sessions and upgrades, unless T3 is recreated\)\. Open https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=66666666-7777-8888-9999-000000000000, select Manage agents, then Database agent settings; turn Enabled on, select azuresql01-abc123/ContosoCare, and under Agent policy turn on Flag long-running queries, Force last known good plans, Flag high CPU; select Apply, then Save'
         $item.message | Should -Match 'T3''s region \(westus3\)'
         $item.evidence.database | Should -Be 'azuresql01-abc123/ContosoCare'
         InModuleScope DbHubDemo { Test-DemoConfirmOnlyResult -Result $args[0] } -ArgumentList $item | Should -BeTrue

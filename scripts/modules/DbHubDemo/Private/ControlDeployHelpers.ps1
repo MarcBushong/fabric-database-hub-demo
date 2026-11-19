@@ -197,14 +197,17 @@ function Get-DemoControlDeployNote {
     <#
     .SYNOPSIS
     DONE's line about the session control (ADR 0026): where Run all is, or what it still needs, from this run's
-    DEPLOY.CONTROL and the control's role Warnings (an Owner runs ./scripts/grant-safety-stop.ps1 once). Empty when this
-    run didn't reach the control. Pure. Internal.
+    DEPLOY.CONTROL and the control's role Warnings (an Owner runs ./scripts/grant-safety-stop.ps1 once). -OmitGrant leaves
+    the roles' part out when DONE's first note says it already (Get-DemoOwnerGrantNote). Empty when this run didn't reach
+    the control. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [AllowEmptyCollection()]
-        [object[]] $Result = @()
+        [object[]] $Result = @(),
+
+        [switch] $OmitGrant
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -224,7 +227,7 @@ function Get-DemoControlDeployNote {
         $first = $azure[0]
         $text = '{0} In Azure: {1}{2}' -f $text, [string]$first.message, $(if ([string]$first.remediation) { ' ' + [string]$first.remediation } else { '' })
     }
-    if ($roles.Count) {
+    if ($roles.Count -and -not $OmitGrant) {
         $grant = [string](@($roles | ForEach-Object { [string]$_.remediation } | Where-Object { $_ }) | Select-Object -First 1)
         $text = '{0} Until its roles are granted, Run all runs a session without what they allow (T4''s read replica, the busy marker, the history''s metrics, or the session itself): {1}' -f $text, $(if ($grant) { $grant } else { 'an Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once.' })
     }

@@ -1348,10 +1348,11 @@ Describe 'Invoke-DemoDeployment' {
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
             'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'App', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
-        # The Database Agent loop's one-time selection (2026-11-18) is the one item a person confirms: it never keeps DONE.
+        # The Database Agent loop's one-time selection (2026-11-18), optional since 2026-11-19, is the one item a person
+        # confirms: it never keeps DONE.
         $summary = $results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }
         $summary.status | Should -Be 'Manual action required'
-        $summary.message | Should -Match 'Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Database Agents on T3, once per deployment'
+        $summary.message | Should -Match 'Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment'
         ($results | Where-Object { $_.checkId -eq 'HUB.AGENT.T3' }).message | Should -Match 'select azuresql01-[a-z0-9]{6}/ContosoCare'
         $script:state.Stage | Should -Be 'Validation'
         @($script:state.BundleSentTo | Sort-Object) | Should -Be @('archost01', 'sqlvm01')

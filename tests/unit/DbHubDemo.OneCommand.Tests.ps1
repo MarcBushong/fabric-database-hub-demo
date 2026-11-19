@@ -375,8 +375,53 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $lines = InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome -Minutes 130 -WorkspaceName 'Database Hub Demo' }
         ($lines -join ' ') | Should -Match '##  DONE'
         ($lines -join ' ') | Should -Match 'The demo is complete\.'
-        ($lines -join ' ') | Should -Match 'Where to look: open Database Hub'
-        ($lines -join ' ') | Should -Match 'capture-t2-golden\.ps1 to make future redeploys skip T2''s build'
+        ($lines -join ' ') | Should -Match 'Where to look: open Database Hub in the Fabric portal, look at Estate and Performance, and investigate what you see with Copilot in Database Hub\.'
+        # Each session is one Run all (2026-11-19); the scripts are the way from a PC.
+        ($lines -join ' ') | Should -Match 'Each session: open NB_DatabaseHub_Control and select Run all: it starts everything, runs the showcase, and stops it all at the end\. From a PC instead: \./scripts/start-demo\.ps1, then \./scripts/stop-demo\.ps1 -SaveHistory\.'
+        # No golden snapshot nudge (2026-11-19, S6): a snapshot bills every month, also after destroy, and T2 needs nobody.
+        ($lines -join ' ') | Should -Not -Match 'capture-t2-golden'
+        ($lines -join ' ') | Should -Not -Match 'with the Database Agent'
+    }
+
+    It 'says where Run all is, and makes the Owner''s one grant the first note when the run couldn''t assign the roles (2026-11-19, S7)' {
+        $config = New-TestConfig -WithT4
+        $place = 'the folder "DBHub Control" of the workspace "Database Hub Demo"'
+        $control = New-DemoResult -CheckId 'DEPLOY.CONTROL' -Area 'workload' -Target 'fabric' -Status 'Pass' -Message ('Run all is ready: open NB_DatabaseHub_Control in {0} and select Run all. It runs the whole session and stops it.' -f $place) -Evidence ([ordered]@{ notebook = 'NB_DatabaseHub_Control'; place = $place; resourceGroup = 'rg-dbhub-control'; ready = $true })
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + @($control); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.SessionPlace | Should -Be $place
+        $outcome.SessionWaitsForGrant | Should -BeFalse
+        ($outcome.Notes -join ' ') | Should -Not -Match 'grant-safety-stop'
+        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $lines | Should -Match ([regex]::Escape(('Each session: open NB_DatabaseHub_Control in {0} and select Run all:' -f $place)))
+
+        # A Contributor's run: the safety stop's role, the control's roles, and T5's container all wait for an Owner.
+        $grant = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'
+        $waiting = @(
+            (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role isn''t assigned.' -Evidence ([ordered]@{ command = $grant }) -Remediation ('An Owner of the subscription runs, once: {0}' -f $grant))
+            (New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'A1 isn''t in place.' -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $grant))
+            (New-DemoResult -CheckId 'DEPLOY.T5.LIFECYCLE' -Area 't5' -Target 'T5' -Status 'Warning' -Message 'T5''s container stays between sessions.' -Remediation ('An Owner runs, once: {0}.' -f $grant))
+        )
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + @($control) + $waiting; State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done' -Because 'Warnings never keep the deployment from DONE'
+        $outcome.Notes[0] | Should -Be ('First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, Run all can''t run a whole session (from a PC, ./scripts/start-demo.ps1 works), nothing stops T4 when Azure starts it again 7 days after a stop, and T5''s container stays between sessions, so its throughput bills all month.' -f $grant)
+        $outcome.SessionWaitsForGrant | Should -BeTrue
+        # Said once: neither the safety stop's own note nor the control's line repeats the grant.
+        @($outcome.Notes | Where-Object { $_ -match 'grant-safety-stop' }).Count | Should -Be 1
+        ($outcome.Notes -join ' ') | Should -Not -Match 'can''t stop anything until its role is assigned'
+        ($outcome.Notes -join ' ') | Should -Match '^First, once: .* Run all is ready: open NB_DatabaseHub_Control'
+        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $lines | Should -Match ([regex]::Escape(('Each session, once that grant is done: open NB_DatabaseHub_Control in {0} and select Run all:' -f $place)))
+        $lines | Should -Match 'Until then, from a PC: \./scripts/start-demo\.ps1, then \./scripts/stop-demo\.ps1 -SaveHistory\.'
+
+        # Only the safety stop's role: the grant's note names T4, not Run all; a role that can't be assigned for another reason
+        # (no identity yet) isn't a grant.
+        $onlyStop = @($waiting[0])
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + $onlyStop; State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Notes[0] | Should -Be ('First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, nothing stops T4 when Azure starts it again 7 days after a stop.' -f $grant)
+        $outcome.SessionWaitsForGrant | Should -BeFalse
+        $noIdentity = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The identity doesn''t exist yet.' -Remediation 'Run ./scripts/deploy.ps1, which creates the identity and assigns the role when you may.'
+        (InModuleScope DbHubDemo -Parameters @{ Result = @($noIdentity) } { Get-DemoOwnerGrantNote -Result $Result }).Text | Should -BeNullOrEmpty
     }
 
     It 'is DONE, naming the Insights app as a failure that doesn''t block DONE with its reason and fix, when its prerequisites aren''t met (2026-11-05)' {
@@ -483,13 +528,14 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -BeNullOrEmpty
     }
 
-    It 'states plainly in Developer mode that T2 has no performance data or agent findings' {
+    It 'states plainly in Developer mode that T2 has no performance data (Database Agents covers T3 only, in every mode)' {
         $config = New-TestConfig -InstallMode 'Developer'
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -InstallMode 'Developer'); State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
-        ($outcome.Notes -join ' ') | Should -Match 'T2 has no performance data or Database Agent findings'
+        ($outcome.Notes -join ' ') | Should -Match 'T2 has no performance data\. JumpstartImage \(the default\) or ProductKey mode gives it\.'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'Database Agent findings'
         $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
-        $lines | Should -Match 'no performance data or Database Agent findings'
+        $lines | Should -Match 'T2 has no performance data'
     }
 
     It 'is NOT DONE, exit code 1, with a Fail: why, the fix, the exact command, how to resume, and the diagnostics bundle' {
