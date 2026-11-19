@@ -28,7 +28,7 @@ export const SCENARIOS: readonly ScenarioInfo[] = [
     { id: "memory-grant-pressure", title: "Memory grant pressure", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "missing-index", title: "Missing index", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "parallel-scans", title: "Parallelism waits", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
-    { id: "plan-regression", title: "Plan regression (automatic plan correction)", targets: ["T3"], defaultMinutes: 10, maxMinutes: 20 },
+    { id: "plan-regression", title: "Plan regression (automatic plan correction)", targets: ["T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "replica-lag", title: "Read replica lag", targets: ["T4"], defaultMinutes: 10, maxMinutes: 15 },
     { id: "resource-governance", title: "Resource governance (CPU cap)", targets: ["T1", "T2", "T3"], defaultMinutes: 5, maxMinutes: 20 },
     { id: "slow-consumer", title: "Slow consumer", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },

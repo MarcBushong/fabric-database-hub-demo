@@ -15,7 +15,9 @@ function Invoke-DemoWorkloadCommand {
 
     The runner holds no secrets: T1 and T2 use Windows authentication as SYSTEM (or the guest administrator
     for T2), and T3 and T4 the T1 managed identity. Output is redacted, and the VM keeps only the last 4,096 bytes of
-    a Run Command's output, so long output is cut from the front.
+    a Run Command's output, so long output is cut from the front. For T2, a broken PowerShell Direct channel into the
+    guest is cleared by restarting the guest once (issue #65): once for deploy.ps1's run (its recovery key,
+    Get-DemoRunRecoveryKey), once an hour otherwise; the result is then a Warning that says so.
 
     Returns Target, Status (an ADR 0012 status from the runner's exit code: 0 Pass or Warning, 2 Manual action
     required, otherwise Fail), ExitCode, Records (the --json output: the items of a JSON array, or one JSON object
@@ -77,7 +79,13 @@ function Invoke-DemoWorkloadCommand {
     if (-not $PSCmdlet.ShouldProcess(('{0} through {1}' -f $Target, $vmName), ('Run ContosoCare.Workload {0}' -f $command))) {
         return
     }
-    $data = Invoke-DemoWorkloadAction -Config $Config -VmName $vmName -Action 'Runner' -Request @{ target = $Target; arguments = @($ArgumentList); timeoutSeconds = $TimeoutSeconds; readySeconds = $ReadySeconds }
+    $request = @{ target = $Target; arguments = @($ArgumentList); timeoutSeconds = $TimeoutSeconds; readySeconds = $ReadySeconds }
+    # Issue #65: T2's relay restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
+    $recoveryKey = Get-DemoRunRecoveryKey
+    if ($Target -eq 'T2' -and $recoveryKey) {
+        $request['recoveryKey'] = $recoveryKey
+    }
+    $data = Invoke-DemoWorkloadAction -Config $Config -VmName $vmName -Action 'Runner' -Request $request
     $evidence = @{}
     if ($data['evidence'] -is [System.Collections.IDictionary]) {
         foreach ($key in $data['evidence'].Keys) {
