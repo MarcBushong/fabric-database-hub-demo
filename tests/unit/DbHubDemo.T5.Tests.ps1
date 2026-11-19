@@ -303,6 +303,18 @@ Describe 'Test-DemoT5' {
         $metrics.status | Should -Be 'Warning'
         $metrics.remediation | Should -Match 'activity profile'
     }
+
+    It 'passes with no 429s at all, when Azure returns no point for the 429 filter (live 2026-11-18: .Sum of nothing stopped deploy.ps1)' {
+        $script:t5.Metrics = @{ NormalizedRUConsumption = @(12.0, 18.0); TotalRequestUnits = @(900.0, 1100.0); TotalRequests = @(60.0, 70.0); Throttled = @() }
+        $snapshot = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); AccountId = $script:accountId } { Get-DemoT5MetricSnapshot -Config $Config -AccountId $AccountId }
+        $snapshot.Succeeded | Should -BeTrue
+        $snapshot.Throttled | Should -Be 0
+        $snapshot.Requests | Should -Be 130
+        $snapshot.PeakNormalizedRu | Should -Be 18
+        $metrics = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); AccountId = $script:accountId } { Test-DemoT5MetricFlow -Config $Config -AccountId $AccountId }
+        $metrics.status | Should -Be 'Pass'
+        $metrics.evidence['throttled'] | Should -Be 0
+    }
 }
 
 Describe 'T5 has no stop: STOP.T5' {

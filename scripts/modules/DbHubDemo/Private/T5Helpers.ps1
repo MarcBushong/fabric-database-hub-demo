@@ -573,14 +573,32 @@ function Get-DemoT5MetricSnapshot {
     finally {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
     }
-    $sum = { param([string] $Key) if ($series.Contains($Key)) { [double](@($series[$Key] | Measure-Object -Property Value -Sum).Sum) } else { $null } }
+    # No Measure-Object here: with -Property it writes nothing for an empty series, such as the 429 filter's when nothing was
+    # throttled, and .Sum of nothing throws under strict mode (live, 2026-11-18, deploy.ps1's METRICS.T5).
+    $sum = {
+        param([string] $Key)
+        if (-not $series.Contains($Key)) {
+            return $null
+        }
+        $total = 0.0
+        foreach ($point in @($series[$Key])) {
+            $total += [double]$point.Value
+        }
+        return $total
+    }
     $normalized = if ($series.Contains('NormalizedRu')) { @($series['NormalizedRu'] | Sort-Object -Property Utc) } else { @() }
+    $peak = $null
+    foreach ($point in $normalized) {
+        if ($null -eq $peak -or [double]$point.Value -gt $peak) {
+            $peak = [double]$point.Value
+        }
+    }
     $newest = @(foreach ($key in $series.Keys) { $series[$key] | Where-Object { $null -ne $_.Utc } | ForEach-Object { $_.Utc } }) | Sort-Object -Descending | Select-Object -First 1
     $lastThrottled = if ($series.Contains('Throttled')) { @($series['Throttled'] | Where-Object { $_.Value -gt 0 -and $null -ne $_.Utc } | Sort-Object -Property Utc -Descending) | Select-Object -First 1 } else { $null }
     [pscustomobject]@{
         Succeeded          = ($errors.Count -lt $reads.Count)
         Error              = ($errors | Select-Object -First 1)
-        PeakNormalizedRu   = $(if ($normalized.Count -gt 0) { [double](@($normalized | Measure-Object -Property Value -Maximum).Maximum) } else { $null })
+        PeakNormalizedRu   = $peak
         LatestNormalizedRu = $(if ($normalized.Count -gt 0) { [double]$normalized[-1].Value } else { $null })
         Requests           = (& $sum 'Requests')
         Throttled          = (& $sum 'Throttled')
