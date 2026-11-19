@@ -99,6 +99,7 @@ BeforeAll {
         $script:server = $null
         $script:cost = New-TestCost
         $script:freeOfferFails = $false
+        $script:t5FreeRefused = $false
         $script:createsServer = ''
         $script:elsewhere = @{}
         $script:refusesExisting = $false
@@ -184,6 +185,10 @@ BeforeAll {
                 }
                 if ($script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ProvisioningDisabled) Cannot update paid database to free database.')
+                }
+                # T5's free tier refused, in the live error's shape (2026-11-18, an internal subscription).
+                if ($script:t5FreeRefused -and $script:deployCalls[-1]['parameters'].Contains('t5FreeTier') -and $script:deployCalls[-1]['parameters']['t5FreeTier']['value']) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}]}}')
                 }
                 # Azure refuses a size only when it creates the server; an existing one isn't created again.
                 $code = [string]$script:codes[$script:currentSize]
@@ -1838,5 +1843,49 @@ Describe 'Get-DemoT4State and its callers: a server Azure is deleting isn''t T4 
         $enable.checkId | Should -Be 'WORKLOAD.T4.ENABLE'
         $enable.status | Should -Be 'Fail'
         $enable.message | Should -Be 'T4 (pgflex01-abc123) wasn''t found: Azure is deleting it (Dropping)'
+    }
+}
+
+Describe 'T5''s free tier, refused by Azure: deployed again without it, once, with one Warning (live 2026-11-18)' {
+    # Live, in an internal subscription: "Free tier is not supported for Internal subscriptions". The template failed at
+    # cosmos01, the run deployed it again without the free tier, and both DEPLOY.T5.FREETIER results were kept, the Pass
+    # that Resolve-DemoT5FreeTier gave and the refusal's Warning, which also blamed another account.
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:t5FreeRefused = $true
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5FreeTier -MockWith {
+            [pscustomobject]@{ UseFreeTier = $true; Exists = $false; Holder = ''; Reason = 'Free'; Result = (New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'No account in the subscription has the free tier, so T5 is created with it.') }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+    }
+
+    It 'sends the template again with t5FreeTier false, and keeps one DEPLOY.T5.FREETIER, a Warning with Azure''s reason' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1 -Because 'the refusal replaces the Pass that was given before the template'
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'Free tier is not supported for Internal subscriptions'
+        $free[0].message | Should -Not -Match 'is taken'
+    }
+
+    It 'doesn''t retry a second time when the second template fails too' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:elsewhere['Standard_D4ds_v5'] = 'InternalServerError'
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeFalse
+        $script:deployCalls.Count | Should -Be 2
     }
 }

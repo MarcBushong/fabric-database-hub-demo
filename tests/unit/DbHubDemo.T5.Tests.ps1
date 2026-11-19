@@ -54,6 +54,7 @@ BeforeAll {
             Throughput  = 400
             Assignments = @(@{ properties = @{ roleDefinitionId = ($script:accountId + '/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002'); principalId = $script:principalId; scope = $script:accountId } })
             Metrics     = @{ NormalizedRUConsumption = @(35.0, 100.0, 62.0); TotalRequestUnits = @(9000.0, 24000.0, 15000.0); TotalRequests = @(400.0, 900.0, 500.0); Throttled = @(0.0, 120.0, 0.0) }
+            QuotaId     = 'PayAsYouGo_2014-09-01'
         }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -90,6 +91,9 @@ BeforeAll {
             }
             if ($text -match 'databaseAccounts/cosmos01-abc123\?') {
                 return (New-AzResult -Json $script:t5.Account)
+            }
+            if ($text -match 'management\.azure\.com/subscriptions/[0-9a-f-]+\?api-version=' -and $text -match 'subscriptionPolicies\.quotaId') {
+                return (New-AzResult -Json ([string]$script:t5.QuotaId))
             }
             return (New-AzResult -ExitCode 1 -StdErr ('unexpected: {0}' -f $text))
         }
@@ -180,9 +184,35 @@ Describe 'Resolve-DemoT5FreeTier' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -Times 0 -Exactly
     }
 
-    It 'knows a refusal of the free tier from the template''s error text' {
+    It 'leaves it out in an internal subscription, which Azure refuses it in, without a template that fails first (live 2026-11-18)' {
+        $script:t5.Account = $null
+        $script:t5.QuotaId = 'Internal_2014-09-01'
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Resolve-DemoT5FreeTier -Config $Config -DeploymentId 'abc123' }
+        $resolved.UseFreeTier | Should -BeFalse
+        $resolved.Reason | Should -Be 'Offer'
+        $resolved.Result.status | Should -Be 'Warning'
+        $resolved.Result.message | Should -Match 'internal subscription, Internal_2014-09-01'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -Times 0 -Exactly
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT5FreeTierStatus -Config $Config -DeploymentId 'abc123' } | Should -BeFalse -Because 'the estimate prices the list price, not "not checked"'
+    }
+
+    It 'still asks for it when the subscription''s offer can''t be read; the template''s refusal retry is the backstop' {
+        $script:t5.Account = $null
+        $script:t5.QuotaId = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { '' }
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Resolve-DemoT5FreeTier -Config $Config -DeploymentId 'abc123' }
+        $resolved.UseFreeTier | Should -BeTrue
+        $resolved.Reason | Should -Be 'Free'
+    }
+
+    It 'knows a refusal of the free tier from the template''s error text, and says Azure''s reason' {
         InModuleScope DbHubDemo { Test-DemoT5FreeTierRefusal -Text 'ERROR: (BadRequest) Free tier has already been applied to another Azure Cosmos DB account in this subscription.' } | Should -BeTrue
         InModuleScope DbHubDemo { Test-DemoT5FreeTierRefusal -Text 'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3.' } | Should -BeFalse
+        # The live refusal's text (2026-11-18), as az prints the nested deployment error.
+        $live = 'ERROR: {"status":"Failed","error":{"details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 936fc553-6833-40bb-98a8-379a4bfc7b8e, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}}'
+        InModuleScope DbHubDemo -Parameters @{ Text = $live } { Test-DemoT5FreeTierRefusal -Text $Text } | Should -BeTrue
+        InModuleScope DbHubDemo -Parameters @{ Text = $live } { Get-DemoT5FreeTierRefusalReason -Text $Text } | Should -Match '"Free tier is not supported for Internal subscriptions"'
+        InModuleScope DbHubDemo { Get-DemoT5FreeTierRefusalReason -Text 'ERROR: (BadRequest) Free tier has already been applied.' } | Should -Match 'taken'
     }
 }
 

@@ -134,7 +134,7 @@ function Test-DemoT5 {
         & $add 'T5.FREETIER' 'Pass' ('T5 has the subscription''s free tier: the first {0} RU/s and {1} GB are free, so its {2} RU/s cost nothing.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $names.Throughput) $freeEvidence '' $docs['freeTier']
     }
     else {
-        & $add 'T5.FREETIER' 'Pass' ('T5 doesn''t have the free tier (another account in the subscription has it, t5UseFreeTier is false, or it was created without it), so its {0} RU/s bill every hour; estimate-cost.ps1 prices them. Azure sets the free tier only when an account is created.' -f $names.Throughput) $freeEvidence '' $docs['freeTier']
+        & $add 'T5.FREETIER' 'Pass' ('T5 doesn''t have the free tier (another account in the subscription has it, the subscription is internal, where Azure doesn''t offer it, t5UseFreeTier is false, or it was created without it), so its {0} RU/s bill every hour; estimate-cost.ps1 prices them. Azure sets the free tier only when an account is created.' -f $names.Throughput) $freeEvidence '' $docs['freeTier']
     }
 
     $principalId = Get-DemoT1PrincipalId -Config $Config

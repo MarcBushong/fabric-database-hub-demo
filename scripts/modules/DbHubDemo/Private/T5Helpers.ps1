@@ -185,21 +185,70 @@ function Get-DemoT5FreeTierHolder {
     return [pscustomobject]@{ Succeeded = $true; Error = ''; Accounts = $accounts }
 }
 
+function Get-DemoSubscriptionQuotaId {
+    <#
+    .SYNOPSIS
+    The configured subscription's offer, as Azure Resource Manager's subscriptionPolicies.quotaId (for example
+    Internal_2014-09-01), or '' when it couldn't be read. A read; never throws. Internal.
+
+    .DESCRIPTION
+    Azure Cosmos DB refuses the free tier in an internal subscription ("Free tier is not supported for Internal
+    subscriptions", live 2026-11-18, quotaId Internal_2014-09-01), which a first deployment otherwise learns only from a
+    failed template, about 7 minutes later. Source: Subscriptions - Get
+    (https://learn.microsoft.com/rest/api/resources/subscriptions/get, checked 2026-11-18).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $subscriptionId = [string]$Config['subscriptionId']
+    try {
+        $url = 'https://management.azure.com/subscriptions/{0}?api-version={1}' -f $subscriptionId, (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Resources/subscriptions')
+        $read = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'get', '--url', $url, '--query', 'subscriptionPolicies.quotaId', '--output', 'tsv') -AllowFailure
+        if ($read.ExitCode -eq 0) {
+            return ([string]$read.StdOut).Trim()
+        }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The subscription''s offer couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    return ''
+}
+
+function Test-DemoT5FreeTierOffered {
+    # Whether Azure Cosmos DB offers the free tier to a subscription with this quotaId: not to an internal one (live
+    # 2026-11-18). An empty quotaId (not read) counts as offered; the template's refusal retry is the backstop. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [string] $QuotaId = ''
+    )
+
+    return -not ($QuotaId -like 'Internal_*')
+}
+
 function Resolve-DemoT5FreeTier {
     <#
     .SYNOPSIS
     Whether this deployment creates T5 with the subscription's free tier, and DEPLOY.T5.FREETIER, which says why (ADR 0027).
-    Returns UseFreeTier, Exists, Holder, and Result. Internal.
+    Returns UseFreeTier, Exists, Holder, Reason, and Result. Internal.
 
     .DESCRIPTION
     - An existing T5 keeps what it has: Azure sets enableFreeTier only at creation, so the template gets the account's own
-      value and a redeploy changes nothing.
-    - t5UseFreeTier false: no free tier.
-    - Otherwise the free tier when Azure Resource Graph lists no other account in the subscription with it. Another account
-      has it: no free tier, and the result names that account. Resource Graph can't be read: no free tier, with a Warning,
-      because asking for a free tier that's taken fails the account's creation; the throughput is billed then.
+      value and a redeploy changes nothing (Reason Existing).
+    - t5UseFreeTier false: no free tier (Reason Configured).
+    - An internal subscription (quotaId Internal_*): no free tier, which Azure refuses there, with a Warning (Reason Offer).
+    - Otherwise the free tier when Azure Resource Graph lists no other account in the subscription with it (Reason Free).
+      Another account has it: no free tier, and the result names that account (Reason Holder). Resource Graph can't be
+      read: no free tier, with a Warning, because asking for a free tier that's taken fails the account's creation; the
+      throughput is billed then (Reason Unread).
     -AccountState is Get-DemoT5State's answer when the caller has read it already.
-    Source: https://learn.microsoft.com/azure/cosmos-db/free-tier (checked 2026-11-18).
+    Sources: https://learn.microsoft.com/azure/cosmos-db/free-tier and
+    https://learn.microsoft.com/rest/api/resources/subscriptions/get (checked 2026-11-18).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -218,39 +267,46 @@ function Resolve-DemoT5FreeTier {
     $current = if ($null -ne $AccountState) { $AccountState } else { Get-DemoT5State -Config $Config -DeploymentId $DeploymentId }
     $accountName = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Names') -Name 'AccountName')
     $make = {
-        param([bool] $Use, [string] $Status, [string] $Message, [string] $Holder = '', [string] $Remediation = '')
+        param([bool] $Use, [string] $Status, [string] $Message, [string] $Reason, [string] $Holder = '', [string] $Remediation = '')
         [pscustomobject]@{
             UseFreeTier = $Use
             Exists      = [bool]$current.Exists
             Holder      = $Holder
-            Result      = (New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status $Status -Message $Message -Evidence ([ordered]@{ account = $accountName; exists = [bool]$current.Exists; useFreeTier = $Use; holder = $Holder }) -Remediation $Remediation -DocUrl $docUrl)
+            Reason      = $Reason
+            Result      = (New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status $Status -Message $Message -Evidence ([ordered]@{ account = $accountName; exists = [bool]$current.Exists; useFreeTier = $Use; holder = $Holder; reason = $Reason }) -Remediation $Remediation -DocUrl $docUrl)
         }
     }
     if ($current.Exists) {
         if ($current.FreeTier) {
-            return (& $make $true 'Pass' ('T5 ({0}) has the subscription''s free tier, so its {1} RU/s cost nothing.' -f $accountName, $cosmos['throughputRUs']))
+            return (& $make $true 'Pass' ('T5 ({0}) has the subscription''s free tier, so its {1} RU/s cost nothing.' -f $accountName, $cosmos['throughputRUs']) 'Existing')
         }
-        return (& $make $false 'Pass' ('T5 ({0}) exists without the free tier, which Azure sets only when an account is created, so it keeps that: its {1} RU/s are billed every hour (estimate-cost.ps1 prices them).' -f $accountName, $cosmos['throughputRUs']))
+        return (& $make $false 'Pass' ('T5 ({0}) exists without the free tier, which Azure sets only when an account is created, so it keeps that: its {1} RU/s are billed every hour (estimate-cost.ps1 prices them).' -f $accountName, $cosmos['throughputRUs']) 'Existing')
     }
     if (-not (Test-DemoT5FreeTierWanted -Config $Config)) {
-        return (& $make $false 'Pass' 't5UseFreeTier is false in the configuration, so T5 is created without the free tier: its throughput is billed every hour (estimate-cost.ps1 prices it).')
+        return (& $make $false 'Pass' 't5UseFreeTier is false in the configuration, so T5 is created without the free tier: its throughput is billed every hour (estimate-cost.ps1 prices it).' 'Configured')
+    }
+    $quotaId = Get-DemoSubscriptionQuotaId -Config $Config
+    if (-not (Test-DemoT5FreeTierOffered -QuotaId $quotaId)) {
+        return (& $make $false 'Warning' ('Azure Cosmos DB''s free tier isn''t offered to this subscription (an internal subscription, {0}: Azure refuses it there), so T5 is created without it: its {1} RU/s are billed every hour (estimate-cost.ps1 prices them).' -f $quotaId, $cosmos['throughputRUs']) 'Offer' '' 'Nothing to do. In a subscription that isn''t internal, T5 gets the free tier when it''s created there and no other account has it.')
     }
     $holders = Get-DemoT5FreeTierHolder -Config $Config
     if (-not $holders.Succeeded) {
-        return (& $make $false 'Warning' ('Azure Resource Graph couldn''t be read to find whether another account has the subscription''s free tier ({0}), so T5 is created without it: its throughput is billed every hour.' -f $holders.Error) '' 'Nothing to do. The free tier can only be set when an account is created.')
+        return (& $make $false 'Warning' ('Azure Resource Graph couldn''t be read to find whether another account has the subscription''s free tier ({0}), so T5 is created without it: its throughput is billed every hour.' -f $holders.Error) 'Unread' '' 'Nothing to do. The free tier can only be set when an account is created.')
     }
     $other = @($holders.Accounts | Where-Object { $_.Name -ine $accountName }) | Select-Object -First 1
     if ($null -ne $other) {
         $holder = '{0} (resource group {1})' -f $other.Name, $other.ResourceGroup
-        return (& $make $false 'Warning' ('The subscription''s one free-tier Azure Cosmos DB account is {0}, so T5 is created without it: its throughput is billed every hour (estimate-cost.ps1 prices it).' -f $holder) $holder 'Nothing to do. To have T5 use the free tier, delete that account before T5 is created; once created, T5 keeps what it has.')
+        return (& $make $false 'Warning' ('The subscription''s one free-tier Azure Cosmos DB account is {0}, so T5 is created without it: its throughput is billed every hour (estimate-cost.ps1 prices it).' -f $holder) 'Holder' $holder 'Nothing to do. To have T5 use the free tier, delete that account before T5 is created; once created, T5 keeps what it has.')
     }
-    return (& $make $true 'Pass' ('No account in the subscription has the free tier, so T5 is created with it: the first {0} RU/s and {1} GB are free, which covers T5''s {2} RU/s.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $cosmos['throughputRUs']))
+    return (& $make $true 'Pass' ('No account in the subscription has the free tier, so T5 is created with it: the first {0} RU/s and {1} GB are free, which covers T5''s {2} RU/s.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $cosmos['throughputRUs']) 'Free')
 }
 
 function Test-DemoT5FreeTierRefusal {
     <#
     .SYNOPSIS
-    True when a failed deployment's error says Azure refused T5's free tier (another account took it meanwhile). Internal.
+    True when a failed deployment's error says Azure refused T5's free tier: the subscription's offer doesn't include it
+    ("Free tier is not supported for Internal subscriptions", live 2026-11-18), or another account took it meanwhile.
+    Internal.
 
     .DESCRIPTION
     Microsoft Learn lists no error code for it, so the match needs an error that names the free tier, as
@@ -264,6 +320,24 @@ function Test-DemoT5FreeTierRefusal {
     )
 
     return ($Text -match '(?i)free[ -]?tier')
+}
+
+function Get-DemoT5FreeTierRefusalReason {
+    # Azure's reason for refusing T5's free tier, in a few words for DEPLOY.T5.FREETIER, from the failed deployment's error.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Text = ''
+    )
+
+    $flat = $Text -replace '\\r\\n|\\n|\\"', ' '
+    $match = [regex]::Match($flat, '(?i)free[ -]?tier is not supported for ([A-Za-z]+) subscriptions')
+    if ($match.Success) {
+        return ('"Free tier is not supported for {0} subscriptions": the subscription''s offer doesn''t include it' -f $match.Groups[1].Value)
+    }
+    return 'the subscription''s one free-tier account is taken, or its offer doesn''t include the free tier'
 }
 
 function Get-DemoT5MissingResult {
@@ -341,7 +415,7 @@ function Get-DemoT5FreeTierStatus {
     }
     try {
         $resolved = Resolve-DemoT5FreeTier -Config $Config -DeploymentId $DeploymentId
-        if (-not $resolved.Exists -and [string]$resolved.Result.status -eq 'Warning' -and -not $resolved.Holder) {
+        if ([string]$resolved.Reason -eq 'Unread') {
             # Resource Graph couldn't be read: the estimate says it wasn't checked.
             return $null
         }

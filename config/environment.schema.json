@@ -156,7 +156,7 @@
       "default": true
     },
     "t5UseFreeTier": {
-      "description": "T5 uses the subscription's free-tier account, the first 1,000 RU/s and 25 GB of one Azure Cosmos DB account a subscription gets free, when no other account in the subscription has it (true, the default). Azure sets free tier only when an account is created, so an existing T5 keeps what it has. deploy.ps1 reads the subscription's accounts through Azure Resource Graph before it creates T5, says which one has the free tier when another account does (DEPLOY.T5.FREETIER), and deploys T5 again without it when Azure refuses it. false never uses it (ADR 0027).",
+      "description": "T5 uses the subscription's free-tier account, the first 1,000 RU/s and 25 GB of one Azure Cosmos DB account a subscription gets free, when no other account in the subscription has it and the subscription isn't internal, which Azure refuses it in (true, the default). Azure sets free tier only when an account is created, so an existing T5 keeps what it has. deploy.ps1 reads the subscription's accounts through Azure Resource Graph before it creates T5, says which one has the free tier when another account does (DEPLOY.T5.FREETIER), and deploys T5 again without it when Azure refuses it. false never uses it (ADR 0027).",
       "type": "boolean",
       "default": true
     },
