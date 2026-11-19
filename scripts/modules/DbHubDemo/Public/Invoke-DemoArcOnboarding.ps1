@@ -39,7 +39,13 @@ function Invoke-DemoArcOnboarding {
        Right after the onboarding, a second Run Command (DbHubDemo-SignInData, no secret) removes what's left of
        the token on the host and in the guest (Run Command passes protected parameters to the script as
        arguments, which the host's PowerShell can log) and verifies that none is left; if any is, the result is
-       Fail (ADR 0009).
+       Fail (ADR 0009). Since 2026-11-19 (dbhubfn, a first deployment whose sweep failed to connect to the guest while the
+       host's own sign-in cleanup checked it), it first waits for the host's bootstrap pass and holds its lock
+       (bootstrap.lock, at most 30 minutes), so the two never sweep the guest at the same time, and a guest part that
+       fails runs again up to three more times, 10, 30, and 60 seconds apart, with issue #65's bounded recovery first
+       (DEPLOY.T2.GUESTRETRY or DEPLOY.T2.GUESTRESTART). The onboarding records on the resource group that its sweep is
+       owed (DbHubArcSweepUtc) until it passes, so every later run sweeps and verifies again, whatever the host's state;
+       a Fail's fix is to run ./scripts/deploy.ps1 again.
     5. Waits up to -ConnectWaitMinutes for the Azure machine to report Connected.
 
     PowerShell Direct into the guest that breaks while the guest runs with a healthy heartbeat (issue #65, 2026-11-18: an
@@ -142,6 +148,73 @@ function Invoke-DemoArcOnboarding {
         return (& $newResult 'Not selected' 'What if: nothing ran. Onboarding reads the host''s health, probes the guest, and onboards it while the host waits for it.')
     }
 
+    # Issue #65: the host restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
+    $recoveryKey = Get-DemoRunRecoveryKey
+    # The sign-in data sweep after an onboarding (ADR 0009). 2026-11-19 (dbhubfn): a first onboarding's sweep failed while
+    # the host's own sign-in cleanup swept the guest beside it, and a rerun never swept again, because the host was past
+    # onboarding. Now the sweep waits for the host's bootstrap pass and holds its lock (at most SweepLockMinutes), so the two
+    # never sweep the guest at the same time; a guest that doesn't answer gets issue #65's bounded recovery; and the
+    # onboarding leaves a record on the resource group (DbHubArcSweepUtc) until its sweep passes, so a plain rerun of
+    # deploy.ps1 sweeps and verifies again by itself, whatever the host's state.
+    $sweepLockMinutes = 30
+    $sweepOwed = Get-DemoArcSweepOwed -Target $target
+    $sweepFix = 'Run ./scripts/deploy.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself, and T2 goes on once it passes.'
+    $runSweep = {
+        $withGuest = -not $target.EvaluationOnly
+        if ($withGuest) {
+            Write-DemoLog -Message ('Sign-in data cleanup after the Arc onboarding of {0}: it waits for {1}''s own bootstrap pass first (at most {2} minutes), so the two never sweep {0} at the same time.' -f $target.MachineName, $target.HostVmName, $sweepLockMinutes)
+        }
+        $sweep = Invoke-DemoSignInDataAction -Config $Config -VmName $target.HostVmName -Action 'Clean' -Scope $(if ($withGuest) { 'Both' } else { 'Local' }) -IncludeBrowserCache:$target.EvaluationOnly -LockMinutes $sweepLockMinutes -RecoveryKey $recoveryKey
+        $sweepResult = Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName $target.HostVmName -GuestName $(if ($withGuest) { $target.MachineName } else { '' }) -Outcome $sweep -Remediation $sweepFix
+        $sweepEvidence = Get-DemoMemberValue -InputObject $sweepResult -Name 'evidence'
+        $record = [ordered]@{ status = $sweepResult.status; message = $sweepResult.message; seconds = $sweep.Seconds; note = [string](Get-DemoMemberValue -InputObject $sweepEvidence -Name 'note') }
+        foreach ($name in 'lockSeconds', 'lockTimedOut', 'guestRecovery') {
+            $value = Get-DemoMemberValue -InputObject $sweepEvidence -Name $name
+            if ($null -ne $value) {
+                $record[$name] = $value
+            }
+        }
+        $guestEvidence = Get-DemoMemberValue -InputObject $sweepEvidence -Name ('{0} (guest)' -f $target.MachineName)
+        $guestError = [string](Get-DemoMemberValue -InputObject $guestEvidence -Name 'error')
+        if ($guestError) {
+            $record['error'] = $guestError
+        }
+        $evidence['signInData'] = $record
+        if ($sweepResult.status -in 'Pass', 'Warning') {
+            if ($sweepOwed) {
+                $null = Set-DemoArcSweepOwed -Config $Config -Value '' -Confirm:$false
+            }
+        }
+        elseif ($sweepResult.status -eq 'Fail') {
+            # Recorded again, in case the record before the onboarding wasn't written: the next run must sweep again.
+            $null = Set-DemoArcSweepOwed -Config $Config -Value $(if ($sweepOwed -and $sweepOwed -ne 'unknown') { $sweepOwed } else { [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
+        }
+        return $sweepResult
+    }
+    # The result that ends onboarding when its sweep didn't pass; $null when it did.
+    $sweepStop = {
+        param([object] $SweepResult)
+        if ($SweepResult.status -eq 'Fail') {
+            return (& $newResult 'Fail' ('{0} is onboarded, but the onboarding token''s traces couldn''t be removed and verified: {1}' -f $target.MachineName, $SweepResult.message) $sweepFix)
+        }
+        if ($SweepResult.status -eq 'Manual action required') {
+            return (& $newResult 'Manual action required' ('{0} is onboarded. {1}' -f $target.MachineName, $SweepResult.message) $SweepResult.remediation)
+        }
+        return $null
+    }
+    # A sweep an earlier run's onboarding left unfinished, on a path that doesn't onboard: it runs now, and its outcome goes
+    # with the result's message.
+    $owedSweep = {
+        param([string] $Status, [string] $Message)
+        $sweepResult = & $runSweep
+        $stop = & $sweepStop $sweepResult
+        if ($null -ne $stop) {
+            return $stop
+        }
+        $then = if ($sweepResult.status -eq 'Warning') { 'Warning' } else { $Status }
+        return (& $newResult $then ('{0} The sign-in data check after an earlier run''s Arc onboarding, which didn''t pass then, passed now: {1}' -f $Message, $sweepResult.message))
+    }
+
     # 1. The host's state (read-only).
     $health = $Health
     if ($null -eq $health) {
@@ -205,7 +278,13 @@ function Invoke-DemoArcOnboarding {
     if (-not $Force -and $hostState -ne 'WaitingForArcOnboarding') {
         $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
         switch ($hostState) {
-            'Ready' { return (& $newResult 'Pass' ('{0} is Ready, so it isn''t waiting for onboarding; T2.ARC.CONNECTED checks the machine.' -f $target.HostVmName)) }
+            'Ready' {
+                $readyText = '{0} is Ready, so it isn''t waiting for onboarding; T2.ARC.CONNECTED checks the machine.' -f $target.HostVmName
+                if ($sweepOwed) {
+                    return (& $owedSweep 'Pass' $readyText)
+                }
+                return (& $newResult 'Pass' $readyText)
+            }
             'ManualActionRequired' { return (& $newResult 'Manual action required' ('{0} is past onboarding and waits for a manual step: {1}' -f $target.HostVmName, $hostMessage) 'Follow the instructions in health.json (Get-DemoVmHealth -View Full), then run configure-arc.ps1 again.') }
             'WaitingForProductKey' { return (& $newResult 'Manual action required' ('{0} waits for the SQL Server product key (ProductKey mode, prerequisite P10) before onboarding.' -f $target.HostVmName) 'Run ./scripts/configure-arc.ps1 -ProductKey, or set DBHUB_SQL_PRODUCT_KEY in GitHub Actions.') }
             'Failed' { return (& $newResult 'Fail' ('{0} reports a failed bootstrap step: {1}' -f $target.HostVmName, $hostMessage) 'Read health.json and the bootstrap log on the host, fix the cause, and run deploy.ps1 -Resume.') }
@@ -223,7 +302,11 @@ function Invoke-DemoArcOnboarding {
                 if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $connected -Name 'properties') -Name 'status') -eq 'Connected') {
                     $evidence['azureStatus'] = 'Connected'
                     $evidence['decision'] = 'AlreadyConnected'
-                    return (& $newResult 'Pass' ('{0} is already Connected; {1} reports {2}, so onboarding isn''t needed.' -f $target.MachineName, $target.HostVmName, $(if ($hostState) { $hostState } else { 'no state' })))
+                    $connectedText = '{0} is already Connected; {1} reports {2}, so onboarding isn''t needed.' -f $target.MachineName, $target.HostVmName, $(if ($hostState) { $hostState } else { 'no state' })
+                    if ($sweepOwed) {
+                        return (& $owedSweep 'Pass' $connectedText)
+                    }
+                    return (& $newResult 'Pass' $connectedText)
                 }
                 $decision = Get-DemoArcOnboardingDecision -HostState $hostState -MachineName $target.MachineName -ResourceGroupName $target.ResourceGroupName -SubscriptionId $target.SubscriptionId -Probe $null -Machine $null
                 return (& $newResult $decision.Status $decision.Reason 'Wait for the host to reach WaitingForArcOnboarding (the guest build takes 60 to 90 minutes), then run configure-arc.ps1 again.')
@@ -233,8 +316,6 @@ function Invoke-DemoArcOnboarding {
 
     # 2. Probe the guest (read-only), and 3. read the Azure machine.
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
-    # Issue #65: the host restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
-    $recoveryKey = Get-DemoRunRecoveryKey
     $probeParameters = @{ Action = 'Probe'; MachineName = $target.MachineName; Mode = $target.T2Mode }
     if ($recoveryKey) {
         $probeParameters['RecoveryKey'] = $recoveryKey
@@ -349,6 +430,12 @@ function Invoke-DemoArcOnboarding {
         }
     }
 
+    if ($parameters['Action'] -eq 'Onboard') {
+        # Owed until it passes (2026-11-19): written before the token goes to the host, so a run that stops during the
+        # onboarding or its sweep leaves the next run to sweep again.
+        $sweepOwed = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+        $null = Set-DemoArcSweepOwed -Config $Config -Value $sweepOwed -Confirm:$false
+    }
     try {
         $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcOnboard' -Script $script -Parameter $parameters -ProtectedParameter $protected -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
     }
@@ -386,16 +473,14 @@ function Invoke-DemoArcOnboarding {
     # 5b. The token's carriers (ADR 0009): the Run Command is already deleted. Run Command passes protected
     # parameters to the script as arguments, so the host's PowerShell can log them, and the guest's agent ran
     # with the token; remove what's left of it on the host and in the guest, and verify none is left (fail closed).
-    if ($parameters['Action'] -eq 'Onboard') {
-        $sweep = Invoke-DemoSignInDataAction -Config $Config -VmName $target.HostVmName -Action 'Clean' -Scope $(if ($target.EvaluationOnly) { 'Local' } else { 'Both' }) -IncludeBrowserCache:$target.EvaluationOnly
-        $sweepResult = Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName $target.HostVmName -GuestName $(if ($target.EvaluationOnly) { '' } else { $target.MachineName }) -Outcome $sweep
-        $evidence['signInData'] = [ordered]@{ status = $sweepResult.status; message = $sweepResult.message; seconds = $sweep.Seconds; note = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $sweepResult -Name 'evidence') -Name 'note') }
-        if ($sweepResult.status -eq 'Fail') {
-            return (& $newResult 'Fail' ('{0} is onboarded, but the onboarding token''s traces couldn''t be removed and verified: {1}' -f $target.MachineName, $sweepResult.message) 'Run ./scripts/check-sign-in-data.ps1 -Clean until it passes, then ./scripts/configure-arc.ps1 again.')
+    # Also when only the marker was written, if an earlier run's onboarding left its sweep unfinished (2026-11-19).
+    $sweptNow = $false
+    if ($parameters['Action'] -eq 'Onboard' -or $sweepOwed) {
+        $stop = & $sweepStop (& $runSweep)
+        if ($null -ne $stop) {
+            return $stop
         }
-        if ($sweepResult.status -eq 'Manual action required') {
-            return (& $newResult 'Manual action required' ('{0} is onboarded. {1}' -f $target.MachineName, $sweepResult.message) $sweepResult.remediation)
-        }
+        $sweptNow = $parameters['Action'] -ne 'Onboard'
     }
 
     $machine = Wait-DemoArcMachineConnected -Target $target -WaitMinutes $ConnectWaitMinutes -PollIntervalSeconds $PollIntervalSeconds
@@ -416,6 +501,9 @@ function Invoke-DemoArcOnboarding {
     $signInNote = ''
     if ($evidence.Contains('signInData') -and $evidence['signInData']['status'] -ne 'Warning' -and $evidence['signInData']['note']) {
         $signInNote = ' ' + [string]$evidence['signInData']['note']
+    }
+    if ($sweptNow -and $evidence['signInData']['status'] -ne 'Warning') {
+        $signInNote = ' The sign-in data check after an earlier run''s Arc onboarding, which didn''t pass then, passed now: {0}' -f [string]$evidence['signInData']['message']
     }
     if ($warnings.Count -gt 0) {
         return (& $newResult 'Warning' ('{0} {1}; the host continues its bootstrap. {2}{3}' -f $target.MachineName, $verb, ($warnings -join ' '), $signInNote))
