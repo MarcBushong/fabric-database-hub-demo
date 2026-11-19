@@ -1127,6 +1127,50 @@ Describe 'Resolve-DemoFabricAppItem' {
         (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 2 -Exactly
     }
+
+    It 'reads T2''s migration assessment as Azure has it now, from the same read, for the app''s migration card: words and numbers only (R924)' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 200; Items = @([pscustomobject]@{ id = $script:modelId }); Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @() } }
+        $script:armGroup = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lab-demo'
+        $script:assessment = [pscustomobject]@{
+            enabled                  = $true
+            assessmentUploadTime     = '2026-11-17T23:05:00Z'
+            skuRecommendationResults = [pscustomobject]@{
+                azureSqlDatabase        = [pscustomobject]@{ recommendationStatus = 'NotReady' }
+                azureSqlManagedInstance = [pscustomobject]@{ recommendationStatus = 'Ready'; targetSku = [pscustomobject]@{ category = [pscustomobject]@{ sqlServiceTier = 'GeneralPurpose' }; computeSize = 4 } }
+                azureSqlVirtualMachine  = [pscustomobject]@{ recommendationStatus = '<b>Ready</b>' }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith {
+            $instance = [pscustomobject]@{
+                id         = '{0}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01' -f $script:armGroup
+                name       = 'arcsql01'
+                properties = [pscustomobject]@{ containerResourceId = ('{0}/providers/Microsoft.HybridCompute/machines/arcsql01' -f $script:armGroup); instanceName = 'MSSQLSERVER'; migration = [pscustomobject]@{ assessment = $script:assessment } }
+            }
+            return , @($instance)
+        }
+        $config = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; tenantId = $script:tenantId; prefix = 'lab'; environment = 'demo'; fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config
+        $verdict = $result.evidence['t2Migration']
+        # The record's evidence goes through JSON (New-DemoResult), which reads its ISO times back as DateTime values.
+        $iso = { param([object] $Value) if ($Value -is [datetime]) { $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$Value } }
+        $verdict['resource'] | Should -BeExactly 'arcsql01'
+        $verdict['enabled'] | Should -BeTrue
+        & $iso $verdict['uploadedAt'] | Should -BeExactly '2026-11-17T23:05:00Z'
+        & $iso $verdict['readAt'] | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        @($verdict['targets'].Keys) | Should -Be @('azureSqlManagedInstance', 'azureSqlDatabase') -Because 'a status that isn''t a word is left out'
+        $verdict['targets']['azureSqlDatabase'] | Should -BeExactly 'NotReady'
+        @($verdict['recommended'].Keys) | Should -Be @('azureSqlManagedInstance')
+        $verdict['recommended']['azureSqlManagedInstance'] | Should -BeExactly 'General Purpose, 4 vCores'
+        $result.evidence['links']['t2MigrationAssessment'] | Should -Match '/sqlServerInstances/arcsql01$'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 1 -Exactly
+
+        # On, with no result yet: no verdict, and the link stays.
+        $script:assessment = [pscustomobject]@{ enabled = $true }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config
+        $result.evidence.Keys | Should -Not -Contain 't2Migration'
+        $result.evidence['links'].Keys | Should -Contain 't2MigrationAssessment'
+    }
 }
 
 Describe 'Resolve-DemoFabricAppOperator' {
@@ -1326,6 +1370,8 @@ Describe 'configure-fabric-app.ps1' {
             ($records | Where-Object { $_.checkId -eq $checkId }).status | Should -Be 'Pass' -Because $checkId
         }
         ($records | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').status | Should -Be 'Manual action required'
+        # A -FabricToken run has no subscription guard of its own, so the estate function gets no scope (R924).
+        ($records | Where-Object checkId -EQ 'FABRIC.APP.ESTATE').status | Should -Be 'Not selected'
         Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { $ItemName -eq 'APP_DatabaseHub_Insights' -and $WorkspaceId -eq $script:workspaceId -and $TenantId -eq $script:tenantId }
         Should -Invoke -CommandName Sync-DemoFabricAppStage -Times 1 -Exactly -ParameterFilter { $EnvValues['DBHUB_SEMANTIC_MODEL_ID'] -eq $script:modelId -and $DeployFile['links']['report'] -match '/reports/' -and $PesterBoundParameters['WorkspaceId'] -eq $script:workspaceId }
         Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $HostingUrl -eq $script:hosting }
@@ -1532,6 +1578,38 @@ Describe 'configure-fabric-app.ps1' {
             $actions[0].status | Should -Be 'Warning'
             $actions[0].evidence.apiUrl | Should -Be 'https://example.invalid/api/' -Because 'the second write''s record, which the stage has'
             $actions[0].evidence.PSObject.Properties.Name | Should -Not -Contain 'redeployed'
+        }
+
+        It 'writes T2''s readiness for the app''s migration card, and says the app''s live views aren''t supported yet with what works, never a Fail (R924)' {
+            $pass = $script:passResult
+            $testFabricToken = $script:token
+            Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }
+            Mock -CommandName Get-DemoFabricToken -MockWith { $testFabricToken }
+            Mock -CommandName Get-DemoPowerBIToken -MockWith { throw 'No Power BI token here.' }
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith { @((& $pass 'FABRIC.APP.DEPLOY' @{ itemId = $itemId; hostingUrl = $hosting }), (& $pass 'FABRIC.APP.STATUS')) }
+            $verdict = [ordered]@{ resource = 'arcsql01'; readAt = '2026-11-19T22:10:00Z'; enabled = $true; uploadedAt = '2026-11-17T23:05:00Z'; targets = [ordered]@{ azureSqlManagedInstance = 'Ready'; azureSqlDatabase = 'NotReady' }; recommended = [ordered]@{} }
+            Mock -CommandName Resolve-DemoFabricAppItem -MockWith { & $pass 'FABRIC.APP.ITEMS' @{ semanticModelId = $modelId; links = [ordered]@{}; t2Migration = $verdict } }
+            $output = Join-Path -Path $TestDrive -ChildPath 'estate.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Sync-DemoFabricAppStage -Times 1 -Exactly -ParameterFilter { $DeployFile['t2Migration']['targets']['azureSqlManagedInstance'] -eq 'Ready' -and $DeployFile['t2Migration']['readAt'] -eq '2026-11-19T22:10:00Z' }
+            $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+            $estate = @($records | Where-Object checkId -EQ 'FABRIC.APP.ESTATE')
+            $estate.Count | Should -Be 1
+            $estate[0].status | Should -Be 'Not supported'
+            $estate[0].message | Should -Match 'Database Hub refuses the sign-in that Fabric gives the app''s functions \(HTTP 401, found live 2026-11-19, R924\)'
+            $estate[0].message | Should -Match ([regex]::Escape('the app shows the saved history and T2''s migration readiness as Azure had it at this deploy (2026-11-19T22:10:00Z), and Database Hub''s own pages show the live estate'))
+            $estate[0].evidence.functionDeployed | Should -BeTrue
+            $estate[0].evidence.invoked | Should -BeFalse
+            @($records | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+
+            # Without an assessment result at this deploy, the app names T2's portal path, and so does the record.
+            Mock -CommandName Resolve-DemoFabricAppItem -MockWith { & $pass 'FABRIC.APP.ITEMS' @{ semanticModelId = $modelId; links = [ordered]@{} } }
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $estate = @(Get-Content -LiteralPath $output | ConvertFrom-Json | Where-Object checkId -EQ 'FABRIC.APP.ESTATE')
+            $estate[0].status | Should -Be 'Not supported'
+            $estate[0].message | Should -Match 'T2''s Azure portal path to its migration assessment'
+            Should -Invoke -CommandName Sync-DemoFabricAppStage -Times 1 -Exactly -ParameterFilter { -not $DeployFile.Contains('t2Migration') }
         }
 
         It 'adds no FABRIC.APP.TOKEN and opens no browser when only the connector''s direct route refused the token: Execute Queries checked the app and proves its tenant setting (2026-11-09 live finding)' {

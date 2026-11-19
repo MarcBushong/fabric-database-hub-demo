@@ -117,13 +117,31 @@ export interface EstateAnswer<V extends EstateView = EstateView> {
     /** The Database Hub routes that answered, relative ("<METHOD> /<route>", exactly ALLOWED_ROUTES entries): the UI shows them under "Database Hub API". */
     source: string[];
     scope: { subscriptionId: string; resourceGroups: string[] };
-    /** Empty only when the function has no scope; a partial answer keeps what it read, with the reasons in errors. */
+    /** Empty when nothing was read (no scope, or no route answered), with the reasons in errors; a partial answer keeps what it read. */
     data: EstateDataByView[V] | Record<string, never>;
+    /** Each route's own failure, for the function's log: the pages and the dock never show these (R924). */
     errors: string[];
     at: string;
+    /**
+     * One plain sentence for the pages and the dock when nothing was read and won't be on the next read: Database Hub
+     * refused the app's sign-in (HTTP 401 or 403 on every route it called; R924), or the function has no scope. They show
+     * this, never errors. Absent when Database Hub didn't answer for another reason (an outage, a timeout), which a later
+     * read may not meet: data is then empty, with the reasons in errors.
+     */
+    unavailable?: string;
 }
 
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Database Hub refused every route the function called (HTTP 401 or 403). Live on 2026-11-19 (R924), every route answered
+ * 401 "Authentication failed for all authenticators" to the token Fabric gives the app's functions (ctx.Tokens.Fabric,
+ * the app identity's), while the same routes accept a person's own sign-in. The function still calls them every time,
+ * so the live views come back by themselves if Database Hub starts accepting that token.
+ */
+export const LIVE_REFUSED = "Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in.";
+/** The deploy wrote no scope (scope.generated.ts), so the function reads nothing. */
+export const LIVE_NO_SCOPE = "The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1.";
 
 export const DBHUB_BASE = "https://api.fabric.microsoft.com/v1/databasehub/__private";
 /** This app's own identity on every call (the app's version, rayfin/rayfin.yml). */
@@ -148,6 +166,9 @@ export const ALLOWED_ROUTES = [
 class Reader {
     readonly source: string[] = [];
     readonly errors: string[] = [];
+    /** How many calls Database Hub answered, and how many it refused for the app's sign-in (HTTP 401 or 403). */
+    answered = 0;
+    refused = 0;
     private readonly deadline: number;
     constructor(
         private readonly token: string,
@@ -180,9 +201,11 @@ class Reader {
             });
             if (!response.ok) {
                 const text = (await response.text().catch(() => "")).slice(0, 300).replace(/\s+/g, " ");
+                if (response.status === 401 || response.status === 403) this.refused++;
                 this.errors.push(`${label}: HTTP ${response.status}${text ? ` ${text}` : ""}`);
                 return null;
             }
+            this.answered++;
             return (await response.json()) as Record<string, unknown>;
         } catch (err) {
             this.errors.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
@@ -397,11 +420,18 @@ export async function readEstate<V extends EstateView>(
     const r = new Reader(token, fetchImpl, clock);
     const scopeOut = { subscriptionId: scope.subscriptionId, resourceGroups: scope.resourceGroups };
     if (!scope.subscriptionId || scope.resourceGroups.length === 0) {
-        return { view, source: [], scope: scopeOut, data: {}, errors: ["The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1."], at: now.toISOString() };
+        return { view, source: [], scope: scopeOut, data: {}, errors: [LIVE_NO_SCOPE], at: now.toISOString(), unavailable: LIVE_NO_SCOPE };
     }
     let data: EstateDataByView[EstateView];
     if (view === "health") data = await health(r, scope, now);
     else if (view === "security") data = await security(r, scope);
     else data = await inventory(r, scope);
-    return { view, source: [...r.source], scope: scopeOut, data: data as EstateDataByView[V], errors: r.errors, at: now.toISOString() };
+    const at = now.toISOString();
+    // No route answered: an empty estate would read as a real one, so the answer carries no data and its routes' reasons,
+    // and, when Database Hub refused the app's sign-in on every route, one plain sentence for the pages and the dock.
+    if (r.answered === 0) {
+        const refused = r.refused > 0 && r.refused === r.errors.length;
+        return { view, source: [...r.source], scope: scopeOut, data: {}, errors: r.errors.length > 0 ? [...r.errors] : ["Database Hub didn't answer."], at, ...(refused ? { unavailable: LIVE_REFUSED } : {}) };
+    }
+    return { view, source: [...r.source], scope: scopeOut, data: data as EstateDataByView[V], errors: r.errors, at };
 }

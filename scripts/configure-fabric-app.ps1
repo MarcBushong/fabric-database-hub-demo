@@ -384,6 +384,28 @@ $deployFile = [ordered]@{
     resourceGroup    = $resourceGroupName
     links            = $links
 }
+# T2's migration assessment as Azure has it now (R924): words, numbers, and times only. The app's migration card shows it,
+# with this time, while Database Hub's live view isn't available to the app; every deploy reads it again. The record's
+# evidence went through JSON (New-DemoResult), which makes its times DateTime values, so they're ISO 8601 in UTC again.
+$isoUtc = {
+    param([object] $Value)
+    if ($Value -is [datetime]) {
+        $utc = if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc) } else { $Value.ToUniversalTime() }
+        return $utc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+$savedMigration = $itemsResult.evidence['t2Migration']
+if ($null -ne $savedMigration) {
+    $deployFile['t2Migration'] = [ordered]@{
+        resource    = [string]$savedMigration['resource']
+        readAt      = & $isoUtc $savedMigration['readAt']
+        enabled     = [bool]$savedMigration['enabled']
+        uploadedAt  = & $isoUtc $savedMigration['uploadedAt']
+        targets     = $savedMigration['targets']
+        recommended = $savedMigration['recommended']
+    }
+}
 # The Copilot dock (Ask, ADR 0028): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
 # gets the relay's address, and the live estate function's scope. -DryRun and -CheckOnly only look for the relay.
 $functionScope = $null
@@ -514,6 +536,29 @@ else {
 }
 if ($deployed -and $null -ne $manageResult) {
     $results.Add($manageResult)
+}
+# The live estate (R924, found live 2026-11-19): Database Hub answers HTTP 401 "Authentication failed for all
+# authenticators" to the token Fabric gives the app's functions, so the estate function reads nothing, and the app's
+# pages and Ask say so in one sentence. No setting or role fixes that, and a script can't call the function to check it
+# (Fabric runs it only for a person signed in to the app), so this says what still works: Not supported, never a Fail.
+if ($deployed -and -not $DryRun) {
+    $estateDoc = 'https://learn.microsoft.com/fabric/apps/functions-connect-external-resources'
+    $saved = $deployFile['t2Migration']
+    $readiness = if ($null -ne $saved) {
+        'T2''s migration readiness as Azure had it at this deploy ({0})' -f $saved['readAt']
+    }
+    else {
+        'T2''s Azure portal path to its migration assessment (Azure had no assessment result for T2 at this deploy; the next ./scripts/deploy.ps1 reads it again)'
+    }
+    $estateEvidence = [ordered]@{ functionDeployed = ($null -ne $functionScope); invoked = $false; finding = 'R924'; t2MigrationReadAt = $(if ($null -ne $saved) { [string]$saved['readAt'] } else { '' }) }
+    if ($null -eq $functionScope) {
+        $estateMessage = 'The live estate function has no scope in this run (no configuration, or no subscription guard), so it reads nothing. The app shows the saved history and {0}; Database Hub shows the live estate.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message $estateMessage -Evidence $estateEvidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 with the configuration, which writes the function''s scope.' -DocUrl $estateDoc))
+    }
+    else {
+        $estateMessage = 'The app''s live views aren''t supported yet: Database Hub refuses the sign-in that Fabric gives the app''s functions (HTTP 401, found live 2026-11-19, R924), so the app''s pages and Ask say in one sentence that its live view isn''t available. What works: the app shows the saved history and {0}, and Database Hub''s own pages show the live estate. Nothing to fix here: the function asks Database Hub on every read, so Overview''s Live now shows tiles once Database Hub accepts that sign-in. A script can''t call the function to check it, because Fabric runs it only for a person signed in to the app.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message $estateMessage -Evidence $estateEvidence -DocUrl $estateDoc))
+    }
 }
 #endregion Step 6: deploy
 

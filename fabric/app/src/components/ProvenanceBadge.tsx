@@ -21,8 +21,8 @@ const OFF: Record<LiveState, { label: string; tip: string }> = {
     unavailable: { label: "Live \u00b7 unavailable", tip: "Nothing is read live in this app right now: every page shows the history. Database Hub has the live view." },
 };
 
-/** Says where a visual's data comes from, and how fresh it is. */
-export function ProvenanceBadge({ provenance, asOf, compact = false, liveState }: { provenance: DataProvenance; asOf?: Date | null; compact?: boolean; liveState?: LiveState }) {
+/** Says where a visual's data comes from, and how fresh it is; label and tip name a source of their own (saved at deploy). */
+export function ProvenanceBadge({ provenance, asOf, compact = false, liveState, label, tip }: { provenance: DataProvenance; asOf?: Date | null; compact?: boolean; liveState?: LiveState; label?: string; tip?: string }) {
     if (provenance === "live" && liveState) {
         const off = OFF[liveState];
         return (
@@ -34,7 +34,7 @@ export function ProvenanceBadge({ provenance, asOf, compact = false, liveState }
             </Tooltip>
         );
     }
-    const text = TEXT[provenance];
+    const text = { label: label ?? TEXT[provenance].label, tip: tip ?? TEXT[provenance].tip };
     const Icon = provenance === "live" ? Live20Regular : provenance === "sample" ? Beaker16Regular : History16Regular;
     const age = asOf ? (provenance === "live" ? ` · as of ${formatDateTimeUtc(asOf)}` : ` · ${formatAgo(asOf)}`) : "";
     return (
