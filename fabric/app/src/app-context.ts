@@ -30,6 +30,10 @@ export interface ManageAccess {
     job?: (jobInstance: string) => Promise<ManageJobAnswer>;
     /** Run mode: switches to copy mode, with the reason, when the function couldn't send a request that Run all can. */
     fallBack?: (reason: string) => void;
+    /** Run mode: reads the viewer's access and the control's run in progress again (before each action, and after a start). */
+    refresh?: () => Promise<void>;
+    /** Run mode: true while refresh reads them. */
+    refreshing?: boolean;
     /** Still finding out which mode this deployment has. */
     checking?: boolean;
 }

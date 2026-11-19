@@ -27,6 +27,14 @@ export interface ManageApi {
 
 type Invoke = (input?: unknown, options?: { timeoutMs?: number }) => Promise<unknown>;
 
+/**
+ * How long the app waits for the Manage function's answers. A request waits longer: Stop now waits up to STOP_WAIT_MS
+ * (150 seconds, rayfin/functions/src/manage-core.ts) for the runs it cancelled to end and for the capacity to take it,
+ * and a function runs at most 240 seconds.
+ */
+export const ACCESS_TIMEOUT_MS = 60_000;
+export const REQUEST_TIMEOUT_MS = 200_000;
+
 /** One of the app's functions, or null when this deployment doesn't have it. */
 function functionOf(client: unknown, name: keyof ManageFunctionsSchema): Invoke | null {
     try {
@@ -39,17 +47,17 @@ function functionOf(client: unknown, name: keyof ManageFunctionsSchema): Invoke 
 
 /** The Manage API over the app's Rayfin client; its calls reject when the function isn't deployed or can't be reached. */
 export function functionsManageApi(client: unknown): ManageApi {
-    const call = async <T>(name: keyof ManageFunctionsSchema, input?: unknown): Promise<T> => {
+    const call = async <T>(name: keyof ManageFunctionsSchema, input?: unknown, timeoutMs = ACCESS_TIMEOUT_MS): Promise<T> => {
         const invoke = functionOf(client, name);
         if (!invoke) throw new Error("This deployment has no Manage function.");
-        const raw = await invoke(input, { timeoutMs: 60_000 });
+        const raw = await invoke(input, { timeoutMs });
         const answer = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
         if (!answer || typeof answer !== "object") throw new Error("The Manage function returned an unexpected answer.");
         return answer as T;
     };
     return {
         access: () => call<ManageAccessAnswer>("manageAccess"),
-        request: (request) => call<ManageRequestAnswer>("manageRequest", { request }),
+        request: (request) => call<ManageRequestAnswer>("manageRequest", { request }, REQUEST_TIMEOUT_MS),
         job: (jobInstance) => call<ManageJobAnswer>("manageJob", { jobInstance }),
     };
 }

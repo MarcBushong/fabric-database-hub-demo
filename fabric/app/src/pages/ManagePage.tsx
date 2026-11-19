@@ -112,7 +112,7 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
     const [draft, setDraft] = useState<ControlRequest | null>(request);
     const [prev, setPrev] = useState<ControlRequest | null>(request);
     const [sending, setSending] = useState(false);
-    const [notice, setNotice] = useState<string | null>(null);
+    const [notice, setNotice] = useState<{ title: string; text: string } | null>(null);
     if (request !== prev) {
         setPrev(request);
         setDraft(request);
@@ -121,10 +121,12 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
     if (!draft) return null;
     const summary = describeRequest(draft);
     const params = notebookParameters(draft);
-    // The control takes one request at a time, and follows a session that's running instead of starting another.
+    // The control takes one request at a time: while one of its runs is in progress, only Stop now goes (the function refuses
+    // the others too). The page reads that run again when an action opens, so Confirm waits for that read.
+    const checking = manage.mode === "run" && manage.refreshing === true;
     const running = manage.mode === "run" ? (manage.running ?? null) : null;
     const runningText = running ? `A run of NB_DatabaseHub_Control is ${running.status === "NotStarted" ? "queued" : "in progress"}${running.startedAt ? `, since ${formatDateTimeUtc(new Date(running.startedAt))}` : ""}` : "";
-    const busy = running && draft.action !== "stop" ? (draft.action === "session" ? `${runningText}. The control follows a session that's running instead of starting another: Stop now first, then start a new one.` : `${runningText}, and the control takes one request at a time: wait for it to end, or Stop now first.`) : null;
+    const busy = running && draft.action !== "stop" ? `${runningText}, and the control takes one request at a time: wait for it to end. Stop now ends whatever it runs, as a session's end would, its history saved.` : null;
     const problem = validateRequest(draft, manage.mode === "run" ? manage.targets : undefined) ?? busy;
 
     const copyAndOpen = async () => {
@@ -135,7 +137,7 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
     };
 
     const send = async () => {
-        if (!manage.send || problem) return;
+        if (!manage.send || problem || checking) return;
         setSending(true);
         try {
             const answer = await manage.send(draft);
@@ -143,19 +145,22 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
                 const cancelled = answer.cancelled?.length ? ", after cancelling the run in progress" : "";
                 notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy}${answer.jobInstance ? ` (run ${answer.jobInstance.slice(0, 8)})` : ""}${cancelled}`, "success");
                 if (answer.jobInstance) onStarted({ id: answer.jobInstance, title: summary.title });
+                void manage.refresh?.();
                 onClose();
             } else if (answer.copy && manage.fallBack) {
                 // The function couldn't send it, but Run all can: this dialog and the page now copy the request instead.
-                setNotice(answer.reason);
+                setNotice({ title: answer.cancelled?.length ? "Stop now cancelled the control's run, but the stop didn't start." : "The app couldn't send it.", text: answer.reason });
                 manage.fallBack(answer.reason);
             } else {
                 notify(`${summary.title} wasn't sent: ${answer.reason}`, "error");
+                // A run that started meanwhile shows on the page.
+                void manage.refresh?.();
                 onClose();
             }
         } catch (error) {
             const reason = `The app couldn't reach its Manage function (${clause(error instanceof Error ? error.message : String(error))}), so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.`;
             if (manage.fallBack) {
-                setNotice(reason);
+                setNotice({ title: "The app couldn't send it.", text: reason });
                 manage.fallBack(reason);
             } else {
                 notify(`${summary.title} wasn't sent: ${reason}`, "error");
@@ -175,17 +180,18 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
                         {notice ? (
                             <MessageBar intent="warning">
                                 <MessageBarBody>
-                                    <MessageBarTitle>The app couldn't send it.</MessageBarTitle>
-                                    {notice} Copy it below instead.
+                                    <MessageBarTitle>{notice.title}</MessageBarTitle>
+                                    {notice.text} Copy it below instead.
                                 </MessageBarBody>
                             </MessageBar>
                         ) : null}
                         <RequestForm request={draft} onChange={setDraft} />
+                        {checking ? <Spinner size="extra-tiny" labelPosition="after" label="Checking NB_DatabaseHub_Control's runs…" /> : null}
                         {running && draft.action === "stop" ? (
                             <MessageBar intent="warning">
                                 <MessageBarBody>
                                     <MessageBarTitle>Stop now cancels the control's run first.</MessageBarTitle>
-                                    {`${runningText}. On a small capacity, Stop now couldn't start until it ended, so it's cancelled first; the session still ends as its end would, its history saved.`}
+                                    {`${runningText}. On a small capacity, Stop now couldn't start until it ended, so it's cancelled first, and Stop now waits for it to end. If that run was ending a session, Stop now saves the session's history itself; either way, the session ends as its end would.`}
                                 </MessageBarBody>
                             </MessageBar>
                         ) : null}
@@ -229,7 +235,7 @@ function ConfirmDialog({ request, onClose, onStarted }: { request: ControlReques
                             </Button>
                         ) : (
                             <Tooltip content={manage.canRun ? "Send it to the session control" : manage.reason} relationship="description">
-                                <Button appearance="primary" disabledFocusable={!manage.canRun || problem !== null || sending} icon={sending ? <Spinner size="tiny" /> : undefined} onClick={() => void send()}>
+                                <Button appearance="primary" disabledFocusable={!manage.canRun || problem !== null || sending || checking} icon={sending ? <Spinner size="tiny" /> : undefined} onClick={() => void send()}>
                                     {sending ? "Sending…" : "Confirm"}
                                 </Button>
                             </Tooltip>
@@ -317,6 +323,11 @@ export default function ManagePage() {
     const sessionsState = useQuery(sessionsSpec);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
     const last = sessions[0] ?? null;
+    // Each action reads the control's run in progress again first: the state read when the page opened may be old.
+    const openAction = (action: ControlAction) => {
+        setPending(DEFAULTS[action]);
+        void manage.refresh?.();
+    };
 
     return (
         <div className="page">
@@ -363,7 +374,7 @@ export default function ManagePage() {
                         </h3>
                         <p>{a.summary}</p>
                         <div className="action-foot">
-                            <Button appearance={a.tone === "primary" ? "primary" : "secondary"} onClick={() => setPending(DEFAULTS[a.action])}>
+                            <Button appearance={a.tone === "primary" ? "primary" : "secondary"} onClick={() => openAction(a.action)}>
                                 {a.button}
                             </Button>
                             {manage.mode === "run" && !manage.canRun && !manage.checking ? (

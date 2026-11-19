@@ -41,7 +41,13 @@ export interface VerifiedCaller {
     verified: true;
     /** The caller's Microsoft Entra object ID (the token's oid), or "" when the token has none. */
     objectId: string;
-    /** Their names in the token (email, upn, preferred_username, unique_name, or Fabric's rfn_email for this app), lowercased. */
+    /**
+     * Fabric's sign-in email for this app (xms_attr[appId].rfn_email), lowercased, read only once the token's audience or
+     * subject path has tied it to this app; "" when there's none. Without an object ID, it's the one name an operator can
+     * match on (ADR 0029), until the identity proof shows whether Fabric's managed token carries an object ID.
+     */
+    appEmail: string;
+    /** Their names in the token (email, upn, preferred_username, unique_name, and the app email), lowercased: for the record only. */
     names: string[];
     /** How the control records them: their first name, or their object ID. */
     display: string;
@@ -89,19 +95,36 @@ function json(part: string): Claims | null {
 const reject = (reason: string): RejectedCaller => ({ verified: false, reason });
 const lower = (value: unknown): string => (typeof value === "string" ? value.trim().toLowerCase() : "");
 
+const audiencesOf = (claims: Claims): string[] => (Array.isArray(claims.aud) ? claims.aud : [claims.aud]).filter((a): a is string => typeof a === "string");
+
 /**
- * Why a verified token isn't for this app, or "". Its issuer and audience must equal the pinned ones once known; until
- * then, the deployment record's IDs bind it: its tenant (tid, or the tenant in Fabric's managed token's subject path)
- * and this app (an audience of the app's ID or API, Fabric's subject path for this app, or its xms_attr for this app).
+ * What ties a token to this app, or "": an audience naming the app (its ID, api://<its ID>, its API, or the pinned
+ * audience when that names the app's ID), or Fabric's managed token's subject path through this app. Nothing else counts:
+ * a key for the app among a token's attributes (xms_attr) doesn't, because a token for another app can carry one too.
+ */
+function appTie(claims: Claims, binding: TokenBinding): "audience" | "subject" | "" {
+    const app = lower(binding.appId);
+    if (!app) return "";
+    const api = lower(binding.apiUrl).replace(/\/+$/, "");
+    const pinned = lower(binding.audience).replace(/\/+$/, "");
+    const named = audiencesOf(claims).some((a) => {
+        const audience = lower(a).replace(/\/+$/, "");
+        return audience === app || audience === `api://${app}` || audience === api || (pinned !== "" && audience === pinned && pinned.includes(app));
+    });
+    if (named) return "audience";
+    return lower(claims.sub).includes(`/workspaces/${lower(binding.workspaceId)}/appbackends/${app}/users/`) ? "subject" : "";
+}
+
+/**
+ * Why a verified token isn't for this app, or "". Its issuer and audience must equal the pinned ones once known (the
+ * identity proof shows them); with or without them, the deployment record's IDs bind it: its tenant (tid, or the tenant
+ * in Fabric's managed token's subject path), and this app (appTie).
  */
 function bindingProblem(claims: Claims, binding: TokenBinding): string {
     const issuer = typeof claims.iss === "string" ? claims.iss : "";
     if (binding.issuer ? issuer !== binding.issuer : !/^https:\/\/\S+$/i.test(issuer)) return binding.issuer ? "the caller's token is from another issuer" : "the caller's token names no issuer";
-    const audiences = (Array.isArray(claims.aud) ? claims.aud : [claims.aud]).filter((a): a is string => typeof a === "string");
-    if (binding.audience && !audiences.includes(binding.audience)) return "the caller's token is for another audience";
+    if (binding.audience && !audiencesOf(claims).includes(binding.audience)) return "the caller's token is for another audience";
     const tenant = lower(binding.tenantId);
-    const app = lower(binding.appId);
-    const workspace = lower(binding.workspaceId);
     const subject = lower(claims.sub);
     // Fabric's managed token names its tenant, workspace, and app in its subject path: when it does, they must be this app's.
     const path = (segment: string) => new RegExp(`/${segment}/([^/]+)/`).exec(subject)?.[1];
@@ -109,34 +132,27 @@ function bindingProblem(claims: Claims, binding: TokenBinding): string {
     if (claims.tid !== undefined ? lower(claims.tid) !== tenant || (pathTenant !== undefined && pathTenant !== tenant) : pathTenant !== tenant) return "the caller's token is for another tenant";
     const pathWorkspace = path("workspaces");
     const pathApp = path("appbackends");
-    if ((pathWorkspace !== undefined && pathWorkspace !== workspace) || (pathApp !== undefined && pathApp !== app)) return "the caller's token isn't for this app";
-    if (binding.audience) return "";
-    const api = lower(binding.apiUrl).replace(/\/+$/, "");
-    const attributes = claims.xms_attr && typeof claims.xms_attr === "object" ? Object.keys(claims.xms_attr).map(lower) : [];
-    const forApp =
-        audiences.some((a) => {
-            const audience = lower(a).replace(/\/+$/, "");
-            return audience === app || audience === `api://${app}` || audience === api;
-        }) ||
-        subject.includes(`/workspaces/${workspace}/appbackends/${app}/users/`) ||
-        attributes.includes(app);
-    return forApp ? "" : "the caller's token isn't for this app";
+    if ((pathWorkspace !== undefined && pathWorkspace !== lower(binding.workspaceId)) || (pathApp !== undefined && pathApp !== lower(binding.appId))) return "the caller's token isn't for this app";
+    return appTie(claims, binding) ? "" : "the caller's token isn't for this app";
 }
 
-/** Who the token names: its object ID (oid), and its names, Fabric's rfn_email for this app among them. */
-function identityOf(claims: Claims, appId: string): { objectId: string; names: string[] } {
+/**
+ * Who the token names: its object ID (oid); Fabric's sign-in email for this app (xms_attr[appId].rfn_email), only when
+ * the token is tied to this app; and its names, for the record.
+ */
+function identityOf(claims: Claims, appId: string, tied: boolean): { objectId: string; appEmail: string; names: string[] } {
     const objectId = typeof claims.oid === "string" && GUID.test(claims.oid) ? claims.oid.toLowerCase() : "";
-    const managed: unknown[] = [];
-    if (claims.xms_attr && typeof claims.xms_attr === "object") {
+    let appEmail = "";
+    if (tied && claims.xms_attr && typeof claims.xms_attr === "object") {
         for (const [key, value] of Object.entries(claims.xms_attr as Record<string, unknown>)) {
-            if (lower(key) === lower(appId) && value && typeof value === "object") managed.push((value as Record<string, unknown>).rfn_email);
+            if (lower(key) === lower(appId) && value && typeof value === "object") appEmail = lower((value as Record<string, unknown>).rfn_email);
         }
     }
-    const names = [claims.email, claims.upn, claims.preferred_username, claims.unique_name, ...managed]
+    const names = [claims.email, claims.upn, claims.preferred_username, claims.unique_name, appEmail]
         .filter((n): n is string => typeof n === "string" && n.trim() !== "")
         .map((n) => n.trim().toLowerCase())
         .filter((n, i, all) => all.indexOf(n) === i);
-    return { objectId, names };
+    return { objectId, appEmail, names };
 }
 
 /**
@@ -182,18 +198,20 @@ export async function verifyCaller(token: string, binding: TokenBinding, deps: {
 
     const bound = bindingProblem(claims, binding);
     if (bound) return reject(bound);
-    const { objectId, names } = identityOf(claims, binding.appId);
-    if (!objectId && names.length === 0) return reject("the caller's token names no object ID or sign-in name");
-    return { verified: true, objectId, names, display: names[0] ?? objectId };
+    const { objectId, appEmail, names } = identityOf(claims, binding.appId, appTie(claims, binding) !== "");
+    // Names can change, so they don't identify a caller: an object ID does, or, without one, Fabric's email for this app.
+    if (!objectId && !appEmail) return reject("the caller's token names no object ID, and no sign-in email from Fabric for this app");
+    return { verified: true, objectId, appEmail, names, display: names[0] ?? objectId };
 }
 
 /**
- * An operator is in the deploy-time list by object ID. Names can change, so they count only when the token has no
- * object ID (Microsoft identity platform: don't authorize on email or preferred_username).
+ * An operator is in the deploy-time list by object ID. Without one, Fabric's sign-in email for this app is the one name
+ * that counts (ADR 0029: accepted until the identity proof); the token's other names never do (Microsoft identity
+ * platform: don't authorize on email or preferred_username).
  */
 export function isOperator(caller: VerifiedCaller, settings: Pick<ManageSettings, "operators">): boolean {
     if (caller.objectId) return settings.operators.some((o) => o.objectId === caller.objectId);
-    return settings.operators.some((o) => caller.names.some((n) => o.names.includes(n)));
+    return caller.appEmail !== "" && settings.operators.some((o) => o.names.includes(caller.appEmail));
 }
 
 /** The control's REQUESTED_BY: "app/" and the caller, in the characters its name rule allows (1 to 64). */
@@ -330,6 +348,8 @@ export interface ManageRequestAnswer {
     copy: boolean;
     /** Stop now: the control's runs it cancelled first, so it can start on a small capacity. */
     cancelled: string[];
+    /** The control's run in progress that kept this request from starting: the control takes one request at a time. */
+    running?: ControlRun;
 }
 
 export interface ManageJobAnswer {
@@ -353,12 +373,26 @@ export interface ManageCall {
 export interface ManageDeps {
     fetch: typeof fetch;
     now?: () => number;
+    /** Waits between Fabric's answers (the tests pass a clock of their own). */
+    sleep?: (ms: number) => Promise<void>;
 }
 
 /** The Fabric REST API's job scheduler (https://learn.microsoft.com/rest/api/fabric/core/job-scheduler). */
 const FABRIC_API = "https://api.fabric.microsoft.com/v1";
 const NOT_OPERATOR = "Only the demo's operators send actions from the app: the deployer and the members of its admin group. A redeploy refreshes the list.";
 const COPY = "so each action copies its request for NB_DatabaseHub_Control, where Run all sends it";
+/**
+ * How long Stop now may wait, in all, for the runs it cancelled to end and for the capacity to take the stop: a function
+ * runs at most 240 seconds (https://learn.microsoft.com/fabric/data-engineering/user-data-functions/user-data-functions-service-limits),
+ * and the app waits 200 for its answer (src/lib/manage-client.ts).
+ */
+export const STOP_WAIT_MS = 150_000;
+/** Between reads of a cancelled run, and between starts the capacity refused, when Fabric asks for no interval. */
+const POLL_MS = 5_000;
+const CAPACITY_RETRY_MS = 20_000;
+/** Fabric's job states that end a run (ItemJobStatus); any other state is still running. */
+const ENDED = new Set(["Completed", "Failed", "Cancelled", "Deduped"]);
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Why this deployment's function can't send requests, or "" when its settings are complete. */
 export function settingsProblem(settings: ManageSettings): string {
@@ -415,18 +449,20 @@ async function refusal(response: Response): Promise<string> {
     return `HTTP ${response.status}${detail ? `, ${clause(detail)}` : ""}`;
 }
 
-/** NB_DatabaseHub_Control's runs that are queued or in progress, from the job API's list; none when it can't be read. */
-async function activeRuns(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ControlRun[]> {
+/** NB_DatabaseHub_Control's runs that are queued or in progress, from the job API's list, or why it couldn't be read. */
+async function activeRuns(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<{ runs: ControlRun[] } | { error: string }> {
     try {
         const response = await fabric(call, deps, jobsPath(settings));
-        if (!response.ok) return [];
+        if (!response.ok) return { error: await refusal(response) };
         const body = (await response.json()) as { value?: unknown };
         const jobs = Array.isArray(body.value) ? (body.value as Array<Record<string, unknown>>) : [];
-        return jobs
-            .filter((j) => (j.status === "InProgress" || j.status === "NotStarted") && typeof j.id === "string" && GUID.test(j.id))
-            .map((j) => ({ id: (j.id as string).toLowerCase(), status: j.status as string, startedAt: utc(j.startTimeUtc), ...(typeof j.invokeType === "string" ? { invokeType: j.invokeType } : {}) }));
-    } catch {
-        return [];
+        return {
+            runs: jobs
+                .filter((j) => (j.status === "InProgress" || j.status === "NotStarted") && typeof j.id === "string" && GUID.test(j.id))
+                .map((j) => ({ id: (j.id as string).toLowerCase(), status: j.status as string, startedAt: utc(j.startTimeUtc), ...(typeof j.invokeType === "string" ? { invokeType: j.invokeType } : {}) })),
+        };
+    } catch (error) {
+        return { error: messageOf(error) };
     }
 }
 
@@ -434,15 +470,77 @@ async function activeRuns(call: ManageCall, settings: ManageSettings, deps: Mana
 export async function answerAccess(call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageAccessAnswer> {
     const g = await gate(call, settings, deps);
     if (!g.ok) return { configured: !g.copy, operator: false, reason: g.reason, who: g.caller?.display ?? "", running: null, targets: [] };
-    const [running] = await activeRuns(call, settings, deps);
-    return { configured: true, operator: true, reason: "", who: g.caller.display, running: running ?? null, targets: [...g.catalog.targets] };
+    const active = await activeRuns(call, settings, deps);
+    const running = "runs" in active ? (active.runs[0] ?? null) : null;
+    return { configured: true, operator: true, reason: "", who: g.caller.display, running, targets: [...g.catalog.targets] };
+}
+
+/** How long Fabric asks to wait before the next call (Retry-After: seconds, or an HTTP date), in milliseconds, or the fallback. */
+function retryAfterMs(response: Response, fallback: number, now: number): number {
+    const value = (response.headers.get("retry-after") ?? "").trim();
+    if (/^\d+$/.test(value)) return Math.max(1_000, Number(value) * 1_000);
+    const at = Date.parse(value);
+    return value && !Number.isNaN(at) ? Math.max(1_000, at - now) : fallback;
+}
+
+/** Whether Fabric refused a run because the capacity's Spark cores are all in use (HTTP 430, TooManyRequestsForCapacity), or throttled it (429). */
+async function capacityRefused(response: Response): Promise<boolean> {
+    if (response.status === 430 || response.status === 429) return true;
+    if (response.ok) return false;
+    try {
+        return ((await response.clone().json()) as { errorCode?: unknown }).errorCode === "TooManyRequestsForCapacity";
+    } catch {
+        return false;
+    }
 }
 
 /**
+ * Waits for the runs Stop now cancelled to end: Fabric's cancel only asks (HTTP 202), and on a small capacity (F2, F4) the
+ * stop can't start while a cancelled run still holds the Spark session. It reads each run no sooner than Fabric asks
+ * (Retry-After), until the deadline. Returns the runs that hadn't ended by then.
+ */
+async function waitForEnd(ids: readonly string[], firstWait: number, call: ManageCall, settings: ManageSettings, deps: ManageDeps, deadline: number): Promise<string[]> {
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? pause;
+    let waiting = [...ids];
+    let wait = firstWait;
+    while (waiting.length > 0 && now() + wait <= deadline) {
+        await sleep(wait);
+        const still: string[] = [];
+        let next = POLL_MS;
+        for (const id of waiting) {
+            const response = await fabric(call, deps, `${jobsPath(settings)}/${id}`);
+            // A run Fabric no longer has has ended.
+            if (response.status === 404) continue;
+            let status = "";
+            if (response.ok) {
+                try {
+                    status = String(((await response.json()) as Record<string, unknown>).status ?? "");
+                } catch {
+                    status = "";
+                }
+            }
+            if (!ENDED.has(status)) {
+                still.push(id);
+                next = Math.max(next, retryAfterMs(response, POLL_MS, now()));
+            }
+        }
+        waiting = still;
+        wait = next;
+    }
+    return waiting;
+}
+
+const shortIds = (ids: readonly string[]): string => list(ids.map((id) => id.slice(0, 8)));
+
+/**
  * manageRequest: runs NB_DatabaseHub_Control through the Fabric job API (Run On Demand Item Job, jobType RunNotebook)
- * with a checked request's parameters, and REQUESTED_BY from the verified caller, never from the request. Stop now
- * first cancels the control's own runs in progress (Cancel Item Job Instance): on a small capacity, a run that follows a
- * session holds its Spark session, so the stop would wait for it. The session still ends as its end would.
+ * with a checked request's parameters, and REQUESTED_BY from the verified caller, never from the request. The control
+ * takes one request at a time, so while one of its runs is queued or in progress, only Stop now is sent. Stop now first
+ * cancels the control's runs in progress (Cancel Item Job Instance), waits for them to end, and asks again while the
+ * capacity refuses it (HTTP 430), within STOP_WAIT_MS: on a small capacity, a run that follows a session holds its Spark
+ * session, so the stop would wait for it. The session still ends as its end would; if the run cancelled was ending a
+ * session, the stop saves that session's history (NB_DatabaseHub_Control's Stop now, 2026-11-19).
  */
 export async function answerRequest(input: unknown, call: ManageCall, settings: ManageSettings, deps: ManageDeps): Promise<ManageRequestAnswer> {
     const refuse = (reason: string, copy: boolean, requestedBy = "", cancelled: string[] = []): ManageRequestAnswer => ({ started: false, jobInstance: "", reason, requestedBy, copy, cancelled });
@@ -451,23 +549,59 @@ export async function answerRequest(input: unknown, call: ManageCall, settings: 
     const checked = checkRequest(input, g.catalog);
     if (!checked.ok) return refuse(checked.reason, false);
     const requestedBy = requestedByOf(g.caller);
+    const now = deps.now ?? Date.now;
+    const sleep = deps.sleep ?? pause;
+    const stop = checked.request.action === "stop";
     const cancelled: string[] = [];
+    const notStopped = (why: string) =>
+        refuse(
+            `Stop now cancelled NB_DatabaseHub_Control's run ${shortIds(cancelled)}, but ${why}. Nothing is stopping the session now: Run all in the notebook sends the same request, or ./scripts/stop-demo.ps1 -SaveHistory stops it from a PC. Its auto-stop still stops everything at its end, and the next Run all saves its history.`,
+            true,
+            requestedBy,
+            cancelled,
+        );
     try {
-        if (checked.request.action === "stop") {
-            for (const run of await activeRuns(call, settings, deps)) {
-                const answer = await fabric(call, deps, `${jobsPath(settings)}/${run.id}/cancel`, { method: "POST" });
-                if (answer.ok) cancelled.push(run.id);
+        const active = await activeRuns(call, settings, deps);
+        if (!stop) {
+            if ("error" in active) return refuse(`Fabric didn't list NB_DatabaseHub_Control's runs (${active.error}), so the app can't tell whether one is in progress. Run all in the notebook sends the same request.`, true, requestedBy);
+            const [running] = active.runs;
+            if (running) {
+                const state = running.status === "NotStarted" ? "queued" : "in progress";
+                return { ...refuse(`NB_DatabaseHub_Control's run ${running.id.slice(0, 8)} is ${state}, and the control takes one request at a time: wait for it to end, or use Stop now, which ends the session as its end would.`, false, requestedBy), running };
             }
         }
-        const response = await fabric(call, deps, `${jobsPath(settings)}?jobType=RunNotebook`, {
-            method: "POST",
-            body: JSON.stringify({ executionData: { parameters: jobParameters(checked.request, requestedBy) } }),
-        });
-        if (!response.ok) return refuse(`Fabric didn't start NB_DatabaseHub_Control (${await refusal(response)}). Run all in the notebook sends the same request.`, true, requestedBy, cancelled);
+        const deadline = now() + STOP_WAIT_MS;
+        if (stop && "runs" in active) {
+            let firstWait = POLL_MS;
+            for (const run of active.runs) {
+                const answer = await fabric(call, deps, `${jobsPath(settings)}/${run.id}/cancel`, { method: "POST" });
+                // A run that ended meanwhile can't be cancelled: there's nothing to wait for.
+                if (answer.ok) {
+                    cancelled.push(run.id);
+                    firstWait = Math.max(firstWait, retryAfterMs(answer, POLL_MS, now()));
+                }
+            }
+            if (cancelled.length > 0) await waitForEnd(cancelled, firstWait, call, settings, deps, deadline);
+        }
+        const start = () => fabric(call, deps, `${jobsPath(settings)}?jobType=RunNotebook`, { method: "POST", body: JSON.stringify({ executionData: { parameters: jobParameters(checked.request, requestedBy) } }) });
+        let response = await start();
+        // Stop now asks again while the capacity refuses it, as the notebook's history job does.
+        while (stop && (await capacityRefused(response))) {
+            const wait = retryAfterMs(response, CAPACITY_RETRY_MS, now());
+            if (now() + wait > deadline) break;
+            await sleep(wait);
+            response = await start();
+        }
+        if (!response.ok) {
+            const why = await refusal(response);
+            if (cancelled.length > 0) return notStopped(`Fabric didn't start the stop (${why})`);
+            return refuse(`Fabric didn't start NB_DatabaseHub_Control (${why}). Run all in the notebook sends the same request.`, true, requestedBy, cancelled);
+        }
         // 202 Accepted: the Location header is the new job instance's URL.
         const id = (response.headers.get("location") ?? "").replace(/\/+$/, "").split("/").pop() ?? "";
         return { started: true, jobInstance: GUID.test(id) ? id.toLowerCase() : "", reason: "", requestedBy, copy: false, cancelled };
     } catch (error) {
+        if (cancelled.length > 0) return notStopped(`the stop wasn't started (${messageOf(error)})`);
         return refuse(`NB_DatabaseHub_Control wasn't started (${messageOf(error)}). Run all in the notebook sends the same request.`, true, requestedBy, cancelled);
     }
 }
