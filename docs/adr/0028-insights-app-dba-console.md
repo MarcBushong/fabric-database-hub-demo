@@ -1,4 +1,4 @@
-# ADR 0027: The Insights app as a DBA console
+# ADR 0028: The Insights app as a DBA console
 
 - **Status:** Proposed (2026-11-18). The design system, the information architecture, the live data, and Manage's copy mode are built and tested; Manage's sending mode waits on [the identity proof](#validation).
 - **Date:** 2026-11-18

@@ -1,0 +1,236 @@
+// The Manage function's checks, pure, so the app's tests run them (ADR 0028): who the caller is, from their Rayfin
+// token verified with the app's own keys; whether they're an operator; and whether a request is one the session control
+// accepts. manage.ts runs NB_DatabaseHub_Control with the result. No Node.js or SDK import: Web Crypto and fetch only.
+
+/** What deploy.ps1 writes for the function (manage.generated.ts in the stage): never a secret. */
+export interface ManageSettings {
+    /** The app's own Rayfin API (rayfinApiUrl), pinned at deploy time: its keys come only from here, never from a request. */
+    apiUrl: string;
+    publishableKey: string;
+    /** NB_DatabaseHub_Control: the workspace and the item the Fabric job API runs. */
+    controlWorkspaceId: string;
+    controlNotebookId: string;
+    /** The operators: the deployer and the demo admin group's users, with their object IDs and names, lowercased. */
+    operators: ReadonlyArray<{ objectId: string; names: readonly string[] }>;
+}
+
+export interface VerifiedCaller {
+    verified: true;
+    /** The caller's Microsoft Entra object ID (the token's oid), or "" when the token has none. */
+    objectId: string;
+    /** Their names in the token (email, upn, preferred_username, unique_name), lowercased. */
+    names: string[];
+    /** How the control records them: their first name, or the token's subject. */
+    display: string;
+}
+
+export interface RejectedCaller {
+    verified: false;
+    reason: string;
+}
+
+export type Caller = VerifiedCaller | RejectedCaller;
+
+type Claims = Record<string, unknown>;
+type Jwk = Record<string, unknown> & { kid?: string; alg?: string };
+
+const ALGORITHMS: Record<string, { name: string; hash: string; namedCurve?: string }> = {
+    RS256: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    RS384: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-384" },
+    RS512: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-512" },
+    ES256: { name: "ECDSA", hash: "SHA-256", namedCurve: "P-256" },
+    ES384: { name: "ECDSA", hash: "SHA-384", namedCurve: "P-384" },
+};
+
+function bytes(part: string): Uint8Array {
+    const base64 = part.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(part.length / 4) * 4, "=");
+    const text = atob(base64);
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i);
+    return out;
+}
+
+function json(part: string): Claims | null {
+    try {
+        const value: unknown = JSON.parse(new TextDecoder().decode(bytes(part)));
+        return value && typeof value === "object" && !Array.isArray(value) ? (value as Claims) : null;
+    } catch {
+        return null;
+    }
+}
+
+const reject = (reason: string): RejectedCaller => ({ verified: false, reason });
+
+/**
+ * Verifies the caller's Rayfin token: its signature with the app's own JWKS, read from the pinned API (the backend's
+ * public `.well-known/jwks.json`, or the auth service's), then its expiry, subject, and audience. The token comes from the
+ * Rayfin runtime (the function's context); nothing the browser sends names the caller.
+ */
+export async function verifyCaller(token: string, settings: Pick<ManageSettings, "apiUrl" | "publishableKey">, deps: { fetch: typeof fetch; now?: () => number }): Promise<Caller> {
+    const parts = token.split(".");
+    if (parts.length !== 3) return reject("the caller's token isn't a JWT");
+    const header = json(parts[0]);
+    const claims = json(parts[1]);
+    if (!header || !claims) return reject("the caller's token can't be read");
+    const alg = String(header.alg ?? "");
+    const params = ALGORITHMS[alg];
+    if (!params) return reject(`the caller's token is signed with ${alg || "no algorithm"}, which the function doesn't accept`);
+    const now = Math.floor((deps.now ?? Date.now)() / 1000);
+    if (typeof claims.exp !== "number" || claims.exp <= now) return reject("the caller's token has expired");
+    if (typeof claims.sub !== "string" || !claims.sub || claims.aud === undefined) return reject("the caller's token has no subject or audience");
+    if (!/^https:\/\//i.test(settings.apiUrl)) return reject("the function has no pinned API to read its keys from");
+
+    const root = settings.apiUrl.replace(/\/+$/, "");
+    let keys: Jwk[] = [];
+    for (const url of [`${root}/.well-known/jwks.json`, `${root}/api/auth/v1/.well-known/jwks.json`]) {
+        try {
+            const response = await deps.fetch(url, { headers: { "X-Publishable-Key": settings.publishableKey } });
+            if (!response.ok) continue;
+            const body = (await response.json()) as { keys?: unknown };
+            if (Array.isArray(body.keys)) {
+                keys = body.keys as Jwk[];
+                break;
+            }
+        } catch {
+            // The next URL, then the reason below.
+        }
+    }
+    if (keys.length === 0) return reject("the app's keys couldn't be read");
+    const jwk = keys.find((k) => k.kid === header.kid && (!k.alg || k.alg === alg));
+    if (!jwk) return reject("no key of the app's signs the caller's token");
+
+    try {
+        const importParams = params.name === "ECDSA" ? { name: params.name, namedCurve: params.namedCurve } : { name: params.name, hash: params.hash };
+        const key = await crypto.subtle.importKey("jwk", jwk as never, importParams as never, false, ["verify"]);
+        const verifyParams = params.name === "ECDSA" ? { name: params.name, hash: params.hash } : { name: params.name };
+        const signed = await crypto.subtle.verify(verifyParams as never, key, bytes(parts[2]) as never, new TextEncoder().encode(`${parts[0]}.${parts[1]}`) as never);
+        if (!signed) return reject("the caller's token isn't signed by the app");
+    } catch {
+        return reject("the caller's token's signature can't be checked");
+    }
+
+    const names = [claims.email, claims.upn, claims.preferred_username, claims.unique_name]
+        .filter((n): n is string => typeof n === "string" && n.trim() !== "")
+        .map((n) => n.trim().toLowerCase())
+        .filter((n, i, all) => all.indexOf(n) === i);
+    const objectId = typeof claims.oid === "string" ? claims.oid.toLowerCase() : "";
+    return { verified: true, objectId, names, display: names[0] ?? claims.sub };
+}
+
+/** An operator is in the deploy-time list by object ID, or by a name in the token. */
+export function isOperator(caller: VerifiedCaller, settings: Pick<ManageSettings, "operators">): boolean {
+    return settings.operators.some((o) => (caller.objectId !== "" && o.objectId === caller.objectId) || caller.names.some((n) => o.names.includes(n)));
+}
+
+/** The control's REQUESTED_BY: "app/" and the caller, in the characters its name rule allows (1 to 64). */
+export function requestedByOf(caller: VerifiedCaller): string {
+    return `app/${caller.display}`.replace(/[^A-Za-z0-9._@/-]/g, "-").slice(0, 64);
+}
+
+/** The session control's bounds (CATALOG_JSON's rules): the app's tests keep them equal to each scenario's scenario.json. */
+export const SESSION_BOUNDS = { min: 30, max: 120, default: 90 } as const;
+
+export const SCENARIO_RULES: ReadonlyArray<{ id: string; targets: readonly string[]; defaultMinutes: number; maxMinutes: number }> = [
+    { id: "blocking-chain", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "capacity-max", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 20 },
+    { id: "connection-surge", targets: ["T4"], defaultMinutes: 5, maxMinutes: 15 },
+    { id: "cpu-pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "deadlock-storm", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "healthy-baseline", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 30, maxMinutes: 240 },
+    { id: "idle-in-transaction", targets: ["T4"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "inefficient-query", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "io-pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "locking-blocking", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "log-flush-waits", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "log-rate-pressure", targets: ["T1", "T2", "T3"], defaultMinutes: 5, maxMinutes: 15 },
+    { id: "memory-grant-pressure", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "missing-index", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "parallel-scans", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "plan-regression", targets: ["T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "replica-lag", targets: ["T4"], defaultMinutes: 10, maxMinutes: 15 },
+    { id: "resource-governance", targets: ["T1", "T2", "T3"], defaultMinutes: 5, maxMinutes: 20 },
+    { id: "slow-consumer", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+    { id: "tempdb-contention", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
+];
+
+const RESET_TARGETS = ["T1", "T2", "T3", "T4"];
+
+export type ManageRequest =
+    | { action: "session"; durationMinutes: number }
+    | { action: "run"; scenario: string; target: string; durationMinutes: number; intensity?: number }
+    | { action: "stop" }
+    | { action: "reset"; targets: string[] };
+
+const KEYS: Record<ManageRequest["action"], readonly string[]> = {
+    session: ["action", "durationMinutes"],
+    run: ["action", "scenario", "target", "durationMinutes", "intensity"],
+    stop: ["action"],
+    reset: ["action", "targets"],
+};
+
+const isInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v);
+
+/**
+ * Accepts only the documented actions and values, within the control's allow-lists and caps, and nothing else: an
+ * unknown action, an unknown field, a scenario on a target it doesn't apply to, or minutes past its cap is refused.
+ */
+export function checkRequest(input: unknown): { ok: true; request: ManageRequest } | { ok: false; reason: string } {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "The request isn't an object." };
+    const r = input as Record<string, unknown>;
+    const action = r.action;
+    if (action !== "session" && action !== "run" && action !== "stop" && action !== "reset") return { ok: false, reason: "The action must be session, run, stop, or reset." };
+    const extra = Object.keys(r).filter((k) => !KEYS[action].includes(k));
+    if (extra.length > 0) return { ok: false, reason: `Unknown fields: ${extra.join(", ")}.` };
+    switch (action) {
+        case "session": {
+            const minutes = r.durationMinutes ?? SESSION_BOUNDS.default;
+            if (!isInt(minutes) || minutes < SESSION_BOUNDS.min || minutes > SESSION_BOUNDS.max) return { ok: false, reason: `A session runs ${SESSION_BOUNDS.min} to ${SESSION_BOUNDS.max} minutes.` };
+            return { ok: true, request: { action, durationMinutes: minutes } };
+        }
+        case "run": {
+            const rule = SCENARIO_RULES.find((s) => s.id === r.scenario);
+            if (!rule) return { ok: false, reason: "The scenario isn't in the catalog." };
+            if (typeof r.target !== "string" || !rule.targets.includes(r.target)) return { ok: false, reason: `${rule.id} runs on ${rule.targets.join(", ")}.` };
+            const minutes = r.durationMinutes ?? rule.defaultMinutes;
+            if (!isInt(minutes) || minutes < 5 || minutes > rule.maxMinutes) return { ok: false, reason: `${rule.id} runs 5 to ${rule.maxMinutes} minutes.` };
+            if (r.intensity !== undefined && (!isInt(r.intensity) || r.intensity < 1 || r.intensity > 10)) return { ok: false, reason: "Intensity is 1 to 10." };
+            return { ok: true, request: { action, scenario: rule.id, target: r.target, durationMinutes: minutes, ...(r.intensity !== undefined ? { intensity: r.intensity as number } : {}) } };
+        }
+        case "stop":
+            return { ok: true, request: { action } };
+        case "reset": {
+            const targets = r.targets ?? [];
+            if (!Array.isArray(targets) || targets.some((t) => typeof t !== "string" || !RESET_TARGETS.includes(t))) return { ok: false, reason: "Reset applies to T1, T2, T3, and T4." };
+            return { ok: true, request: { action, targets: [...new Set(targets as string[])] } };
+        }
+    }
+}
+
+export interface JobParameter {
+    value: string | number | boolean;
+    type: "string" | "int" | "bool";
+}
+
+/** NB_DatabaseHub_Control's parameters for a checked request, as the Fabric job API takes them, with who sent it. */
+export function jobParameters(request: ManageRequest, requestedBy: string): Record<string, JobParameter> {
+    const who: Record<string, JobParameter> = { REQUESTED_BY: { value: requestedBy, type: "string" } };
+    switch (request.action) {
+        case "session":
+            return { MODE: { value: "session", type: "string" }, DURATION_MINUTES: { value: request.durationMinutes, type: "int" }, WAIT_FOR_END: { value: true, type: "bool" }, ...who };
+        case "run": {
+            const activity: Record<string, unknown> = { target: request.target, scenario: request.scenario };
+            if (request.intensity !== undefined) activity.intensity = request.intensity;
+            return {
+                MODE: { value: "activities", type: "string" },
+                ACTIVITIES: { value: JSON.stringify([activity]), type: "string" },
+                DURATION_MINUTES: { value: request.durationMinutes, type: "int" },
+                WATCH_MINUTES: { value: 0, type: "int" },
+                ...who,
+            };
+        }
+        case "stop":
+            return { STOP_NOW: { value: true, type: "bool" }, ...who };
+        case "reset":
+            return { RESET_NOW: { value: true, type: "bool" }, RESET_TARGETS: { value: JSON.stringify(request.targets), type: "string" }, ...who };
+    }
+}

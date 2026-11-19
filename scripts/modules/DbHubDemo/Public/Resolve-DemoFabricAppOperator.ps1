@@ -2,7 +2,7 @@ function Resolve-DemoFabricAppOperator {
     <#
     .SYNOPSIS
     Resolves who may send the Insights app's Manage actions: the deployer and the users in the demo's admin group
-    (t3AdminGroupObjectId), for the app's Manage function (FABRIC.APP.OPERATORS, ADR 0027).
+    (t3AdminGroupObjectId), for the app's Manage function (FABRIC.APP.OPERATORS, ADR 0028).
 
     .DESCRIPTION
     The coordinator's decision for the user (2026-11-18): operators are the deployer plus the members of the demo's

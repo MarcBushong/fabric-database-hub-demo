@@ -3131,7 +3131,7 @@ The work:
 
 ### The Insights app as a DBA console (2026-11-18)
 
-**Why.** The user, on `ignite-updates`: "Adjust the Fabric Rayfin App to really be a DBA's dream app to manage and view their estate with the conversational analytics", "more professional, and functional and clean/modern", and "The GitHub Copilot chat interface right in the App is a must and a gamechanger"; then "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible". A separate session builds the Copilot chat; this entry is the app around it ([ADR 0027](adr/0027-insights-app-dba-console.md)).
+**Why.** The user, on `ignite-updates`: "Adjust the Fabric Rayfin App to really be a DBA's dream app to manage and view their estate with the conversational analytics", "more professional, and functional and clean/modern", and "The GitHub Copilot chat interface right in the App is a must and a gamechanger"; then "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible". A separate session builds the Copilot chat; this entry is the app around it ([ADR 0028](adr/0028-insights-app-dba-console.md)).
 
 **Decisions.**
 
@@ -3139,7 +3139,7 @@ The work:
 - **A DBA's information architecture:** Overview, Estate (T1 to T5, with T4's read replica), Performance, Incidents, Findings, Readiness, Trends, Manage, and Live views, under a left navigation and a global target and period filter.
 - **The Copilot contract first** (`src/copilot/contract.ts`, 935eeed): `AskContext`, `ChartSpec`, and `CopilotApi`, so the chat session and the pages built on it at once. `ChartView` draws every chart, the dock's too.
 - **History and live, labeled everywhere:** the live estate comes from the chat session's function (the coordinator's decision 3), loaded through `import.meta.glob`, so the app builds without it and pages say why there's no live data.
-- **Manage (the coordinator's decision for the user):** A, the app's Manage function, with C, copying the request for Run all, as the automatic fallback; the conditions are in ADR 0027.
+- **Manage (the coordinator's decision for the user):** A, the app's Manage function, with C, copying the request for Run all, as the automatic fallback; the conditions are in ADR 0028.
 
 **Work summary.**
 
@@ -3151,7 +3151,7 @@ The work:
 - **The deploy-time check** (`Test-DemoFabricApp.ps1`): queries marked `mayBeEmpty` are said, not warned about; a Pester case.
 - **`package-lock.json`:** every package from `registry.npmjs.org` with SHA-512. The Fluent packages had resolved through a mirror, which `DbHubDemo.FabricApp.Tests.ps1` caught; the hashes came from `npm pack`, matched npmjs's in public lock files, and `npm ci` verified them.
 - **The preview** (`npm run dev:sample`, `src/preview/`): sample history and live answers, for design work and screenshots.
-- **Docs:** the app's guide (Demo it yourself, pages, Copilot, Manage, update and delete), ADR 0027, and the app's parts of the presentation page and the walkthrough.
+- **Docs:** the app's guide (Demo it yourself, pages, Copilot, Manage, update and delete), ADR 0028, and the app's parts of the presentation page and the walkthrough.
 
 **Validation.**
 

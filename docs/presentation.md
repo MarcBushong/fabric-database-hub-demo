@@ -8,7 +8,7 @@ How to present the demo, and to whom. Four surfaces show the same SQL estate: tw
 
 **Status (2026-10-22, Phase 19b):** the Insights app `APP_DatabaseHub_Insights`, a [Fabric App (preview)](https://learn.microsoft.com/fabric/apps/overview) over the same history model, deploys by script with `configure-fabric-app.ps1`, and every query it runs returned rows through its connector. Opened from its workspace item, the first build passed the owner's browser check ("Connector check passed"); the full app's browser check is the remaining manual step ([its guide](../fabric/app/README.md)).
 
-**Status (2026-11-18, the redesign):** the Insights app is the demo's DBA console ([ADR 0027](adr/0027-insights-app-dba-console.md)): Fluent 2, nine pages from Overview to Manage, Database Hub live beside the history, T5 (Azure Cosmos DB), the Database Agent loop on T3, the in-app Copilot, and bounded, confirmed actions through the session control. It's built and tested with sample data; its live check is pending.
+**Status (2026-11-18, the redesign):** the Insights app is the demo's DBA console ([ADR 0028](adr/0028-insights-app-dba-console.md)): Fluent 2, nine pages from Overview to Manage, Database Hub live beside the history, T5 (Azure Cosmos DB), the Database Agent loop on T3, the in-app Copilot, and bounded, confirmed actions through the session control. It's built and tested with sample data; its live check is pending.
 
 ## The four surfaces
 
@@ -65,7 +65,7 @@ Database Hub's **Performance** page has **Create SQL monitors from template**: i
 
 ## The Fabric app: the Insights app
 
-The demo's Fabric app is the Insights app, `APP_DatabaseHub_Insights`: a [Fabric Apps](https://learn.microsoft.com/fabric/apps/overview) (preview) item built with the Rayfin SDK and CLI, redesigned on 2026-11-18 as a DBA's console ([ADR 0027](adr/0027-insights-app-dba-console.md), [its guide](../fabric/app/README.md)). Fabric hosts it and signs users in to it; its read-only connector to `SM_DatabaseHub_History` runs DAX as the signed-in user, and its function reads Database Hub's own API, scoped to the demo's resource groups. Phase 19 keeps the model's names stable for it.
+The demo's Fabric app is the Insights app, `APP_DatabaseHub_Insights`: a [Fabric Apps](https://learn.microsoft.com/fabric/apps/overview) (preview) item built with the Rayfin SDK and CLI, redesigned on 2026-11-18 as a DBA's console ([ADR 0028](adr/0028-insights-app-dba-console.md), [its guide](../fabric/app/README.md)). Fabric hosts it and signs users in to it; its read-only connector to `SM_DatabaseHub_History` runs DAX as the signed-in user, and its function reads Database Hub's own API, scoped to the demo's resource groups. Phase 19 keeps the model's names stable for it.
 
 - **What a DBA sees, in order:** **Overview** (what needs attention now: **Live now** from Database Hub, then each target's health, incidents, findings, readiness, and the last session), **Estate** (every engine and target, with each target's page), **Performance**, **Incidents** (the timeline, the replay, what changed, and T3's Database Agent loop: detect, evidence, respond, verify), **Findings** (security and optimization live from Database Hub), **Readiness**, **Trends**, **Manage**, and **Live views**.
 - **History and live, labeled:** every visual says **History** (with the newest snapshot's age) or **Live, as of** a UTC time with its Database Hub API calls. Without the live function, a page says why in one line and shows the history.

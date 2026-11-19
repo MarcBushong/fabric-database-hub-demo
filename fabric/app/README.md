@@ -1,6 +1,6 @@
 # Database Hub Insights: the Fabric App (preview)
 
-`APP_DatabaseHub_Insights` is the demo's DBA console: a [Fabric app](https://learn.microsoft.com/fabric/apps/overview) where a DBA sees what needs attention across the estate, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts through the demo's own session control ([ADR 0027](../../docs/adr/0027-insights-app-dba-console.md)). Fabric Apps is a **preview**.
+`APP_DatabaseHub_Insights` is the demo's DBA console: a [Fabric app](https://learn.microsoft.com/fabric/apps/overview) where a DBA sees what needs attention across the estate, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts through the demo's own session control ([ADR 0028](../../docs/adr/0028-insights-app-dba-console.md)). Fabric Apps is a **preview**.
 
 It reads two sources and says which one every visual shows:
 
@@ -98,7 +98,7 @@ Every action says what it does and what bounds it, shows the control request, an
 |---|---|
 | Template | The Fabric Apps data app template, `microsoft/fabric-apps-analytic-templates` at commit `239b2c7` (MIT), recorded in `config/versions.json` (`fabricApp.template`) |
 | Runtime | React 19 and Vite, the Rayfin SDK 1.36.2 (`@microsoft/rayfin-client`, `-auth-provider-fabric`, `-connector-fabric-semanticmodel`) |
-| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0027](../../docs/adr/0027-insights-app-dba-console.md)) |
+| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0028](../../docs/adr/0028-insights-app-dba-console.md)) |
 | Charts | One chart component, `ChartView`: hand-built SVG with d3-scale and d3-shape (line, area, bar, stacked bar, scatter, table, and KPI, with incident bands, thresholds, and markers), which the Copilot dock's charts use too; the incident replay, a heatmap, and sparklines. No charting library and no CDN |
 | Fonts | Segoe UI from the system, like Fabric; no web fonts |
 | Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)). Live data from the app's function (`src/copilot/estate.ts`), through `src/data/live-estate.ts` |
