@@ -3073,10 +3073,10 @@ The work:
 - **The response runs inside Run all** (one notebook, one action). At 85% of its window, T3's agent beat makes Database Agents' documented manual response itself, so the presenter needs no second action ([ADR 0013](adr/0013-agent-experience.md#amendment-general-availability-and-the-database-agent-loop-on-t3-2026-11-18)).
 - **`FORCE_LAST_GOOD_PLAN` is held off for the beat** (the owner, 2026-11-18), so automatic tuning doesn't fix the regression before the agent raises its issue. Every way a session ends turns it back on:
   - The nightly safety stop can't change anything ([ADR 0024](adr/0024-nightly-safety-stop.md)), so after it the next run on T3 restores the setting. That needs no role change (the coordinator's option A).
-  - `stop-demo.ps1` restores it through Azure Resource Manager, and `deploy.ps1`'s setup does too.
+  - `stop-demo.ps1` releases the hold through T3 itself, before it stops T1, and `deploy.ps1`'s setup restores it too. Before the review, `stop-demo.ps1` wrote the option through Azure Resource Manager, which could undo an off set outside the demo.
 - **The showcase:** the cycle-2 timing, at most two T3 incidents at once, and the cycle-3 recurrence beat, which stays (the coordinator, 2026-11-18; [ADR 0010](adr/0010-workload-generator-technology.md#amendment-the-database-agent-beat-2026-11-18)).
 - **The engine dashboards are linked, not rebuilt** (the coordinator's option a): no Log Analytics workspace.
-- **T2's assessment stays out of the history:** the notebooks have no Azure Resource Manager token, so it shows on the status page and in Database Hub.
+- **T2's assessment stays out of the history:** the notebooks have no Azure Resource Manager token, so it shows on the status page and in Database Hub. Database Hub's own inventory carries it (`properties.migrationAssessment`, read through the Database Hub CLI skill), so the Insights app's live estate can show it too.
 
 **Work summary.**
 
@@ -3091,7 +3091,7 @@ The work:
 - **The module** (`Private/T3AgentHelpers.ps1`, new):
   - `T3.AGENT`: **Pass** or a **Warning**. It checks write access (Permissions - List For Resource), a one-vCore serverless T3, an elastic pool, and monitoring.
   - `T3.AUTOTUNING` and `STATUS.T3.AUTOTUNING` (Database Automatic Tuning - Get).
-  - `STOP.T3.AUTOTUNING`: the PATCH back to Default, only while T3 is online.
+  - `STOP.T3.AUTOTUNING`: read-only, after `stop-demo.ps1` released the hold through T3 itself (`Invoke-DemoT3AutoTuningRelease`, before T1 deallocates; it was a PATCH back to Default before the review, which also overrode an off set outside the demo).
   - `HUB.AGENT.T3`: **Manual action required**, confirm-only, so it never keeps **DONE**. It gives the link, the database, the policy, and "once per deployment".
   - They're called from `Test-DemoT3`, `Get-DemoEnvironmentStatus`, `Stop-DemoEnvironment`, both deploy paths' validation, and the confirm list.
 - **The control notebook:**
@@ -3126,5 +3126,19 @@ The work:
     - Two of the failures were this change's, and both are fixed: the presenter grant's test compared a hashtable's key order, which changes from one process to the next, and the Database Hub link was a literal URL, which the documented-hosts test forbids in module code. It now comes from `versions.json`, as the Insights app's links do. Their files then passed: 823 passed, and the only failures were the two below.
     - Not this change's: the Fabric App's lockfile test (`DbHubDemo.FabricApp.Tests.ps1`) fails on `fabric/app/package-lock.json` from 935eeed, and the teardown test's child `pwsh` loads this PC's OneDrive Pester.
 - **Live:** the live test follows, in a test environment of its own: deploy `main`, upgrade it with this branch, then Run all, `validate.ps1`, the agent loop, and T2's assessment. Until then, [limitations](limitations.md#not-proven-live-yet) lists what isn't proven live.
+
+**The independent review** (2026-11-18, of `935eeed..4c7817a`; three findings, all fixed):
+
+- **High: an upgraded T3 cut the agent beat to 20 minutes.** Setup only lowered `demo.scenario_control`, so a T3 set up before kept `plan-regression` at 1200 seconds, and `demo.usp_run_begin` ended the 30-minute beat at 20. The live test's T3 had it (evidence `07`). Setup now raises only that old default to 1800; a limit an operator lowered stays. Tests in `SqlScriptTests` and the opt-in `SqlIntegrationTests`.
+- **Medium: a migration assessment problem ended T2's track.** It's now a **Warning** with the fix in every case, outside the track's failure check. The update is read again for up to 3 minutes (Azure accepts it before it applies), and a start that fails is tried again every 2 minutes for up to 10 once T2's host is ready, before T2's profile (option `T2AssessmentRetryMinutes`).
+- **Low: `stop-demo.ps1` could turn the option back on after someone turned it off.** It now releases the hold through T3 (`demo.usp_release_auto_tuning_hold @force = 1`, which restores what the hold recorded) before T1 deallocates, while it can still reach T3, and `STOP.T3.AUTOTUNING` only reads.
+
+**Live** (2026-11-18, the test environment `dbhubal`, lowest-cost, West US 3; the Fabric home region is West US 3 too):
+
+- `main` deployed to **DONE** with 0 **Fail** (20:07 ET), then this branch upgraded it to **DONE** with 0 **Fail** (21:13 ET): T3 scaled from 1 to 2 vCores online (`DEPLOY.T3.SCALE`), the ceiling's 15-to-20 note showed, `T3.AGENT` and `T3.AUTOTUNING` passed, and `HUB.AGENT.T3` gave the link and `azuresql01-ortkll/ContosoCare`.
+- T2's assessment: the first start got HTTP 500 ("unexpected problem communicating with the Arc Sql Extension") until the extension picked up the setting, about 40 minutes later; the assessment then uploaded 6 minutes after its start, and `T2.ARC.MIGRATIONASSESSMENT` passed: Azure SQL Managed Instance **Ready** (Next-Gen General Purpose, 4 vCores), SQL Server on Azure Virtual Machines **Ready** (2 vCores), and Azure SQL Database **Not ready**.
+- Database Hub's data, read through the Database Hub CLI skill: T2's migration assessment **Available** with the same readiness (`main`'s T2: **Unavailable**), and no license-model finding on T1 or T2. A ready assessment isn't an issue, so it doesn't add to the **Optimization** count in **What needs attention**; that count came from other servers in the tenant. The docs point to Overview's **Optimization** card and Estate, never to Database Hub's leftover preview Optimization page, and to the Azure portal's **Assessments** page, which always has it.
+- `stop-demo.ps1` (21:52 ET): VMs deallocated, T4 stopped, `STOP.T3.AUTOTUNING` **Pass**.
+- Not proven live yet: the agent's issue, **Explain why** and **Analyze slow query**, the response, and the issue closing, which need the owner's one-time **Manage agents** selection first; the Database Hub UI's placement of T2's readiness. See [limitations](limitations.md#not-proven-live-yet).
 
 **Risks.** None new: the agent loop's preview dependencies are in [limitations](limitations.md#preview-disclosures).

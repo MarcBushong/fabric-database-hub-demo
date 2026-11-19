@@ -55,7 +55,7 @@ Which security findings should I address first? Don't change anything.
 | Investigate next | Overview's issues, ranked; Estate sorted by open issues | The target in the beat that's running now, and T3 while the Database Agent's issue is open |
 | Security first | Estate's security findings: Microsoft Entra authentication, auditing, and customer-managed keys | T3 is Entra-only; findings on the other targets follow their own configuration |
 
-- **Optimization** sits beside these on Overview and Estate: T2 (`arcsql01`) with its migration assessment ready. T1 and T2 already use pay-as-you-go, so neither shows a license-model opportunity.
+- **Optimization** is a card in Overview's **What needs attention**, and an issue on a resource's row in Estate: license-model opportunities and SQL Servers that don't report usage. T2 (`arcsql01`) has its migration assessment ready, which isn't an issue, so look for it on T2 in Estate. T1 and T2 already use pay-as-you-go, so neither shows a license-model opportunity.
 
 ## How to judge the answer
 

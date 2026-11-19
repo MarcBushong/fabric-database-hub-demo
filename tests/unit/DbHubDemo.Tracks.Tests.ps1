@@ -949,6 +949,30 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' } | Should -BeNullOrEmpty
     }
 
+    It 'tries T2''s first migration assessment again after the host is Ready, and its new row replaces the Warning (2026-11-18 live finding)' {
+        $warning = New-DemoResult -CheckId 'T2.ARC.MIGRATIONASSESSMENT' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Migration assessment is on for arcsql01, but Azure didn''t take its first run: (InternalServerError)' -Evidence ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = '' })
+        $script:arcRows = @((New-TestResult 'T2.ARC.ONBOARDING'), (New-TestResult 'T2.ARC.CONNECTED'), $warning)
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith { $script:calls.Add('arc'); $script:arcRows }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentRetry -MockWith {
+            $script:calls.Add('assessment retry')
+            New-DemoResult -CheckId 'T2.ARC.MIGRATIONASSESSMENT' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Migration assessment is on for arcsql01, and its first run started (InProgress).'
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        $rows = @($outcome.Results | Where-Object { $_.checkId -eq 'T2.ARC.MIGRATIONASSESSMENT' })
+        $rows.Count | Should -Be 1
+        $rows[0].status | Should -Be 'Pass'
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'assessment retry') | Should -BeGreaterThan ([array]::IndexOf($calls, 'health archost01'))
+        [array]::IndexOf($calls, 'assessment retry') | Should -BeLessThan ([array]::IndexOf($calls, 'profile T2'))
+
+        # A row that needs no retry, an uploaded one or none at all, tries nothing more.
+        $script:calls.Clear()
+        $script:arcRows = @((New-TestResult 'T2.ARC.ONBOARDING'), (New-TestResult 'T2.ARC.CONNECTED'), (New-TestResult 'T2.ARC.MIGRATIONASSESSMENT'))
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $script:calls | Should -Not -Contain 'assessment retry'
+    }
+
     It 'says why the host''s waits stopped when Azure keeps its Run Commands in Deleting: the Ready wait and the build wait (2026-11-13 live finding)' {
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { $script:calls.Add('health ' + $VmName); [pscustomobject]@{ Health = [pscustomobject]@{ state = 'InProgress'; message = 'Step WorkloadRunner is running.' }; Polls = 3; Full = $true } }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
