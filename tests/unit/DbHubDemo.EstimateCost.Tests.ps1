@@ -41,8 +41,11 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $true; Reason = 'the nightly safety stop is in place'; Missing = ''; Fix = '' } }
         # T5's free tier (2026-11-18, ADR 0027), read the same way.
         Mock -ModuleName DbHubDemo Get-DemoT5FreeTierStatus { $true }
-        # T5's container lifecycle (2026-11-19, ADR 0027): the resource group's DbHubT5Container tag.
+        # T5's container lifecycle (2026-11-19, ADR 0027): the resource group's DbHubT5Container tag, and with Session, what
+        # deletes the container after a session (review of ab91ee5): here the session control's role.
         Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $true; T5Container = 'Session' } }
+        Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDeletes { $false }
         Mock Get-DemoCostEstimate {
             [pscustomobject]@{
                 Results = @(); Components = @(); HourlyRunning = 1.0; BastionHourly = 0.2; SessionCost = 5.0; IdleMonthly = 30.0; LightUseMonthly = 40.0
@@ -105,6 +108,16 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Get-DemoDeploymentState -Times 1 -Exactly
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq $Expected }
         Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+    }
+
+    It 'prices a recorded Session all month when nothing automatic deletes the container: no session-control role and no nightly safety stop that can (review of ab91ee5)' {
+        Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('a'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
+        Invoke-TestEstimate
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' }
+        Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month*' }
+        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDeletes { $true }
+        Invoke-TestEstimate
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' }
     }
 
     It 'prices -T5ContainerLifecycle as given, without reading the environment''s, and assumes Session when the tag can''t be read (2026-11-19)' {

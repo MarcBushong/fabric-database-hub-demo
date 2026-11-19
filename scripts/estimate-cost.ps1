@@ -190,8 +190,9 @@ else {
         if (-not $t5Lifecycle -and (& $module { param($Settings) Test-DemoT5Enabled -Config $Settings } $config)) {
             try {
                 $state = Get-DemoDeploymentState -Config $config
-                $t5Lifecycle = if ($state.Exists -and [string]$state.T5Container -cne 'Session') { 'AlwaysOn' } else { 'Session' }
-                Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, so its throughput bills all month' } elseif ($state.Exists) { 'it exists only during a session, so its throughput bills only while the demo runs' } else { 'no environment yet, so the estimate assumes it exists only during a session' }))
+                # The shared rule (review of ab91ee5): Session only where something automatic deletes the container after a session.
+                $t5Lifecycle = & $module { param($Settings, $State) Get-DemoT5CostLifecycle -Config $Settings -State $State } $config $state
+                Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month' } elseif ($state.Exists) { 'it exists only during a session, so its throughput bills only while the demo runs' } else { 'no environment yet, so the estimate assumes it exists only during a session' }))
             }
             catch {
                 $t5Lifecycle = ''

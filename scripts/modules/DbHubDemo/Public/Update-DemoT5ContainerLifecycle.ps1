@@ -101,12 +101,19 @@ function Update-DemoT5ContainerLifecycle {
         }
     }
     # Preflight priced T5's throughput for a session's hours only (Get-DemoT5CostLifecycle -ThisRunDeploys; the coordinator's
-    # gap fix, 2026-11-19), and this run recorded AlwaysOn (a role update that failed, for example): the month's worst case
-    # against monthlyCeilingUsd again.
+    # gap fix, 2026-11-19), and this run ended with it priced all month (AlwaysOn after a role update that failed, or no
+    # session-control role with nothing automatic to delete it, as when Azure refused a role write that the deployer's
+    # permissions allowed): the month's worst case against monthlyCeilingUsd again, as DEPLOY.COST.T4RESTART does for T4.
     $monthly = @(@($PriorResult) | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'PREFLIGHT.COST.MONTHLY' }) | Select-Object -Last 1
     $priced = Get-DemoMemberValue -InputObject $monthly -Name 'evidence'
     $pricedWorst = Get-DemoMemberValue -InputObject $priced -Name 'monthlyWorstCase'
-    if ([string]$result.status -eq 'Warning' -and [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'lifecycle') -ceq $script:T5LifecycleAlwaysOn -and [string](Get-DemoMemberValue -InputObject $priced -Name 't5ContainerLifecycle') -ceq $script:T5LifecycleSession -and $null -ne $pricedWorst) {
+    # How the estimate prices what this run recorded: AlwaysOn for an AlwaysOn lifecycle, and for a Session one that nothing
+    # automatic deletes (no session-control role and no nightly safety stop that can; review of ab91ee5).
+    $priceNow = [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'price')
+    if (-not $priceNow) {
+        $priceNow = [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'lifecycle')
+    }
+    if ([string]$result.status -eq 'Warning' -and $priceNow -ceq $script:T5LifecycleAlwaysOn -and [string](Get-DemoMemberValue -InputObject $priced -Name 't5ContainerLifecycle') -ceq $script:T5LifecycleSession -and $null -ne $pricedWorst) {
         $culture = [System.Globalization.CultureInfo]::InvariantCulture
         $extra = [double](Get-DemoMemberValue -InputObject $priced -Name 't5AlwaysOnExtraMonthly')
         $worst = [System.Math]::Round([double]$pricedWorst + $extra, 2)

@@ -471,6 +471,8 @@ Describe 'Test-DemoT5' {
             @{ Recorded = 'AlwaysOn'; Status = 'Warning'; Message = 'stays between sessions, so its 400 RU/s bill around the clock'; Fix = 'grant-safety-stop\.ps1' }
             @{ Recorded = ''; Status = 'Warning'; Message = 'deployed before 2026-11-19'; Fix = 'deploy\.ps1' }
         )
+        # A recorded Session is read as stop-demo.ps1 would decide it (review of ab91ee5): here the control's role can.
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = ''; RoleName = 'DbHub Demo Activity Operator'; Mode = 'Control'; AutoDelete = $true; Price = 'Session' } }
         foreach ($case in $cases) {
             Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T5Container = $case.Recorded; Tags = @{ deploymentId = 'abc123' } } }.GetNewClosure()
             Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { 'PowerState/running' }
@@ -481,6 +483,14 @@ Describe 'Test-DemoT5' {
             $lifecycle.message | Should -Match $case.Message
             [string]$lifecycle.remediation | Should -Match $case.Fix
         }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -Times 1 -Exactly -ParameterFilter { $Purpose -eq 'Stop' -and [bool]$PesterBoundParameters['WhatIf'] } -Because 'validate.ps1 writes nothing'
+        # With no session-control role and no nightly safety stop that deletes it, a Warning that names stop-demo.ps1.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T5Container = 'Session'; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $false; Price = 'AlwaysOn' } }
+        $manual = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123' -IncludeLifecycle) | Where-Object checkId -EQ 'T5.LIFECYCLE'
+        $manual.status | Should -Be 'Warning'
+        $manual.message | Should -Match 'deleted only when you run \./scripts/stop-demo\.ps1'
+        $manual.evidence['autoDelete'] | Should -BeFalse
         $script:t5.Account = New-AccountJson -FreeTier 'true'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T5Container = 'AlwaysOn'; Tags = @{ deploymentId = 'abc123' } } }
         (@(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123' -IncludeLifecycle) | Where-Object checkId -EQ 'T5.LIFECYCLE').status | Should -Be 'Pass'
@@ -628,6 +638,9 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { $script:principal }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { [pscustomobject]@{ Exists = $script:held; Other = $script:other; Missing = $false; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:recorded.Add([string]$Value['T5Container']) }
+        # Whether the nightly safety stop deletes the container (review of ab91ee5): not by default, as in a Contributor's run.
+        $script:safetyDeletes = $false
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $script:safetyDeletes }
         function Resolve-Lifecycle([string] $Purpose, [string] $Recorded) {
             InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Purpose = $Purpose; State = [pscustomobject]@{ T5Container = $Recorded } } { Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose $Purpose -State $State -Confirm:$false }
         }
@@ -677,15 +690,45 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         (Resolve-Lifecycle 'Grant' 'AlwaysOn').Lifecycle | Should -Be 'Session'
     }
 
+    It 'keeps the tag Session with no role, so stop-demo.ps1 deletes the container, but prices it all month unless the nightly safety stop deletes it too (review of ab91ee5)' {
+        $script:held = $false
+        $manual = Resolve-Lifecycle 'Deploy' ''
+        $manual.Lifecycle | Should -Be 'Session' -Because 'stop-demo.ps1 deletes it only while the tag says Session'
+        $manual.AutoDelete | Should -BeFalse
+        $manual.Price | Should -Be 'AlwaysOn' -Because 'nothing automatic deletes it: the control has no role, and the nightly safety stop can''t'
+        $script:safetyDeletes = $true
+        $nightly = Resolve-Lifecycle 'Deploy' ''
+        $nightly.AutoDelete | Should -BeTrue
+        $nightly.Price | Should -Be 'Session'
+        $script:held = $true
+        $script:safetyDeletes = $false
+        $control = Resolve-Lifecycle 'Deploy' ''
+        $control.Mode | Should -Be 'Control'
+        $control.AutoDelete | Should -BeTrue
+        $control.Price | Should -Be 'Session'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -Times 2 -Exactly -Because 'only a control with no role needs the nightly safety stop'
+    }
+
     It 'says on the status page which mode applies and why, and names grant-safety-stop.ps1 where it helps' {
         $script:held = $false
         $noRole = Resolve-Lifecycle 'Deploy' ''
+        # Review of ab91ee5: with no role and no nightly safety stop that deletes it, only stop-demo.ps1 does.
+        $said = InModuleScope DbHubDemo -Parameters @{ Lifecycle = $noRole } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle -ConfigPath 'config/demo.config.json' }
+        $said.status | Should -Be 'Warning'
+        $said.evidence['mode'] | Should -Be 'NoRole'
+        $said.evidence['price'] | Should -Be 'AlwaysOn'
+        $said.message | Should -Match '^T5''s container is deleted only when you run \./scripts/stop-demo\.ps1'
+        $said.message | Should -Match 'bill around the clock until the next stop-demo\.ps1, and the estimate prices them all month'
+        $said.remediation | Should -Match '^Run \./scripts/stop-demo\.ps1 after each session\. Or an Owner runs, once: \./scripts/grant-safety-stop\.ps1'
+        (InModuleScope DbHubDemo -Parameters @{ Lifecycle = $noRole } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle -FreeTier $true }).status | Should -Be 'Pass' -Because 'it costs nothing on the free tier'
+        $script:safetyDeletes = $true
+        $noRole = Resolve-Lifecycle 'Deploy' ''
         $said = InModuleScope DbHubDemo -Parameters @{ Lifecycle = $noRole } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle -ConfigPath 'config/demo.config.json' }
         $said.status | Should -Be 'Pass'
-        $said.evidence['mode'] | Should -Be 'NoRole'
-        $said.message | Should -Match 'start-demo\.ps1 creates it with your own rights'
+        $said.message | Should -Match 'start-demo\.ps1 creates it with your own rights, and stop-demo\.ps1 and the nightly safety stop delete it'
         $said.message | Should -Match 'Run all can''t start a session'
         $said.message | Should -Match 'grant-safety-stop\.ps1'
+        $script:safetyDeletes = $false
         $script:held = $true
         $script:roleActions = @('Microsoft.Compute/virtualMachines/read')
         $lacking = Resolve-Lifecycle 'Deploy' ''
@@ -734,6 +777,9 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         # A new environment: no session control yet.
         $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity id-dbhub-demo-control doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { $script:control }
+        # Whether the nightly safety stop deletes the container (review of ab91ee5): not by default.
+        $script:safetyDeletes = $false
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $script:safetyDeletes }
         $script:owner = [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' }
         $script:contributor = [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' }
         function Get-Priced([object] $State, [object] $Permission, [switch] $ThisRunDeploys) {
@@ -746,8 +792,11 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         $script:older = [pscustomobject]@{ Mode = 'Lacking'; Why = 'the session control''s custom role "DbHub Demo Activity Operator" doesn''t have them yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $true; HoldsOther = $false }
     }
 
-    It 'prices a new environment session-only for an Owner and for a Contributor, whose session control has no role (fix 1)' {
+    It 'prices a new environment session-only for an Owner, and all month for a Contributor, whose control gets no role and whose container only stop-demo.ps1 deletes (review of ab91ee5)' {
         Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+        Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn'
+        # Where the nightly safety stop deletes the container already, a control with no role is session-only (fix 1).
+        $script:safetyDeletes = $true
         Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
     }
 
@@ -759,16 +808,19 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Get-Priced -State $script:fromMain -Permission ([pscustomobject]@{ CanDefine = $false; CanAssign = $true; Error = '' }) -ThisRunDeploys | Should -Be 'AlwaysOn'
     }
 
-    It 'prices an update from main whose session control never got a role (a Contributor deployed it) Session for a Contributor, since Run all can''t start a session there' {
+    It 'prices an update from main whose session control never got a role (a Contributor deployed it) by what deletes the container: the nightly safety stop, or only stop-demo.ps1' {
         $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn'
+        $script:safetyDeletes = $true
         Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
-        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+        $script:safetyDeletes = $false
+        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session' -Because 'an Owner''s run assigns the control its role'
     }
 
     It 'prices a new environment AlwaysOn only for a deployer who can assign the shared role but not add its actions, where another environment''s older code left it without them' {
         $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
         Get-Priced -State $script:new -Permission ([pscustomobject]@{ CanDefine = $false; CanAssign = $true; Error = '' }) -ThisRunDeploys | Should -Be 'AlwaysOn'
-        Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+        Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn' -Because 'with no role and no nightly safety stop, only stop-demo.ps1 deletes the container'
         Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
     }
     It 'prices a control whose role already has the container''s actions Session, and one that holds another role AlwaysOn, for any deployer' {
@@ -786,7 +838,9 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
             InModuleScope DbHubDemo { $script:ActivityControlRoleActions = @($script:ActivityControlRoleActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' }) }
             Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'AlwaysOn'
             $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
-            Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session' -Because 'with no role at all, the person''s own scripts create the container'
+            $script:safetyDeletes = $true
+            Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session' -Because 'with no role at all, the person''s own scripts create the container, and the nightly safety stop deletes it'
+            $script:safetyDeletes = $false
             $script:control = $script:older
         }
         finally {
@@ -794,14 +848,21 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         }
         Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
     }
-    It 'keeps a recorded Session without reading the control, prices what it can''t read AlwaysOn (fail safe), and follows the tag outside deploy.ps1' {
-        Get-Priced -State ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -Times 0 -Exactly
+    It 'prices a recorded Session by what deletes the container outside deploy.ps1 too, and what it can''t read AlwaysOn (fail safe; review of ab91ee5)' {
+        $session = [pscustomobject]@{ Exists = $true; T5Container = 'Session' }
+        # start-demo.ps1, estimate-cost.ps1, and validate.ps1: the session control's role deletes it, or nothing automatic does.
+        $script:control = [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false }
+        Get-Priced -State $session -Permission $null | Should -Be 'Session'
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $session -Permission $null | Should -Be 'AlwaysOn' -Because 'only stop-demo.ps1 deletes it'
+        Get-Priced -State $session -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn' -Because 'a recorded Session is read again in deploy.ps1''s preflight too'
+        $script:safetyDeletes = $true
+        Get-Priced -State $session -Permission $null | Should -Be 'Session'
         $script:control = [pscustomobject]@{ Mode = 'Unknown'; Why = 'the role couldn''t be read'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $session -Permission $null | Should -Be 'AlwaysOn'
         Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'AlwaysOn'
-        # start-demo.ps1 and estimate-cost.ps1 price what's recorded.
+        # No tag in an existing environment, and no environment yet.
         Get-Priced -State $script:fromMain -Permission $null | Should -Be 'AlwaysOn'
-        Get-Priced -State ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) -Permission $null | Should -Be 'Session'
         Get-Priced -State $script:new -Permission $null | Should -Be 'Session'
     }
 }
@@ -831,6 +892,23 @@ Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when th
         $over.remediation | Should -Match 'Or raise monthlyCeilingUsd to at least 393 in your configuration\.$'
         $over.evidence['overCeiling'] | Should -BeTrue
         $over.evidence['monthlyWorstCase'] | Should -Be 392.92
+    }
+
+    It 'prices it again when the run ends with no session-control role and nothing automatic to delete the container, though the tag stays Session (review of ab91ee5)' {
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $false; Price = 'AlwaysOn' } }
+        $manual = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $manual.status | Should -Be 'Warning'
+        $manual.evidence['lifecycle'] | Should -Be 'Session' -Because 'stop-demo.ps1 still deletes it'
+        $manual.evidence['price'] | Should -Be 'AlwaysOn'
+        $manual.message | Should -Match '^T5''s container is deleted only when you run \./scripts/stop-demo\.ps1'
+        $manual.message | Should -Match 'the month''s worst case is about 22\.32 USD more than its estimate: 392\.92 USD, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $manual.remediation | Should -Match 'stop-demo\.ps1 after each session'
+        $manual.remediation | Should -Match 'raise monthlyCeilingUsd to at least 393'
+        # With the nightly safety stop deleting it, nothing changes.
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $true; Price = 'Session' } }
+        $nightly = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $nightly.status | Should -Be 'Pass'
+        $nightly.message | Should -Not -Match 'Preflight priced'
     }
 
     It 'says it''s within the ceiling, and adds nothing when preflight priced AlwaysOn already or didn''t run' {
