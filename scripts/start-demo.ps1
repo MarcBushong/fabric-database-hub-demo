@@ -151,6 +151,20 @@ $activityDone = $false
 try {
     $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipT4Replica:$SkipT4Replica -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
 
+    # Ask (ADR 0027): wakes the Copilot chat's relay, which scales to zero, so the session's first question in the
+    # Insights app is fast. A relay that doesn't answer is a Warning; nothing here stops the session.
+    if (-not $whatIf) {
+        try {
+            $askRelay = Get-DemoAskRelayEndpoint -SubscriptionId ([string]$config['subscriptionId']) -ResourceGroupName ('rg-{0}-{1}' -f $config['prefix'], $config['environment'])
+            if ($askRelay) {
+                $results.AddRange([object[]]@(Test-DemoAskRelay -Endpoint $askRelay -TimeoutSeconds 90 | Where-Object { $_.checkId -eq 'ASK.RELAY.HEALTH' }))
+            }
+        }
+        catch {
+            $results.Add((New-DemoResult -CheckId 'ASK.RELAY.HEALTH' -Area 'fabric' -Target 'subscription' -Status 'Warning' -Message ('Ask''s chat relay wasn''t woken: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do: the first question in the Insights app wakes it, in about 15 seconds.'))
+        }
+    }
+
     $keyVaultSection = $config['keyVault']
     $useVault = ($keyVaultSection -is [System.Collections.IDictionary]) -and [bool]$keyVaultSection['enabled']
     $noFail = @($results | Where-Object { $_.status -eq 'Fail' }).Count -eq 0

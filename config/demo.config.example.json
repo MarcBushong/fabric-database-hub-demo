@@ -45,6 +45,11 @@
     "notebookUserObjectIds": [],
     "fabricFolderName": "DBHub Control"
   },
+  "ask": {
+    "enabled": true,
+    "image": "",
+    "githubClientId": ""
+  },
   "hostPriority": "Regular",
   "t1Priority": "Regular",
   "securityType": {

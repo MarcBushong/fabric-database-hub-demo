@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { ALLOWED_ROUTES, DBHUB_BASE, inScope, readEstate, type EstateScope } from "../../rayfin/functions/src/estate-core";
+import { ALLOWED_ROUTES, BUDGET_MS, DBHUB_BASE, inScope, readEstate, USER_AGENT, type EstateScope } from "../../rayfin/functions/src/estate-core";
 
 const scope: EstateScope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-dbhub-demo"] };
 const mine = "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Sql/servers/s/databases/d";
@@ -12,7 +14,7 @@ function fakeDbHub(handlers: Record<string, (body: Record<string, unknown> | nul
     const calls: Array<{ method: string; route: string; body: Record<string, unknown> | null; headers: Record<string, string> }> = [];
     const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
         const u = new URL(url);
-        const route = u.pathname.replace("/v1/databasehub/__private", "");
+        const route = u.pathname.replace(new URL(DBHUB_BASE).pathname, "");
         const body = typeof init.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
         calls.push({ method: init.method ?? "GET", route, body, headers: init.headers as Record<string, string> });
         const handler = handlers[`${init.method} ${route}`];
@@ -23,16 +25,28 @@ function fakeDbHub(handlers: Record<string, (body: Record<string, unknown> | nul
 }
 
 describe("the estate function", () => {
-    it("reads the inventory with the skill's header, filtered to the demo's resource group", async () => {
+    it("reads the inventory as this app, not as the skill, filtered to the demo's resource group", async () => {
         const { calls, fetchImpl } = fakeDbHub({
             "POST /savedView/resources/list": () => ({ resources: [{ databaseType: "AzureSql", name: "ContosoCare", resourceGroupName: "rg-dbhub-demo" }, { databaseType: "PostgreSql", name: "pgflex01" }] }),
         });
         const answer = await readEstate("inventory", scope, token, fetchImpl, new Date("2026-11-18T12:34:00Z"));
         expect(answer.data).toMatchObject({ totalCount: 2, countByType: { AzureSql: 1, PostgreSql: 1 }, complete: true });
-        expect(answer.source).toEqual(["POST /v1/databasehub/__private/savedView/resources/list"]);
-        expect(calls[0].headers).toMatchObject({ Authorization: `Bearer ${token}`, "x-ms-fabric-skill": "databasehub-cli" });
+        expect(answer.source).toEqual([`POST ${new URL(DBHUB_BASE).pathname}/savedView/resources/list`]);
+        expect(calls[0].headers).toMatchObject({ Authorization: `Bearer ${token}`, "User-Agent": USER_AGENT });
+        const appVersion = /^version:\s*(\S+)/m.exec(readFileSync(join(process.cwd(), "rayfin", "rayfin.yml"), "utf8"))?.[1];
+        expect(USER_AGENT).toBe(`DbHubDemo-InsightsApp/${appVersion}`);
+        expect(Object.keys(calls[0].headers).map((h) => h.toLowerCase())).not.toContain("x-ms-fabric-skill");
         expect(calls[0].body).toMatchObject({ overviewFilters: { subscriptionIds: [scope.subscriptionId], resourceGroups: ["rg-dbhub-demo"] } });
         expect(fetchImpl.mock.calls[0][0].startsWith(DBHUB_BASE)).toBe(true);
+    });
+
+    it("stops calling routes when the answer's time budget runs out, and says so", async () => {
+        const { fetchImpl } = fakeDbHub({ "POST /savedView/resources/list": () => ({ resources: [] }) });
+        let ticks = 0;
+        const clock = () => (ticks++ === 0 ? 0 : BUDGET_MS);
+        const answer = await readEstate("inventory", scope, token, fetchImpl, new Date(), clock);
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expect(answer.errors[0]).toMatch(/budget ran out/);
     });
 
     it("reads health across engines in one pinned window, and pages Cosmos DB to the end", async () => {

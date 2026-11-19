@@ -221,10 +221,13 @@ Describe 'Documented interfaces only' {
         }
     }
 
-    It 'no file outside the docs names a private Database Hub route (repo-wide, including KQL and manifests)' {
+    It 'no file outside the docs names a private Database Hub route, except the Insights app''s estate function (ADR 0013''s exception)' {
         $route = '/v1/databasehub/' + '__private'
+        # ADR 0013 (2026-11-18): the one exception is the estate function's core, which reads the GA databasehub-cli
+        # skill's 8 read-only routes as the app's owner, scoped to the demo's resource group (its tests pin the allowlist).
+        $exception = [System.IO.Path]::GetFullPath((Join-Path -Path $repoRoot -ChildPath 'fabric/app/rayfin/functions/src/estate-core.ts'))
         $hits = foreach ($path in $visible) {
-            if ($path -match '\.md$' -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            if ($path -match '\.md$' -or $path -eq $exception -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
                 continue
             }
             if (Select-String -LiteralPath $path -Pattern $route -SimpleMatch -Quiet) {

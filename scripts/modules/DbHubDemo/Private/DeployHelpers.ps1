@@ -1048,7 +1048,7 @@ function ConvertTo-DemoInsightsAppRecord {
     elseif ($marks.Contains('reportedStatus') -and -not $fix) {
         $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
     }
-    if (-not $own -and [string]$Record.message -notlike 'Insights app:*') {
+    if (-not $own -and [string]$Record.checkId -notlike 'ASK.*' -and [string]$Record.message -notlike 'Insights app:*') {
         $Record.message = 'Insights app: {0}' -f [string]$Record.message
     }
     return $Record
@@ -1107,6 +1107,7 @@ function Invoke-DemoInsightsAppStep {
     $records = @()
     try {
         Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message 'Creating or updating the Insights app (it doesn''t block DONE).'
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Running' -Message 'Setting up the app''s Copilot chat relay with the app (it doesn''t block DONE).'
         $null = Wait-DemoFabricAppSignIn -ProgressPath $ProgressPath
         $records = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $ConfigPath -WorkspaceId (Get-DemoResolvedWorkspaceId -Result $FabricResult))
     }
@@ -1127,6 +1128,17 @@ function Invoke-DemoInsightsAppStep {
         if ($app.State -eq 'Failed') {
             # The console says so at once, as for any other step (Phase 28 live finding), and that the run goes on.
             Write-DemoLog -Level Warning -Message ('The Insights app step failed; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $app.Reason, $app.HowTo)
+        }
+        # Ask (ADR 0027): the app's step sets up its chat relay; without any ASK.* record, it stopped before that.
+        $ask = Get-DemoAskSummary -Result $records
+        if ($null -eq $ask) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Skipped' -Status 'Not selected' -Message 'Not set up: the Insights app''s step stopped before it (the Insights app row says why). The next run sets it up.' -MaxLength 1200
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State $ask.State -Status $ask.Status -Message $ask.StepMessage -MaxLength 1200
+            if ([bool]$ask.Warning) {
+                Write-DemoLog -Level Warning -Message ('The Copilot chat in the Insights app (Ask) needs attention; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $ask.Reason, $ask.HowTo)
+            }
         }
     }
     catch {

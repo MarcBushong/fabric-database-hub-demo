@@ -52,3 +52,23 @@ The nightly safety stop ([ADR 0024](adr/0024-nightly-safety-stop.md)) is part of
 | `t3AutoPauseMinutes` | `15` | The T3 check's time: 30 minutes after the stop, or this delay plus 15 minutes when that's longer, at most 345 minutes. With `-1` (auto-pause off), the check reports that T3 stays online |
 
 To skip one night, turn off its schedule `dbhub-safety-stop` in `aa-<prefix>-<environment>-safetystop` in the Azure portal; the next `deploy.ps1` turns it on again ([what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)).
+
+## Ask, the Copilot chat in the Insights app
+
+Ask ([ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md)) is part of every deployment, and its defaults need no edit: `deploy.ps1` deploys its chat relay with the Insights app, and each viewer signs in to GitHub once per browser with their own Copilot license.
+
+```json
+"ask": {
+  "enabled": true,
+  "image": "",
+  "githubClientId": ""
+}
+```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | `false`: no relay is deployed, and the app's Copilot dock says Ask isn't deployed. A relay deployed before stays, unused and scaled to zero, until `destroy.ps1` |
+| `image` | empty: the image `config/versions.json` pins (`askRelay.image`) | Your own relay image, a full reference pinned by digest (`<registry>/<repository>@sha256:<digest>`) that Azure Container Apps can pull without credentials, for example one you built from `ask-relay/` |
+| `githubClientId` | empty: the shared OAuth App **Database Hub Insights Ask** (`askRelay.githubClientId`) | Your own GitHub OAuth App's client ID, with **Enable Device Flow** on and no client secret, for viewers to sign in through instead. Nobody needs one: the shared app works in any tenant, for any GitHub account |
+
+The relay's size (1 vCPU, 2 GiB, 0 to 1 replica) and the Copilot SDK's version are pinned in `config/versions.json` (`askRelay`), not configured. **Checks:** `ASK.RELAY`, `ASK.RELAY.HEALTH`, `ASK.SIGNIN`, and `ASK.CSP`, in `configure-fabric-app.ps1` and so in `deploy.ps1`; each is a **Pass**, a **Warning**, or **Not selected**, never a **Fail** ([troubleshooting](troubleshooting.md#ask-the-copilot-chat-in-the-insights-app-2026-11-18)).

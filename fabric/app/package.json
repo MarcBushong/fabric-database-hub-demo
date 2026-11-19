@@ -18,6 +18,7 @@
     "test:watch": "vitest",
     "check:licenses": "node scripts/check-licenses.mjs",
     "queries:export": "tsx scripts/export-queries.ts",
+    "guide:build": "tsx scripts/build-model-guide.ts",
     "verify": "npm run typecheck && npm run lint && npm run test && npm run check:licenses && npm run build"
   },
   "dependencies": {

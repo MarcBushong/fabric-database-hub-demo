@@ -247,6 +247,16 @@ function Get-DemoNonBlockingItem {
                 howTo   = 'A Fabric administrator turns on Dataset Execute Queries REST API; then run ./scripts/configure-powerbi.ps1 -CheckModelData.'
             })
     }
+    # Ask, the Copilot chat in the Insights app (ADR 0027): a Warning when its relay isn't deployed or can't be reached.
+    $ask = Get-DemoAskSummary -Result $Result
+    if ($null -ne $ask -and [bool]$ask.Warning) {
+        $items.Add([ordered]@{
+                name    = 'the Copilot chat in the Insights app (Ask)'
+                state   = 'Warning'
+                message = $ask.Reason
+                howTo   = $ask.HowTo
+            })
+    }
     # deploy.ps1's history snapshot at the end of the run, when it didn't work (2026-11-06).
     $history = Get-DemoHistorySnapshotItem -Result $Result
     if ($null -ne $history) {
@@ -270,7 +280,7 @@ function Format-DemoNonBlockingLine {
         return ''
     }
     $state = [string](Get-DemoMemberValue -InputObject $Item -Name 'state')
-    if ($state -notin 'Failed', 'Action needed') {
+    if ($state -notin 'Failed', 'Action needed', 'Warning') {
         $state = 'Failed'
     }
     $name = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Item -Name 'name')
@@ -382,6 +392,41 @@ function Get-DemoInsightsAppSummary {
     }
     $reason = 'It wasn''t created, and its step didn''t say why.'
     return [pscustomobject]@{ State = 'Failed'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo); Deployed = $false; ConfirmOnly = $false; Failed = $true }
+}
+
+function Get-DemoAskSummary {
+    <#
+    .SYNOPSIS
+    Ask's outcome (the Copilot chat in the Insights app, ADR 0027) from the app step's ASK.* records: State for the
+    status page's Fabric.Ask row (Done, Action needed, or Skipped), Status, Reason, HowTo, StepMessage, and Warning
+    (true when it needs attention). $null without any ASK.* record. Ask never blocks DONE: its records are Pass,
+    Warning, or Not selected. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $records = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'ASK.*' })
+    if ($records.Count -eq 0) {
+        return $null
+    }
+    $warning = @($records | Where-Object { [string]$_.status -in 'Warning', 'Fail', 'Manual action required' }) | Select-Object -First 1
+    if ($null -ne $warning) {
+        $reason = ConvertTo-DemoPlainText -Value $warning.message
+        $howTo = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $warning -Name 'remediation')
+        return [pscustomobject]@{ State = 'Action needed'; Status = 'Warning'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo).Trim(); Warning = $true }
+    }
+    $relay = @($records | Where-Object { [string]$_.checkId -eq 'ASK.RELAY' }) | Select-Object -First 1
+    if ($null -ne $relay -and [string]$relay.status -eq 'Not selected') {
+        $reason = ConvertTo-DemoPlainText -Value $relay.message
+        return [pscustomobject]@{ State = 'Skipped'; Status = 'Not selected'; Reason = $reason; HowTo = ''; StepMessage = $reason; Warning = $false }
+    }
+    $health = @($records | Where-Object { [string]$_.checkId -eq 'ASK.RELAY.HEALTH' -and [string]$_.status -eq 'Pass' }) | Select-Object -First 1
+    $message = if ($null -ne $health) { 'Ready: open the Insights app, select Ask Copilot, and sign in with GitHub once. {0}' -f (ConvertTo-DemoPlainText -Value $health.message) } else { ConvertTo-DemoPlainText -Value $relay.message }
+    return [pscustomobject]@{ State = 'Done'; Status = 'Pass'; Reason = ''; HowTo = ''; StepMessage = $message; Warning = $false }
 }
 
 function Test-DemoNonBlockingResult {

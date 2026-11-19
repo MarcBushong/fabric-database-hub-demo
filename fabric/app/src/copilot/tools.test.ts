@@ -70,7 +70,7 @@ describe("the tool runner", () => {
 
     it("passes the live estate's source with its answer", async () => {
         const onEstate = vi.fn();
-        const estate = vi.fn().mockResolvedValue({ source: ["GET /v1/databasehub/__private/health/v2/filtered-summary"], data: { totalDatabases: 3 } });
+        const estate = vi.fn().mockResolvedValue({ source: ["POST /health/v2/filtered-summary"], data: { totalDatabases: 3 } });
         const runner = createToolRunner({ runDax: vi.fn(), estate, onEstate });
         const out = await runner.run("estate_overview", { view: "nonsense" });
         expect(estate).toHaveBeenCalledWith("inventory");

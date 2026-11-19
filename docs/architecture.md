@@ -54,8 +54,11 @@ flowchart LR
     NB2["NB_DatabaseHub_LiveActivity"]
     NB3["NB_DatabaseHub_Control: one Run all per session"]
     LH["LH_DatabaseHub Delta tables"]
+    APP["APP_DatabaseHub_Insights: Copilot dock (Ask)"]
   end
-  AG["Fallback agents: Copilot CLI or VS Code with microsoft-sql-fdh and microsoft-sql"]
+  RELAY["Ask's chat relay: Container App, scales to zero, no credential"]
+  GHC["GitHub Copilot: each viewer's own"]
+  AG["Fallback agents: Copilot CLI or VS Code with the GA databasehub-cli skill and microsoft-sql"]
   CLI -->|"ARM, Run Command, caller token"| RG
   ACT -->|"OIDC"| UAMI
   UAMI -->|"Contributor"| RG
@@ -77,6 +80,10 @@ flowchart LR
   NB2 --> LH
   AG --> HUB
   AG --> TEL
+  APP -->|"WebSocket, the app's origin only"| RELAY
+  RELAY -->|"the viewer's GitHub token"| GHC
+  APP -->|"read-only DAX, as the viewer"| LH
+  APP -->|"estate function, as the app's owner"| HUB
 ```
 
 ## At a glance
@@ -310,7 +317,7 @@ Discovery, monitoring, agents, and mirroring are separate concerns.
 - **Live (2026-10-20 and 2026-10-21):** all three targets passed their Estate and telemetry checks: T1 (`T1.SQLVM.MONITORING` **Pass**; 10 telemetry tables), T2 (`HUB.ESTATE.T2` and `TELEMETRY.T2` **Pass**, about 7 minutes after monitoring was turned on), and T3 (first sample 2.8 minutes after creation). The Hub UI itself is the owner's rehearsal.
 - **No Hub API:** Hub has no public API or ARM resource. Saved views, the **Enable Performance Monitoring** button, monitor templates, and the Database Agent are UI-only. The repo never calls `/v1/databasehub/__private` routes.
 - **Real-Time Dashboard as code (Phase 18):** [`fabric/realtime/`](../fabric/realtime/README.md) defines `RTD_DatabaseHub_LiveView`, a Fabric Real-Time Dashboard over the same telemetry endpoint as an Azure Data Explorer data source with each viewer's identity. Its definition is generated from the live-activity notebook's own KQL, so the two can't drift, and `configure-fabric.ps1 -ImportDashboard` imports it through the generic `Import-DemoFabricItem`, reads it back with Get Item Definition, and checks that every tile gets data by running its KQL read-only against the telemetry endpoint (`Test-DemoRealTimeDashboardData`, also a deploy step). Hub's monitor template wizard builds a similar dashboard by hand. Viewers need Reader like Hub users; Power BI content needs Pro or PPU below F64 (P11, `PREFLIGHT.FABRIC.VIEWERLICENSE`). See [presentation surfaces](presentation.md).
-- **Agents:** the in-Hub Database Agent is the presenter-driven showcase, and every proposed action needs human approval. The `microsoft-sql-fdh` and `microsoft-sql` plugins are the scriptable fallback ([ADR 0013](adr/0013-agent-experience.md)). The install guide, the plugin pins, and the prompt pack are in [`fabric/agent/`](../fabric/agent/README.md) (Phase 10).
+- **Agents:** the in-Hub Database Agent is the presenter-driven showcase, and every proposed action needs human approval. The Insights app's own GitHub Copilot chat (Ask: a relay in an Azure Container App, the viewer's own Copilot, and read-only tools that run in the page) answers questions on the history and the live estate in the app ([ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md)). The GA `databasehub-cli` skill (in the `fabric-skills` plugin) and the `microsoft-sql` plugin are the presenter's scriptable fallback ([ADR 0013](adr/0013-agent-experience.md)). The install guide, the plugin pins, and the prompt pack are in [`fabric/agent/`](../fabric/agent/README.md) (Phase 10).
 - **Mirroring:** deferred from v1 ([ADR 0015](adr/0015-mirroring-deferral.md)).
 
 ## Control surface and lifecycle

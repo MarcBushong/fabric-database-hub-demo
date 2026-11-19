@@ -204,9 +204,9 @@ function Status({ chat }: { chat: ChatController }) {
             <MessageBar intent="warning" layout="multiline">
                 <MessageBarBody>
                     <MessageBarTitle>GitHub sign-in isn't set up yet</MessageBarTitle>
-                    The chat relay has no GitHub app to sign viewers in with. The demo ships one (its client ID is in <code>config/versions.json</code>, <code>askRelay.githubClientId</code>), so this appears only
-                    when a configuration's <code>ask.githubClientId</code> overrides it with an empty value. To use your own app instead: on GitHub, Settings, Developer settings, OAuth Apps, New OAuth App;
-                    tick Enable Device Flow (no client secret); put its Client ID in <code>ask.githubClientId</code>; run <code>./scripts/deploy.ps1</code>.
+                    The chat relay has no GitHub app to sign viewers in with. The demo ships one (its client ID is in <code>config/versions.json</code>, <code>askRelay.githubClientId</code>), so the relay was deployed from a
+                    version without it: run <code>./scripts/deploy.ps1</code> again. To use your own app instead: on GitHub, Settings, Developer settings, OAuth Apps, New OAuth App; tick Enable Device Flow (no
+                    client secret); put its Client ID in <code>ask.githubClientId</code> in <code>config/demo.config.json</code>; run <code>./scripts/deploy.ps1</code>.
                 </MessageBarBody>
             </MessageBar>
         );

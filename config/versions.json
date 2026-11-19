@@ -76,7 +76,7 @@
     "avm/res/network/network-security-group": "0.5.4"
   },
   "apiVersions": {
-    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
+    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference; 2026-11-18: Microsoft.App/managedEnvironments and containerApps for Ask's chat relay in infra/ask (ADR 0027), the newest stable version Bicep 0.47.16 has types for, from the Container Apps template reference). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
     "Microsoft.Authorization/denyAssignments": "2022-04-01",
     "Microsoft.Authorization/locks": "2020-05-01",
     "Microsoft.Authorization/roleAssignments": "2022-04-01",
@@ -116,7 +116,9 @@
     "Microsoft.Automation/automationAccounts/webhooks": "2024-10-23",
     "Microsoft.Automation/automationAccounts/variables": "2024-10-23",
     "Microsoft.KeyVault/vaults/secrets": "2026-02-01",
-    "Microsoft.Fabric/capacities": "2023-11-01"
+    "Microsoft.Fabric/capacities": "2023-11-01",
+    "Microsoft.App/managedEnvironments": "2025-07-01",
+    "Microsoft.App/containerApps": "2025-07-01"
   },
   "arc": {
     "note": "Azure Arc onboarding of the T2 guest and SQL Server enabled by Azure Arc (Phase 7, ADR 0005, ADR 0006). Checked on Microsoft Learn on 2026-10-20; the source of each value is in docUrls.",
@@ -421,27 +423,45 @@
     "localTestPostgresImage": "postgres:18.6-bookworm"
   },
   "agentPlugins": {
-    "note": "Agent plugins for the skills fallback (ADR 0013, fabric/agent/README.md). Copilot CLI ('copilot plugin marketplace add owner/repo#ref') and VS Code ('chat.plugins.marketplaces' with 'owner/repo#<commit>') install from the marketplace repository at 'marketplace.commit', so both hosts get the versions below. Move the pin only after re-running the prompt pack; a Pester test keeps the install guide on this commit. The Learn MCP server is a remote endpoint and has no version; 'learnMcp.plugin*' records the optional microsoft-docs plugin.",
-    "verifiedOn": "2026-10-20",
-    "marketplace": {
-      "name": "microsoft-sql",
-      "repository": "microsoft/microsoft-sql",
-      "url": "https://github.com/microsoft/microsoft-sql",
-      "commit": "eeb1c6867c2d128763516a1aad41671c593cc189",
-      "version": "1.0.0"
+    "note": "Agent plugins for the presenter's local fallback (ADR 0013, fabric/agent/README.md): GitHub Copilot CLI or VS Code. The Database Hub skill is the GA databasehub-cli from Microsoft's skills-for-fabric marketplace (fabric-collection, bundle fabric-skills); the SQL diagnostics stay on the microsoft-sql marketplace. Copilot CLI ('copilot plugin marketplace add owner/repo#ref') and VS Code ('chat.plugins.marketplaces' with 'owner/repo#<commit>') install from each marketplace at its 'commit', so both hosts get the versions below. The Insights app's Copilot dock (ADR 0027) doesn't use the skill: its estate function reads the same Database Hub routes itself. Move a pin only after re-running the prompt pack; a Pester test keeps the install guide on these commits. The Learn MCP server is a remote endpoint and has no version; 'learnMcp.plugin*' records the optional microsoft-docs plugin.",
+    "verifiedOn": "2026-11-18",
+    "marketplaces": {
+      "fabric-collection": {
+        "repository": "microsoft/skills-for-fabric",
+        "url": "https://github.com/microsoft/skills-for-fabric",
+        "commit": "e31422e7d1045ef3a0906df9ff5991f2338af010",
+        "version": "0.3.22"
+      },
+      "microsoft-sql": {
+        "repository": "microsoft/microsoft-sql",
+        "url": "https://github.com/microsoft/microsoft-sql",
+        "commit": "eeb1c6867c2d128763516a1aad41671c593cc189",
+        "version": "1.0.0"
+      }
     },
     "plugins": {
-      "microsoft-sql-fdh": {
-        "version": "1.0.0",
+      "fabric-skills": {
+        "marketplace": "fabric-collection",
+        "version": "0.3.22",
         "skillsUsed": [ "databasehub-cli" ]
       },
       "microsoft-sql": {
+        "marketplace": "microsoft-sql",
         "version": "1.0.0",
         "skillsUsed": [ "diagnose-blocking-and-deadlocks", "diagnose-resource-pressure", "diagnose-slow-query", "read-execution-plan" ]
       },
       "microsoft-sql-vscode": {
+        "marketplace": "microsoft-sql",
         "version": "1.0.0",
         "note": "Instead of microsoft-sql in VS Code with the MSSQL extension; install one of the two, never both."
+      }
+    },
+    "skills": {
+      "databasehub-cli": {
+        "note": "The GA Database Hub skill (2026-11-17), in the fabric-skills bundle. Its content last changed in lastChangedCommit (release 0.3.21); APM installs it alone: apm install microsoft/skills-for-fabric --skill databasehub-cli --target copilot -g --only apm.",
+        "repository": "microsoft/skills-for-fabric",
+        "path": "skills/databasehub-cli",
+        "lastChangedCommit": "c13604ae6f4fb727ac7bc74784eeff4332433c63"
       }
     },
     "learnMcp": {
@@ -450,6 +470,22 @@
       "pluginRepository": "MicrosoftDocs/mcp",
       "pluginVersion": "0.3.1",
       "pluginCommit": "f8ffde185dfd232dbf5d187c22ce299eadc3d583"
+    }
+  },
+  "askRelay": {
+    "note": "The Insights app's Copilot dock (Ask, ADR 0027). 'image' is the chat relay's container image, built by .github/workflows/ask-relay-image.yml from ask-relay/ and pinned here by digest; deploy.ps1 runs exactly this digest, and while it's empty Ask isn't deployed (a Warning, never a Fail). 'githubClientId' is the public client ID of the GitHub OAuth App 'Database Hub Insights Ask' (owned by MarcBushong; device flow, no client secret), so a deployer registers nothing. demo.config.json overrides both: 'ask.image' (an image Container Apps can pull without credentials) and 'ask.githubClientId'. 'buildImage' and 'runtimeImage' are ask-relay/Dockerfile's MCR bases (the runtime is distroless and non-root), and 'copilotSdk' its @microsoft/copilot-sdk; a Pester test keeps them in step.",
+    "verifiedOn": "2026-11-18",
+    "image": "",
+    "imageRepository": "ghcr.io/marcbushong/fabric-database-hub-demo/ask-relay",
+    "githubClientId": "Ov23li4Z8nL4XtaoR4s8",
+    "copilotSdk": "2.0.0",
+    "buildImage": "mcr.microsoft.com/azurelinux/base/nodejs:24.22.3-1-azl3.0.20261116@sha256:1c87a74ac10b0ad7711bcc862fa6a2b13e6a4db96d3a026dbb7fcf8486d57ba3",
+    "runtimeImage": "mcr.microsoft.com/azurelinux/distroless/nodejs:24.22.3-1-nonroot-azl3.0.20261116@sha256:64653c45a2fe9899f744e00716b140a3ea7d2202deb3a9d6307ddf62732e3e3c",
+    "containerApp": {
+      "cpu": 1.0,
+      "memory": "2Gi",
+      "minReplicas": 0,
+      "maxReplicas": 1
     }
   }
 }
