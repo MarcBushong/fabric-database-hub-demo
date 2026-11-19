@@ -898,7 +898,8 @@ function Get-DemoT2GuestStateResult {
         $problems.Add(('it''s {0}' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' })))
     }
     if ($problems.Count -gt 0) {
-        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Connect, set, and start it on archost01: {0}' -f $connect } else { 'Use {0}, which starts an off guest and sets its automatic start, or run on archost01: {1}' -f $fabricStart, $connect }
+        # Scripted fixes first; the by-hand command is the last resort (the coordinator's decision, 2026-11-19).
+        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Run ./scripts/deploy.ps1; if T2.GUEST.STATE still says this, deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1. As a last resort, connect, set, and start it on archost01: {0}' -f $connect } else { 'Use {0}, which starts an off guest and sets its automatic start. As a last resort, run on archost01: {1}' -f $fabricStart, $connect }
         return (& $new 'Fail' ('{0} can''t be in Database Hub while archost01 runs: {1} ({2}).' -f $guestName, ($problems -join '; '), $seen) $fix)
     }
     $notes = [System.Collections.Generic.List[string]]::new()
