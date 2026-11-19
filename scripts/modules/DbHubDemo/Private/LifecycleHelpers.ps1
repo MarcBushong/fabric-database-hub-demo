@@ -928,7 +928,8 @@ function Test-DemoStartCost {
     - PREFLIGHT.COST.SESSION and PREFLIGHT.COST.MONTHLY from Get-DemoCostEstimate (Azure Retail Prices API at
       run time, with the subscription's Defender for Cloud plans when they can be read): the same checks
       preflight runs before deploy.ps1, with the run's activity profile (-ActivityProfile, else the configuration's, else
-      business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail).
+      business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail). -BastionHours counts
+      Bastion's hours in them: start-demo.ps1 -Interactive deploys it, and a default session has none (2026-11-19).
     - START.COST.T4RESTART: which worst case the monthly check counts for T4's 7-day automatic restart, about a day per
       restart where a safety stop (the nightly one, ADR 0024) is fully in place, otherwise the rest of the month, with a Warning that names
       what's missing (Get-DemoT4RestartCoverage; 2026-11-04, ADR 0016).
@@ -950,13 +951,19 @@ function Test-DemoStartCost {
         [object] $T3UseFreeLimit,
 
         [AllowEmptyString()]
-        [string] $ActivityProfile = ''
+        [string] $ActivityProfile = '',
+
+        [ValidateRange(-1, 24)]
+        [double] $BastionHours = -1
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     $docUrl = 'https://learn.microsoft.com/rest/api/cost-management/query/usage'
     # The run's activity profile, so business-day's T3 incidents are counted (2026-11-03).
     $costParameters = @{ Config = $Config; NetworkMode = $NetworkMode; ActivityProfile = $ActivityProfile }
+    if ($BastionHours -ge 0) {
+        $costParameters['BastionHours'] = $BastionHours
+    }
     if ($null -ne $T3UseFreeLimit) {
         $costParameters['T3UseFreeLimit'] = [bool]$T3UseFreeLimit
     }

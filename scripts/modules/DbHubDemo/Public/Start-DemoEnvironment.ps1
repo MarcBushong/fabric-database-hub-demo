@@ -220,8 +220,10 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.COST' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'The cost guardrail was skipped (-SkipCostCheck).'))
     }
     else {
-        # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such.
-        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit -ActivityProfile $activity.Name)
+        # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such. Bastion only
+        # with -Interactive, which deploys it, for at most bastionMaxHours (2026-11-19): a default session has none.
+        $bastionHours = if ($Interactive) { [System.Math]::Min([double]$Config['bastionMaxHours'], [double](Get-DemoProfile).assumptions.demoHoursPerSession) } else { -1 }
+        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit -ActivityProfile $activity.Name -BastionHours $bastionHours)
         foreach ($item in $cost) {
             $results.Add($item)
         }

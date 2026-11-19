@@ -9,12 +9,11 @@
 # delete T5's session-only container, nothing else. It can't start, create, or change anything; it has no Run Command, no
 # data action, and no Automation, Key Vault, Fabric, or role permission. Changing this list needs the owner's approval;
 # tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and the ADR differ.
-# 2026-11-19 (ADR 0024 and ADR 0027, provisionally approved by the coordinator for the owner, who reviews it before any
-# merge): read and delete T5's session-only container, so a session that ended without its stop doesn't leave its
-# provisioned throughput billing all night. It could read or delete any Azure Cosmos DB for NoSQL container in the demo
-# resource group, where T5's account is the only account, and the runbook deletes contosocare/patient-events only, and only
-# while the DbHubT5Container tag is Session (a session creates it again). Nothing of the account, its keys, its network,
-# or its data plane.
+# 2026-11-19 (ADR 0024 and ADR 0027, approved by the owner on 2026-11-19): read and delete T5's session-only container,
+# so a session that ended without its stop doesn't leave its provisioned throughput billing all night. It could read or
+# delete any Azure Cosmos DB for NoSQL container in the demo resource group, where T5's account is the only account, and
+# the runbook deletes contosocare/patient-events only, and only while the DbHubT5Container tag is Session (a session
+# creates it again). Nothing of the account, its keys, its network, or its data plane.
 # https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
 $script:SafetyStopRoleName = 'DbHub Demo Safety Stop'
 $script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, read its Azure SQL database''s status, and read and delete its session-only Azure Cosmos DB container. Assigned only at the demo resource group, to the nightly safety stop''s identity.'
@@ -840,8 +839,24 @@ function Grant-DemoSafetyStopRole {
     $evidence['roleId'] = $roleId
     $can = 'the nightly safety stop can stop the VMs and T4, read T3, and delete T5''s container between sessions'
     $updatedText = if ([bool]$evidence['updated']) { ' (its definition was updated in place, under the same ID, to exactly the {0} approved actions{1}{2})' -f $script:SafetyStopRoleActions.Count, $(if (@($evidence['added']).Count) { '; added: {0}' -f (@($evidence['added']) -join ', ') } else { '' }), $(if (@($evidence['removed']).Count) { '; removed: {0}' -f (@($evidence['removed']) -join ', ') } else { '' }) } else { '' }
+    # A role this run couldn't write that doesn't have exactly its approved actions (review of ab91ee5): another environment's
+    # older deploy.ps1 wrote it back for the whole subscription (R910), so the nightly stop can't do what it lacks, such as
+    # deleting T5's container. A Warning that names them, never a Pass.
+    $stale = {
+        param([string] $State)
+        $missing = @($script:SafetyStopRoleActions | Where-Object { $_ -cnotin @($role.Actions) })
+        $extra = @(@($role.Actions) | Where-Object { $_ -cnotin $script:SafetyStopRoleActions })
+        $evidence['missingActions'] = $missing
+        $evidence['extraActions'] = $extra
+        $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
+        $message = 'The role {0} is {1}, but the custom role "{2}" doesn''t have exactly its {3} approved actions: {4} (another environment''s deploy.ps1 on older code may have written it back for the whole subscription), and you can''t write it (it takes Microsoft.Authorization/roleDefinitions/write: an Owner or a User Access Administrator). Until then the nightly safety stop can''t do what it lacks{5}.' -f $label, $State, $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $(if (@($missing | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count) { ', such as deleting T5''s container between sessions' } else { '' })
+        New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('An Owner of the subscription runs, once: {0}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $command) -DocUrl $script:SafetyStopRoleDoc
+    }
     $existing = Test-DemoActivityControlAssignment -SubscriptionId $Name.SubscriptionId -Scope $Name.ResourceGroupId -PrincipalId $PrincipalId -RoleId $roleId
     if ($existing.Exists) {
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned')
+        }
         return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is in place{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     if ($existing.Error -and -not $existing.Missing) {
@@ -858,6 +873,9 @@ function Grant-DemoSafetyStopRole {
     $write = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments/{1}?api-version={2}' -f $Name.ResourceGroupId, $assignmentName, $permissionsVersion) -Body $body
     if ($write.Ok -or $write.Error -match 'RoleAssignmentExists') {
         $evidence['assigned'] = $true
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned now')
+        }
         return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is assigned{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     return (& $warn ('The role {0} couldn''t be assigned: {1}.' -f $label, $write.Error))
@@ -1160,6 +1178,16 @@ function Get-DemoSafetyStopStatus {
             if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred') {
                 $problems.Add('its last run didn''t finish its work')
             }
+            # T5's container (2026-11-19, ADR 0027) is apart from its status (t5Status, review of ab91ee5), so a container it
+            # couldn't delete never makes T4's stop look failed (R910), and it's said here instead.
+            $t5Status = [string](Get-DemoMemberValue -InputObject $stopResult -Name 't5Status')
+            $evidence['lastStopT5'] = $t5Status
+            if ($t5Status -eq 'NotGranted') {
+                $problems.Add('its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until ./scripts/stop-demo.ps1 deletes it')
+            }
+            elseif ($t5Status -eq 'Failed') {
+                $problems.Add('its last run couldn''t delete T5''s container, so it bills until ./scripts/stop-demo.ps1 deletes it')
+            }
         }
         if ($null -ne $runs.Check) {
             $checkResult = $runs.Check.Result
@@ -1196,6 +1224,9 @@ function Get-DemoSafetyStopStatus {
     }
     $fix = if (@($problems | Where-Object { $_ -match 'online past' }).Count -gt 0) {
         'Something kept T3 awake: the activity log''s Resume Databases events name what resumed it (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor). Open the job in {0} (Process Automation > Jobs) for the rest.' -f $name.AutomationAccount
+    }
+    elseif (@($problems | Where-Object { $_ -match 'container''s actions' }).Count -gt 0) {
+        'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: {0}. It gives the role the container''s actions again.' -f $command
     }
     else {
         'Open the job in {0} (Process Automation > Jobs) to see why, then run ./scripts/status.ps1 again; ./scripts/deploy.ps1 sets the safety stop up again.' -f $name.AutomationAccount

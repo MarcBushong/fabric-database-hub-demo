@@ -21,7 +21,7 @@ BeforeAll {
         'Microsoft.Sql/servers/databases/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
-        # T5's session-only container (2026-11-19, ADR 0024's amendment, provisionally approved by the coordinator for the owner).
+        # T5's session-only container (2026-11-19, ADR 0024's amendment, approved by the owner).
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
     )
@@ -488,6 +488,28 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         @($script:roleDefinitions[0]['permissions'][0]['actions']) | Should -Be $script:approvedActions
     }
 
+    It 'as a Contributor, says the shared role is stale when another environment''s older code wrote it back, and never claims it deletes T5''s container (review of ab91ee5)' {
+        # In place before: the role and its assignment (an Owner's earlier run), then older code wrote the role back to 7 actions.
+        Set-FakeInPlace
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $script:canDefine = $false
+        $script:canAssign = $false
+        $results = & $script:setup
+        $role = $results | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $role.status | Should -Be 'Warning'
+        $role.message | Should -Match '^The role "DbHub Demo Safety Stop" for id-dbhub-demo-safetystop at rg-dbhub-demo is assigned, but the custom role "DbHub Demo Safety Stop" doesn''t have exactly its 9 approved actions: it doesn''t have Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
+        $role.message | Should -Match 'such as deleting T5''s container between sessions\.$'
+        $role.message | Should -Not -Match 'can stop the VMs and T4, read T3, and delete T5''s container'
+        $role.remediation | Should -Match 'grant-safety-stop\.ps1'
+        @($role.evidence['missingActions']).Count | Should -Be 2
+        @($script:writes | Where-Object { $_ -match 'roleDefinitions' }) | Should -BeNullOrEmpty
+        # As a Role Based Access Control Administrator, who assigns it but can't write it: the same Warning once assigned.
+        $script:assignments.Clear()
+        $script:canAssign = $true
+        $assigned = (& $script:setup) | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $assigned.status | Should -Be 'Warning'
+        $assigned.message | Should -Match 'is assigned now, but the custom role'
+    }
     It 'as a Role Based Access Control Administrator: assigns the role when it exists, and needs an Owner to create it' {
         $script:canDefine = $false
         $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
@@ -755,6 +777,22 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         $warned.remediation | Should -Match 'Process Automation > Jobs'
     }
 
+    It 'warns about T5''s container from its own field, apart from a stop that stopped what ran (review of ab91ee5, R910)' {
+        Set-FakeInPlace
+        $kept = 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'NotGranted'; t5 = $kept; message = ('Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), {0}.' -f $kept) }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'To check: its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until \./scripts/stop-demo\.ps1 deletes it\.$'
+        $warned.message | Should -Not -Match 'didn''t finish its work' -Because 'the VMs and T4 stopped, which the cost check of T4''s restart reads'
+        $warned.remediation | Should -Be 'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json. It gives the role the container''s actions again.'
+        $warned.evidence.lastStopT5 | Should -Be 'NotGranted'
+        $script:jobs = @()
+        $script:outputs = @{}
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000004' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'Deleted'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container deleted (its 400 RU/s stop billing until the next session creates it).' }
+        (& $script:status).status | Should -Be 'Pass'
+    }
+
     It 'warns, with the fix, when <Case>' -ForEach @(
         @{ Case = 'it isn''t set up'; Setup = { }; Match = '^The nightly safety stop isn''t in place \(the schedule dbhub-safety-stop doesn''t exist\), so only the VMs'' own auto-shutdown stops them at 19:00, and nothing stops T4'; Fix = '^Run \./scripts/deploy\.ps1' }
         @{ Case = 'its role isn''t assigned'; Setup = { Set-FakeInPlace; $script:assignments.Clear() }; Match = 'but it can''t stop anything: id-dbhub-demo-safetystop doesn''t hold .* So T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'; Fix = '^An Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json$' }
@@ -904,22 +942,22 @@ Describe 'A nightly safety stop that this run sets up (2026-11-19, the coordinat
     }
 
     It 'says so again on the status page when its setup in this run doesn''t put it in place: the worst case without it, the ceiling, and the fix' {
-        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 395.12 })
+        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 423.10 })
         $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role assignment failed: Conflict.'
         $setup = @((New-TestResult 'SAFETYSTOP.RESOURCES'), (New-TestResult 'SAFETYSTOP.RUNBOOK'), (New-TestResult 'SAFETYSTOP.SCHEDULE'), $role)
         $config = New-SafetyConfig
-        $config['monthlyCeilingUsd'] | Should -Be 390 -Because 'the example''s default for a new configuration since 2026-11-19'
+        $config['monthlyCeilingUsd'] | Should -Be 415 -Because 'the example''s default for a new configuration since 2026-11-19'
         $over = & $script:planResult @($monthly) $setup $config
         $over.checkId | Should -Be 'DEPLOY.COST.T4RESTART'
         $over.status | Should -Be 'Warning'
         $over.message | Should -Match '^Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place \(SAFETYSTOP\.ROLE: The role assignment failed: Conflict\.\)'
-        $over.message | Should -Match 'the worst case is 395\.12 USD a month, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $over.message | Should -Match 'the worst case is 423\.10 USD a month, over monthlyCeilingUsd \(415\.00 USD\)\.$'
         $over.remediation | Should -Match 'grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json'
-        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 396 in your configuration\.$'
+        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 424 in your configuration\.$'
         $over.evidence['overCeiling'] | Should -BeTrue
-        $config['monthlyCeilingUsd'] = 400
+        $config['monthlyCeilingUsd'] = 430
         $within = & $script:planResult @($monthly) $setup $config
-        $within.message | Should -Match 'within monthlyCeilingUsd \(400\.00 USD\)\.$'
+        $within.message | Should -Match 'within monthlyCeilingUsd \(430\.00 USD\)\.$'
         $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
         # Nothing when the setup put it in place, or when preflight didn't count it.
         $passed = @($setup | ForEach-Object { New-TestResult ([string]$_.checkId) })

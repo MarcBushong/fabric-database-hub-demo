@@ -177,6 +177,12 @@ Describe 'Find-DemoSecretLeak (Phase 14 secret scan)' {
         @($scan.Skipped).Count | Should -Be 0
         $scan.PrunedCount | Should -Be 2
         @($scan.Pruned) | Should -Be @((& $at 'fabric-app/node_modules'), (& $at 'tools/scripts/__pycache__'))
+        # Without -DependencyRoot every one is unexpected; with the app's build stage, only the one outside it (review of ab91ee5).
+        $scan.UnexpectedPrunedCount | Should -Be 2
+        $staged = Find-DemoSecretLeak -Path $out -DependencyRoot (& $at 'fabric-app')
+        $staged.PrunedCount | Should -Be 2
+        $staged.UnexpectedPrunedCount | Should -Be 1
+        @($staged.UnexpectedPruned) | Should -Be @(& $at 'tools/scripts/__pycache__')
         ($scan | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:jwt))
         # A file or folder named on purpose is scanned, even inside such a tree.
         @((Find-DemoSecretLeak -Path $files['Package']).Findings).Rule | Should -Contain 'jwt'
