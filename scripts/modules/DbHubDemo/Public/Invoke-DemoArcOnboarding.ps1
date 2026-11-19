@@ -78,6 +78,10 @@ function Invoke-DemoArcOnboarding {
     .PARAMETER PollIntervalSeconds
     Seconds between reads while waiting.
 
+    .PARAMETER PassWaitMinutes
+    With -Force, how long onboarding waits while the host's pass checks a new bootstrap generation (the health read's
+    generationPending, #65 follow-up) before its PowerShell Direct sessions go into the guest. 0 doesn't wait.
+
     .EXAMPLE
     Invoke-DemoArcOnboarding -Config (Get-DemoConfig -Path ./config/demo.config.json)
     #>
@@ -103,7 +107,10 @@ function Invoke-DemoArcOnboarding {
         [int] $ConnectWaitMinutes = 5,
 
         [ValidateRange(1, 300)]
-        [int] $PollIntervalSeconds = 15
+        [int] $PollIntervalSeconds = 15,
+
+        [ValidateRange(0, 60)]
+        [int] $PassWaitMinutes = 20
     )
 
     $target = Get-DemoArcTarget -Config $Config
@@ -144,6 +151,32 @@ function Invoke-DemoArcOnboarding {
     }
     if ($null -eq $health) {
         return (& $newResult 'Not selected' 'What if: nothing ran. Onboarding reads the host''s health, probes the guest, and onboards it while the host waits for it.')
+    }
+    # #65 follow-up: after a new bundle, the host's pass checks every step again, and PowerShell Direct sessions that
+    # deploy.ps1 started while it ran broke (the user's update, 2026-11-18). The health read reports that pass
+    # (generationPending); without -Force the host's state already holds onboarding back, so -Force (a golden copy, a
+    # repair) waits for the pass here, up to PassWaitMinutes, before its probe and marker go into the guest.
+    if ($Force -and [bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')) {
+        $passClock = [System.Diagnostics.Stopwatch]::StartNew()
+        while ([bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending') -and $passClock.Elapsed.TotalMinutes -lt $PassWaitMinutes) {
+            $passStep = [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')
+            Write-DemoLog -Message ('{0} checks every step again for its new bootstrap generation ({1}); onboarding waits for that pass, so its PowerShell Direct sessions into {2} don''t overlap it ({3} of at most {4} minutes).' -f $target.HostVmName, $(if ($passStep) { 'step {0}' -f $passStep } else { 'starting' }), $target.MachineName, [int]$passClock.Elapsed.TotalMinutes, $PassWaitMinutes)
+            Start-Sleep -Seconds $PollIntervalSeconds
+            try {
+                $again = Get-DemoVmHealth -Config $Config -VmName $target.HostVmName -View Summary
+                if ($null -ne $again) {
+                    $health = $again
+                }
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('Reading the health of {0} again failed; reading it once more: {1}' -f $target.HostVmName, $_.Exception.Message)
+            }
+        }
+        $evidence['passWaitSeconds'] = [int]$passClock.Elapsed.TotalSeconds
+        if ([bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')) {
+            $evidence['passPending'] = $true
+            Write-DemoLog -Level Warning -Message ('{0} still checks its new bootstrap generation after {1} minutes; onboarding goes ahead, and a PowerShell Direct channel that breaks is recovered (issue #65).' -f $target.HostVmName, $PassWaitMinutes)
+        }
     }
     $hostState = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
     $evidence['hostState'] = $hostState

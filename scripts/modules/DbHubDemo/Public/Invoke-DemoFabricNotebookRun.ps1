@@ -13,7 +13,9 @@ function Invoke-DemoFabricNotebookRun {
 
     Returns FABRIC.NOTEBOOKRUN.<NAME>: Pass when the job completed; Fail when it failed or was cancelled, with the
     failure reason; Warning when another run was already in progress (Deduped) or the wait ran out (the job keeps
-    running; the evidence has its start time). Not selected without a configured workspace. It never pauses, resumes,
+    running; the evidence has its start time and, since 2026-11-19, its location, jobLocation, which deploy.ps1 follows
+    for a first history run, #68). Evidence queuedSeconds says how long the job waited in the capacity's queue. Not
+    selected without a configured workspace. It never pauses, resumes,
     or scales the capacity; a paused capacity fails the submit, and the message says so. When the notebook couldn't be
     looked up, the list's error isn't a missing notebook (live finding, 2026-11-10): a paused or inactive capacity is
     Manual action required, with the resume as the fix, and any other error a Fail whose fix is to run it again.
@@ -44,6 +46,16 @@ function Invoke-DemoFabricNotebookRun {
     .PARAMETER PollSeconds
     Seconds between reads of the job instance.
 
+    .PARAMETER ProgressPath
+    The status page's model (deploy-progress.json): while the job is queued on the capacity or runs, its -ProgressId row
+    says so, with the minutes so far and -TimeoutMinutes (#68). Nothing without it.
+
+    .PARAMETER ProgressId
+    The status page's row for -ProgressPath.
+
+    .PARAMETER ProgressNote
+    What that row adds after the wait, such as what comes once the job completes.
+
     .EXAMPLE
     Invoke-DemoFabricNotebookRun -Config $config -Name NB_DatabaseHub_LiveActivity -Parameter @{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = 1440; RESOURCE_GROUP = 'rg-dbhub-demo' }
 
@@ -68,7 +80,16 @@ function Invoke-DemoFabricNotebookRun {
         [int] $TimeoutMinutes = 30,
 
         [ValidateRange(1, 300)]
-        [int] $PollSeconds = 20
+        [int] $PollSeconds = 20,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressId = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressNote = ''
     )
 
     $checkId = 'FABRIC.NOTEBOOKRUN.{0}' -f $Name.ToUpperInvariant()
@@ -133,39 +154,30 @@ function Invoke-DemoFabricNotebookRun {
     }
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $status = 'NotStarted'
-    $state = $null
-    $maxPolls = [int][System.Math]::Ceiling($TimeoutMinutes * 60.0 / $PollSeconds)
-    # Elapsed time bounds the polls too, the reads included: a read that keeps getting a transient status (HTTP 429 or
-    # 5xx) pays its attempts and backoff on every poll (review of c7c86ec). A network error that lasts throws.
-    $deadline = (Get-DemoUtcNow).AddMinutes($TimeoutMinutes)
-    for ($poll = 1; $poll -le $maxPolls; $poll++) {
-        $remaining = ($deadline - (Get-DemoUtcNow)).TotalSeconds
-        if ($remaining -le 0) {
-            break
-        }
-        Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($remaining))))
-        $read = Invoke-DemoFabricRequest -Method 'Get' -Uri $location -Token $Token
-        if ($read.StatusCode -ne 200) {
-            continue
-        }
-        $state = $read.Body
-        $status = [string](Get-DemoMemberValue -InputObject $state -Name 'status')
-        if ($status -in 'Completed', 'Failed', 'Cancelled', 'Deduped') {
-            break
-        }
-    }
+    # Wait-DemoFabricNotebookJob: elapsed time bounds the polls, the reads included, and the status page's -ProgressId row
+    # says while the job is queued on the capacity or runs (#68).
+    $wait = Wait-DemoFabricNotebookJob -Location $location -Token $Token -Name $Name -TimeoutMinutes $TimeoutMinutes -PollSeconds $PollSeconds -ProgressPath $ProgressPath -ProgressId $ProgressId -ProgressNote $ProgressNote
+    $status = [string]$wait.Status
+    $state = $wait.State
     $evidence = [ordered]@{
-        notebook     = $Name
-        status       = $status
-        seconds      = [int]$watch.Elapsed.TotalSeconds
-        startTimeUtc = [string](Get-DemoMemberValue -InputObject $state -Name 'startTimeUtc')
-        endTimeUtc   = [string](Get-DemoMemberValue -InputObject $state -Name 'endTimeUtc')
-        parameters   = @($parameters.Keys)
+        notebook      = $Name
+        status        = $status
+        seconds       = [int]$wait.Seconds
+        queuedSeconds = [int]$wait.QueuedSeconds
+        startTimeUtc  = [string](Get-DemoMemberValue -InputObject $state -Name 'startTimeUtc')
+        endTimeUtc    = [string](Get-DemoMemberValue -InputObject $state -Name 'endTimeUtc')
+        parameters    = @($parameters.Keys)
+    }
+    if ($status -notin 'Completed', 'Failed', 'Cancelled', 'Deduped') {
+        # The job keeps running: deploy.ps1 follows a first history run from here (Invoke-DemoHistoryFirstRunFollowUp).
+        $evidence['jobLocation'] = $location
     }
     switch ($status) {
         'Completed' {
-            return (& $result 'Pass' ('{0} ran on demand and completed in about {1:N0} seconds.' -f $Name, $watch.Elapsed.TotalSeconds) $evidence)
+            if ($wait.QueuedSeconds -ge 60) {
+                return (& $result 'Pass' ('{0} waited about {1} minutes in the capacity''s queue, then ran on demand and completed, about {2:N0} seconds in all.' -f $Name, [int][System.Math]::Round($wait.QueuedSeconds / 60.0), $wait.Seconds) $evidence)
+            }
+            return (& $result 'Pass' ('{0} ran on demand and completed in about {1:N0} seconds.' -f $Name, $(if ($wait.Seconds -gt 0) { $wait.Seconds } else { $watch.Elapsed.TotalSeconds })) $evidence)
         }
         'Deduped' {
             return (& $result 'Warning' ('{0} was already running, so this run was deduplicated; its results come from that run.' -f $Name) $evidence)

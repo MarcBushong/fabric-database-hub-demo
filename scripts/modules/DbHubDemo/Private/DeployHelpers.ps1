@@ -776,7 +776,9 @@ function Invoke-DemoFabricStage {
     gate, and the dashboard's tile check to the validation, which passes -CheckDashboardData once telemetry
     flows, and -T3PerformanceMonitoringCheck with the T3.PROPERTY result, so the gate's extended-property part
     isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -NewNotebooksOnly: notebooks
-    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a).
+    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a). The
+    track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first history run waits that
+    long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -796,7 +798,14 @@ function Invoke-DemoFabricStage {
 
         [switch] $CheckDashboardData,
 
-        [scriptblock] $T3PerformanceMonitoringCheck
+        [scriptblock] $T3PerformanceMonitoringCheck,
+
+        # The first history run's wait (configure-fabric.ps1 -HistoryRunWaitMinutes; #68), and the status page it shows on.
+        [ValidateRange(0, 120)]
+        [int] $HistoryRunWaitMinutes = 0,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
     )
 
     $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-fabric'
@@ -835,6 +844,12 @@ function Invoke-DemoFabricStage {
         }
         if ($CheckDashboardData) {
             $arguments['CheckDashboardData'] = $true
+        }
+        if ($HistoryRunWaitMinutes -ge 5) {
+            $arguments['HistoryRunWaitMinutes'] = $HistoryRunWaitMinutes
+        }
+        if ($ProgressPath) {
+            $arguments['ProgressPath'] = $ProgressPath
         }
         $null = Invoke-DemoRepositoryScript -Path (Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-fabric.ps1') -Argument $arguments
         if (-not (Test-Path -LiteralPath $output)) {

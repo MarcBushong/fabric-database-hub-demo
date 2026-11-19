@@ -137,6 +137,8 @@ function Wait-DemoT2HostBuild {
     measured time), the estimate follows the mode the host runs, and a report from the bundle before this run's
     (-BundlePrefix) doesn't end the wait for up to 20 minutes. Since 2026-11-13, reads that find no room for a fresh Run
     Command name (Azure keeps the host's Run Commands in Deleting) end the wait after 15 minutes, with TimedOut and Full.
+    Since 2026-11-19, a host whose pass checks a new bootstrap generation that it hasn't reported yet (the health read's
+    generationPending, #65 follow-up) reads InProgress, so the wait goes on, every minute, until that pass reports.
     Returns Health, TimedOut, Failed, Rebuilt, Results, and Full. Internal.
     #>
     [CmdletBinding()]
@@ -221,7 +223,8 @@ function Wait-DemoT2HostBuild {
         else {
             ''
         }
-        $what = if ($rebuilding) { 'makes T2 again from Arc Jumpstart''s image (about 27 minutes in all, measured on 2026-11-06, with the 34 GiB download at about 51 MiB/s)' } elseif ($stale) { 'starts this run''s bootstrap (its last report is from the bundle before)' } else { 'builds its guest' }
+        $checking = [bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')
+        $what = if ($rebuilding) { 'makes T2 again from Arc Jumpstart''s image (about 27 minutes in all, measured on 2026-11-06, with the 34 GiB download at about 51 MiB/s)' } elseif ($stale) { 'starts this run''s bootstrap (its last report is from the bundle before)' } elseif ($checking) { 'checks every step again for this run''s bootstrap generation' } else { 'builds its guest' }
         $message = 'archost01 {5}: step {0} ({1} of {2}), {3} minutes so far.{4}' -f $(if ($phase.Step) { $phase.Step } else { 'starting' }), $phase.Index, $phase.Count, $elapsed, $estimate, $what
         # 2026-11-13 live finding: while Azure keeps DbHubDemo-HealthRead in Deleting, the reads run under a fresh name.
         if (@(Get-DemoRunCommandStuckResult -VmName 'archost01').Count -gt 0) {
@@ -236,7 +239,7 @@ function Wait-DemoT2HostBuild {
         if ($left -le 0) {
             return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false; Rebuilt = $rebuilding; Results = $followUp.ToArray(); Full = $false }
         }
-        $poll = if ($stale) { [System.Math]::Min($PollSeconds, 60) } else { $PollSeconds }
+        $poll = if ($stale -or $checking) { [System.Math]::Min($PollSeconds, 60) } else { $PollSeconds }
         Start-Sleep -Seconds ([int][System.Math]::Max(5, [System.Math]::Min($poll, $left)))
     }
 }

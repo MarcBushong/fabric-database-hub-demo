@@ -1560,4 +1560,54 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         $summary.PSObject.Properties['t2Guest'] | Should -BeNullOrEmpty
         $summary.state | Should -Be 'Ready'
     }
+
+    It 'reports a bootstrap generation that health.json doesn''t report yet as in progress, with its pass''s step, in both views (#65 follow-up)' {
+        $root = New-HealthRoot
+        $before = 'aaaaaaaaaaaa-20261119020000'
+        $new = 'bbbbbbbbbbbb-20261119040000'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject ([ordered]@{ schemaVersion = 1; role = 'ArcHost'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = $null; generation = $before; steps = @() })))
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject ([ordered]@{ role = 'ArcHost'; bundlePath = $repoRoot; generation = $new; loaderRunUtc = [DateTime]::UtcNow.AddMinutes(-2).ToString('o') })))
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'state.json'), (ConvertTo-Json -InputObject ([ordered]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generation = $new })))
+        $summary = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $summary.state | Should -Be 'InProgress'
+        $summary.status | Should -Be 'Warning'
+        $summary.generation | Should -Be $new
+        $summary.currentStep | Should -Be 'GuestSignInCleanup'
+        $summary.generationPending | Should -BeTrue
+        $summary.reportedGeneration | Should -Be $before
+        $summary.reportedState | Should -Be 'Ready'
+        $summary.message | Should -Match 'checks every step again \(at step GuestSignInCleanup\)'
+        $full = (& $healthScript -Root $root -View Full) | ConvertFrom-Json
+        $full.state | Should -Be 'InProgress'
+        $full.generationPending | Should -BeTrue
+        # Before that pass starts, state.json still has the generation before: no step yet.
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'state.json'), (ConvertTo-Json -InputObject ([ordered]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; generation = $before })))
+        $starting = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $starting.state | Should -Be 'InProgress'
+        $starting.currentStep | Should -BeNullOrEmpty
+        $starting.message | Should -Match '\(starting\)'
+    }
+
+    It 'leaves health.json as it is once it reports that generation, on T1, and for a loader that ran more than 30 minutes ago (#65 follow-up)' {
+        $root = New-HealthRoot
+        $new = 'bbbbbbbbbbbb-20261119040000'
+        $health = [ordered]@{ schemaVersion = 1; role = 'ArcHost'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = $null; generation = $new; steps = @() }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject $health))
+        $settings = [ordered]@{ role = 'ArcHost'; bundlePath = $repoRoot; generation = $new; loaderRunUtc = [DateTime]::UtcNow.AddMinutes(-2).ToString('o') }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject $settings))
+        $reported = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $reported.state | Should -Be 'Ready'
+        $reported.PSObject.Properties['generationPending'] | Should -BeNullOrEmpty
+        $health['generation'] = 'aaaaaaaaaaaa-20261119020000'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject $health))
+        foreach ($case in @(@{ Role = 'SqlVm'; Minutes = -2 }, @{ Role = 'ArcHost'; Minutes = -45 })) {
+            $settings['role'] = $case.Role
+            $settings['loaderRunUtc'] = [DateTime]::UtcNow.AddMinutes($case.Minutes).ToString('o')
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject $settings))
+            $left = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+            $left.state | Should -Be 'Ready'
+            $left.generation | Should -Be 'aaaaaaaaaaaa-20261119020000'
+            $left.PSObject.Properties['generationPending'] | Should -BeNullOrEmpty
+        }
+    }
 }

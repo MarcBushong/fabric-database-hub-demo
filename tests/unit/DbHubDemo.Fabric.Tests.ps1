@@ -673,6 +673,36 @@ Describe 'configure-fabric.ps1' {
         ($results | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
     }
 
+    It 'waits up to -HistoryRunWaitMinutes for the first history run, which a busy capacity keeps queued for more than 10 minutes, on the status page (#68)' {
+        # Live (2026-11-19, a shared F4): the first history run stayed queued for about 15 minutes, past the 10 minutes it was
+        # waited for, and the first deployment ended NOT DONE.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        $queued = @(foreach ($i in 1..40) { New-FabricResponse -Status 200 -Body @{ status = 'NotStarted'; startTimeUtc = '2026-11-19T02:02:45Z' } })
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(
+                    New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment'; type = 'Notebook' }) }
+                    New-FabricResponse -Status 200 -Body @{ value = @() }
+                    New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }
+                ) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @($queued + @(New-FabricResponse -Status 200 -Body @{ status = 'Completed'; startTimeUtc = '2026-11-19T02:02:45Z'; endTimeUtc = '2026-11-19T02:19:23Z' })) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+            @{ Method = 'Post'; Match = '/items$'; Responses = @(New-FabricResponse -Status 201 -Body @{ id = $itemId }) }
+        )
+        # The wait's clock: each poll's sleep moves it (Set-FabricMock's own Start-Sleep doesn't). Unqualified in the mocks,
+        # as Set-FabricMock's are.
+        $script:clock = [pscustomobject]@{ Now = [datetime]::new(2026, 11, 19, 2, 2, 45, [System.DateTimeKind]::Utc) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $clock.Now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $clock.Now = $clock.Now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -NewNotebooksOnly -ProgressPath (Join-Path -Path $TestDrive -ChildPath 'deploy-progress.json') -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        $run = Read-ImportResult | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY'
+        $run.status | Should -Be 'Pass'
+        $run.evidence.queuedSeconds | Should -BeGreaterThan 600
+        $run.message | Should -Match 'waited about 14 minutes in the capacity''s queue'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -ParameterFilter { $Id -eq 'Fabric.Items' -and $Message -eq 'NB_DatabaseHub_LiveActivity is queued on the capacity (13 of at most 45 minutes). It''s the first history run: the history model refreshes once it has run.' }
+    }
+
     It 'scopes -RunLiveActivity to the configured resource group, analyze-only (live finding, 2026-11-06)' {
         # Live: a clean deploy in rg-dbhublt-demo, then -RunLiveActivity without RESOURCE_GROUP, which left the notebook on
         # its default, rg-dbhub-demo: its queries found nothing, so it saved no telemetry snapshots.
