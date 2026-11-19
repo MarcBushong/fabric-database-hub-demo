@@ -702,7 +702,264 @@ print(json.dumps(report))
         $persist | Should -Match 'write_delta\("telemetry_snapshots"'
         $persist | Should -Match 'write_delta\("analysis_findings"'
         $persist.IndexOf('prepare_report_tables()') | Should -BeLessThan $persist.IndexOf('write_delta("scenario_runs"')
-        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)'
+        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS\)'
+    }
+
+    It 'saves a demo session once: the next run completes a save that a cancel cut off, table by table, and a first save is unchanged (R907)' {
+        # The app's Stop now cancels the control's run, which may be saving a session's history; Stop now then saves that
+        # session again, without its plan. The setup, section 3, and persist cells run here against a lakehouse in memory.
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'save_once.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, re, sys, types
+import pandas as pd
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+# Spark isn't here: the schema's types as stand-ins, and the default lakehouse's tables in memory (Lake).
+spark_types = types.ModuleType("pyspark.sql.types")
+for name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, name, type(name, (), {}))
+spark_types.StructField = lambda name, kind, nullable: name
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+setup = [cell for cell in code if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+session_cell = next(cell for cell in code if cell.startswith("# This session"))
+persist = next(cell for cell in code if cell.startswith("# Persist:"))
+
+
+class Cancelled(BaseException):
+    """A cancel ends the run where it is; no except Exception in the notebook catches it."""
+
+
+class Rows:
+    def __init__(self, lake, rows):
+        self.lake, self.rows = lake, rows
+
+    def filter(self, condition):
+        column, value = re.fullmatch(r"(\w+) = '([^']*)'", condition).groups()
+        self.lake.reads.append(column)
+        return Rows(self.lake, [row for row in self.rows if row.get(column) == value])
+
+    def limit(self, count):
+        return Rows(self.lake, self.rows[:count])
+
+    def count(self):
+        return len(self.rows)
+
+
+class Lake:
+    def __init__(self):
+        self.tables, self.log, self.reads, self.cancel_at, self.columns = {}, [], [], None, {}
+        self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
+        self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+
+    def table(self, name):
+        rows = Rows(self, self.tables[name])
+        rows.schema = types.SimpleNamespace(fields=[types.SimpleNamespace(name=column) for column, _ in self.columns[name]])
+        return rows
+
+    def createDataFrame(self, data, schema):
+        lake, rows = self, [dict(zip(schema, values)) for values in data]
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                if table == lake.cancel_at:
+                    raise Cancelled(table)
+                lake.log.append("append %s %d" % (table, len(rows)))
+                lake.tables.setdefault(table, []).extend(rows)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+    def sql(self, statement):
+        result = []
+        delete = re.fullmatch(r"DELETE FROM (\w+) WHERE run_id = '([^']*)'", statement)
+        if delete:
+            table = self.tables[delete.group(1)]
+            kept = [row for row in table if row.get("run_id") != delete.group(2)]
+            self.log.append("delete %s %d" % (delete.group(1), len(table) - len(kept)))
+            table[:] = kept
+        elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
+            self.tables.setdefault(statement.split()[5], [])
+        elif statement.startswith("SELECT COUNT(*) AS n FROM "):
+            result = [{"n": 0}]
+        elif statement.startswith("DESCRIBE DETAIL "):
+            result = [{"numFiles": 1}]
+        else:
+            raise AssertionError("unexpected statement: " + statement)
+        return types.SimpleNamespace(collect=lambda: result)
+
+
+SID = "0123456789abcdef0123456789abcdef"
+PLAN = json.dumps({"version": 1, "sessionId": SID, "startUtc": "2026-11-19T14:00:00Z", "endUtc": "2026-11-19T15:30:00Z", "beats": [
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-19T14:04:00Z", "endUtc": "2026-11-19T14:14:00Z"},
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-19T14:30:00Z", "endUtc": "2026-11-19T15:00:00Z",
+     "agent": True, "regressUtc": "2026-11-19T14:33:00Z", "respondUtc": "2026-11-19T14:55:30Z"}]})
+BASE = pd.Timestamp("2026-11-19T14:00:00Z")
+
+
+def run(lake, session_id, plan, cancel_at=None, again=False):
+    """One notebook run: its setup, section 3, what sections 5 to 8 add, and the persist cell, which a cancel cuts off at
+    a table's write. Returns its run ID, whether it was cut off, its writes, and how many tables it kept."""
+    ns = {}
+    exec(setup[0], ns)
+    ns.update(SESSION_ID=session_id, SESSION_PLAN=plan)
+    for cell in setup[1:]:
+        exec(cell, ns)
+    lake.columns = ns["TABLE_COLUMNS"]
+    ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": "lakehouse"},
+              _notebookutils=lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda value: None)))
+    beat = ("session:%s:00" % SID, BASE + pd.Timedelta(minutes=4), BASE + pd.Timedelta(minutes=14))
+
+    def incident_rows():
+        if plan:
+            return [ns["_incident_row"]("request:" + beat[0], "Recorded request", "T1", "blocking", beat[1], beat[2], 3.0,
+                                        scenario="blocking-chain", request_id=beat[0])], []
+        # Without the plan, the beat's blocking has no recorded window to explain it.
+        return [], [ns["_incident_row"]("detected:T1:blocking:" + beat[1].strftime("%Y%m%dT%H%M"), "Detected signal", "T1",
+                                        "blocking", beat[1], beat[2], 3.0)]
+
+    def merge(session, recorded, detected):
+        table = lake.tables["incident_windows"]
+        for row in recorded + detected:
+            table[:] = [item for item in table if item["incident_key"] != row["incident_key"]] + [dict(row)]
+        lake.log.append("merge incident_windows %d" % len(recorded + detected))
+        return len(recorded + detected), 0
+
+    ns.update(incident_window_rows=incident_rows, merge_incident_windows=merge)
+    before, printed, cut = len(lake.log), io.StringIO(), False
+    with contextlib.redirect_stdout(printed):
+        exec(session_cell, ns)
+        cpu = pd.DataFrame({"Target": "T1", "Bucket": [BASE + pd.Timedelta(minutes=minute) for minute in range(6)],
+                            "AvgCPU": [20.0, 85.0, 90.0, 30.0, 25.0, 20.0]})
+        ns["add_snapshot"]("cpu", cpu, ns["WINDOW_START"], ns["WINDOW_END"], metrics=["AvgCPU"], units={"AvgCPU": "percent"})
+        ru = pd.DataFrame({"Target": "T5", "Bucket": [BASE + pd.Timedelta(minutes=minute) for minute in range(3)],
+                           "NormalizedRUConsumption": [40.0, 100.0, 60.0]})
+        ns["add_snapshot"]("cosmosdb", ru, ns["WINDOW_START"], ns["WINDOW_END"], metrics=["NormalizedRUConsumption"])
+        ns["add_finding"]("consumption", "T1", "Warning", "T1's CPU peaked at 90%.", "cpu")
+        ns["add_finding"]("cosmosdb", "T5", "Pass", "T5's metrics were added.", "capture")
+        if plan:
+            ns["add_finding"]("correlation", "T1", "Pass", "blocking-chain on T1: expected signal observed.", beat[0], request_id=beat[0])
+            ns["add_finding"]("database_agent", "T3", "Pass", "Database Agent loop on T3: its CPU fell.", "session:%s:01" % SID,
+                              request_id="session:%s:01" % SID)
+        lake.cancel_at = cancel_at
+        try:
+            exec(persist, ns)
+            if again:
+                exec(persist, ns)
+        except Cancelled:
+            cut = True
+    lake.cancel_at = None
+    return {"runId": ns["RUN_ID"], "cut": cut, "writes": lake.log[before:], "kept": printed.getvalue().count("so this run keeps them")}
+
+
+def state(lake):
+    rows = [row for table in lake.tables.values() for row in table]
+    return {"counts": {table: len(rows) for table, rows in lake.tables.items()},
+            "runIds": sorted({row["run_id"] for row in rows}),
+            "agentFindings": sum(1 for row in lake.tables.get("analysis_findings", []) if row["analysis"] == "database_agent"),
+            "detected": sum(1 for row in lake.tables.get("incident_windows", []) if row["source"] == "Detected signal"),
+            "deleted": sum(int(entry.split()[-1]) for entry in lake.log if entry.startswith("delete ")),
+            "runIdReads": lake.reads.count("run_id")}
+
+
+report = {}
+lake = Lake()
+first = run(lake, SID, PLAN)
+report["first"] = dict(run=first, **state(lake))
+lake = Lake()
+cutoff = run(lake, SID, PLAN, cancel_at="scenario_runs")
+report["stopNow"] = dict(cutoff=cutoff, again=run(lake, SID, ""), **state(lake))
+lake = Lake()
+cutoff = run(lake, SID, PLAN, cancel_at="analysis_findings")
+second = run(lake, SID, PLAN)
+report["resumed"] = dict(cutoff=cutoff, second=second, third=run(lake, SID, ""), **state(lake))
+lake = Lake()
+report["twice"] = dict(run=run(lake, SID, PLAN, again=True), **state(lake))
+lake = Lake()
+runs = [run(lake, "", ""), run(lake, "", "")]
+report["noSession"] = dict(runs=runs, **state(lake))
+print(json.dumps(report))
+'@
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $runId = 'session-0123456789abcdef0123456789abcdef'
+        # One copy of the session's rows: 9 telemetry rows (T1's CPU and T5's RU), 4 findings, its beat's incident window,
+        # and its scenario_runs rows when a run with its plan saved them.
+        $oneCopy = {
+            param($State, [int] $Sessions)
+            foreach ($pair in @(@('telemetry_snapshots', 9), @('analysis_findings', 4), @('incident_windows', 1), @('scenario_runs', $Sessions))) {
+                $State.counts.($pair[0]) | Should -Be $pair[1] -Because $pair[0]
+            }
+        }
+
+        # A first save: the same writes in the same order, the session's rows last, nothing deleted or kept, under the
+        # session's run ID.
+        $report.first.run.runId | Should -Be $runId
+        $report.first.run.cut | Should -BeFalse
+        @($report.first.run.writes | Where-Object { $_ -notlike 'delete *' }) | Should -Be @('append telemetry_snapshots 9', 'append analysis_findings 4', 'merge incident_windows 1', 'append scenario_runs 3')
+        $report.first.deleted | Should -Be 0
+        $report.first.run.kept | Should -Be 0
+        & $oneCopy $report.first 3
+        @($report.first.runIds) | Should -Be @($runId)
+
+        # Cut off before scenario_runs, then Stop now's run, without the plan: it keeps what the earlier run saved, one copy
+        # of each row with its database_agent finding, and records no detected twin of the beat's recorded window.
+        $report.stopNow.cutoff.cut | Should -BeTrue
+        @($report.stopNow.again.writes) | Should -BeNullOrEmpty
+        $report.stopNow.again.kept | Should -Be 3
+        & $oneCopy $report.stopNow 0
+        $report.stopNow.agentFindings | Should -Be 1
+        $report.stopNow.detected | Should -Be 0
+        @($report.stopNow.runIds) | Should -Be @($runId)
+
+        # Cut off after telemetry_snapshots: the next run saves the rest once, the session's rows last, and a run after that
+        # finds the session saved and saves nothing.
+        $report.resumed.cutoff.cut | Should -BeTrue
+        @($report.resumed.cutoff.writes) | Should -Be @('append telemetry_snapshots 9')
+        $report.resumed.second.kept | Should -Be 1
+        @($report.resumed.second.writes | Where-Object { $_ -notlike 'delete *' }) | Should -Be @('append analysis_findings 4', 'merge incident_windows 1', 'append scenario_runs 3')
+        @($report.resumed.third.writes) | Should -BeNullOrEmpty
+        & $oneCopy $report.resumed 3
+        $report.resumed.deleted | Should -Be 0
+
+        # The persist cell run twice in one run replaces that run's rows in every table.
+        & $oneCopy $report.twice 3
+        $report.twice.deleted | Should -Be 16
+        $report.twice.run.kept | Should -Be 0
+
+        # An analysis without a session: its own run ID each time, no read for an earlier run, and each run's rows, as before.
+        @($report.noSession.runIds).Count | Should -Be 2
+        foreach ($id in $report.noSession.runIds) {
+            $id | Should -Match '^\d{8}T\d{6}Z-[0-9a-f]{8}$'
+        }
+        $report.noSession.counts.telemetry_snapshots | Should -Be 18
+        $report.noSession.counts.analysis_findings | Should -Be 4
+        $report.noSession.runIdReads | Should -Be 0
+        $report.noSession.deleted | Should -Be 0
     }
 
     It 'analyzes blocking, consumption, and T3 log-rate governance with charts' {
@@ -1398,7 +1655,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'prepares the report tables in the persist cell, after both writes and only when SAVE_RESULTS is True' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)\s+else:'
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
