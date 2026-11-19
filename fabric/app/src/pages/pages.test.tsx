@@ -380,7 +380,7 @@ describe("Manage", () => {
         expect(await screen.findByText("Each action copies its request for the control notebook.")).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
         const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
-        expect(within(dialog).getByText(/Ends after 90 minutes: saves T4's metrics, deletes the read replica/)).toBeInTheDocument();
+        expect(within(dialog).getByText(/Ends after 90 minutes: saves T4's metrics, and T5's when it's deployed, deletes the read replica/)).toBeInTheDocument();
         fireEvent.click(within(dialog).getByRole("button", { name: "Copy and open the notebook" }));
         await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringMatching(/\nMODE = "session"\nDURATION_MINUTES = 90\nWAIT_FOR_END = True$/)));
         expect(open).toHaveBeenCalledWith(expect.stringMatching(/^https:\/\//), "_blank", "noopener,noreferrer");

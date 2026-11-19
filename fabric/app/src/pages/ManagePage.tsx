@@ -48,7 +48,7 @@ const ACTIONS: ActionInfo[] = [
     { action: "session", title: "Start a session", icon: <Play20Regular />, summary: "What Run all does: start every target, run the showcase's incidents and T3's Database Agent beat, and stop everything at its end.", button: "Start a session…", tone: "primary" },
     { action: "run", title: "Run an incident", icon: <Flash20Regular />, summary: "One bounded scenario from the catalog on one target, with the baseline beside it.", button: "Run an incident…", tone: "secondary" },
     { action: "stop", title: "Stop now", icon: <Stop20Regular />, summary: "End the session now, as its end would: save the history and stop what costs money.", button: "Stop now…", tone: "secondary" },
-    { action: "reset", title: "Reset", icon: <ArrowCounterclockwise20Regular />, summary: "Return ContosoCare to its seed state on the running targets.", button: "Reset…", tone: "secondary" },
+    { action: "reset", title: "Reset", icon: <ArrowCounterclockwise20Regular />, summary: "Return ContosoCare to its seed state on the running targets, and remove what a cut-off RU storm left on T5.", button: "Reset…", tone: "secondary" },
 ];
 
 function RequestForm({ request, onChange }: { request: ControlRequest; onChange: (next: ControlRequest) => void }) {

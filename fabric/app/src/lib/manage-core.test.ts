@@ -78,6 +78,7 @@ describe("the Manage function's requests", () => {
         expect(checkRequest({ action: "session" })).toEqual({ ok: true, request: { action: "session", durationMinutes: 90 } });
         expect(checkRequest({ action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10, intensity: 6 })).toMatchObject({ ok: true });
         expect(checkRequest({ action: "reset", targets: ["T1", "T1", "T3"] })).toEqual({ ok: true, request: { action: "reset", targets: ["T1", "T3"] } });
+        expect(checkRequest({ action: "reset", targets: ["T5"] })).toEqual({ ok: true, request: { action: "reset", targets: ["T5"] } });
         for (const bad of [
             null,
             [],
@@ -89,7 +90,7 @@ describe("the Manage function's requests", () => {
             { action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 31 },
             { action: "run", scenario: "cpu-pressure", target: "T3", intensity: 11 },
             { action: "run", scenario: "drop-database", target: "T3" },
-            { action: "reset", targets: ["T5"] },
+            { action: "reset", targets: ["T4-replica"] },
         ]) {
             expect(checkRequest(bad)).toMatchObject({ ok: false });
         }

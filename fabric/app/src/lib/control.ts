@@ -40,7 +40,7 @@ export function validateRequest(req: ControlRequest): string | null {
             return null;
         }
         case "reset":
-            if (req.targets && req.targets.some((t) => !["T1", "T2", "T3", "T4"].includes(t))) return "Reset applies to T1, T2, T3, and T4.";
+            if (req.targets && req.targets.some((t) => !["T1", "T2", "T3", "T4", "T5"].includes(t))) return "Reset applies to T1, T2, T3, T4, and T5.";
             return null;
 
         case "stop":
@@ -97,7 +97,7 @@ export function describeRequest(req: ControlRequest): RequestSummary {
                     "Starts T1's and T2's VMs, T3's database, and T4 with its read replica, if they're stopped.",
                     "Runs the showcase on every target: the baseline plus bounded incidents, at most two at a time per target.",
                     "Includes T3's Database Agent beat (minutes 30 to 60): the plan regresses, the agent raises its issue, and the run applies the documented response, forcing the last good plan through Query Store.",
-                    `Ends after ${minutes} minutes: saves T4's metrics, deletes the read replica, stops T4, deallocates the VMs, and saves the session's history.`,
+                    `Ends after ${minutes} minutes: saves T4's metrics, and T5's when it's deployed, deletes the read replica, stops T4, deallocates the VMs, and saves the session's history. T5's account has no stop: its activity ends with T1's VM.`,
                 ],
                 bounds: [
                     "The same session as Run all in NB_DatabaseHub_Control; a Run all while it runs follows it.",
@@ -120,7 +120,7 @@ export function describeRequest(req: ControlRequest): RequestSummary {
                 title: "Stop now",
                 effects: [
                     "Stops every running activity.",
-                    "Ends the session as its end would: saves T4's and its replica's metrics, deletes the replica, stops T4, and deallocates the VMs.",
+                    "Ends the session as its end would: saves T4's, its replica's, and T5's metrics, deletes the replica, stops T4, and deallocates the VMs.",
                     "Saves the session's history once the telemetry arrives, about 15 minutes later.",
                 ],
                 bounds: ["Without a session, it stops whatever runs.", "The same as STOP_NOW in NB_DatabaseHub_Control."],
@@ -128,7 +128,11 @@ export function describeRequest(req: ControlRequest): RequestSummary {
         case "reset":
             return {
                 title: `Reset ${req.targets && req.targets.length > 0 ? req.targets.join(", ") : "every running target"}`,
-                effects: ["Stops the scenarios and returns ContosoCare to its seed state on the targets whose VM runs.", "Ends only sessions tagged ContosoCare.Demo/; nothing outside ContosoCare changes."],
+                effects: [
+                    "Stops the scenarios and returns ContosoCare to its seed state on the targets whose VM runs.",
+                    "On T5, deletes any RU-storm documents a cut-off run left; the baseline's documents stay.",
+                    "Ends only sessions tagged ContosoCare.Demo/; nothing outside ContosoCare changes.",
+                ],
                 bounds: ["No infrastructure is redeployed.", "The same as RESET_NOW in NB_DatabaseHub_Control."],
             };
     }

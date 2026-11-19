@@ -83,7 +83,7 @@ Run all in `NB_DatabaseHub_Control` stays the demo's one action ([ADR 0026](../.
 | **Start a session** | What Run all does: starts every target, runs the showcase's incidents and T3's Database Agent beat, and stops everything at its end (30 to 120 minutes, 90 by default) | `MODE = "session"`, `DURATION_MINUTES`, `WAIT_FOR_END = True` |
 | **Run an incident** | One scenario from the catalog on one target it applies to, within the scenario's maximum minutes, with the baseline beside it | `MODE = "activities"`, `ACTIVITIES`, `DURATION_MINUTES` |
 | **Stop now** | Ends the session as its end would: saves the history, deletes T4's read replica, and stops what costs money | `STOP_NOW = True` |
-| **Reset** | Returns ContosoCare to its seed state on the running targets | `RESET_NOW = True`, `RESET_TARGETS` |
+| **Reset** | Returns ContosoCare to its seed state on the running targets, and removes what a cut-off RU storm left on T5 | `RESET_NOW = True`, `RESET_TARGETS` |
 
 Every action says what it does and what bounds it, shows the control request, and asks for confirmation; a value outside the control's allow-lists and caps can't be confirmed. No secret reaches the browser: the control's webhook URL stays in Key Vault, read by the control notebook. Manage works one of two ways, which the app finds out by itself:
 

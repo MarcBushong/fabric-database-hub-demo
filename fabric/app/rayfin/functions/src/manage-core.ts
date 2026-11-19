@@ -154,7 +154,7 @@ export const SCENARIO_RULES: ReadonlyArray<{ id: string; targets: readonly strin
     { id: "tempdb-contention", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
 ];
 
-const RESET_TARGETS = ["T1", "T2", "T3", "T4"];
+const RESET_TARGETS = ["T1", "T2", "T3", "T4", "T5"];
 
 export type ManageRequest =
     | { action: "session"; durationMinutes: number }
@@ -201,7 +201,7 @@ export function checkRequest(input: unknown): { ok: true; request: ManageRequest
             return { ok: true, request: { action } };
         case "reset": {
             const targets = r.targets ?? [];
-            if (!Array.isArray(targets) || targets.some((t) => typeof t !== "string" || !RESET_TARGETS.includes(t))) return { ok: false, reason: "Reset applies to T1, T2, T3, and T4." };
+            if (!Array.isArray(targets) || targets.some((t) => typeof t !== "string" || !RESET_TARGETS.includes(t))) return { ok: false, reason: "Reset applies to T1, T2, T3, T4, and T5." };
             return { ok: true, request: { action, targets: [...new Set(targets as string[])] } };
         }
     }
