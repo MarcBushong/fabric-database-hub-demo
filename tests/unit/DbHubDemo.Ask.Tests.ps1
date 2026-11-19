@@ -228,6 +228,18 @@ Describe 'Ask''s relay checks and the tenant setting' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 1 -ParameterFilter { $Headers['Origin'] -eq $script:appOrigin -and $Uri -eq ($script:endpoint + '/healthz') }
     }
 
+    It 'waits while the relay''s earlier revision still answers for another origin, then passes on the new one (live, 2026-11-19)' {
+        $script:answers = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith {
+            $script:answers++
+            $allowed = if ($script:answers -lt 3) { 'http://localhost:5173' } else { $script:appOrigin }
+            [pscustomobject]@{ StatusCode = 200; Content = '{"ok":true,"version":"abc123","signIn":"device","sessions":0}'; Headers = @{ 'Access-Control-Allow-Origin' = @($allowed) } }
+        }
+        $results = Test-DemoAskRelay -Endpoint $script:endpoint -Origin $script:appOrigin
+        ($results | Where-Object checkId -EQ 'ASK.RELAY.HEALTH').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 3 -Exactly
+    }
+
     It 'warns when the relay allows another origin, when sign-in is off, and when it doesn''t answer' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith {
             [pscustomobject]@{ StatusCode = 200; Content = '{"ok":true,"version":"abc123","signIn":"off"}'; Headers = @{ 'Access-Control-Allow-Origin' = @('https://elsewhere.example') } }

@@ -8,7 +8,8 @@ function Test-DemoAskRelay {
     The relay scales to zero, so the first request starts a replica (about 15 seconds, measured on 2026-11-18); this
     asks again every 10 seconds until -TimeoutSeconds.
     - ASK.RELAY.HEALTH: Pass when it answers HTTP 200 and allows exactly -Origin (its Access-Control-Allow-Origin).
-      Warning when it doesn't answer, or doesn't allow the origin yet.
+      Warning when it doesn't answer, or doesn't allow the origin by -TimeoutSeconds: after the origin changes, the
+      relay's earlier revision answers until the new one is ready, so the check waits for it.
     - ASK.SIGNIN: Pass when GitHub sign-in is on (the relay has the OAuth App's client ID: device flow, no client
       secret); Warning when it's off, with how to set it. Each viewer signs in once with their own GitHub account.
     Sources: https://learn.microsoft.com/azure/container-apps/scale-app,
@@ -39,24 +40,37 @@ function Test-DemoAskRelay {
     $doc = 'https://learn.microsoft.com/azure/container-apps/scale-app'
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $response = $null
+    $stale = $null
     $lastError = ''
     $headers = @{ 'User-Agent' = 'DbHubDemo-AskCheck' }
     if ($Origin) {
         $headers['Origin'] = $Origin
     }
-    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+    # A relay at zero starts a replica first, and one whose origin was just set answers from its earlier revision until
+    # the new one is ready (live, 2026-11-19: 27 s), so it asks again every 10 seconds until it allows -Origin.
+    $attempts = [int][Math]::Ceiling($TimeoutSeconds / 10) + 1
+    for ($attempt = 1; $attempt -le $attempts -and $watch.Elapsed.TotalSeconds -lt $TimeoutSeconds; $attempt++) {
         try {
-            $response = Invoke-WebRequest -Uri ('{0}/healthz' -f $Endpoint) -Headers $headers -TimeoutSec ([Math]::Max(10, [Math]::Min(45, $TimeoutSeconds - [int]$watch.Elapsed.TotalSeconds))) -SkipHttpErrorCheck -ErrorAction Stop
-            if ($response.StatusCode -eq 200) {
-                break
+            $candidate = Invoke-WebRequest -Uri ('{0}/healthz' -f $Endpoint) -Headers $headers -TimeoutSec ([Math]::Max(10, [Math]::Min(45, $TimeoutSeconds - [int]$watch.Elapsed.TotalSeconds))) -SkipHttpErrorCheck -ErrorAction Stop
+            if ($candidate.StatusCode -eq 200) {
+                $allowedNow = [string](@($candidate.Headers['Access-Control-Allow-Origin']) | Select-Object -First 1)
+                if (-not $Origin -or $allowedNow -eq $Origin) {
+                    $response = $candidate
+                    break
+                }
+                $stale = $candidate
             }
-            $lastError = 'HTTP {0}' -f $response.StatusCode
+            else {
+                $lastError = 'HTTP {0}' -f $candidate.StatusCode
+            }
         }
         catch {
             $lastError = Protect-DemoText -Text $_.Exception.Message
         }
-        $response = $null
         Start-Sleep -Seconds 10
+    }
+    if ($null -eq $response) {
+        $response = $stale
     }
     $seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 1)
     $evidence = [ordered]@{ endpoint = $Endpoint; origin = $Origin; seconds = $seconds }
