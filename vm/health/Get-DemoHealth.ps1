@@ -22,6 +22,9 @@ the WebView2 runtime, IE Enhanced Security Configuration off for administrators,
 deploy.ps1 asks for a person only at ready), the last cleanup's reason, and up to five problems it left. Since
 2026-11-05 it also prints the free space on the drive that holds the guest's disk (details.storage, for status.ps1's
 early warning) and, in JumpstartImage mode, the Jumpstart image's etag, Last-Modified, and whether it's the tested one.
+Since 2026-11-18 both views also print guestRecovery, the last restart that cleared a broken PowerShell Direct channel
+into the T2 guest, read from guest-recovery.json itself (issue #65): when, by whom, its run key, how long it took, how
+the guest stopped, whether it answered again, and the first 200 characters of the error.
 That always fits in 4 KB, even when instructions are long.
 
 .PARAMETER Root
@@ -201,9 +204,46 @@ function Get-DemoHealthRebuildFact {
     return $facts
 }
 
+function Get-DemoHealthRecoveryFact {
+    # The last restart that cleared a broken PowerShell Direct channel into the T2 guest (issue #65), read from
+    # guest-recovery.json itself, so a restart a Run Command made shows before the bootstrap's next pass: startedUtc, by,
+    # key, seconds, stoppedBy, recovered, and the first 200 characters of its reason. $null when there's none.
+    param([string] $StateRoot)
+
+    $recordPath = Join-Path -Path $StateRoot -ChildPath 'guest-recovery.json'
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $record = [System.IO.File]::ReadAllText($recordPath) | ConvertFrom-Json
+        $last = @($record.restarts) | Select-Object -Last 1
+        if ($null -eq $last) {
+            return $null
+        }
+        $fact = [ordered]@{}
+        foreach ($name in 'startedUtc', 'endedUtc', 'by', 'key', 'seconds', 'stoppedBy', 'recovered', 'reason') {
+            $property = $last.PSObject.Properties[$name]
+            $fact[$name] = if ($property) { $property.Value } else { $null }
+            if ($fact[$name] -is [datetime]) {
+                # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
+                $fact[$name] = $fact[$name].ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
+        $reason = [string]$fact['reason']
+        if ($reason.Length -gt 200) {
+            $fact['reason'] = $reason.Substring(0, 200)
+        }
+        return $fact
+    }
+    catch {
+        return [ordered]@{ error = ([string]$_.Exception.Message) -replace '[\r\n]+', ' ' }
+    }
+}
+
 $path = Join-Path -Path $Root -ChildPath 'health.json'
 $guestFacts = Get-DemoHealthGuestFact -StateRoot $Root -Guest $GuestName
 $rebuildFacts = Get-DemoHealthRebuildFact -StateRoot $Root -Guest $GuestName
+$recoveryFacts = Get-DemoHealthRecoveryFact -StateRoot $Root
 if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     $missing = [ordered]@{ schemaVersion = 1; state = 'NotStarted'; status = 'Warning'; message = 'The bootstrap has not written health.json yet.' }
     if ($null -ne $guestFacts) {
@@ -274,6 +314,9 @@ if ($View -eq 'Summary') {
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts
     }
+    if ($null -ne $recoveryFacts) {
+        $summary['guestRecovery'] = $recoveryFacts
+    }
     Write-Output (ConvertTo-Json -InputObject $summary -Compress -Depth 4)
     return
 }
@@ -287,5 +330,8 @@ if ($null -ne $guestFacts) {
 }
 if ($null -ne $rebuildFacts) {
     $health | Add-Member -NotePropertyName 't2Rebuild' -NotePropertyValue $rebuildFacts -Force
+}
+if ($null -ne $recoveryFacts) {
+    $health | Add-Member -NotePropertyName 'guestRecovery' -NotePropertyValue $recoveryFacts -Force
 }
 Write-Output ($health | ConvertTo-Json -Depth 10 -Compress)

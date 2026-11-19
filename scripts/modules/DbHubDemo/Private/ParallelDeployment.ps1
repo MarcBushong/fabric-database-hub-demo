@@ -619,6 +619,11 @@ function Invoke-DemoParallelDeployment {
     if ($WaitForT2) {
         $TrackTimeoutMinutes = [System.Math]::Min(600, [System.Math]::Max($TrackTimeoutMinutes, $T2WaitMinutes + 65 + 30 + $ArcWaitMinutes + 30 + $TelemetryWaitMinutes + 15))
     }
+    # Issue #65: this run's key for the T2 host's guest restart that clears a broken PowerShell Direct channel, so the host
+    # restarts the guest at most once for this run, and a rerun gets its own. The track processes get it in their context.
+    $recoveryModel = Read-DemoProgress -Path $ProgressPath
+    $recoveryKey = New-DemoRunRecoveryKey -RunId $(if ($null -ne $recoveryModel) { [string]$recoveryModel['runId'] } else { '' })
+    Set-DemoRunRecoveryKey -Key $recoveryKey
     $context = @{
         NetworkMode           = $state.NetworkMode
         T3UseFreeLimit        = $state.T3UseFreeLimit
@@ -641,6 +646,9 @@ function Invoke-DemoParallelDeployment {
         PagePath              = $PagePath
         # Why a resumed track sends its VM's artifacts again, by track; its Artifacts step says it (2026-11-06).
         ResendNote            = $resend.Notes
+        RecoveryKey           = $recoveryKey
+        # Since when a guest restart counts as this run's (DEPLOY.T2.GUESTRESTART), the interim baseline's included.
+        RunStartUtc           = $startUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
     }
     $ensureContext = {
         if (-not $context.NetworkMode) {
@@ -1354,6 +1362,17 @@ function Invoke-DemoParallelDeployment {
     }
     # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
     & $addAll @(Get-DemoRunCommandStuckResult -Clear)
+    # Issue #65: each recovery from a broken PowerShell Direct channel into T2's guest during this run, once
+    # (DEPLOY.T2.GUESTRESTART or DEPLOY.T2.GUESTRETRY), the interim baseline's and the switch's included, which the T2
+    # track doesn't see.
+    $guestRestarts = @(Get-DemoGuestRecoveryRunResult -Result $results.ToArray() -SinceUtc $startUtc -CheckPrefix 'DEPLOY')
+    if ($guestRestarts.Count -gt 0) {
+        & $addAll $guestRestarts
+        foreach ($item in $guestRestarts) {
+            Write-DemoLog -Level Warning -Message ('{0}: {1}' -f [string]$item.checkId, [string]$item.message)
+        }
+    }
+    Set-DemoGuestRecoveryProgress -ProgressPath $ProgressPath -Result $results.ToArray()
 
     $all = $results.ToArray()
     # 2026-11-09: T4 out of this deployment is never silent (DEPLOY.T4.OFF): a Fail, because DONE needs T4, with the reason

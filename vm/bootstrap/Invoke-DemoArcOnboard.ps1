@@ -38,8 +38,17 @@ blocked; the bootstrap disables the Azure guest agent last).
 The last line of output is one compact JSON object; errors go to standard error, redacted. Exit code 0 means
 the action succeeded.
 
+A broken PowerShell Direct channel into a guest that runs with a healthy heartbeat (issue #65, 2026-11-18) is cleared
+by restarting the guest once for the caller's run (RecoveryKey; Invoke-DemoGuestRecovery), and the action then runs
+again once (Invoke-DemoArcOnboardWithRecovery). The JSON object then has guestRecovery: what broke, the restart, and
+whether the guest answered again.
+
 .PARAMETER Action
 Probe, Onboard, or WriteMarker.
+
+.PARAMETER RecoveryKey
+The caller's run (deploy.ps1's run), so a broken channel restarts the guest at most once for it; without it, at most
+once an hour.
 
 .PARAMETER AgentSignerPatternBase64
 The required Authenticode signer subject text, Base64-encoded UTF-8 because it contains spaces and Run
@@ -74,6 +83,7 @@ param(
     [string] $IdentityClientId = '',
     [string] $Mode = 'Nested',
     [string] $AccessToken = '',
+    [string] $RecoveryKey = '',
     [string] $Root = 'C:\ProgramData\DbHubDemo'
 )
 
@@ -879,6 +889,119 @@ function Invoke-DemoArcOnboardAction {
     return $result
 }
 
+function Invoke-DemoArcOnboardWithRecovery {
+    <#
+    .SYNOPSIS
+    Runs Invoke-DemoArcOnboardAction, and when it fails with a broken PowerShell Direct channel into the guest (issue #65,
+    2026-11-18: an update's WriteMarker failed with "The Hyper-V socket target process has ended"), runs it again once,
+    after Invoke-DemoGuestRecovery: a break that's over (three probes, 10 seconds apart) only waits, and one that stays
+    restarts the guest once for the caller's run. A Probe that found the guest unreachable is checked with one probe
+    (Test-DemoGuestChannel) first. Another failure stays as it is, with no restart. The result gets guestRecovery; a
+    failure that remains says what the recovery did. Nothing changes in the evaluation-only mode, which has no guest.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Probe', 'Onboard', 'WriteMarker')]
+        [string] $ActionName,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $InputValue,
+
+        [AllowEmptyString()]
+        [string] $Token = '',
+
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string] $BundleRoot,
+
+        [AllowEmptyString()]
+        [string] $RecoveryKey = ''
+    )
+
+    $arguments = @{ ActionName = $ActionName; InputValue = $InputValue; Token = $Token; StateRoot = $StateRoot; BundleRoot = $BundleRoot }
+    if ([string]$InputValue['Mode'] -eq 'EvaluationOnlyAzureVm') {
+        return (Invoke-DemoArcOnboardAction @arguments)
+    }
+    $result = $null
+    $failure = $null
+    try {
+        $result = Invoke-DemoArcOnboardAction @arguments
+    }
+    catch {
+        $failure = $_
+    }
+    if ($null -eq $failure -and -not ($ActionName -eq 'Probe' -and -not [bool]$result['guestReachable'])) {
+        return $result
+    }
+    # A host whose installed bundle is from before #65 has no recovery functions: its failure stays as it is.
+    $recoveryCommands = @('Test-DemoGuestChannelBroken', 'Test-DemoGuestChannel', 'Get-DemoGuestRecoveryKey', 'Invoke-DemoGuestRecovery', 'Complete-DemoGuestRecoveryInterrupted')
+    if (@($recoveryCommands | Where-Object { -not (Get-Command -Name $_ -ErrorAction SilentlyContinue) }).Count -gt 0) {
+        if ($null -ne $failure) {
+            throw $failure
+        }
+        return $result
+    }
+    # Only a broken channel calls for more; another failure stays as it is.
+    $failureText = if ($null -ne $failure) { [string]$failure.Exception.Message } else { '' }
+    if ($null -ne $failure -and -not (Test-DemoGuestChannelBroken -Text $failureText)) {
+        throw $failure
+    }
+    $guestConfig = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($BundleRoot, 'vm', 'dsc', 'guest.psd1'))
+    $guestName = [string]$InputValue['MachineName']
+    if (-not $guestName) {
+        $guestName = [string]$guestConfig.Name
+    }
+    $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName ([string]$guestConfig.AdministratorName)
+    $key = Get-DemoGuestRecoveryKey -Key $RecoveryKey -Prefix 'arc'
+    $toEvidence = {
+        param([object] $Recovery, [string] $Why)
+        [ordered]@{ action = [string]$Recovery.Action; restarted = [bool]$Recovery.Restarted; recovered = [bool]$Recovery.Recovered; seconds = [int]$Recovery.Seconds; atUtc = [string]$Recovery.AtUtc; restartUtc = [string]$Recovery.RestartUtc; stoppedBy = [string]$Recovery.StoppedBy; by = [string]$Recovery.By; key = $(if ([string]$Recovery.Key) { [string]$Recovery.Key } else { $key }); reason = $Why; message = [string]$Recovery.Message; guest = $guestName }
+    }
+    $reason = $failureText
+    $recovery = $null
+    if ($null -eq $failure) {
+        # A Probe that found the guest unreachable without an error. A guest that an interrupted restart left off is
+        # started again first (review of #65); otherwise only a channel that's broken now calls for more.
+        $recovery = Complete-DemoGuestRecoveryInterrupted -Name $guestName -Credential $credential -StateRoot $StateRoot -Confirm:$false
+        if ($null -ne $recovery) {
+            $reason = [string]$recovery.Reason
+        }
+        else {
+            $probe = Test-DemoGuestChannel -Name $guestName -Credential $credential
+            if (-not $probe.Broken) {
+                return $result
+            }
+            $reason = [string]$probe.Error
+        }
+    }
+    if ($null -eq $recovery) {
+        # A break that's over by now (the user's demo, 2026-11-18: about 2 seconds) only waits for the guest to answer;
+        # one that stays restarts the guest once for this run (vu, 2026-11-18: 20 minutes and more).
+        $recovery = Invoke-DemoGuestRecovery -Name $guestName -Credential $credential -Key $key -By 'Arc onboarding' -Reason $reason -StateRoot $StateRoot -Confirm:$false
+    }
+    $evidence = & $toEvidence $recovery $reason
+    if (-not $recovery.Recovered) {
+        if ($null -ne $failure) {
+            throw ('{0} PowerShell Direct into {1} is broken. {2}' -f $failureText, $guestName, $recovery.Message)
+        }
+        $result['guestRecovery'] = $evidence
+        return $result
+    }
+    Write-DemoVmLog -Message ('Arc {0} runs again now that {1} answers over PowerShell Direct ({2}).' -f $ActionName, $guestName, $recovery.Message)
+    try {
+        $again = Invoke-DemoArcOnboardAction @arguments
+    }
+    catch {
+        $how = if ($recovery.Restarted) { ('after {0} was restarted once for this run' -f $guestName) } else { ('once {0} answered again' -f $guestName) }
+        throw ('{0} (It ran again {1}, which didn''t clear it: {2})' -f [string]$_.Exception.Message, $how, $reason)
+    }
+    $again['guestRecovery'] = $evidence
+    return $again
+}
+
 # Dot-sourcing (tests) only defines the functions.
 if ($MyInvocation.InvocationName -ne '.') {
     $exitCode = 1
@@ -924,7 +1047,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             TokenSource          = $TokenSource
             Mode                 = $Mode
         }
-        $outcome = Invoke-DemoArcOnboardAction -ActionName $Action -InputValue $values -Token $token -StateRoot $Root -BundleRoot $bundleRoot
+        $outcome = Invoke-DemoArcOnboardWithRecovery -ActionName $Action -InputValue $values -Token $token -StateRoot $Root -BundleRoot $bundleRoot -RecoveryKey $RecoveryKey
         $token = $null
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject $outcome -Compress -Depth 6))
         if ($outcome['succeeded']) {
