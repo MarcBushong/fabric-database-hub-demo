@@ -135,6 +135,10 @@ $script:DemoResourceTypes = @(
     'Microsoft.Authorization/roleAssignments'
 )
 
+# T5's types (ADR 0027): the policy checks leave them out when t5Enabled is false (Get-DemoResourceTypeList; review,
+# 2026-11-19), so a policy that denies Azure Cosmos DB doesn't stop a configuration that turned T5 off for exactly that.
+$script:DemoT5ResourceTypes = @($script:DemoResourceTypes | Where-Object { $_ -like 'Microsoft.DocumentDB/*' })
+
 # Redaction rules, applied after exact-match replacement of registered secrets.
 $script:RedactionRules = @(
     @{ Name = 'jwt'; Pattern = 'eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*'; Replacement = '[REDACTED:jwt]' }

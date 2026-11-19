@@ -121,7 +121,7 @@ function Get-DemoPolicyInventoryFingerprint {
         t1Priority    = [string]$Config['t1Priority']
         hostPriority  = [string]$Config['hostPriority']
         catalog       = Get-DemoCanonicalText -Value (Get-DemoProfile)
-        resourceTypes = @($script:DemoResourceTypes)
+        resourceTypes = @(Get-DemoResourceTypeList -Config $Config)
         assignments   = $assignmentTexts
     }
     return (Get-DemoSha256Text -Text (Get-DemoCanonicalText -Value $inputs))

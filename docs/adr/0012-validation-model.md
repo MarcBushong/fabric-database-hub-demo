@@ -90,7 +90,7 @@ Preflight reads the Azure Policy assignments that apply to the subscription, rea
 | `PREFLIGHT.POLICY.SQLPUBLIC` | A policy that turns off or denies public network access on SQL servers, and the effective `networkMode` (evidence `effectiveNetworkMode`) | Pass; Fail for an explicit `public`; Warning when the inventory is incomplete |
 | `PREFLIGHT.POLICY.SQLENTRAONLY` | A deny on SQL servers without Entra-only authentication. T3 is Entra-only by design (ADR 0009). | Pass |
 | `PREFLIGHT.POLICY.VMSIZE` | The profile's VM sizes against VM size deny rules, ignoring case, with unblocked profiles as alternatives | Pass, or Fail |
-| `PREFLIGHT.POLICY.RESOURCETYPES` | Every resource type the demo creates, including those created at run time, against type deny rules | Pass, or Fail |
+| `PREFLIGHT.POLICY.RESOURCETYPES` | Every resource type the demo creates, including those created at run time, against type deny rules; without T5's Azure Cosmos DB types when `t5Enabled` is false, and a denial of T5's types alone says to set it false (ADR 0027) | Pass, or Fail |
 | `PREFLIGHT.POLICY.DEFENDER` | Policies that deploy Defender plans; the cost estimate includes them | Warning |
 | `PREFLIGHT.POLICY.EXTENSIONS` | Policies that add VM or Arc machine extensions, and where; bootstraps must retry on Conflict | Warning |
 | `PREFLIGHT.POLICY.PUBLICIP` | Append or modify rules on public IP addresses, such as IP tags on Bastion's public IP | Warning |
