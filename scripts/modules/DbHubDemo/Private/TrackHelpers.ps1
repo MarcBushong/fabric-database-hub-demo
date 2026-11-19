@@ -1355,7 +1355,7 @@ function Invoke-DemoDeploymentTrack {
                         # The AutoLogonSecret step's note (ADR 0009): the lone LSA secret it deleted keeps the Pass; armed is a Warning.
                         $signInNote = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInNote')
                         $signInArmed = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInFound') -eq 'Armed'
-                        & $note 'DEPLOY.T1.READY' 'T1' $(if ($signInArmed) { 'Warning' } else { 'Pass' }) ('T1''s bootstrap is Ready: {0}{1}' -f $message, $(if ($signInNote) { ' ' + $signInNote } else { '' })) $(if ($signInArmed) { 'Nothing more to do: the cleanup turned automatic sign-in off. If it happens again, read docs/troubleshooting.md (the sign-in data sweep).' } else { '' })
+                        & $note 'DEPLOY.T1.READY' 'T1' $(if ($signInArmed) { 'Warning' } else { 'Pass' }) ('T1''s bootstrap is Ready: {0}{1}' -f $message, $(if ($signInNote) { ' ' + $signInNote } else { '' })) $(if ($signInArmed) { 'Nothing more to do: the cleanup turned automatic sign-in off. If it happens again, read docs/troubleshooting.md (T2: sign-in data and the Arc SQL extension).' } else { '' })
                     }
                     elseif ($state -eq 'Failed') {
                         & $note 'DEPLOY.T1.READY' 'T1' 'Fail' ('T1''s bootstrap failed: {0}' -f $message) 'Read C:\ProgramData\DbHubDemo\logs on sqlvm01 (Get-DemoVmHealth -View Full), fix the cause, then run deploy.ps1 -FromStage Artifacts.'
@@ -1620,7 +1620,7 @@ function Invoke-DemoDeploymentTrack {
                                 break
                             }
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'The build didn''t finish within the wait.'
-                            & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md.'
+                            & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md (A first run that''s slow or doesn''t finish).'
                             $outcome = 'Open'
                             break
                         }
