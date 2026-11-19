@@ -1323,6 +1323,135 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
         }
+
+        Context 'a broken PowerShell Direct channel (issue #65)' {
+            BeforeEach {
+                $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start'; Uptime = [timespan]::FromMinutes(42) }
+                $script:adapters = @([pscustomobject]@{ SwitchName = 'DbHubDemoNat' })
+                Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:guest.State; Heartbeat = $script:guest.Heartbeat; AutomaticStartAction = $script:guest.AutomaticStartAction; Uptime = $script:guest.Uptime; VMId = 'hyper-v-id' } }
+                $script:brokenText = 'The background process reported an error with the following message: "The Hyper-V socket target process has ended.".'
+                $script:probeBroken = $false
+                Mock -CommandName Test-DemoGuestChannel -MockWith { [pscustomobject]@{ Ok = -not $script:probeBroken; State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; UptimeMinutes = 42.0; Error = $(if ($script:probeBroken) { $script:brokenText } else { '' }); Broken = $script:probeBroken } }
+                $script:recovery = [pscustomobject]@{ Action = 'Restart'; Restarted = $true; Recovered = $true; Seconds = 95; Reason = $script:brokenText; By = 'the T2 relay'; Key = 'deploy-aaaaaaaaaaaa'; RestartUtc = '2026-11-18T18:52:10.0000000Z'; StoppedBy = 'Shutdown'; Message = 'arcsql01 was restarted once (a clean shutdown, 95 s) and answers over PowerShell Direct again.' }
+                Mock -CommandName Invoke-DemoGuestRecovery -MockWith { $script:probeBroken = $false; $script:recovery }
+                function New-RecoveryRoot {
+                    $root = New-ReadyRoot -Role 'ArcHost'
+                    New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'protected') -Force | Out-Null
+                    Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'protected\guest-administrator.bin') -Value 'not-a-real-secret'
+                    return $root
+                }
+            }
+
+            It 'restarts the guest once before Run all''s profile, and the run is a Warning that says what broke (live, 2026-11-18)' {
+                $script:probeBroken = $true
+                $root = New-RecoveryRoot
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet; recoveryKey = 'deploy-aaaaaaaaaaaa' }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Warning'
+                $result.message | Should -Match 'PowerShell Direct into arcsql01 was broken \(.*Hyper-V socket target process has ended.*\), so archost01 restarted arcsql01 once \(95 s\), and the command then ran\.'
+                $result.evidence.guestRecovery.restarted | Should -BeTrue
+                $result.evidence.guestRecovery.recovered | Should -BeTrue
+                $result.evidence.guestRecovery.guest | Should -Be 'arcsql01'
+                $result.evidence.guestRecovery.key | Should -Be 'deploy-aaaaaaaaaaaa'
+                Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 1 -Exactly -ParameterFilter { $Key -eq 'deploy-aaaaaaaaaaaa' -and $By -eq 'the T2 relay' }
+                @($script:guestCalls)[-1] | Should -Match '^runner profile set --name incident:cpu-pressure .* --target T2$'
+            }
+
+            It 'restarts the guest when the command meets a broken channel, and runs the command again once' {
+                $script:runnerCalls = 0
+                Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                    $text = $ScriptBlock.ToString()
+                    if ($text -match 'MSSQLSERVER') {
+                        return [pscustomobject]@{ status = 'Running'; seconds = 1; startedByScript = $false }
+                    }
+                    if ($text -match "'warmup'") {
+                        return (New-Run)
+                    }
+                    $script:runnerCalls++
+                    if ($script:runnerCalls -eq 1) {
+                        throw $script:brokenText
+                    }
+                    return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+                }
+                $root = New-RecoveryRoot
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Warning'
+                $script:runnerCalls | Should -Be 2
+                # Without the caller's key, the relay's own key allows one restart an hour.
+                Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 1 -Exactly -ParameterFilter { $Key -match '^control-\d{10}$' -and $Reason -match 'Hyper-V socket target process has ended' }
+            }
+
+            It 'stays a Fail that says why when the run already restarted the guest, and runs nothing' {
+                $script:probeBroken = $true
+                $script:recovery = [pscustomobject]@{ Action = 'Exhausted'; Restarted = $false; Recovered = $false; Seconds = 0; Reason = $script:brokenText; By = 'the T2 relay'; Key = 'deploy-aaaaaaaaaaaa'; RestartUtc = ''; StoppedBy = ''; Message = 'arcsql01 wasn''t restarted: this run already restarted the guest once, at 2026-11-18T18:52:10Z.' }
+                Mock -CommandName Invoke-DemoGuestRecovery -MockWith { $script:recovery }
+                $root = New-RecoveryRoot
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet; recoveryKey = 'deploy-aaaaaaaaaaaa' }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Fail'
+                $result.message | Should -Match 'PowerShell Direct into arcsql01 is broken \(.*target process has ended.*\)\. arcsql01 wasn''t restarted: this run already restarted the guest once'
+                $result.evidence.guestRecovery.action | Should -Be 'Exhausted'
+                Should -Invoke -CommandName Invoke-DemoControlGuestCommand -Times 0 -Exactly
+            }
+
+            It 'runs the command again, without a restart, after a break that''s over when it''s checked' {
+                $script:runnerCalls = 0
+                Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                    $text = $ScriptBlock.ToString()
+                    if ($text -match 'MSSQLSERVER') {
+                        return [pscustomobject]@{ status = 'Running'; seconds = 1; startedByScript = $false }
+                    }
+                    if ($text -match "'warmup'") {
+                        return (New-Run)
+                    }
+                    $script:runnerCalls++
+                    if ($script:runnerCalls -eq 1) {
+                        throw $script:brokenText
+                    }
+                    return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+                }
+                $script:recovery = [pscustomobject]@{ Action = 'Healed'; Restarted = $false; Recovered = $true; Seconds = 0; Reason = $script:brokenText; By = 'the T2 relay'; Key = 'deploy-aaaaaaaaaaaa'; AtUtc = '2026-11-18T18:49:26.0000000Z'; RestartUtc = ''; StoppedBy = ''; Message = 'arcsql01 answers over PowerShell Direct again.' }
+                Mock -CommandName Invoke-DemoGuestRecovery -MockWith { $script:recovery }
+                $root = New-RecoveryRoot
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet; recoveryKey = 'deploy-aaaaaaaaaaaa' }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Warning'
+                $result.message | Should -Match '^PowerShell Direct into arcsql01 broke for a moment \(.*target process has ended.*\), so the command ran once arcsql01 answered again\.'
+                $result.evidence.guestRecovery.action | Should -Be 'Healed'
+                $result.evidence.guestRecovery.atUtc | Should -Not -BeNullOrEmpty
+                $script:runnerCalls | Should -Be 2
+            }
+
+            It 'says so when the channel breaks again after the run''s restart' {
+                Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                    $text = $ScriptBlock.ToString()
+                    if ($text -match 'MSSQLSERVER') {
+                        return [pscustomobject]@{ status = 'Running'; seconds = 1; startedByScript = $false }
+                    }
+                    if ($text -match "'warmup'") {
+                        return (New-Run)
+                    }
+                    throw $script:brokenText
+                }
+                $root = New-RecoveryRoot
+                { Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet; recoveryKey = 'deploy-aaaaaaaaaaaa' }) -StateRoot $root } | Should -Throw '*target process has ended*archost01 restarted arcsql01 once for this run (95 s), and its channel broke again.*'
+                Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 1 -Exactly
+            }
+
+            It 'probes nothing before a read, or in a guest that started less than 5 minutes ago' {
+                $script:probeBroken = $true
+                $root = New-RecoveryRoot
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = @('profile', 'get', '--json') }) -StateRoot $root
+                (Get-ControlResult).status | Should -Be 'Pass'
+                $script:lines.Clear()
+                $script:guest.Uptime = [timespan]::FromMinutes(2)
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+                (Get-ControlResult).status | Should -Be 'Pass'
+                Should -Invoke -CommandName Test-DemoGuestChannel -Times 0 -Exactly
+                Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 0 -Exactly
+            }
+        }
     }
 }
 

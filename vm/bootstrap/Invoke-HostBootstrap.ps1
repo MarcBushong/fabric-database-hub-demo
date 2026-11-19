@@ -371,6 +371,11 @@ function Get-DemoHostHealthDetail {
     if ($null -ne $evaluation) {
         $detail.evaluation = [ordered]@{ checkedUtc = $evaluation['checkedUtc']; action = $evaluation['action']; reason = $evaluation['reason']; lastRearmUtc = $evaluation['lastRearmUtc'] }
     }
+    # The last restart that cleared a broken PowerShell Direct channel (issue #65); deploy.ps1 reports one from its run.
+    $recovery = Read-DemoGuestRecoveryRecord -StateRoot $Context.Root
+    if ($null -ne $recovery -and $recovery.Contains('restarts') -and @($recovery['restarts']).Count -gt 0) {
+        $detail.guestRecovery = @($recovery['restarts'])[-1]
+    }
     if ($Context.Mode -eq 'PaygWizard') {
         $detail.guidedSetup = Get-DemoHostGuidedSetupDetail -Context $Context
     }
@@ -439,6 +444,8 @@ function Invoke-DemoHostBootstrap {
         # The operator's clipboard helper for the PaygWizard step lives next to the state files.
         Copy-Item -LiteralPath ([System.IO.Path]::Combine($BundleRoot, 'vm', 'hyperv-guest', 'Copy-GuestCredential.ps1')) -Destination (Join-Path -Path $StateRoot -ChildPath 'Copy-GuestCredential.ps1') -Force
         $plan = Get-DemoHostStepPlan -Context $context
+        # A restart of the guest that its process didn't finish is finished first, so a guest it left off starts (#65).
+        Invoke-DemoHostGuestRecoveryRepair -Context $context
         if ($context.Mode -eq 'PaygWizard' -or (Test-DemoHostGuidedSetupLeftover -Context $context)) {
             # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28). In
             # any mode while an earlier guided stop's records are here (2026-11-09): a guest built in PaygWizard mode runs as
