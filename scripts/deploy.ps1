@@ -30,6 +30,11 @@ One command, one guided stop (Phase 28):
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
+- An update leaves the demo as it found it (2026-11-19): when the demo was stopped when the run began, a run that ends
+  DONE stops again what it started, through stop-demo.ps1's stop path (DEPLOY.ENDSTOP, the status page's last row), after
+  waiting for work it started that still needs the hosts (T2's first migration assessment, a bootstrap pass; at most 15
+  minutes). A new deployment, a demo that was running, a session that started meanwhile, and -KeepRunning keep it
+  running, and DONE says what it bills an hour, until when, and that ./scripts/stop-demo.ps1 stops it now.
 - The Insights app (APP_DatabaseHub_Insights) is part of every deployment. It deploys with your Azure CLI sign-in
   (az login, since 2026-11-09): each Rayfin CLI command gets a token for its own audience, so no browser opens. Only
   after Fabric refused that token in an earlier run does the Rayfin CLI's own browser sign-in (P14) start at the
@@ -174,11 +179,18 @@ deploy.ps1 starts again with the new code and the same parameters; anything else
 diverged, offline, no Git, a downloaded zip) is a Warning with the exact command, and the run goes on with the code in
 this folder (DEPLOY.SELFUPDATE, 2026-11-09). CI skips the check.
 
+.PARAMETER KeepRunning
+Leave what an update started running at its end, for a demo right after the update (2026-11-19). Without it, an update
+that found the demo stopped stops it again once it's DONE (DEPLOY.ENDSTOP). A new deployment keeps running either way.
+
 .EXAMPLE
 ./scripts/deploy.ps1
 
 .EXAMPLE
 ./scripts/deploy.ps1 -NoWaitForT2
+
+.EXAMPLE
+./scripts/deploy.ps1 -KeepRunning
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -229,7 +241,9 @@ param(
 
     [switch] $TreatManualAsError,
 
-    [switch] $NoSelfUpdate
+    [switch] $NoSelfUpdate,
+
+    [switch] $KeepRunning
 )
 
 Set-StrictMode -Version Latest
@@ -350,7 +364,7 @@ try {
         # Always one ending, even after Ctrl+C, and fast then: the model and the page say DONE or NOT DONE (Stopped, not
         # done, with the command to continue), and the PC may sleep again whatever happens (Phase 28 live finding).
         try {
-            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished)
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished) -KeepRunning:$KeepRunning
         }
         finally {
             $null = Exit-DemoKeepAwake

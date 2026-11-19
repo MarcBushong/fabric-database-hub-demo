@@ -1818,7 +1818,7 @@ function Get-DemoT4ReplicaHold {
     .DESCRIPTION
     - A session or run the control notebook started (ADR 0020, ADR 0026): its auto-stop, the one-time schedule
       dbhub-autostop in the control's Automation account, is still to come. That auto-stop deletes the replica at the
-      session's end.
+      session's end. Since 2026-11-19 a start-demo.ps1 session has one too, marked in its description: By StartDemo.
     - A session start-demo.ps1 started: the replica's DbHubSessionUntilUtc tag, the VMs' next auto-shutdown when the
       session started, is still ahead. A new replica has it from its creation (Start-DemoT4ReplicaCreate); one that was
       there already gets it from Set-DemoT4ReplicaHold. The tag goes with the replica, which stop-demo.ps1 and a
@@ -1848,9 +1848,12 @@ function Get-DemoT4ReplicaHold {
         $url = Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
         $schedule = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url $url
         if ($schedule.Ok) {
-            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+            $properties = Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties'
+            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
             if ($null -ne $stopUtc -and $stopUtc -gt $now) {
-                return [pscustomobject]@{ Held = $true; By = 'Control'; UntilUtc = $stopUtc; Error = '' }
+                # A start-demo.ps1 session's own auto-stop (2026-11-19) is the same schedule, marked in its description.
+                $startDemo = ([string](Get-DemoMemberValue -InputObject $properties -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+                return [pscustomobject]@{ Held = $true; By = $(if ($startDemo) { 'StartDemo' } else { 'Control' }); UntilUtc = $stopUtc; Error = '' }
             }
         }
         elseif (-not $schedule.Missing) {

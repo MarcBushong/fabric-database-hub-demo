@@ -96,6 +96,14 @@ BeforeAll {
         return $secure
     }
 
+    # A schedule's startTime as the fake stores it: ConvertFrom-Json turns an ISO 8601 time into a DateTime already.
+    function ConvertTo-FakeUtc([object] $Value) {
+        if ($Value -is [datetime]) {
+            return $Value.ToUniversalTime()
+        }
+        return ([DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+    }
+
     # The fake Azure Resource Manager behind 'az rest'. -Query is what --url-parameters carried.
     function Invoke-FakeArm([string] $Method, [string] $Url, [string] $Body, [string] $Query = '') {
         $path = ([uri]$Url).AbsolutePath
@@ -180,6 +188,18 @@ BeforeAll {
                 }
                 return (New-AzResult -StdOut '{"name":"aa-dbhub-control"}')
             }
+            '/runbooks/DbHub-Control/content$' {
+                # The published DbHub-Control's content (Runbook - Get Content, 2026-11-19): with the start-demo.ps1 marker
+                # unless $script:controlRunbookOld (published before 2026-11-19), or missing.
+                if ($script:controlRunbookMissing) {
+                    return (Get-NotFound 'DbHub-Control')
+                }
+                $text = "<#`n.SYNOPSIS`nThe DbHub-Control runbook.`n#>`n"
+                if (-not $script:controlRunbookOld) {
+                    $text += "`$script:DbHubStartDemoMarker = '[start-demo.ps1]'`n"
+                }
+                return (New-AzResult -StdOut ($text + "function Get-DbHubActiveRun { }`n"))
+            }
             '/runbooks/(DbHub-Control|DbHub-Stop|DbHub-Monitor)$' {
                 return (New-AzResult -StdOut '{"properties":{"state":"Published"}}')
             }
@@ -229,23 +249,39 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/schedules/dbhub-autostop-backup$' {
-                # A control session's backup auto-stop (ADR 0026).
+                # A control session's backup auto-stop (ADR 0026), and a start-demo.ps1 session's (2026-11-19).
                 if ($Method -eq 'delete' -and $script:backupDeleteFails) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to delete the schedule.')
+                }
+                if ($Method -eq 'put') {
+                    $properties = ($Body | ConvertFrom-Json -AsHashtable)['properties']
+                    $script:backupStop = ConvertTo-FakeUtc $properties['startTime']
+                    $script:backupDescription = [string]$properties['description']
+                    return (New-AzResult -StdOut '{}')
                 }
                 if (-not $script:backupStop) {
                     return (Get-NotFound 'dbhub-autostop-backup')
                 }
-                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backupStop.ToString('o') } }))
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backupStop.ToString('o'); description = $script:backupDescription } }))
             }
             '/schedules/dbhub-autostop$' {
                 if ($Method -eq 'delete' -and $script:autoStopDeleteFails) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to delete the schedule.')
                 }
+                if ($Method -eq 'put') {
+                    # start-demo.ps1's own auto-stop (2026-11-19): what it wrote is what a later read returns.
+                    if ($script:autoStopPutFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to write the schedule.')
+                    }
+                    $properties = ($Body | ConvertFrom-Json -AsHashtable)['properties']
+                    $script:autoStop = ConvertTo-FakeUtc $properties['startTime']
+                    $script:autoStopDescription = [string]$properties['description']
+                    return (New-AzResult -StdOut '{}')
+                }
                 if (-not $script:autoStop) {
                     return (Get-NotFound 'dbhub-autostop')
                 }
-                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autoStop.ToString('o') } }))
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autoStop.ToString('o'); description = $script:autoStopDescription } }))
             }
             '/schedules/dbhub-t4-safety-stop$' {
                 if ($script:safetyStopReadFails) {
@@ -331,8 +367,13 @@ BeforeAll {
         $script:webhookExpiry = [datetime]::new(2027, 1, 25, 15, 0, 0, [System.DateTimeKind]::Utc)
         $script:webhookUrl = ''
         $script:autoStop = $null
+        $script:autoStopDescription = ''
         $script:autoStopDeleteFails = $false
+        $script:autoStopPutFails = $false
+        $script:controlRunbookOld = $false
+        $script:controlRunbookMissing = $false
         $script:backupStop = $null
+        $script:backupDescription = ''
         $script:backupDeleteFails = $false
         $script:monitorSchedules = @()
         $script:stopJobStates = @()
@@ -1800,19 +1841,210 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         $fromModule | Should -Contain 'Running'
     }
 
-    It 'stop-demo.ps1 warns when it can''t remove the auto-stop, and says start-demo.ps1 cancels it at the next start' {
+    It 'stop-demo.ps1 warns when it can''t remove the auto-stop, and says start-demo.ps1 replaces it at the next start' {
         $script:autoStop = $script:now.AddMinutes(30)
         $script:autoStopDeleteFails = $true
         $result = Invoke-Clear -Purpose Stop
         $result.checkId | Should -Be 'STOP.CONTROL.AUTOSTOP'
         $result.status | Should -Be 'Warning'
-        $result.message | Should -Match 'start-demo\.ps1 cancels it when the next session starts'
+        $result.message | Should -Match 'The pending on-demand auto-stop couldn''t be removed'
+        $result.message | Should -Match 'start-demo\.ps1 replaces it when the next session starts'
         $result.remediation | Should -Match 'run stop-demo\.ps1 again'
+    }
+
+    It 'stop-demo.ps1 removes a start-demo.ps1 session''s auto-stop and its backup, and says whose it was (2026-11-19)' {
+        $script:autoStop = $script:now.AddHours(3)
+        $script:autoStopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T14:00:00Z.'
+        $script:backupStop = $script:now.AddHours(3.5)
+        $result = Invoke-Clear -Purpose Stop
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match '^The pending start-demo\.ps1 session''s auto-stop was removed; stop-demo\.ps1 stops the demo itself\. The session''s backup auto-stop dbhub-autostop-backup was removed too\.$'
+        Get-Deleted | Should -Contain 'dbhub-autostop'
+        Get-Deleted | Should -Contain 'dbhub-autostop-backup'
     }
 
     It 'is called by Stop-DemoEnvironment for a full stop with the control on, and not for -ParkT2' {
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1') -Raw
         $text | Should -Match 'if \(-not \$ParkT2 -and \(Get-DemoActivityControlSetting -Config \$Config\)\.Enabled\) \{\s+#[^\n]*\n\s+\$results\.Add\(\(Clear-DemoActivityControlAutoStop -Config \$Config -Confirm:\$false\)\)'
+    }
+}
+
+Describe 'start-demo.ps1''s auto-stop (Register-DemoActivityControlAutoStop, 2026-11-19)' {
+    BeforeEach {
+        Reset-FakeAzure
+        $script:logs = [System.Collections.Generic.List[string]]::new()
+        Register-FakeAzure
+        Initialize-GuardTestContext -ObjectId $script:callerId
+        # 15:00 UTC is 11:00 on the VMs' clock (Eastern, daylight saving time); the nightly stop is at 19:00 there.
+        $script:now = [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)
+        $name = Get-ControlName (New-ControlConfig)
+        # A1: the session control's identity holds its role at the demo resource group, so DbHub-Stop can stop the demo.
+        $role = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $script:customRoleId
+        $script:assignments.Add([pscustomobject]@{ name = '1'; scope = $name.DemoResourceGroupId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
+        function Invoke-Register([double] $Hours = 4, [int] $WarmUpMinutes = 0, [switch] $DryRun) {
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig); Hours = $Hours; WarmUp = $WarmUpMinutes; Now = $script:now; DryRun = [bool]$DryRun } {
+                Register-DemoActivityControlAutoStop -Config $Config -Hours $Hours -WarmUpMinutes $WarmUp -NowUtc $Now -ConfigPath './config/demo.config.json' -WhatIf:$DryRun -Confirm:$false
+            }
+        }
+        function Get-Write([string] $Method, [string] $Pattern) {
+            @($script:rest | Where-Object { $_.Method -eq $Method -and ([uri]$_.Url).AbsolutePath -match $Pattern })
+        }
+    }
+
+    It 'schedules dbhub-autostop 4 hours after the start, linked to DbHub-Stop for the whole demo, with a backup 30 minutes later, and says when the demo stops' {
+        $results = @(Invoke-Register)
+        $results.Count | Should -Be 1
+        $results[0].checkId | Should -Be 'START.CONTROL.AUTOSTOP'
+        $results[0].status | Should -Be 'Pass'
+        $results[0].message | Should -Match '^The demo stops by itself at 15:00 \(Eastern Standard Time\), 4 hours after this start: its auto-stop deallocates the VMs, stops T4'
+        $results[0].message | Should -Match 'running \./scripts/start-demo\.ps1 again starts the hours over \(-Hours sets them\); Run all or the Insights app''s Start replaces it with its own plan\.$'
+        $script:autoStop | Should -Be ([datetime]::new(2026, 10, 27, 19, 0, 0, [System.DateTimeKind]::Utc))
+        $script:autoStopDescription.StartsWith('[start-demo.ps1] Stops the demo 4 hours after this start', [System.StringComparison]::Ordinal) | Should -BeTrue
+        $schedule = (Get-Write 'put' '/schedules/dbhub-autostop$')[0].Body
+        $schedule | Should -Match '"frequency":\s*"OneTime"'
+        $schedule | Should -Match '"timeZone":\s*"UTC"'
+        $schedule | Should -Match '"startTime":\s*"2026-10-27T19:00:00Z"'
+        $links = @(Get-Write 'put' '/jobSchedules/[0-9a-f-]{36}$' | ForEach-Object { ($_.Body | ConvertFrom-Json -AsHashtable)['properties'] })
+        @($links | ForEach-Object { $_['schedule']['name'] }) | Should -Be @('dbhub-autostop', 'dbhub-autostop-backup')
+        @($links | ForEach-Object { $_['runbook']['name'] }) | Should -Be @('DbHub-Stop', 'DbHub-Stop')
+        @($links | ForEach-Object { $_['parameters']['Scope'] }) | Should -Be @('All', 'All')
+        $script:backupStop | Should -Be ([datetime]::new(2026, 10, 27, 19, 30, 0, [System.DateTimeKind]::Utc))
+        $script:backupDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
+        @($script:rest | Where-Object Method -EQ 'delete') | Should -BeNullOrEmpty -Because 'no auto-stop was pending'
+    }
+
+    It 'counts <Span> from <From>, and says so when the nightly stop comes first' -ForEach @(
+        @{ Hours = 2.5; WarmUp = 0; From = 'this start'; Span = '2.5 hours'; Utc = [datetime]::new(2026, 10, 27, 17, 30, 0, [System.DateTimeKind]::Utc); Clock = '13:30'; First = $false }
+        @{ Hours = 0.5; WarmUp = 0; From = 'this start'; Span = '30 minutes'; Utc = [datetime]::new(2026, 10, 27, 15, 30, 0, [System.DateTimeKind]::Utc); Clock = '11:30'; First = $false }
+        @{ Hours = 4; WarmUp = 30; From = 'the warm-up'; Span = '4 hours'; Utc = [datetime]::new(2026, 10, 27, 19, 30, 0, [System.DateTimeKind]::Utc); Clock = '15:30'; First = $false }
+        @{ Hours = 10; WarmUp = 0; From = 'this start'; Span = '10 hours'; Utc = [datetime]::new(2026, 10, 28, 1, 0, 0, [System.DateTimeKind]::Utc); Clock = '21:00'; First = $true }
+    ) {
+        $result = @(Invoke-Register -Hours $Hours -WarmUpMinutes $WarmUp)[0]
+        $result.status | Should -Be 'Pass'
+        $script:autoStop | Should -Be $Utc
+        $result.message | Should -Match ('^The demo stops by itself at {0} \(Eastern Standard Time\), {1} after {2}: ' -f $Clock, [regex]::Escape($Span), $From)
+        if ($First) {
+            $result.message | Should -Match 'The nightly stop at 19:00 \(Eastern Standard Time\) comes first and stops the demo then: start-demo\.ps1 sets no busy marker'
+        }
+        else {
+            $result.message | Should -Not -Match 'comes first'
+        }
+    }
+
+    It 'replaces <Whose> pending auto-stop, with its backup and its monitoring re-checks: the newer session''s plan wins' -ForEach @(
+        @{ Whose = 'a Run all session''s'; Description = 'Stops the demo at the end of the run.'; Text = 'the auto-stop of a session from the control notebook' }
+        @{ Whose = 'an earlier start-demo.ps1 session''s'; Description = '[start-demo.ps1] Stops the demo 4 hours after this start.'; Text = 'an earlier start-demo.ps1 session''s auto-stop' }
+    ) {
+        $script:autoStop = $script:now.AddMinutes(90)
+        $script:autoStopDescription = $Description
+        $script:backupStop = $script:now.AddMinutes(120)
+        $script:monitorSchedules = @('dbhub-monitor-1')
+        $result = @(Invoke-Register)[0]
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('It replaces {0}, which was due 12:30 \(Eastern Standard Time\): the newer session''s plan wins\.' -f [regex]::Escape($Text))
+        $deleted = @($script:rest | Where-Object Method -EQ 'delete' | ForEach-Object { ([uri]$_.Url).AbsolutePath.Split('/')[-1] })
+        $deleted | Should -Contain 'dbhub-autostop-backup'
+        $deleted | Should -Contain 'dbhub-monitor-1'
+        $deleted | Should -Contain 'dbhub-autostop'
+        $deleted | Should -Contain 'ffffffff-0000-0000-0000-000000000007'
+        $lastDelete = [array]::FindLastIndex($script:rest.ToArray(), [Predicate[object]] { param($call) $call.Method -eq 'delete' })
+        $firstPut = [array]::FindIndex($script:rest.ToArray(), [Predicate[object]] { param($call) $call.Method -eq 'put' })
+        $lastDelete | Should -BeLessThan $firstPut -Because 'the earlier auto-stop goes before the new one is written'
+        $script:autoStop | Should -Be ([datetime]::new(2026, 10, 27, 19, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'without the session control''s role, schedules nothing, removes an earlier session''s pending auto-stop, and warns that the nightly stop is the limit, with the grant' {
+        # A Contributor's environment before an Owner's grant: A1 is missing, so DbHub-Stop couldn't stop anything.
+        $script:assignments.Clear()
+        $script:autoStop = $script:now.AddMinutes(90)
+        $results = @(Invoke-Register)
+        $results.Count | Should -Be 1
+        $results[0].status | Should -Be 'Warning'
+        $results[0].message | Should -Match '^The demo doesn''t stop by itself after this session: the session control''s identity .+ doesn''t hold its role .+ yet'
+        $results[0].message | Should -Match 'It runs until \./scripts/stop-demo\.ps1 or the nightly stop at 19:00 \(Eastern Standard Time\)\.'
+        $results[0].message | Should -Match 'An earlier session''s auto-stop \(due 12:30 \(Eastern Standard Time\)\) was removed, so it doesn''t cut this session off\.$'
+        $results[0].remediation | Should -Match ([regex]::Escape('An Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
+        @(Get-Write 'put' '/(schedules|jobSchedules)/') | Should -BeNullOrEmpty
+        @(Get-Write 'delete' '/schedules/dbhub-autostop$').Count | Should -Be 1
+    }
+
+    It 'schedules it anyway when whether the role is held can''t be read, with a Warning that the nightly stop is the limit if it''s missing' {
+        $script:roleReadFails = $true
+        $result = @(Invoke-Register)[0]
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The demo stops by itself at 15:00 \(Eastern Standard Time\)'
+        $result.message | Should -Match 'Note: the session control''s role couldn''t be read .*; if the role is missing, the auto-stop''s job fails, and the nightly stop at 19:00 \(Eastern Standard Time\) stops the demo\.$'
+        $result.remediation | Should -Match 'grant-safety-stop\.ps1'
+        $script:autoStop | Should -Be ([datetime]::new(2026, 10, 27, 19, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'warns, links nothing, and lets the start carry on when the schedule can''t be written' {
+        $script:autoStopPutFails = $true
+        $result = @(Invoke-Register)[0]
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The demo doesn''t stop by itself after this session: its schedule couldn''t be written \(.*AuthorizationFailed'
+        $result.message | Should -Match 'the nightly stop at 19:00'
+        @(Get-Write 'put' '/jobSchedules/') | Should -BeNullOrEmpty
+    }
+
+    It 'waits for a stop job in flight before it schedules anything, and returns both results' {
+        $script:stopJobStates = @('Running', 'Completed')
+        $results = @(Invoke-Register)
+        @($results | ForEach-Object checkId) | Should -Be @('START.CONTROL.AUTOSTOP', 'START.CONTROL.STOPJOB')
+        $results[0].status | Should -Be 'Pass'
+        $results[1].status | Should -Be 'Pass'
+    }
+
+    It 'does what it did before, with deploy.ps1 as the fix, while the published DbHub-Control <Case> (an update of the scripts before deploy.ps1)' -ForEach @(
+        @{ Case = 'is from before 2026-11-19'; Old = $true; Missing = $false; Match = 'the session control''s runbook DbHub-Control is from before 2026-11-19, so a Run all would be refused until the auto-stop''s time' }
+        @{ Case = 'isn''t published'; Old = $false; Missing = $true; Match = 'the session control''s runbook DbHub-Control isn''t published' }
+    ) {
+        # An older DbHub-Control counts any pending auto-stop as an active run, so Run all would be refused until its time.
+        $script:controlRunbookOld = $Old
+        $script:controlRunbookMissing = $Missing
+        $script:autoStop = $script:now.AddMinutes(90)
+        $script:stopJobStates = @('Running', 'Completed')
+        $results = @(Invoke-Register)
+        @($results | ForEach-Object checkId) | Should -Be @('START.CONTROL.AUTOSTOP', 'START.CONTROL.STOPJOB') -Because 'a stop job in flight is still waited for, as before'
+        $results[0].status | Should -Be 'Warning'
+        $results[0].message | Should -Match ('^The demo doesn''t stop by itself after this session: {0}\. It runs until \./scripts/stop-demo\.ps1 or the nightly stop at 19:00 \(Eastern Standard Time\)\.' -f $Match)
+        $results[0].message | Should -Match 'An earlier session''s auto-stop \(due 12:30 \(Eastern Standard Time\)\) was removed, so it doesn''t cut this session off\.$'
+        $results[0].remediation | Should -Match '^Run \./scripts/deploy\.ps1: it publishes the current runbooks\.'
+        @(Get-Write 'put' '/(schedules|jobSchedules)/') | Should -BeNullOrEmpty
+        @(Get-Write 'delete' '/schedules/dbhub-autostop$').Count | Should -Be 1
+    }
+
+    It 'knows a current DbHub-Control by the variable that holds the marker in the runbooks'' code' {
+        $runbook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1') -Raw
+        $token = InModuleScope -ModuleName DbHubDemo { $script:ActivityControlStartDemoRunbookToken }
+        $runbook.Contains(('{0} = ' -f $token)) | Should -BeTrue
+        (InModuleScope -ModuleName DbHubDemo -Parameters @{ Name = $name } { Test-DemoActivityControlStartDemoRunbook -Name $Name }).Current | Should -BeTrue
+        $script:controlRunbookOld = $true
+        (InModuleScope -ModuleName DbHubDemo -Parameters @{ Name = $name } { Test-DemoActivityControlStartDemoRunbook -Name $Name }).Current | Should -BeFalse
+    }
+
+    It 'changes nothing with -WhatIf' {
+        $script:autoStop = $script:now.AddMinutes(90)
+        $results = @(Invoke-Register -DryRun)
+        $results.Count | Should -Be 1
+        $results[0].status | Should -Be 'Not selected'
+        $results[0].message | Should -Be 'What if: the demo''s auto-stop would be scheduled 4 hours after this start (dbhub-autostop).'
+        @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
+    }
+
+    It 'marks its schedule the way the runbooks read it, so a later Run all replaces it' {
+        $runbook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1') -Raw
+        $found = $runbook -match '\$script:DbHubStartDemoMarker = ''(?<marker>[^'']+)'''
+        $marker = $Matches['marker']
+        $found | Should -BeTrue
+        (InModuleScope -ModuleName DbHubDemo { $script:ActivityControlStartDemoMarker }) | Should -BeExactly $marker
+    }
+
+    It 'is what Start-DemoEnvironment calls before the VMs start, with -AutoStopHours, and start-demo.ps1 passes -Hours' {
+        $start = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Public/Start-DemoEnvironment.ps1') -Raw
+        $start | Should -Match 'Register-DemoActivityControlAutoStop -Config \$Config -Hours \$AutoStopHours'
+        $script = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -Raw
+        $script | Should -Match '-AutoStopHours \$Hours'
     }
 }
 

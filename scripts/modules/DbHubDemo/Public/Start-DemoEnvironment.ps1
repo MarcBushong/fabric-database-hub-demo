@@ -30,12 +30,15 @@ function Start-DemoEnvironment {
        Running, or when no fresh status comes, and checks for Running and OK.
        A one-time host password left from an earlier session that couldn't be rotated is rotated now, unless
        -Interactive; with the Key Vault opt-in, the vault's copy is disabled too (START.KEYVAULT.CLEANUP).
-       Before the VMs start, with the on-demand activity control (control.enabled, ADR 0020), a pending auto-stop
-       of a notebook run is cancelled, because this session takes over: a Warning says the VMs now run until
-       stop-demo.ps1 or the nightly auto-shutdown (START.CONTROL.AUTOSTOP). When it can't be cancelled, the
-       Warning gives the pending stop's time and how to cancel it, and the start carries on. A DbHub-Stop job
-       that's queued or running is waited for, up to 10 minutes, and never stopped (START.CONTROL.STOPJOB): a Pass
-       when it finishes; a Warning when it's still running after the wait or its state can't be read.
+       Before the VMs start, the session's auto-stop is scheduled (2026-11-19, Register-DemoActivityControlAutoStop,
+       START.CONTROL.AUTOSTOP): the same one-time schedule a Run all session uses (dbhub-autostop, linked to DbHub-Stop),
+       -AutoStopHours (4) after this start, or after the warm-up it waits for, so a forgotten session stops by itself; it
+       replaces a pending one from an earlier session (the newer session's plan wins), and a later Run all or the Insights
+       app's Start replaces it in turn. The result says when the demo stops, the nightly stop included. Without the session
+       control's role (A1, before an Owner's grant) it isn't scheduled: a Warning says the nightly stop is the limit, with
+       the grant. A DbHub-Stop job that's queued or running is waited for first, up to 10 minutes, and never stopped
+       (START.CONTROL.STOPJOB): a Pass when it finishes; a Warning when it's still running after the wait or its state
+       can't be read.
        With fabric.manageCapacity true (Phase 26b, ADR 0023), the Fabric capacity in fabric.capacityName is resumed
        when it's Paused and recorded in the group's DbHubFabricCapacityResumed tag, so stop-demo.ps1 pauses only what
        the demo resumed (START.FABRIC.CAPACITY; Resume-DemoFabricCapacity). With false, the default, it's Not selected
@@ -136,6 +139,10 @@ function Start-DemoEnvironment {
     VMs whose switch from the interim baseline the caller makes itself, after Run Commands it still sends them
     (start-demo.ps1 with -Interactive -ResetAdminPassword holds archost01 for the host password).
 
+    .PARAMETER AutoStopHours
+    Hours after this start (after the warm-up with -WaitForWarmUp) when the session's auto-stop stops the demo (default 4,
+    2026-11-19); start-demo.ps1 -Hours.
+
     .EXAMPLE
     Start-DemoEnvironment -Config $config -WarmUpMinutes 30
     #>
@@ -177,7 +184,10 @@ function Start-DemoEnvironment {
 
         [AllowEmptyCollection()]
         [ValidateSet('sqlvm01', 'archost01')]
-        [string[]] $HoldActivitySwitchVm = @()
+        [string[]] $HoldActivitySwitchVm = @(),
+
+        [ValidateRange(0.5, 24)]
+        [double] $AutoStopHours = 4
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -225,17 +235,18 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.DEMO' -Area 'infra' -Target 'subscription' -Status 'Not selected' -Message 'What if: nothing was started.'))
         return $results.ToArray()
     }
-    # A local session takes over from an on-demand run (ADR 0020): the run's pending auto-stop would deallocate this
-    # session's VMs, so it's cancelled first, with a Warning, and a stop job already in flight is waited for. Nothing
-    # here stops the start.
+    # start-demo.ps1's auto-stop (2026-11-19): the session stops by itself -AutoStopHours after this start, or after the
+    # warm-up it waits for, through the same one-time schedule a Run all session uses (dbhub-autostop), which replaces an
+    # earlier session's: the newer session's plan wins. A stop job already in flight is waited for first. Without the
+    # session control's role it isn't scheduled, with a Warning: the nightly stop is the limit. Nothing here stops the start.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         try {
-            foreach ($item in @(Clear-DemoActivityControlAutoStop -Config $Config -Purpose Start -Confirm:$false)) {
+            foreach ($item in @(Register-DemoActivityControlAutoStop -Config $Config -Hours $AutoStopHours -WarmUpMinutes $(if ($WaitForWarmUp) { $WarmUpMinutes } else { 0 }) -Confirm:$false)) {
                 $results.Add($item)
             }
         }
         catch {
-            $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A pending on-demand auto-stop couldn''t be checked: {0}. If one is pending, it deallocates the VMs at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). To cancel it, delete the schedule dbhub-autostop in the control Automation account aa-<prefix>-control (Shared resources > Schedules) in the Azure portal, or run start-demo.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/delete'))
+            $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The demo''s auto-stop couldn''t be scheduled: {0}. The demo runs until ./scripts/stop-demo.ps1 or the nightly stop, and a pending one from an earlier session stops it at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). Run start-demo.ps1 again to schedule it; run stop-demo.ps1 when the session ends.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/create-or-update'))
         }
     }
     # The busy marker (2026-11-14): this session takes over from a run the nightly stop waited for, so the deferred pass

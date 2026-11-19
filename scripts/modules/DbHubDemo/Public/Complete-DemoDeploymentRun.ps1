@@ -18,6 +18,12 @@ function Complete-DemoDeploymentRun {
     throws: a run that can't be judged is NOT DONE. The Insights app's sign-in, when it still runs because the run ended
     before it settled (Start-DemoFabricAppSignIn), is ended too.
 
+    Once the run is judged, the stop at the end of an update (2026-11-19, Invoke-DemoUpdateEndStop): a run that ends DONE
+    and found its demo stopped stops again what it started, through stop-demo.ps1's stop path, unless -KeepRunning or a
+    session uses the demo now. DEPLOY.ENDSTOP (Pass, Warning, or Not selected; never NOT DONE) goes into Added, and DONE gets
+    one line: what was stopped, or what bills an hour, until when, and how to stop it now. A stopped demo needs no nightly
+    stop tonight, so DONE leaves out DEPLOY.NIGHTLYSTOP's note then. The run's minutes count the stop.
+
     .PARAMETER Run
     What Start-DemoDeploymentRun returned.
 
@@ -56,6 +62,9 @@ function Complete-DemoDeploymentRun {
     demo stops tonight, which DONE and NOT DONE say too; a stopped run only clears the marker. The outcome's Added holds
     what the ending added to the run's results.
 
+    .PARAMETER KeepRunning
+    deploy.ps1 -KeepRunning (2026-11-19): an update that found the demo stopped leaves what it started running.
+
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
     #>
@@ -83,7 +92,9 @@ function Complete-DemoDeploymentRun {
 
         [switch] $Sequential,
 
-        [switch] $Stopped
+        [switch] $Stopped,
+
+        [switch] $KeepRunning
     )
 
     $wasStopped = [bool]$Stopped -or (-not $WhatIfRun -and (Test-DemoRunCancelled))
@@ -181,10 +192,45 @@ function Complete-DemoDeploymentRun {
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; NonBlocking = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
     }
+    # The stop at the end of an update (2026-11-19): an update leaves the demo as it found it. Never in DONE's way: the outcome
+    # is judged already, and DEPLOY.ENDSTOP is Pass, Warning, or Not selected. A run that isn't DONE, a stopped one, or a
+    # what-if only gets its status page row, with no Azure call.
+    $added = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($busyResults)) {
+        $added.Add($item)
+    }
+    $endStop = $null
+    try {
+        $endStop = Invoke-DemoUpdateEndStop -Config $Config -Result @($Result) -Model $model -State $judgedState -OutcomeKind ([string]$outcome.Kind) -KeepRunning:$KeepRunning -Stopped:$wasStopped -ProgressPath ([string]$Run.ProgressPath) -Confirm:$false
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The stop at the end of this run didn''t run: {0}. ./scripts/stop-demo.ps1 stops the demo now.' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if ($null -ne $endStop -and $null -ne $endStop.Result) {
+        $added.Add($endStop.Result)
+        if ([string]$outcome.Kind -eq 'Done' -and $null -ne $outcome.PSObject.Properties['Notes']) {
+            # Get-DemoMemberValue returns the notes array whole: assigned first, then each note is its own item.
+            $doneNotes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
+            $kept = @(@($doneNotes) | Where-Object { $_ })
+            if ([bool]$endStop.Stopped) {
+                # Stopped now, so tonight's nightly stop has nothing left to wait for (Stop-DemoEnvironment settled it).
+                $busyNote = Get-DemoBusyMarkerNote -Result @($Result)
+                if ($busyNote) {
+                    $kept = @($kept | Where-Object { [string]$_ -ne $busyNote })
+                    Set-DemoProgressStep -Path ([string]$Run.ProgressPath) -Id 'NightlyStop' -State 'Done' -Status 'Pass' -Message 'Not needed tonight any more: this update stopped the demo at its end (Stop at the end), which put the nightly stop back as usual.'
+                }
+            }
+            if ([string]$endStop.Line) {
+                $kept = @($kept) + @([string]$endStop.Line)
+            }
+            $outcome.Notes = [string[]]@($kept)
+        }
+    }
     $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
     $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
-    # What the ending added to the run's results (DEPLOY.NIGHTLYSTOP), for deploy.ps1's report and out/deploy.jsonl.
-    $outcome | Add-Member -NotePropertyName 'Added' -NotePropertyValue @($busyResults) -Force
+    # What the ending added to the run's results (DEPLOY.NIGHTLYSTOP, DEPLOY.ENDSTOP), for deploy.ps1's report and
+    # out/deploy.jsonl.
+    $outcome | Add-Member -NotePropertyName 'Added' -NotePropertyValue $added.ToArray() -Force
     # What runs now, and how to choose the other profile: DONE's "Activity:" line, on the console and the status page.
     $activityLine = ''
     try {

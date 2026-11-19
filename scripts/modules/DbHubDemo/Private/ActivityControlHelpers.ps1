@@ -91,6 +91,13 @@ $script:ActivityControlDoc = 'https://learn.microsoft.com/azure/automation/autom
 # the REST API has no Queued status, so a queued job is New or Activating
 # (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account).
 $script:ActivityControlActiveJobStatuses = @('New', 'Activating', 'Running', 'Resuming', 'Blocked', 'Stopping', 'Suspending')
+# start-demo.ps1's auto-stop (2026-11-19): the same one-time schedule dbhub-autostop as a session's, whose description begins
+# with this marker, so the control's runbook lets a later Run all, the Insights app's Start, or a run replace it with its own
+# plan ($script:DbHubStartDemoMarker in DbHubControl.Common.ps1, which must match), and status.ps1 says whose it is.
+$script:ActivityControlStartDemoMarker = '[start-demo.ps1]'
+# How start-demo.ps1 tells that the published DbHub-Control knows that marker (Test-DemoActivityControlStartDemoRunbook):
+# the variable that holds it in DbHubControl.Common.ps1.
+$script:ActivityControlStartDemoRunbookToken = '$script:DbHubStartDemoMarker'
 
 function Get-DemoActivityControlList {
     <#
@@ -2646,6 +2653,8 @@ function Clear-DemoActivityControlAutoStop {
     stop-demo.ps1's and start-demo.ps1's part of the on-demand activity control (ADR 0020): removes a pending
     auto-stop (the one-time schedule dbhub-autostop and its links to DbHub-Stop, with the run's monitoring re-checks
     dbhub-monitor-<n> and their links to DbHub-Monitor), and for a start, waits for a stop job in flight. Internal.
+    Since 2026-11-19 start-demo.ps1 schedules its own auto-stop instead (Register-DemoActivityControlAutoStop), and
+    stop-demo.ps1 removes it here like any other.
     https://learn.microsoft.com/rest/api/automation/schedule/delete
     https://learn.microsoft.com/rest/api/automation/job-schedule/delete
 
@@ -2760,11 +2769,13 @@ function Clear-DemoActivityControlAutoStop {
         }
         $deleted = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id $scheduleId -ApiVersion $version)
         $removed = $deleted.Ok -or $deleted.Missing
+        # Whose it was (2026-11-19): a start-demo.ps1 session's own auto-stop, or a run's from the control notebook.
+        $whose = if (([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)) { 'start-demo.ps1 session''s' } else { 'on-demand' }
         if ($Purpose -eq 'Stop') {
             if ($removed) {
-                return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'The pending on-demand auto-stop was removed; stop-demo.ps1 stops the demo itself.' -Evidence $evidence -DocUrl $doc))
+                return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The pending {0} auto-stop was removed; stop-demo.ps1 stops the demo itself.' -f $whose) -Evidence $evidence -DocUrl $doc))
             }
-            return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The pending on-demand auto-stop couldn''t be removed: {0}. It deallocates the VMs at its time; start-demo.ps1 cancels it when the next session starts.' -f $deleted.Error) -Evidence $evidence -Remediation $cancel -DocUrl $doc))
+            return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The pending {0} auto-stop couldn''t be removed: {1}. It deallocates the VMs at its time; start-demo.ps1 replaces it when the next session starts.' -f $whose, $deleted.Error) -Evidence $evidence -Remediation $cancel -DocUrl $doc))
         }
         if ($removed) {
             $result = New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('An on-demand run''s auto-stop was cancelled; the VMs now run until stop-demo.ps1 or {0}.' -f $until) -Evidence $evidence -Remediation 'Run stop-demo.ps1 when the session ends.' -DocUrl $doc
@@ -2828,6 +2839,384 @@ function Clear-DemoActivityControlBackupStop {
     catch {
         return [pscustomobject]@{ Found = $true; Removed = $false; Error = (Protect-DemoText -Text $_.Exception.Message) }
     }
+}
+
+function Get-DemoActivityControlAutoStopState {
+    <#
+    .SYNOPSIS
+    The pending auto-stop, the one-time schedule dbhub-autostop in the control's Automation account (2026-11-19): Ok (read,
+    or not there), Exists, StartUtc, StartDemo (start-demo.ps1 scheduled it: its description begins with
+    [start-demo.ps1]), and Error. Read-only; never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/schedule/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name
+    )
+
+    $none = [pscustomobject]@{ Ok = $true; Exists = $false; StartUtc = $null; StartDemo = $false; Error = '' }
+    try {
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $Name.AutomationAccountId, $Name.AutoStopSchedule) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts'))
+    }
+    catch {
+        $none.Ok = $false
+        $none.Error = Protect-DemoText -Text $_.Exception.Message
+        return $none
+    }
+    if (-not $read.Ok) {
+        $none.Ok = [bool]$read.Missing
+        $none.Error = $(if ($read.Missing) { '' } else { [string]$read.Error })
+        return $none
+    }
+    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+    $description = [string](Get-DemoMemberValue -InputObject $properties -Name 'description')
+    return [pscustomobject]@{
+        Ok        = $true
+        Exists    = $true
+        StartUtc  = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
+        StartDemo = $description.StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+        Error     = ''
+    }
+}
+
+function Test-DemoActivityControlStopRole {
+    <#
+    .SYNOPSIS
+    Whether DbHub-Stop can stop the demo at an auto-stop's time (2026-11-19): the session control's identity holds its role
+    at the demo resource group (A1, ADR 0020). Returns Granted ($true, $false, or $null when it couldn't be read), Why, and
+    Fix (the grant, or ./scripts/deploy.ps1 when the control isn't set up). Read-only; never throws. Internal.
+    https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name,
+
+        [string] $ConfigPath = ''
+    )
+
+    $grant = 'An Owner of the subscription runs, once: {0}' -f (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath)
+    $setup = 'Run ./scripts/deploy.ps1: it sets up the session control.'
+    try {
+        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $Name.SubscriptionId -RoleName $Name.RoleName
+        if (-not $roleId) {
+            return [pscustomobject]@{ Granted = $false; Why = ('the session control''s role "{0}" doesn''t exist yet' -f $Name.RoleName); Fix = $grant }
+        }
+        $principalId = Get-DemoActivityControlPrincipalId -Name $Name
+        if (-not $principalId) {
+            return [pscustomobject]@{ Granted = $false; Why = ('the session control''s identity {0} doesn''t exist' -f $Name.Identity); Fix = $setup }
+        }
+        $held = Test-DemoActivityControlAssignment -SubscriptionId $Name.SubscriptionId -Scope $Name.DemoResourceGroupId -PrincipalId $principalId -RoleId $roleId
+        if ($held.Exists) {
+            return [pscustomobject]@{ Granted = $true; Why = ''; Fix = '' }
+        }
+        if ($held.Error -and -not $held.Missing) {
+            return [pscustomobject]@{ Granted = $null; Why = ('whether the session control''s identity holds its role at {0} couldn''t be read ({1})' -f $Name.DemoResourceGroup, ([string]$held.Error).TrimEnd('.')); Fix = $grant }
+        }
+        return [pscustomobject]@{ Granted = $false; Why = ('the session control''s identity {0} doesn''t hold its role "{1}" at {2} yet, so its DbHub-Stop job couldn''t deallocate the VMs or stop T4' -f $Name.Identity, $Name.RoleName, $Name.DemoResourceGroup); Fix = $grant }
+    }
+    catch {
+        return [pscustomobject]@{ Granted = $null; Why = ('the session control''s role couldn''t be read ({0})' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.')); Fix = $grant }
+    }
+}
+
+function Remove-DemoActivityControlAutoStopSchedule {
+    <#
+    .SYNOPSIS
+    Removes the pending auto-stop and what goes with it (2026-11-19), as the runbook's Clear-DbHubAutoStop does: its backup
+    (Clear-DemoActivityControlBackupStop), the links to DbHub-Stop and DbHub-Monitor of dbhub-autostop and of the run's
+    monitoring re-checks (dbhub-monitor-<n>), those re-checks, and dbhub-autostop itself. Returns Removed (nothing of the
+    auto-stop is left), BackupRemoved, and Error. Never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/schedule/delete
+    https://learn.microsoft.com/rest/api/automation/job-schedule/delete
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Name.AutoStopSchedule, 'Remove the pending auto-stop')) {
+        return [pscustomobject]@{ Removed = $false; BackupRemoved = $false; Error = '' }
+    }
+    try {
+        $backup = Clear-DemoActivityControlBackupStop -Name $Name -ApiVersion $ApiVersion -Confirm:$false
+        $monitorPattern = '^{0}\d+$' -f [regex]::Escape($Name.MonitorPrefix)
+        $links = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $Name.AutomationAccountId) -ApiVersion $ApiVersion)
+        foreach ($link in @(Get-DemoActivityControlList -InputObject $links.Value -Name 'value')) {
+            $properties = Get-DemoMemberValue -InputObject $link -Name 'properties'
+            $linkId = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobScheduleId')
+            $linked = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'schedule') -Name 'name')
+            if (($linked -eq $Name.AutoStopSchedule -or $linked -match $monitorPattern) -and $linkId -match '^[0-9a-fA-F-]{36}$') {
+                $null = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $Name.AutomationAccountId, $linkId) -ApiVersion $ApiVersion)
+            }
+        }
+        # A run's monitoring re-checks do nothing once their auto-stop is gone (DbHub-Monitor acts only while one is pending).
+        $schedules = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules' -f $Name.AutomationAccountId) -ApiVersion $ApiVersion)
+        foreach ($item in @(Get-DemoActivityControlList -InputObject $schedules.Value -Name 'value')) {
+            $recheck = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+            if ($recheck -match $monitorPattern) {
+                $null = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $Name.AutomationAccountId, $recheck) -ApiVersion $ApiVersion)
+            }
+        }
+        $deleted = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $Name.AutomationAccountId, $Name.AutoStopSchedule) -ApiVersion $ApiVersion)
+        $removed = [bool]($deleted.Ok -or $deleted.Missing)
+        $errorText = if ($removed) { '' } else { [string]$deleted.Error }
+        if ($backup.Found -and -not $backup.Removed) {
+            $removed = $false
+            $errorText = (@($errorText, ('{0}: {1}' -f $Name.AutoStopBackupSchedule, [string]$backup.Error)) | Where-Object { $_ }) -join '; '
+        }
+        return [pscustomobject]@{ Removed = $removed; BackupRemoved = [bool]$backup.Removed; Error = $errorText }
+    }
+    catch {
+        return [pscustomobject]@{ Removed = $false; BackupRemoved = $false; Error = (Protect-DemoText -Text $_.Exception.Message) }
+    }
+}
+
+function Get-DemoAutoStopClockText {
+    # A UTC time on the VMs' clock (autoShutdownTimeZone): "13:15 (Eastern Standard Time)", with "tomorrow" or the date when
+    # it isn't -NowUtc's day there. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [datetime] $Utc,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $shutdown = Get-DemoAutoShutdownSetting -Config $Config
+    $toZone = { param([datetime] $Value) [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($(if ($Value.Kind -eq [System.DateTimeKind]::Local) { $Value.ToUniversalTime() } else { $Value }), [System.DateTimeKind]::Utc), $shutdown.Zone) }
+    $local = & $toZone $Utc
+    $today = (& $toZone $NowUtc).Date
+    $day = if ($local.Date -eq $today) { '' } elseif ($local.Date -eq $today.AddDays(1)) { ' tomorrow' } else { ' on {0}' -f $local.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }
+    return ('{0}{1} ({2})' -f $local.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture), $day, $shutdown.TimeZoneId)
+}
+
+function Test-DemoActivityControlStartDemoRunbook {
+    <#
+    .SYNOPSIS
+    Whether the session control's published DbHub-Control knows start-demo.ps1's auto-stop (2026-11-19): its content has
+    the marker's variable, so a later Run all, or the Insights app's Start, replaces a marked auto-stop instead of refusing
+    to start while it's pending. A DbHub-Control published before then counts it as an active run. Returns Current ($true,
+    $false, or $null when it couldn't be read), Missing (DbHub-Control isn't published), and Error. Read-only; never
+    throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/runbook/get-content
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name
+    )
+
+    $none = { param([object] $Current, [bool] $Missing, [string] $Problem) [pscustomobject]@{ Current = $Current; Missing = $Missing; Error = $Problem } }
+    try {
+        $url = Get-DemoActivityControlUrl -Id ('{0}/runbooks/{1}/content' -f $Name.AutomationAccountId, $Name.ControlRunbook) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url $url
+    }
+    catch {
+        return (& $none $null $false (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if (-not $read.Ok) {
+        if ($read.Missing) {
+            return (& $none $false $true '')
+        }
+        return (& $none $null $false ([string]$read.Error))
+    }
+    # A runbook's content is PowerShell, not JSON, so it comes back as text (as Publish-DemoSafetyStopRunbook reads it).
+    $text = if ($read.Value -is [string]) { [string]$read.Value } else { '' }
+    return (& $none $text.Contains($script:ActivityControlStartDemoRunbookToken) $false '')
+}
+
+function Register-DemoActivityControlAutoStop {
+    <#
+    .SYNOPSIS
+    start-demo.ps1's auto-stop (2026-11-19, the coordinator's decision for the owner, who can reverse it): the same one-time
+    schedule dbhub-autostop that a Run all session creates, linked to DbHub-Stop (Scope All), -Hours after this start, so a
+    session someone forgets stops by itself. Returns START.CONTROL.AUTOSTOP, and START.CONTROL.STOPJOB when it waited for a
+    stop job. Never a Fail, and never stops the start. Internal.
+
+    .DESCRIPTION
+    - When: -Hours (4 by default) after -NowUtc, this start's own time, or after the warm-up's end when the start waits for
+      it (-WarmUpMinutes). Running start-demo.ps1 again schedules it again, from that start: that's how a session gets longer.
+      The nightly stop still stops everything at autoShutdownTime (a start-demo.ps1 session sets no busy marker), so the
+      result says when the demo stops: at the earlier of the two.
+    - A DbHub-Stop job that's queued or running is waited for first, up to 10 minutes (Wait-DemoActivityControlStopJob,
+      START.CONTROL.STOPJOB): it would deallocate what this start brings up, and removes an auto-stop as it starts.
+    - The newer session's plan wins: a pending auto-stop (a Run all session's, a run's, or an earlier start-demo.ps1's) is
+      replaced, with its backup and its monitoring re-checks (Remove-DemoActivityControlAutoStopSchedule). Its description
+      begins with [start-demo.ps1], so the control's runbook lets a later Run all, the Insights app's Start, or a run replace
+      it in turn with its own plan (DbHubControl.Common.ps1, Get-DbHubAutoStopRunEnd), and status.ps1 says whose it is. Like a
+      session's, a second one (dbhub-autostop-backup) follows 30 minutes later, for when the first one's job fails.
+    - Without the session control's role at the demo resource group (A1: an environment a Contributor deployed, until an
+      Owner runs ./scripts/grant-safety-stop.ps1), DbHub-Stop couldn't stop anything, so none is scheduled, and a pending one
+      is removed, as before 2026-11-19: a Warning says the nightly stop is the limit, with the grant as the fix. The same
+      Warning when the control isn't set up (./scripts/deploy.ps1 sets it up) or a schedule can't be written.
+    - Until ./scripts/deploy.ps1 republishes the session control's runbooks (Test-DemoActivityControlStartDemoRunbook): a
+      DbHub-Control published before 2026-11-19 counts any pending auto-stop as an active run, so it would refuse a Run all
+      until this one's time. Then none is scheduled, and a pending one is removed, as before: a Warning with ./scripts/deploy.ps1.
+    - -WhatIf changes nothing: Not selected.
+    https://learn.microsoft.com/rest/api/automation/schedule/create-or-update
+    https://learn.microsoft.com/rest/api/automation/job-schedule/create
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0.5, 24)]
+        [double] $Hours = 4,
+
+        [ValidateRange(0, 240)]
+        [int] $WarmUpMinutes = 0,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow,
+
+        [string] $ConfigPath = ''
+    )
+
+    $name = Get-DemoActivityControlName -Config $Config
+    $checkId = 'START.CONTROL.AUTOSTOP'
+    $version = Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts'
+    $doc = 'https://learn.microsoft.com/rest/api/automation/schedule/create-or-update'
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc) }
+    $minutes = [int][System.Math]::Round($Hours * 60)
+    $span = if ($minutes -lt 60) { '{0} minutes' -f $minutes } elseif ($minutes % 60 -eq 0) { '{0} hour{1}' -f ($minutes / 60), $(if ($minutes -eq 60) { '' } else { 's' }) } else { [string]::Format($culture, '{0:0.##} hours', $minutes / 60.0) }
+    $after = if ($WarmUpMinutes -gt 0) { '{0} after the warm-up' -f $span } else { '{0} after this start' -f $span }
+    # Whole minutes, at least 6 ahead: Azure Automation wants a one-time schedule's start at least 5 minutes ahead.
+    $stopUtc = $now.AddMinutes($WarmUpMinutes + $minutes)
+    $stopUtc = [datetime]::new($stopUtc.Year, $stopUtc.Month, $stopUtc.Day, $stopUtc.Hour, $stopUtc.Minute, 0, [System.DateTimeKind]::Utc)
+    $nightlyUtc = $null
+    try {
+        $nightlyUtc = Get-DemoNextShutdownUtc -Config $Config -NowUtc $now
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The next nightly stop couldn''t be worked out: {0}' -f $_.Exception.Message)
+    }
+    $nightlyText = if ($null -ne $nightlyUtc) { 'the nightly stop at {0}' -f (Get-DemoAutoStopClockText -Config $Config -Utc $nightlyUtc -NowUtc $now) } else { 'the nightly stop' }
+    $evidence = [ordered]@{ schedule = $name.AutoStopSchedule; hours = $Hours; warmUpMinutes = $WarmUpMinutes; autoStopUtc = ''; nightlyStopUtc = $(if ($null -ne $nightlyUtc) { $nightlyUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture) } else { '' }); replaced = ''; replacedStartDemo = $false; backupUtc = '' }
+    $prior = Get-DemoActivityControlAutoStopState -Name $name
+    $pending = [bool]$prior.Exists -and $null -ne $prior.StartUtc -and $prior.StartUtc -gt $now
+    if ($pending) {
+        $evidence['replaced'] = $prior.StartUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture)
+        $evidence['replacedStartDemo'] = [bool]$prior.StartDemo
+    }
+    if (-not $PSCmdlet.ShouldProcess($name.AutoStopSchedule, ('Schedule the demo''s auto-stop {0}' -f $after))) {
+        return @(New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: the demo''s auto-stop would be scheduled {0} (dbhub-autostop).' -f $after) -Evidence $evidence -DocUrl $doc)
+    }
+    $results = [System.Collections.Generic.List[object]]::new()
+    $unavailable = {
+        param([string] $Why, [string] $Fix)
+        $removedText = ''
+        if ($pending) {
+            # The earlier session's auto-stop would cut this one off at its time (ADR 0020): it goes, as before 2026-11-19.
+            $gone = Remove-DemoActivityControlAutoStopSchedule -Name $name -ApiVersion $version -Confirm:$false
+            $removedText = if ($gone.Removed) { ' An earlier session''s auto-stop (due {0}) was removed, so it doesn''t cut this session off.' -f (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now) } else { ' An earlier session''s auto-stop is still pending and stops the demo at {0}: it couldn''t be removed ({1}).' -f (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now), ([string]$gone.Error).TrimEnd('.') }
+        }
+        $message = 'The demo doesn''t stop by itself after this session: {0}. It runs until ./scripts/stop-demo.ps1 or {1}.{2}' -f $Why, $nightlyText, $removedText
+        Write-DemoLog -Level Warning -Message ('{0} {1}' -f $message, $Fix)
+        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('{0} Then run ./scripts/start-demo.ps1 again; until then, run ./scripts/stop-demo.ps1 when the session ends.' -f $Fix) -DocUrl $doc)
+    }
+    if (-not $prior.Ok) {
+        $results.Add((& $unavailable ('the session control''s auto-stop couldn''t be read ({0})' -f ([string]$prior.Error).TrimEnd('.')) 'Run ./scripts/status.ps1 to see the session control (STATUS.CONTROL).'))
+        return $results.ToArray()
+    }
+    $role = Test-DemoActivityControlStopRole -Name $name -ConfigPath $ConfigPath
+    if ($role.Granted -eq $false) {
+        $results.Add((& $unavailable $role.Why $role.Fix))
+        return $results.ToArray()
+    }
+    # A stop job that's queued or running now would deallocate what this start brings up, and removes the auto-stop as it
+    # starts, so it's waited for before the new one is made.
+    $recent = if ([bool]$prior.Exists -and $null -ne $prior.StartUtc -and $prior.StartUtc -le $now -and $prior.StartUtc -gt $now.AddHours(-1)) { $prior.StartUtc } else { $null }
+    $stopJob = Wait-DemoActivityControlStopJob -Config $Config -AutoStopUtc $recent
+    if ($null -ne $stopJob -and [string]$stopJob.status -ne 'Not selected') {
+        $results.Add($stopJob)
+    }
+    # A DbHub-Control published before 2026-11-19 would count this auto-stop as an active run and refuse a Run all, or the
+    # Insights app's Start, until its time. Until ./scripts/deploy.ps1 republishes it, the start does what it did before:
+    # no auto-stop, and a pending one removed.
+    $runbook = Test-DemoActivityControlStartDemoRunbook -Name $name
+    if ($runbook.Current -ne $true) {
+        $why = if ($null -eq $runbook.Current) {
+            'whether the session control''s runbook {0} is current couldn''t be read ({1})' -f $name.ControlRunbook, ([string]$runbook.Error).TrimEnd('.')
+        }
+        elseif ($runbook.Missing) {
+            'the session control''s runbook {0} isn''t published' -f $name.ControlRunbook
+        }
+        else {
+            'the session control''s runbook {0} is from before 2026-11-19, so a Run all would be refused until the auto-stop''s time' -f $name.ControlRunbook
+        }
+        $evidence['runbookCurrent'] = $runbook.Current
+        $results.Insert(0, (& $unavailable $why 'Run ./scripts/deploy.ps1: it publishes the current runbooks.'))
+        return $results.ToArray()
+    }
+    if ([bool]$prior.Exists) {
+        $gone = Remove-DemoActivityControlAutoStopSchedule -Name $name -ApiVersion $version -Confirm:$false
+        if (-not $gone.Removed) {
+            # The earlier auto-stop stays, and stops the demo at its time; this session's isn't scheduled.
+            $message = 'This session''s auto-stop wasn''t scheduled: the earlier auto-stop couldn''t be replaced ({0}){1}.' -f ([string]$gone.Error).TrimEnd('.'), $(if ($pending) { ', so it still stops the demo at {0}' -f (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now) } else { '' })
+            Write-DemoLog -Level Warning -Message $message
+            $results.Insert(0, (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Run ./scripts/start-demo.ps1 again, or delete the schedule {0} in the Automation account {1} (Shared resources > Schedules) in the Azure portal; ./scripts/stop-demo.ps1 stops the demo when the session ends.' -f $name.AutoStopSchedule, $name.AutomationAccount) -DocUrl $doc))
+            return $results.ToArray()
+        }
+    }
+    $startText = $now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture)
+    $stopText = $stopUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture)
+    $schedulePath = '{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule
+    $made = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method put -Url (Get-DemoActivityControlUrl -Id $schedulePath -ApiVersion $version) -Body ([ordered]@{ name = $name.AutoStopSchedule; properties = [ordered]@{ description = ('{0} Stops the demo {1}: the start-demo.ps1 session started at {2}. Run all, the Insights app''s Start, or a run replaces it with its own plan.' -f $script:ActivityControlStartDemoMarker, $after, $startText); startTime = $stopText; frequency = 'OneTime'; timeZone = 'UTC' } })
+    $linked = $null
+    if ($made.Ok) {
+        $linked = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method put -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $name.AutomationAccountId, [guid]::NewGuid().ToString()) -ApiVersion $version) -Body ([ordered]@{ properties = [ordered]@{ schedule = [ordered]@{ name = $name.AutoStopSchedule }; runbook = [ordered]@{ name = $name.StopRunbook }; parameters = [ordered]@{ Scope = 'All' } } })
+    }
+    if (-not $made.Ok -or -not $linked.Ok) {
+        $why = if (-not $made.Ok) { [string]$made.Error } else { [string]$linked.Error }
+        if ($made.Ok) {
+            $null = Remove-DemoActivityControlAutoStopSchedule -Name $name -ApiVersion $version -Confirm:$false
+        }
+        $pending = $false
+        $results.Insert(0, (& $unavailable ('its schedule couldn''t be written ({0})' -f $why.TrimEnd('.')) ('Run ./scripts/start-demo.ps1 again; if it stays, run ./scripts/deploy.ps1, which sets up the session control, or an Owner runs {0}.' -f (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath))))
+        return $results.ToArray()
+    }
+    $evidence['autoStopUtc'] = $stopText
+    # The second auto-stop, as a session's (ADR 0026): for when the first one's job fails before it stops anything.
+    $backupUtc = $stopUtc.AddMinutes(30)
+    $backupPath = '{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopBackupSchedule
+    $backup = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method put -Url (Get-DemoActivityControlUrl -Id $backupPath -ApiVersion $version) -Body ([ordered]@{ name = $name.AutoStopBackupSchedule; properties = [ordered]@{ description = ('{0} Stops the demo if the auto-stop of the start-demo.ps1 session that started at {1} didn''t.' -f $script:ActivityControlStartDemoMarker, $startText); startTime = $backupUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture); frequency = 'OneTime'; timeZone = 'UTC' } })
+    if ($backup.Ok) {
+        $backupLink = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method put -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $name.AutomationAccountId, [guid]::NewGuid().ToString()) -ApiVersion $version) -Body ([ordered]@{ properties = [ordered]@{ schedule = [ordered]@{ name = $name.AutoStopBackupSchedule }; runbook = [ordered]@{ name = $name.StopRunbook }; parameters = [ordered]@{ Scope = 'All' } } })
+        if ($backupLink.Ok) {
+            $evidence['backupUtc'] = $backupUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $culture)
+        }
+        else {
+            Write-DemoLog -Level Warning -Message ('The second auto-stop wasn''t linked to {0}: {1}' -f $name.StopRunbook, $backupLink.Error)
+        }
+    }
+    else {
+        Write-DemoLog -Level Warning -Message ('The second auto-stop wasn''t created: {0}' -f $backup.Error)
+    }
+    $stopClock = Get-DemoAutoStopClockText -Config $Config -Utc $stopUtc -NowUtc $now
+    $first = if ($null -ne $nightlyUtc -and $nightlyUtc -lt $stopUtc) { ' {0} comes first and stops the demo then: start-demo.ps1 sets no busy marker, so the nightly stop never waits for its session.' -f ($nightlyText.Substring(0, 1).ToUpperInvariant() + $nightlyText.Substring(1)) } else { '' }
+    $replacedText = if ($pending) { ' It replaces {0}, which was due {1}: the newer session''s plan wins.' -f $(if ($prior.StartDemo) { 'an earlier start-demo.ps1 session''s auto-stop' } else { 'the auto-stop of a session from the control notebook' }), (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now) } else { '' }
+    $roleText = if ($null -eq $role.Granted) { ' Note: {0}; if the role is missing, the auto-stop''s job fails, and {1} stops the demo.' -f $role.Why, $nightlyText } else { '' }
+    $message = 'The demo stops by itself at {0}, {1}: its auto-stop deallocates the VMs, stops T4, and deletes T4''s read replica and T5''s container, as a Run all session''s does. ./scripts/stop-demo.ps1 stops it sooner; running ./scripts/start-demo.ps1 again starts the hours over (-Hours sets them); Run all or the Insights app''s Start replaces it with its own plan.{2}{3}{4}' -f $stopClock, $after, $first, $replacedText, $roleText
+    Write-DemoLog -Message $message
+    $status = if ($null -eq $role.Granted) { 'Warning' } else { 'Pass' }
+    $results.Insert(0, (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status $status -Message $message -Evidence $evidence -Remediation $(if ($status -eq 'Warning') { $role.Fix } else { '' }) -DocUrl $doc))
+    return $results.ToArray()
 }
 
 function Get-DemoActivityControlStatus {

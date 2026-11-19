@@ -1167,6 +1167,10 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         Mock -ModuleName DbHubDemo -CommandName Start-DemoProgressPageWriter -MockWith { $null }
         Mock -ModuleName DbHubDemo -CommandName Open-DemoProgressPage -MockWith { 'The status page is open in your browser.' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+        # The stop at the end of an update (2026-11-19) has its own tests below: here, a DONE that keeps the demo running
+        # reads its hourly price and a session's auto-stop from these, not from Azure.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -MockWith { [pscustomobject]@{ Hourly = 2.64; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaHold -MockWith { [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Error = '' } }
     }
 
     It 'keeps the PC awake, writes the model and the page, opens the page, and prints the expectations' {
@@ -1395,7 +1399,8 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @(New-DoneResult) -State (New-FinishedState -WithT4)
         Should -Invoke -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -Times 1 -Exactly -ParameterFilter { $null -ne $Run -and $Run.By -eq 'deploy' -and -not $Stopped }
         $outcome.Kind | Should -Be 'Done' -Because 'a Warning never keeps the deployment from DONE'
-        @($outcome.Added).checkId | Should -Be 'DEPLOY.NIGHTLYSTOP'
+        # The stop at the end of an update (2026-11-19) adds its own record after the nightly stop's.
+        @($outcome.Added).checkId | Should -Be @('DEPLOY.NIGHTLYSTOP', 'DEPLOY.ENDSTOP')
         $note = 'The nightly stop waited for this run: its 19:00 stop (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:35 (Pacific Standard Time), 60 minutes after this run ended. To keep the demo running tonight, run ./scripts/start-demo.ps1. To stop the demo now, run ./scripts/stop-demo.ps1.'
         @($outcome.Notes) | Should -Contain $note
         @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Should -Contain $note
@@ -1471,6 +1476,320 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
             $outcome.Kind | Should -Be 'NotDone'
             $outcome.Reason | Should -Be 'Not every target finished: T2.'
             Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match '^This run finished track T2 at Telemetry \(the state had T2\), but recording it again failed: ' }
+        }
+    }
+}
+
+Describe 'The stop at the end of an update: an update leaves the demo as it found it (2026-11-19)' {
+    BeforeAll {
+        # DEPLOY.VMSTART as Wait-DemoStoppedStart writes it: what this run started, the VMs that ran when it began, and the
+        # power state each stopped one had then.
+        function New-VmStartResult([string[]] $Started = @('sqlvm01', 'archost01'), [string] $T4 = 'Pass', [string[]] $Running = @(), [System.Collections.IDictionary] $Before = $null) {
+            if ($null -eq $Before) {
+                $Before = [ordered]@{}
+                foreach ($vm in $Started) {
+                    $Before[$vm] = 'deallocated'
+                }
+                if ($T4 -eq 'Pass') {
+                    $Before['T4'] = 'Stopped'
+                }
+            }
+            New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started what was stopped.' -Evidence ([ordered]@{ vms = @($Started); started = @($Started); notRunning = @(); t4 = $T4; minutes = 3; running = @($Running); before = $Before })
+        }
+        function New-StopResult([string] $CheckId, [string] $Status = 'Pass', [System.Collections.IDictionary] $Evidence = [ordered]@{}) {
+            New-DemoResult -CheckId $CheckId -Area 'infra' -Target 'subscription' -Status $Status -Message ('{0} {1}' -f $CheckId, $Status) -Evidence $Evidence
+        }
+        function Invoke-EndStop([object[]] $Result, [object] $Model = $null, [string] $OutcomeKind = 'Done', [switch] $KeepRunning, [switch] $Stopped, [int] $WaitMinutes = 15) {
+            InModuleScope DbHubDemo -Parameters @{ Config = $script:config; Result = $Result; Model = $Model; Kind = $OutcomeKind; Keep = [bool]$KeepRunning; Halted = [bool]$Stopped; Wait = $WaitMinutes } {
+                Invoke-DemoUpdateEndStop -Config $Config -Result $Result -Model $Model -State ([pscustomobject]@{ Tags = @{ deploymentId = 'abc123' } }) -OutcomeKind $Kind -KeepRunning:$Keep -Stopped:$Halted -ProgressPath 'progress.json' -WorkWaitMinutes $Wait -PollSeconds 1 -Confirm:$false
+            }
+        }
+        function Get-EndStopRow {
+            @($script:rows | Where-Object Id -EQ 'EndStop') | Select-Object -Last 1
+        }
+        # The status page's rows, as Invoke-DemoUpdateEndStop sets them (the ending's own test reads the real model).
+        function Register-RowMock {
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:rows.Add([pscustomobject]@{ Id = [string]$PesterBoundParameters['Id']; State = [string]$PesterBoundParameters['State']; Status = [string]$PesterBoundParameters['Status']; Message = [string]$PesterBoundParameters['Message'] }) }
+        }
+    }
+
+    BeforeEach {
+        $script:config = New-TestConfig -WithT4
+        $script:config['autoShutdownTime'] = '1900'
+        $script:config['autoShutdownTimeZone'] = 'Pacific Standard Time'
+        $script:rows = [System.Collections.Generic.List[object]]::new()
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        $script:hold = [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Error = '' }
+        $script:stopResults = @((New-StopResult 'STOP.VM_ARCHOST01'), (New-StopResult 'STOP.VM_SQLVM01'), (New-StopResult 'STOP.T4.STOP'), (New-StopResult 'STOP.T5' 'Pass' ([ordered]@{ outcome = 'Deleted' })))
+        $script:stopThrows = $false
+        $script:health = @{}
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -MockWith { [pscustomobject]@{ Hourly = 2.64; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaHold -MockWith { $script:hold }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:order.Add('Health:' + $VmName)
+            $queue = $script:health[$VmName]
+            if ($null -ne $queue -and $queue.Count -gt 1) { return $queue.Dequeue() }
+            if ($null -ne $queue -and $queue.Count -eq 1) { return $queue.Peek() }
+            [pscustomobject]@{ state = 'Ready'; status = 'Pass'; currentStep = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -MockWith {
+            $script:order.Add('Stop')
+            if ($script:stopThrows) {
+                throw 'ERROR: (AuthorizationFailed) The client has no access to deallocate the VM.'
+            }
+            $script:stopResults
+        }
+    }
+
+    Context 'whether it stops (Get-DemoUpdateStopPlan, pure)' {
+        It '<Case>' -ForEach @(
+            @{ Case = 'an update that found the demo stopped stops what it started'; Kind = 'Done'; VmStart = $true; Running = @(); Keep = $false; Halted = $false; ModelVms = @(); Reason = 'Stop'; Applies = $true }
+            @{ Case = 'a new deployment keeps running, so its "See it" steps work'; Kind = 'Done'; VmStart = $false; Running = @(); Keep = $false; Halted = $false; ModelVms = @('sqlvm01', 'archost01', 'T4'); Reason = 'NewDeployment'; Applies = $false }
+            @{ Case = 'an update that found a demo VM running keeps it running'; Kind = 'Done'; VmStart = $true; Running = @('archost01'); Keep = $false; Halted = $false; ModelVms = @(); Reason = 'WasRunning'; Applies = $false }
+            @{ Case = 'an update of a demo that was running starts nothing, and keeps it running'; Kind = 'Done'; VmStart = $false; Running = @(); Keep = $false; Halted = $false; ModelVms = @(); Reason = 'NothingStopped'; Applies = $false }
+            @{ Case = '-KeepRunning keeps what an update started running'; Kind = 'Done'; VmStart = $true; Running = @(); Keep = $true; Halted = $false; ModelVms = @(); Reason = 'KeepRunning'; Applies = $false }
+            @{ Case = 'a run that isn''t DONE keeps what it started for the next run'; Kind = 'NotDone'; VmStart = $true; Running = @(); Keep = $false; Halted = $false; ModelVms = @(); Reason = 'NotDone'; Applies = $false }
+            @{ Case = 'a run stopped with Ctrl+C keeps what it started'; Kind = 'NotDone'; VmStart = $true; Running = @(); Keep = $false; Halted = $true; ModelVms = @(); Reason = 'Stopped'; Applies = $false }
+            @{ Case = 'a what-if starts and stops nothing'; Kind = 'WhatIf'; VmStart = $false; Running = @(); Keep = $false; Halted = $false; ModelVms = @(); Reason = 'WhatIf'; Applies = $false }
+        ) {
+            $results = @(New-DoneResult) + @(if ($VmStart) { New-VmStartResult -Started @('sqlvm01', 'archost01' | Where-Object { $_ -notin $Running }) -Running $Running })
+            $model = @{ run = @{ startedVms = @($ModelVms) } }
+            $plan = InModuleScope DbHubDemo -Parameters @{ Result = $results; Model = $model; Kind = $Kind; Keep = $Keep; Halted = $Halted } { Get-DemoUpdateStopPlan -Result $Result -Model $Model -OutcomeKind $Kind -KeepRunning:$Keep -Stopped:$Halted }
+            $plan.Reason | Should -Be $Reason
+            $plan.Applies | Should -Be $Applies
+            if ($Reason -eq 'Stop') {
+                @($plan.Started) | Should -Be @('sqlvm01', 'archost01', 'T4')
+            }
+            else {
+                $plan.Text | Should -Not -BeNullOrEmpty
+            }
+        }
+
+        It 'keeps the demo running when a VM was still starting when the run began: something else was starting it' {
+            $results = @(New-DoneResult) + @(New-VmStartResult -Started @('archost01') -T4 '' -Before ([ordered]@{ sqlvm01 = 'starting'; archost01 = 'deallocated' }))
+            $plan = InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoUpdateStopPlan -Result $Result -OutcomeKind 'Done' }
+            $plan.Reason | Should -Be 'WasRunning'
+            $plan.Text | Should -Match '^sqlvm01 was starting when this run began'
+        }
+    }
+
+    Context 'the stop and DONE''s line (Invoke-DemoUpdateEndStop)' {
+        BeforeEach {
+            Register-RowMock
+        }
+
+        It 'stops what an update started, through stop-demo.ps1''s path without the history save or the capacity pause, and shows it on the status page' {
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult))
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $SkipFabric }
+            $end.Stopped | Should -BeTrue
+            $end.Result.checkId | Should -Be 'DEPLOY.ENDSTOP'
+            $end.Result.status | Should -Be 'Pass'
+            $end.Result.message | Should -Be 'Stopped at the end, as this run found the demo: archost01 and sqlvm01 are deallocated, T4 is stopped, and T5''s container is deleted, so only what bills while the demo is stopped is left (./scripts/estimate-cost.ps1 shows it).'
+            $end.Line | Should -Be ('{0} Start a session with Run all in NB_DatabaseHub_Control, or ./scripts/start-demo.ps1; ./scripts/deploy.ps1 -KeepRunning leaves the demo running after an update.' -f $end.Result.message)
+            $end.Result.evidence['reason'] | Should -Be 'Stop'
+            @($end.Result.evidence['started']) | Should -Be @('sqlvm01', 'archost01', 'T4')
+            $script:rows[0].Id | Should -Be 'EndStop'
+            $script:rows[0].State | Should -Be 'Running'
+            $script:rows[0].Message | Should -Match '^Stopping what this update started \(sqlvm01, archost01, and T4\), as it found the demo: about 5 to 10 minutes\. \./scripts/deploy\.ps1 -KeepRunning leaves it running\.$'
+            (Get-EndStopRow).State | Should -Be 'Done'
+            (Get-EndStopRow).Status | Should -Be 'Pass'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -Times 0 -Exactly -Because 'nothing bills by the hour once it''s stopped'
+        }
+
+        It 'keeps a new deployment running, and DONE''s line says what it bills an hour, until when, and how to stop it now' {
+            $end = Invoke-EndStop -Result @(New-DoneResult) -Model @{ run = @{ startedVms = @('sqlvm01', 'archost01', 'T4') } }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            $end.Stopped | Should -BeFalse
+            $end.Result.status | Should -Be 'Not selected'
+            $end.Result.evidence['reason'] | Should -Be 'NewDeployment'
+            $end.Result.evidence['hourlyUsd'] | Should -Be 2.64
+            $end.Line | Should -Be 'The demo runs and bills about 2.64 USD an hour at list prices (./scripts/estimate-cost.ps1 has the detail) until the nightly stop at 19:00 (Pacific Standard Time); ./scripts/stop-demo.ps1 stops it now. A new deployment keeps running, so you can look at it now.'
+            (Get-EndStopRow).State | Should -Be 'Skipped'
+            (Get-EndStopRow).Status | Should -Be 'Not selected'
+            (Get-EndStopRow).Message | Should -Be 'A new deployment keeps running, so you can look at it now.'
+        }
+
+        It 'leaves what an update started running with -KeepRunning, and DONE''s line names it' {
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult)) -KeepRunning
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            $end.Result.status | Should -Be 'Not selected'
+            $end.Line | Should -Match '^The demo runs and bills about 2\.64 USD an hour at list prices .+ until the nightly stop at 19:00 \(Pacific Standard Time\); \./scripts/stop-demo\.ps1 stops it now\. -KeepRunning: what this run started \(sqlvm01, archost01, and T4\) keeps running\.$'
+        }
+
+        It 'says until when, with a price it couldn''t read, and when the nightly stop waited for this run' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -MockWith { [pscustomobject]@{ Hourly = $null; Error = 'The Retail Prices API didn''t answer.' } }
+            $nightly = New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The nightly stop waited for this run.' -Evidence ([ordered]@{ stopsAt = '21:35' })
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @($nightly)) -Model @{ run = @{ startedVms = @('sqlvm01') } }
+            $end.Line | Should -Be 'The demo runs and bills by the hour (its list price couldn''t be read: The Retail Prices API didn''t answer; ./scripts/estimate-cost.ps1 shows it) until the nightly stop at 21:35 (Pacific Standard Time), which waited for this run; ./scripts/stop-demo.ps1 stops it now. A new deployment keeps running, so you can look at it now.'
+        }
+
+        It 'leaves the demo running for a session that started meanwhile: <By>' -ForEach @(
+            @{ By = 'StartDemo'; Text = 'A start-demo.ps1 session uses the demo, so this run leaves it running: its auto-stop stops it at 14:00 (Pacific Standard Time), or ./scripts/stop-demo.ps1 sooner.'; Until = 'until the session''s end at 14:00 (Pacific Standard Time)' }
+            @{ By = 'Control'; Text = 'A session from the control notebook (Run all, or the Insights app''s Start) uses the demo, so this run leaves it running: its auto-stop stops it at 14:00 (Pacific Standard Time).'; Until = 'until the session''s end at 14:00 (Pacific Standard Time)' }
+            @{ By = 'Unknown'; Text = 'Whether a session uses the demo couldn''t be read (AuthorizationFailed), so this run leaves it running: ./scripts/stop-demo.ps1 stops it when no session runs.'; Until = 'until the nightly stop at 19:00 (Pacific Standard Time)' }
+        ) {
+            $script:hold = [pscustomobject]@{ Held = $true; By = $By; UntilUtc = $(if ($By -ne 'Unknown') { [datetime]::new(2026, 11, 19, 22, 0, 0, [System.DateTimeKind]::Utc) } else { $null }); Error = $(if ($By -eq 'Unknown') { 'AuthorizationFailed.' } else { '' }) }
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult))
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            $end.Result.status | Should -Be 'Not selected'
+            $end.Result.message | Should -Be $Text
+            $end.Result.evidence['heldBy'] | Should -Be $By
+            $end.Line | Should -Match ([regex]::Escape($Until))
+            (Get-EndStopRow).State | Should -Be 'Skipped'
+        }
+
+        It 'is a Warning with ./scripts/stop-demo.ps1 as the fix, never a Fail, when <Case>' -ForEach @(
+            @{ Case = 'a VM isn''t deallocated'; Throws = $false; Vm = 'Warning'; Match = 'STOP\.VM_ARCHOST01: STOP\.VM_ARCHOST01 Warning' }
+            @{ Case = 'the stop throws'; Throws = $true; Vm = 'Pass'; Match = 'the stop failed: ERROR: \(AuthorizationFailed\)' }
+        ) {
+            $script:stopThrows = $Throws
+            $script:stopResults = @((New-StopResult 'STOP.VM_ARCHOST01' $Vm), (New-StopResult 'STOP.VM_SQLVM01'), (New-StopResult 'STOP.T4.STOP'))
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult))
+            $end.Result.status | Should -Be 'Warning'
+            $end.Result.message | Should -Match ('^The stop at the end of this update didn''t stop all of what the run started \(sqlvm01, archost01, and T4\): .*{0}' -f $Match)
+            $end.Result.remediation | Should -Be 'Run ./scripts/stop-demo.ps1: it stops what still runs. Otherwise the nightly stop at 19:00 (Pacific Standard Time) stops it.'
+            $end.Line | Should -Match 'Run \./scripts/stop-demo\.ps1: it stops what still runs\.'
+            (Get-EndStopRow).State | Should -Be 'Done'
+            (Get-EndStopRow).Status | Should -Be 'Warning'
+        }
+
+        It 'makes no Azure call for a run that isn''t DONE, a stopped run, or a what-if, and shows why on the status page' {
+            foreach ($case in @(@{ Kind = 'NotDone'; Halted = $false; Row = '^The run isn''t DONE' }, @{ Kind = 'NotDone'; Halted = $true; Row = '^deploy\.ps1 was stopped \(Ctrl\+C\)' }, @{ Kind = 'WhatIf'; Halted = $false; Row = '^What if: nothing was started' })) {
+                $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult)) -OutcomeKind $case.Kind -Stopped:$case.Halted
+                $end.Line | Should -BeNullOrEmpty
+                $end.Result.status | Should -Be 'Not selected'
+                (Get-EndStopRow).State | Should -Be 'Skipped'
+                (Get-EndStopRow).Message | Should -Match $case.Row
+            }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaHold -Times 0 -Exactly
+        }
+    }
+
+    Context 'work this run started that still needs a host (Wait-DemoUpdateStopWork)' {
+        BeforeEach {
+            Register-RowMock
+            $script:uploads = [System.Collections.Generic.Queue[string]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { $script:order.Add('ArcRead'); [pscustomobject]@{ HostedInstances = @(); Target = [pscustomobject]@{ Setting = [pscustomobject]@{ MinimumCoresPerOse = 4 } } } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoArcInstanceInfo -MockWith {
+                $uploaded = if ($script:uploads.Count -gt 1) { $script:uploads.Dequeue() } elseif ($script:uploads.Count -eq 1) { $script:uploads.Peek() } else { '' }
+                [pscustomobject]@{ Name = 'arcsql01'; MigrationAssessment = [pscustomobject]@{ Enabled = $true; UploadedAt = $uploaded } }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentRetry -MockWith {
+                $script:order.Add('AssessmentRetry')
+                New-DemoResult -CheckId 'T2.ARC.MIGRATIONASSESSMENT' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'started' -Evidence ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = 'Succeeded' })
+            }
+            function New-AssessmentResult([string] $RunStarted) {
+                New-DemoResult -CheckId 'T2.ARC.MIGRATIONASSESSMENT' -Area 't2' -Target 'T2' -Status $(if ($RunStarted) { 'Pass' } else { 'Warning' }) -Message 'assessment' -Evidence ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = $RunStarted })
+            }
+        }
+
+        It 'waits for T2''s first migration assessment to upload before it deallocates archost01, starting it once more when Azure had refused it' {
+            foreach ($value in '', '', '2026-11-19T18:06:00Z') {
+                $script:uploads.Enqueue($value)
+            }
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-AssessmentResult '') + @(New-VmStartResult))
+            $script:order | Should -Contain 'AssessmentRetry'
+            $script:order.IndexOf('AssessmentRetry') | Should -BeLessThan $script:order.IndexOf('Stop')
+            $script:order.LastIndexOf('ArcRead') | Should -BeLessThan $script:order.IndexOf('Stop')
+            $end.Result.status | Should -Be 'Pass'
+            $end.Result.message | Should -Match 'It waited first for T2''s first migration assessment, which uploaded at 2026-11-19T18:06:00Z after about a minute\.$'
+            @($end.Result.evidence['waitedFor']).Count | Should -Be 1
+        }
+
+        It 'waits at most its bound, then stops anyway and says where the assessment goes on' {
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-AssessmentResult 'Succeeded') + @(New-VmStartResult)) -WaitMinutes 0
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 1 -Exactly
+            $end.Result.status | Should -Be 'Pass'
+            $end.Result.message | Should -Match 'Not finished: T2''s first migration assessment hadn''t uploaded after about a minute, so it may not finish; the next \./scripts/deploy\.ps1 or \./scripts/configure-arc\.ps1 starts it again\.$'
+            (Get-EndStopRow).Message | Should -Match 'configure-arc\.ps1 starts it again'
+        }
+
+        It 'waits for a bootstrap pass that still runs on a host it deallocates, and not for one on a VM it leaves alone' {
+            $pending = [System.Collections.Generic.Queue[object]]::new()
+            $pending.Enqueue([pscustomobject]@{ state = 'InProgress'; status = 'Warning'; currentStep = 'ArcOnboarding'; generationPending = $true })
+            $pending.Enqueue([pscustomobject]@{ state = 'Ready'; status = 'Pass'; currentStep = '' })
+            $script:health['archost01'] = $pending
+            $end = Invoke-EndStop -Result (@(New-DoneResult) + @(New-VmStartResult -Started @('archost01')))
+            @($script:order | Where-Object { $_ -eq 'Health:archost01' }).Count | Should -Be 2
+            $script:order | Should -Not -Contain 'Health:sqlvm01'
+            $script:order.LastIndexOf('Health:archost01') | Should -BeLessThan $script:order.IndexOf('Stop')
+            $end.Result.message | Should -Match 'It waited first for archost01''s bootstrap pass, which ended after about a minute\.$'
+        }
+    }
+
+    Context 'deploy.ps1''s ending (Complete-DemoDeploymentRun)' {
+        BeforeEach {
+            $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
+            Mock -ModuleName DbHubDemo -CommandName Write-Host -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Enter-DemoKeepAwake -MockWith { $true }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoProgressPageWriter -MockWith { $null }
+            Mock -ModuleName DbHubDemo -CommandName Open-DemoProgressPage -MockWith { 'The status page is open in your browser.' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+            function Get-ModelStep([string] $Path, [string] $Id) {
+                $model = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+                foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq $Id) { return $item } } }
+            }
+        }
+
+        It 'an update that found the demo stopped ends DONE with the demo stopped again, on the console, the status page, and in the run''s results' {
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (@(New-DoneResult) + @(New-VmStartResult)) -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'Done'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $SkipFabric }
+            $added = @($outcome.Added | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' })
+            $added.Count | Should -Be 1
+            $added[0].status | Should -Be 'Pass'
+            $line = @($outcome.Notes | Where-Object { $_ -match '^Stopped at the end, as this run found the demo' })
+            $line.Count | Should -Be 1
+            @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Should -Contain $line[0]
+            $step = Get-ModelStep -Path $run.ProgressPath -Id 'EndStop'
+            $step['state'] | Should -Be 'Done'
+            $step['status'] | Should -Be 'Pass'
+            (Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20)['run']['reason'] | Should -Match 'Stopped at the end, as this run found the demo'
+        }
+
+        It 'a new deployment ends DONE running, with DONE''s billing line, and the Stop at the end row Skipped with why' {
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            InModuleScope DbHubDemo -Parameters @{ Path = $run.ProgressPath } { Add-DemoProgressStartedVm -Path $Path -Name 'sqlvm01', 'archost01', 'T4' }
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result @(New-DoneResult) -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'Done'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            $billing = 'The demo runs and bills about 2.64 USD an hour at list prices (./scripts/estimate-cost.ps1 has the detail) until the nightly stop at 19:00 (Pacific Standard Time); ./scripts/stop-demo.ps1 stops it now. A new deployment keeps running, so you can look at it now.'
+            @($outcome.Notes) | Should -Contain $billing
+            @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Should -Contain $billing
+            $step = Get-ModelStep -Path $run.ProgressPath -Id 'EndStop'
+            $step['state'] | Should -Be 'Skipped'
+            $step['message'] | Should -Be 'A new deployment keeps running, so you can look at it now.'
+        }
+
+        It 'an update run with -KeepRunning ends DONE running, and says so' {
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (@(New-DoneResult) + @(New-VmStartResult)) -State (New-FinishedState -WithT4) -KeepRunning
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            @($outcome.Notes | Where-Object { $_ -match '-KeepRunning: what this run started \(sqlvm01, archost01, and T4\) keeps running\.$' }).Count | Should -Be 1
+        }
+
+        It 'drops the nightly stop''s note once the demo is stopped, and says the nightly stop isn''t needed tonight any more' {
+            $nightly = New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The nightly stop waited for this run: the demo now stops at 21:35 (Pacific Standard Time).' -Remediation 'To keep the demo running tonight, run ./scripts/start-demo.ps1.' -Evidence ([ordered]@{ stopsAt = '21:35' })
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (@(New-DoneResult) + @(New-VmStartResult) + @($nightly)) -State (New-FinishedState -WithT4)
+            @($outcome.Notes | Where-Object { $_ -match 'The nightly stop waited for this run' }).Count | Should -Be 0
+            (Get-ModelStep -Path $run.ProgressPath -Id 'NightlyStop')['message'] | Should -Match '^Not needed tonight any more: this update stopped the demo at its end'
+        }
+
+        It 'a run that isn''t DONE keeps its billing note, stops nothing, and makes no Azure call for it' {
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @((New-TestResult 'TELEMETRY.T1' 'Fail'), (New-VmStartResult))
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result $result -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'NotDone'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoEnvironment -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -Times 0 -Exactly
+            @($outcome.Notes | Where-Object { $_ -match '^Running and billing, because this run started or created them' }).Count | Should -Be 1
+            (Get-ModelStep -Path $run.ProgressPath -Id 'EndStop')['state'] | Should -Be 'Skipped'
         }
     }
 }

@@ -19,6 +19,13 @@ sections 9.4, 9.6).
 - T4's read replica (ADR 0025) is created for each session once T4 is Ready, about 9 minutes, while the profiles are
   set and the warm-up runs; the script waits for it at its end (START.T4.REPLICA). stop-demo.ps1 deletes it, so it
   bills only during sessions. -SkipT4Replica leaves it out.
+- The session stops by itself (2026-11-19): -Hours (4 by default) after this start, or after the warm-up with
+  -WaitForWarmUp, its auto-stop deallocates the VMs, stops T4, and deletes T4's read replica and T5's container, as a Run
+  all session's does (START.CONTROL.AUTOSTOP says when; so does status.ps1). Run start-demo.ps1 again to start the hours
+  over; stop-demo.ps1 stops the demo sooner and removes the auto-stop. A Run all or the Insights app's Start that begins
+  later replaces it with its own plan, and this start replaces an earlier session's. The nightly stop still comes at
+  autoShutdownTime. Without the session control's role (before an Owner runs ./scripts/grant-safety-stop.ps1), there's
+  no auto-stop: a Warning says so, and the nightly stop is the limit.
 - Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
   2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown. business-day is the steady mix plus bounded incidents
   at fixed minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for
@@ -84,8 +91,15 @@ Where to write the results as JSON lines.
 .PARAMETER TreatManualAsError
 Exit with code 2 when a result is Manual action required.
 
+.PARAMETER Hours
+Hours until the session's auto-stop stops the demo (default 4, at most 24), counted from this start, or from the end of
+the warm-up with -WaitForWarmUp. Running start-demo.ps1 again starts them over.
+
 .EXAMPLE
 ./scripts/start-demo.ps1 -WarmUpMinutes 30
+
+.EXAMPLE
+./scripts/start-demo.ps1 -Hours 6
 
 .EXAMPLE
 ./scripts/start-demo.ps1 -ActivityProfile baseline
@@ -119,7 +133,10 @@ param(
 
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../out/start-demo.jsonl'),
 
-    [switch] $TreatManualAsError
+    [switch] $TreatManualAsError,
+
+    [ValidateRange(0.5, 24)]
+    [double] $Hours = 4
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -149,7 +166,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 $holdSwitch = @(if ($Interactive -and $ResetAdminPassword -and -not $whatIf -and [string]$config['t2Mode'] -ne 'EvaluationOnlyAzureVm') { 'archost01' })
 $activityDone = $false
 try {
-    $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipT4Replica:$SkipT4Replica -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
+    $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipT4Replica:$SkipT4Replica -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -AutoStopHours $Hours -WhatIf:$whatIf -Confirm:$false))
 
     # Ask (ADR 0028): wakes the Copilot chat's relay, which scales to zero, so the session's first question in the
     # Insights app is fast. A relay that doesn't answer is a Warning; nothing here stops the session.

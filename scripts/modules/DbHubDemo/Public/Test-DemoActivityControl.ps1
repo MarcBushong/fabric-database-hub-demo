@@ -13,8 +13,9 @@ function Test-DemoActivityControl {
       (setup-activity-control.ps1 -RotateWebhook), Manual action required when it has expired or is missing.
     - CONTROL.ROLE.A1, CONTROL.ROLE.A2, CONTROL.ROLE.A3: Pass when present; Manual action required with the exact
       -GrantRole command when missing (a redeploy deletes A1 with the demo resource group).
-    - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active); Warning for one that
-      should have run more than an hour ago.
+    - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active, or a start-demo.ps1 session
+      runs: its own auto-stop since 2026-11-19, with its time on the VMs' clock); Warning for one that should have run more
+      than an hour ago.
     - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop; Pass without it too while the
       nightly safety stop (ADR 0024), part of every deployment, is in place, because it stops T4 every night.
     Metadata only: no secret value is read.
@@ -101,8 +102,16 @@ function Test-DemoActivityControl {
         $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The auto-stop schedule couldn''t be read: {0}' -f $autostop.Error) -DocUrl $stopDoc))
     }
     else {
-        $start = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $autostop.Value -Name 'properties') -Name 'startTime')
-        if ($null -ne $start -and $start -gt $NowUtc) {
+        $properties = Get-DemoMemberValue -InputObject $autostop.Value -Name 'properties'
+        $start = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
+        # start-demo.ps1's own auto-stop (2026-11-19): its description begins with the marker.
+        $startDemo = ([string](Get-DemoMemberValue -InputObject $properties -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+        if ($null -ne $start -and $start -gt $NowUtc -and $startDemo) {
+            $shutdown = Get-DemoAutoShutdownSetting -Config $Config
+            $local = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($start, [System.DateTimeKind]::Utc), $shutdown.Zone)
+            $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('A start-demo.ps1 session runs; its auto-stop deallocates the VMs and stops T4 at {0:yyyy-MM-dd HH:mm} UTC ({1:HH:mm} {2}). ./scripts/stop-demo.ps1 stops the demo sooner.' -f $start, $local, $shutdown.TimeZoneId) -Evidence ([ordered]@{ autoStopUtc = $start; startDemo = $true }) -DocUrl $stopDoc))
+        }
+        elseif ($null -ne $start -and $start -gt $NowUtc) {
             $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('An on-demand run is active; its auto-stop deallocates the VMs and stops T4 at {0:yyyy-MM-dd HH:mm} UTC.' -f $start) -Evidence ([ordered]@{ autoStopUtc = $start }) -DocUrl $stopDoc))
         }
         elseif ($null -ne $start -and $start -lt $NowUtc.AddHours(-1)) {

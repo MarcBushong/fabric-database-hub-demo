@@ -1070,7 +1070,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $item.checkId | Should -Be 'DEPLOY.NIGHTLYSTOP'
         $item.status | Should -Be 'Warning'
         $item.message | Should -Be 'The nightly stop waited for this run: its 19:00 stop (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:35 (Pacific Standard Time), 60 minutes after this run ended: the deferred pass dbhub-safety-deferred stops the VMs and T4, and the VMs'' auto-shutdown is set to that time for tonight.'
-        $item.remediation | Should -Be 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and the next nightly stop is tomorrow at 19:00. To stop the demo now, run ./scripts/stop-demo.ps1.'
+        $item.remediation | Should -Be 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and then its session stops by itself 4 hours after that start (-Hours sets them; since 2026-11-19), or at the next nightly stop, tomorrow at 19:00, if that comes first. To stop the demo now, run ./scripts/stop-demo.ps1.'
         $item.evidence['stopsAt'] | Should -Be '21:35'
         $script:groupTags['DbHubBusyBy'] | Should -Be 'deploy-grace'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -Be '2026-11-06T05:30:00Z'
@@ -1168,7 +1168,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $settled.Count | Should -Be 1
         $settled[0].checkId | Should -Be 'START.NIGHTLYSTOP'
         $settled[0].status | Should -Be 'Pass'
-        $settled[0].message | Should -Be 'This session takes over from a run the nightly stop waited for: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00, the busy marker (deploy-grace) is cleared. The demo runs until ./scripts/stop-demo.ps1 or the next nightly stop at 19:00 (Pacific Standard Time).'
+        $settled[0].message | Should -Be 'This session takes over from a run the nightly stop waited for: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00, the busy marker (deploy-grace) is cleared. The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at 19:00 (Pacific Standard Time).'
         $script:schedules.Contains('dbhub-safety-deferred') | Should -BeFalse
         $script:shutdowns['archost01'] | Should -Be '1900'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty

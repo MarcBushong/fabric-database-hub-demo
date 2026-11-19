@@ -82,6 +82,11 @@ function Stop-DemoEnvironment {
     How long the profiles' off waits for both VMs together before the stop goes on anyway, and how long the guest's clean
     shutdown may take (default 180).
 
+    .PARAMETER SkipFabric
+    Leave Fabric alone (2026-11-19): no history save, not even with fabric.saveHistoryOnStop, and no pause of the Fabric
+    capacity. deploy.ps1's stop at the end of an update uses it (Invoke-DemoUpdateEndStop): that run took its own history
+    snapshot, which goes on in Fabric and must not be cancelled by a pause.
+
     .EXAMPLE
     Stop-DemoEnvironment -Config $config -RemoveT3
     #>
@@ -105,7 +110,9 @@ function Stop-DemoEnvironment {
         [int] $SaveHistoryWindowMinutes = 720,
 
         [ValidateRange(30, 900)]
-        [int] $ProfileOffWaitSeconds = 180
+        [int] $ProfileOffWaitSeconds = 180,
+
+        [switch] $SkipFabric
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -254,7 +261,7 @@ function Stop-DemoEnvironment {
         }
         else {
             $capacitySettingEarly = Get-DemoFabricCapacitySetting -Config $Config
-            if ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop) {
+            if (-not $SkipFabric -and ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop)) {
                 $postgresHistory = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
                 if ($null -ne $postgresHistory -and $null -ne $postgresHistory.Result) {
                     $results.Add($postgresHistory.Result)
@@ -339,9 +346,10 @@ function Stop-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))
     }
 
-    if (-not $ParkT2) {
+    if (-not $ParkT2 -and -not $SkipFabric) {
         # Phase 26b (ADR 0023): the session's history first, then the capacity the demo resumed, because a pause would
-        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called.
+        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called. -SkipFabric (deploy.ps1's stop
+        # at the end of an update, 2026-11-19) leaves both alone.
         $capacitySetting = Get-DemoFabricCapacitySetting -Config $Config
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
