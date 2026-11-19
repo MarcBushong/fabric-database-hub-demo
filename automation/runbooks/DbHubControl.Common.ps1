@@ -1923,7 +1923,8 @@ function Stop-DbHubDemo {
     Run Command (Phase 25a, finding 5): deallocation ends every session on T1 and T2 (the T2 guest shuts down through the
     host's automatic stop action, ShutDown), T3's sessions end with T1's runner, and T3 auto-pauses after its delay. The
     activity profiles end at their own end; the profile host ends what a stopped run left behind when it starts again.
-    Returns Done, Failed, MetricsStatus, and MetricsMessage.
+    Returns Done, Failed, MetricsStatus, MetricsMessage, and T5Status (Remove-DbHubT5Container's outcome, '' when it wasn't
+    asked; apart from Failed, review of ab91ee5).
 
     .DESCRIPTION
     With the control's session settings (2026-11-14, ADR 0026), and T4's read replica there or a session's busy marker set:
@@ -1972,6 +1973,7 @@ function Stop-DbHubDemo {
     $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $metricsStatus = ''
     $metricsMessage = ''
+    $t5Status = ''
     if (Clear-DbHubAutoStop -Context $Context) {
         $done.Add('auto-stop removed')
     }
@@ -2017,12 +2019,12 @@ function Stop-DbHubDemo {
     if ($null -eq $OnlyVm -or $RemoveT5Container) {
         # T5's container (2026-11-19, ADR 0027): its throughput bills every hour it exists, so it goes once the VMs, whose
         # runner drives T5, are on their way down, and after the history's metrics above, which read T5's too.
+        # Its outcome is apart from the stop's failed list (review of ab91ee5): one this role can't delete is said, never a
+        # failed stop of the VMs and T4.
         $t5 = Remove-DbHubT5Container -Context $Context -Tags $Tags
         $t5Text = Get-DbHubT5ContainerText -Outcome $t5
-        if ($t5.Outcome -in 'Failed', 'NotGranted') {
-            $failed.Add($t5Text)
-        }
-        elseif ($t5Text) {
+        $t5Status = [string]$t5.Outcome
+        if ($t5Text) {
             $done.Add($t5Text)
         }
     }
@@ -2100,7 +2102,7 @@ function Stop-DbHubDemo {
             Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
         }
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; T5Status = $t5Status }
 }
 
 function Get-DbHubLastShutdownUtc {
@@ -2329,17 +2331,29 @@ function Invoke-DbHubNightlyStop {
     elseif ($replicaText) {
         $done.Add($replicaText)
     }
-    # T5's container (2026-11-19, ADR 0027), when a session's stop didn't delete it: one it can't delete makes the job
-    # Partial, so its history shows it.
-    $t5 = Remove-DbHubT5Container -Context $Context -Tags $Tags
-    $t5Text = Get-DbHubT5ContainerText -Outcome $t5
-    if ($t5.Outcome -in 'Failed', 'NotGranted') {
-        $failed.Add($t5Text)
+    # T5's container (2026-11-19, ADR 0027), when a session's stop didn't delete it. Only while sqlvm01, whose runner drives T5,
+    # is still on its way down (review of ab91ee5): this pass read the busy marker once, at its start, and a session started
+    # since then uses the container. Its outcome is apart from the job's status (t5Status), so a container this role can't
+    # delete never makes the stop of the VMs and T4 look failed, which the cost check of T4's restart reads (R910).
+    $t5Status = ''
+    $t5Text = ''
+    if ((Get-DbHubT5Lifecycle -Tags $Tags) -eq 'Session' -and (Get-DbHubT5ContainerPath -Settings $settings -Tags $Tags)) {
+        $sqlState = Get-DbHubVmState -Context $Context -VmName ([string]$settings.sqlVmName)
+        if ($sqlState -notin 'deallocated', 'deallocating', 'stopped', 'Missing') {
+            $t5Status = 'InUse'
+            $t5Text = 'T5''s container left alone: {0} is {1}, so a session may use it' -f $settings.sqlVmName, $sqlState
+            Write-DbHubLog -Context $Context -Message $t5Text
+        }
     }
-    elseif ($t5Text) {
+    if (-not $t5Status) {
+        $t5 = Remove-DbHubT5Container -Context $Context -Tags $Tags
+        $t5Status = [string]$t5.Outcome
+        $t5Text = Get-DbHubT5ContainerText -Outcome $t5
+    }
+    if ($t5Text) {
         $done.Add($t5Text)
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text; Replica = $replicaText; T5 = $t5Text }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text; Replica = $replicaText; T5 = $t5Text; T5Status = $t5Status }
 }
 
 function Get-DbHubT4WaitMinute {
@@ -3107,7 +3121,8 @@ function Remove-DbHubT5Container {
 
 function Get-DbHubT5ContainerText {
     # What a stop says about T5's container (2026-11-19, ADR 0027), from Remove-DbHubT5Container's outcome: one phrase for
-    # its done list (Deleted, Missing, Kept) or its failed list (NotGranted, Failed); '' without T5 (NotConfigured).
+    # its done list, whatever the outcome, which is apart from the stop's status (t5Status, review of ab91ee5); '' without
+    # T5 (NotConfigured).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Outcome
@@ -3122,7 +3137,7 @@ function Get-DbHubT5ContainerText {
         'Deleted' { return ('T5''s container deleted ({0} billing until the next session creates it)' -f $billing) }
         'Missing' { return 'T5''s container already gone' }
         'Kept' { return ('T5''s container kept between sessions ({0})' -f [string](Get-DbHubMember -InputObject $Outcome -Name 'Reason')) }
-        'NotGranted' { return 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once' }
+        'NotGranted' { return 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)' }
         'Failed' { return ('T5''s container not deleted: {0}' -f [string](Get-DbHubMember -InputObject $Outcome -Name 'Error')) }
     }
     return ''
@@ -3270,8 +3285,10 @@ function Get-DbHubT5LastStormEnd {
     session's status (t5.endUtc) and the notebook's guide. The showcase's profile ends at its minutes from when it's set,
     or 2 minutes before its NotAfterUtc when that's earlier (the runner's end), and Get-DbHubT5LastStormMinute applies the
     runner's rule to it, less StartMinutes for its Run Command to set the profile on sqlvm01, so a ru-storm that only fits
-    when the profile is set at once isn't counted. Nothing is cut: T5's baseline runs on until the session ends. Returns
-    $null for an activity it doesn't apply to (another target, off, the baseline, or an incident) or when no ru-storm runs.
+    when the profile is set at once isn't counted. The profile's minutes count from when it's set, at most StartMinutes
+    after now, so the time is that much later too (review of ab91ee5), and T5 is back at its baseline by then. Nothing is
+    cut: T5's baseline runs on until the session ends. Returns $null for an activity it doesn't apply to (another target,
+    off, the baseline, or an incident) or when no ru-storm runs.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -3304,7 +3321,7 @@ function Get-DbHubT5LastStormEnd {
     if ($minute -le 0) {
         return $null
     }
-    return $NowUtc.AddMinutes($minute)
+    return $NowUtc.AddMinutes($StartMinutes + $minute)
 }
 
 function Get-DbHubLeftRunning {
@@ -6337,7 +6354,7 @@ function Invoke-DbHubControl {
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
         Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
-        return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed }
+        return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status }
     }
     if ($request.Action -eq 'reset') {
         return (Reset-DbHubActivity -Context $Context -Request $request -Tags $group.Tags)
@@ -6417,17 +6434,18 @@ function Invoke-DbHubStop {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($nightly.Failed) -join ', ')
         }
-        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4; replica = $nightly.Replica; t5 = $nightly.T5 }
+        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4; replica = $nightly.Replica; t5 = $nightly.T5; t5Status = $nightly.T5Status }
     }
     if ($Scope -eq 'T4') {
         # T5's container (2026-11-19, ADR 0027), as a fallback for a night the safety stop couldn't delete it (its role
         # without the container's actions yet): only while sqlvm01, whose runner drives T5, doesn't run, so nothing uses it.
-        $t5Part = [pscustomobject]@{ Text = ''; Failed = $false; Deleted = $false }
+        # Its outcome is apart from the job's status (t5Status; review of ab91ee5), as in the nightly pass.
+        $t5Part = [pscustomobject]@{ Text = ''; Status = ''; Deleted = $false }
         $sqlState = Get-DbHubVmState -Context $Context -VmName ([string]$Context.Settings.sqlVmName)
         if ($sqlState -in 'deallocated', 'deallocating', 'stopped', 'Missing') {
             $t5 = Remove-DbHubT5Container -Context $Context -Tags $group.Tags
             $t5Part.Text = Get-DbHubT5ContainerText -Outcome $t5
-            $t5Part.Failed = $t5.Outcome -in 'Failed', 'NotGranted'
+            $t5Part.Status = [string]$t5.Outcome
             $t5Part.Deleted = $t5.Outcome -eq 'Deleted'
         }
         else {
@@ -6453,24 +6471,25 @@ function Invoke-DbHubStop {
                 $outcome = 'accepted'
             }
             $replicaDone = & $replicaPart $(if ($sent) { 'Sent' } else { 'Failed' })
-            if ($replicaDone.Failed -or $t5Part.Failed) {
+            if ($replicaDone.Failed) {
                 $status = 'Partial'
             }
             $replicaSentence = if ($replicaDone.Text) { ' {0}.' -f $replicaDone.Text } else { '' }
-            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.{3}{4}' -f $t4.Name, $t4.State, $outcome, $replicaSentence, $t5Sentence); replica = $replicaDone.Text; t5 = $t5Part.Text }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.{3}{4}' -f $t4.Name, $t4.State, $outcome, $replicaSentence, $t5Sentence); replica = $replicaDone.Text; t5 = $t5Part.Text; t5Status = $t5Part.Status }
         }
         $replicaDone = & $replicaPart ''
         if ($replicaDone.Text -or $t5Part.Text) {
             $status = 'Stopped'
-            if ($replicaDone.Failed -or $t5Part.Failed) {
+            if ($replicaDone.Failed) {
                 $status = 'Partial'
             }
             elseif (-not $replicaDone.Text -and -not $t5Part.Deleted) {
-                # T4 was already stopped, and T5's container was already gone or is kept: nothing was stopped now.
+                # T4 was already stopped, and T5's container was already gone, is kept, or couldn't be deleted: nothing was
+                # stopped now.
                 $status = 'Skipped'
             }
             $replicaSentence = if ($replicaDone.Text) { ' {0}.' -f $replicaDone.Text } else { '' }
-            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 is {0}.{1}{2}' -f $t4.State, $replicaSentence, $t5Sentence); replica = $replicaDone.Text; t5 = $t5Part.Text }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 is {0}.{1}{2}' -f $t4.State, $replicaSentence, $t5Sentence); replica = $replicaDone.Text; t5 = $t5Part.Text; t5Status = $t5Part.Status }
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
     }
@@ -6482,7 +6501,7 @@ function Invoke-DbHubStop {
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
     Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By 'Auto-stop'
-    return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed }
+    return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status }
 }
 
 function Invoke-DbHubMonitor {
