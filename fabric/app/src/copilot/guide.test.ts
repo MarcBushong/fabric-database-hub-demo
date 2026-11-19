@@ -7,6 +7,7 @@ import { buildSystemMessage } from "./guide";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
 import { MODEL_GUIDE } from "./model-guide.generated";
+import { COSMOS_PROBE_DAX } from "./starters";
 import { parseTable, toDaxRef } from "./tmdl";
 
 describe("the model guide", () => {
@@ -61,6 +62,20 @@ describe("the model guide", () => {
         expect(withLive).toContain("suggest_followups");
         expect(withLive).toContain(MODEL_GUIDE.slice(0, 200));
         expect(buildSystemMessage({ estate: false })).toMatch(/LIVE estate: not available/);
+    });
+
+    it("teaches T5 (Azure Cosmos DB) from its latest capture, with columns and measures the model has", () => {
+        const message = buildSystemMessage({ estate: false });
+        const rules = message.slice(0, message.indexOf("# The history model"));
+        expect(rules).toContain(`TREATAS ( { "T5" }, 'Target'[Target Key] ), TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )`);
+        const columns = new Set(rules.match(/'[^']+'\[[^\]]+\]/g));
+        expect(columns.size).toBeGreaterThan(8);
+        for (const column of columns) expect(MODEL_GUIDE).toContain(column);
+        for (const measure of ["[CPU (%)]", "[Wait Time (s)]", "[Peak Norm RU (%)]", "[Throttled Requests (429s)]", "[RU Consumed]", "[Has Cosmos DB Bins]"]) {
+            expect(rules).toContain(measure);
+            expect(MODEL_GUIDE).toContain(measure);
+        }
+        expect(COSMOS_PROBE_DAX).toContain("[Has Cosmos DB Bins]");
     });
 });
 

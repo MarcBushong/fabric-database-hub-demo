@@ -5,6 +5,7 @@ import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
+import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
 // Built at run time so secret scanners never see a token-shaped literal.
@@ -70,8 +71,10 @@ function fetchStub(routes: Record<string, unknown>) {
     });
 }
 
+/** What the history model's T5 probe answers: 1 once the lakehouse holds T5's (Azure Cosmos DB) metrics. */
+let hasCosmos = 0;
 const queryClient: QueryClient = {
-    run: vi.fn(async (spec) => ({ spec, columns: [], rows: [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0), provenance: "history" as const })),
+    run: vi.fn(async (spec) => ({ spec, columns: [], rows: spec.dax === COSMOS_PROBE_DAX ? [{ HasCosmos: hasCosmos }] : [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0), provenance: "history" as const })),
     peek: () => undefined,
     clear: () => undefined,
 };
@@ -87,6 +90,8 @@ function renderDock(initialOpen = true) {
 }
 
 beforeEach(() => {
+    hasCosmos = 0;
+    vi.mocked(queryClient.run).mockClear();
     window.localStorage.clear();
     window.sessionStorage.clear();
     vi.stubGlobal("WebSocket", FakeSocket);
@@ -139,7 +144,11 @@ describe("the Copilot dock", () => {
         );
         renderDock();
         await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo Copilot Enterprise"));
-        fireEvent.click(await screen.findByRole("button", { name: "Which target worked hardest this week?" }));
+        const hardest = await screen.findByRole("button", { name: "Which target worked hardest this week?" });
+        await waitFor(() => expect(queryClient.run).toHaveBeenCalledWith(expect.objectContaining({ dax: COSMOS_PROBE_DAX })));
+        await act(async () => undefined);
+        expect(screen.queryByRole("button", { name: "Was Cosmos DB throttled?" })).not.toBeInTheDocument();
+        fireEvent.click(hardest);
         expect(await screen.findByText(/peaked at 88.2/)).toBeInTheDocument();
         const socket = FakeSocket.last!;
         expect(socket.sent[0]).toMatchObject({ type: "start", token: fakeToken() });
@@ -153,6 +162,23 @@ describe("the Copilot dock", () => {
             fireEvent.click(screen.getByRole("button", { name: "New chat" }));
         });
         expect(screen.queryByText(/peaked at 88.2/)).not.toBeInTheDocument();
+    });
+
+    it("offers T5's starter once the history holds T5's metrics, asking the history model once", async () => {
+        hasCosmos = 1;
+        window.localStorage.setItem("dbhub-insights.github.v1", JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        const run = vi.mocked(queryClient.run);
+        renderDock();
+        expect(await screen.findByRole("button", { name: "Was Cosmos DB throttled?" })).toBeInTheDocument();
+        expect(run.mock.calls.filter(([spec]) => spec.dax === COSMOS_PROBE_DAX)).toHaveLength(1);
     });
 
     it("keeps a visual's context attached until the viewer asks", async () => {

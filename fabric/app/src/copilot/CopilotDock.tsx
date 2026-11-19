@@ -317,7 +317,7 @@ function Conversation({ chat }: { chat: ChatController }) {
                 <p className="copilot-intro-title">Ask about your database estate</p>
                 <p>What needs attention now, what happened, and why. Every answer shows the query, or the Database Hub source, behind it. Every visual has Ask Copilot, and every anomaly has Ask why.</p>
                 <div className="copilot-starters" role="group" aria-label="Start with a question">
-                    {startersFor(Boolean(state.settings?.estate)).map((s) => (
+                    {startersFor(Boolean(state.settings?.estate), state.cosmosHistory).map((s) => (
                         <Button key={s.label} appearance="outline" size="small" shape="circular" onClick={() => chat.send(s.prompt)} disabled={state.busy}>
                             {s.label}
                         </Button>

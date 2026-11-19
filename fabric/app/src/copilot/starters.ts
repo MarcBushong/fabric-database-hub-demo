@@ -7,7 +7,12 @@ export interface Starter {
     prompt: string;
     /** Needs the live estate function. */
     live?: boolean;
+    /** Needs T5's (Azure Cosmos DB) history: shown only once the history model holds some. */
+    cosmos?: boolean;
 }
+
+/** One row: 1 when the lakehouse holds any T5 (Azure Cosmos DB) metric, whatever the filters, else 0. */
+export const COSMOS_PROBE_DAX = 'EVALUATE ROW ( "HasCosmos", [Has Cosmos DB Bins] )';
 
 export const STARTERS: readonly Starter[] = [
     { label: "How is my estate doing right now?", prompt: "How is my database estate doing right now? Check every engine, and tell me which database needs attention first.", live: true },
@@ -19,8 +24,10 @@ export const STARTERS: readonly Starter[] = [
     { label: "What changed since yesterday?", prompt: "What changed in my databases between the newest telemetry day and the day before? Lead with the biggest change." },
     { label: "Is the demo ready?", prompt: "Is the demo ready? Summarize the latest validation run and list anything that failed or needs a manual step, with its fix." },
     { label: "How is T4 (PostgreSQL) doing?", prompt: "How is T4, the PostgreSQL flexible server, doing in its latest capture: CPU, connections, and read replica lag?" },
+    { label: "Was Cosmos DB throttled?", prompt: "Was T5, the Azure Cosmos DB account, throttled in its latest capture? Chart its peak normalized RU and its throttled requests (429s) over time, compare the RU it consumed with its provisioned RU/s, and tell me what to change.", cosmos: true },
 ];
 
-export function startersFor(estate: boolean): Starter[] {
-    return STARTERS.filter((s) => estate || !s.live);
+/** The starters this environment can answer: the live ones with the estate function, T5's once its history exists. */
+export function startersFor(estate: boolean, cosmos = false): Starter[] {
+    return STARTERS.filter((s) => (estate || !s.live) && (cosmos || !s.cosmos));
 }

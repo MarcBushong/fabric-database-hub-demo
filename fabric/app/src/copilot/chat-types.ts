@@ -45,6 +45,8 @@ export interface ChatState {
     connecting: boolean;
     /** The context an entry point attached with open(ctx), waiting for a question. */
     pending: AskContext | null;
+    /** True once the history model is known to hold T5's (Azure Cosmos DB) metrics: the dock offers T5's starter. */
+    cosmosHistory: boolean;
 }
 
 export interface ChatController {

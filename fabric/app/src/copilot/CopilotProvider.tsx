@@ -13,6 +13,7 @@ import { clearSession, fromPoll, loadSession, saveSession, sessionState, type Gi
 import { buildSystemMessage } from "./guide";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
+import { COSMOS_PROBE_DAX } from "./starters";
 import { createToolRunner, toolSpecs, type ToolRunner } from "./tools";
 import { CopilotContext, type AttachedContext, type CopilotContextValue } from "./use-copilot";
 
@@ -104,6 +105,19 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         if (!initialOpen || !relay) return;
         checkRelay();
     }, [checkRelay, initialOpen, relay]);
+
+    // Whether the history holds T5's (Azure Cosmos DB) metrics, asked once when the dock first opens, so T5's starter
+    // shows only when it has an answer. A failure (the local preview's sample, a model without T5's measures) leaves it out.
+    const [cosmosHistory, setCosmosHistory] = useState(false);
+    const cosmosProbed = useRef(false);
+    useEffect(() => {
+        if (!isOpen || !relay || !queryClient || cosmosProbed.current) return;
+        cosmosProbed.current = true;
+        queryClient.run({ id: "copilot-has-cosmos", title: "Copilot: T5 history", dax: COSMOS_PROBE_DAX, rowLimit: 1, columns: [] }).then(
+            (result) => setCosmosHistory(Number(result.rows[0]?.HasCosmos) === 1),
+            () => undefined,
+        );
+    }, [isOpen, queryClient, relay]);
 
     // Who the stored sign-in belongs to, and whether that account can use GitHub Copilot here.
     const token = session?.accessToken ?? null;
@@ -451,6 +465,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         busy,
         connecting,
         pending: attached?.ctx ?? null,
+        cosmosHistory,
     };
     const chat: ChatController = {
         state: chatState,

@@ -21,6 +21,7 @@ export function buildSystemMessage(options: GuideOptions): string {
 
 # The estate
 - T1: SQL Server 2022 on an Azure VM. T2: Arc-enabled SQL Server in a nested Hyper-V guest. T3: Azure SQL Database. T4: Azure Database for PostgreSQL flexible server, with a read replica (T4-replica) during a session.
+- T5, when the configuration deploys it: an Azure Cosmos DB account. Its history is its Azure Monitor metrics (analysis cosmosdb), saved by captures (a session's end, deploy.ps1, stop-demo.ps1 -SaveHistory), and read with the measures in the Cosmos DB folder; [Has Cosmos DB Bins] is 1 once there's any.
 - A workload runner drives activity, and bounded incidents (blocking, CPU, IO, log rate) run at fixed minutes past each UTC hour.
 
 # Your data sources
@@ -43,6 +44,8 @@ ${live}
   EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], 'Target'[Target Key], TREATAS ( { "T1", "T2", "T3" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "CpuPct", [CPU (%)], "WaitS", [Wait Time (s)] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - Where the wait time went: EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], 'Target'[Target Key], <filters>, "WaitS", [Wait Time (s)] ) ORDER BY [WaitS] DESC
 - Incidents: EVALUATE TOPN ( 20, 'Incident Windows', 'Incident Windows'[Window Start UTC], DESC )
+- T5 (Azure Cosmos DB): its measures pick its metrics themselves; filter only the target and its latest capture, because two captures of one period both count in sums:
+  EVALUATE VAR LatestCapture = CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb" ) VAR LatestRun = CALCULATETABLE ( VALUES ( 'Analysis Findings'[Run ID] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb", 'Analysis Findings'[Captured At UTC] = LatestCapture ) RETURN SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], TREATAS ( { "T5" }, 'Target'[Target Key] ), TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ), "PeakNormRuPct", [Peak Norm RU (%)], "Throttled429", [Throttled Requests (429s)], "RuConsumed", [RU Consumed] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - Findings that need attention: filter 'Analysis Findings' with RELATED ( 'Status'[Needs Attention] ) = "Yes".
 - A string column's values: EVALUATE TOPN ( 50, VALUES ( 'Telemetry Snapshots'[Metric] ) ).
 - Return names that are easy to chart: "CpuPct" rather than "[CPU (%)]".
