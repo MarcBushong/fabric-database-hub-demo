@@ -800,6 +800,51 @@ function Set-DemoProgressStep {
     }
 }
 
+function Add-DemoProgressStepNote {
+    <#
+    .SYNOPSIS
+    Adds a later finding to a step that already ended, after its own message, and raises its status to -Status when that's
+    worse (2026-11-19: DEPLOY.COST.T4RESTART on the Infrastructure row, when the nightly safety stop that preflight counted
+    isn't in place after all). Never throws. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $Id,
+
+        [Parameter(Mandatory)]
+        [string] $Status,
+
+        [Parameter(Mandatory)]
+        [string] $Note,
+
+        [ValidateRange(20, 4000)]
+        [int] $MaxLength = 1200
+    )
+
+    if (-not $Path) {
+        return
+    }
+    try {
+        $model = Read-DemoProgress -Path $Path
+        $item = if ($null -ne $model) { Find-DemoProgressStep -Model $model -Id $Id } else { $null }
+        if ($null -eq $item) {
+            return
+        }
+        $text = (@([string]$item['message'], $Note) | Where-Object { $_ }) -join ' '
+        $worst = Get-DemoWorstStatus -Status @(@([string]$item['status'], $Status) | Where-Object { $_ })
+        $state = if ([string]$item['state'] -in 'Done', 'Failed', 'Skipped', 'Action needed') { [string]$item['state'] } else { 'Done' }
+        Set-DemoProgressStep -Path $Path -Id $Id -State $state -Status $worst -Message $text -MaxLength $MaxLength
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The status page''s {0} row wasn''t updated: {1}' -f $Id, (Protect-DemoText -Text $_.Exception.Message))
+    }
+}
+
 function Set-DemoProgressStopped {
     <#
     .SYNOPSIS

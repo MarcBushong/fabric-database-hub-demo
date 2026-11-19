@@ -579,6 +579,42 @@ Describe 'T5''s container, only during a session (2026-11-19)' {
     }
 }
 
+Describe 'Update-DemoT5ContainerLifecycle: the status page says the roles were updated before a session relies on them' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T5Container = ''; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = ''; RoleName = 'DbHub Demo Activity Operator (dbhubc6)' } }
+        $script:rows = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:rows.Add(('{0}|{1}|{2}' -f (@($PesterBoundParameters['Id']) -join ','), [string]$PesterBoundParameters['Status'], [string]$PesterBoundParameters['Message'])) }
+        $script:containerActions = @('read', 'write', 'delete' | ForEach-Object { 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/' + $_ })
+    }
+
+    It 'names the container actions this run added to both roles, on the result and the T5.Lifecycle row' {
+        $prior = @(
+            New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'updated' -Evidence ([ordered]@{ role = 'DbHub Demo Activity Operator (dbhubc6)'; added = $script:containerActions })
+            New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'updated' -Evidence ([ordered]@{ role = 'DbHub Demo Safety Stop'; added = @($script:containerActions[0], $script:containerActions[2]) })
+            New-DemoResult -CheckId 'CONTROL.ROLE.WRITER' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'kept' -Evidence ([ordered]@{ role = 'DbHub Demo Session Writer'; added = @('Microsoft.KeyVault/vaults/secrets/write') })
+        )
+        $result = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Prior = $prior } { Update-DemoT5ContainerLifecycle -Config $Config -ProgressPath 'progress.json' -PriorResult $Prior -Confirm:$false })[0]
+        $result.checkId | Should -Be 'DEPLOY.T5.LIFECYCLE'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'exists only during a session from now on'
+        $result.message | Should -Match 'This run updated the roles first: "DbHub Demo Activity Operator \(dbhubc6\)" gained read, write, delete; "DbHub Demo Safety Stop" gained read, delete \(the container''s actions\)\.$'
+        $script:rows[-1] | Should -Match '^T5\.Lifecycle\|Pass\|.*This run updated the roles first'
+    }
+
+    It 'adds nothing when this run added no container action, and says when the run left T5 out' {
+        $prior = @(New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'kept' -Evidence ([ordered]@{ role = 'DbHub Demo Activity Operator' }))
+        $result = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Prior = $prior } { Update-DemoT5ContainerLifecycle -Config $Config -PriorResult $Prior -Confirm:$false })[0]
+        $result.message | Should -Not -Match 'updated the roles'
+        $leftOut = New-TestConfig -Override @{ t5Enabled = $false; t5LeftOut = 'ServiceUnavailable: high demand' }
+        $off = @(InModuleScope DbHubDemo -Parameters @{ Config = $leftOut } { Update-DemoT5ContainerLifecycle -Config $Config -Confirm:$false })[0]
+        $off.status | Should -Be 'Not selected'
+        $off.message | Should -Match 'left out of this run because Azure didn''t create its account'
+    }
+}
+
 Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only when a session can create it again' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -587,8 +623,10 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         $script:roleThrows = $false
         $script:recorded = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlRoleId -MockWith { if ($script:roleThrows) { throw 'The role definitions couldn''t be read: timeout' }; [pscustomobject]@{ Id = 'abababab-abab-abab-abab-abababababab'; Actions = @($script:roleActions) } }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { '12121212-1212-1212-1212-121212121212' }
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { [pscustomobject]@{ Exists = $script:held; Missing = $false; Error = '' } }
+        $script:other = $false
+        $script:principal = '12121212-1212-1212-1212-121212121212'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { $script:principal }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { [pscustomobject]@{ Exists = $script:held; Other = $script:other; Missing = $false; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:recorded.Add([string]$Value['T5Container']) }
         function Resolve-Lifecycle([string] $Purpose, [string] $Recorded) {
             InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Purpose = $Purpose; State = [pscustomobject]@{ T5Container = $Recorded } } { Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose $Purpose -State $State -Confirm:$false }
@@ -610,7 +648,58 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         $script:recorded | Should -Be @('AlwaysOn')
         $script:roleActions = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete')
         $script:held = $false
-        (Resolve-Lifecycle 'Deploy' '').Why | Should -Match 'doesn''t hold the role'
+        $script:other = $true
+        $another = Resolve-Lifecycle 'Deploy' ''
+        $another.Lifecycle | Should -Be 'AlwaysOn' -Because 'a control that holds another role at the group could start a session that can''t create the container'
+        $another.Mode | Should -Be 'Lacking'
+        $another.Why | Should -Match 'holds another role at rg-dbhub-demo'
+    }
+
+    It 'deploy.ps1 records Session when the session control holds no role at all (fix 1): Run all can''t start a session, and start-demo.ps1 creates the container with your own rights' {
+        $script:held = $false
+        $script:roleActions = @('Microsoft.Compute/virtualMachines/read')
+        foreach ($recorded in '', 'AlwaysOn', 'Session') {
+            $script:recorded.Clear()
+            $none = Resolve-Lifecycle 'Deploy' $recorded
+            $none.Lifecycle | Should -Be 'Session' -Because "a Contributor's run (recorded: '$recorded'), whose control has no role, even one without the container's actions"
+            $none.Mode | Should -Be 'NoRole'
+            $none.Why | Should -Match 'holds no role at rg-dbhub-demo yet'
+        }
+        $script:principal = ''
+        $missing = Resolve-Lifecycle 'Deploy' ''
+        $missing.Lifecycle | Should -Be 'Session'
+        $missing.Mode | Should -Be 'NoRole'
+        $missing.Why | Should -Match 'doesn''t exist yet'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -Times 3 -Exactly -Because 'an identity that doesn''t exist holds nothing, so its assignments aren''t read'
+        # A stop keeps Session, and a grant turns AlwaysOn into Session.
+        $script:principal = '12121212-1212-1212-1212-121212121212'
+        (Resolve-Lifecycle 'Stop' 'Session').Lifecycle | Should -Be 'Session'
+        (Resolve-Lifecycle 'Grant' 'AlwaysOn').Lifecycle | Should -Be 'Session'
+    }
+
+    It 'says on the status page which mode applies and why, and names grant-safety-stop.ps1 where it helps' {
+        $script:held = $false
+        $noRole = Resolve-Lifecycle 'Deploy' ''
+        $said = InModuleScope DbHubDemo -Parameters @{ Lifecycle = $noRole } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle -ConfigPath 'config/demo.config.json' }
+        $said.status | Should -Be 'Pass'
+        $said.evidence['mode'] | Should -Be 'NoRole'
+        $said.message | Should -Match 'start-demo\.ps1 creates it with your own rights'
+        $said.message | Should -Match 'Run all can''t start a session'
+        $said.message | Should -Match 'grant-safety-stop\.ps1'
+        $script:held = $true
+        $script:roleActions = @('Microsoft.Compute/virtualMachines/read')
+        $lacking = Resolve-Lifecycle 'Deploy' ''
+        $warned = InModuleScope DbHubDemo -Parameters @{ Lifecycle = $lacking } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle -ConfigPath 'config/demo.config.json' }
+        $warned.status | Should -Be 'Warning'
+        $warned.evidence['mode'] | Should -Be 'Lacking'
+        $warned.message | Should -Match 'stays between sessions'
+        $warned.remediation | Should -Match 'grant-safety-stop\.ps1'
+        $script:roleActions = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete')
+        $control = Resolve-Lifecycle 'Deploy' ''
+        $passed = InModuleScope DbHubDemo -Parameters @{ Lifecycle = $control } { Get-DemoT5LifecycleResult -Lifecycle $Lifecycle }
+        $passed.status | Should -Be 'Pass'
+        $passed.evidence['mode'] | Should -Be 'Control'
+        $passed.message | Should -Match 'Run all create it'
     }
 
     It 'grant-safety-stop.ps1 turns AlwaysOn into Session, but leaves an environment deployed before the lifecycle to deploy.ps1' {
@@ -638,6 +727,93 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
     }
 }
 
+Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput (2026-11-19, the coordinator''s gap fix)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:actions = @('read', 'write', 'delete' | ForEach-Object { 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/' + $_ })
+        # A new environment: no session control yet.
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity id-dbhub-demo-control doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { $script:control }
+        $script:owner = [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' }
+        $script:contributor = [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' }
+        function Get-Priced([object] $State, [object] $Permission, [switch] $ThisRunDeploys) {
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $State; Permission = $Permission; Deploys = [bool]$ThisRunDeploys } { Get-DemoT5CostLifecycle -Config $Config -State $State -Permission $Permission -ThisRunDeploys:$Deploys }
+        }
+        $script:new = [pscustomobject]@{ Exists = $false; T5Container = '' }
+        # An environment from main: deployed before 2026-11-19, so no tag, and its control holds its role without the
+        # container's actions.
+        $script:fromMain = [pscustomobject]@{ Exists = $true; T5Container = '' }
+        $script:older = [pscustomobject]@{ Mode = 'Lacking'; Why = 'the session control''s custom role "DbHub Demo Activity Operator" doesn''t have them yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $true; HoldsOther = $false }
+    }
+
+    It 'prices a new environment session-only for an Owner and for a Contributor, whose session control has no role (fix 1)' {
+        Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+        Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+    }
+
+    It 'prices an update from main AlwaysOn when a Contributor runs it, since its control keeps a role without the container''s actions, and Session for an Owner, whose run updates the role' {
+        $script:control = $script:older
+        Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn'
+        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+        # Someone who can assign roles but not write them (a Role Based Access Control Administrator) can't add the actions.
+        Get-Priced -State $script:fromMain -Permission ([pscustomobject]@{ CanDefine = $false; CanAssign = $true; Error = '' }) -ThisRunDeploys | Should -Be 'AlwaysOn'
+    }
+
+    It 'prices a control whose role already has the container''s actions Session, and one that holds another role AlwaysOn, for any deployer' {
+        $script:control = [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false }
+        Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+        $script:control = [pscustomobject]@{ Mode = 'Lacking'; Why = 'it holds another role'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $false; HoldsOther = $true }
+        Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'AlwaysOn'
+        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session' -Because 'an Owner''s run assigns the control its own role'
+    }
+
+    It 'keeps a recorded Session without reading the control, prices what it can''t read AlwaysOn (fail safe), and follows the tag outside deploy.ps1' {
+        Get-Priced -State ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -Times 0 -Exactly
+        $script:control = [pscustomobject]@{ Mode = 'Unknown'; Why = 'the role couldn''t be read'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'AlwaysOn'
+        # start-demo.ps1 and estimate-cost.ps1 price what's recorded.
+        Get-Priced -State $script:fromMain -Permission $null | Should -Be 'AlwaysOn'
+        Get-Priced -State ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) -Permission $null | Should -Be 'Session'
+        Get-Priced -State $script:new -Permission $null | Should -Be 'Session'
+    }
+}
+
+Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when the run records what preflight didn''t price' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T5Container = ''; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'AlwaysOn'; Recorded = ''; Changed = $true; Known = $true; Why = 'the session control''s custom role "DbHub Demo Activity Operator" doesn''t have Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'Lacking' } }
+        function New-Priced([string] $Lifecycle, [double] $Worst) {
+            New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t5ContainerLifecycle = $Lifecycle; t5AlwaysOnExtraMonthly = 22.32; monthlyWorstCase = $Worst })
+        }
+        function Update-Lifecycle([object[]] $Prior, [double] $Ceiling = 390) {
+            $config = New-TestConfig
+            $config['monthlyCeilingUsd'] = $Ceiling
+            @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Prior = $Prior } { Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath './config/demo.config.json' -PriorResult $Prior -Confirm:$false })[0]
+        }
+    }
+
+    It 'adds the worst case, over the ceiling, with the ceiling to raise' {
+        $over = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $over.status | Should -Be 'Warning'
+        $over.message | Should -Match 'Preflight priced its throughput for a session''s hours only, so the month''s worst case is about 22\.32 USD more than its estimate: 392\.92 USD, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $over.remediation | Should -Match 'grant-safety-stop\.ps1'
+        $over.remediation | Should -Match 'Or raise monthlyCeilingUsd to at least 393 in your configuration\.$'
+        $over.evidence['overCeiling'] | Should -BeTrue
+        $over.evidence['monthlyWorstCase'] | Should -Be 392.92
+    }
+
+    It 'says it''s within the ceiling, and adds nothing when preflight priced AlwaysOn already or didn''t run' {
+        $within = Update-Lifecycle -Prior @(New-Priced 'Session' 200.00)
+        $within.message | Should -Match 'worst case is about 22\.32 USD more than its estimate: 222\.32 USD, within monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
+        (Update-Lifecycle -Prior @(New-Priced 'AlwaysOn' 380.00)).message | Should -Not -Match 'Preflight priced'
+        (Update-Lifecycle -Prior @()).message | Should -Not -Match 'Preflight priced'
+    }
+}
 Describe 'Invoke-DemoT5WarmUp' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }

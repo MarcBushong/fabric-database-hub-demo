@@ -1034,7 +1034,12 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
     It 'runs on both deploy paths: the Azure part beside the nightly safety stop, the notebook after the Fabric track, a status page row, and DONE''s line' {
         foreach ($file in 'Public/Invoke-DemoDeployment.ps1', 'Private/ParallelDeployment.ps1') {
             $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
-            $text | Should -Match 'Invoke-DemoSafetyStopSetup -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false\)\s+(#[^\n]*\n\s+)*(Write-DemoLog[^\n]*\n\s+)?& \$addAll @\(Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Azure' -Because $file
+            $between = [regex]::Matches($text, '(?s)\$safetyResults = @\(Invoke-DemoSafetyStopSetup -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false\)\s+& \$addAll \$safetyResults(.*?)& \$addAll @\(Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Azure')
+            $between.Count | Should -BeGreaterThan 0 -Because $file
+            foreach ($match in $between) {
+                # Only the safety stop's plan Warning comes between them (2026-11-19, the coordinator's option 2).
+                @([regex]::Matches($match.Groups[1].Value, '\b[A-Z][a-z]+-Demo[A-Za-z]+') | ForEach-Object { $_.Value } | Sort-Object -Unique) | Should -Be @('Add-DemoProgressStepNote', 'New-DemoSafetyStopPlanResult', 'Write-DemoLog') -Because $file
+            }
             $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath' -Because $file
             $text | Should -Not -Match 'Invoke-DemoActivityControlRegrant' -Because $file
             # Since Phase 28 both paths build DEPLOY.SUMMARY in one place.

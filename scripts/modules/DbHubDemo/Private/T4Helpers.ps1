@@ -2420,7 +2420,9 @@ function New-DemoT4RestartCoverageResult {
         return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false), so its automatic restart costs nothing.' -DocUrl $doc)
     }
     if ($null -ne $Coverage -and $Coverage.Counts) {
-        return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts each restart as about a day, until the next safety stop.' -f $Coverage.Reason) -Evidence $Coverage.Evidence -DocUrl $doc)
+        # Planned (2026-11-19, the coordinator's option 2): deploy.ps1 sets it up in this run, after its template.
+        $then = if ([bool](Get-DemoMemberValue -InputObject $Coverage -Name 'Planned')) { ' If its setup then doesn''t put it in place, the run says so (DEPLOY.COST.T4RESTART), with the worst case without it.' } else { '' }
+        return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts each restart as about a day, until the next safety stop.{1}' -f $Coverage.Reason, $then) -Evidence $Coverage.Evidence -DocUrl $doc)
     }
     $reason = if ($null -ne $Coverage) { $Coverage.Reason } else { 'whether the nightly safety stop is in place wasn''t checked' }
     $fix = if ($null -ne $Coverage -and $Coverage.Fix) { $Coverage.Fix } else { 'Run ./scripts/deploy.ps1, which sets up the nightly safety stop (ADR 0024).' }

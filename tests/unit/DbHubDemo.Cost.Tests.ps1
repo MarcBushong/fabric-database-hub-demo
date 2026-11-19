@@ -245,6 +245,27 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Not -Match 't4SkuName'
     }
 
+    It 'counts a nightly safety stop that this run sets up, and keeps the worst case without it for DEPLOY.COST.T4RESTART (2026-11-19, the coordinator''s option 2)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }
+        $planned = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = 'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'; Fix = ''; Evidence = [ordered]@{ counts = $true }; WithoutReason = 'the nightly safety stop isn''t in place yet'; WithoutFix = 'Run ./scripts/deploy.ps1.' }
+        $estimate = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $planned
+        $estimate.T4RestartHours | Should -Be 96
+        $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $without = [System.Math]::Round($estimate.LightUseMonthly + 0.18 * 720, 2)
+        $monthly.evidence.t4RestartPlanned | Should -BeTrue
+        $monthly.evidence.t4AutoRestartWorstCaseWithoutSafetyStopMonthly | Should -Be ([System.Math]::Round(0.18 * 720, 2))
+        $monthly.evidence.monthlyWorstCaseWithoutSafetyStop | Should -Be $without
+        $monthly.evidence.monthlyWorstCase | Should -Be ([System.Math]::Round($estimate.LightUseMonthly + 0.18 * 96, 2))
+        $monthly.evidence.t4RestartWithoutReason | Should -Match 'isn''t in place yet'
+        $monthly.message | Should -Match 'and deploy\.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role, so the worst case counts up to 4 restarts'
+        $monthly.message | Should -Match ('If its setup in this run doesn''t put it in place, the worst case is {0} USD a month, which the run then says \(DEPLOY\.COST\.T4RESTART\)\.' -f [regex]::Escape($without.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)))
+        # A safety stop that's already in place has no worst case without it.
+        $inPlace = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is in place'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $kept = (Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $inPlace).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $kept.evidence.t4RestartPlanned | Should -BeFalse
+        $kept.evidence.Contains('monthlyWorstCaseWithoutSafetyStop') | Should -BeFalse
+        $kept.message | Should -Not -Match 'DEPLOY\.COST\.T4RESTART'
+    }
     It 'keeps today''s monthly ceiling at <Ceiling> USD: a Warning only for init''s old 250 when only T4''s default size puts the month over it (R727, 2026-11-09)' -ForEach @(
         @{ Ceiling = 250; Legacy = $true }
         @{ Ceiling = 249; Legacy = $false }
@@ -469,7 +490,8 @@ Describe 'Get-DemoCostEstimate' {
         $monthly = $session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) costs 7\.80 USD a month whether the demo runs or not \(its private endpoint and private DNS zone\)\. Its container exists only during a session \(.+\), so its 400 RU/s of throughput and its storage add 0\.032 USD a running hour\.'
         $monthly.message | Should -Match 'doesn''t have the free tier'
-        $monthly.message | Should -Match 'If the session control''s role can''t be updated \(no Owner has run \./scripts/grant-safety-stop\.ps1\), the container stays between sessions and adds about 22\.32 USD a month\.'
+        $monthly.message | Should -Match 'If the session control holds a role without the container''s actions \(an update by someone who isn''t an Owner, until an Owner runs \./scripts/grant-safety-stop\.ps1 once\), the container stays between sessions and adds about 22\.32 USD a month\.'
+        $monthly.evidence.monthlyWorstCase | Should -Be $session.LightUseMonthly -Because 'without T4, the worst case is the light-use month'
         $monthly.evidence.t5ContainerLifecycle | Should -Be 'Session'
         @($session.MissingPrices) | Should -BeNullOrEmpty
 

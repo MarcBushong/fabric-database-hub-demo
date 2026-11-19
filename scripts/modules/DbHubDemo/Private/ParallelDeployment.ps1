@@ -1153,10 +1153,19 @@ function Invoke-DemoParallelDeployment {
             # deployed, as in a full run.
             if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
                 Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
-                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                $safetyResults = @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                & $addAll $safetyResults
+                # Preflight counted this safety stop (2026-11-19, option 2): when its setup didn't put it in place, the worst case
+                # without it, on the console and the Infrastructure row (DEPLOY.COST.T4RESTART).
+                $planResult = New-DemoSafetyStopPlanResult -Result $results.ToArray() -SetupResult $safetyResults -Config $Config -ConfigPath $ConfigPath
+                if ($null -ne $planResult) {
+                    $results.Add($planResult)
+                    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                    Add-DemoProgressStepNote -Path $ProgressPath -Id 'Infrastructure' -Status 'Warning' -Note ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                }
                 Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric)
-                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
@@ -1188,14 +1197,23 @@ function Invoke-DemoParallelDeployment {
         # handoff, so none of them waits for it. Its problems are Warnings, never a Fail.
         if (-not $whatIf) {
             Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
-            & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            $safetyResults = @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            & $addAll $safetyResults
+            # Preflight counted this safety stop (2026-11-19, option 2): when its setup didn't put it in place, the worst case
+            # without it, on the console and the Infrastructure row (DEPLOY.COST.T4RESTART).
+            $planResult = New-DemoSafetyStopPlanResult -Result $results.ToArray() -SetupResult $safetyResults -Config $Config -ConfigPath $ConfigPath
+            if ($null -ne $planResult) {
+                $results.Add($planResult)
+                Write-DemoLog -Level Warning -Message ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                Add-DemoProgressStepNote -Path $ProgressPath -Id 'Infrastructure' -Status 'Warning' -Note ('{0} {1}' -f $planResult.message, $planResult.remediation)
+            }
             # The session control's Azure part (ADR 0026), the same way: while the tracks run, never a Fail. A control set up
             # before 2026-11-14 is adopted; its runbooks get this code, and its roles what this code needs.
             Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
             & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
             # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
             # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
-            & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
+            & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
         }
 
         # 4. The tracks.

@@ -361,6 +361,7 @@ function Get-DemoCostEstimate {
     $t4ComputeItem = $null
     $t4WorstCase = $null
     $t4Restart = $null
+    $t4WorstCaseWithout = $null
     $t4ReplicaOn = $false
     if ($t4On -and $null -ne $sizing.t4) {
         # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
@@ -382,6 +383,12 @@ function Get-DemoCostEstimate {
             $t4Capped = $null -ne $T4RestartCoverage -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Counts')
             $t4Restart = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $t4Capped -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
             $t4WorstCase = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Restart.Hours, 2)
+            # A safety stop that deploy.ps1 sets up in this run (2026-11-19, the coordinator's option 2): the worst case
+            # without it too, which the run reports when its setup doesn't put it in place (DEPLOY.COST.T4RESTART).
+            if ($t4Capped -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Planned')) {
+                $t4Uncapped = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $false -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
+                $t4WorstCaseWithout = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Uncapped.Hours, 2)
+            }
         }
         # T4's read replica (2026-11-13, ADR 0025): created for each session and deleted after it, so everything it bills is
         # counted for the session's running hours only: its compute at T4's size, and its storage prorated by the hour (its
@@ -650,6 +657,14 @@ function Get-DemoCostEstimate {
         $evidence['t4RestartAssumption'] = if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } else { 'RestOfMonth' }
         $evidence['t4RestartHours'] = if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null }
         $evidence['t4RestartMissing'] = if ($null -eq $T4RestartCoverage) { 'NotChecked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Missing') }
+        # A safety stop that this run sets up (option 2): the worst case without it, for DEPLOY.COST.T4RESTART.
+        $evidence['t4RestartPlanned'] = $null -ne $t4WorstCaseWithout
+        if ($null -ne $t4WorstCaseWithout) {
+            $evidence['t4AutoRestartWorstCaseWithoutSafetyStopMonthly'] = $t4WorstCaseWithout
+            $evidence['monthlyWorstCaseWithoutSafetyStop'] = [System.Math]::Round($lightUseMonthly + $t4WorstCaseWithout, 2)
+            $evidence['t4RestartWithoutReason'] = [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'WithoutReason')
+            $evidence['t4RestartWithoutFix'] = [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'WithoutFix')
+        }
         # T4's read replica (ADR 0025): per session, so only in the running hours.
         $evidence['t4ReplicaIncluded'] = [bool]$t4ReplicaOn
         $evidence['t4ReplicaHourly'] = [System.Math]::Round($replicaRunning, 4)
@@ -665,6 +680,10 @@ function Get-DemoCostEstimate {
         $evidence['t5RunningHourly'] = $t5RunningHourly
         $evidence['t5AlwaysOnExtraMonthly'] = $t5AlwaysOnExtra
     }
+    # The monthly check's worst case (2026-11-19): DEPLOY.T5.LIFECYCLE prices it again when the run records what preflight
+    # didn't assume.
+    $evidence['lightUseMonthly'] = $lightUseMonthly
+    $evidence['monthlyWorstCase'] = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
         $evidence['defenderMonthly'] = $defenderMonthly
@@ -695,7 +714,8 @@ function Get-DemoCostEstimate {
                 ' Its compute price couldn''t be read, so its automatic restart isn''t counted.'
             }
             elseif ($t4Restart.Restarts -gt 0) {
-                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts up to {1} restarts a month of about a day each, until the next safety stop: {2:N0} hours, {3:N2} USD of T4 compute, against the ceiling.', [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason'), $t4Restart.Restarts, $t4Restart.Hours, [double]$t4WorstCase)
+                $plannedText = if ($null -ne $t4WorstCaseWithout) { [string]::Format($culture, ' If its setup in this run doesn''t put it in place, the worst case is {0:N2} USD a month, which the run then says (DEPLOY.COST.T4RESTART).', $lightUseMonthly + $t4WorstCaseWithout) } else { '' }
+                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts up to {1} restarts a month of about a day each, until the next safety stop: {2:N0} hours, {3:N2} USD of T4 compute, against the ceiling.{4}', [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason'), $t4Restart.Restarts, $t4Restart.Hours, [double]$t4WorstCase, $plannedText)
             }
             else {
                 $why = if ($null -eq $T4RestartCoverage) { 'whether the nightly safety stop is in place wasn''t checked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason') }
@@ -776,7 +796,7 @@ function Get-DemoCostEstimate {
             $t5Rus = (Get-DemoCosmosSetting)['throughputRUs']
             if ($t5Session) {
                 $t5Other = if ($t5AlwaysOnExtra -gt 0) {
-                    [string]::Format($t5Culture, ' If the session control''s role can''t be updated (no Owner has run ./scripts/grant-safety-stop.ps1), the container stays between sessions and adds about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
+                    [string]::Format($t5Culture, ' If the session control holds a role without the container''s actions (an update by someone who isn''t an Owner, until an Owner runs ./scripts/grant-safety-stop.ps1 once), the container stays between sessions and adds about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
                 }
                 else { '' }
                 $t5Parts = if ($billedPlans -contains 'CosmosDbs') { ', its storage, and Defender for Azure Cosmos DB' } else { ' and its storage' }

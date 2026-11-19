@@ -674,8 +674,14 @@ function Get-DemoT5CostLifecycle {
     How the cost estimate prices T5's throughput (Get-DemoCostEstimate -T5ContainerLifecycle; 2026-11-19, ADR 0027):
     Session, for the running hours only, unless the environment exists and its DbHubT5Container tag isn't Session (an
     environment whose session control can't create the container yet, or one deployed before then), whose container stays
-    between sessions: AlwaysOn, all month. A new environment is priced as Session, which the estimate's message qualifies.
-    Never throws: a state that can't be read is Session. Internal.
+    between sessions: AlwaysOn, all month. Never throws: a state that can't be read is Session. Internal.
+
+    .DESCRIPTION
+    -ThisRunDeploys (deploy.ps1's preflight, 2026-11-19, the coordinator's gap fix): what this run's lifecycle step will
+    record, unless the tag is Session already: Session when the session control will be able to create the container (its
+    role has the container's actions, or the deployer can write them, and its identity holds it, or the deployer can
+    assign it) or will have no role at all (the deployer can't assign it: Run all can't start a session then); AlwaysOn
+    when it will hold a role without the actions, or when that can't be read (fail safe).
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -685,14 +691,40 @@ function Get-DemoT5CostLifecycle {
 
         # Get-DemoDeploymentState's result; read when it isn't given.
         [AllowNull()]
-        [object] $State = $null
+        [object] $State = $null,
+
+        [switch] $ThisRunDeploys,
+
+        # Get-DemoDeployerRolePermission's answer, for -ThisRunDeploys; read when it isn't given.
+        [AllowNull()]
+        [object] $Permission = $null
     )
 
     try {
         if ($null -eq $State) {
             $State = Get-DemoDeploymentState -Config $Config
         }
-        if ([bool](Get-DemoMemberValue -InputObject $State -Name 'Exists') -and [string](Get-DemoMemberValue -InputObject $State -Name 'T5Container') -cne $script:T5LifecycleSession) {
+        $exists = [bool](Get-DemoMemberValue -InputObject $State -Name 'Exists')
+        $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Container')
+        if ($ThisRunDeploys -and $recorded -cne $script:T5LifecycleSession) {
+            if ($null -eq $Permission) {
+                $Permission = Get-DemoDeployerRolePermission -Config $Config
+            }
+            $control = Get-DemoT5ControlRoleState -Config $Config
+            if ($control.Mode -eq 'Unknown') {
+                return $script:T5LifecycleAlwaysOn
+            }
+            $willHaveActions = @($control.Lacking).Count -eq 0 -or [bool]$Permission.CanDefine
+            $willHold = [bool]$control.HoldsRole -or [bool]$Permission.CanAssign
+            if ($willHold -and -not $willHaveActions) {
+                return $script:T5LifecycleAlwaysOn
+            }
+            if (-not $willHold -and [bool]$control.HoldsOther) {
+                return $script:T5LifecycleAlwaysOn
+            }
+            return $script:T5LifecycleSession
+        }
+        if ($exists -and $recorded -cne $script:T5LifecycleSession) {
             return $script:T5LifecycleAlwaysOn
         }
     }
@@ -946,6 +978,72 @@ function Remove-DemoT5Container {
     return [pscustomobject]@{ Outcome = 'Failed'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = ('it was still there {0} minutes after its deletion was accepted{1}' -f $WaitMinutes, $(if ($waited.Error) { ' (' + $waited.Error + ')' } else { '' })) }
 }
 
+function Get-DemoT5ControlRoleState {
+    <#
+    .SYNOPSIS
+    What the session control can do with T5's container (2026-11-19, ADR 0027), read once: Mode, Why, RoleName, and the
+    facts behind them (RoleExists, Lacking, IdentityExists, HoldsRole, HoldsOther). Internal.
+
+    .DESCRIPTION
+    Mode:
+    - Control: its custom role has the container's actions ($script:T5ContainerControlActions), and its identity holds it at
+      the demo resource group, so Run all creates the container at a session's start.
+    - NoRole: its identity holds no role at the demo resource group (or doesn't exist yet), so Run all can't start a session
+      at all, and only start-demo.ps1 and demo-control.ps1 do, which create the container with the person's own rights (the
+      coordinator's fix 1, 2026-11-19).
+    - Lacking: its identity holds its role, which doesn't have the container's actions (an earlier grant, and a deployer who
+      can't write the role), or holds another role there: Run all could start a session that couldn't create the container.
+    - Unknown: the role or the assignments couldn't be read.
+    Reads: the role definitions, the identity, and its role assignments at the demo resource group (at, above, or below).
+    https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $name = Get-DemoActivityControlName -Config $Config
+    $answer = [ordered]@{ Mode = 'Unknown'; Why = ''; RoleName = $name.RoleName; RoleExists = $false; Lacking = @($script:T5ContainerControlActions); IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+    try {
+        $role = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $name.RoleName -WithActions
+        $answer.RoleExists = [bool]$role.Id
+        $answer.Lacking = @(if ($role.Id) { $script:T5ContainerControlActions | Where-Object { $_ -notin @($role.Actions) } } else { $script:T5ContainerControlActions })
+        $principalId = Get-DemoActivityControlPrincipalId -Name $name
+        $answer.IdentityExists = [bool]$principalId
+        if ($principalId) {
+            $held = Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId ([string]$role.Id)
+            if ([string]$held.Error -and -not [bool]$held.Missing) {
+                $answer.Why = 'the session control''s role assignments couldn''t be read: {0}' -f $held.Error
+                return [pscustomobject]$answer
+            }
+            $answer.HoldsRole = [bool]$held.Exists
+            $answer.HoldsOther = [bool](Get-DemoMemberValue -InputObject $held -Name 'Other')
+        }
+    }
+    catch {
+        $answer.Why = 'the session control''s role couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message)
+        return [pscustomobject]$answer
+    }
+    if ($answer.HoldsRole -and $answer.Lacking.Count -eq 0) {
+        $answer.Mode = 'Control'
+    }
+    elseif ($answer.HoldsRole) {
+        $answer.Mode = 'Lacking'
+        $answer.Why = 'the session control''s custom role "{0}" doesn''t have {1} yet' -f $name.RoleName, ($answer.Lacking -join ', ')
+    }
+    elseif ($answer.HoldsOther) {
+        $answer.Mode = 'Lacking'
+        $answer.Why = 'the session control''s identity {0} holds another role at {1}, not "{2}"' -f $name.Identity, $name.DemoResourceGroup, $name.RoleName
+    }
+    else {
+        $answer.Mode = 'NoRole'
+        $answer.Why = if (-not $answer.IdentityExists) { 'the session control''s identity {0} doesn''t exist yet' -f $name.Identity } else { '{0} holds no role at {1} yet' -f $name.Identity, $name.DemoResourceGroup }
+    }
+    return [pscustomobject]$answer
+}
+
 function Resolve-DemoT5ContainerLifecycle {
     <#
     .SYNOPSIS
@@ -954,18 +1052,20 @@ function Resolve-DemoT5ContainerLifecycle {
     Known, and Why (what keeps it AlwaysOn). Internal.
 
     .DESCRIPTION
-    A stop deletes the container only when a session can create it again (the owner's condition, 2026-11-19): the
-    session control's custom role (this environment's name for "DbHub Demo Activity Operator") has the container's
-    actions ($script:T5ContainerControlActions), and the control's identity holds it at the demo resource group. -Purpose
-    says what may change the tag:
+    A stop deletes the container only when a session can't run without it (the owner's condition, 2026-11-19): the
+    session control can create it at a session's start (Get-DemoT5ControlRoleState's Control: its custom role has the
+    container's actions, and its identity holds it at the demo resource group), or it has no role there at all (NoRole,
+    the coordinator's fix 1, 2026-11-19): Run all can't start a session then, and start-demo.ps1 and demo-control.ps1 create
+    the container with the person's own rights. A control that holds a role without the container's actions (Lacking)
+    keeps the container between sessions. -Purpose says what may change the tag:
     - Deploy (deploy.ps1, right after the session control's setup, which updates the role for an Owner and publishes the
-      runbooks that create the container): Session when the role can, AlwaysOn otherwise.
-    - Grant (grant-safety-stop.ps1, after an Owner's grants): AlwaysOn becomes Session when the role can now; an
+      runbooks that create the container): Session for Control or NoRole, AlwaysOn otherwise.
+    - Grant (grant-safety-stop.ps1, after an Owner's grants): AlwaysOn becomes Session when the control can now; an
       environment without the tag (deployed before 2026-11-19, whose runbooks can't create the container) keeps none,
       because deploy.ps1 sets it up.
-    - Stop (stop-demo.ps1, before it deletes the container): Session becomes AlwaysOn when the role can't any more (a
-      shared role that another deployment changed back, for example); nothing becomes Session.
-    When the role can't be read, the recorded value stands. -WhatIf reads, and records nothing.
+    - Stop (stop-demo.ps1, before it deletes the container): Session becomes AlwaysOn when the control holds a role that
+      can't any more (a shared role that another deployment changed back, for example); nothing becomes Session.
+    When the role can't be read, the recorded value stands. -WhatIf reads, and records nothing. Mode says which case.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -985,43 +1085,10 @@ function Resolve-DemoT5ContainerLifecycle {
         $State = Get-DemoDeploymentState -Config $Config
     }
     $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Container')
-    $name = Get-DemoActivityControlName -Config $Config
-    $able = $false
-    $known = $true
-    $why = ''
-    try {
-        $role = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $name.RoleName -WithActions
-        $lacking = @($script:T5ContainerControlActions | Where-Object { $_ -notin @($role.Actions) })
-        if (-not $role.Id) {
-            $why = 'the session control''s custom role "{0}" doesn''t exist yet' -f $name.RoleName
-        }
-        elseif ($lacking.Count -gt 0) {
-            $why = 'the session control''s custom role "{0}" doesn''t have {1} yet' -f $name.RoleName, ($lacking -join ', ')
-        }
-        else {
-            $principalId = Get-DemoActivityControlPrincipalId -Name $name
-            if (-not $principalId) {
-                $why = 'the session control''s identity {0} doesn''t exist yet' -f $name.Identity
-            }
-            else {
-                $held = Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId $role.Id
-                if ($held.Exists) {
-                    $able = $true
-                }
-                elseif ($held.Error -and -not $held.Missing) {
-                    $known = $false
-                    $why = 'the session control''s role assignments couldn''t be read: {0}' -f $held.Error
-                }
-                else {
-                    $why = '{0} doesn''t hold the role "{1}" at {2} yet' -f $name.Identity, $name.RoleName, $name.DemoResourceGroup
-                }
-            }
-        }
-    }
-    catch {
-        $known = $false
-        $why = 'the session control''s role couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message)
-    }
+    $control = Get-DemoT5ControlRoleState -Config $Config
+    $known = $control.Mode -ne 'Unknown'
+    $able = $control.Mode -in 'Control', 'NoRole'
+    $why = [string]$control.Why
     $session = $script:T5LifecycleSession
     $alwaysOn = $script:T5LifecycleAlwaysOn
     $lifecycle = switch ($Purpose) {
@@ -1041,7 +1108,7 @@ function Resolve-DemoT5ContainerLifecycle {
             $changed = $false
         }
     }
-    return [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $recorded; Changed = $changed; Known = $known; Why = $why; RoleName = $name.RoleName }
+    return [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $recorded; Changed = $changed; Known = $known; Why = $why; RoleName = $control.RoleName; Mode = $control.Mode }
 }
 
 function Get-DemoT5LifecycleText {
@@ -1065,6 +1132,12 @@ function Get-DemoT5LifecycleText {
 
     $ru = [int](Get-DemoCosmosSetting)['throughputRUs']
     $value = [string]$Lifecycle.Lifecycle
+    if ($value -ceq $script:T5LifecycleSession -and [string](Get-DemoMemberValue -InputObject $Lifecycle -Name 'Mode') -eq 'NoRole') {
+        # The coordinator's fix 1 (2026-11-19): with no role, Run all can't start a session, and the person's own scripts
+        # create and delete the container.
+        $text = 'T5''s container exists only during a session{0}: start-demo.ps1 creates it with your own rights, and stop-demo.ps1 deletes it, so its {1} RU/s bill only while the demo runs. The session control has no role yet ({2}), so Run all can''t start a session; once an Owner runs, once, {3}, Run all creates the container at each session''s start, and the nightly safety stop deletes it too.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.Why, (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath)
+        return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
+    }
     if ($value -ceq $script:T5LifecycleSession) {
         $text = 'T5''s container exists only during a session{0}: start-demo.ps1 and Run all create it, and stop-demo.ps1, the session''s end, and the nightly safety stop delete it, so its {1} RU/s bill only while the demo runs. The session control''s role ("{2}") can create it again, and the account, its database, private endpoint, and DNS zone stay, so Database Hub keeps T5 in its estate.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.RoleName
         return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
@@ -1102,7 +1175,7 @@ function Get-DemoT5LifecycleResult {
     )
 
     $said = Get-DemoT5LifecycleText -Lifecycle $Lifecycle -FreeTier $FreeTier -ConfigPath $ConfigPath
-    $evidence = [ordered]@{ lifecycle = [string]$Lifecycle.Lifecycle; recorded = [string]$Lifecycle.Recorded; changed = [bool]$Lifecycle.Changed; known = [bool]$Lifecycle.Known; role = [string]$Lifecycle.RoleName; freeTier = $FreeTier }
+    $evidence = [ordered]@{ lifecycle = [string]$Lifecycle.Lifecycle; recorded = [string]$Lifecycle.Recorded; changed = [bool]$Lifecycle.Changed; known = [bool]$Lifecycle.Known; mode = [string](Get-DemoMemberValue -InputObject $Lifecycle -Name 'Mode'); role = [string]$Lifecycle.RoleName; freeTier = $FreeTier }
     return (New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $said.Status -Message $said.Text -Evidence $evidence -Remediation $said.Fix -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['provisionThroughput']))
 }
 

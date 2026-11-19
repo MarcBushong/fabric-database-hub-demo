@@ -450,3 +450,29 @@ Describe 'Show-DemoDeploymentProgress (status.ps1 -Watch)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly
     }
 }
+
+Describe 'Add-DemoProgressStepNote (2026-11-19)' {
+    It 'adds a later finding after a finished row''s own message, raises its status when that''s worse, and keeps it ended' {
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            Set-DemoProgressStep -Path $Path -Id 'Infrastructure' -State 'Done' -Status 'Pass' -Message 'The template deployed.'
+            Add-DemoProgressStepNote -Path $Path -Id 'Infrastructure' -Status 'Warning' -Note 'The nightly safety stop isn''t fully in place, so T4''s restart counts the rest of the month again.'
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = Get-TestStep -Model $model -Id 'Infrastructure'
+        $row['state'] | Should -Be 'Done'
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -Be 'The template deployed. The nightly safety stop isn''t fully in place, so T4''s restart counts the rest of the month again.'
+        # A worse status stays, and a missing row or path changes nothing.
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            Set-DemoProgressStep -Path $Path -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message 'The template failed.'
+            Add-DemoProgressStepNote -Path $Path -Id 'Infrastructure' -Status 'Warning' -Note 'A note.'
+            Add-DemoProgressStepNote -Path $Path -Id 'No.Such.Row' -Status 'Warning' -Note 'A note.'
+            Add-DemoProgressStepNote -Path '' -Id 'Infrastructure' -Status 'Warning' -Note 'A note.'
+        }
+        $row = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Infrastructure'
+        $row['state'] | Should -Be 'Failed'
+        $row['status'] | Should -Be 'Fail'
+        $row['message'] | Should -Be 'The template failed. A note.'
+    }
+}

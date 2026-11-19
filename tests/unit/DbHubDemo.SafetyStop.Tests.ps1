@@ -475,6 +475,19 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $note | Should -Be 'The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned: an Owner of the subscription runs, once, ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json. Until then T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.'
     }
 
+    It 'as an Owner, updates an existing role in place and says what it added, as an update from before T5''s container lifecycle does (2026-11-19)' {
+        $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $results = & $script:setup
+        $role = $results | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $role.status | Should -Be 'Pass'
+        $role.message | Should -Match ('its definition was updated in place, under the same ID, to exactly the {0} approved actions; added: Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/delete\)' -f $script:approvedActions.Count)
+        $role.message | Should -Match 'delete T5''s container between sessions\.$'
+        @($role.evidence['added']).Count | Should -Be 2
+        @($role.evidence['removed']).Count | Should -Be 0
+        @($script:roleDefinitions[0]['permissions'][0]['actions']) | Should -Be $script:approvedActions
+    }
+
     It 'as a Role Based Access Control Administrator: assigns the role when it exists, and needs an Owner to create it' {
         $script:canDefine = $false
         $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
@@ -835,6 +848,86 @@ Describe 'What stops T4 after its 7-day restart, and DONE (ADR 0024)' {
     }
 }
 
+Describe 'A nightly safety stop that this run sets up (2026-11-19, the coordinator''s option 2)' {
+    BeforeEach {
+        Reset-FakeAzure
+        Register-FakeAzure
+        Initialize-GuardTestContext
+        $script:plan = { InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoSafetyStopPlan -Config $Config } }
+        $script:permission = { InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoDeployerRolePermission -Config $Config } }
+        $script:planResult = { param([object[]] $Result, [object[]] $Setup, [System.Collections.IDictionary] $Config) InModuleScope DbHubDemo -Parameters @{ Result = $Result; Setup = $Setup; Config = $Config } { New-DemoSafetyStopPlanResult -Result $Result -SetupResult $Setup -Config $Config -ConfigPath './config/demo.config.json' } }
+    }
+
+    It 'counts it for an Owner, who can write and assign its role, on a first deployment and on an update, and only reads' {
+        $script:groupMissing = $true
+        $owner = & $script:permission
+        $owner.CanDefine | Should -BeTrue
+        $owner.CanAssign | Should -BeTrue -Because 'before the demo resource group exists, the subscription''s permissions say whether the deployer can assign roles there'
+        $owner.Error | Should -BeNullOrEmpty
+        $first = & $script:plan
+        $first.Planned | Should -BeTrue
+        $first.Reason | Should -Be 'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'
+        $script:groupMissing = $false
+        (& $script:plan).Planned | Should -BeTrue
+        @($script:writes) | Should -BeNullOrEmpty
+    }
+
+    It 'doesn''t count it for a Contributor, the documented minimum, or for someone who can assign roles but not write a role that isn''t current' {
+        $script:canDefine = $false
+        $script:canAssign = $false
+        $contributor = & $script:plan
+        $contributor.Planned | Should -BeFalse
+        $contributor.Reason | Should -Match '^you can''t assign the nightly safety stop''s role'
+        $contributor.Evidence['canAssignRoles'] | Should -BeFalse
+        $script:canAssign = $true
+        $administrator = & $script:plan
+        $administrator.Planned | Should -BeFalse
+        $administrator.Reason | Should -Match 'custom role needs writing first'
+        # A role that already has exactly its approved actions needs no writing: assigning it is enough.
+        $script:roleId = 'dddddddd-0000-0000-0000-00000000000d'
+        $script:roleActions = $script:approvedActions
+        $ready = & $script:plan
+        $ready.Planned | Should -BeTrue
+        $ready.Evidence['roleReady'] | Should -BeTrue
+        # An older definition, without T5's container actions, needs writing again.
+        $script:roleActions = @($script:approvedActions | Select-Object -SkipLast 2)
+        (& $script:plan).Planned | Should -BeFalse
+    }
+
+    It 'doesn''t count it when the deployer''s permissions can''t be read (fail safe)' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { throw 'The resource groups couldn''t be listed: timeout' }
+        $unread = & $script:permission
+        $unread.CanDefine | Should -BeFalse
+        $unread.CanAssign | Should -BeFalse
+        $unread.Error | Should -Match 'timeout'
+        (& $script:plan).Planned | Should -BeFalse
+    }
+
+    It 'says so again on the status page when its setup in this run doesn''t put it in place: the worst case without it, the ceiling, and the fix' {
+        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 395.12 })
+        $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role assignment failed: Conflict.'
+        $setup = @((New-TestResult 'SAFETYSTOP.RESOURCES'), (New-TestResult 'SAFETYSTOP.RUNBOOK'), (New-TestResult 'SAFETYSTOP.SCHEDULE'), $role)
+        $config = New-SafetyConfig
+        $config['monthlyCeilingUsd'] | Should -Be 390 -Because 'the example''s default for a new configuration since 2026-11-19'
+        $over = & $script:planResult @($monthly) $setup $config
+        $over.checkId | Should -Be 'DEPLOY.COST.T4RESTART'
+        $over.status | Should -Be 'Warning'
+        $over.message | Should -Match '^Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place \(SAFETYSTOP\.ROLE: The role assignment failed: Conflict\.\)'
+        $over.message | Should -Match 'the worst case is 395\.12 USD a month, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $over.remediation | Should -Match 'grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json'
+        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 396 in your configuration\.$'
+        $over.evidence['overCeiling'] | Should -BeTrue
+        $config['monthlyCeilingUsd'] = 400
+        $within = & $script:planResult @($monthly) $setup $config
+        $within.message | Should -Match 'within monthlyCeilingUsd \(400\.00 USD\)\.$'
+        $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
+        # Nothing when the setup put it in place, or when preflight didn't count it.
+        $passed = @($setup | ForEach-Object { New-TestResult ([string]$_.checkId) })
+        & $script:planResult @($monthly) $passed $config | Should -BeNullOrEmpty
+        $unplanned = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $false })
+        & $script:planResult @($unplanned) $setup $config | Should -BeNullOrEmpty
+    }
+}
 Describe 'scripts/grant-safety-stop.ps1, the Owner''s one command' {
     It 'runs Invoke-DemoSafetyStopSetup -GrantRole and the control''s grant with the configuration, writes their results, and exits 0 on a Warning' {
         $configPath = Join-Path -Path $TestDrive -ChildPath 'demo.config.json'

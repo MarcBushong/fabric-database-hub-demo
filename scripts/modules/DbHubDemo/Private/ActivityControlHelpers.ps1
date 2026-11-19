@@ -797,7 +797,8 @@ function Get-DemoActivityControlPrincipalId {
 function Test-DemoActivityControlAssignment {
     <#
     .SYNOPSIS
-    Whether a principal holds a role definition at exactly a scope. Returns Exists and Error. Internal.
+    Whether a principal holds a role definition at exactly a scope. Returns Exists, Other (it holds another role at the scope
+    or above it, 2026-11-19, for Get-DemoT5ControlRoleState), Missing, and Error. Internal.
     https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
     #>
     [CmdletBinding()]
@@ -812,23 +813,30 @@ function Test-DemoActivityControlAssignment {
         [Parameter(Mandatory)]
         [string] $PrincipalId,
 
+        # Empty when the role doesn't exist: then only Other can be true.
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string] $RoleId
     )
 
     $read = Invoke-DemoActivityControlArm -SubscriptionId $SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments' -f $Scope) -Query ([ordered]@{ '$filter' = ("principalId eq '{0}'" -f $PrincipalId); 'api-version' = '2022-04-01' })
     if (-not $read.Ok) {
-        return [pscustomobject]@{ Exists = $false; Missing = $read.Missing; Error = $read.Error }
+        return [pscustomobject]@{ Exists = $false; Other = $false; Missing = $read.Missing; Error = $read.Error }
     }
+    $exists = $false
+    $other = $false
     foreach ($assignment in @(Get-DemoActivityControlList -InputObject $read.Value -Name 'value')) {
         $properties = Get-DemoMemberValue -InputObject $assignment -Name 'properties'
         $role = [string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')
         $at = [string](Get-DemoMemberValue -InputObject $properties -Name 'scope')
-        if ($role.EndsWith('/' + $RoleId, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($at, $Scope, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
+        if ($RoleId -and $role.EndsWith('/' + $RoleId, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals($at, $Scope, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $exists = $true
+        }
+        elseif ($at -and $Scope.StartsWith($at, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $other = $true
         }
     }
-    return [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' }
+    return [pscustomobject]@{ Exists = $exists; Other = $other; Missing = $false; Error = '' }
 }
 
 function Get-DemoActivityControlGrantPlan {

@@ -586,12 +586,21 @@ function Invoke-DemoDeployment {
                     & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
                 }
                 # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
-                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                $safetyResults = @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                & $addAll $safetyResults
+                # Preflight counted this safety stop (2026-11-19, option 2): when its setup didn't put it in place, the worst case
+                # without it, on the console and the Infrastructure row (DEPLOY.COST.T4RESTART).
+                $planResult = New-DemoSafetyStopPlanResult -Result $results.ToArray() -SetupResult $safetyResults -Config $Config -ConfigPath $ConfigPath
+                if ($null -ne $planResult) {
+                    $results.Add($planResult)
+                    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                    Add-DemoProgressStepNote -Path $ProgressPath -Id 'Infrastructure' -Status 'Warning' -Note ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                }
                 # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
                 # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
                 # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
-                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
