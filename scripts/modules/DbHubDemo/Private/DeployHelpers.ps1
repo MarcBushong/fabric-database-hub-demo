@@ -130,6 +130,10 @@ function Get-DemoDeploymentStateTagName {
         # so a resume leaves T5 out instead of starting from preflight (Resolve-DemoT5LeftOut); a template run that creates
         # T5 clears it.
         T5Refused                = 'DbHubT5Refused'
+        # 2026-11-19 (review of the stop at the end of an update): when the last start-demo.ps1 began (UTC), written before it
+        # starts anything, so deploy.ps1's stop at the end of an update leaves a session that began during the run alone,
+        # also one with no auto-stop (Get-DemoUpdateStopSession).
+        StartDemoUtc             = 'DbHubStartDemoUtc'
     }
 }
 

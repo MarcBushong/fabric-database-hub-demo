@@ -317,6 +317,8 @@ try {
     $outcome = $null
     $finished = $false
     $stopped = $false
+    # What the run's ending hands over even when Ctrl+C cuts it short (2026-11-19): its outcome, which this script reports.
+    $ending = @{}
     try {
         $parameters = @{
             Config                = $config
@@ -364,11 +366,24 @@ try {
         # Always one ending, even after Ctrl+C, and fast then: the model and the page say DONE or NOT DONE (Stopped, not
         # done, with the command to continue), and the PC may sleep again whatever happens (Phase 28 live finding).
         try {
-            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished) -KeepRunning:$KeepRunning
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished) -KeepRunning:$KeepRunning -Ending $ending
         }
         finally {
             $null = Exit-DemoKeepAwake
             $awake = 'released'
+            # Ctrl+C during the ending's stop at the end of an update (2026-11-19): the ending finished in its own finally
+            # block, but a pipeline stop skips the rest of this one and everything after it, so its outcome is reported here:
+            # the report with what the ending added, out/deploy.jsonl, and DONE.
+            if ($null -eq $outcome -and $null -ne $ending['Outcome']) {
+                $endingOutcome = $ending['Outcome']
+                $endingResults = @($results)
+                if ($null -ne $endingOutcome.PSObject.Properties['Added']) {
+                    $endingResults = @($endingResults) + @($endingOutcome.Added | Where-Object { $null -ne $_ })
+                }
+                Write-DemoResultReport -Result $endingResults -Title 'deploy.ps1' -OutcomeDone:([string]$endingOutcome.Kind -eq 'Done') -DeployCommand ([string]$run.Command)
+                Export-DemoResult -Result $endingResults -Path $OutputPath
+                Write-DemoDeploymentOutcome -Outcome $endingOutcome -WorkspaceName $workspaceName
+            }
         }
         if (-not $finished) {
             Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName

@@ -237,6 +237,15 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.DEMO' -Area 'infra' -Target 'subscription' -Status 'Not selected' -Message 'What if: nothing was started.'))
         return $results.ToArray()
     }
+    # This start's time, before it starts anything (2026-11-19, DbHubStartDemoUtc): deploy.ps1's stop at the end of an update
+    # leaves a session that began during that run alone, also one that gets no auto-stop (Get-DemoUpdateStopSession). Never
+    # in the start's way.
+    try {
+        Set-DemoDeploymentState -Config $Config -Value @{ StartDemoUtc = (ConvertTo-DemoBusyTimeText -Utc ([DateTime]::UtcNow)) } -Confirm:$false
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('This start''s time wasn''t recorded on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
     # start-demo.ps1's auto-stop (2026-11-19): the session stops by itself -AutoStopHours after this start, or after the
     # warm-up it waits for, through the same one-time schedule a Run all session uses (dbhub-autostop), which replaces an
     # earlier session's: the newer session's plan wins. A stop job already in flight is waited for first. Without the

@@ -2090,6 +2090,25 @@ Describe 'start-demo.ps1''s auto-stop (Register-DemoActivityControlAutoStop, 202
         @(Get-Write 'delete' '/schedules/dbhub-autostop$').Count | Should -Be 1
     }
 
+    It 'removes a pending backup auto-stop too when the first one''s time has passed, as before 2026-11-19, while <Case> (the review''s finding 7)' -ForEach @(
+        @{ Case = 'the role is missing'; NoRole = $true; Old = $false }
+        @{ Case = 'the published DbHub-Control is from before 2026-11-19'; NoRole = $false; Old = $true }
+    ) {
+        # A Run all whose auto-stop job failed 10 minutes ago: its backup comes in 20 minutes, and would cut this session off.
+        if ($NoRole) {
+            $script:assignments.Clear()
+        }
+        $script:controlRunbookOld = $Old
+        $script:autoStop = $script:now.AddMinutes(-10)
+        $script:backupStop = $script:now.AddMinutes(20)
+        $result = @(Invoke-Register)[0]
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'An earlier session''s backup auto-stop \(dbhub-autostop-backup\) was removed, so it doesn''t cut this session off\.$'
+        @(Get-Write 'delete' '/schedules/dbhub-autostop-backup$').Count | Should -Be 1
+        @(Get-Write 'delete' '/schedules/dbhub-autostop$').Count | Should -Be 0 -Because 'an auto-stop whose time has passed isn''t pending'
+        @(Get-Write 'put' '/(schedules|jobSchedules)/') | Should -BeNullOrEmpty
+    }
+
     It 'knows a current DbHub-Control by the variable that holds the marker in the runbooks'' code' {
         $runbook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1') -Raw
         $token = InModuleScope -ModuleName DbHubDemo { $script:ActivityControlStartDemoRunbookToken }

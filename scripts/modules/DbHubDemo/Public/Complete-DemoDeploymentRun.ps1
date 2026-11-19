@@ -65,6 +65,13 @@ function Complete-DemoDeploymentRun {
     .PARAMETER KeepRunning
     deploy.ps1 -KeepRunning (2026-11-19): an update that found the demo stopped leaves what it started running.
 
+    .PARAMETER Ending
+    A hashtable that gets the outcome (Outcome) when the ending finishes (2026-11-19, the review's finding 2): deploy.ps1
+    calls this from a finally block, where Ctrl+C during the stop at the end of an update skips everything after the call
+    but nested finally blocks, so this function finishes the ending in its own finally block (the stop's row as a Warning,
+    the run's state, DONE's notes, the page writer, the sign-in, and the cancel watch), and deploy.ps1 reports the outcome
+    from there.
+
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
     #>
@@ -94,7 +101,10 @@ function Complete-DemoDeploymentRun {
 
         [switch] $Stopped,
 
-        [switch] $KeepRunning
+        [switch] $KeepRunning,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Ending = $null
     )
 
     $wasStopped = [bool]$Stopped -or (-not $WhatIfRun -and (Test-DemoRunCancelled))
@@ -200,70 +210,86 @@ function Complete-DemoDeploymentRun {
         $added.Add($item)
     }
     $endStop = $null
+    $endStopProgress = @{ Phase = ''; Started = '' }
+    $endStopEnded = $false
     try {
-        $endStop = Invoke-DemoUpdateEndStop -Config $Config -Result @($Result) -Model $model -State $judgedState -OutcomeKind ([string]$outcome.Kind) -KeepRunning:$KeepRunning -Stopped:$wasStopped -ProgressPath ([string]$Run.ProgressPath) -Confirm:$false
+        try {
+            $endStop = Invoke-DemoUpdateEndStop -Config $Config -Result @($Result) -Model $model -State $judgedState -OutcomeKind ([string]$outcome.Kind) -KeepRunning:$KeepRunning -Stopped:$wasStopped -ProgressPath ([string]$Run.ProgressPath) -RunStartedUtc (Get-DemoMemberValue -InputObject $Run -Name 'StartedUtc') -Progress $endStopProgress -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The stop at the end of this run didn''t run: {0}. ./scripts/stop-demo.ps1 stops the demo now.' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
+        $endStopEnded = $true
     }
-    catch {
-        Write-DemoLog -Level Warning -Message ('The stop at the end of this run didn''t run: {0}. ./scripts/stop-demo.ps1 stops the demo now.' -f (Protect-DemoText -Text $_.Exception.Message))
-    }
-    if ($null -ne $endStop -and $null -ne $endStop.Result) {
-        $added.Add($endStop.Result)
-        if ([string]$outcome.Kind -eq 'Done' -and $null -ne $outcome.PSObject.Properties['Notes']) {
-            # Get-DemoMemberValue returns the notes array whole: assigned first, then each note is its own item.
-            $doneNotes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
-            $kept = @(@($doneNotes) | Where-Object { $_ })
-            if ([bool]$endStop.Stopped) {
-                # Stopped now, so tonight's nightly stop has nothing left to wait for (Stop-DemoEnvironment settled it).
-                $busyNote = Get-DemoBusyMarkerNote -Result @($Result)
-                if ($busyNote) {
-                    $kept = @($kept | Where-Object { [string]$_ -ne $busyNote })
-                    Set-DemoProgressStep -Path ([string]$Run.ProgressPath) -Id 'NightlyStop' -State 'Done' -Status 'Pass' -Message 'Not needed tonight any more: this update stopped the demo at its end (Stop at the end), which put the nightly stop back as usual.'
+    finally {
+        # Ctrl+C during the stop at the end (the review of 2026-11-19, finding 2): deploy.ps1 calls this from its finally
+        # block, where a pipeline stop skips everything but nested finally blocks, so the rest of the ending runs here, and
+        # -Ending gets the outcome for deploy.ps1's report, out/deploy.jsonl, and DONE.
+        if (-not $endStopEnded -and $null -eq $endStop) {
+            $endStop = Complete-DemoUpdateEndStopInterrupted -Config $Config -Result @($Result) -Progress $endStopProgress -ProgressPath ([string]$Run.ProgressPath)
+        }
+        if ($null -ne $endStop -and $null -ne $endStop.Result) {
+            $added.Add($endStop.Result)
+            if ([string]$outcome.Kind -eq 'Done' -and $null -ne $outcome.PSObject.Properties['Notes']) {
+                # Get-DemoMemberValue returns the notes array whole: assigned first, then each note is its own item.
+                $doneNotes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
+                $kept = @(@($doneNotes) | Where-Object { $_ })
+                if ([bool]$endStop.Stopped) {
+                    # Stopped now, so tonight's nightly stop has nothing left to wait for (Stop-DemoEnvironment settled it).
+                    $busyNote = Get-DemoBusyMarkerNote -Result @($Result)
+                    if ($busyNote) {
+                        $kept = @($kept | Where-Object { [string]$_ -ne $busyNote })
+                        Set-DemoProgressStep -Path ([string]$Run.ProgressPath) -Id 'NightlyStop' -State 'Done' -Status 'Pass' -Message 'Not needed tonight any more: this update stopped the demo at its end (Stop at the end), which put the nightly stop back as usual.'
+                    }
                 }
+                if ([string]$endStop.Line) {
+                    $kept = @($kept) + @([string]$endStop.Line)
+                }
+                $outcome.Notes = [string[]]@($kept)
             }
-            if ([string]$endStop.Line) {
-                $kept = @($kept) + @([string]$endStop.Line)
+        }
+        $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
+        $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
+        # What the ending added to the run's results (DEPLOY.NIGHTLYSTOP, DEPLOY.ENDSTOP), for deploy.ps1's report and
+        # out/deploy.jsonl.
+        $outcome | Add-Member -NotePropertyName 'Added' -NotePropertyValue $added.ToArray() -Force
+        # What runs now, and how to choose the other profile: DONE's "Activity:" line, on the console and the status page.
+        $activityLine = ''
+        try {
+            $activityLine = Get-DemoActivitySummaryLine -ActivityProfile (Get-DemoActivityProfile -Config $Config)
+        }
+        catch {
+            Write-DemoLog -Level Debug -Message ('The activity line couldn''t be built: {0}' -f $_.Exception.Message)
+        }
+        $outcome | Add-Member -NotePropertyName 'Activity' -NotePropertyValue $activityLine -Force
+        if ($Run.ProgressPath) {
+            $runState = if ($outcome.Kind -eq 'Done') { 'Done' } else { 'NotDone' }
+            # The notes are an array, which Get-DemoMemberValue returns whole: assigned first, then each note is its own item,
+            # not "System.String[]" (Phase 28 live finding, 2026-10-30).
+            $notes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
+            $reason = (@([string]$outcome.Reason) + @($notes) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ' '
+            Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode; activity = $activityLine })
+            # What didn't work but never blocks DONE (the Insights app), with its error and fix (2026-11-05).
+            $nonBlockingValue = Get-DemoMemberValue -InputObject $outcome -Name 'NonBlocking'
+            Set-DemoProgressValue -Path $Run.ProgressPath -Section 'nonBlocking' -Value @(@($nonBlockingValue) | Where-Object { $null -ne $_ })
+            # What only a person can confirm, once each, which never kept the run from DONE (Phase 28 live finding).
+            $confirmValue = Get-DemoMemberValue -InputObject $outcome -Name 'Confirm'
+            Set-DemoProgressValue -Path $Run.ProgressPath -Section 'confirm' -Value @(@($confirmValue) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'text') })
+            if ($outcome.Kind -eq 'Done') {
+                Set-DemoProgressStep -Path $Run.ProgressPath -Id 'Validation' -State 'Done' -Message ('Done in {0} minutes.' -f $minutes)
             }
-            $outcome.Notes = [string[]]@($kept)
+            elseif ($wasStopped) {
+                Set-DemoProgressStopped -Path $Run.ProgressPath -Message ('Stopped here (Ctrl+C); {0} continues from this step.' -f $Run.Command)
+            }
+        }
+        Stop-DemoProgressPageWriter -Job $Run.Writer -ModelPath ([string]$Run.ProgressPath) -PagePath ([string]$Run.PagePath)
+        # A sign-in for the Insights app that still runs (the run ended or was stopped before it settled) ends with the run.
+        Stop-DemoFabricAppSignIn
+        # The run is over: a later Ctrl+C in this session belongs to another command.
+        Disable-DemoRunCancelWatch
+        if ($null -ne $Ending) {
+            $Ending['Outcome'] = $outcome
         }
     }
-    $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
-    $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
-    # What the ending added to the run's results (DEPLOY.NIGHTLYSTOP, DEPLOY.ENDSTOP), for deploy.ps1's report and
-    # out/deploy.jsonl.
-    $outcome | Add-Member -NotePropertyName 'Added' -NotePropertyValue $added.ToArray() -Force
-    # What runs now, and how to choose the other profile: DONE's "Activity:" line, on the console and the status page.
-    $activityLine = ''
-    try {
-        $activityLine = Get-DemoActivitySummaryLine -ActivityProfile (Get-DemoActivityProfile -Config $Config)
-    }
-    catch {
-        Write-DemoLog -Level Debug -Message ('The activity line couldn''t be built: {0}' -f $_.Exception.Message)
-    }
-    $outcome | Add-Member -NotePropertyName 'Activity' -NotePropertyValue $activityLine -Force
-    if ($Run.ProgressPath) {
-        $runState = if ($outcome.Kind -eq 'Done') { 'Done' } else { 'NotDone' }
-        # The notes are an array, which Get-DemoMemberValue returns whole: assigned first, then each note is its own item,
-        # not "System.String[]" (Phase 28 live finding, 2026-10-30).
-        $notes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
-        $reason = (@([string]$outcome.Reason) + @($notes) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ' '
-        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode; activity = $activityLine })
-        # What didn't work but never blocks DONE (the Insights app), with its error and fix (2026-11-05).
-        $nonBlockingValue = Get-DemoMemberValue -InputObject $outcome -Name 'NonBlocking'
-        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'nonBlocking' -Value @(@($nonBlockingValue) | Where-Object { $null -ne $_ })
-        # What only a person can confirm, once each, which never kept the run from DONE (Phase 28 live finding).
-        $confirmValue = Get-DemoMemberValue -InputObject $outcome -Name 'Confirm'
-        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'confirm' -Value @(@($confirmValue) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'text') })
-        if ($outcome.Kind -eq 'Done') {
-            Set-DemoProgressStep -Path $Run.ProgressPath -Id 'Validation' -State 'Done' -Message ('Done in {0} minutes.' -f $minutes)
-        }
-        elseif ($wasStopped) {
-            Set-DemoProgressStopped -Path $Run.ProgressPath -Message ('Stopped here (Ctrl+C); {0} continues from this step.' -f $Run.Command)
-        }
-    }
-    Stop-DemoProgressPageWriter -Job $Run.Writer -ModelPath ([string]$Run.ProgressPath) -PagePath ([string]$Run.PagePath)
-    # A sign-in for the Insights app that still runs (the run ended or was stopped before it settled) ends with the run.
-    Stop-DemoFabricAppSignIn
-    # The run is over: a later Ctrl+C in this session belongs to another command.
-    Disable-DemoRunCancelWatch
     return $outcome
 }

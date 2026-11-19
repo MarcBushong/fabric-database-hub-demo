@@ -3195,11 +3195,13 @@ function Register-DemoActivityControlAutoStop {
       session's, a second one (dbhub-autostop-backup) follows 30 minutes later, for when the first one's job fails.
     - Without the session control's role at the demo resource group (A1: an environment a Contributor deployed, until an
       Owner runs ./scripts/grant-safety-stop.ps1), DbHub-Stop couldn't stop anything, so none is scheduled, and a pending one
-      is removed, as before 2026-11-19: a Warning says the nightly stop is the limit, with the grant as the fix. The same
-      Warning when the control isn't set up (./scripts/deploy.ps1 sets it up) or a schedule can't be written.
+      is removed, or a pending backup (dbhub-autostop-backup) when the first one's time has passed, as before 2026-11-19: a
+      Warning says the nightly stop is the limit, with the grant as the fix. The same Warning when the control isn't set up
+      (./scripts/deploy.ps1 sets it up) or a schedule can't be written.
     - Until ./scripts/deploy.ps1 republishes the session control's runbooks (Test-DemoActivityControlStartDemoRunbook): a
       DbHub-Control published before 2026-11-19 counts any pending auto-stop as an active run, so it would refuse a Run all
-      until this one's time. Then none is scheduled, and a pending one is removed, as before: a Warning with ./scripts/deploy.ps1.
+      until this one's time. Then none is scheduled, and a pending one, or its backup, is removed, as before: a Warning with
+      ./scripts/deploy.ps1.
     - -WhatIf changes nothing: Not selected.
     https://learn.microsoft.com/rest/api/automation/schedule/create-or-update
     https://learn.microsoft.com/rest/api/automation/job-schedule/create
@@ -3259,6 +3261,17 @@ function Register-DemoActivityControlAutoStop {
             # The earlier session's auto-stop would cut this one off at its time (ADR 0020): it goes, as before 2026-11-19.
             $gone = Remove-DemoActivityControlAutoStopSchedule -Name $name -ApiVersion $version -Confirm:$false
             $removedText = if ($gone.Removed) { ' An earlier session''s auto-stop (due {0}) was removed, so it doesn''t cut this session off.' -f (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now) } else { ' An earlier session''s auto-stop is still pending and stops the demo at {0}: it couldn''t be removed ({1}).' -f (Get-DemoAutoStopClockText -Config $Config -Utc $prior.StartUtc -NowUtc $now), ([string]$gone.Error).TrimEnd('.') }
+        }
+        else {
+            # A session's backup auto-stop (dbhub-autostop-backup) deallocates the VMs 30 minutes after an auto-stop whose job
+            # failed, so it goes whatever the first one's state, as before 2026-11-19 (the review's finding 7).
+            $backup = Clear-DemoActivityControlBackupStop -Name $name -ApiVersion $version -Confirm:$false
+            if ($backup.Removed) {
+                $removedText = ' An earlier session''s backup auto-stop ({0}) was removed, so it doesn''t cut this session off.' -f $name.AutoStopBackupSchedule
+            }
+            elseif ($backup.Found) {
+                $removedText = ' An earlier session''s backup auto-stop ({0}) couldn''t be removed ({1}), so it may stop the demo at its time.' -f $name.AutoStopBackupSchedule, ([string]$backup.Error).TrimEnd('.')
+            }
         }
         $message = 'The demo doesn''t stop by itself after this session: {0}. It runs until ./scripts/stop-demo.ps1 or {1}.{2}' -f $Why, $nightlyText, $removedText
         Write-DemoLog -Level Warning -Message ('{0} {1}' -f $message, $Fix)
