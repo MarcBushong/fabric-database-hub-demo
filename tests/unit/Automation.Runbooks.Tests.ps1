@@ -1474,6 +1474,38 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.metrics.status | Should -Be 'Pass'
     }
 
+    It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {
+        # The control notebook's Stop now and its next Run all's pre-check rebuild the session's beats from it, to save
+        # its history with them when the run that was ending it stopped first.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        $plan = 'acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc $script:clock)
+        $result.status | Should -Be 'Stopped'
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        $stopped.stoppedBy | Should -Be 'Stop now'
+        $stopped.metrics.status | Should -Be 'Pass'
+        foreach ($name in $plan) {
+            (ConvertTo-Json -InputObject $stopped.$name -Depth 8 -Compress) | Should -BeExactly (ConvertTo-Json -InputObject $running.$name -Depth 8 -Compress) -Because $name
+        }
+        $stopped.planKept | Should -BeTrue
+        $stopped.PSObject.Properties.Name | Should -Not -Contain 'steps'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        # A copy of another session's status (one that started since) gives a stop of this session nothing of it.
+        $script:automationVariables['DbHubSessionStatus'] = '{"sessionId":"fedcba9876543210fedcba9876543210","phase":"running","acceptedUtc":"2026-10-27T18:00:00Z","runEndUtc":"2026-10-27T19:30:00Z","dispatchUtc":{"T1":"2026-10-27T18:04:00Z"}}'
+        $script:groupTags['DbHubSessionId'] = $script:sessionId
+        $null = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc $script:clock)
+        $again = Get-SessionStatus
+        $again.stoppedBy | Should -Be 'Auto-stop'
+        $again.sessionId | Should -Be $script:sessionId
+        foreach ($name in $plan) {
+            $again.PSObject.Properties.Name | Should -Not -Contain $name
+        }
+        $again.planKept | Should -BeFalse -Because 'the notebook says the runbook didn''t find the plan, rather than that the runbooks are old'
+    }
+
     It 'asks T4 to stop again when Azure fails its first stop right after the replica''s delete (SourceReplicasStartStopOrder, live 2026-11-14)' {
         # Live: the session's auto-stop saw the replica's 404 about 20 seconds before its delete finished, and T4's stop,
         # accepted, failed a minute later, which left T4 running.
