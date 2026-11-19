@@ -484,7 +484,7 @@ Describe 'Agent plugin pins in config/versions.json' {
             $agentPlugins.marketplaces.Keys | Should -Contain $plugin.marketplace
         }
         $agentPlugins.plugins['fabric-skills'].skillsUsed | Should -Contain 'databasehub-cli'
-        $agentPlugins.skills['databasehub-cli'].lastChangedCommit | Should -Match '^[0-9a-f]{40}$'
+        $agentPlugins.skills['databasehub-cli'].commit | Should -Match '^[0-9a-f]{40}$'
         $agentPlugins.learnMcp.endpoint | Should -BeExactly 'https://learn.microsoft.com/api/mcp'
         $agentPlugins.learnMcp.pluginCommit | Should -Match '^[0-9a-f]{40}$'
     }

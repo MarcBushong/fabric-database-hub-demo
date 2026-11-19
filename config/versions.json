@@ -467,10 +467,10 @@
     },
     "skills": {
       "databasehub-cli": {
-        "note": "The GA Database Hub skill (2026-11-17), in the fabric-skills bundle. Its content last changed in lastChangedCommit (release 0.3.21); APM installs it alone: apm install microsoft/skills-for-fabric --skill databasehub-cli --target copilot -g --only apm.",
+        "note": "The GA Database Hub skill (2026-11-17), in the fabric-skills bundle. Its content last changed in commit (release 0.3.21), the commit this pin names; APM installs it alone: apm install microsoft/skills-for-fabric --skill databasehub-cli --target copilot -g --only apm.",
         "repository": "microsoft/skills-for-fabric",
         "path": "skills/databasehub-cli",
-        "lastChangedCommit": "c13604ae6f4fb727ac7bc74784eeff4332433c63"
+        "commit": "c13604ae6f4fb727ac7bc74784eeff4332433c63"
       }
     },
     "learnMcp": {

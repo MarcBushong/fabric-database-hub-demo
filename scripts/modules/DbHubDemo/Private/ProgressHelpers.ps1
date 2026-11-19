@@ -884,7 +884,7 @@ function Set-DemoProgressValue {
         $clean = @(foreach ($entry in @($Value | Where-Object { $null -ne $_ })) {
                 [ordered]@{
                     name    = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'name'))
-                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
+                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed', 'Warning') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
                     message = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'message')) -MaxLength 1200
                     howTo   = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'howTo')) -MaxLength 1200
                 }

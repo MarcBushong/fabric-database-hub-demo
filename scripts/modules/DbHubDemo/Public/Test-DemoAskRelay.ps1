@@ -51,7 +51,8 @@ function Test-DemoAskRelay {
     $attempts = [int][Math]::Ceiling($TimeoutSeconds / 10) + 1
     for ($attempt = 1; $attempt -le $attempts -and $watch.Elapsed.TotalSeconds -lt $TimeoutSeconds; $attempt++) {
         try {
-            $candidate = Invoke-WebRequest -Uri ('{0}/healthz' -f $Endpoint) -Headers $headers -TimeoutSec ([Math]::Max(10, [Math]::Min(45, $TimeoutSeconds - [int]$watch.Elapsed.TotalSeconds))) -SkipHttpErrorCheck -ErrorAction Stop
+            $limit = [Math]::Max(10, [Math]::Min(45, $TimeoutSeconds - [int]$watch.Elapsed.TotalSeconds))
+            $candidate = Invoke-WebRequest -Uri ('{0}/healthz' -f $Endpoint) -Headers $headers -TimeoutSec $limit -OperationTimeoutSeconds $limit -SkipHttpErrorCheck -ErrorAction Stop
             if ($candidate.StatusCode -eq 200) {
                 $allowedNow = [string](@($candidate.Headers['Access-Control-Allow-Origin']) | Select-Object -First 1)
                 if (-not $Origin -or $allowedNow -eq $Origin) {

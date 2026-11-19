@@ -285,6 +285,22 @@ Describe 'How deploy.ps1 shows Ask' {
         }
     }
 
+    It 'keeps it a Warning on the status page''s Needs attention box, not Failed (live, 2026-11-19)' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'progress-ask.json'
+        $problems = InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -InstallMode 'JumpstartImage') -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -NowUnix (Get-DemoUnixTime)
+            Initialize-DemoProgress -Path $Path -Model $model -Confirm:$false
+            $warning = New-DemoResult -CheckId 'ASK.RELAY.HEALTH' -Area 'fabric' -Target 'subscription' -Status 'Warning' -Message 'Ask''s chat relay answers, but doesn''t allow the Insights app''s origin yet.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 again.'
+            Set-DemoProgressValue -Path $Path -Section 'nonBlocking' -Value @(Get-DemoNonBlockingItem -Result @($warning))
+            Set-DemoProgressValue -Path $Path -Section 'run' -Value ([ordered]@{ state = 'Done'; endedAt = (Get-DemoUnixTime); reason = ''; next = ''; nextCommand = ''; exitCode = 0; activity = '' })
+            $saved = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            @($saved['nonBlocking'])[0]['state'] | Should -Be 'Warning'
+            Get-DemoProgressProblem -Model $saved
+        }
+        @($problems).Count | Should -Be 1
+        $problems[0] | Should -BeLike 'Warning (doesn''t block DONE): the Copilot chat in the Insights app (Ask).*'
+    }
+
     It 'shows Done when the relay is up and Skipped when Ask is off' {
         InModuleScope DbHubDemo {
             $up = @(
