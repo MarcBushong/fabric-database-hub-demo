@@ -493,6 +493,239 @@ Describe 'Invoke-DemoSignInSweep' {
         $script:read | Should -Be 0
         [System.IO.File]::ReadAllText($file) | Should -Be $before
     }
+
+    It 'skips a file that another sweep deleted before this one''s cleanup reached it, without writing an error (live, 2026-11-19)' {
+        # Over PowerShell Direct, Invoke-Command -ErrorAction Stop ends the whole guest sweep on any error the guest writes:
+        # live, the host's own sign-in cleanup deleted what deploy.ps1's sweep was about to clean.
+        $machine = New-TestMachine
+        $token = New-TestToken -Claim @{ scp = 'x'; upn = 'someone@example.com' }
+        $script:vanish = Write-TestFile -Path ([System.IO.Path]::Combine($machine.Users, 'Administrator', 'AppData', 'Local', 'Temp', 'setup.log')) -Text ('x {0}' -f $token)
+        $script:armed = 1
+        # Automatic sign-in reads as armed, so the cleanup turns it off before the files: the other sweep deletes the file then.
+        $provider = {
+            param($Mode)
+            if ($Mode -eq 'Clear') {
+                Remove-Item -LiteralPath $script:vanish -Force
+                $script:armed = 0
+            }
+            @{ Enabled = $script:armed; Secret = 0; PlainValue = 0; UserName = 0 }
+        }
+        $output = & $script:sweep -Clean $true -Folder $machine -EventLogReader $script:noEvents -EventLogClearer { param($Name) $null = $Name } -AutoLogonProvider $provider 2>&1
+        $errors = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+        $errors.Count | Should -Be 0 -Because (($errors | ForEach-Object { $_.ToString() }) -join '; ')
+        $result = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })[-1]
+        $result.actions.filesFailed | Should -Be 0
+        $result.actions.filesRedacted | Should -Be 0
+        $result.pass | Should -BeTrue
+    }
+}
+
+Describe 'Invoke-DemoSignInGuestSweep: the guest part''s bounded recovery (2026-11-19, dbhubfn)' {
+    BeforeAll {
+        # Stand-ins for Hyper-V's cmdlets and issue #65's recovery (the installed bundle's GuestVm.ps1), which each test mocks.
+        function Get-VM { [CmdletBinding()] param([string] $Name) $null = $Name }
+        function Start-VM { [CmdletBinding()] param([string] $Name) $null = $Name }
+        function Test-DemoGuestChannelBroken { [CmdletBinding()] param([string] $Text) [bool]($Text -match '(?i)Hyper-V socket target process has ended|PSSessionStateBroken') }
+        function Test-DemoGuestChannel { [CmdletBinding()] param([string] $Name, [pscredential] $Credential) $null = $Name, $Credential }
+        function Test-DemoGuestOnline { [CmdletBinding()] param([string] $Name, [pscredential] $Credential) $null = $Name, $Credential }
+        function Invoke-DemoGuestRecovery { [CmdletBinding(SupportsShouldProcess = $true)] param([string] $Name, [pscredential] $Credential, [string] $Key, [string] $By, [string] $Reason, [string] $StateRoot) $null = $PSCmdlet.ShouldProcess($Name), $Credential, $Key, $By, $Reason, $StateRoot }
+        function Get-DemoGuestRecoveryKey { [CmdletBinding()] param([string] $Key, [string] $Prefix) if ($Key) { $Key } else { '{0}-2026111919' -f $Prefix } }
+        function Complete-DemoGuestRecoveryInterrupted { [CmdletBinding(SupportsShouldProcess = $true)] param([string] $Name, [pscredential] $Credential, [string] $StateRoot) $null = $PSCmdlet.ShouldProcess($Name), $Credential, $StateRoot }
+        function Get-DemoVmUtcNow { '2026-11-19T19:44:02.0000000Z' }
+        # Mocks never read the password, so an empty one will do.
+        $script:credential = [pscredential]::new('Administrator', [System.Security.SecureString]::new())
+        # PowerShell Direct's own failure when the channel is broken (issue #65), and the guest's answer.
+        $script:broken = [System.Management.Automation.ErrorRecord]::new([System.Management.Automation.Remoting.PSRemotingTransportException]::new('The Hyper-V socket target process has ended.'), 'PSSessionStateBroken', 'OpenError', 'arcsql01')
+        $script:answer = [pscustomobject]@{ computer = 'ARCSQL01'; pass = $true; found = [pscustomobject]@{ userTokens = 0 } }
+        $script:restart = [pscustomobject]@{ Action = 'Restart'; Restarted = $true; Recovered = $true; Seconds = 95; Reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'; By = 'the sign-in data cleanup'; Key = 'deploy-bbbbbbbbbbbb'; AtUtc = '2026-11-19T19:44:02.0000000Z'; RestartUtc = '2026-11-19T19:44:31.0000000Z'; StoppedBy = 'Shutdown'; Message = 'arcsql01 was restarted once (a clean shutdown, 95 s) and answers over PowerShell Direct again.' }
+    }
+
+    BeforeEach {
+        $script:attempts = [System.Collections.Generic.Queue[object]]::new()
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ State = 'Running' } }
+        Mock -CommandName Start-VM -MockWith { }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Invoke-Command -MockWith {
+            $next = $script:attempts.Dequeue()
+            if ($next -is [System.Management.Automation.ErrorRecord]) { throw $next }
+            if ($next -is [string]) { throw $next }
+            $next
+        }
+        Mock -CommandName Invoke-DemoGuestRecovery -MockWith { $script:restart }
+        Mock -CommandName Test-DemoGuestChannel -MockWith { [pscustomobject]@{ Ok = $true; State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; UptimeMinutes = 40.0; Error = ''; Broken = $false } }
+        Mock -CommandName Complete-DemoGuestRecoveryInterrupted -MockWith { $null }
+    }
+
+    It 'restarts the guest once for the run when its channel is broken, sweeps again, and says so in guestRecovery' {
+        $script:attempts.Enqueue($script:broken)
+        $script:attempts.Enqueue($script:answer)
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $result.reachable | Should -BeTrue
+        $result.pass | Should -BeTrue
+        $result.guestRecovery.action | Should -Be 'Restart'
+        $result.guestRecovery.restarted | Should -BeTrue
+        $result.guestRecovery.recovered | Should -BeTrue
+        $result.guestRecovery.ranAgain | Should -BeTrue
+        $result.guestRecovery.by | Should -Be 'the sign-in data cleanup'
+        $result.guestRecovery.restartUtc | Should -Be '2026-11-19T19:44:31.0000000Z'
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 1 -Exactly -ParameterFilter { $Key -eq 'deploy-bbbbbbbbbbbb' -and $By -eq 'the sign-in data cleanup' -and $Reason -eq 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' }
+        Should -Invoke -CommandName Invoke-Command -Times 2 -Exactly
+    }
+
+    It 'stays unreachable with PowerShell Direct''s own error when the sweep fails again after the restart, or when the restart didn''t bring the guest back' {
+        foreach ($i in 1..4) {
+            $script:attempts.Enqueue($script:broken)
+        }
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $result.reachable | Should -BeFalse
+        $result.pass | Should -BeFalse
+        $result.state | Should -Be 'Running'
+        $result.error | Should -Be 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'
+        $result.guestRecovery.restarted | Should -BeTrue
+        $result.guestRecovery.recovered | Should -BeFalse
+        $result.guestRecovery.tries | Should -Be 4 -Because 'one restart, then the pauses of 30 and 60 seconds'
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 1 -Exactly
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 30 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+
+        # A restart after which the guest didn't answer: the sweep doesn't run again.
+        $script:attempts.Clear()
+        $script:attempts.Enqueue($script:broken)
+        Mock -CommandName Invoke-DemoGuestRecovery -MockWith { [pscustomobject]@{ Action = 'Restart'; Restarted = $true; Recovered = $false; Seconds = 660; Reason = 'x'; By = 'the sign-in data cleanup'; Key = 'deploy-bbbbbbbbbbbb'; AtUtc = '2026-11-19T19:44:02Z'; RestartUtc = '2026-11-19T19:44:31Z'; StoppedBy = 'TurnOff'; Message = 'arcsql01 was restarted once, but it didn''t answer over PowerShell Direct within 10 minutes.' } }
+        $gone = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $gone.reachable | Should -BeFalse
+        $gone.guestRecovery.ranAgain | Should -BeFalse
+        $gone.guestRecovery.message | Should -Match 'didn''t answer over PowerShell Direct within 10 minutes'
+        Should -Invoke -CommandName Invoke-Command -Times 5 -Exactly
+    }
+
+    It 'runs again after a short pause, without a restart, after a failure that isn''t a broken channel while the guest answers' {
+        $script:attempts.Enqueue('Cannot find path ''C:\Windows\Temp\x.log'' because it does not exist.')
+        $script:attempts.Enqueue($script:answer)
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $result.reachable | Should -BeTrue
+        $result.guestRecovery.action | Should -Be 'Healed'
+        $result.guestRecovery.restarted | Should -BeFalse
+        $result.guestRecovery.tries | Should -Be 2
+        $result.guestRecovery.reason | Should -Match 'does not exist'
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 0 -Exactly
+        Should -Invoke -CommandName Test-DemoGuestChannel -Times 1 -Exactly
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+    }
+
+    It 'tries up to three more times, 10, 30, and 60 seconds apart, while the failures go on and the guest answers (the host check of dbhubfn, 2026-11-19)' {
+        # Live, the sweep's sessions failed within a second, while the host's own sign-in cleanup opened its sessions.
+        foreach ($i in 1..3) {
+            $script:attempts.Enqueue(('The background process reported an error with the following message: try {0}.' -f $i))
+        }
+        $script:attempts.Enqueue($script:answer)
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $result.reachable | Should -BeTrue
+        $result.guestRecovery.action | Should -Be 'Healed'
+        $result.guestRecovery.tries | Should -Be 4
+        $result.guestRecovery.seconds | Should -Be 100
+        $result.guestRecovery.message | Should -Be 'arcsql01 answered the sweep on try 4, after 100 seconds of pauses.'
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 30 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+
+        # Each try fails: the last error, and the first, are kept; nothing more than the three pauses.
+        $script:attempts.Clear()
+        foreach ($i in 1..4) {
+            $script:attempts.Enqueue(('The background process reported an error with the following message: try {0}.' -f $i))
+        }
+        $failed = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -RecoveryKey 'deploy-bbbbbbbbbbbb' -StateRoot $TestDrive
+        $failed.reachable | Should -BeFalse
+        $failed.error | Should -Match 'try 4\.$'
+        $failed.firstError | Should -Match 'try 1\.$'
+        $failed.guestRecovery.tries | Should -Be 4
+        $failed.guestRecovery.message | Should -Be '4 tries over 100 seconds of pauses all failed.'
+        Should -Invoke -CommandName Invoke-Command -Times 8 -Exactly
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 0 -Exactly
+    }
+
+    It 'waits a bounded time for a guest that doesn''t answer, and never starts it' {
+        Mock -CommandName Test-DemoGuestChannel -MockWith { [pscustomobject]@{ Ok = $false; State = 'Off'; Heartbeat = ''; UptimeMinutes = 0.0; Error = 'arcsql01 is Off.'; Broken = $false } }
+        Mock -CommandName Test-DemoGuestOnline -MockWith { $false }
+        $script:attempts.Enqueue('The virtual machine arcsql01 is not in a valid state to perform the operation.')
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $true -OnlineMinutes 2 -StateRoot $TestDrive
+        $result.reachable | Should -BeFalse
+        $result.guestRecovery.ranAgain | Should -BeFalse
+        $result.guestRecovery.message | Should -Match 'didn''t answer over PowerShell Direct within 2 minutes \(Off\)'
+        Should -Invoke -CommandName Test-DemoGuestOnline -Times 6 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 0 -Exactly
+    }
+
+    It 'runs again after its pauses without the recovery (an older bundle on the host)' {
+        $script:attempts.Enqueue($script:broken)
+        $script:attempts.Enqueue($script:answer)
+        $result = Invoke-DemoSignInGuestSweep -Name 'arcsql01' -Credential @($script:credential) -Clean $true -Recover $false -StateRoot $TestDrive
+        $result.reachable | Should -BeTrue
+        $result.guestRecovery.action | Should -Be 'Healed'
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+        Should -Invoke -CommandName Invoke-DemoGuestRecovery -Times 0 -Exactly
+    }
+}
+
+Describe 'The host bootstrap''s lock around a guest sweep (2026-11-19, dbhubfn)' {
+    It 'holds bootstrap.lock as the host''s bootstrap runs do, and waits only a bounded time while a run holds it' {
+        $root = Join-Path -Path $TestDrive -ChildPath ('state-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $lockPath = Join-Path -Path $root -ChildPath 'bootstrap.lock'
+        $taken = Enter-DemoSignInBootstrapLock -Root $root -Seconds 5 -PollSeconds 1
+        try {
+            $taken.TimedOut | Should -BeFalse
+            $taken.Stream | Should -Not -BeNullOrEmpty
+            # A bootstrap run that starts meanwhile can't take it (Enter-DemoVmLock), so it exits and runs again later.
+            { [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose() } | Should -Throw
+        }
+        finally {
+            $taken.Stream.Dispose()
+        }
+        # A bootstrap run holds it: the sweep gives up after its bound.
+        $held = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            $busy = Enter-DemoSignInBootstrapLock -Root $root -Seconds 1 -PollSeconds 1
+            $busy.TimedOut | Should -BeTrue
+            $busy.Stream | Should -BeNullOrEmpty
+        }
+        finally {
+            $held.Dispose()
+        }
+        # No state folder: no bootstrap runs there, so there's nothing to wait for.
+        $none = Enter-DemoSignInBootstrapLock -Root (Join-Path -Path $TestDrive -ChildPath 'missing') -Seconds 1
+        $none.TimedOut | Should -BeFalse
+        $none.Stream | Should -BeNullOrEmpty
+    }
+
+    It 'sweeps nothing and fails closed when the lock isn''t free in time, and releases it when it ends' {
+        $root = Join-Path -Path $TestDrive -ChildPath ('state-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $lockPath = Join-Path -Path $root -ChildPath 'bootstrap.lock'
+        $script = Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoSignInResidue.ps1'
+        $held = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            $output = & pwsh -NoProfile -NonInteractive -File $script -ResidueAction 'Clean' -ResidueScope 'Guest' -ResidueStateRoot $root -ResidueLockMinutes '0.02' 2>$null
+        }
+        finally {
+            $held.Dispose()
+        }
+        $LASTEXITCODE | Should -Be 0
+        $json = @($output)[-1] | ConvertFrom-Json
+        $json.pass | Should -BeFalse
+        $json.lock.timedOut | Should -BeTrue
+        $json.guest.reachable | Should -BeFalse
+        $json.guest.state | Should -Be 'Busy'
+        $json.guest.error | Should -Match 'bootstrap\.lock'
+
+        # Free: it takes the lock first (no credential here, so the guest isn't reached), and leaves it free when it ends.
+        $output = & pwsh -NoProfile -NonInteractive -File $script -ResidueAction 'Scan' -ResidueScope 'Guest' -ResidueStateRoot $root -ResidueLockMinutes '1' 2>$null
+        $json = @($output)[-1] | ConvertFrom-Json
+        $json.lock.timedOut | Should -BeFalse
+        $json.guest.state | Should -Be 'NoCredential'
+        { [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose() } | Should -Not -Throw
+    }
 }
 
 Describe 'Invoke-DemoSignInResidue.ps1 as a Run Command script' {

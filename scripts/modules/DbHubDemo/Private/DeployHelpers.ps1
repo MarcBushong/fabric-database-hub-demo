@@ -134,6 +134,10 @@ function Get-DemoDeploymentStateTagName {
         # starts anything, so deploy.ps1's stop at the end of an update leaves a session that began during the run alone,
         # also one with no auto-stop (Get-DemoUpdateStopSession).
         StartDemoUtc             = 'DbHubStartDemoUtc'
+        # 2026-11-19 (dbhubfn): when an Arc onboarding of T2's guest began whose sign-in data sweep hasn't passed yet (UTC;
+        # empty when none is owed), written before the onboarding's Run Command, so a later run sweeps and verifies again
+        # by itself, whatever the host's state, until it passes (Invoke-DemoArcOnboarding).
+        ArcSweepUtc              = 'DbHubArcSweepUtc'
     }
 }
 
