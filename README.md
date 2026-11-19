@@ -160,10 +160,10 @@ Nothing here needs you, and nothing here starts anything: only Azure starts a st
 | The nightly safety stop | The same time, and its T3 check 30 minutes later | Deallocates a VM that still runs, stops T4, after Azure's 7-day restart too, stops a read replica that a session left behind, and deletes T5's container when a session or `deploy.ps1` left it (the next session creates it again). It never starts or creates anything. It waits for a `deploy.ps1` that's still running, then stops the demo 60 minutes after the run ends, and **DONE** says when |
 | T3's auto-pause | `t3AutoPauseMinutes` (15) after its last session | Azure pauses the serverless database, which then bills only its storage |
 | A Run all session's auto-stop | 10 minutes after the session's end, and a backup 30 minutes later that runs only when the first one failed | Deletes T4's read replica, stops T4, deallocates the VMs, and deletes T5's container |
-| The control's daily T4 safety stop | 15 minutes after `autoShutdownTime` | Stops T4 when it runs, then a left-over read replica, and deletes T5's container when the VMs are deallocated |
+| The control's daily T4 safety stop | 15 minutes after `autoShutdownTime` | Stops T4 when it runs, then a left-over read replica, and deletes T5's container while `sqlvm01` isn't running |
 | Ask's chat relay | About 10 minutes after the last question | Scales to zero, so it bills nothing until the next question |
 
-- **To skip one night:** turn off the schedules `dbhub-safety-stop` and `dbhub-safety-t3check` in `aa-<prefix>-<environment>-safetystop` (and `dbhub-safety-deferred` when a run left one), and the VMs' auto-shutdown in the Azure portal. The next `./scripts/deploy.ps1` turns the safety stop on again.
+- **To skip one night:** turn off the schedules `dbhub-safety-stop` and `dbhub-safety-t3check` in `aa-<prefix>-<environment>-safetystop` (and `dbhub-safety-deferred` when a run left one), the session control's `dbhub-t4-safety-stop` in `aa-<prefix>-control`, which stops T4 too, and the VMs' auto-shutdown in the Azure portal. Turn them on again the next day; the next `./scripts/deploy.ps1` turns the nightly safety stop's on again.
 - **Where to see it:** `./scripts/status.ps1` (`STATUS.SAFETYSTOP` and `STATUS.NIGHTLYSTOP`). [Cost management](docs/cost-management.md#what-stops-or-pauses-on-its-own) lists every schedule, with the hours each part runs.
 - The Fabric capacity isn't on this list: you or its administrator pause it.
 
@@ -181,7 +181,7 @@ Nothing here needs you, and nothing here starts anything: only Azure starts a st
 
 ## Delete everything
 
-`./scripts/destroy.ps1` deletes everything `deploy.ps1` created for the environment in your configuration. First it lists what it deletes and what it keeps, and asks you to confirm; `-Force` doesn't ask. Each part reports its own `DESTROY.*` result, and a part that fails doesn't stop the others.
+`./scripts/destroy.ps1` deletes everything `deploy.ps1` created for the environment in your configuration. First it lists what it deletes and what it keeps, and asks you to confirm; `-Force` doesn't ask. Each part reports its own `DESTROY.*` result. The Fabric, session control, and group parts run first, and one that fails doesn't stop the others; a **Fail** in the Arc or resource group part stops what comes after it, so run `destroy.ps1` again to finish.
 
 **What it deletes, in this order,** each part only when it can tell it's this environment's:
 
