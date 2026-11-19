@@ -1113,7 +1113,7 @@ function Get-DemoExistingEnvironmentReport {
             if (& $value 'autoShutdownTime') { $parts.Add(('auto-shutdown at {0} {1}' -f (& $value 'autoShutdownTime'), (& $value 'autoShutdownTimeZone')).TrimEnd()) }
             if (& $value 'owner') { $parts.Add(('the owner tag {0}' -f (& $value 'owner'))) }
             if (& $value 'ownerEmail') { $parts.Add(('budget alerts to {0}' -f (& $value 'ownerEmail'))) }
-            if ($WorkspaceName -and $WorkspaceSource -ne 'unknown') { $parts.Add(('the Fabric workspace "{0}"{1}' -f $WorkspaceName, $(if ($WorkspaceSource -eq 'default') { ' (by its default name: it doesn''t record one)' } else { '' }))) }
+            if ($WorkspaceName -and $WorkspaceSource -notin 'unknown', 'renamed') { $parts.Add(('the Fabric workspace "{0}"{1}' -f $WorkspaceName, $(if ($WorkspaceSource -eq 'default') { ' (by its default name: it doesn''t record one)' } else { '' }))) }
             if ($ControlName) { $parts.Add(('the control''s workspace "{0}"' -f $ControlName)) }
             if (& $value 'control.roleNameSuffix') { $parts.Add(('its own custom roles, "{0} ({1})" and its Session Writer (control.roleNameSuffix)' -f $script:ActivityControlRoleName, (& $value 'control.roleNameSuffix'))) }
             $source = if ([bool]$Existing.Record) { 'its deployment record of {0} and its resource group''s tags' -f $(if ($Existing.RecordDate) { $Existing.RecordDate } else { 'an earlier run' }) } else { 'its resource group''s tags, without a deployment record' }
