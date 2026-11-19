@@ -778,7 +778,7 @@ print(json.dumps(out))
         $text | Should -Match '14:48  From about now, the agent''s issue on azuresql01-abc123/ContosoCare, a new one each session'
         $text | Should -Match 'Explain why, then Analyze slow query'
         $text | Should -Match '14:55  Respond: this Run all forces the last good plan through Query Store'
-        $text | Should -Match 'Optimization: arcsql01, ready to migrate'
+        $text | Should -Match 'Optimization: the card in What needs attention; arcsql01 in Estate, ready to migrate'
         $text | Should -Match '\[What changed\] What changed in my databases\?'
         $text | Should -Not -Match 'cuts the beat short'
         # A 45-minute session cuts the beat to 15 minutes, so the response can come before the agent's issue.
