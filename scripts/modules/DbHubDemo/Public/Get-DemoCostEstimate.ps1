@@ -115,6 +115,16 @@ function Get-DemoCostEstimate {
     the container stays between sessions and they bill all month, as before. T5's private endpoint and private DNS zone bill
     all month either way. PREFLIGHT.COST.MONTHLY gives the difference between the two (T5AlwaysOnExtraMonthly).
 
+    .PARAMETER T5ManualDeleteOnly
+    With -T5ContainerLifecycle AlwaysOn (2026-11-19, the re-review of 0590bbe; the coordinator's decision, which the owner
+    can reverse): the container is priced all month only because nothing automatic deletes it after a session (the session
+    control holds no role, and no nightly safety stop can; Get-DemoT5CostLifecycle -Detail's ManualDeleteOnly), while
+    ./scripts/stop-demo.ps1 still does. Then, as for a T4 size the person didn't choose, the hard ceiling is a Warning, not
+    a Fail, when only that puts the month over monthlyCeilingUsd: the month with the container for the running hours only
+    fits. The Warning names the three fixes (an Owner's ./scripts/grant-safety-stop.ps1, a higher monthlyCeilingUsd, or
+    t5Enabled false), and the configured ceiling and its budget stay as they are. A month over the ceiling for any other
+    reason is still a Fail.
+
     .PARAMETER SkipCeilingReference
     Internal (2026-11-09): skips the reference size's estimate behind PREFLIGHT.COST.MONTHLY's Warning instead of a Fail
     when only a T4 size the person didn't choose puts the month over monthlyCeilingUsd: monthlyCeilingUsd at exactly 250,
@@ -173,6 +183,8 @@ function Get-DemoCostEstimate {
 
         [ValidateSet('Session', 'AlwaysOn')]
         [string] $T5ContainerLifecycle = 'Session',
+
+        [switch] $T5ManualDeleteOnly,
 
         [switch] $SkipCeilingReference
     )
@@ -698,6 +710,7 @@ function Get-DemoCostEstimate {
         $evidence['t5ContainerLifecycle'] = $T5ContainerLifecycle
         $evidence['t5RunningHourly'] = $t5RunningHourly
         $evidence['t5AlwaysOnExtraMonthly'] = $t5AlwaysOnExtra
+        $evidence['t5ManualDeleteOnly'] = [bool]$T5ManualDeleteOnly -and -not $t5Session
     }
     # The monthly check's worst case (2026-11-19): DEPLOY.T5.LIFECYCLE prices it again when the run records what preflight
     # didn't assume.
@@ -806,12 +819,15 @@ function Get-DemoCostEstimate {
                         $monthlyStatus = 'Warning'
                         $month = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
                         $evidence['ceilingReference'] = [ordered]@{ skuName = $reference; monthlyUsd = $referenceMonth; reason = $(if ($reference -ceq $asked -and $pinnedSku) { 'fallback' } else { 'init250' }) }
-                        $monthlyMessage += if ($evidence['ceilingReference']['reason'] -eq 'fallback') {
-                            [string]::Format($culture, ' This is a Warning, not a Fail: T4 runs as {0} only because Azure refused {1}, the size t4SkuName sets (deploy.ps1''s fallback chose {0}), and with T4 at {1} the month would be {2:N2} USD, within the ceiling; {0} brings it to {3:N2} USD.', $t4Sku, $reference, $referenceMonth, $month)
+                        $referenceText = if ($evidence['ceilingReference']['reason'] -eq 'fallback') {
+                            [string]::Format($culture, 'This is a Warning, not a Fail: T4 runs as {0} only because Azure refused {1}, the size t4SkuName sets (deploy.ps1''s fallback chose {0}), and with T4 at {1} the month would be {2:N2} USD, within the ceiling; {0} brings it to {3:N2} USD.', $t4Sku, $reference, $referenceMonth, $month)
                         }
                         else {
-                            [string]::Format($culture, ' This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be {0:N2} USD, within it, and T4 at {1} brings it to {2:N2} USD.', $referenceMonth, $t4Sku, $month)
+                            [string]::Format($culture, 'This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be {0:N2} USD, within it, and T4 at {1} brings it to {2:N2} USD.', $referenceMonth, $t4Sku, $month)
                         }
+                        $monthlyMessage += ' ' + $referenceText
+                        # What the status page's Preflight row says (2026-11-19): the worst case against the ceiling, and why it's a Warning.
+                        $evidence['ceilingWarning'] = [string]::Format($culture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $referenceText)
                         $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure), or keep it: deploy.ps1 and start-demo.ps1 go on, the Azure budget alerts at 50, 80, and 100 percent of it, and start-demo.ps1 stops starting the demo once this month''s actual cost reaches it.{1}', [System.Math]::Ceiling($month), $safetyFix)
                     }
                 }
@@ -844,6 +860,11 @@ function Get-DemoCostEstimate {
                 $t5Parts = if ($billedPlans -contains 'CosmosDbs') { ', its storage, and Defender for Azure Cosmos DB' } else { ' and its storage' }
                 $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its private endpoint and private DNS zone). Its container exists only during a session (start-demo.ps1 and Run all create it; stop-demo.ps1, the session''s end, and the nightly safety stop delete it), so its {1} RU/s of throughput{2} add {3:N3} USD a running hour.{4}{5}', [double]$t5FixedMonthly, $t5Rus, $t5Parts, [double]$t5RunningHourly, $t5FreeText, $t5Other)
             }
+            elseif ($T5ManualDeleteOnly) {
+                # Only ./scripts/stop-demo.ps1 deletes the container (2026-11-19, the re-review): it's priced all month because
+                # nothing automatic does, not because it stays.
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) is priced at {0:N2} USD a month (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}): its container exists only during a session, but only ./scripts/stop-demo.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t, so the estimate counts it all month, about {3:N2} USD more than for the running hours only.{4}', [double]$t5FixedMonthly, $t5Rus, $t5Defender, [double]$t5AlwaysOnExtra, $t5FreeText)
+            }
             else {
                 $t5Other = if ($t5AlwaysOnExtra -gt 0) {
                     [string]::Format($t5Culture, ' Once ./scripts/deploy.ps1 runs as an Owner of the subscription, or an Owner runs ./scripts/grant-safety-stop.ps1 once, the container exists only during a session, which saves about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
@@ -870,6 +891,31 @@ function Get-DemoCostEstimate {
             }
             $monthlyMessage += $activityText
             $sessionActivity = $activityText
+        }
+        # 2026-11-19 (the re-review of 0590bbe; the coordinator's decision, which the owner can reverse): T5's container priced
+        # all month only because nothing automatic deletes it after a session (-T5ManualDeleteOnly: no session-control role,
+        # and no nightly safety stop that can, while ./scripts/stop-demo.ps1 does) never makes the hard ceiling a Fail by
+        # itself, when the month fits with it for the running hours only, as for a T4 size the person didn't choose (above):
+        # an existing configuration keeps its own ceiling, and a Contributor's update and start stay one click. A month over
+        # the ceiling for any other reason stays a Fail; the configured value stays, and the budget keeps alerting at it.
+        if ($monthlyStatus -eq 'Fail' -and $t5On -and -not $t5Session -and $T5ManualDeleteOnly -and [double]$t5AlwaysOnExtra -gt 0) {
+            $exceptionCulture = [System.Globalization.CultureInfo]::InvariantCulture
+            $sessionMonth = [System.Math]::Round($worstMonth - [double]$t5AlwaysOnExtra, 2)
+            if ($sessionMonth -le $monthlyCeiling) {
+                $monthlyStatus = 'Warning'
+                # After an Owner's grant: the container for the running hours only, and T4's restart about a day each, since
+                # the nightly safety stop then holds its role.
+                $grantMonth = $sessionMonth
+                if ($t4On -and $null -ne $t4ComputeItem -and $null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
+                    $capped = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $true -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
+                    $grantMonth = [System.Math]::Round($sessionMonth - [double]$t4WorstCase + [double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $capped.Hours, 2)
+                }
+                $evidence['t5CeilingException'] = [ordered]@{ sessionMonthlyUsd = $sessionMonth; t5AlwaysOnExtraMonthly = [double]$t5AlwaysOnExtra; grantMonthlyUsd = $grantMonth }
+                $exceptionText = [string]::Format($exceptionCulture, 'This is a Warning, not a Fail: T5''s container is priced all month, {0:N2} USD more than for the running hours only, because no role can delete it automatically after a session (the session control has no role, and the nightly safety stop''s role can''t delete it), so only ./scripts/stop-demo.ps1 does; with it deleted after each session, the month would be {1:N2} USD, within the ceiling.', [double]$t5AlwaysOnExtra, $sessionMonth)
+                $monthlyMessage += ' ' + $exceptionText
+                $evidence['ceilingWarning'] = [string]::Format($exceptionCulture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $exceptionText)
+                $monthlyRemediation = [string]::Format($exceptionCulture, 'deploy.ps1 and start-demo.ps1 go on. To clear it, any one of these: an Owner of the subscription runs, once: {0}, which gives the session control and the nightly safety stop their roles, so the worst case falls to about {1:N2} USD; or raise monthlyCeilingUsd to at least {2:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure); or set t5Enabled to false, which leaves T5 out. Until then, run ./scripts/stop-demo.ps1 after each session: it deletes T5''s container.', (Get-DemoSafetyStopCommand), $grantMonth, [System.Math]::Ceiling($worstMonth))
+            }
         }
         # T4's read replica (ADR 0025): its share of the session, which start-demo.ps1 -SkipT4Replica leaves out.
         $sessionReplica = ''

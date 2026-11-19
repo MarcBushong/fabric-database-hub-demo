@@ -679,8 +679,13 @@ function Invoke-DemoValidationCost {
         }
         # T5's free tier (ADR 0027): the account's own when it exists.
         $parameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $config -DeploymentId ([string]$Context.DeploymentId)
-        # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions.
-        $parameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $config
+        # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions, and why
+        # (the re-review of 0590bbe).
+        $t5Cost = Get-DemoT5CostLifecycle -Config $config -Detail
+        $parameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+        if ($t5Cost.ManualDeleteOnly) {
+            $parameters['T5ManualDeleteOnly'] = $true
+        }
         try {
             foreach ($item in @((Get-DemoCostEstimate @parameters).Results)) {
                 $results.Add($item)

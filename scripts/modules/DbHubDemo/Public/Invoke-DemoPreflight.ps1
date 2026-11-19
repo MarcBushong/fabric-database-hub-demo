@@ -728,8 +728,13 @@ function Invoke-DemoPreflight {
     # and the session control's roles need the deployer to assign them, and to write them when they aren't current.
     $deployer = Get-DemoDeployerRolePermission -Config $Config
     # T5's container lifecycle (2026-11-19): its throughput bills for the running hours only, as this run's lifecycle step
-    # will record it (Get-DemoT5CostLifecycle -ThisRunDeploys), unless the container stays between sessions.
-    $costParameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config -ThisRunDeploys -Permission $deployer
+    # will record it (Get-DemoT5CostLifecycle -ThisRunDeploys), unless the container stays between sessions. Priced all month
+    # only because nothing automatic deletes it (the re-review of 0590bbe), it never makes the hard ceiling a Fail by itself.
+    $t5Cost = Get-DemoT5CostLifecycle -Config $Config -ThisRunDeploys -Permission $deployer -Detail
+    $costParameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+    if ($t5Cost.ManualDeleteOnly) {
+        $costParameters['T5ManualDeleteOnly'] = $true
+    }
     # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On

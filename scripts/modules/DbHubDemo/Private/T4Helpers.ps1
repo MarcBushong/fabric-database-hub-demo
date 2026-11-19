@@ -912,7 +912,11 @@ function Get-DemoT4GeneralPurposeCost {
         # A safety stop caps the restart worst case when it's fully in place (2026-11-04, ADR 0024); never throws.
         $shared['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
         # T5's container lifecycle (2026-11-19, ADR 0027), as the other estimates price it; never throws.
-        $shared['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config
+        $t5Cost = Get-DemoT5CostLifecycle -Config $Config -Detail
+        $shared['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+        if ($t5Cost.ManualDeleteOnly) {
+            $shared['T5ManualDeleteOnly'] = $true
+        }
         foreach ($key in $shared.Keys) {
             $parameters[$key] = $shared[$key]
         }

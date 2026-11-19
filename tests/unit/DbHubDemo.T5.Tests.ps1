@@ -865,6 +865,32 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Get-Priced -State $script:fromMain -Permission $null | Should -Be 'AlwaysOn'
         Get-Priced -State $script:new -Permission $null | Should -Be 'Session'
     }
+
+    It 'says why with -Detail, and ManualDeleteOnly only where nothing automatic deletes the container while stop-demo.ps1 does (the re-review of 0590bbe)' {
+        $detail = {
+            param([object] $State, [object] $Permission, [bool] $Deploys)
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $State; Permission = $Permission; Deploys = $Deploys } { Get-DemoT5CostLifecycle -Config $Config -State $State -Permission $Permission -ThisRunDeploys:$Deploys -Detail }
+        }
+        $reason = { param([object] $Answer) '{0}/{1}/{2}' -f $Answer.Lifecycle, $Answer.Reason, $Answer.ManualDeleteOnly }
+        # A Contributor's update of an environment from main whose session control never got a role, and that environment
+        # afterwards (its recorded Session, which start-demo.ps1 reads): only stop-demo.ps1 deletes the container.
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $false; HoldsOther = $false }
+        & $reason (& $detail $script:fromMain $script:contributor $true) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) $null $false) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail $script:new $script:contributor $true) | Should -Be 'AlwaysOn/NoAutoDelete/True'
+        & $reason (& $detail $script:fromMain $script:owner $true) | Should -Be 'Session/Session/False'
+        # All month for another reason: no stop deletes the container, or the environment predates its lifecycle, or the
+        # role can't be read.
+        $script:control = $script:older
+        & $reason (& $detail $script:fromMain $script:contributor $true) | Should -Be 'AlwaysOn/Lacking/False'
+        & $reason (& $detail ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) $null $false) | Should -Be 'AlwaysOn/Lacking/False'
+        & $reason (& $detail $script:fromMain $null $false) | Should -Be 'AlwaysOn/NotRecorded/False'
+        $script:control = [pscustomobject]@{ Mode = 'Unknown'; Why = 'the role couldn''t be read'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        & $reason (& $detail $script:new $script:owner $true) | Should -Be 'AlwaysOn/Unknown/False'
+        & $reason (& $detail $script:new $null $false) | Should -Be 'Session/NoEnvironment/False'
+        # Without -Detail, the lifecycle alone, as before.
+        Get-Priced -State $script:new -Permission $null | Should -BeOfType [string]
+    }
 }
 
 Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when the run records what preflight didn''t price' {

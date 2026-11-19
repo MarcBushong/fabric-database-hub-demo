@@ -2135,6 +2135,36 @@ Describe 'Invoke-DemoParallelDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
     }
 
+    It 'goes on when the month''s ceiling only warns, and shows the Warning with its fix on the status page''s Preflight row (the re-review of 0590bbe)' {
+        # A Contributor's update over monthlyCeilingUsd only because T5's container is priced all month, since nothing
+        # automatic deletes it (Get-DemoCostEstimate -T5ManualDeleteOnly).
+        $script:ceilingText = 'The month''s worst case is 398.23 USD, 23.23 USD over the hard ceiling of 375.00 USD. This is a Warning, not a Fail: T5''s container is priced all month.'
+        $script:ceilingFix = 'deploy.ps1 and start-demo.ps1 go on. To clear it, any one of these: an Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1.'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith {
+            New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'
+            New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message ('lowest-cost: {0}' -f $script:ceilingText) -Remediation $script:ceilingFix -Evidence ([ordered]@{ ceilingWarning = $script:ceilingText })
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.PREFLIGHT' }).status | Should -Be 'Pass'
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Warning'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 1 -Exactly
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Preflight') { $item } } })[0]
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -BeLike ('* Cost (PREFLIGHT.COST.MONTHLY): {0} {1}' -f $script:ceilingText, $script:ceilingFix)
+
+        # Within the ceiling, the row stays a Pass and says nothing of the cost.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith { New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'; New-TestResult 'PREFLIGHT.COST.MONTHLY' }
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Preflight') { $item } } })[0]
+        $row['status'] | Should -Be 'Pass'
+        $row['message'] | Should -Not -BeLike '*PREFLIGHT.COST.MONTHLY*'
+    }
+
     It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
         # The issue's case: t4AutonomousTuning true with a t4SkuName that can't run it, from the Infrastructure stage.
         $config['t4SkuName'] = 'Standard_B1ms'

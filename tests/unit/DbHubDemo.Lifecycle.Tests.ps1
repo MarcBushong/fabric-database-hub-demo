@@ -4145,6 +4145,31 @@ Describe 'Test-DemoStartCost' {
         $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('BastionHours') }
     }
+
+    It 'lets a Contributor''s environment start with a Warning when only T5''s container priced all month, since nothing automatic deletes it, is over the ceiling (the re-review of 0590bbe)' {
+        # After the update: T5's container exists only during a session (its tag), the session control holds no role, and the
+        # nightly safety stop can't delete it, so only stop-demo.ps1 does. The estimate stands in for Get-DemoCostEstimate,
+        # whose Warning DbHubDemo.Cost.Tests.ps1 tests: over the ceiling, and a Fail unless it's told so.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T5Container = 'Session'; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $false }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
+            $monthly = if ($PesterBoundParameters.ContainsKey('T5ManualDeleteOnly') -and [bool]$PesterBoundParameters['T5ManualDeleteOnly']) { 'Warning' } else { 'Fail' }
+            [pscustomobject]@{ SessionCost = 12.5; Results = @((New-TestResult 'PREFLIGHT.COST.SESSION' 'Pass' 'preflight'), (New-TestResult 'PREFLIGHT.COST.MONTHLY' $monthly 'preflight')) }
+        }
+        $results = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly }
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Warning'
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'start-demo.ps1 stops only on a Fail'
+        # A nightly safety stop that deletes the container: priced for the running hours, with nothing to excuse.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $true }
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
+        # A session-control role without the container's actions: all month for real, so the ceiling still fails.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'Lacking'; Why = 'its role doesn''t have the container''s actions'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        $lacking = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        ($lacking | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Fail'
+    }
 }
 
 Describe 'Reset-DemoWorkload' {

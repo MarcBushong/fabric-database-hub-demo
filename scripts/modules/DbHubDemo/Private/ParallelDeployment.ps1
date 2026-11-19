@@ -961,6 +961,16 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $mark.Invoke('Preflight', $watch)
             & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit) -T2Source ([string]$context.T2Source))
+            # A monthly ceiling that only warns (2026-11-19, the re-review of 0590bbe): T5's container priced all month only
+            # because nothing automatic deletes it, or a T4 size the person didn't choose; the status page says so, with the fix.
+            $ceilingWarning = @($preflight | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.COST.MONTHLY' -and [string]$_.status -eq 'Warning' }) | Select-Object -First 1
+            if ($null -ne $ceilingWarning) {
+                $ceilingText = [string](Get-DemoMemberValue -InputObject $ceilingWarning.evidence -Name 'ceilingWarning')
+                if (-not $ceilingText) {
+                    $ceilingText = [string]$ceilingWarning.message
+                }
+                Add-DemoProgressStepNote -Path $ProgressPath -Id 'Preflight' -Status 'Warning' -Note ('Cost (PREFLIGHT.COST.MONTHLY): {0} {1}' -f $ceilingText, [string]$ceilingWarning.remediation) -MaxLength 2000
+            }
             & $signInTick
         }
         if (-not $whatIf) {

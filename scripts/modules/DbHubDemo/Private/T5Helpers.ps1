@@ -691,9 +691,16 @@ function Get-DemoT5CostLifecycle {
     or the deployer can write them, and its identity holds it, or the deployer can assign it), or will have no role at all
     while the nightly safety stop already deletes the container; AlwaysOn when it will hold a role without the actions, no
     role with nothing automatic to delete it, or when that can't be read (fail safe).
+
+    -Detail (the re-review of 0590bbe, 2026-11-19) returns Lifecycle, Reason, and ManualDeleteOnly instead of the
+    lifecycle alone. Reason is Session, NoEnvironment, or Unread for Session; NoAutoDelete, Lacking, NotRecorded, or
+    Unknown for AlwaysOn. ManualDeleteOnly is true for NoAutoDelete only: the container is priced all month only because
+    nothing automatic deletes it after a session (the session control holds no role, and no nightly safety stop can),
+    while ./scripts/stop-demo.ps1 still does; Get-DemoCostEstimate -T5ManualDeleteOnly then never makes the hard ceiling
+    a Fail by itself.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
+    [OutputType([string], [pscustomobject])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
@@ -706,9 +713,18 @@ function Get-DemoT5CostLifecycle {
 
         # Get-DemoDeployerRolePermission's answer, for -ThisRunDeploys; read when it isn't given.
         [AllowNull()]
-        [object] $Permission = $null
+        [object] $Permission = $null,
+
+        [switch] $Detail
     )
 
+    $reply = {
+        param([string] $Lifecycle, [string] $Reason)
+        if ($Detail) {
+            return [pscustomobject]@{ Lifecycle = $Lifecycle; Reason = $Reason; ManualDeleteOnly = ($Reason -ceq 'NoAutoDelete') }
+        }
+        return $Lifecycle
+    }
     try {
         if ($null -eq $State) {
             $State = Get-DemoDeploymentState -Config $Config
@@ -721,7 +737,7 @@ function Get-DemoT5CostLifecycle {
             }
             $control = Get-DemoT5ControlRoleState -Config $Config
             if ($control.Mode -eq 'Unknown') {
-                return $script:T5LifecycleAlwaysOn
+                return (& $reply $script:T5LifecycleAlwaysOn 'Unknown')
             }
             # The run writes the control's role to exactly its approved actions ($script:ActivityControlRoleActions), so a
             # deployer who can write it adds the container's actions only while they're approved there.
@@ -729,40 +745,43 @@ function Get-DemoT5CostLifecycle {
             $willHaveActions = @($control.Lacking).Count -eq 0 -or ([bool]$Permission.CanDefine -and $approved)
             $willHold = [bool]$control.HoldsRole -or [bool]$Permission.CanAssign
             if ($willHold -and -not $willHaveActions) {
-                return $script:T5LifecycleAlwaysOn
+                return (& $reply $script:T5LifecycleAlwaysOn 'Lacking')
             }
             if (-not $willHold -and [bool]$control.HoldsOther) {
-                return $script:T5LifecycleAlwaysOn
+                return (& $reply $script:T5LifecycleAlwaysOn 'Lacking')
             }
             # No role at all (review of ab91ee5): only stop-demo.ps1 deletes the container then, unless the nightly safety stop
             # does already; this run can't set that up either, since it can't assign roles.
             if (-not $willHold -and -not (Test-DemoT5SafetyStopDeletes -Config $Config)) {
-                return $script:T5LifecycleAlwaysOn
+                return (& $reply $script:T5LifecycleAlwaysOn 'NoAutoDelete')
             }
-            return $script:T5LifecycleSession
+            return (& $reply $script:T5LifecycleSession 'Session')
         }
         if (-not $exists) {
-            return $script:T5LifecycleSession
+            return (& $reply $script:T5LifecycleSession 'NoEnvironment')
         }
         if ($recorded -cne $script:T5LifecycleSession) {
-            return $script:T5LifecycleAlwaysOn
+            return (& $reply $script:T5LifecycleAlwaysOn 'NotRecorded')
         }
         # Recorded Session: for a session's hours only where something automatic deletes the container (review of
         # ab91ee5): the session control's role, or, while it holds none, the nightly safety stop. Otherwise only
         # stop-demo.ps1 does, so it's priced all month, and a role that can't be read is too (fail safe).
         $control = Get-DemoT5ControlRoleState -Config $Config
         if ($control.Mode -eq 'Control') {
-            return $script:T5LifecycleSession
+            return (& $reply $script:T5LifecycleSession 'Session')
         }
-        if ($control.Mode -eq 'NoRole' -and (Test-DemoT5SafetyStopDeletes -Config $Config)) {
-            return $script:T5LifecycleSession
+        if ($control.Mode -eq 'NoRole') {
+            if (Test-DemoT5SafetyStopDeletes -Config $Config) {
+                return (& $reply $script:T5LifecycleSession 'Session')
+            }
+            return (& $reply $script:T5LifecycleAlwaysOn 'NoAutoDelete')
         }
-        return $script:T5LifecycleAlwaysOn
+        return (& $reply $script:T5LifecycleAlwaysOn $(if ($control.Mode -eq 'Lacking') { 'Lacking' } else { 'Unknown' }))
     }
     catch {
         Write-DemoLog -Level Debug -Message ('T5''s container lifecycle wasn''t read for the estimate, so it''s priced as Session: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
-    return $script:T5LifecycleSession
+    return (& $reply $script:T5LifecycleSession 'Unread')
 }
 
 function Get-DemoT5ContainerBody {
