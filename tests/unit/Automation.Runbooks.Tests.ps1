@@ -2098,6 +2098,39 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         @($auto.done) | Should -Contain 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
     }
 
+    It 'leaves T5''s container alone when a session started sqlvm01 again while the nightly stop waited for T4 (review of ab91ee5)' {
+        # The nightly stop read the busy marker once, at its start; a presenter's Run all right after the auto-shutdown
+        # starts sqlvm01 while the nightly stop waits for a starting T4, and its session uses the container.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Starting'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:t5Container = 'Present'
+        $script:sessionAt = $script:clock.AddMinutes(2)
+        Mock Start-Sleep {
+            $script:clock = $script:clock.AddSeconds($Seconds)
+            if ($script:clock -ge $script:sessionAt -and $script:vm['sqlvm01'] -eq 'deallocating') {
+                $script:vm['sqlvm01'] = 'starting'
+            }
+        }
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.t5Status | Should -Be 'InUse'
+        $result.t5 | Should -Be 'T5''s container left alone: sqlvm01 is starting, so a session may use it'
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
+        $script:t5Container | Should -Be 'Present'
+        # Once sqlvm01 is down for good, the next pass deletes it.
+        $script:vm['sqlvm01'] = 'deallocated'
+        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).t5Status | Should -Be 'Deleted'
+        $script:t5Container | Should -Be ''
+        # A container kept between sessions (AlwaysOn) is said as kept, whatever sqlvm01 does: nothing would delete it.
+        $script:groupTags['DbHubT5Container'] = 'AlwaysOn'
+        $script:t5Container = 'Present'
+        $script:vm['sqlvm01'] = 'running'
+        $script:deallocateStatus['sqlvm01'] = 409
+        $kept = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $kept.t5Status | Should -Be 'Kept'
+        $kept.t5 | Should -Match '^T5''s container kept between sessions \('
+    }
 
     It 'deletes T5''s container in the control''s daily T4 stop too, only while sqlvm01 doesn''t run (2026-11-19)' {
         $script:t4 = 'Stopped'

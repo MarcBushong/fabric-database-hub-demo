@@ -2319,12 +2319,25 @@ function Invoke-DbHubNightlyStop {
     elseif ($replicaText) {
         $done.Add($replicaText)
     }
-    # T5's container (2026-11-19, ADR 0027), when a session's stop didn't delete it. Its outcome is apart from the job's
-    # status (t5Status, review of ab91ee5), so a container this role can't delete never makes the stop of the VMs and T4
-    # look failed, which the cost check of T4's restart reads (R910).
-    $t5 = Remove-DbHubT5Container -Context $Context -Tags $Tags
-    $t5Status = [string]$t5.Outcome
-    $t5Text = Get-DbHubT5ContainerText -Outcome $t5
+    # T5's container (2026-11-19, ADR 0027), when a session's stop didn't delete it. Only while sqlvm01, whose runner drives T5,
+    # is still on its way down (review of ab91ee5): this pass read the busy marker once, at its start, and a session started
+    # since then uses the container. Its outcome is apart from the job's status (t5Status), so a container this role can't
+    # delete never makes the stop of the VMs and T4 look failed, which the cost check of T4's restart reads (R910).
+    $t5Status = ''
+    $t5Text = ''
+    if ((Get-DbHubT5Lifecycle -Tags $Tags) -eq 'Session' -and (Get-DbHubT5ContainerPath -Settings $settings -Tags $Tags)) {
+        $sqlState = Get-DbHubVmState -Context $Context -VmName ([string]$settings.sqlVmName)
+        if ($sqlState -notin 'deallocated', 'deallocating', 'stopped', 'Missing') {
+            $t5Status = 'InUse'
+            $t5Text = 'T5''s container left alone: {0} is {1}, so a session may use it' -f $settings.sqlVmName, $sqlState
+            Write-DbHubLog -Context $Context -Message $t5Text
+        }
+    }
+    if (-not $t5Status) {
+        $t5 = Remove-DbHubT5Container -Context $Context -Tags $Tags
+        $t5Status = [string]$t5.Outcome
+        $t5Text = Get-DbHubT5ContainerText -Outcome $t5
+    }
     if ($t5Text) {
         $done.Add($t5Text)
     }
