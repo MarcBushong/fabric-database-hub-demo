@@ -530,6 +530,11 @@ body {
     color: var(--status-manual);
 }
 
+/* Live, but no live answer (reading, or unavailable): neutral, never the live green. */
+.provenance-off {
+    border-style: dashed;
+}
+
 .section-title {
     display: flex;
     align-items: center;

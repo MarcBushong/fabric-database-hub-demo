@@ -6,6 +6,7 @@ import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
 import { EmptyState } from "@/components/EmptyState";
 import { KpiTile } from "@/components/KpiTile";
+import { ProvenanceBadge } from "@/components/ProvenanceBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
@@ -15,7 +16,7 @@ import { useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-e
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
-import { formatDateTimeUtc } from "@/lib/format";
+import { clause, formatDateTimeUtc, sentence } from "@/lib/format";
 import { worstStatus } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
 
@@ -104,7 +105,10 @@ function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRo
             <section className="panel span-12 live-panel" aria-label={info.title}>
                 <h3>{info.title}</h3>
                 <p className="panel-sub">{info.fallback}</p>
-                <p className="muted">{`Not read live here: ${props.unavailable ?? "no live source"}. The table below is the history's own findings.`}</p>
+                <p className="muted live-off">
+                    <ProvenanceBadge provenance="live" liveState="unavailable" />
+                    {` ${sentence(props.unavailable ?? "this app has no live source")} The table below is the history's own findings.`}
+                </p>
                 <div>{open}</div>
             </section>
         );
@@ -129,7 +133,7 @@ function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRo
         >
             {live && live.errors.length > 0 ? (
                 <MessageBar intent="warning">
-                    <MessageBarBody>{`Partial answer: ${live.errors.join("; ")}. What the other routes read is below.`}</MessageBarBody>
+                    <MessageBarBody>{`Partial answer: ${live.errors.map(clause).join("; ")}. What the other routes read is below.`}</MessageBarBody>
                 </MessageBar>
             ) : null}
             <DataGrid columns={LIVE_COLUMNS} rows={props.rows} caption={`Live ${props.tab} checks`} exportName={`findings-live-${props.tab}`} />

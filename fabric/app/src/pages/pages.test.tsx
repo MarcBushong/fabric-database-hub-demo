@@ -76,9 +76,12 @@ describe("Overview", () => {
         expect(navigate).toHaveBeenCalledWith("findings", { category: "security" });
     });
 
-    it("says in one line when nothing is read live", async () => {
+    it("says in one line when nothing is read live, with a neutral badge and one period per sentence", async () => {
         renderWithApp(<OverviewPage />);
-        expect(await screen.findByText(/Not read live here: the live estate function isn't deployed in this app\. Every page shows the history/)).toBeInTheDocument();
+        const line = await screen.findByText(/^The live estate function isn't deployed in this app\. Every page shows the history; Database Hub has the live view\.$/);
+        expect(line.textContent).not.toMatch(/\.\./);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(screen.queryByText(/^Live$/)).not.toBeInTheDocument();
     });
     it("on the first run, says the one action that fills it: Run all in NB_DatabaseHub_Control", async () => {
         renderWithApp(<OverviewPage />, { client: fakeQueryClient({ "history-meta": [] }), metaEmpty: true });
@@ -260,7 +263,7 @@ describe("Findings", () => {
 
     it("says why security isn't read live, links to Database Hub, and keeps the history's findings", async () => {
         renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" } });
-        expect(await screen.findByText(/^Not read live here: the live estate function isn't deployed in this app\./)).toBeInTheDocument();
+        expect(await screen.findByText(/^The live estate function isn't deployed in this app\. The table below is the history's own findings\.$/)).toBeInTheDocument();
         const panel = screen.getByRole("region", { name: "Security posture, live from Database Hub" });
         expect(within(panel).getByRole("link", { name: "Open Database Hub, then Security" })).toHaveAttribute("target", "_blank");
         await waitFor(() => expect(within(screen.getByRole("table", { name: "Findings" })).getAllByRole("row")).toHaveLength(2));

@@ -41,7 +41,7 @@ const runtime: AppRuntime = {
 };
 
 const empty = params.get("empty") === "1";
-setLiveEstateReader(sampleLiveReader({ at: new Date().toISOString(), delayMs: 900, off: params.get("live") === "off" ? "the live estate function isn't deployed in this app" : undefined }));
+setLiveEstateReader(sampleLiveReader({ at: new Date().toISOString(), delayMs: 900, off: params.get("live") === "off" ? "The live estate function isn't deployed in this app." : undefined }));
 const sample: DataSource = {
     provenance: "sample",
     answers: () => true,

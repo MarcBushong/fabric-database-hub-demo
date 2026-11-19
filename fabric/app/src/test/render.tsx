@@ -230,7 +230,7 @@ export interface RenderOptions {
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
-    setLiveEstateReader(sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "the live estate function isn't deployed in this app" }));
+    setLiveEstateReader(sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "The live estate function isn't deployed in this app." }));
     const setView = vi.fn();
     const navigate = vi.fn();
     const notify = vi.fn();

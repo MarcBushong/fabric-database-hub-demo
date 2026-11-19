@@ -7,7 +7,7 @@ import { ArrowClockwise16Regular, Code16Regular, Sparkle16Filled } from "@fluent
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import { useLiveEstate, type EstateAnswer, type EstateView, type HealthData, type UsageCounts } from "@/data/live-estate";
-import { formatNumber } from "@/lib/format";
+import { formatNumber, sentence } from "@/lib/format";
 import { inventoryMix, liveSecurityRows, targetOfResource } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
 import { ProvenanceBadge } from "./ProvenanceBadge";
@@ -39,8 +39,8 @@ export function LiveNow() {
         const reason = inventory.unavailable ?? health.unavailable ?? security.unavailable;
         return (
             <p className="live-off muted span-12">
-                <ProvenanceBadge provenance="live" compact />
-                {` Not read live here: ${reason ?? "no live source"}. Every page shows the history; Database Hub has the live view.`}
+                <ProvenanceBadge provenance="live" liveState="unavailable" />
+                {` ${sentence(reason ?? "this app has no live source")} Every page shows the history; Database Hub has the live view.`}
             </p>
         );
     }
@@ -80,7 +80,7 @@ export function LiveNow() {
                 <h2 id="live-now-title" className="section-title">
                     Live now
                 </h2>
-                {at ? <ProvenanceBadge provenance="live" asOf={new Date(at)} /> : <ProvenanceBadge provenance="live" compact />}
+                {at ? <ProvenanceBadge provenance="live" asOf={new Date(at)} /> : <ProvenanceBadge provenance="live" liveState="reading" />}
                 {loading ? <Spinner size="extra-tiny" label="Reading Database Hub: a first read takes 5 to 12 seconds" labelPosition="after" /> : null}
                 {failed.length > 0 ? <span className="vcard-partial">{`Partial: ${failed.length} API calls failed`}</span> : null}
                 <span className="live-now-tools">
