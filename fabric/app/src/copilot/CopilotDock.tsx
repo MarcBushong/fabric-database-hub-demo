@@ -448,7 +448,7 @@ function PartView({ part, expanded, streaming = false }: { part: Part; expanded:
             {open ? (
                 <div className="copilot-source-body">
                     {call.error ? <p className="copilot-error">{call.error}</p> : null}
-                    <Caption1>Read-only Database Hub routes, as this app's owner, filtered to the demo's resource group:</Caption1>
+                    <Caption1>Database Hub API: read-only, as this app's owner, filtered to the demo's resource group.</Caption1>
                     <ul className="copilot-routes">
                         {call.source.map((s) => (
                             <li key={s}>

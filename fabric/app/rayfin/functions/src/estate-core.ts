@@ -91,7 +91,7 @@ export interface EstateDataByView {
 
 export interface EstateAnswer<V extends EstateView = EstateView> {
     view: V;
-    /** The Database Hub routes that answered, for the dock's "source" view. */
+    /** The Database Hub routes that answered, relative ("<METHOD> /<route>", exactly ALLOWED_ROUTES entries): the UI shows them under "Database Hub API". */
     source: string[];
     scope: { subscriptionId: string; resourceGroups: string[] };
     /** Empty only when the function has no scope; a partial answer keeps what it read, with the reasons in errors. */
@@ -338,5 +338,5 @@ export async function readEstate<V extends EstateView>(
     if (view === "health") data = await health(r, scope, now);
     else if (view === "security") data = await security(r, scope);
     else data = await inventory(r, scope);
-    return { view, source: r.source.map((s) => s.replace(" /", ` ${new URL(DBHUB_BASE).pathname}/`)), scope: scopeOut, data: data as EstateDataByView[V], errors: r.errors, at: now.toISOString() };
+    return { view, source: [...r.source], scope: scopeOut, data: data as EstateDataByView[V], errors: r.errors, at: now.toISOString() };
 }

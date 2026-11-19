@@ -31,7 +31,9 @@ describe("the estate function", () => {
         });
         const answer = await readEstate("inventory", scope, token, fetchImpl, new Date("2026-11-18T12:34:00Z"));
         expect(answer.data).toMatchObject({ totalCount: 2, countByType: { AzureSql: 1, PostgreSql: 1 }, complete: true });
-        expect(answer.source).toEqual([`POST ${new URL(DBHUB_BASE).pathname}/savedView/resources/list`]);
+        expect(answer.source).toEqual(["POST /savedView/resources/list"]);
+        expect(answer.source.every((s) => (ALLOWED_ROUTES as readonly string[]).includes(s))).toBe(true);
+        expect(answer.source.join(" ")).not.toContain(new URL(DBHUB_BASE).pathname);
         expect(calls[0].headers).toMatchObject({ Authorization: `Bearer ${token}`, "User-Agent": USER_AGENT });
         const appVersion = /^version:\s*(\S+)/m.exec(readFileSync(join(process.cwd(), "rayfin", "rayfin.yml"), "utf8"))?.[1];
         expect(USER_AGENT).toBe(`DbHubDemo-InsightsApp/${appVersion}`);

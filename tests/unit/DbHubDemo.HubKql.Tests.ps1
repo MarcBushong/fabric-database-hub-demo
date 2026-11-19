@@ -224,7 +224,7 @@ Describe 'Documented interfaces only' {
     It 'no file outside the docs names a private Database Hub route, except the Insights app''s estate function (ADR 0013''s exception)' {
         $route = '/v1/databasehub/' + '__private'
         # ADR 0013 (2026-11-18): the one exception is the estate function's core, which reads the GA databasehub-cli
-        # skill's 8 read-only routes as the app's owner, scoped to the demo's resource group (its tests pin the allowlist).
+        # skill's 8 read-only routes as the app's owner, scoped to the demo's resource group (the next test pins its allowlist).
         $exception = [System.IO.Path]::GetFullPath((Join-Path -Path $repoRoot -ChildPath 'fabric/app/rayfin/functions/src/estate-core.ts'))
         $hits = foreach ($path in $visible) {
             if ($path -match '\.md$' -or $path -eq $exception -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -235,6 +235,27 @@ Describe 'Documented interfaces only' {
             }
         }
         $hits | Should -BeNullOrEmpty
+    }
+
+    It 'the estate function''s allowlist is exactly the 8 read-only routes of ADR 0013''s exception, on the one private base' {
+        # This list is the exception's guard: adding a route needs a deliberate change here and in ADR 0013's amendment.
+        $expected = @(
+            'POST /savedView/resources/list'
+            'POST /health/v2/filtered-summary'
+            'POST /health/v2/filtered-usage-details'
+            'POST /postgreSql/health/v2/summary'
+            'POST /cosmosDb/health/summary'
+            'GET /auth/warnings'
+            'GET /auditing/warnings'
+            'GET /cmk/warnings'
+        )
+        $core = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/rayfin/functions/src/estate-core.ts') -Raw
+        $block = [regex]::Match($core, 'export const ALLOWED_ROUTES = \[(?<body>[^\]]*)\] as const;')
+        $block.Success | Should -BeTrue
+        $actual = @([regex]::Matches($block.Groups['body'].Value, '"(?<route>[^"]+)"') | ForEach-Object { $_.Groups['route'].Value })
+        ($actual -join "`n") | Should -BeExactly ($expected -join "`n")
+        # One definition of the base (DBHUB_BASE); every route is relative to it, and answers name the routes only.
+        [regex]::Matches($core, [regex]::Escape('/v1/databasehub/' + '__private')).Count | Should -Be 1
     }
 
     It 'the Hub validators call only documented hosts' {
