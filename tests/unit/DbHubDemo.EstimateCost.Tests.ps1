@@ -52,8 +52,19 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
                 DefenderIncluded = $PesterBoundParameters.ContainsKey('DefenderPlans'); DefenderSession = 0.1; DefenderMonthly = 1.0
                 T3FreeOffer = $false; T3FreeOfferUnchecked = $false; T4ReplicaIncluded = $false; T4ReplicaSession = $null
                 QueriedOn = '2026-11-13'; NetworkMode = 'private'; NetworkModeAssumed = $false
+                # The monthly check (2026-11-19): the worst case, its ceiling and margin, and what it assumed.
+                T4RestartHours = 96.0; T4AutoRestartWorstCaseMonthly = 34.18; T5Enabled = $true; T5ContainerLifecycle = 'Session'
+                BastionHours = 0.0; MonthlyWorstCase = 74.18; MonthlyCeiling = 415.0; MonthlyMargin = 340.82
             }
         }
+    }
+
+    It 'prints the monthly check: the worst case against monthlyCeilingUsd, its margin, and what it assumed (2026-11-19, the docs audit)' {
+        $output = & $script:entry -ConfigPath (New-TestConfigFile) -NetworkMode private -BastionHours 4 -OutputPath (Join-Path -Path $TestDrive -ChildPath 'estimate.jsonl') | Out-String -Width 250
+        $output | Should -Match 'The monthly check: the worst case against monthlyCeilingUsd \(a negative margin is over it\)'
+        $output | Should -Match 'Profile\s+Light-use month\s+T4 restart hours\s+T4 restart\s+T5 container\s+Bastion hours\s+Worst-case month\s+Ceiling\s+Margin'
+        $output | Should -Match 'lowest-cost\s+40(\.0+)?\s+96(\.0+)?\s+34\.18\s+Session\s+0(\.0+)?\s+74\.18\s+415(\.0+)?\s+340\.82'
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $BastionHours -eq 4 }
     }
 
     It 'reads whether a safety stop covers T4''s 7-day restart, so the estimate counts about a day per restart' {

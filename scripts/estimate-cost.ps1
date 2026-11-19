@@ -53,6 +53,12 @@ Hours in one demo-day session. Defaults to config/profiles.json.
 .PARAMETER LightUseHoursPerMonth
 Running hours in a light-use month. Defaults to config/profiles.json.
 
+.PARAMETER BastionHours
+Hours of Azure Bastion and its public IP in a session and a light-use month. Defaults to config/profiles.json's
+bastionHoursPerSession, 0 since 2026-11-19: a default deployment and session have no Bastion. Only start-demo.ps1
+-Interactive deploys it, for at most bastionMaxHours (4 by default), which its cost guardrail counts; pass that here to
+price such a session.
+
 .PARAMETER NetworkMode
 The effective network mode, public or private.
 
@@ -88,6 +94,9 @@ param(
 
     [ValidateRange(-1, 744)]
     [double] $LightUseHoursPerMonth = -1,
+
+    [ValidateRange(-1, 24)]
+    [double] $BastionHours = -1,
 
     [ValidateSet('public', 'private')]
     [string] $NetworkMode,
@@ -204,8 +213,11 @@ else {
 
 $profileNames = if ($AllProfiles) { @('lowest-cost', 'demo-day', 'enhanced-performance') } elseif ($ProfileName) { @($ProfileName) } else { @($config['profile']) }
 $results = [System.Collections.Generic.List[object]]::new()
+# The monthly check (2026-11-19, the docs audit): the worst-case total each profile is checked against monthlyCeilingUsd,
+# with the margin and what it assumed, so the result says why it passed or failed.
+$monthlyChecks = [System.Collections.Generic.List[object]]::new()
 $summary = foreach ($name in $profileNames) {
-    $parameters = @{ Config = $config; ProfileName = $name; DemoHours = $DemoHours; LightUseHoursPerMonth = $LightUseHoursPerMonth }
+    $parameters = @{ Config = $config; ProfileName = $name; DemoHours = $DemoHours; LightUseHoursPerMonth = $LightUseHoursPerMonth; BastionHours = $BastionHours }
     if ($NetworkMode) {
         $parameters['NetworkMode'] = $NetworkMode
     }
@@ -245,12 +257,25 @@ $summary = foreach ($name in $profileNames) {
         'T3 free offer'    = if ($estimate.T3FreeOffer) { 'yes' } elseif ($estimate.T3FreeOfferUnchecked) { 'unchecked' } else { 'no' }
         'Replica session'  = if ($estimate.T4ReplicaIncluded) { $estimate.T4ReplicaSession } else { 'none' }
     }
+    $monthlyChecks.Add([pscustomobject]@{
+            Profile            = $name
+            'Light-use month'  = $estimate.LightUseMonthly
+            'T4 restart hours' = if ($null -ne $estimate.T4RestartHours) { $estimate.T4RestartHours } else { 'not counted' }
+            'T4 restart'       = if ($null -ne $estimate.T4AutoRestartWorstCaseMonthly) { $estimate.T4AutoRestartWorstCaseMonthly } else { 'not counted' }
+            'T5 container'     = if ($estimate.T5Enabled) { $estimate.T5ContainerLifecycle } else { 'no T5' }
+            'Bastion hours'    = $estimate.BastionHours
+            'Worst-case month' = $estimate.MonthlyWorstCase
+            'Ceiling'          = if ($null -ne $estimate.MonthlyCeiling) { $estimate.MonthlyCeiling } else { 'not in USD' }
+            'Margin'           = if ($null -ne $estimate.MonthlyMargin) { $estimate.MonthlyMargin } else { 'not in USD' }
+        })
     $queriedOn = $estimate.QueriedOn
     $effectiveNetworkMode = $estimate.NetworkMode
     $networkModeAssumed = $estimate.NetworkModeAssumed
 }
 
 $summary | Format-Table -AutoSize | Out-String -Width 220 | Write-Output
+Write-Output 'The monthly check: the worst case against monthlyCeilingUsd (a negative margin is over it)'
+$monthlyChecks | Format-Table -AutoSize | Out-String -Width 220 | Write-Output
 Write-DemoLog -Message "List prices in USD from the Azure Retail Prices API on $queriedOn for $($config['location']). Estimates, not quotes."
 if ($networkModeAssumed) {
     Write-DemoLog -Level Warning -Message 'networkMode auto is not resolved, so the estimate assumes private mode. Pass -NetworkMode with the mode preflight resolved.'
