@@ -1,5 +1,6 @@
 // Ready-made prompts for Database Hub's built-in Database Agent (preview), and the same questions for the documented
-// fallback: the microsoft-sql-fdh and microsoft-sql plugins in GitHub Copilot CLI or VS Code (fabric/agent/README.md).
+// fallback: the GA Database Hub skill (databasehub-cli, in the fabric-skills plugin) and the microsoft-sql plugin in GitHub
+// Copilot CLI or VS Code (fabric/agent/README.md).
 // The agent is UI-only, so the app only builds text from the query results: it never sends a prompt or runs anything.
 // Every prompt ends with the prompt pack's safety sentence (fabric/agent/prompts/README.md), so a copied prompt keeps it.
 
@@ -12,7 +13,7 @@ export type AgentSurface = "hub" | "skills";
 
 export const AGENT_SURFACES: ReadonlyArray<{ id: AgentSurface; label: string; short: string }> = [
     { id: "hub", label: "The Database Agent in Database Hub", short: "Database Agent" },
-    { id: "skills", label: "GitHub Copilot CLI or VS Code with the microsoft-sql-fdh and microsoft-sql plugins", short: "Copilot CLI · VS Code" },
+    { id: "skills", label: "GitHub Copilot CLI or VS Code with the GA databasehub-cli skill (fabric-skills) and the microsoft-sql plugin", short: "Copilot CLI · VS Code" },
 ];
 
 export interface AgentPrompt {
@@ -318,7 +319,7 @@ export function libraryPrompts(context: LibraryContext, surface: AgentSurface): 
         {
             id: id("health"),
             title: "Estate health",
-            purpose: "The microsoft-sql-fdh plugin's Database Hub skill",
+            purpose: "The GA Database Hub skill, databasehub-cli (the fabric-skills plugin)",
             text: `Use the Database Hub skill to show the SQL resources ${scope}, grouped by engine and subscription, with CPU, storage, and memory health over the last hour: ${names}. Report coverage, partial results, and anything you couldn't read. ${NO_CHANGE}`,
         },
         {

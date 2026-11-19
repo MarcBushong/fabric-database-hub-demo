@@ -1,126 +1,44 @@
-// Live estate data from Database Hub, read by the app's function through the GA databasehub-cli skill's read-only
-// routes, scoped to the demo's own resource groups. The chat session's module (src/copilot/estate.ts) owns the call:
-// one per view, cached for 60 seconds and shared with the Copilot dock. Until that module is in the build, or when the
-// app's function isn't deployed, pages say so and fall back to the history.
+// Live estate data from Database Hub, read by the app's estate function (rayfin/functions, estateOverview) through the
+// GA databasehub-cli skill's read-only routes, scoped to the demo's own resource groups. The chat session's module
+// (src/copilot/estate.ts) owns the call: one per view, cached for 60 seconds and shared with the Copilot dock. The
+// shapes are that function's own (estate-core.ts), so a change there fails this app's typecheck instead of a page. When
+// the function isn't deployed, or can't be reached, pages say so and fall back to the history.
 
 import { useCallback, useEffect, useState } from "react";
 
-export type EstateView = "inventory" | "health" | "security";
+import type { EstateAnswer, EstateDataByView, EstateView, InventoryResource } from "@/copilot/estate";
 
+export type {
+    EstateAnswer,
+    EstateDataByView,
+    EstateView,
+    HealthData,
+    InventoryData,
+    InventoryResource,
+    MigrationAssessment,
+    SecurityArea,
+    SecurityData,
+    SecurityFinding,
+    UsageSummary,
+} from "@/copilot/estate";
+
+/** One inventory row, as the estate function passes it. */
+export type LiveResource = InventoryResource;
 export type FlagCategory = "security" | "performance" | "optimization";
-/** A true flag needs attention ("hasCmkIssue": true). */
-export type FlagGroups = Partial<Record<FlagCategory, Record<string, boolean>>>;
-
-export interface LiveResource {
-    databaseType: string;
-    name: string;
-    resourceGroup?: string;
-    location?: string;
-    sku?: string;
-    status?: string;
-    /** Database Hub's issues: what needs attention. */
-    issues?: FlagGroups;
-    /** Database Hub's enhancements: what it recommends. */
-    enhancements?: FlagGroups;
-    /** A SQL Server instance's migration assessment (SQL Server enabled by Azure Arc), when Database Hub's row carries one. */
-    migrationAssessment?: MigrationAssessment;
-}
+/** Database Hub's flags by area; a true flag needs attention ("hasCmkIssue": true). */
+export type FlagGroups = NonNullable<InventoryResource["issues"]>;
 
 /**
- * Database Hub's migration assessment of a SQL Server instance: its inventory row's properties.migrationAssessment, as
- * the app's function passes it (the chat session's estate types). Database Hub doesn't raise a ready assessment as an
- * issue, so this is where "which servers can move to Azure, and to what" comes from.
+ * The answer's data, or null when there's none: the function answers with empty data when it has no scope (the
+ * deploy didn't write one), with the reason in errors.
  */
-export interface MigrationAssessment {
-    enabled: boolean;
-    /** When the instance last uploaded its assessment, or null. */
-    uploadedAt: string | null;
-    /** "Available" with results, "Stale", or "Unavailable". */
-    dataStatus: string;
-    /** Readiness per Azure SQL target, with Database Hub's names and values, for example azureSqlManagedInstance: "Ready". */
-    targets: Record<string, string>;
-    readyTargets?: string[];
-    /** Database Hub's own flag (issues.optimization.hasMigrationAssessmentIssue), when the row has it. */
-    hasIssue?: boolean;
-}
-
-export interface InventoryData {
-    totalCount: number;
-    countByType: Record<string, number>;
-    resources: LiveResource[];
-    complete: boolean;
-}
-
-export interface UsageCounts {
-    cpu: number;
-    storage: number;
-    memory: number;
-}
-
-export interface EngineHealth {
-    totalDatabases: number;
-    highUsage: UsageCounts | null;
-}
-
-export interface CosmosHealth {
-    totalAccounts: number;
-    minimumServiceAvailability: number | null;
-    maximumNormalizedRu: number | null;
-    note?: string;
-}
-
-export interface HealthData {
-    window: { startTime: string; endTime: string; granularity?: string; aggregation?: string };
-    microsoftSql: EngineHealth | null;
-    postgreSql: EngineHealth | null;
-    cosmosDb: CosmosHealth | null;
-}
-
-export interface SecurityWarning {
-    name: string;
-    type: string;
-    serverName?: string;
-    reason?: string;
-}
-
-export interface SecurityArea {
-    scope: string;
-    warnings: SecurityWarning[];
-    warningCount: number;
-    complete: boolean;
-}
-
-export interface SecurityData {
-    authentication?: SecurityArea;
-    auditing?: SecurityArea;
-    customerManagedKeys?: SecurityArea;
-}
-
-export interface EstateDataByView {
-    inventory: InventoryData;
-    health: HealthData;
-    security: SecurityData;
-}
-
-export interface EstateAnswer<V extends EstateView = EstateView> {
-    view: V;
-    /** The Database Hub API calls that answered, "<METHOD> /<route>" relative to the API: what the visual shows instead of DAX. */
-    source: string[];
-    scope: { subscriptionId: string; resourceGroups: string[] };
-    data: EstateDataByView[V];
-    /** The API calls that failed; a partial answer keeps what it read. */
-    errors: string[];
-    /** When the answer was read (ISO 8601). */
-    at: string;
+export function liveDataOf<V extends EstateView>(answer: EstateAnswer<V> | null | undefined): EstateDataByView[V] | null {
+    const data = answer?.data;
+    return data && typeof data === "object" && Object.keys(data).length > 0 ? (data as EstateDataByView[V]) : null;
 }
 
 export type EstateReader = <V extends EstateView>(view: V, options?: { force?: boolean }) => Promise<EstateAnswer<V>>;
 
-interface EstateModule {
-    readEstate?: EstateReader;
-}
-
-const modules = import.meta.glob<EstateModule>("../copilot/estate.ts");
 let override: EstateReader | null = null;
 
 /** The local preview and the tests answer with their own reader; null goes back to the app's function. */
@@ -131,10 +49,8 @@ export function setLiveEstateReader(reader: EstateReader | null): void {
 /** The live answer for one view; it rejects when the app has no live source (the function isn't deployed). */
 export async function readLiveEstate<V extends EstateView>(view: V, options?: { force?: boolean }): Promise<EstateAnswer<V>> {
     if (override) return override(view, options);
-    const load = Object.values(modules)[0];
-    const module = load ? await load() : null;
-    if (!module?.readEstate) throw new Error("This build of the app has no live estate source.");
-    return module.readEstate(view, options);
+    const { readEstate } = await import("@/copilot/estate");
+    return readEstate(view, options);
 }
 
 export interface LiveState<V extends EstateView> {
@@ -154,7 +70,10 @@ export function useLiveEstate<V extends EstateView>(view: V, enabled = true): Li
         let alive = true;
         readLiveEstate(view, nonce > 0 ? { force: true } : undefined).then(
             (answer) => {
-                if (alive) setSettled({ view, n: nonce, answer, unavailable: null });
+                if (!alive) return;
+                // No data at all (the function has no scope): the page says why, as when the function isn't deployed.
+                if (liveDataOf(answer) === null) setSettled({ view, n: nonce, answer: null, unavailable: answer.errors[0] ?? "Database Hub returned no data for this view." });
+                else setSettled({ view, n: nonce, answer, unavailable: null });
             },
             (error: unknown) => {
                 if (alive) setSettled({ view, n: nonce, answer: null, unavailable: error instanceof Error ? error.message : String(error) });

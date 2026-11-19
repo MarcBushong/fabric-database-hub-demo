@@ -8,7 +8,7 @@ import { Open16Regular, Sparkle16Filled } from "@fluentui/react-icons";
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import type { ColumnSpec } from "@/data/queries";
-import { useLiveEstate } from "@/data/live-estate";
+import { liveDataOf, useLiveEstate } from "@/data/live-estate";
 import { buildAskContext } from "@/lib/ask";
 import { formatDateTimeUtc, sentence } from "@/lib/format";
 import { liveMigrations, migrationSentence, type MigrationTargetRow } from "@/lib/live-findings";
@@ -30,7 +30,7 @@ export function MigrationCard({ className = "span-12", resourceName = "arcsql01"
     const copilot = useCopilot();
     const inventory = useLiveEstate("inventory");
     const answer = inventory.answer;
-    const all = answer ? liveMigrations(answer.data) : [];
+    const all = liveMigrations(liveDataOf(answer));
     const m = all.find((x) => x.target === "T2") ?? all[0] ?? null;
     const name = m?.resource ?? resourceName;
     const portalUrl = runtime.links.t2MigrationAssessment;

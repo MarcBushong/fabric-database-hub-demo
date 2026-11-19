@@ -13,7 +13,7 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import { FINDING_CATEGORIES, findingCategory, toFindings, toPostgresFindings, toTargetNames, type FindingCategory, type TargetName } from "@/data/model";
 import { findingsQuery, postgresFindingsQuery, targetNamesQuery } from "@/data/queries";
-import { useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
+import { liveDataOf, useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
@@ -156,8 +156,8 @@ export default function FindingsPage() {
     // The live reads are cached for a minute and shared with the Copilot dock, so the tiles and tabs read them once.
     const security = useLiveEstate("security");
     const inventory = useLiveEstate("inventory");
-    const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(security.answer?.data, inventory.answer?.data) : null), [security.answer, inventory.answer]);
-    const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(inventory.answer.data) : null), [inventory.answer]);
+    const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), liveDataOf(inventory.answer)) : null), [security.answer, inventory.answer]);
+    const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(liveDataOf(inventory.answer)) : null), [inventory.answer]);
     const hubUrl = hubUrlOf(runtime);
     const rows: FindingRow[] = useMemo(() => {
         const sql = toFindings(findingsState.data?.rows ?? []).filter((f) => !/^T\d/.test(f.target) || view.targets.some((t) => f.target === t || f.target.startsWith(`${t}-`)));

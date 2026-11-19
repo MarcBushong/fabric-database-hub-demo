@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
 import { estateQuery } from "@/data/queries";
-import type { InventoryData } from "@/data/live-estate";
+import { liveDataOf, type InventoryData } from "@/data/live-estate";
 import { flagText, inventoryMix, isDown, liveMigrations, liveOptimizationRows, liveSecurityRows, migrationSentence, readinessText, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { buildAskContext } from "@/lib/ask";
@@ -148,7 +148,8 @@ describe("live findings", () => {
         expect(targetOfResource({ name: "ContosoCare", databaseType: "AzureSql" }, "azuresql01-x")).toBe("T3");
         expect(targetOfResource({ name: "elsewhere", databaseType: "PostgreSql" })).toBe("");
         expect(flagText("hasSomethingNewIssue")).toBe("Something new");
-        const rows = liveSecurityRows(answers.security.data, answers.inventory.data);
+        const inventory = liveDataOf(answers.inventory);
+        const rows = liveSecurityRows(liveDataOf(answers.security), inventory);
         expect(rows.map((r) => `${r.attention}|${r.target}|${r.area}`)).toEqual([
             "Needs attention|T3|Auditing",
             "Needs attention|T3|Customer-managed keys",
@@ -157,15 +158,15 @@ describe("live findings", () => {
             "Recommended|T4-replica|Customer-managed keys",
         ]);
         // Live, 2026-11-18: neither T1 nor T2 has a license finding, and a ready assessment isn't an issue.
-        expect(liveOptimizationRows(answers.inventory.data)).toEqual([]);
-        expect(inventoryMix(answers.inventory.data)).toBe("2 PostgreSQL · 1 Arc SQL · 1 Azure SQL · 1 SQL VM · 1 Cosmos DB");
-        expect(inventoryMix(answers.inventory.data, true)).toMatch(/^2 Azure Database for PostgreSQL, 1 Arc-enabled SQL Server, /);
+        expect(liveOptimizationRows(inventory)).toEqual([]);
+        expect(inventoryMix(inventory)).toBe("2 PostgreSQL · 1 Arc SQL · 1 Azure SQL · 1 SQL VM · 1 Cosmos DB");
+        expect(inventoryMix(inventory, true)).toMatch(/^2 Azure Database for PostgreSQL, 1 Arc-enabled SQL Server, /);
         expect(liveSecurityRows(null, null)).toEqual([]);
         expect(flagText("hasUsageReportingIssue")).toBe("Usage reporting to Azure needs attention");
     });
 
     it("counts a SQL Server on an Azure VM once, though Database Hub lists its VM and its instance (live, 2026-11-18)", () => {
-        const vm = { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-x" };
+        const vm = { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-x", location: "westus3" };
         const inventory: InventoryData = {
             totalCount: 3,
             countByType: { AzureSqlVM: 2, AzureSql: 1 },
@@ -173,7 +174,7 @@ describe("live findings", () => {
             resources: [
                 { ...vm, status: "Unknown", issues: { optimization: { hasPaygLicenseIssue: true, hasLowComputeUtilizationIssue: false } } },
                 { ...vm, resourceGroup: "RG-X", status: "Connected", issues: { optimization: { hasLowComputeUtilizationIssue: true } } },
-                { databaseType: "AzureSql", name: "ContosoCare", resourceGroup: "rg-x", status: "Online" },
+                { databaseType: "AzureSql", name: "ContosoCare", resourceGroup: "rg-x", location: "westus3", status: "Online" },
             ],
         };
         const unique = uniqueInventory(inventory);
@@ -185,14 +186,14 @@ describe("live findings", () => {
     });
 
     it("reads T2's migration assessment: readiness per Azure SQL target in Learn's words, ready ones named first", () => {
-        const [t2] = liveMigrations(sampleLiveAnswers("2026-10-21T21:00:00.000Z").inventory.data);
+        const [t2] = liveMigrations(liveDataOf(sampleLiveAnswers("2026-10-21T21:00:00.000Z").inventory));
         expect(t2).toMatchObject({ resource: "arcsql01", target: "T2", type: "Arc-enabled SQL Server", enabled: true, dataStatus: "Available", hasResults: true });
         expect(t2.uploadedAt?.toISOString()).toBe("2026-10-21T18:00:00.000Z");
         expect(t2.rows.map((r) => `${r.azureTarget}: ${r.readiness}`)).toEqual(["Azure SQL Managed Instance: Ready", "SQL Server on Azure Virtual Machines: Ready", "Azure SQL Database: Not ready"]);
         expect(migrationSentence(t2)).toBe("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.");
         expect(migrationSentence({ ready: [], notReady: ["Azure SQL Database"] })).toBe("Not ready for Azure SQL Database.");
         expect([readinessText("NotReady"), readinessText("Unknown"), readinessText("ReadyWithConditions")]).toEqual(["Not ready", "Unknown", "Ready With Conditions"]);
-        const none = liveMigrations({ totalCount: 1, countByType: {}, complete: true, resources: [{ databaseType: "ArcSqlServer", name: "arcsql01", migrationAssessment: { enabled: true, uploadedAt: null, dataStatus: "Unavailable", targets: { azureSqlDatabase: "Unknown" } } }] });
+        const none = liveMigrations({ totalCount: 1, countByType: {}, complete: true, resources: [{ databaseType: "ArcSqlServer", name: "arcsql01", resourceGroup: "rg-x", location: "westus3", status: "Connected", migrationAssessment: { enabled: true, uploadedAt: null, dataStatus: "Unavailable", targets: { azureSqlDatabase: "Unknown" }, readyTargets: [] } }] });
         expect(none[0]).toMatchObject({ hasResults: false, ready: [], uploadedAt: null });
     });
 });

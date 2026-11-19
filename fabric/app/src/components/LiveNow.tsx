@@ -6,20 +6,22 @@ import { ArrowClockwise16Regular, Code16Regular, Sparkle16Filled } from "@fluent
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
-import { useLiveEstate, type EstateAnswer, type EstateView, type HealthData, type UsageCounts } from "@/data/live-estate";
+import { liveDataOf, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
 import { formatNumber, sentence } from "@/lib/format";
 import { inventoryMix, isDown, liveSecurityRows, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
 import { ProvenanceBadge } from "./ProvenanceBadge";
 
-function usage(u: UsageCounts | null | undefined): number {
-    return u ? u.cpu + u.memory + u.storage : 0;
+type HighUsage = UsageSummary["highUsage"];
+
+function usage(u: HighUsage | null | undefined): number {
+    return u ? (u.cpu ?? 0) + (u.memory ?? 0) + (u.storage ?? 0) : 0;
 }
 
 /** "SQL: CPU 1", naming only the nonzero counts; null when there are none. */
-function usageText(name: string, u: UsageCounts | null | undefined): string | null {
+function usageText(name: string, u: HighUsage | null | undefined): string | null {
     if (!u) return null;
-    const parts = ([["CPU", u.cpu], ["memory", u.memory], ["storage", u.storage]] as const).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`);
+    const parts = ([["CPU", u.cpu ?? 0], ["memory", u.memory ?? 0], ["storage", u.storage ?? 0]] as const).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`);
     return parts.length > 0 ? `${name}: ${parts.join(", ")}` : null;
 }
 
@@ -43,12 +45,14 @@ export function LiveNow() {
     }
 
     // One row per resource: Database Hub lists a SQL Server on an Azure VM twice (uniqueInventory).
-    const inv = inventory.answer ? uniqueInventory(inventory.answer.data) : undefined;
-    const h: HealthData | undefined = health.answer?.data;
+    const invData = liveDataOf(inventory.answer);
+    const inv = invData ? uniqueInventory(invData) : undefined;
+    const h = liveDataOf(health.answer) ?? undefined;
     const down = (inv?.resources ?? []).filter((r) => isDown(r.status));
-    const warnings = security.answer || inventory.answer ? liveSecurityRows(security.answer?.data, inv).filter((r) => r.attention === "Needs attention") : null;
+    const warnings = security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), inv).filter((r) => r.attention === "Needs attention") : null;
     const high = h ? usage(h.microsoftSql?.highUsage) + usage(h.postgreSql?.highUsage) : null;
-    const cosmos = h?.cosmosDb && h.cosmosDb.totalAccounts > 0 ? h.cosmosDb : null;
+    // Database Hub may leave out the account count while it still reports RU; either one means T5 is there.
+    const cosmos = h?.cosmosDb && ((h.cosmosDb.totalAccounts ?? 0) > 0 || h.cosmosDb.maximumNormalizedRu !== null) ? h.cosmosDb : null;
     const at = answers.map((a) => a.at).sort()[0];
     const routes = answers.flatMap((a) => a.source);
     const failed = answers.flatMap((a) => a.errors);
