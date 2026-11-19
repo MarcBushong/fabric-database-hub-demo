@@ -1,8 +1,7 @@
 // The live estate: Database Hub's current view of the demo's own resources, read by the app's estate function
 // (rayfin/functions, as the app item's owner, scoped to the demo's resource group). The dock's estate_overview
-// tool and any page use the same source through this module: readEstate(view) or useLiveEstate(view).
-
-import { useCallback, useEffect, useState } from "react";
+// tool calls readEstate(view); the pages read it through src/data/live-estate.ts (useLiveEstate), which loads this
+// module, so both share one call and its 60-second cache.
 
 import { getRayfinClient } from "@/lib/rayfin-client";
 import type { EstateAnswer, EstateView } from "../../rayfin/functions/src/estate-core";
@@ -55,33 +54,4 @@ export function readEstate<V extends EstateView>(view: V, options: { force?: boo
     cache.set(view, { at: Date.now(), value });
     value.catch(() => cache.delete(view));
     return value;
-}
-
-export interface LiveEstateState<V extends EstateView = EstateView> {
-    data: EstateAnswer<V> | undefined;
-    error: Error | undefined;
-    loading: boolean;
-    refetch: () => void;
-}
-
-/** The live estate for a page: the same source and cache as the dock's estate_overview tool. */
-export function useLiveEstate<V extends EstateView>(view: V, enabled = true): LiveEstateState<V> {
-    const [n, setN] = useState(0);
-    const key = `${view}:${n}`;
-    const [settled, setSettled] = useState<{ key: string; data?: EstateAnswer<V>; error?: Error } | null>(null);
-    useEffect(() => {
-        if (!enabled) return;
-        let cancelled = false;
-        readEstate(view, { force: n > 0 }).then(
-            (data) => !cancelled && setSettled({ key: `${view}:${n}`, data }),
-            (error: unknown) => !cancelled && setSettled({ key: `${view}:${n}`, error: error instanceof Error ? error : new Error(String(error)) }),
-        );
-        return () => {
-            cancelled = true;
-        };
-    }, [view, enabled, n]);
-    const refetch = useCallback(() => setN((v) => v + 1), []);
-    const current = settled?.key === key ? settled : null;
-    // While a refresh runs, keep showing what the page already had.
-    return { data: current?.data ?? settled?.data, error: current?.error, loading: enabled && !current, refetch };
 }
