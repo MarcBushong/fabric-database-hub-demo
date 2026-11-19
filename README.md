@@ -15,6 +15,8 @@ A low-cost, repeatable customer demo of **Microsoft Fabric Database Hub**, gener
 5. **Stop now, if you need to:** `./scripts/stop-demo.ps1`. The nightly safety stop at 19:00 catches whatever you forget.
 6. **Later:** update with `./scripts/deploy.ps1` again ([upgrading](#upgrading-an-existing-demo)); delete everything with `./scripts/destroy.ps1` ([delete everything](#delete-everything)).
 
+**Already have a demo in this subscription?** A fresh clone's first `./scripts/deploy.ps1` finds the one that's yours and updates it. For a second, separate environment beside it, run `./scripts/init.ps1 -Prefix <prefix> -WorkspaceName "<a new workspace name>" -CreateAdminGroup` first, then `./scripts/deploy.ps1`: each environment needs its own prefix and its own Fabric workspace.
+
 ```powershell
 git clone https://github.com/MarcBushong/fabric-database-hub-demo.git   # or "Use this template", or a codespace
 cd fabric-database-hub-demo
@@ -24,7 +26,7 @@ az login                 # you sign in; in a codespace or a container: az login 
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/MarcBushong/fabric-database-hub-demo?quickstart=1)
 
-**What it costs:** about $3 an hour while it runs, about $6 for a Run all session, and about $43 a month while it's stopped, at list prices; the Fabric capacity, licenses, and each viewer's GitHub Copilot plan aren't included ([what it costs](#what-it-costs)).
+**What it costs:** about $3 an hour while it runs, about $6 for a Run all session, and about $43 a month while it's stopped, at list prices, before your subscription's Defender for Cloud plans; the Fabric capacity, licenses, and each viewer's GitHub Copilot plan aren't included ([what it costs](#what-it-costs)).
 
 ### What you need
 
@@ -51,21 +53,21 @@ On its first run, `deploy.ps1` writes `config/demo.config.json` from your sign-i
 
 ## What it costs
 
-`./scripts/estimate-cost.ps1` prices the demo from Azure's list prices at run time, with no sign-in; signed in, it also reads your Defender for Cloud plans, T3's free offer, T5's free tier, and whether the nightly safety stop is in place. Preflight checks the same estimate. Dated example: list prices in USD for West US 3 on 2026-11-19, the example configuration (`lowest-cost`, private networking), without Defender for Cloud, before any free offer or free tier ([cost management](docs/cost-management.md#at-a-glance) itemizes it):
+`./scripts/estimate-cost.ps1` prices the demo from Azure's list prices at run time, with no sign-in; signed in, it also adds your subscription's own Defender for Cloud plans, as preflight does, and reads T3's free offer, T5's free tier, and whether the nightly safety stop is in place. Dated example: list prices in USD for West US 3 on 2026-11-19, the example configuration (`lowest-cost`, private networking), before any free offer or free tier; the second column has the six Defender plans an internal subscription enforces (Servers P2, SQL servers on machines, Azure SQL, open-source relational databases, CSPM, and Azure Cosmos DB). [Cost management](docs/cost-management.md#at-a-glance) itemizes it.
 
-| What | About |
-|---|---|
-| Everything running | $3.11 an hour |
-| A Run all session (90 minutes, about 2 billed hours) | $6.41 |
-| A 5-hour session from a PC | $15.73 |
-| A month with everything stopped | $42.69 |
-| A light-use month (10 running hours) | $73.95 |
+| What | Without Defender for Cloud | With an internal subscription's Defender plans |
+|---|---|---|
+| Everything running | $3.11 an hour | $3.25 an hour |
+| A Run all session (90 minutes, about 2 billed hours; `estimate-cost.ps1 -DemoHours 2`) | $6.41 | $6.70 |
+| A 5-hour session from a PC | $15.73 | $16.46 |
+| A month with everything stopped | $42.69 | $82.63 |
+| A light-use month (10 running hours) | $73.95 | $115.36 |
 
 - **Between sessions:** both VMs' disks, T3's and T4's storage, T3's private endpoint in private mode, T5's private endpoint, the private DNS zones, and any Defender for Cloud plans your tenant turns on. The VMs and T4 bill no compute, T4's read replica is deleted, T3 pauses by itself, and T5's container, which holds its 400 RU/s, is deleted: an Azure Cosmos DB account has no stop. A golden snapshot, when you keep one, bills every month, after `destroy.ps1` too.
 - **During a session:** the VMs' compute and their pay-as-you-go SQL Server licenses (T1 by the hour, T2 per core-hour through Azure Arc), T3's compute while it's active, T4 and its read replica, and T5's container. Ask's chat relay bills only while someone uses the chat, and nothing while idle. Bastion, only when you start one.
 - **Close to nothing:** the two Automation accounts (their jobs fit in the 500 free job minutes a month), the Key Vault's operations, the identities, the role definitions, and the budget.
-- **The worst case preflight checks** adds T4's 7-day automatic restart: about a day per restart with the nightly safety stop in place, the rest of the month without it. In an internal subscription, with the Defender for Cloud plans it enforces, that's $149.54 a month for an Owner's new deployment and $398.42 for a Contributor's, until an Owner runs `./scripts/grant-safety-stop.ps1`, which sets up the safety stop and makes T5's container exist only during a session.
-- **Not included:** the Fabric capacity, which bills while it runs (you or its administrator pause it); Fabric and Power BI licenses; each viewer's GitHub Copilot plan; taxes and negotiated prices. **Your tenant's Defender for Cloud plans** are outside the demo's control: in an internal subscription they add about $39.94 a month whether the demo runs or not.
+- **The worst case preflight checks** adds T4's 7-day automatic restart to the light-use month: about a day per restart with the nightly safety stop in place, the rest of the month without it. With an internal subscription's Defender plans, that's $149.54 a month for an Owner's new deployment, which sets the safety stop up, and $398.42 for a Contributor's, until an Owner runs `./scripts/grant-safety-stop.ps1`, which sets up the safety stop and makes T5's container exist only during a session.
+- **Not included:** the Fabric capacity, which bills while it runs (you or its administrator pause it); Fabric and Power BI licenses; each viewer's GitHub Copilot plan; taxes and negotiated prices. **Your tenant's Defender for Cloud plans** are outside the demo's control: in an internal subscription they add $39.94 a month whether the demo runs or not, and $0.15 a running hour.
 - **The ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling that preflight fails above; a configuration keeps its own value). The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
 
 ## What's deployed, and by what
@@ -170,8 +172,8 @@ Nothing here needs you, and nothing here starts anything: only Azure starts a st
 ## Upgrading an existing demo
 
 - **Nothing changes until you run `./scripts/deploy.ps1`.** The deployed environment never reads GitHub, and a newer copy of the scripts works with it: `status.ps1`, `start-demo.ps1`, and `stop-demo.ps1` say what isn't deployed yet, with `./scripts/deploy.ps1` as the fix, never as a **Fail**.
-- **One command:** `./scripts/deploy.ps1`. It first updates a clean checkout of `main` from GitHub, then runs that code; `-NoSelfUpdate` runs the code you have. Your configuration file needs no edit, and the run continues where it stopped if it's interrupted.
-- **Without your configuration file** (a fresh clone, another PC; [#60](https://github.com/MarcBushong/fabric-database-hub-demo/issues/60)): the same command's first run writes it from what's deployed when the environment is yours (its owner tag or budget address is your sign-in, or you own the group that administers its T3 and T4), so the update changes nothing you didn't ask for; `INIT.EXISTING` lists the settings that kept their defaults. When it isn't yours, or that can't be told, the run never updates it: it deploys a new environment with the next free prefix (`dbhub2`, ...). For an environment with another prefix, run `./scripts/init.ps1 -Prefix <prefix>` first ([deployment](docs/deployment.md#first-run-initps1)).
+- **One command:** `./scripts/deploy.ps1`. A plain run updates the demo it finds: the environment your configuration file names, or, without one, the one in this subscription that's yours (below). It first updates a clean checkout of `main` from GitHub, then runs that code; `-NoSelfUpdate` runs the code you have. Your configuration file needs no edit, and the run continues where it stopped if it's interrupted.
+- **Without your configuration file** (a fresh clone, another PC; [#60](https://github.com/MarcBushong/fabric-database-hub-demo/issues/60)): the same command's first run writes it from what's deployed when the environment is yours (its owner tag or budget address is your sign-in, or you own the group that administers its T3 and T4), so the update changes nothing you didn't ask for; `INIT.EXISTING` lists the settings that kept their defaults. When it isn't yours, or that can't be told, the run never updates it: it deploys a new environment with the next free prefix (`dbhub2`, ...). To update an environment with another prefix, run `./scripts/init.ps1 -Prefix <prefix>` first; to add a second environment beside yours instead, see the [quick start](#quick-start) ([deployment](docs/deployment.md#first-run-initps1)).
 - **What that run adds and changes,** with nothing to do by hand: T4's read replica for each session; the session control behind Run all (a control you set up before is adopted as it is); **T5**, the Azure Cosmos DB account, with T1's access to it and its place in Run all, and its container only during a session; the redesigned Insights app with Ask, its Copilot chat (registering the `Microsoft.App` resource provider when the subscription hasn't); T3 at 2 vCores, scaled online (under 30 seconds of interruption; a free-offer database keeps its offer); T2's migration assessment, turned on with its first run; a configuration whose session ceiling is exactly 15 gets the new 20. It republishes the runbooks, the notebooks, the history model, the Insights app, and the workload runner, and keeps the lakehouse's history and T4's data. A T4 that `t4SkuName` doesn't size moves to the default, `Standard_D4ds_v5`, once, with a restart, when it's on another size. It brings back a T2 host whose VM agent no longer starts, rebuilding only that VM, once, when nothing else works (about 70 minutes more), and retries a step into T2's guest that PowerShell Direct broke, restarting the guest once when needed ([#65](https://github.com/MarcBushong/fabric-database-hub-demo/issues/65); `DEPLOY.T2.GUESTRETRY`, `DEPLOY.T2.GUESTRESTART`).
 - **What you may do once afterward:** when you aren't an Owner, an Owner runs `./scripts/grant-safety-stop.ps1`, which **DONE** prints first: it grants the nightly safety stop's and the session control's roles, and until then T5's container stays between sessions; optionally, select T3 for Database Agents (`HUB.AGENT.T3`, under **Please confirm**; [demo it yourself](#demo-it-yourself)); and each viewer signs in to GitHub once per browser for the chat.
 - **`destroy.ps1` deletes more than it used to** (2026-11-17): also the session control, the Fabric workspaces with the history in the lakehouse, and the administrators' group that `init.ps1` created, each only when it's this environment's ([delete everything](#delete-everything)).
