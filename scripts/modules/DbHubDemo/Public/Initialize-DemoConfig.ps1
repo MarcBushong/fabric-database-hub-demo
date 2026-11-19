@@ -58,7 +58,7 @@ function Initialize-DemoConfig {
        -ManageCapacity.
 
     Results use the ADR 0012 statuses. Messages name the subscription, workspace, capacity, and group; their IDs are
-    only in the evidence and the file. Every command a result's fix or a next step tells you to run names this run's
+    only in the evidence and the file. Every command a result, its fix, or a next step tells you to run names this run's
     -Prefix when it isn't the default, and its -ConfigPath when it isn't config/demo.config.json (Resolve-DemoInitCommandText,
     2026-11-19), so it never writes the default prefix's configuration for another environment. Returns Results, Config,
     Path, Written, BackupPath, NextSteps, and Existing (Kind:
@@ -243,9 +243,11 @@ function Initialize-DemoConfig {
     $commandDefaultPrefix = 'dbhub'
     $finish = {
         param([bool] $Written, [string] $BackupPath = '', $Config = $null)
-        # Every command a fix or a next step tells you to run names this run's -Prefix and -ConfigPath (2026-11-19), so it
-        # never writes the default prefix's configuration, or config/demo.config.json, for another environment.
+        # Every command a result, its fix, or a next step tells you to run names this run's -Prefix and -ConfigPath
+        # (2026-11-19), so it never writes the default prefix's configuration, or config/demo.config.json, for another
+        # environment, nor runs another script on it.
         foreach ($item in $results) {
+            $item.message = Protect-DemoText -Text (Resolve-DemoInitCommandText -Text ([string]$item.message) -Prefix $commandPrefix -DefaultPrefix $commandDefaultPrefix -ConfigPath $fullPath)
             $item.remediation = Protect-DemoText -Text (Resolve-DemoInitCommandText -Text ([string]$item.remediation) -Prefix $commandPrefix -DefaultPrefix $commandDefaultPrefix -ConfigPath $fullPath)
         }
         [pscustomobject]@{

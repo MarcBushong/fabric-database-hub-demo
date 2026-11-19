@@ -692,7 +692,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else, and none of the demo''s notebooks, keeps a first run''s rule'
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 updates them\)\.'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
         (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
 
         $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
@@ -1028,7 +1028,7 @@ Describe 'The commands init.ps1 tells you to run name the run''s -Prefix and -Co
         (Get-Content -LiteralPath $script:path -Raw).Trim() | Should -Be '{ "prefix": "dbhub" }'
     }
 
-    It 'scans every fix and next step of runs for another environment: each init.ps1 command names the run''s -ConfigPath and a -Prefix' {
+    It 'scans every result, fix, and next step of runs for another environment: each init.ps1 command names the run''s -ConfigPath and a -Prefix' {
         $other = '12121212-1212-1212-1212-121212121212'
         $runs = @(
             @{ Name = 'no group, no address'; Parameters = @{}; Setup = { $script:init.Profile.Subscriptions[0].Account = 'colleague'; Mock -ModuleName DbHubDemo -CommandName Get-DemoSignedInUser -MockWith { $null } } }
@@ -1055,7 +1055,7 @@ Describe 'The commands init.ps1 tells you to run name the run''s -Prefix and -Co
             . $run.Setup
             $parameters = $run.Parameters
             $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -NonInteractive -BackupDirectory $script:backup -Confirm:$false @parameters
-            $texts = @(@($init.Results | ForEach-Object { [string]$_.remediation }) + @($init.NextSteps) | Where-Object { $_ })
+            $texts = @(@($init.Results | ForEach-Object { [string]$_.message; [string]$_.remediation }) + @($init.NextSteps) | Where-Object { $_ })
             $commands[$run.Name] = 0
             foreach ($text in $texts) {
                 $text | Should -Not -Match '(?<![/\w])init\.ps1 -' -Because ('{0}: "{1}"' -f $run.Name, $text)
