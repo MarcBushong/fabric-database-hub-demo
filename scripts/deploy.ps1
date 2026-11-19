@@ -5,7 +5,7 @@ Deploys and configures the whole demo with one command after 'az login', and con
 again (plan section 9.2, ADR 0011, Phase 28).
 
 .DESCRIPTION
-One command, one guided stop (Phase 28):
+One command, with no stop for a person (Phase 28; the PaygWizard guided stop is retired since 2026-11-09):
 - No configuration yet: it writes one first, as init.ps1 does (Initialize-DemoFirstRun: the same prompts, and the P6
   admin group created when it's missing and you may create it), then deploys. init.ps1 still works on its own. Since
   2026-11-09 neither asks how T2 gets SQL Server: a first deployment gets JumpstartImage, which needs nobody. Since
@@ -19,14 +19,11 @@ One command, one guided stop (Phase 28):
   (DEPLOY.T4.MISSING), or the run says why not (DEPLOY.T4.OFF).
 - It keeps this PC awake while it runs (Windows), writes the progress model out/deploy-progress.json and the live status
   page out/deploy-status.html, opens the page (in GitHub Codespaces it says how to preview it), and prints what to
-  expect: the timeline, and in PaygWizard mode when a person is needed and for how long. ./scripts/status.ps1 -Watch
-  shows the same view in a second terminal.
-- Without a golden snapshot it waits for T2's guest build in every install mode (up to -T2WaitMinutes, 180 by
-  default), and in PaygWizard mode it stops once for a person: Bastion opens, the browser opens archost01's page, and
-  the guest signs itself in and opens a pre-filled SQL Server setup, where you choose pay-as-you-go and Standard and
-  sign in to Azure (about 10 minutes, about 60 to 90 minutes after the start). It then finishes T2 by itself:
-  onboarding, PAYG, monitoring, and telemetry. -NoWaitForT2 opts out; GitHub Actions and other CI systems don't wait
-  unless -WaitForT2.
+  expect: the timeline. ./scripts/status.ps1 -Watch shows the same view in a second terminal.
+- Without a golden snapshot it waits for T2's guest build (up to -T2WaitMinutes, 180 by default), then finishes T2 by
+  itself: Arc onboarding, PAYG, monitoring, and telemetry. No T2 step needs a person (a configuration's PaygWizard runs
+  as JumpstartImage since 2026-11-09). -NoWaitForT2 opts out; GitHub Actions and other CI systems don't wait unless
+  -WaitForT2.
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.

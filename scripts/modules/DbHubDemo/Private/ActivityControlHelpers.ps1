@@ -390,22 +390,22 @@ function Resolve-DemoActivityControlVaultMode {
     $result = { param([string] $Mode, [string] $Status, [string] $Message, [string] $Remediation) $evidence['mode'] = $Mode; [pscustomobject]@{ Mode = $Mode; Status = $Status; Message = $Message; Remediation = $Remediation; Evidence = $evidence; DocUrl = $docUrl } }
     switch ($ConfiguredMode) {
         'private' {
-            return (& $result 'private' 'Pass' 'vaultNetworkMode is private: the vault has no public access, and the notebook reads it through a managed private endpoint from the DBHub Control workspace.' '')
+            return (& $result 'private' 'Pass' 'vaultNetworkMode is private: the vault has no public access, and the notebook reads it through a managed private endpoint from the control''s own workspace.' '')
         }
         'public' {
             if ($forcing.Count -gt 0) {
                 $tagNote = if ($tags.Count) { (' The policy skips resources tagged {0}; this script never adds that tag, because opting out of the control is a governance decision.' -f ($tags -join ' or ')) } else { '' }
-                return (& $result 'public' 'Fail' ('vaultNetworkMode is public, but Azure Policy makes new vaults private: {0}. The vault would end up without public access, and the notebook in the shared workspace couldn''t read it, so nothing was created.{1}' -f ($names -join '; '), $tagNote) 'Set control.vaultNetworkMode to auto or private (the control workspace path), or ask your governance team; then run setup-activity-control.ps1 again.')
+                return (& $result 'public' 'Fail' ('vaultNetworkMode is public, but Azure Policy makes new vaults private: {0}. The vault would end up without public access, and the notebook in the shared workspace couldn''t read it, so nothing was created.{1}' -f ($names -join '; '), $tagNote) 'Set control.vaultNetworkMode to auto or private (the control workspace path), or ask your governance team; then run ./scripts/deploy.ps1 again.')
             }
             $unknownNote = if ($PolicyUnknown) { ' The policy assignments couldn''t all be read, so a policy may still change the vault.' } else { '' }
-            return (& $result 'public' $(if ($PolicyUnknown) { 'Warning' } else { 'Pass' }) ('vaultNetworkMode is public: the vault keeps public network access, and only users with Key Vault Secrets User on its one secret can read it.{0}' -f $unknownNote) '')
+            return (& $result 'public' $(if ($PolicyUnknown) { 'Warning' } else { 'Pass' }) ('vaultNetworkMode is public: the vault keeps public network access, and only users with Key Vault Secrets User on its three secrets can read them.{0}' -f $unknownNote) '')
         }
         default {
             if ($forcing.Count -gt 0) {
-                return (& $result 'private' 'Pass' ('auto: Azure Policy makes new vaults private ({0}), so the vault is private and the notebook runs in the DBHub Control workspace with a managed private endpoint to it. Its Spark sessions start in 3 to 5 minutes, because a managed virtual network turns off starter pools.' -f ($names -join '; ')) '')
+                return (& $result 'private' 'Pass' ('auto: Azure Policy makes new vaults private ({0}), so the vault is private and the notebook runs in the control''s own workspace with a managed private endpoint to it. Its Spark sessions start in 3 to 5 minutes, because a managed virtual network turns off starter pools.' -f ($names -join '; ')) '')
             }
             if ($PolicyUnknown) {
-                return (& $result 'private' 'Warning' 'auto: the policy assignments couldn''t all be read, so the vault is private (that path works whatever the policy says) and the notebook runs in the DBHub Control workspace.' 'Run setup-activity-control.ps1 again with read access to the policy assignments (Reader) to get the faster public path where policy allows it.')
+                return (& $result 'private' 'Warning' 'auto: the policy assignments couldn''t all be read, so the vault is private (that path works whatever the policy says) and the notebook runs in the control''s own workspace.' 'Run ./scripts/deploy.ps1 again with read access to the policy assignments (Reader) to get the faster public path where policy allows it.')
             }
             return (& $result 'public' 'Pass' 'auto: no policy makes new vaults private, so the vault keeps public network access (Azure RBAC per user) and the notebook goes in a folder of the existing workspace, with its fast start.' '')
         }
@@ -1253,7 +1253,7 @@ function Initialize-DemoActivityControlGroup {
         $register = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('provider', 'register', '--namespace', 'Microsoft.Automation', '--wait') -AllowFailure -TimeoutSeconds 900
         $status = if ($register.ExitCode -eq 0) { 'Pass' } else { 'Fail' }
         $message = if ($register.ExitCode -eq 0) { 'The Microsoft.Automation resource provider was registered.' } else { 'The Microsoft.Automation resource provider couldn''t be registered: {0}' -f (Protect-DemoText -Text ([string]$register.StdErr)).Trim() }
-        $results.Add((New-DemoResult -CheckId 'CONTROL.PROVIDER' -Area 'workload' -Target 'subscription' -Status $status -Message $message -Remediation $(if ($status -eq 'Fail') { 'Register it (az provider register --namespace Microsoft.Automation), then run setup-activity-control.ps1 again.' } else { '' }) -DocUrl $providerDoc))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.PROVIDER' -Area 'workload' -Target 'subscription' -Status $status -Message $message -Remediation $(if ($status -eq 'Fail') { 'Register it (az provider register --namespace Microsoft.Automation), then run ./scripts/deploy.ps1 again.' } else { '' }) -DocUrl $providerDoc))
     }
 
     $exists = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $Name.ResourceGroup) -AllowFailure
@@ -1322,7 +1322,7 @@ function Invoke-DemoActivityControlTemplate {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false -WhatIf:$false | Out-Null
     }
     if ($run.ExitCode -ne 0) {
-        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: {0}' -f (Protect-DemoText -Text ([string]$run.StdErr)).Trim()) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run setup-activity-control.ps1 again.' -DocUrl $doc); Outputs = $null }
+        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: {0}' -f (Protect-DemoText -Text ([string]$run.StdErr)).Trim()) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $null }
     }
     $raw = [string]$run.StdOut | ConvertFrom-Json -AsHashtable -Depth 16
     $outputs = [ordered]@{}
@@ -1333,7 +1333,7 @@ function Invoke-DemoActivityControlTemplate {
     $actual = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $vault.Value -Name 'properties') -Name 'publicNetworkAccess')
     $evidence['vaultPublicNetworkAccess'] = $actual
     if ($Mode -eq 'public' -and $actual -and $actual -ne 'Enabled') {
-        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('{0} was deployed with public network access, but it''s {1} now: a policy changed it, so the notebook in the shared workspace can''t read it.' -f $Name.KeyVault, $actual) -Evidence $evidence -Remediation 'Set control.vaultNetworkMode to auto or private, then run setup-activity-control.ps1 again; it never adds a policy''s exclusion tag.' -DocUrl $doc); Outputs = $outputs }
+        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('{0} was deployed with public network access, but it''s {1} now: a policy changed it, so the notebook in the shared workspace can''t read it.' -f $Name.KeyVault, $actual) -Evidence $evidence -Remediation 'Set control.vaultNetworkMode to auto or private, then run ./scripts/deploy.ps1 again; it never adds a policy''s exclusion tag.' -DocUrl $doc); Outputs = $outputs }
     }
     return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0}, {1}, and {2} ({3} network access) are deployed in {4}.' -f $Name.Identity, $Name.AutomationAccount, $Name.KeyVault, $(if ($actual) { $actual } else { $Mode }), $Name.ResourceGroup) -Evidence $evidence -DocUrl $doc); Outputs = $outputs }
 }
@@ -2128,7 +2128,7 @@ function Set-DemoActivityControlFabric {
     $sharedId = [string]$resolution.WorkspaceId
     if ($sharedId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
         $why = @($resolution.Results | ForEach-Object { [string]$_.message }) -join ' '
-        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The demo''s Fabric workspace isn''t resolved, so the control notebook wasn''t imported. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 or ./scripts/deploy.ps1 first (they create the workspace when fabric.createIfMissing is true), then run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces'
+        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The demo''s Fabric workspace isn''t resolved, so the control notebook wasn''t imported. {0}' -f $why).Trim() @{} 'Run ./scripts/deploy.ps1 again: it creates the workspace when fabric.createIfMissing is true, then puts the control notebook in Fabric.' 'https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces'
         return $results.ToArray()
     }
     $lakehouseId = [string]$resolution.LakehouseId
@@ -2142,7 +2142,7 @@ function Set-DemoActivityControlFabric {
     $workspaceCheck = @(Test-DemoFabricWorkspace -Config $Config -Token $Token)
     $capacity = @($workspaceCheck | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
     if ($null -eq $capacity -or $capacity.status -notin 'Pass', 'Warning') {
-        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The existing workspace''s capacity isn''t usable now ({0}), so nothing was created in Fabric; this script never resumes, pauses, or scales a capacity.' -f $(if ($null -ne $capacity) { $capacity.message } else { 'unknown' })) ([ordered]@{ demoWorkspaceId = $sharedId }) 'When the capacity''s administrator has it Active, run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The existing workspace''s capacity isn''t usable now ({0}), so nothing was created in Fabric; this script never resumes, pauses, or scales a capacity.' -f $(if ($null -ne $capacity) { $capacity.message } else { 'unknown' })) ([ordered]@{ demoWorkspaceId = $sharedId }) 'When the capacity''s administrator has it Active, run ./scripts/deploy.ps1 again.' 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
         return $results.ToArray()
     }
 
@@ -2182,7 +2182,7 @@ function Set-DemoActivityControlFabric {
             & $add 'CONTROL.FABRIC.WORKSPACE' 'Pass' ('The workspace "{0}" exists.' -f $Name.FabricWorkspace) ([ordered]@{ workspace = $Name.FabricWorkspace }) '' $workspaceDoc
         }
         elseif (-not $capacityId -or $workspaces.StatusCode -ne 200) {
-            & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be prepared: the existing workspace''s capacity or the workspace list couldn''t be read ({1}).' -f $Name.FabricWorkspace, $workspaces.Error) @{} 'Check your Fabric access, then run setup-activity-control.ps1 again.' $workspaceDoc
+            & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be prepared: the existing workspace''s capacity or the workspace list couldn''t be read ({1}).' -f $Name.FabricWorkspace, $workspaces.Error) @{} 'Check your Fabric access, then run ./scripts/deploy.ps1 again.' $workspaceDoc
             return $results.ToArray()
         }
         elseif (-not $PSCmdlet.ShouldProcess($Name.FabricWorkspace, 'Create the control workspace on the existing workspace''s capacity')) {
@@ -2191,7 +2191,7 @@ function Set-DemoActivityControlFabric {
         else {
             $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body ([ordered]@{ displayName = $Name.FabricWorkspace; description = 'The Database Hub demo''s session control (ADR 0026): NB_DatabaseHub_Control, whose Run all runs a whole demo session, and its managed private endpoint to the control vault.'; capacityId = $capacityId }) -Token $Token -NotIdempotent
             if ($created.StatusCode -notin 200, 201) {
-                & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be created: {1}' -f $Name.FabricWorkspace, (Get-DemoFabricErrorText -Response $created)) @{} 'Creating a workspace needs the Fabric tenant setting that allows it and a role on the capacity; then run setup-activity-control.ps1 again.' $workspaceDoc
+                & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be created: {1}' -f $Name.FabricWorkspace, (Get-DemoFabricErrorText -Response $created)) @{} 'Creating a workspace needs the Fabric tenant setting that allows it and a role on the capacity; then run ./scripts/deploy.ps1 again.' $workspaceDoc
                 return $results.ToArray()
             }
             $targetWorkspace = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'id')
@@ -2202,7 +2202,7 @@ function Set-DemoActivityControlFabric {
         $policy = Invoke-DemoFabricRequest -Method Get -Uri ('{0}/workspaces/{1}/networking/communicationPolicy' -f $base, $targetWorkspace) -Token $Token
         $outbound = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $policy.Body -Name 'outbound') -Name 'publicAccessRules') -Name 'defaultAction')
         if ($policy.StatusCode -eq 200 -and $outbound -eq 'Deny') {
-            & $add 'CONTROL.FABRIC.OUTBOUND' 'Fail' ('Outbound access protection is on in "{0}", so its notebook can''t reach the webhook or the telemetry endpoint.' -f $Name.FabricWorkspace) @{} 'Turn outbound access protection off in the workspace''s network settings (it stays off for the control workspace), then run setup-activity-control.ps1 again.' $policyDoc
+            & $add 'CONTROL.FABRIC.OUTBOUND' 'Fail' ('Outbound access protection is on in "{0}", so its notebook can''t reach the webhook or the telemetry endpoint.' -f $Name.FabricWorkspace) @{} 'Turn outbound access protection off in the workspace''s network settings (it stays off for the control workspace), then run ./scripts/deploy.ps1 again.' $policyDoc
         }
         elseif ($policy.StatusCode -eq 200) {
             & $add 'CONTROL.FABRIC.OUTBOUND' 'Pass' ('Outbound access protection is off in "{0}", so its notebook reaches the webhook and the telemetry endpoint.' -f $Name.FabricWorkspace) @{} '' $policyDoc
@@ -2227,7 +2227,7 @@ function Set-DemoActivityControlFabric {
         if (($null -eq $endpoint -or $endpointState -eq 'Failed') -and $PSCmdlet.ShouldProcess($Name.FabricWorkspace, $(if ($null -eq $endpoint) { 'Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault } else { 'Delete the failed managed private endpoint {0} and create it again' -f $Name.PrivateEndpoint }))) {
             $made = New-DemoActivityControlEndpoint -EndpointsUri $endpointsUri -Name $Name -RequestMessage $request -Token $Token -Failed $(if ($null -ne $endpoint) { $endpoint } else { $null }) -Confirm:$false
             if (-not $made.Ok -and $null -eq $endpoint) {
-                & $add 'CONTROL.FABRIC.ENDPOINT' 'Fail' ('The managed private endpoint couldn''t be created: {0}' -f $made.Error) @{} 'Creating it needs the Admin role in the control workspace; then run setup-activity-control.ps1 again.' $endpointDoc
+                & $add 'CONTROL.FABRIC.ENDPOINT' 'Fail' ('The managed private endpoint couldn''t be created: {0}' -f $made.Error) @{} 'Creating it needs the Admin role in the control workspace; then run ./scripts/deploy.ps1 again.' $endpointDoc
                 return $results.ToArray()
             }
             $replaced = [bool]$made.Replaced
@@ -2278,7 +2278,7 @@ function Set-DemoActivityControlFabric {
         }
         elseif ($endpointState -eq 'Failed' -or $replaceError) {
             $what = if ($replaceError) { 'and replacing it failed: {0}' -f $replaceError } elseif ($replaced) { 'again after this run deleted it and created it again' } else { 'and nothing replaced it' }
-            & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('Fabric failed to provision the managed private endpoint to {0} ({1}), so the vault has no connection to approve and the notebook can''t read the session''s secrets.' -f $Name.KeyVault, $what) $endpointEvidence ('Run setup-activity-control.ps1 again: it deletes the failed endpoint and creates it again. If it fails every time, delete {0} in the workspace "{1}" (Workspace settings > Network security > Managed private endpoints), then run setup-activity-control.ps1 again.' -f $Name.PrivateEndpoint, $Name.FabricWorkspace) $endpointDoc
+            & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('Fabric failed to provision the managed private endpoint to {0} ({1}), so the vault has no connection to approve and the notebook can''t read the session''s secrets.' -f $Name.KeyVault, $what) $endpointEvidence ('Run ./scripts/deploy.ps1 again: it deletes the failed endpoint and creates it again. If it fails every time, delete {0} in the workspace "{1}" (Workspace settings > Network security > Managed private endpoints), then run ./scripts/deploy.ps1 again.' -f $Name.PrivateEndpoint, $Name.FabricWorkspace) $endpointDoc
         }
         else {
             & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('The managed private endpoint to {0} isn''t approved yet (Fabric creates it in a few minutes).' -f $Name.KeyVault) $endpointEvidence ('Run setup-activity-control.ps1 again in a few minutes, or approve the pending connection in the vault''s Networking > Private endpoint connections in the Azure portal.') $endpointDoc

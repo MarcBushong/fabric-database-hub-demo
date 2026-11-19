@@ -1,16 +1,18 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-Starts the demo for a session: the cost guardrail, the VMs, T3 (resumed, or recreated when it was removed),
-the activity profile, an optional warm-up, and on-demand Bastion with a one-time host password (plan
-sections 9.4, 9.6).
+Starts the demo for a session: the cost guardrail, the session's auto-stop, the VMs, T3 (resumed, or recreated when it
+was removed), T4 and its read replica, T5's container, the activity profile, an optional warm-up, and on-demand Bastion
+with a one-time host password (plan sections 9.4, 9.6).
 
 .DESCRIPTION
 - The cost guardrail runs first: the live estimate against sessionCeilingUsd and monthlyCeilingUsd, and this
   month's actual cost plus one session against monthlyCeilingUsd. A Fail stops the start before anything
   runs; -SkipCostCheck starts anyway.
-- Starts sqlvm01 and the T2 VM at once and waits until they run. The bootstraps continue on their own. A
-  golden snapshot's source host gets its air-gapped guest back (T2.GOLDEN.SOURCE).
+- Starts sqlvm01 and the T2 VM at once and waits until they run, and T4 (START.T4.START; -SkipT4 leaves it stopped).
+  The bootstraps continue on their own. A golden snapshot's source host gets its air-gapped guest back (T2.GOLDEN.SOURCE).
+- T5's container (ADR 0027) is created again with your own rights, about a minute (START.T5.CONTAINER); stop-demo.ps1 and
+  the session's auto-stop delete it, so its throughput bills only during sessions.
 - T3 persists between demos by default and is resumed (Invoke-DemoT3WarmUp). After stop-demo.ps1 -RemoveT3
   it's recreated under the same names and configured from T1, then the readiness gate checks Resource
   Graph, the extended property, and fresh telemetry, and reports a Warning with the measured lag otherwise;
@@ -27,7 +29,7 @@ sections 9.4, 9.6).
   autoShutdownTime. Without the session control's role (before an Owner runs ./scripts/grant-safety-stop.ps1), there's
   no auto-stop: a Warning says so, and the nightly stop is the limit.
 - Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
-  2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown. business-day is the steady mix plus bounded incidents
+  2026-11-03) on T1, T3, T4, T5, and T2 until the next auto-shutdown. business-day is the steady mix plus bounded incidents
   at fixed minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for
   the quieter demo. A profile with incidents is set as baseline first and switched once this start's own Run Commands
   are done, at the warm-up's start (START.INCIDENTS_*), so no incident slows them; with -Interactive
@@ -39,7 +41,7 @@ sections 9.4, 9.6).
 - -WarmUpMinutes: the activity keeps running in the background and the script returns once the profiles are
   set (ADR 0018); START.WARMUP says when to check the telemetry. -WaitForWarmUp waits that long and checks
   that telemetry arrives (the scheduled warm-up workflows use 30).
-- -Interactive deploys Azure Bastion Basic for the T2 setup-wizard step (about 8 minutes); stop-demo.ps1
+- -Interactive deploys Azure Bastion Basic for interactive access, such as T2's missing-index fix (about 8 minutes); stop-demo.ps1
   removes it, and the bastion-cleanup workflow does after bastionMaxHours.
 - -ResetAdminPassword (with -Interactive) sets a one-time password for the T2 host's administrator through a
   Run Command and copies it to your clipboard. It's never displayed, logged, or stored, and stop-demo.ps1

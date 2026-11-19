@@ -137,7 +137,7 @@ function Resolve-DemoFabricAppItem {
     }
     $missing = @(@(if (-not $dashboardId) { $settings['dashboardName'] }; if (-not $reportId) { $settings['reportName'] }) | Where-Object { $_ })
     if ($missing.Count -gt 0) {
-        return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Found {0}; not found: {1}, so the app''s Live links page explains how to add them.' -f $settings['semanticModelName'], ($missing -join ', ')) -Evidence $evidence -Remediation 'Run ./scripts/configure-fabric.ps1 -ImportDashboard and ./scripts/configure-powerbi.ps1, then run this script again.' -DocUrl $docUrl
+        return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Found {0}; not found: {1}, so the app''s Live views page explains how to add them.' -f $settings['semanticModelName'], ($missing -join ', ')) -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1: its Fabric track imports the dashboard and the history model, then the app.' -DocUrl $docUrl
     }
     return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('Found {0}, {1}, and {2}; the app links to them in a new tab.' -f $settings['semanticModelName'], $settings['dashboardName'], $settings['reportName']) -Evidence $evidence -DocUrl $docUrl
 }

@@ -1181,7 +1181,7 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
 
     It 'exits cleanly when the demo resource group <Name>' -ForEach @(
         @{ Name = 'doesn''t exist'; Code = 404; Match = 'doesn''t exist' }
-        @{ Name = 'can''t be read (A1 missing after a redeploy)'; Code = 403; Match = '-GrantRole' }
+        @{ Name = 'can''t be read (A1 missing after a redeploy)'; Code = 403; Match = 'an Owner runs \./scripts/grant-safety-stop\.ps1 \(A1\)' }
     ) {
         $script:group = $Code
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)

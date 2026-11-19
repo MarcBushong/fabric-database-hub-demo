@@ -151,7 +151,7 @@ function ConvertFrom-DbHubSetting {
 
     $settings = $Json | ConvertFrom-Json
     if ([int](Get-DbHubMember -InputObject $settings -Name 'schemaVersion') -ne 1) {
-        throw 'The runbook settings have an unknown schemaVersion; publish the runbooks again with setup-activity-control.ps1.'
+        throw 'The runbook settings have an unknown schemaVersion; run ./scripts/deploy.ps1, which publishes the runbooks again.'
     }
     if ([string](Get-DbHubMember -InputObject $settings -Name 'subscriptionId') -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
         throw 'The runbook settings have no valid subscriptionId.'
@@ -219,7 +219,7 @@ function Get-DbHubArmToken {
     $endpoint = $env:IDENTITY_ENDPOINT
     $header = $env:IDENTITY_HEADER
     if (-not $endpoint -or -not $header) {
-        throw 'The Automation sandbox has no managed identity endpoint (IDENTITY_ENDPOINT); run setup-activity-control.ps1 again so the account has id-<prefix>-automation.'
+        throw 'The Automation sandbox has no managed identity endpoint (IDENTITY_ENDPOINT); run ./scripts/deploy.ps1 again, which gives the account id-<prefix>-automation.'
     }
     $uri = '{0}?resource={1}&client_id={2}' -f $endpoint, [uri]::EscapeDataString('https://management.azure.com/'), $ClientId
     $headers = @{ 'X-IDENTITY-HEADER' = $header; 'Metadata' = 'True' }
@@ -6417,7 +6417,7 @@ function Invoke-DbHubControl {
     if ($group.GroupState -ne 'Present') {
         $reasons = @{
             Missing    = 'the demo resource group doesn''t exist'
-            NotGranted = 'the automation identity can''t read the demo resource group; after a redeploy, run setup-activity-control.ps1 -GrantRole (A1)'
+            NotGranted = 'the automation identity can''t read the demo resource group; after a redeploy, an Owner runs ./scripts/grant-safety-stop.ps1 (A1)'
             Unknown    = ('the demo resource group couldn''t be read: {0}' -f $group.Error)
         }
         $why = $reasons[$group.GroupState]

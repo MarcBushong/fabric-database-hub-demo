@@ -113,7 +113,7 @@ function Invoke-DemoActivityControlSetup {
         }
     }
     catch {
-        $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing changed. Sign in yourself (az login) and run setup-activity-control.ps1 again.'))
+        $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing changed. Sign in yourself (az login), then run ./scripts/deploy.ps1 again.'))
         return $results.ToArray()
     }
     $name = Get-DemoActivityControlName -Config $Config
@@ -126,7 +126,7 @@ function Invoke-DemoActivityControlSetup {
             return (Get-DemoFabricToken -SubscriptionId $name.SubscriptionId)
         }
         catch {
-            $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.TOKEN' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('No Fabric token: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Sign in with an account that can use the Fabric workspace, then run setup-activity-control.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/fabric/articles/get-started/fabric-api-quickstart'))
+            $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.TOKEN' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('No Fabric token: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Sign in with an account that can use the Fabric workspace, then run ./scripts/deploy.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/fabric/articles/get-started/fabric-api-quickstart'))
             return $null
         }
     }
@@ -205,7 +205,7 @@ function Invoke-DemoActivityControlSetup {
 
     # 7. The notebook.
     if ($SkipFabric) {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric part was skipped (-SkipFabric); run setup-activity-control.ps1 again for the notebook.'))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric part was skipped (-SkipFabric); ./scripts/deploy.ps1 without -SkipFabric puts the notebook in Fabric.'))
     }
     else {
         $fabricToken = & $getToken
