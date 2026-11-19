@@ -28,9 +28,11 @@ function Invoke-DemoActivityControlSetup {
     -GrantRole (an Owner, signed in with multifactor authentication): creates or updates the custom role
     "DbHub Demo Activity Operator" with exactly the approved actions, and assigns A1 (the identity at the demo
     resource group), A2 (the identity at the control account), and A3 (Key Vault Secrets User on the one secret, for
-    the signed-in owner and control.notebookUserObjectIds). It shows the identity's object ID before it assigns
-    anything. This is the only path that creates the role; deploy.ps1 re-grants A1 after a redeploy when assignRoles
-    and control.enabled are true, with the same function.
+    the signed-in owner, the environment's deployer, and control.notebookUserObjectIds). The deployer (2026-11-19) is
+    the person whose deploy.ps1 last set up the control vault, as Azure records it on the vault, so a Contributor who
+    deployed can Run all after an Owner's one run (CONTROL.ROLE.DEPLOYER). It shows the identity's object ID before it
+    assigns anything. This is the only path that creates the role; deploy.ps1 re-grants A1 after a redeploy when
+    assignRoles and control.enabled are true, with the same function.
 
     -RotateWebhook: a new webhook and a new secret version, then the old webhook is deleted.
 
@@ -129,7 +131,7 @@ function Invoke-DemoActivityControlSetup {
     }
 
     if ($GrantRole) {
-        foreach ($item in @(Grant-DemoActivityControlRole -Config $Config -IncludeDefinition -ConfigPath $ConfigPath)) {
+        foreach ($item in @(Grant-DemoActivityControlRole -Config $Config -IncludeDefinition -IncludeDeployer -ConfigPath $ConfigPath)) {
             $results.Add($item)
         }
         return $results.ToArray()
