@@ -821,6 +821,7 @@ Describe 'A second environment''s Fabric workspace (2026-11-19, the final tests'
         $workspace.message | Should -Match '^The Fabric workspace "Database Hub Demo dbhub" doesn''t exist yet: deploy\.ps1 creates it'
         $workspace.message | Should -Match ('It''s this environment''s own: "Database Hub Demo", the name it would have had, is the workspace rg-dbhub-demo \(subscription {0}\) records as its own, so init\.ps1 doesn''t give it to this environment\.$' -f $script:subB)
         $workspace.remediation | Should -Be 'Nothing to do. To choose another name, run init.ps1 -Force -Prefix dbhub -WorkspaceName <a name no other environment uses>.'
+        $init.Existing.Note | Should -Be ('The Fabric workspace is "Database Hub Demo dbhub", this environment''s own: "Database Hub Demo", the name it would have had, is the one rg-dbhub-demo (subscription {0}) records as its own (INIT.FABRIC.WORKSPACE).' -f $script:subB) -Because 'an automatic change shows on deploy.ps1''s start banner and status page too'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -ParameterFilter { $Config['prefix'] -eq 'dbhub' -and $Config['subscriptionId'] -eq $script:subA }
 
         # Its own name is taken too, by a workspace another environment records: the next one.

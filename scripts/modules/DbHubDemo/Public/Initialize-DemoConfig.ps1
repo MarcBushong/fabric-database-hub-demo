@@ -449,6 +449,8 @@ function Initialize-DemoConfig {
     # A recovered environment's fabric.importNotebooks, and why (Resolve-DemoRecoveredNotebookImport); $null keeps the
     # first run's rule.
     $notebookImport = $null
+    # What another demo environment's record of the workspace changed (Resolve-DemoFabricWorkspaceClaim), when Fabric was read.
+    $claimOutcome = $null
     $stateTags = Get-DemoDeploymentStateTagName
     $recordedId = { param([string] $Key) if ($existing.Tags.Contains($stateTags[$Key])) { ([string]$existing.Tags[$stateTags[$Key]]).Trim() } else { '' } }
     $unknownWorkspace = {
@@ -484,7 +486,6 @@ function Initialize-DemoConfig {
         }
         # A workspace that another demo environment records (2026-11-19) is never this environment's by default, and never a
         # silent Pass (Resolve-DemoFabricWorkspaceClaim): one Azure Resource Graph query, only for a workspace that exists.
-        $claimOutcome = $null
         if ($workspaceList.Succeeded -and @(Select-DemoFabricNamed -Items $shared -Name $workspace).Count -eq 1) {
             $claim = Get-DemoFabricWorkspaceClaim -Config ([ordered]@{ subscriptionId = $subscription; prefix = $effectivePrefix; environment = $environment })
             $origin = if ($WorkspaceName) { 'option' } elseif ($recovered) { 'recovered' } else { 'default' }
@@ -831,7 +832,10 @@ function Initialize-DemoConfig {
     }
     $report = Get-DemoExistingEnvironmentReport -Existing $existing -Path $fullPath -GroupName $(if ($groupId -ne $zeroGuid) { $groupName } else { '' }) -WorkspaceName $workspace -WorkspaceSource $workspaceSource -ControlName $controlWorkspace -NotebookImport $notebookImport -Defaulted $defaulted.ToArray() -DryRun:$dryRun
     $results.Add($report.Result)
-    $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = $effectivePrefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = [string]$existing.Signal; Note = [string]$report.Note }
+    # A workspace renamed because another environment records the one it would have had is an automatic change, so
+    # deploy.ps1's start banner and status page say it too (2026-11-19).
+    $runNote = (@([string]$report.Note, $(if ($null -ne $claimOutcome) { [string]$claimOutcome.Line } else { '' })) | Where-Object { $_ }) -join ' '
+    $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = $effectivePrefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = [string]$existing.Signal; Note = $runNote }
 
     $json = $config | ConvertTo-Json -Depth 32
     $validationErrors = @()

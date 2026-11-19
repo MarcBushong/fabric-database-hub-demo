@@ -295,7 +295,8 @@ function Resolve-DemoFabricWorkspaceClaim {
     Resource Graph that couldn't answer is a Warning that says so, never a silent Pass. A workspace that nobody else
     records, that doesn't exist yet (deploy.ps1 creates it), or whose name more than one has: Status '', nothing to add.
     Returns WorkspaceName, Renamed, From, Status ('', Warning, or Manual action required), Note (the sentence the result
-    adds, or its whole message for Manual action required), Remediation, and ClaimedBy (the other environments' labels).
+    adds, or its whole message for Manual action required), Remediation, ClaimedBy (the other environments' labels), and
+    Line: for a rename, the line deploy.ps1's start banner and status page show, since it's an automatic change.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -325,7 +326,7 @@ function Resolve-DemoFabricWorkspaceClaim {
         [string] $ResourceGroup = ''
     )
 
-    $answer = [ordered]@{ WorkspaceName = $WorkspaceName; Renamed = $false; From = ''; Status = ''; Note = ''; Remediation = ''; ClaimedBy = @() }
+    $answer = [ordered]@{ WorkspaceName = $WorkspaceName; Renamed = $false; From = ''; Status = ''; Note = ''; Remediation = ''; ClaimedBy = @(); Line = '' }
     $items = @($Workspace | Where-Object { $null -ne $_ })
     $found = @(Select-DemoFabricNamed -Items $items -Name $WorkspaceName)
     if ($found.Count -ne 1) {
@@ -395,6 +396,7 @@ function Resolve-DemoFabricWorkspaceClaim {
     $answer.Status = 'Warning'
     $answer.Note = 'It''s this environment''s own: "{0}", the name it would have had, is the workspace {1}, so init.ps1 doesn''t give it to this environment.' -f $WorkspaceName, $recordsPhrase
     $answer.Remediation = 'Nothing to do. To choose another name, run {0}.' -f $fix
+    $answer.Line = 'The Fabric workspace is "{0}", this environment''s own: "{1}", the name it would have had, is the one {2} (INIT.FABRIC.WORKSPACE).' -f $free, $WorkspaceName, $recordsPhrase
     return [pscustomobject]$answer
 }
 
