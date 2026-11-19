@@ -37,7 +37,10 @@ function Update-DemoT5ContainerLifecycle {
     The run's results so far (deploy.ps1): when CONTROL.ROLE.DEFINITION or SAFETYSTOP.ROLE added the container's actions,
     the result and the status page's T5.Lifecycle row say this run updated the roles first. When PREFLIGHT.COST.MONTHLY
     priced the container for a session's hours only and this run records AlwaysOn, they give the month's worst case again,
-    against monthlyCeilingUsd.
+    against monthlyCeilingUsd: from preflight's worst case, or, when DEPLOY.COST.T4RESTART says the nightly safety stop
+    that preflight counted isn't in place, from the worst case without it (the re-review of 0590bbe). Over the ceiling
+    only because nothing automatic deletes the container while it's within it with the container for the running hours,
+    they say so as PREFLIGHT.COST.MONTHLY does, with its three fixes (Get-DemoT5CeilingExceptionText).
 
     .EXAMPLE
     Update-DemoT5ContainerLifecycle -Config $config -Purpose Grant -ConfigPath ./config/demo.config.json
@@ -107,6 +110,9 @@ function Update-DemoT5ContainerLifecycle {
     $monthly = @(@($PriorResult) | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'PREFLIGHT.COST.MONTHLY' }) | Select-Object -Last 1
     $priced = Get-DemoMemberValue -InputObject $monthly -Name 'evidence'
     $pricedWorst = Get-DemoMemberValue -InputObject $priced -Name 'monthlyWorstCase'
+    # The nightly safety stop that preflight counted, which this run's setup didn't put in place (the re-review of 0590bbe):
+    # T4's restart counts the rest of the month again, so T5's extra adds to that worst case, not to preflight's.
+    $t4Restart = @(@($PriorResult) | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'DEPLOY.COST.T4RESTART' }) | Select-Object -Last 1
     # How the estimate prices what this run recorded: AlwaysOn for an AlwaysOn lifecycle, and for a Session one that nothing
     # automatic deletes (no session-control role and no nightly safety stop that can; review of ab91ee5).
     $priceNow = [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'price')
@@ -116,16 +122,48 @@ function Update-DemoT5ContainerLifecycle {
     if ([string]$result.status -eq 'Warning' -and $priceNow -ceq $script:T5LifecycleAlwaysOn -and [string](Get-DemoMemberValue -InputObject $priced -Name 't5ContainerLifecycle') -ceq $script:T5LifecycleSession -and $null -ne $pricedWorst) {
         $culture = [System.Globalization.CultureInfo]::InvariantCulture
         $extra = [double](Get-DemoMemberValue -InputObject $priced -Name 't5AlwaysOnExtraMonthly')
-        $worst = [System.Math]::Round([double]$pricedWorst + $extra, 2)
+        $base = [double]$pricedWorst
+        $basis = 'its estimate'
+        if ($null -ne $t4Restart) {
+            $without = Get-DemoMemberValue -InputObject $priced -Name 'monthlyWorstCaseWithoutSafetyStop'
+            if ($null -eq $without) {
+                $without = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $t4Restart -Name 'evidence') -Name 'worstCaseWithoutSafetyStop'
+            }
+            if ($null -ne $without) {
+                $base = [double]$without
+                $basis = 'DEPLOY.COST.T4RESTART''s, which counts T4''s restart for the rest of the month'
+            }
+        }
+        $worst = [System.Math]::Round($base + $extra, 2)
         $ceiling = [double]$Config['monthlyCeilingUsd']
         $over = $worst -gt $ceiling
-        $result.message = [string]::Format($culture, '{0} Preflight priced its throughput for a session''s hours only, so the month''s worst case is about {1:N2} USD more than its estimate: {2:N2} USD, {3} monthlyCeilingUsd ({4:N2} USD).', $result.message, $extra, $worst, $(if ($over) { 'over' } else { 'within' }), $ceiling)
-        if ($over) {
+        $result.message = [string]::Format($culture, '{0} Preflight priced its throughput for a session''s hours only, so the month''s worst case is about {1:N2} USD more than {2}: {3:N2} USD, {4} monthlyCeilingUsd ({5:N2} USD).', $result.message, $extra, $basis, $worst, $(if ($over) { 'over' } else { 'within' }), $ceiling)
+        # Over the ceiling only because nothing automatic deletes the container after a session (no session-control role, and
+        # no nightly safety stop that can, while stop-demo.ps1 does): the same Warning, and fixes, as PREFLIGHT.COST.MONTHLY's.
+        $manualOnly = [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'lifecycle') -ceq $script:T5LifecycleSession -and [string](Get-DemoMemberValue -InputObject $result.evidence -Name 'mode') -eq 'NoRole' -and $false -eq (Get-DemoMemberValue -InputObject $result.evidence -Name 'autoDelete')
+        $exception = $null
+        if ($over -and $manualOnly -and $base -le $ceiling) {
+            # After an Owner's grant: the container for the running hours only, and T4's restart about a day each.
+            $grant = [double]$pricedWorst
+            $t4Worst = Get-DemoMemberValue -InputObject $priced -Name 't4AutoRestartWorstCaseMonthly'
+            $t4Capped = Get-DemoMemberValue -InputObject $priced -Name 't4AutoRestartWithSafetyStopMonthly'
+            if ($null -ne $t4Worst -and $null -ne $t4Capped) {
+                $grant = [System.Math]::Round($grant - [double]$t4Worst + [double]$t4Capped, 2)
+            }
+            $exception = Get-DemoT5CeilingExceptionText -ExtraMonthly $extra -SessionMonthly $base -GrantMonthly $grant -WorstMonthly $worst -ConfigPath $ConfigPath
+            $result.message = '{0} {1}' -f $result.message, $exception.Text
+            $result.remediation = $exception.Fix
+        }
+        elseif ($over) {
             $result.remediation = [string]::Format($culture, '{0} Or raise monthlyCeilingUsd to at least {1:N0} in your configuration.', $result.remediation, [System.Math]::Ceiling($worst))
         }
         if ($result.evidence -is [System.Collections.IDictionary]) {
             $result.evidence['monthlyWorstCase'] = $worst
             $result.evidence['overCeiling'] = $over
+            $result.evidence['worstCaseBasis'] = $(if ($basis -ceq 'its estimate') { 'Preflight' } else { 'WithoutSafetyStop' })
+            if ($null -ne $exception) {
+                $result.evidence['t5CeilingException'] = [ordered]@{ sessionMonthlyUsd = $base; t5AlwaysOnExtraMonthly = $extra; grantMonthlyUsd = $grant }
+            }
         }
     }
     Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Lifecycle' -State 'Done' -Status ([string]$result.status) -Message (('{0} {1}' -f $result.message, $result.remediation).Trim()) -MaxLength 1200

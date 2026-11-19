@@ -26,7 +26,10 @@ function Find-DemoSecretLeak {
     Junctions and symbolic links to folders aren't followed. A folder or file named in -Path is scanned even
     when it's inside such a tree. A tree outside every -DependencyRoot is left out too, but listed apart
     (UnexpectedPruned), so the caller can say it wasn't read (review of ab91ee5: a log in out/venv/ or
-    out/.npm/_logs/ is the demo's own output, and the scan shouldn't pass silently without it). Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
+    out/.npm/_logs/ is the demo's own output, and the scan shouldn't pass silently without it), unless it was scanned
+    on purpose (the re-review of 0590bbe): a folder named in -Path that is such a tree, or lies inside one, isn't
+    unexpected, and neither is the tree that holds it, nor a tree inside it, so -Path ./out, ./out/venv clears out/venv
+    and its own site-packages. Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
     byte order mark says so, or as UTF-16 without one when NUL bytes fall on every other byte (Windows
     PowerShell 5.1's Out-File and redirection write UTF-16). Other files with a NUL byte in the first 8,000
     bytes are binary; they, files larger than -MaxFileBytes, and files and folders that can't be read are
@@ -37,7 +40,7 @@ function Find-DemoSecretLeak {
     [REDACTED:<rule>] and the rest is redacted again), Scanned (the sources read), Skipped (with the
     reason), Pruned (the dependency-tree folders left out, full paths, sorted, the first 50), and PrunedCount
     (how many were left out), and UnexpectedPruned and UnexpectedPrunedCount (those of them outside every
-    -DependencyRoot; all of them when -DependencyRoot isn't given).
+    -DependencyRoot and not scanned on purpose through -Path; all the others when -DependencyRoot isn't given).
 
     Sources (checked 2026-10-20): what ADR 0009 requires scanned, and gitleaks for the repository itself
     (https://github.com/gitleaks/gitleaks); GitHub Actions log masking
@@ -112,6 +115,7 @@ function Find-DemoSecretLeak {
     $skipped = [System.Collections.Generic.List[object]]::new()
     $pruned = [System.Collections.Generic.List[string]]::new()
     $unexpected = [System.Collections.Generic.List[string]]::new()
+    $rootFolders = [System.Collections.Generic.List[string]]::new()
     $expectedRoots = @($DependencyRoot | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar })
 
     if ($PSCmdlet.ParameterSetName -eq 'Text') {
@@ -142,7 +146,9 @@ function Find-DemoSecretLeak {
             elseif (Test-Path -LiteralPath $item -PathType Container) {
                 $found = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
                 $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
-                $pending.Push((Get-Item -LiteralPath $item -Force))
+                $rootFolder = Get-Item -LiteralPath $item -Force
+                $rootFolders.Add($rootFolder.FullName.TrimEnd('\', '/'))
+                $pending.Push($rootFolder)
                 while ($pending.Count -gt 0) {
                     $directory = $pending.Pop()
                     try {
@@ -158,10 +164,6 @@ function Find-DemoSecretLeak {
                         }
                         elseif ($prunedNames.Contains($entry.Name)) {
                             $pruned.Add($entry.FullName)
-                            $underRoot = @($expectedRoots | Where-Object { $entry.FullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
-                            if (-not $underRoot) {
-                                $unexpected.Add($entry.FullName)
-                            }
                         }
                         elseif ($entry.Name -ne '.git' -and -not $entry.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
                             $pending.Push($entry)
@@ -175,6 +177,22 @@ function Find-DemoSecretLeak {
             else {
                 $skipped.Add([pscustomobject]@{ Source = $item; Reason = 'not found' })
             }
+        }
+        # Unexpected: outside every -DependencyRoot, and not scanned on purpose (the re-review of 0590bbe). A -Path folder that
+        # is a tree left out, or lies inside one, was named on purpose: that tree, and any tree inside the folder, isn't
+        # unexpected, so -Path ./out, ./out/venv clears the Warning that named out/venv.
+        $separator = [System.IO.Path]::DirectorySeparatorChar
+        $inside = { param([string] $Child, [string] $Parent) $Child.StartsWith($Parent.TrimEnd('\', '/') + $separator, [System.StringComparison]::OrdinalIgnoreCase) }
+        $same = { param([string] $Left, [string] $Right) [string]::Equals($Left.TrimEnd('\', '/'), $Right.TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase) }
+        $named = @($rootFolders | Where-Object { $root = $_; @($pruned | Where-Object { (& $same $root $_) -or (& $inside $root $_) }).Count -gt 0 })
+        foreach ($folder in $pruned) {
+            if (@($expectedRoots | Where-Object { $folder.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+                continue
+            }
+            if (@($named | Where-Object { (& $same $folder $_) -or (& $inside $folder $_) -or (& $inside $_ $folder) }).Count -gt 0) {
+                continue
+            }
+            $unexpected.Add($folder)
         }
         foreach ($file in $files) {
             if ($file.Length -gt $MaxFileBytes) {

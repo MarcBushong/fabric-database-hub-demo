@@ -987,7 +987,13 @@ function Test-DemoStartCost {
     # T5's free tier (2026-11-18, ADR 0027), so a free-tier account isn't priced at list price.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
     # T5's container lifecycle (2026-11-19): its throughput bills only while the demo runs, unless it stays between sessions.
-    $costParameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config
+    # Priced all month only because nothing automatic deletes it (the re-review of 0590bbe), it never makes the hard ceiling
+    # a Fail by itself, so start-demo.ps1 starts with a Warning.
+    $t5Cost = Get-DemoT5CostLifecycle -Config $Config -Detail
+    $costParameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+    if ($t5Cost.ManualDeleteOnly) {
+        $costParameters['T5ManualDeleteOnly'] = $true
+    }
     $sessionCost = 0.0
     try {
         $estimate = Get-DemoCostEstimate @costParameters

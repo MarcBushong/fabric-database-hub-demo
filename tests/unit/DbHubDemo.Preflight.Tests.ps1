@@ -488,6 +488,31 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { -not $T4RestartCoverage.Counts -and $T4RestartCoverage.Missing -eq 'SafetyStop' -and $T5ContainerLifecycle -eq 'AlwaysOn' }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 2 -Exactly -Because 'preflight reads the deployer''s permissions once a run'
     }
+
+    It 'tells the estimate when a Contributor''s update of an environment from main, with no T5 yet, prices T5 all month only because nothing automatic deletes its container, at <Ceiling> USD (the re-review of 0590bbe)' -ForEach @(
+        @{ Ceiling = 375 }
+        @{ Ceiling = 390 }
+    ) {
+        # Deployed from main by a Contributor: no T5 and no tag yet, a nightly safety stop without its role, and a session
+        # control that never got one. Only stop-demo.ps1 would delete T5's container, so its all-month price never fails the
+        # month by itself (Get-DemoCostEstimate -T5ManualDeleteOnly, which DbHubDemo.Cost.Tests.ps1 tests).
+        Set-HappyAzMock
+        $fromMain = [ordered]@{}
+        foreach ($key in $config.Keys) { $fromMain[$key] = $config[$key] }
+        $fromMain['monthlyCeilingUsd'] = $Ceiling
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T5Container = ''; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -MockWith { [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -MockWith { [pscustomobject]@{ Counts = $false; Missing = 'Role'; Reason = 'the nightly safety stop can''t stop T4: its role isn''t assigned'; Fix = 'An Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once.'; Evidence = [ordered]@{ counts = $false; missing = 'Role'; nightly = 'NoRole' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $false }
+        $null = @(Invoke-DemoPreflight -Config $fromMain -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly -and [double]$Config['monthlyCeilingUsd'] -eq $Ceiling -and -not $T4RestartCoverage.Counts }
+        $fromMain['monthlyCeilingUsd'] | Should -Be $Ceiling -Because 'preflight never changes the configured ceiling'
+        # A control that keeps a role without the container's actions: no stop deletes the container, so it's no exception.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'Lacking'; Why = 'its role doesn''t have the container''s actions'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        $null = @(Invoke-DemoPreflight -Config $fromMain -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and -not $T5ManualDeleteOnly }
+    }
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
         Set-HappyAzMock
         # Its numbers are set against a 250 USD ceiling, kept here (the default is 415 for a new configuration since 2026-11-19).

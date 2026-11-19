@@ -189,6 +189,34 @@ Describe 'Find-DemoSecretLeak (Phase 14 secret scan)' {
         @((Find-DemoSecretLeak -Path (& $at 'tools/scripts/__pycache__')).Scanned) | Should -Be @($files['Cache'])
     }
 
+    It 'doesn''t count a dependency-named folder scanned on purpose through -Path as unexpected, nor the trees inside it (the re-review of 0590bbe)' {
+        # validate.ps1's Warning names out/venv; its remediation, -ScanPath ./out/venv, scans it through -Path next to out/.
+        $out = Join-Path -Path $TestDrive -ChildPath ('named-' + [guid]::NewGuid().ToString('N'))
+        $at = { param([string] $Relative) [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath $Relative)) }
+        $files = [ordered]@{
+            Log     = & $at 'venv/run.log'
+            Package = & $at 'venv/Lib/site-packages/pkg/module.py'
+            NpmLog  = & $at '.npm/_logs/debug.log'
+        }
+        foreach ($key in $files.Keys) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $files[$key] -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $files[$key] -Value @('first line', ('token={0}' -f $script:jwt)) -Encoding utf8NoBOM
+        }
+        $plain = Find-DemoSecretLeak -Path $out
+        @($plain.UnexpectedPruned) | Should -Be @((& $at '.npm'), (& $at 'venv'))
+        $named = Find-DemoSecretLeak -Path $out, (& $at 'venv')
+        @($named.Findings | ForEach-Object { $_.Source }) | Should -Be @($files['Log']) -Because 'the folder named on purpose is read, and its own site-packages is still left out'
+        @($named.Pruned) | Should -Be @((& $at '.npm'), (& $at 'venv'), (& $at 'venv/Lib/site-packages'))
+        @($named.UnexpectedPruned) | Should -Be @(& $at '.npm') -Because 'out/.npm wasn''t named, so it still wasn''t read'
+        $named.UnexpectedPrunedCount | Should -Be 1
+        # A folder inside one, named on purpose: the tree that holds it isn't unexpected either.
+        $logs = Find-DemoSecretLeak -Path $out, (& $at '.npm/_logs')
+        @($logs.Findings | ForEach-Object { $_.Source }) | Should -Be @($files['NpmLog'])
+        @($logs.UnexpectedPruned) | Should -Be @(& $at 'venv')
+        # Both named: nothing is unexpected.
+        (Find-DemoSecretLeak -Path $out, (& $at 'venv'), (& $at '.npm')).UnexpectedPrunedCount | Should -Be 0
+    }
+
     It 'never lists the files of a deep dependency tree: 3,000 files under node_modules, with nested ones, are one pruned folder' {
         $out = Join-Path -Path $TestDrive -ChildPath ('deep-' + [guid]::NewGuid().ToString('N'))
         $modules = [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath 'fabric-app/node_modules'))
