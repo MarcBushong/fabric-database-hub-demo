@@ -840,8 +840,24 @@ function Grant-DemoSafetyStopRole {
     $evidence['roleId'] = $roleId
     $can = 'the nightly safety stop can stop the VMs and T4, read T3, and delete T5''s container between sessions'
     $updatedText = if ([bool]$evidence['updated']) { ' (its definition was updated in place, under the same ID, to exactly the {0} approved actions{1}{2})' -f $script:SafetyStopRoleActions.Count, $(if (@($evidence['added']).Count) { '; added: {0}' -f (@($evidence['added']) -join ', ') } else { '' }), $(if (@($evidence['removed']).Count) { '; removed: {0}' -f (@($evidence['removed']) -join ', ') } else { '' }) } else { '' }
+    # A role this run couldn't write that doesn't have exactly its approved actions (review of ab91ee5): another environment's
+    # older deploy.ps1 wrote it back for the whole subscription (R910), so the nightly stop can't do what it lacks, such as
+    # deleting T5's container. A Warning that names them, never a Pass.
+    $stale = {
+        param([string] $State)
+        $missing = @($script:SafetyStopRoleActions | Where-Object { $_ -cnotin @($role.Actions) })
+        $extra = @(@($role.Actions) | Where-Object { $_ -cnotin $script:SafetyStopRoleActions })
+        $evidence['missingActions'] = $missing
+        $evidence['extraActions'] = $extra
+        $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
+        $message = 'The role {0} is {1}, but the custom role "{2}" doesn''t have exactly its {3} approved actions: {4} (another environment''s deploy.ps1 on older code may have written it back for the whole subscription), and you can''t write it (it takes Microsoft.Authorization/roleDefinitions/write: an Owner or a User Access Administrator). Until then the nightly safety stop can''t do what it lacks{5}.' -f $label, $State, $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $(if (@($missing | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count) { ', such as deleting T5''s container between sessions' } else { '' })
+        New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('An Owner of the subscription runs, once: {0}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $command) -DocUrl $script:SafetyStopRoleDoc
+    }
     $existing = Test-DemoActivityControlAssignment -SubscriptionId $Name.SubscriptionId -Scope $Name.ResourceGroupId -PrincipalId $PrincipalId -RoleId $roleId
     if ($existing.Exists) {
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned')
+        }
         return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is in place{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     if ($existing.Error -and -not $existing.Missing) {
@@ -858,6 +874,9 @@ function Grant-DemoSafetyStopRole {
     $write = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments/{1}?api-version={2}' -f $Name.ResourceGroupId, $assignmentName, $permissionsVersion) -Body $body
     if ($write.Ok -or $write.Error -match 'RoleAssignmentExists') {
         $evidence['assigned'] = $true
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned now')
+        }
         return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is assigned{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     return (& $warn ('The role {0} couldn''t be assigned: {1}.' -f $label, $write.Error))

@@ -488,6 +488,28 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         @($script:roleDefinitions[0]['permissions'][0]['actions']) | Should -Be $script:approvedActions
     }
 
+    It 'as a Contributor, says the shared role is stale when another environment''s older code wrote it back, and never claims it deletes T5''s container (review of ab91ee5)' {
+        # In place before: the role and its assignment (an Owner's earlier run), then older code wrote the role back to 7 actions.
+        Set-FakeInPlace
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $script:canDefine = $false
+        $script:canAssign = $false
+        $results = & $script:setup
+        $role = $results | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $role.status | Should -Be 'Warning'
+        $role.message | Should -Match '^The role "DbHub Demo Safety Stop" for id-dbhub-demo-safetystop at rg-dbhub-demo is assigned, but the custom role "DbHub Demo Safety Stop" doesn''t have exactly its 9 approved actions: it doesn''t have Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
+        $role.message | Should -Match 'such as deleting T5''s container between sessions\.$'
+        $role.message | Should -Not -Match 'can stop the VMs and T4, read T3, and delete T5''s container'
+        $role.remediation | Should -Match 'grant-safety-stop\.ps1'
+        @($role.evidence['missingActions']).Count | Should -Be 2
+        @($script:writes | Where-Object { $_ -match 'roleDefinitions' }) | Should -BeNullOrEmpty
+        # As a Role Based Access Control Administrator, who assigns it but can't write it: the same Warning once assigned.
+        $script:assignments.Clear()
+        $script:canAssign = $true
+        $assigned = (& $script:setup) | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $assigned.status | Should -Be 'Warning'
+        $assigned.message | Should -Match 'is assigned now, but the custom role'
+    }
     It 'as a Role Based Access Control Administrator: assigns the role when it exists, and needs an Owner to create it' {
         $script:canDefine = $false
         $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
