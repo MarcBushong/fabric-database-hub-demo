@@ -1,6 +1,8 @@
 # Demo walkthrough
 
-How to present the demo: the presenter's path with one **Run all**, the DBA moments it carries, a 15-minute and a 30-minute script, a cheat sheet for every scenario, then the rehearsal, the fallbacks, and a recovery playbook. Which surface suits which audience is in [presentation surfaces](presentation.md); how the demo is built, and what's automated, are in the [architecture](architecture.md) and the [automation support matrix](automation-support-matrix.md).
+How to present the demo: the presenter's path with one **Run all**, the DBA moments it carries, a 15-minute and a 30-minute script, a cheat sheet for every scenario, then the rehearsal, the fallbacks, and a recovery playbook. How the demo is built, and what's automated, are in the [architecture](architecture.md) and the [automation support matrix](automation-support-matrix.md).
+
+**Where to show it:** **Database Hub** is the live product view, and the product you're demonstrating. The **Insights app** is the demo's own operations product: what each session ran and what it caught, from the saved history. Which surface suits which audience, and what each viewer needs, is in [presentation surfaces](presentation.md).
 
 > **Preview disclosure:** Database Hub is generally available. Copilot in Database Hub, Database Agents, alerts, SQL Server on Azure VM monitoring, unified inventory, the Arc SQL monitoring setting, the telemetry endpoint, and Fabric Apps, which the Insights app is built on, are previews, so their behavior and UI can change ([what's generally available, and what's a preview](limitations.md#preview-disclosures)). This walkthrough never promises what an AI will answer: it names the signals to look for, and every beat that depends on a preview has a fallback.
 
