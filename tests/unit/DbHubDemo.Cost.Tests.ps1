@@ -263,6 +263,43 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Not -Match 't4SkuName'
     }
 
+    It 'says the month''s worst case it checks against the ceiling, the margin under or over it, and what it assumed (2026-11-19, the docs audit)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5'; t5Enabled = $true }
+        $counted = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is in place'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $text = { param([double] $Value) [regex]::Escape($Value.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+        $under = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $counted -T5FreeTier $false
+        $worst = [System.Math]::Round($under.LightUseMonthly + 0.18 * 96, 2)
+        $under.MonthlyWorstCase | Should -Be $worst
+        $under.MonthlyCeiling | Should -Be ([double]$config['monthlyCeilingUsd'])
+        $under.MonthlyMargin | Should -Be ([System.Math]::Round([double]$config['monthlyCeilingUsd'] - $worst, 2))
+        $under.MonthlyMargin | Should -BeGreaterThan 0
+        $monthly = $under.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Pass'
+        $monthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD under the hard ceiling of {2} USD\. It counts idle plus 10 hours of use, {3} USD; T4''s automatic restart for 96 hours, 17\.28 USD; and T5''s container for the running hours only \(Session\)\. ' -f (& $text $worst), (& $text $under.MonthlyMargin), (& $text $under.MonthlyCeiling), (& $text $under.LightUseMonthly))
+        $monthly.evidence.monthlyWorstCase | Should -Be $worst
+        $monthly.evidence.monthlyMargin | Should -Be $under.MonthlyMargin
+        $monthly.evidence.monthlyCeiling | Should -Be $under.MonthlyCeiling
+        # Over it: how far over, with T5's container all month and T4's restart for the rest of the month.
+        $config['monthlyCeilingUsd'] = 50
+        $over = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle AlwaysOn
+        $overWorst = [System.Math]::Round($over.LightUseMonthly + 0.18 * 720, 2)
+        $over.MonthlyMargin | Should -Be ([System.Math]::Round(50 - $overWorst, 2))
+        $overMonthly = $over.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $overMonthly.status | Should -Be 'Fail'
+        $overMonthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of 50\.00 USD\. It counts idle plus 10 hours of use, {2} USD; T4''s automatic restart for 720 hours, 129\.60 USD; and T5''s container all month \(AlwaysOn\)\. ' -f (& $text $overWorst), (& $text ($overWorst - 50)), (& $text $over.LightUseMonthly))
+    }
+
+    It 'counts no Bastion hour by default, since a default deployment and session have none, and -BastionHours counts it (2026-11-19, the docs audit)' {
+        # Only start-demo.ps1 -Interactive deploys Bastion, and its cost guardrail passes -BastionHours.
+        $default = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -NetworkMode public
+        $default.BastionHours | Should -Be 0
+        $default.BastionHourly | Should -BeGreaterThan 0 -Because 'its hourly price is still read and shown'
+        $with = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        [System.Math]::Abs(($with.SessionCost - $default.SessionCost) - $with.BastionHourly) | Should -BeLessOrEqual 0.011
+        [System.Math]::Abs(($with.LightUseMonthly - $default.LightUseMonthly) - $with.BastionHourly) | Should -BeLessOrEqual 0.011
+        (($default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').evidence.bastionHours) | Should -Be 0
+    }
+
     It 'counts a nightly safety stop that this run sets up, and keeps the worst case without it for DEPLOY.COST.T4RESTART (2026-11-19, the coordinator''s option 2)' {
         $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }
         $planned = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = 'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'; Fix = ''; Evidence = [ordered]@{ counts = $true }; WithoutReason = 'the nightly safety stop isn''t in place yet'; WithoutFix = 'Run ./scripts/deploy.ps1.' }
@@ -887,9 +924,9 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Match 'raise monthlyCeilingUsd'
     }
 
-    It 'uses a 390 USD monthly ceiling and a 20 USD session ceiling by default (390 since 2026-11-19, 375 before; 20 since 2026-11-18)' {
+    It 'uses a 415 USD monthly ceiling and a 20 USD session ceiling by default (415 since 2026-11-19, 375 before; 20 since 2026-11-18)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DefenderPlans $defenderPlans
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 390\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 415\.00 USD'
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 20\.00 USD'
     }
 
