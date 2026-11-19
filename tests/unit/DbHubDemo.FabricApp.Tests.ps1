@@ -1515,6 +1515,23 @@ Describe 'configure-fabric-app.ps1' {
             $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
             $LASTEXITCODE | Should -Be 0
             Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 3 -Exactly
+
+            # A first deploy whose second write still leaves Manage copying requests, as without NB_DatabaseHub_Control before
+            # deploy.ps1 puts it in Fabric: no deploy once more, because Manage copies either way, and the deploy that adds the
+            # notebook reads the API from the record (2026-11-19).
+            $writes.Clear()
+            Mock -CommandName Set-DemoFabricAppManageSetting -MockWith {
+                $writes.Add($writes.Count)
+                New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'Manage''s function is missing NB_DatabaseHub_Control, so the app copies each request for Run all in NB_DatabaseHub_Control instead of sending it.' -Evidence ([ordered]@{ functionsEnabled = $true; written = $true; apiUrl = $(if ($writes.Count -eq 1) { '' } else { 'https://example.invalid/api/' }); controlNotebookId = '' })
+            }
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 4 -Exactly
+            $actions = @(Get-Content -LiteralPath $output | ConvertFrom-Json | Where-Object checkId -EQ 'FABRIC.APP.ACTIONS')
+            $actions.Count | Should -Be 1
+            $actions[0].status | Should -Be 'Warning'
+            $actions[0].evidence.apiUrl | Should -Be 'https://example.invalid/api/' -Because 'the second write''s record, which the stage has'
+            $actions[0].evidence.PSObject.Properties.Name | Should -Not -Contain 'redeployed'
         }
 
         It 'adds no FABRIC.APP.TOKEN and opens no browser when only the connector''s direct route refused the token: Execute Queries checked the app and proves its tenant setting (2026-11-09 live finding)' {

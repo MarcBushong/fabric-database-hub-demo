@@ -44,7 +44,7 @@ BeforeAll {
         [pscustomobject]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ('a' * 64); BundleChunkCount = 1; RunnerSha256 = ('b' * 64); RunnerChunkCount = 7
             BundleSentTo = @('sqlvm01', 'archost01'); RunnerSentTo = @('sqlvm01', 'archost01'); NetworkMode = 'private'; T3UseFreeLimit = $true; T3AdminGroupName = 'sg-t3'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; FabricSha256 = ('f' * 64); T2Source = ''; T4Replica = ''; Tags = @{}
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; FabricSha256 = ('f' * 64); AppControlNotebookId = ''; T2Source = ''; T4Replica = ''; Tags = @{}
         }
     }
     Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
@@ -1274,6 +1274,26 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $record[0].Contains('FabricSha256') | Should -BeFalse
     }
 
+    It 'records with the Fabric step which control notebook the Insights app''s Manage was deployed with, none included, so a resume can deploy it once more (2026-11-19)' {
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'rayfin up deployed the app.'
+            New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status $(if ($script:appNotebook) { 'Pass' } else { 'Warning' }) -Message 'Manage' -Evidence ([ordered]@{ controlNotebookId = $script:appNotebook })
+        }
+        foreach ($case in '', 'ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB') {
+            $script:recorded.Clear()
+            $script:appNotebook = $case
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+            $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
+            $record.Count | Should -Be 1
+            $record[0].Contains('AppControlNotebookId') | Should -BeTrue -Because ('the notebook: "{0}"' -f $case)
+            $record[0]['AppControlNotebookId'] | Should -Be $case.ToLowerInvariant()
+        }
+    }
+
     It 'doesn''t record the Fabric step as finished when it needs a person, such as a paused capacity, so the next run runs it again (live, 2026-11-13)' {
         # Live (rg-dbhubup-demo, main's behavior): the first run met a paused capacity, so the workspace couldn't be created;
         # its records were Manual action required, not Fail, so DbHubTrackFabric said Fabric and no later run created it.
@@ -2072,6 +2092,47 @@ Describe 'Invoke-DemoParallelDeployment' {
         @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).status | Should -Be 'Warning'
     }
 
+    It 'deploys the Insights app once more after the control''s notebook is in Fabric when the Fabric track''s app had none, so Manage sends its actions (2026-11-19)' {
+        # The final tests' net-new run (dbhubfn): the Fabric track's app step ran before the control's Fabric part put
+        # NB_DatabaseHub_Control in Fabric, so Manage copied each request ("Manage's function is missing NB_DatabaseHub_Control").
+        $script:notebookId = 'abababab-abab-abab-abab-abababababab'
+        $script:manage = {
+            param([string] $Status, [string] $Notebook)
+            New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status $Status -Message ('FABRIC.APP.ACTIONS {0}' -f $Status) -Evidence ([ordered]@{ controlNotebookId = $Notebook; nonBlocking = 'insightsApp' })
+        }
+        $script:placed = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith {
+            $script:calls.Add(('control {0}' -f $Part))
+            if ($Part -eq 'Fabric') {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status $script:placed -Message ('NB_DatabaseHub_Control {0}' -f $script:placed)
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:calls.Add('app step'); (New-TestResult 'FABRIC.APP.DEPLOY'); (& $script:manage 'Pass' $script:notebookId) }
+        $script:recorded = [System.Collections.Generic.List[hashtable]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:calls.Add('state ' + (@($Value.Keys) -join ',')); $script:recorded.Add(@{} + $Value) }
+        $script:fabricAppRecords = @((New-TestResult 'FABRIC.APP.DEPLOY'), (& $script:manage 'Warning' ''))
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app step') | Should -BeGreaterThan ([array]::IndexOf($calls, 'control Fabric')) -Because 'the app''s step reads the notebook''s IDs'
+        [array]::IndexOf($calls, 'control Fabric') | Should -BeGreaterThan ([array]::IndexOf($calls, 'track Fabric: Fabric'))
+        @($results | Where-Object { $_.checkId -eq 'FABRIC.APP.ACTIONS' } | ForEach-Object { [string]$_.status }) | Should -Be @('Pass') -Because 'its records replace the Fabric track''s'
+        @($results | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' }).Count | Should -Be 1
+        @($script:recorded | Where-Object { $_.Contains('AppControlNotebookId') })[-1]['AppControlNotebookId'] | Should -Be $script:notebookId
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+
+        # Every later run's Fabric track finds the notebook, and a control notebook that isn't in Fabric says why itself:
+        # the app's step doesn't run again.
+        foreach ($case in @(@{ App = 'Pass'; Notebook = $script:notebookId; Placed = 'Pass' }, @{ App = 'Warning'; Notebook = ''; Placed = 'Warning' })) {
+            $script:calls.Clear()
+            $script:placed = $case.Placed
+            $script:fabricAppRecords = @((New-TestResult 'FABRIC.APP.DEPLOY'), (& $script:manage $case.App $case.Notebook))
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            $script:calls | Should -Contain 'control Fabric'
+            $script:calls | Should -Not -Contain 'app step' -Because ('the app''s Manage: {0}; the notebook: {1}' -f $case.App, $case.Placed)
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 1 -Exactly
+    }
+
     It 'starts no sign-in for a run without the Fabric track, or a what-if' {
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in') }
         $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
@@ -2751,6 +2812,36 @@ Describe 'Invoke-DemoParallelDeployment' {
             $calls = @($script:calls)
             [array]::IndexOf($calls, 'fabric items') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })) -Because 'the resume reads the items before it plans'
             [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
+        }
+
+        It 'deploys the Insights app once more on a resume when the state records no notebook for its Manage, and not once it does (2026-11-19)' {
+            # A first run that ended before the app was deployed once more (or ran before 2026-11-19, as dbhubfn's did): its
+            # Fabric step is recorded as finished, so the resume doesn't run it, and its Manage still copies each request.
+            $script:notebookId = 'abababab-abab-abab-abab-abababababab'
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith {
+                if ($Part -eq 'Fabric') {
+                    $script:calls.Add('control Fabric')
+                    New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control was updated.'
+                }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+                $script:calls.Add('app step')
+                New-TestResult 'FABRIC.APP.DEPLOY'
+                New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Manage sends its actions from the app.' -Evidence ([ordered]@{ controlNotebookId = $script:notebookId; nonBlocking = 'insightsApp' })
+            }
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; FabricSha256 = ('f' * 64) }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Not -Contain 'track Fabric: Fabric' -Because 'the earlier run finished the Fabric step'
+            [array]::IndexOf($calls, 'app step') | Should -BeGreaterThan ([array]::IndexOf($calls, 'control Fabric'))
+            $script:tags['AppControlNotebookId'] | Should -Be $script:notebookId
+
+            # The next resume reads that its Manage has the notebook.
+            $script:calls.Clear()
+            $script:tags['Stage'] = 'Monitoring'
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $script:calls | Should -Contain 'control Fabric'
+            $script:calls | Should -Not -Contain 'app step'
         }
 
         It 'keeps the records on -Resume, and lowers on -FromStage only those of the tracks it runs again, as before' {

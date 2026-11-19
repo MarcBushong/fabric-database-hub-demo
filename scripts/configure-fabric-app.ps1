@@ -43,7 +43,9 @@ context, and never pauses, resumes, or scales the capacity.
 5b. Manage (ADR 0029): Resolve-DemoFabricAppOperator reads the operators, the deployer and the users of the demo's admin
    group (FABRIC.APP.OPERATORS), and Set-DemoFabricAppManageSetting writes them, NB_DatabaseHub_Control's IDs, and the
    app's API into the stage for the app's Manage function (FABRIC.APP.ACTIONS). A first deploy records the app's API
-   only in step 6, so it writes them again and deploys once more.
+   only in step 6, so it writes them again and deploys once more, when that completes them. NB_DatabaseHub_Control's
+   IDs come from step 3: when the notebook isn't in Fabric yet (deploy.ps1 puts it there after its tracks), deploy.ps1
+   runs this script once more after it has (Complete-DemoInsightsAppManage, 2026-11-19).
 6. Deploy: Invoke-DemoFabricAppDeployment runs 'rayfin up --yes --json' and 'rayfin up status'
    (FABRIC.APP.DEPLOY, FABRIC.APP.STATUS); when Fabric refuses the Azure CLI's token, FABRIC.APP.TOKEN says why and the
    Rayfin CLI's own sign-in deploys instead.
@@ -488,10 +490,13 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
     }
     if ($deployed -and -not $DryRun -and $null -ne $manage) {
         # A first deploy: rayfin up recorded the app's API only now, so Manage's settings get it, and the app deploys once
-        # more, so that its function checks callers there (about a minute, once). Later deploys find it in the record.
+        # more, so that its function checks callers there (about a minute, once). Later deploys find it in the record. Only
+        # when that lets Manage send (2026-11-19): while something else is missing, such as NB_DatabaseHub_Control before
+        # deploy.ps1 puts it in Fabric, Manage copies each request either way, and the next deploy, which deploy.ps1 runs
+        # once the notebook is there (Complete-DemoInsightsAppManage), reads the API from the record.
         $after = Set-DemoFabricAppManageSetting @manage -Confirm:$false
         $api = [string]$after.evidence['apiUrl']
-        if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written']) {
+        if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written'] -and [string]$after.status -eq 'Pass') {
             $again = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
             $againResult = $again | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' } | Select-Object -First 1
             if ($null -eq $againResult -or $againResult.status -ne 'Pass') {

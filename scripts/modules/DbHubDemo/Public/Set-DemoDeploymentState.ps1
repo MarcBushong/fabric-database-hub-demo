@@ -11,7 +11,7 @@ function Set-DemoDeploymentState {
     FabricCapacityResumedUtc (fabric.manageCapacity, Phase 26b), GuidedStopUtc and T4Sku (Phase 28), T2BuildUtc (Phase
     28 review follow-up), T2InstallMode (2026-11-09), T4Replica and T4ReplicaSize (2026-11-13, ADR 0025), BusyUntilUtc
     and BusyBy (the busy marker, 2026-11-14), FabricSha256 (2026-11-16), FabricWorkspaceId and ControlWorkspaceId
-    (2026-11-17), StartDemoUtc (2026-11-19), and ArcSweepUtc (2026-11-19). A Stage value also
+    (2026-11-17), StartDemoUtc (2026-11-19), ArcSweepUtc (2026-11-19), and AppControlNotebookId (2026-11-19). A Stage value also
     sets StageUtc. A value that the Azure CLI can't carry safely on Windows (a double quote or a percent sign)
     is left out with a warning. The template keeps these tags on every redeployment, because deploy.ps1 passes
     the group's existing tags (ADR 0002). Each write holds the lock that deploy.ps1's parallel tracks share
