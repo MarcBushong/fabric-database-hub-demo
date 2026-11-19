@@ -250,7 +250,7 @@ describe("Database Agent prompts", () => {
             ),
         ).toBeInTheDocument();
         expect(within(card).getByText("Preview")).toBeInTheDocument();
-        expect(within(card).getByText(/The agent proposes; you approve each action/)).toBeInTheDocument();
+        expect(within(card).getByText(/The agent proposes; you decide the response/)).toBeInTheDocument();
         expect(within(card).getByText(/Investigation only: this app never runs anything/)).toBeInTheDocument();
 
         fireEvent.click(within(card).getByRole("button", { name: "Copy prompt 1: What caused it" }));

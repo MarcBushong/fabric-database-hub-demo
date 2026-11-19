@@ -53,7 +53,7 @@ function AgentPanel({ build, lead, warning, visualId }: AgentPanelProps) {
                 </li>
                 <li>
                     <Badge appearance="outline" color="subtle" icon={<ShieldCheckmark16Regular />}>
-                        The agent proposes; you approve each action
+                        The agent proposes; you decide the response
                     </Badge>
                 </li>
                 <li>

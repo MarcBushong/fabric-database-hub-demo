@@ -1,7 +1,8 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-Assigns the nightly safety stop's one role (ADR 0024), for an Owner, once per deployment when deploy.ps1 couldn't.
+Grants the nightly safety stop's role and the session control's roles (ADR 0024, ADR 0026), for an Owner, once per
+deployment when deploy.ps1 couldn't.
 
 .DESCRIPTION
 Every deployment has a nightly safety stop: at the VMs' auto-shutdown time it deallocates the demo's VMs, stops T4 (a
@@ -23,8 +24,8 @@ would do. It never signs in or changes the Azure CLI context: sign in first with
 
 Since 2026-11-14 (ADR 0026) it also grants the on-demand control's roles, which deploy.ps1 sets up in every deployment:
 "DbHub Demo Activity Operator" for id-<prefix>-automation at the demo resource group (A1) and the control's Automation
-account (A2), with the session's actions (create and delete T4's read replica, set its streaming delay, join T4's subnet
-and private DNS zone, read the servers' metrics, tag the demo resource group, and since 2026-11-19 create, read, and
+account (A2), with the session's actions (create and delete T4's read replica, set its streaming delay, read the servers'
+metrics, tag the demo resource group, and since 2026-11-19 create, read, and
 delete T5's container); "DbHub Demo Session Writer" for the same identity at the control vault's two session secrets
 only (A4); and Key Vault Secrets User on the control vault's three secrets for you, the environment's deployer, and
 control.notebookUserObjectIds (A3). The deployer (2026-11-19) is the person whose deploy.ps1 last set up the control

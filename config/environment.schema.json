@@ -316,7 +316,7 @@
           "default": ""
         },
         "notebookUserObjectIds": {
-          "description": "More users who get Key Vault Secrets User on the webhook secret only (A3), besides the Owner who runs -GrantRole. Only -GrantRole assigns them.",
+          "description": "More users who get Key Vault Secrets User on the control vault's three secrets (A3), besides the Owner who grants the roles and the environment's deployer (CONTROL.ROLE.DEPLOYER). deploy.ps1 run by an Owner, or an Owner's grant-safety-stop.ps1, assigns them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/uuid"
