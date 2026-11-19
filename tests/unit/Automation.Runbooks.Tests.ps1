@@ -1800,7 +1800,7 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $script:t5ContainerForbidden = @('DELETE')
         $refused = Remove-DbHubT5Container -Context (New-TestContext) -Tags $tags
         $refused.Outcome | Should -Be 'NotGranted'
-        Get-DbHubT5ContainerText -Outcome $refused | Should -Be 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        Get-DbHubT5ContainerText -Outcome $refused | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         $script:t5Container | Should -Be 'Present'
         # Without T5 in the settings, or without the group's deploymentId: nothing to say, and nothing sent.
         $script:calls.Clear()
@@ -2031,7 +2031,7 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container already gone.'
     }
 
-    It 'deletes T5''s container a session''s stop didn''t, after the VMs and T4, keeps it unless its lifecycle is Session, and makes a delete it isn''t granted Partial (2026-11-19)' {
+    It 'deletes T5''s container a session''s stop didn''t, after the VMs and T4, keeps it unless its lifecycle is Session, and reports a delete it isn''t granted apart from its status (2026-11-19)' {
         $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
         $script:t4 = 'Ready'
         $script:t5Container = 'Present'
@@ -2049,15 +2049,55 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $kept.status | Should -Be 'Stopped'
         $kept.t5 | Should -Be 'T5''s container kept between sessions (the session control''s role can''t create it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
-        # Without the role's container actions yet: Partial, so the job fails after its result line and its history shows it.
+        # Without the role's container actions: kept, and said in t5Status, apart from the job's status (review of ab91ee5).
         $script:calls.Clear()
         $script:groupTags['DbHubT5Container'] = 'Session'
         $script:t5ContainerForbidden = @('DELETE')
         $refused = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
-        $refused.status | Should -Be 'Partial'
-        @($refused.failed) | Should -Be @('T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once')
+        $refused.status | Should -Be 'Stopped'
+        @($refused.failed) | Should -BeNullOrEmpty
+        $refused.t5Status | Should -Be 'NotGranted'
+        $refused.t5 | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         $script:t5Container | Should -Be 'Present'
     }
+
+    It 'keeps T5''s container apart from the status of the nightly stop, the daily T4 stop, and the auto-stop when its role lacks the container''s actions, so T4''s stop still counts (review of ab91ee5, R910)' {
+        # The shared role written back to its 7 actions by older code (R910): a 403 on the container's GET, whether or not
+        # it exists. The VMs and T4 stop as usual, so each job says Stopped (or Skipped), which the cost check of T4's
+        # restart reads (Get-DemoT4RestartCoverage).
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $script:t5Container = ''
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $nightly = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $nightly.status | Should -Be 'Stopped'
+        @($nightly.failed) | Should -BeNullOrEmpty
+        $nightly.t5Status | Should -Be 'NotGranted'
+        $nightly.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        $nightly.message | Should -Not -Match 'keeps billing'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:t4 = 'Ready'
+        $daily = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $daily.status | Should -Be 'Stopped'
+        $daily.t5Status | Should -Be 'NotGranted'
+        $script:t4 = 'Stopped'
+        $stopped = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $stopped.status | Should -Be 'Skipped' -Because 'T4 was stopped already and nothing else was'
+        $stopped.message | Should -Be 'T4 is Stopped. T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $auto = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+        $auto.status | Should -Be 'Stopped'
+        @($auto.failed) | Should -BeNullOrEmpty
+        $auto.t5Status | Should -Be 'NotGranted'
+        @($auto.done) | Should -Contain 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+    }
+
 
     It 'deletes T5''s container in the control''s daily T4 stop too, only while sqlvm01 doesn''t run (2026-11-19)' {
         $script:t4 = 'Stopped'

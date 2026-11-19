@@ -1179,6 +1179,16 @@ function Get-DemoSafetyStopStatus {
             if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred') {
                 $problems.Add('its last run didn''t finish its work')
             }
+            # T5's container (2026-11-19, ADR 0027) is apart from its status (t5Status, review of ab91ee5), so a container it
+            # couldn't delete never makes T4's stop look failed (R910), and it's said here instead.
+            $t5Status = [string](Get-DemoMemberValue -InputObject $stopResult -Name 't5Status')
+            $evidence['lastStopT5'] = $t5Status
+            if ($t5Status -eq 'NotGranted') {
+                $problems.Add('its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until ./scripts/stop-demo.ps1 deletes it')
+            }
+            elseif ($t5Status -eq 'Failed') {
+                $problems.Add('its last run couldn''t delete T5''s container, so it bills until ./scripts/stop-demo.ps1 deletes it')
+            }
         }
         if ($null -ne $runs.Check) {
             $checkResult = $runs.Check.Result
@@ -1215,6 +1225,9 @@ function Get-DemoSafetyStopStatus {
     }
     $fix = if (@($problems | Where-Object { $_ -match 'online past' }).Count -gt 0) {
         'Something kept T3 awake: the activity log''s Resume Databases events name what resumed it (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor). Open the job in {0} (Process Automation > Jobs) for the rest.' -f $name.AutomationAccount
+    }
+    elseif (@($problems | Where-Object { $_ -match 'container''s actions' }).Count -gt 0) {
+        'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: {0}. It gives the role the container''s actions again.' -f $command
     }
     else {
         'Open the job in {0} (Process Automation > Jobs) to see why, then run ./scripts/status.ps1 again; ./scripts/deploy.ps1 sets the safety stop up again.' -f $name.AutomationAccount

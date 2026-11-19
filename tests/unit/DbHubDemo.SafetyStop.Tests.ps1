@@ -777,6 +777,22 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         $warned.remediation | Should -Match 'Process Automation > Jobs'
     }
 
+    It 'warns about T5''s container from its own field, apart from a stop that stopped what ran (review of ab91ee5, R910)' {
+        Set-FakeInPlace
+        $kept = 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'NotGranted'; t5 = $kept; message = ('Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), {0}.' -f $kept) }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'To check: its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until \./scripts/stop-demo\.ps1 deletes it\.$'
+        $warned.message | Should -Not -Match 'didn''t finish its work' -Because 'the VMs and T4 stopped, which the cost check of T4''s restart reads'
+        $warned.remediation | Should -Be 'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json. It gives the role the container''s actions again.'
+        $warned.evidence.lastStopT5 | Should -Be 'NotGranted'
+        $script:jobs = @()
+        $script:outputs = @{}
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000004' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'Deleted'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container deleted (its 400 RU/s stop billing until the next session creates it).' }
+        (& $script:status).status | Should -Be 'Pass'
+    }
+
     It 'warns, with the fix, when <Case>' -ForEach @(
         @{ Case = 'it isn''t set up'; Setup = { }; Match = '^The nightly safety stop isn''t in place \(the schedule dbhub-safety-stop doesn''t exist\), so only the VMs'' own auto-shutdown stops them at 19:00, and nothing stops T4'; Fix = '^Run \./scripts/deploy\.ps1' }
         @{ Case = 'its role isn''t assigned'; Setup = { Set-FakeInPlace; $script:assignments.Clear() }; Match = 'but it can''t stop anything: id-dbhub-demo-safetystop doesn''t hold .* So T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'; Fix = '^An Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json$' }
