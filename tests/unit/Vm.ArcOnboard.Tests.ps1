@@ -639,6 +639,43 @@ Describe 'A restart of the guest that its process didn''t finish (review of #65)
         (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeFalse
         (Get-TestLastRestart -Root $script:root).endedUtc | Should -BeNullOrEmpty
     }
+
+    It 'never restarts a guest that still runs its old boot under a golden capture, and keeps its entry for later (review of the #65 follow-up)' {
+        Mock -CommandName Get-DemoGuestHostVmId -MockWith { '' }
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromHours(3)
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-4).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath 'golden') -Force | Out-Null
+        # A marker that names no host counts as a capture in progress (fail closed).
+        Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json') -Value '{"snapshotName":"snap-dbhub-t2golden-202611190400"}'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        (Get-TestLastRestart -Root $script:root).endedUtc | Should -BeNullOrEmpty
+        # Once the capture is over, a run finishes it.
+        Remove-Item -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json')
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 1 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+    }
+
+    It 'takes a running guest whose uptime rounds to 0 as restarted, so it only completes its entry (review of the #65 follow-up)' {
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromSeconds(2)
+        $script:answers = $true
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        (Get-TestLastRestart -Root $script:root).stoppedBy | Should -Be 'Interrupted'
+        # Only a running guest: one that's off, or one without an uptime, can't tell.
+        $since = [DateTime]::UtcNow.AddMinutes(-1)
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Off'; Uptime = [timespan]::Zero }) -SinceUtc $since | Should -BeFalse
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Running' }) -SinceUtc $since | Should -BeFalse
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Running'; Uptime = [timespan]::FromHours(1) }) -SinceUtc $since | Should -BeFalse
+    }
 }
 
 Describe 'A golden capture marker, read as Get-GoldenCaptureProgress reads it (second review of #65)' {

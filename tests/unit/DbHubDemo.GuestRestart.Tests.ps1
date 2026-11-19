@@ -114,3 +114,33 @@ Describe 'deploy.ps1''s report of a guest restart that cleared a broken PowerShe
         InModuleScope DbHubDemo { New-DemoRunRecoveryKey -RunId '' } | Should -Match '^deploy-[0-9a-f]{12}$'
     }
 }
+
+Describe 'deploy.ps1 waits for the T2 host''s pass over a new bootstrap generation (#65 follow-up)' {
+    It 'keeps waiting while the generation is pending, reading every minute, and ends once the pass reports' {
+        InModuleScope DbHubDemo {
+            $script:reads = 0
+            $script:sleeps = [System.Collections.Generic.List[int]]::new()
+            Mock -CommandName Get-DemoArcTarget -MockWith { [pscustomobject]@{ InstallMode = 'JumpstartImage' } }
+            Mock -CommandName Get-DemoVmHealth -MockWith {
+                $script:reads++
+                if ($script:reads -lt 3) {
+                    [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generation = 'bbbbbbbbbbbb-20261119040000'; generationPending = $true }
+                }
+                else {
+                    [pscustomobject]@{ state = 'Ready'; generation = 'bbbbbbbbbbbb-20261119040000'; message = 'Every step is in the desired state.' }
+                }
+            }
+            Mock -CommandName Complete-DemoT2GuestRebuild -MockWith { @() }
+            Mock -CommandName Set-DemoProgressStep -MockWith { }
+            Mock -CommandName Write-DemoLog -MockWith { }
+            Mock -CommandName Get-DemoRunCommandStuckResult -MockWith { @() }
+            Mock -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds) }
+            $build = Wait-DemoT2HostBuild -Config @{ prefix = 'dbhub' } -DeadlineUtc ([DateTime]::UtcNow.AddHours(1)) -PollSeconds 300 -BundlePrefix 'bbbbbbbbbbbb'
+            $build.TimedOut | Should -BeFalse
+            $build.Health.state | Should -Be 'Ready'
+            $script:reads | Should -Be 3
+            @($script:sleeps) | Should -Be @(60, 60)
+            Should -Invoke -CommandName Write-DemoLog -ParameterFilter { $Message -match 'checks every step again for this run''s bootstrap generation' }
+        }
+    }
+}

@@ -651,7 +651,8 @@ function Test-DemoGuestCaptureInProgress {
 
 function Test-DemoGuestRestartedSince {
     # True when the guest has booted since SinceUtc (its uptime is shorter than the time since), false when it still runs
-    # the boot it had then, or when that can't be told. Never throws.
+    # the boot it had then, or when that can't be told. A running guest whose uptime rounds to 0 (under about 3 seconds)
+    # has just booted, so it counts as restarted (review of #65's follow-up). Never throws.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -673,7 +674,11 @@ function Test-DemoGuestRestartedSince {
             return $false
         }
         $uptime = Get-DemoGuestUptime -Vm $Vm
-        return ($uptime -gt 0 -and $uptime -lt ($NowUtc.ToUniversalTime() - $since).TotalMinutes)
+        if ($uptime -le 0) {
+            $read = { param([string] $Name) if ($null -eq $Vm) { return $null }; $property = $Vm.PSObject.Properties[$Name]; if ($null -ne $property) { $property.Value } else { $null } }
+            return ($null -ne (& $read 'Uptime') -and [string](& $read 'State') -eq 'Running')
+        }
+        return ($uptime -lt ($NowUtc.ToUniversalTime() - $since).TotalMinutes)
     }
     catch {
         return $false
@@ -741,7 +746,8 @@ function Complete-DemoGuestRecoveryInterrupted {
     off on purpose (Test-DemoGuestHeldOff: a golden capture on this host, or a restored copy that isn't released yet).
     One that still runs the boot the restart began on (Hyper-V says Running until the guest's operating system powers
     off, so it may be shutting down) is restarted (Restart-DemoGuestVm: up to StopMinutes for its shutdown, then turned
-    off, then started). One that booted since only gets its entry completed. The entry ends with stoppedBy Interrupted,
+    off, then started), unless a golden capture is in progress on this host (Test-DemoGuestCaptureInProgress). One that
+    booted since only gets its entry completed. The entry ends with stoppedBy Interrupted,
     never while the guest is still Off. A guest that's Off for any other reason, without such an entry, is never
     started here.
     #>
@@ -794,6 +800,12 @@ function Complete-DemoGuestRecoveryInterrupted {
         if ($state -eq 'Off' -and (Test-DemoGuestHeldOff -StateRoot $StateRoot)) {
             return $null
         }
+        # Still the boot the restart began on, so it's restarted below; never under a golden capture on this host (review
+        # of #65's follow-up), which owns the guest: its entry stays for a run after the capture.
+        $sameBoot = $state -ne 'Off' -and -not (Test-DemoGuestRestartedSince -Vm $vm -SinceUtc $entry['startedUtc'])
+        if ($sameBoot -and (Test-DemoGuestCaptureInProgress -StateRoot $StateRoot)) {
+            return $null
+        }
         if (-not $PSCmdlet.ShouldProcess($Name, 'Finish a restart that was interrupted')) {
             return $null
         }
@@ -806,7 +818,7 @@ function Complete-DemoGuestRecoveryInterrupted {
             Start-Sleep -Seconds 20
             $how = 'it was started again'
         }
-        elseif (-not (Test-DemoGuestRestartedSince -Vm $vm -SinceUtc $entry['startedUtc'])) {
+        elseif ($sameBoot) {
             # Still the boot the restart began on: Hyper-V says Running until the guest's operating system powers off, so it
             # may be shutting down, or its process ended before Stop-VM. It's restarted as that recovery meant to be:
             # Restart-DemoGuestVm waits up to StopMinutes for it to be off, turns it off after that, and starts it.
