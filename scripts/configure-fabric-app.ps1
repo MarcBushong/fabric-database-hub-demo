@@ -33,7 +33,9 @@ context, and never pauses, resumes, or scales the capacity.
    name (FABRIC.APP.ITEMS). Their IDs build the app's new-tab links.
 4. Stage: Sync-DemoFabricAppStage mirrors fabric/app into the Git-ignored out/fabric-app, writes the connector's IDs
    to rayfin/.env and the links and the resource group name (for the Database Agent prompts) to
-   public/dbhub-app.json, and runs npm ci when the lock file changed (FABRIC.APP.STAGE, FABRIC.APP.DEPENDENCIES).
+   public/dbhub-app.json, drops rayfin up's records of other workspaces (a destroyed environment's, which rayfin up
+   would otherwise reuse for a new workspace with the same name), and runs npm ci when the lock file changed
+   (FABRIC.APP.STAGE, FABRIC.APP.DEPENDENCIES).
 5. Prerequisites: Test-DemoFabricAppPrerequisite checks Node.js, the sign-in the Rayfin CLI uses (the Azure CLI's
    tokens, or with -RayfinSignIn its own sign-in to the demo's tenant), and the Fabric Apps (preview) and Execute
    Queries tenant settings (FABRIC.APP.NODE, .SIGNIN, .TENANTSETTING, .EXECUTEQUERIES). With -SignIn, a missing sign-in
@@ -398,7 +400,7 @@ if ($config -and $guarded -and $resourceGroupName) {
     $deployFile['ask'] = [ordered]@{ relayUrl = $askRelay; estate = $true }
 }
 $envValues = [ordered]@{ DBHUB_FABRIC_WORKSPACE_ID = $targetWorkspaceId; DBHUB_SEMANTIC_MODEL_ID = $modelId }
-$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -FunctionScope $functionScope -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
+$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -FunctionScope $functionScope -WorkspaceId $targetWorkspaceId -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
 $results.AddRange([object[]]$stageResults)
 if (@($stageResults | Where-Object { $_.status -eq 'Fail' }).Count -gt 0) {
     & $skip 'FABRIC.APP.DEPLOY' 'The deploy stage isn''t ready, so nothing was deployed.'

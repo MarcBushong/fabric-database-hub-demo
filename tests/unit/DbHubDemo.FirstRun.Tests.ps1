@@ -839,6 +839,8 @@ Describe 'Reading back what a deployment recorded (issue 60)' {
             $item = { param([string] $Type, [string] $Name) [pscustomobject]@{ type = $Type; displayName = $Name } }
             $decide = { param([object] $ItemList) Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000099' -ItemList $ItemList -Allowed $allowed -Notebook $notebooks }
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub'), (& $item 'Notebook' 'NB_DatabaseHub_Control')))).Import | Should -BeTrue
+            # The Insights app's deployment since 2026-11-18 adds its functions item, under the app's own name.
+            (& $decide (& $list @((& $item 'Notebook' 'NB_DatabaseHub_Deployment'), (& $item 'AppBackend' 'APP_DatabaseHub_Insights'), (& $item 'UserDataFunction' 'APP_DatabaseHub_Insights_connector'), (& $item 'UserDataFunction' 'APP_DatabaseHub_Insights')))).Reason | Should -Match '^everything in "Contoso Hub" is the demo''s \(4 item\(s\)\)'
             (& $decide (& $list @((& $item 'Notebook' 'nb_databasehub_control')))).Import | Should -BeFalse
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub')) $false)).Import | Should -BeFalse -Because 'items it didn''t list could be anyone''s'
             $many = & $decide (& $list @(1..7 | ForEach-Object { & $item 'Notebook' ('Mine{0}' -f $_) }))
