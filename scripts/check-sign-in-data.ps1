@@ -30,7 +30,9 @@ Remove what's found, then check again.
 With -Clean, also clear the Security log when it holds a token-shaped value.
 
 .PARAMETER Force
-Don't ask for confirmation before -Clean.
+Don't ask for confirmation before -Clean. Where no one can answer a prompt (CI, redirected input, a launcher, or an
+assistant), -Clean without -Force asks nothing: it stops at once, checks and changes nothing, and its result
+(SECURITY.SIGNIN.CONFIRM, Manual action required) gives this command with -Force.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
@@ -40,6 +42,10 @@ Where to write the results as JSON lines.
 
 .EXAMPLE
 ./scripts/check-sign-in-data.ps1 -VmName archost01 -Clean
+
+.EXAMPLE
+./scripts/check-sign-in-data.ps1 -VmName archost01 -Clean -Force
+Cleans without asking, for a terminal where no one can answer.
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
@@ -76,7 +82,29 @@ $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 $config = Get-DemoConfig -Path $ConfigPath
 # A check changes nothing on the VMs, so it never asks; a cleanup asks unless -Force.
 $confirm = $Clean -and -not $Force -and $ConfirmPreference -ne 'None'
-$results = @(Find-DemoSignInData -Config $config -VmName $VmName -Clean:$Clean -ClearSecurityLog:$ClearSecurityLog -WhatIf:([bool]$WhatIfPreference) -Confirm:$confirm)
+if ($confirm -and -not [bool]$WhatIfPreference -and -not [bool](Get-DemoRunEnvironment).Interactive) {
+    # Nobody can answer here (the final tests' F9, 2026-11-19: a launcher's -Clean waited 7.5 minutes on the question, with
+    # nothing on its screen), so it stops at once, as init.ps1 does, with the same command and -Force.
+    $words = [System.Collections.Generic.List[string]]::new()
+    $words.Add('./scripts/check-sign-in-data.ps1')
+    if ($PSBoundParameters.ContainsKey('ConfigPath')) {
+        $words.Add(('-ConfigPath "{0}"' -f [string]$PSBoundParameters['ConfigPath']))
+    }
+    if ($VmName.Count -gt 0) {
+        $words.Add(('-VmName {0}' -f (@($VmName | Select-Object -Unique) -join ',')))
+    }
+    $words.Add('-Clean')
+    if ($ClearSecurityLog) {
+        $words.Add('-ClearSecurityLog')
+    }
+    $words.Add('-Force')
+    $command = $words -join ' '
+    $message = 'Nothing was checked or cleaned: -Clean asks before it changes the VMs, and no one can answer here (CI, redirected input, a launcher, or an assistant), so it didn''t wait.'
+    $results = @(New-DemoResult -CheckId 'SECURITY.SIGNIN.CONFIRM' -Area 'security' -Target 'subscription' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ command = $command }) -Remediation ('Run {0} to clean without asking, or run the same command without -Force in a terminal that can take input, to confirm it there.' -f $command) -DocUrl 'https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_commonparameters#-confirm')
+}
+else {
+    $results = @(Find-DemoSignInData -Config $config -VmName $VmName -Clean:$Clean -ClearSecurityLog:$ClearSecurityLog -WhatIf:([bool]$WhatIfPreference) -Confirm:$confirm)
+}
 
 Write-DemoResultReport -Result $results -Title 'check-sign-in-data.ps1'
 Export-DemoResult -Result $results -Path $OutputPath

@@ -395,6 +395,65 @@ function ConvertTo-DemoArcTagString {
     return (@($pairs) -join ',')
 }
 
+function Get-DemoArcSweepOwed {
+    <#
+    .SYNOPSIS
+    Whether the sign-in data sweep after an Arc onboarding of T2's guest is still owed (2026-11-19, dbhubfn): the UTC time
+    that onboarding began, from the resource group's DbHubArcSweepUtc, or '' when none is. Tags that can't be read (the
+    demo's group always has some) count as owed ('unknown'), so a later run sweeps rather than skip a verification (fail
+    closed). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Target
+    )
+
+    $tags = Get-DemoResourceGroupTag -SubscriptionId $Target.SubscriptionId -ResourceGroupName $Target.ResourceGroupName
+    if ($null -eq $tags -or $tags.Count -eq 0) {
+        Write-DemoLog -Level Warning -Message ('The tags of {0} couldn''t be read, so the sign-in data check after T2''s Arc onboarding runs again to be sure.' -f $Target.ResourceGroupName)
+        return 'unknown'
+    }
+    $name = (Get-DemoDeploymentStateTagName)['ArcSweepUtc']
+    foreach ($key in @($tags.Keys)) {
+        if ([string]::Equals([string]$key, $name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return ([string]$tags[$key]).Trim()
+        }
+    }
+    return ''
+}
+
+function Set-DemoArcSweepOwed {
+    <#
+    .SYNOPSIS
+    Records on the resource group (DbHubArcSweepUtc) that the sign-in data sweep after an Arc onboarding of T2's guest is
+    owed, with the time the onboarding began, or, with an empty Value, that it passed. Returns whether it was recorded; a
+    failure is a warning, never an error, because the run's own sweep follows at once. Internal.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $Value = ''
+    )
+
+    if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), $(if ($Value) { 'Record that the sign-in data check after T2''s Arc onboarding is owed' } else { 'Record that the sign-in data check after T2''s Arc onboarding passed' }))) {
+        return $false
+    }
+    try {
+        Set-DemoDeploymentState -Config $Config -Value @{ ArcSweepUtc = $Value } -Confirm:$false
+        return $true
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The record of the sign-in data check after T2''s Arc onboarding (DbHubArcSweepUtc) wasn''t {0}: {1}' -f $(if ($Value) { 'written, so a later run may not run it again if this one fails' } else { 'cleared, so the next run runs it once more' }), $_.Exception.Message)
+        return $false
+    }
+}
+
 function Get-DemoArcOnboardingDecision {
     <#
     .SYNOPSIS
