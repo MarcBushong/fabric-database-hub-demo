@@ -359,6 +359,66 @@ Describe 'Lifecycle scripts' {
             }
         }
 
+        It 'still reports the ending''s outcome, with what it added, and DONE, when Ctrl+C cuts the stop at the end of an update short (the review of 2026-11-19, finding 2)' {
+            # A real pipeline stop during the ending, which deploy.ps1 calls from a finally block that began as usual: the
+            # ending finishes in its own finally block and hands its outcome over (-Ending); before the fix, nothing after the
+            # call ran, so neither DONE nor out/deploy.jsonl came.
+            $log = Join-Path -Path $TestDrive -ChildPath ('endstop-' + [guid]::NewGuid().ToString('N') + '.log')
+            $output = Join-Path -Path $TestDrive -ChildPath ('endstop-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            $runner = [powershell]::Create()
+            $null = $runner.AddScript({
+                    param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
+                    Import-Module -Name $ModulePath
+                    . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
+                    function global:Get-StopTestRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Start-Transcript { }
+                    function global:Stop-Transcript { }
+                    function global:Initialize-StopTestFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-StopTestDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-StopTestDeployment { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+                    # The ending, stopped while its stop at the end waits, as Complete-DemoDeploymentRun is: it finishes in
+                    # its own finally block.
+                    function global:Complete-StopTestDeploymentRun {
+                        param([System.Collections.IDictionary] $Ending)
+                        try {
+                            Write-StopTestLog 'stopping at the end'
+                            Start-Sleep -Seconds 60
+                            Write-StopTestLog 'not stopped'
+                        }
+                        finally {
+                            $Ending['Outcome'] = [pscustomobject]@{ Kind = 'Done'; ExitCode = 0; Minutes = 1; Reason = ''; Next = ''; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = ''; Added = @(New-DemoResult -CheckId 'DEPLOY.ENDSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'deploy.ps1 was stopped (Ctrl+C) while the stop at its end waited.') }
+                            Write-StopTestLog 'ending finished'
+                        }
+                    }
+                    function global:Exit-StopTestKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-StopTestDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    foreach ($name in 'Get-DemoRunEnvironment', 'Initialize-DemoFirstRun', 'Start-DemoDeploymentRun', 'Invoke-DemoDeployment', 'Complete-DemoDeploymentRun', 'Exit-DemoKeepAwake', 'Write-DemoDeploymentOutcome') {
+                        Set-Alias -Name $name -Value ($name -replace '-Demo', '-StopTest') -Scope Global
+                    }
+                    & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
+                }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($output).AddArgument($log)
+            $null = $runner.BeginInvoke()
+            try {
+                $watch = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not ((Test-Path -LiteralPath $log) -and (Get-Content -LiteralPath $log) -contains 'stopping at the end') -and $watch.Elapsed.TotalSeconds -lt 90) {
+                    Start-Sleep -Milliseconds 200
+                }
+                $runner.Stop()
+                $lines = @(Get-Content -LiteralPath $log)
+                $lines | Should -Contain 'stopping at the end'
+                $lines | Should -Not -Contain 'not stopped'
+                $lines | Should -Contain 'ending finished'
+                $lines | Should -Contain 'awake released'
+                $lines | Should -Contain 'banner Done'
+                $exported = @(Get-Content -LiteralPath $output | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+                @($exported | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' }).Count | Should -Be 1
+                @($exported | Where-Object { $_.checkId -eq 'TEST.RESULT' }).Count | Should -Be 1
+            }
+            finally {
+                $runner.Dispose()
+            }
+        }
+
         It 'lets the PC sleep again when it''s stopped while the run''s experience starts (Phase 28 live finding)' {
             Mock -CommandName Start-DemoDeploymentRun -MockWith { throw 'stopped while the run started' }
             Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }

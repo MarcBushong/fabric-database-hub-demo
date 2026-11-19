@@ -20,6 +20,11 @@
 
 $script:DbHubArmRoot = 'https://management.azure.com'
 $script:DbHubActiveJobStatuses = @('New', 'Activating', 'Running', 'Resuming', 'Blocked', 'Stopping', 'Suspending')
+# start-demo.ps1's own auto-stop (2026-11-19) is the same one-time schedule as a run's, autoStopSchedule, whose description
+# begins with this marker ($script:ActivityControlStartDemoMarker in the module, which must match): it never makes a run
+# active (Get-DbHubAutoStopRunEnd), so a later Run all, the Insights app's Start, or a run replaces it with its own plan,
+# and it waits for a deploy.ps1 run that's still going (Get-DbHubStartDemoDeferral).
+$script:DbHubStartDemoMarker = '[start-demo.ps1]'
 
 function Get-DbHubMember {
     # A property of a PSCustomObject or a key of a dictionary, or $null when it's missing (strict-mode safe).
@@ -750,7 +755,9 @@ function Get-DbHubActiveRun {
 
 function Get-DbHubAutoStopRunEnd {
     # Whether a run's auto-stop is pending: State None (no schedule, or its run has ended: its start minus
-    # autoStopBufferMinutes has passed), Pending (with RunEndUtc), or Unknown (it couldn't be read, with Error).
+    # autoStopBufferMinutes has passed), Pending (with RunEndUtc), or Unknown (it couldn't be read, with Error). StartDemo
+    # says the schedule is start-demo.ps1's own auto-stop (2026-11-19): that's never a run that's active, so it's None, and a
+    # run's Register-DbHubAutoStop replaces it with its own plan.
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context
@@ -760,19 +767,23 @@ function Get-DbHubAutoStopRunEnd {
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
     $schedule = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/schedules/{1}' -f (Get-DbHubAccountPath -Settings $settings), $settings.autoStopSchedule) -ApiVersion $version
     if ($schedule.StatusCode -eq 404) {
-        return [pscustomobject]@{ State = 'None'; RunEndUtc = $null; Error = '' }
+        return [pscustomobject]@{ State = 'None'; RunEndUtc = $null; Error = ''; StartDemo = $false }
     }
     if ($schedule.StatusCode -ne 200) {
-        return [pscustomobject]@{ State = 'Unknown'; RunEndUtc = $null; Error = $schedule.Error }
+        return [pscustomobject]@{ State = 'Unknown'; RunEndUtc = $null; Error = $schedule.Error; StartDemo = $false }
     }
-    $start = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $schedule.Body -Name 'properties') -Name 'startTime')
+    $properties = Get-DbHubMember -InputObject $schedule.Body -Name 'properties'
+    if (([string](Get-DbHubMember -InputObject $properties -Name 'description')).StartsWith($script:DbHubStartDemoMarker, [System.StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ State = 'None'; RunEndUtc = $null; Error = ''; StartDemo = $true }
+    }
+    $start = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $properties -Name 'startTime')
     if ($null -ne $start) {
         $runEnd = $start.AddMinutes(-1 * [int]$settings.autoStopBufferMinutes)
         if ($runEnd -gt $Context.NowUtc) {
-            return [pscustomobject]@{ State = 'Pending'; RunEndUtc = $runEnd; Error = '' }
+            return [pscustomobject]@{ State = 'Pending'; RunEndUtc = $runEnd; Error = ''; StartDemo = $false }
         }
     }
-    return [pscustomobject]@{ State = 'None'; RunEndUtc = $null; Error = '' }
+    return [pscustomobject]@{ State = 'None'; RunEndUtc = $null; Error = ''; StartDemo = $false }
 }
 
 function Get-DbHubMonitorScheduleName {
@@ -855,7 +866,8 @@ function Register-DbHubAutoStop {
     <#
     .SYNOPSIS
     Creates the one-time schedule autoStopSchedule at AutoStopUtc, linked to DbHub-Stop (Scope All), after removing
-    the previous one. It's created before anything starts, so every run has its stop.
+    the previous one. It's created before anything starts, so every run has its stop. -Description replaces the run's own
+    (2026-11-19: a start-demo.ps1 auto-stop that waits for deploy.ps1 keeps its marker, and so does its backup).
     https://learn.microsoft.com/rest/api/automation/schedule/create-or-update
     https://learn.microsoft.com/rest/api/automation/job-schedule/create
     #>
@@ -864,7 +876,9 @@ function Register-DbHubAutoStop {
         [object] $Context,
 
         [Parameter(Mandatory = $true)]
-        [datetime] $AutoStopUtc
+        [datetime] $AutoStopUtc,
+
+        [string] $Description = ''
     )
 
     $settings = $Context.Settings
@@ -874,10 +888,13 @@ function Register-DbHubAutoStop {
         return [pscustomobject]@{ Created = $false; Error = 'the previous auto-stop couldn''t be removed'; StartUtc = ''; BackupUtc = '' }
     }
     $start = [DateTime]::SpecifyKind($AutoStopUtc, [System.DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    if (-not $Description) {
+        $Description = 'Stops the demo after the on-demand run that job {0} started (ADR 0020).' -f $Context.JobId
+    }
     $body = @{
         name       = [string]$settings.autoStopSchedule
         properties = @{
-            description = ('Stops the demo after the on-demand run that job {0} started (ADR 0020).' -f $Context.JobId)
+            description = $Description
             startTime   = $start
             frequency   = 'OneTime'
             timeZone    = 'UTC'
@@ -908,7 +925,11 @@ function Register-DbHubAutoStop {
             $minutes = 30
         }
         $backupStart = [DateTime]::SpecifyKind($AutoStopUtc, [System.DateTimeKind]::Utc).AddMinutes($minutes).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
-        $backupBody = @{ name = $backup; properties = @{ description = ('Stops the demo if the auto-stop of the run that job {0} started didn''t (ADR 0026).' -f $Context.JobId); startTime = $backupStart; frequency = 'OneTime'; timeZone = 'UTC' } }
+        $backupDescription = 'Stops the demo if the auto-stop of the run that job {0} started didn''t (ADR 0026).' -f $Context.JobId
+        if ($Description.StartsWith($script:DbHubStartDemoMarker, [System.StringComparison]::Ordinal)) {
+            $backupDescription = '{0} Stops the demo if the auto-stop of the start-demo.ps1 session didn''t.' -f $script:DbHubStartDemoMarker
+        }
+        $backupBody = @{ name = $backup; properties = @{ description = $backupDescription; startTime = $backupStart; frequency = 'OneTime'; timeZone = 'UTC' } }
         $made = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/schedules/{1}' -f $account, $backup) -ApiVersion $version -Body $backupBody
         if ($made.StatusCode -in 200, 201) {
             $backupLink = @{ properties = @{ schedule = @{ name = $backup }; runbook = @{ name = [string]$settings.stopRunbook }; parameters = @{ Scope = 'All' } } }
@@ -1184,6 +1205,48 @@ function Get-DbHubBusyDeferral {
         $result | Add-Member -NotePropertyName 't3' -NotePropertyValue 'Deferred'
     }
     return $result
+}
+
+function Get-DbHubStartDemoDeferral {
+    <#
+    .SYNOPSIS
+    start-demo.ps1's auto-stop waits for a deploy.ps1 run that's still going (2026-11-19), as the nightly stop does: when
+    the auto-stop is start-demo.ps1's (its description's marker) and the busy marker says deploy.ps1 runs (DbHubBusyBy
+    deploy, Get-DbHubBusyMarker), it moves to 5 minutes after the marker's end, keeping its marker (Register-DbHubAutoStop
+    -Description), and nothing is stopped now. Returns the Deferred result, or $null when the stop goes on. A session's
+    auto-stop from the control notebook never waits: its session ends at its own plan.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $settings = $Context.Settings
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
+    if (-not $busy.Active -or $busy.By -ne 'deploy') {
+        return $null
+    }
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
+    $schedule = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/schedules/{1}' -f (Get-DbHubAccountPath -Settings $settings), $settings.autoStopSchedule) -ApiVersion $version
+    if ($schedule.StatusCode -ne 200) {
+        return $null
+    }
+    $description = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $schedule.Body -Name 'properties') -Name 'description')
+    if (-not $description.StartsWith($script:DbHubStartDemoMarker, [System.StringComparison]::Ordinal)) {
+        return $null
+    }
+    $until = $busy.UntilUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $moved = Register-DbHubAutoStop -Context $Context -AutoStopUtc $busy.UntilUtc.AddMinutes(5) -Description $description
+    $then = 'it stops the demo at {0}' -f $moved.StartUtc
+    if (-not $moved.Created) {
+        $then = 'it couldn''t be moved ({0}), so the nightly stop, which waits for deploy.ps1 too, stops the demo' -f $moved.Error
+    }
+    $message = 'Deferred: deploy.ps1 is still running (busy until {0}), so start-demo.ps1''s auto-stop stopped nothing now; {1}.' -f $until, $then
+    Write-DbHubLog -Context $Context -Message $message
+    return [pscustomobject]@{ action = 'stop-all'; status = 'Deferred'; message = $message; busyUntil = $until; busyBy = $busy.By; autoStopUtc = [string]$moved.StartUtc }
 }
 
 function Get-DbHubT3State {
@@ -6508,6 +6571,11 @@ function Invoke-DbHubStop {
             return [pscustomobject]@{ action = $label; status = $status; message = ('T4 is {0}.{1}{2}' -f $t4.State, $replicaSentence, $t5Sentence); replica = $replicaDone.Text; t5 = $t5Part.Text; t5Status = $t5Part.Status }
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
+    }
+    # start-demo.ps1's auto-stop (2026-11-19) waits for a deploy.ps1 run that's still going; a session's never does.
+    $waiting = Get-DbHubStartDemoDeferral -Context $Context -Tags $group.Tags
+    if ($null -ne $waiting) {
+        return $waiting
     }
     $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds
     $status = 'Stopped'

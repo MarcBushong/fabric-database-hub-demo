@@ -1645,6 +1645,13 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:order | Should -Contain 'SaveHistory'
         }
 
+        It 'with -SkipFabric, the stop at the end of an update, stops the VMs but neither saves the history nor pauses the capacity (2026-11-19)' {
+            # That run took its own history snapshot, which a pause would cancel.
+            $script:stopConfig['fabric']['saveHistoryOnStop'] = $true
+            Stop-DemoEnvironment -Config $script:stopConfig -SkipFabric -Confirm:$false | Out-Null
+            $script:order | Should -Be @('Deallocate:archost01', 'Deallocate:sqlvm01')
+        }
+
         It 'keeps T4''s and its read replica''s captured metrics when the history run didn''t save them, and only then (ADR 0025)' {
             # stop-demo.ps1 deletes the replica, and Azure Monitor no longer answers for its metrics then: a paused capacity
             # mustn't lose the session's lag without a word.

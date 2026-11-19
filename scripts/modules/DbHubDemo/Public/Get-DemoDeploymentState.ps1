@@ -31,7 +31,8 @@ function Get-DemoDeploymentState {
     ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
     ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), T5Refused (when
     Azure didn't create T5's account and the run deployed the rest without it, in DbHubT5Refused; 2026-11-19,
-    Resolve-DemoT5LeftOut), and Tags
+    Resolve-DemoT5LeftOut), StartDemoUtc (when the last start-demo.ps1 began, in DbHubStartDemoUtc; 2026-11-19,
+    Get-DemoUpdateStopSession), and Tags
     (every tag on the group). Read-only.
 
     .PARAMETER Config
@@ -93,6 +94,7 @@ function Get-DemoDeploymentState {
         FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
         ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
         T5Refused         = & $read 'T5Refused'
+        StartDemoUtc      = & $read 'StartDemoUtc'
         Tags              = $tags
     }
 }

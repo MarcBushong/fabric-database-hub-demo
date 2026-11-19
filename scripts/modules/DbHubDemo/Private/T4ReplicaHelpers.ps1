@@ -1812,19 +1812,24 @@ function Get-DemoT4ReplicaHold {
     <#
     .SYNOPSIS
     Whether a demo session uses T4's read replica now (2026-11-16), so deploy.ps1 leaves it at its end
-    (Invoke-DemoT4ReplicaDeployEnd). Returns Held, By (Control, StartDemo, Unknown, or ''), UntilUtc, and Error. Read-only;
-    never throws. Internal.
+    (Invoke-DemoT4ReplicaDeployEnd). Returns Held, By (Control, StartDemo, Unknown, or ''), UntilUtc, StartedUtc (a
+    start-demo.ps1 auto-stop's session start, from its description; $null otherwise), and Error. Read-only; never throws.
+    Internal.
 
     .DESCRIPTION
     - A session or run the control notebook started (ADR 0020, ADR 0026): its auto-stop, the one-time schedule
       dbhub-autostop in the control's Automation account, is still to come. That auto-stop deletes the replica at the
-      session's end.
+      session's end. Since 2026-11-19 a start-demo.ps1 session has one too, marked in its description: By StartDemo.
     - A session start-demo.ps1 started: the replica's DbHubSessionUntilUtc tag, the VMs' next auto-shutdown when the
       session started, is still ahead. A new replica has it from its creation (Start-DemoT4ReplicaCreate); one that was
       there already gets it from Set-DemoT4ReplicaHold. The tag goes with the replica, which stop-demo.ps1 and a
       control session's auto-stop delete; one more than a day ahead is ignored, so no tag keeps a replica longer.
     - The control's auto-stop couldn't be read (anything but "not there", such as no control at all): Held, By Unknown,
-      so a replica a session may use is never deleted.
+      so a replica a session may use is never deleted. So is a replica whose mark couldn't be read (2026-11-19, the review
+      of the stop at the end of an update): its read failed, or the resource group has no deploymentId tag to name it.
+    - -StartDemoSinceUtc (deploy.ps1's stop at the end of an update, which found the demo stopped when it began): a
+      start-demo.ps1 auto-stop from a session that started before then is left over, because the nightly stop or the VMs'
+      auto-shutdown ended that session without removing it, so it doesn't count (Ignored has its time).
     https://learn.microsoft.com/rest/api/automation/schedule/get
     #>
     [CmdletBinding()]
@@ -1838,19 +1843,39 @@ function Get-DemoT4ReplicaHold {
 
         [string] $DeploymentId = '',
 
+        [AllowNull()]
+        [object] $StartDemoSinceUtc = $null,
+
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
     $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { $NowUtc }
+    $since = if ($null -ne $StartDemoSinceUtc) { ConvertTo-DemoUtcDateTime -Value $StartDemoSinceUtc } else { $null }
+    $ignored = $null
     $controlError = ''
     try {
         $name = Get-DemoActivityControlName -Config $Config
         $url = Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
         $schedule = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url $url
         if ($schedule.Ok) {
-            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+            $properties = Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties'
+            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
             if ($null -ne $stopUtc -and $stopUtc -gt $now) {
-                return [pscustomobject]@{ Held = $true; By = 'Control'; UntilUtc = $stopUtc; Error = '' }
+                # A start-demo.ps1 session's own auto-stop (2026-11-19) is the same schedule, marked in its description, which
+                # also says when its session started (Register-DemoActivityControlAutoStop).
+                $description = [string](Get-DemoMemberValue -InputObject $properties -Name 'description')
+                $startDemo = $description.StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+                $startedUtc = $null
+                $found = [regex]::Match($description, 'session started at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)')
+                if ($startDemo -and $found.Success) {
+                    $startedUtc = ConvertTo-DemoUtcDateTime -Value $found.Groups[1].Value
+                }
+                if ($startDemo -and $null -ne $startedUtc -and $null -ne $since -and $startedUtc -lt $since) {
+                    $ignored = $stopUtc
+                }
+                else {
+                    return [pscustomobject]@{ Held = $true; By = $(if ($startDemo) { 'StartDemo' } else { 'Control' }); UntilUtc = $stopUtc; StartedUtc = $startedUtc; Ignored = $null; Error = '' }
+                }
             }
         }
         elseif (-not $schedule.Missing) {
@@ -1860,24 +1885,36 @@ function Get-DemoT4ReplicaHold {
     catch {
         $controlError = Protect-DemoText -Text $_.Exception.Message
     }
+    $replicaError = ''
+    $replicaError = ''
     try {
         if ($null -eq $Replica) {
             $Replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
+        }
+        # A mark that can't be read keeps a session it may belong to (2026-11-19): a read that failed, or no server name
+        # because the resource group has no deploymentId tag.
+        $replicaNames = Get-DemoMemberValue -InputObject $Replica -Name 'Names'
+        if ($null -ne $replicaNames -and -not [string](Get-DemoMemberValue -InputObject $replicaNames -Name 'ServerName')) {
+            $replicaError = 'T4''s read replica can''t be named: the resource group has no deploymentId tag'
+        }
+        elseif ([string](Get-DemoMemberValue -InputObject $Replica -Name 'State') -eq 'Unknown' -and $null -eq (Get-DemoMemberValue -InputObject $Replica -Name 'Server')) {
+            $readError = [string](Get-DemoMemberValue -InputObject $Replica -Name 'Error')
+            $replicaError = 'T4''s read replica couldn''t be read{0}' -f $(if ($readError) { ' ({0})' -f $readError.TrimEnd('.') } else { '' })
         }
         $tags = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Replica -Name 'Server') -Name 'tags'
         $mark = [string](Get-DemoMemberValue -InputObject $tags -Name $script:T4ReplicaSessionTag)
         $until = if ($mark) { ConvertTo-DemoUtcDateTime -Value $mark } else { $null }
         if ($null -ne $until -and $until -gt $now -and $until -le $now.AddHours(24)) {
-            return [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $until; Error = '' }
+            return [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $until; StartedUtc = $null; Ignored = $ignored; Error = '' }
         }
     }
     catch {
-        Write-DemoLog -Level Debug -Message ('T4''s read replica''s session mark couldn''t be read: {0}' -f $_.Exception.Message)
+        $replicaError = 'T4''s read replica''s session mark couldn''t be read ({0})' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.')
     }
-    if ($controlError) {
-        return [pscustomobject]@{ Held = $true; By = 'Unknown'; UntilUtc = $null; Error = (Protect-DemoText -Text $controlError) }
+    if ($controlError -or $replicaError) {
+        return [pscustomobject]@{ Held = $true; By = 'Unknown'; UntilUtc = $null; StartedUtc = $null; Ignored = $ignored; Error = (Protect-DemoText -Text ((@($controlError, $replicaError) | Where-Object { $_ }) -join '; ')) }
     }
-    return [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Error = '' }
+    return [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; StartedUtc = $null; Ignored = $ignored; Error = '' }
 }
 
 function Set-DemoT4ReplicaHold {

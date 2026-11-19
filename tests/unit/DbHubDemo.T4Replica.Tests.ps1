@@ -614,6 +614,71 @@ Describe 'deploy.ps1''s end deletes the replica unless a session uses it (2026-1
     }
 }
 
+Describe 'Whether a session uses T4''s read replica, as the stop at the end of an update reads it (Get-DemoT4ReplicaHold; the review of 2026-11-19)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:now = [datetime]::new(2026, 11, 19, 20, 0, 0, [System.DateTimeKind]::Utc)
+        $script:autoStop = [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith { $script:autoStop }
+        $script:replica = New-ReplicaState -State 'NotFound'
+        $script:replicaThrows = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith {
+            if ($script:replicaThrows) { throw 'ERROR: (TooManyRequests) a fake throttle.' }
+            $script:replica
+        }
+        $script:marker = InModuleScope DbHubDemo { $script:ActivityControlStartDemoMarker }
+        function Get-Hold([object] $Since = $null) {
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Now = $script:now; Since = $Since } { Get-DemoT4ReplicaHold -Config $Config -DeploymentId 'abc123' -StartDemoSinceUtc $Since -NowUtc $Now }
+        }
+        # A start-demo.ps1 session's auto-stop, as Register-DemoActivityControlAutoStop writes it.
+        function Set-StartDemoAutoStop([string] $StartedAt, [string] $Due = '2026-11-19T21:30:00Z') {
+            $script:autoStop = [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ startTime = $Due; description = ('{0} Stops the demo 4 hours after this start: the start-demo.ps1 session started at {1}. Run all, the Insights app''s Start, or a run replaces it with its own plan.' -f $script:marker, $StartedAt) } }; Error = '' }
+        }
+    }
+
+    It 'keeps a session it can''t rule out: <Case> (finding 6)' -ForEach @(
+        @{ Case = 'a replica read that failed'; Setup = { $script:replica = New-ReplicaState -State 'Unknown'; $script:replica.Error = 'ERROR: (TooManyRequests) a fake throttle.' }; Match = 'T4''s read replica couldn''t be read \(ERROR: \(TooManyRequests\) a fake throttle\)' }
+        @{ Case = 'a replica read that threw'; Setup = { $script:replicaThrows = $true }; Match = 'session mark couldn''t be read \(ERROR: \(TooManyRequests\) a fake throttle\)' }
+        @{ Case = 'no deploymentId to name the replica'; Setup = { $script:replica = [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = '' }; State = 'NotFound'; Present = $false; Server = $null; Error = 'The resource group has no deploymentId tag.' } }; Match = 'can''t be named: the resource group has no deploymentId tag' }
+    ) {
+        . $Setup
+        $hold = Get-Hold
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'Unknown'
+        $hold.Error | Should -Match $Match
+    }
+
+    It 'finds no session for a replica that isn''t there, or one without a mark' {
+        (Get-Hold).Held | Should -BeFalse
+        $script:replica = New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5'
+        (Get-Hold).Held | Should -BeFalse
+    }
+
+    It 'leaves out a start-demo.ps1 auto-stop from a session that started before this run, and still reads the replica''s mark (finding 3)' {
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T16:30:00Z'
+        $since = [datetime]::new(2026, 11, 19, 19, 15, 0, [System.DateTimeKind]::Utc)
+        $hold = Get-Hold -Since $since
+        $hold.Held | Should -BeFalse
+        $hold.Ignored | Should -Be ([datetime]::new(2026, 11, 19, 21, 30, 0, [System.DateTimeKind]::Utc))
+        $script:replica = New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5'
+        $script:replica.Server = [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123'; DbHubSessionUntilUtc = '2026-11-20T03:00:00Z' } }
+        $hold = Get-Hold -Since $since
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.UntilUtc | Should -Be ([datetime]::new(2026, 11, 20, 3, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'counts a start-demo.ps1 auto-stop from a session that started during this run, and every one when there''s no run to compare (the replica''s deploy end)' {
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T19:40:00Z'
+        $hold = Get-Hold -Since ([datetime]::new(2026, 11, 19, 19, 15, 0, [System.DateTimeKind]::Utc))
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.StartedUtc | Should -Be ([datetime]::new(2026, 11, 19, 19, 40, 0, [System.DateTimeKind]::Utc))
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T16:30:00Z'
+        (Get-Hold).By | Should -Be 'StartDemo'
+    }
+}
+
 Describe 'The history keeps the session''s lag: captured before stop-demo.ps1 deletes the replica (ADR 0025)' {
     It 'stop-demo.ps1 captures the metrics before it sends the delete, and hands them to the notebook' {
         # Azure Monitor answers ResourceNotFound for a deleted replica's metrics (live, 2026-11-13), so the order matters.
