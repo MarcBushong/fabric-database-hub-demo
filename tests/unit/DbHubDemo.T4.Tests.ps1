@@ -785,6 +785,41 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         $coverage.Evidence.missing | Should -Be $Missing
     }
 
+    It 'counts a nightly run from runbooks older than t5Status that was Partial only because of T5''s container, its job Failed for that alone (the re-review of 0590bbe)' {
+        # An environment whose runbooks predate 2026-11-19's t5Status (R910): DbHub-Stop -Scope Nightly fails a Partial job.
+        $script:control = $false
+        $script:nightly = New-NightlyState -State 'InPlace'
+        $notGranted = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        $script:nightlyRuns = New-NightlyRun -JobStatus 'Failed' -ResultStatus 'Partial'
+        $script:nightlyRuns.Stop.Result['failed'] = @($notGranted)
+        $script:nightlyRuns.Stop.Result['t5'] = $notGranted
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeTrue -Because 'the VMs and T4 were stopped'
+        $coverage.Evidence.nightlyLastRun | Should -Be 'Failed (Partial, only T5''s container)'
+        # Anything else in its failed list: T4 may not have been stopped.
+        $script:nightlyRuns.Stop.Result['failed'] = @('pgflex01-abc123 not stopped: HTTP 409; the nightly safety stop stops it tonight', $notGranted)
+        (& $script:coverage).Counts | Should -BeFalse
+        # Today's runbooks keep T5 apart (t5Status), so their Partial is never T5's alone.
+        $script:nightlyRuns.Stop.Result['failed'] = @($notGranted)
+        $script:nightlyRuns.Stop.Result['t5Status'] = 'NotGranted'
+        (& $script:coverage).Counts | Should -BeFalse
+    }
+
+    It 'counts the control''s last DbHub-Stop job from runbooks older than t5Status when only T5''s container made it Partial: <Case> (the re-review of 0590bbe)' -ForEach @(
+        @{ Case = 'the auto-stop'; Counts = $true; Line = @{ action = 'stop-all'; status = 'Partial'; message = 'Auto-stop: auto-stop removed, sqlvm01 deallocating, pgflex01-abc123 stopping; failed: T5''s container not deleted: HTTP 429.'; done = @('auto-stop removed', 'sqlvm01 deallocating', 'pgflex01-abc123 stopping'); failed = @('T5''s container not deleted: HTTP 429') } }
+        @{ Case = 'the daily T4 job'; Counts = $true; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 (pgflex01-abc123) was Ready; its stop was accepted. T5''s container not deleted: HTTP 429.'; replica = ''; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the daily T4 job, T4 already stopped'; Counts = $true; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 is Stopped. T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once.'; replica = ''; t5 = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once' } }
+        @{ Case = 'the daily T4 job whose T4 stop failed too'; Counts = $false; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 (pgflex01-abc123) was Ready; its stop was failed. T5''s container not deleted: HTTP 429.'; replica = ''; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the daily T4 job whose replica wasn''t stopped'; Counts = $false; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 is Stopped. T4''s read replica pgflex01-abc123-replica (a session left it behind) not stopped: HTTP 409; ./scripts/stop-demo.ps1 deletes it. T5''s container not deleted: HTTP 429.'; replica = 'T4''s read replica pgflex01-abc123-replica (a session left it behind) not stopped: HTTP 409; ./scripts/stop-demo.ps1 deletes it'; t5 = 'T5''s container not deleted: HTTP 429' } }
+        @{ Case = 'the auto-stop whose T4 stop failed too'; Counts = $false; Line = @{ action = 'stop-all'; status = 'Partial'; message = 'Auto-stop: auto-stop removed; failed: pgflex01-abc123, T5''s container not deleted: HTTP 429.'; done = @('auto-stop removed'); failed = @('pgflex01-abc123', 'T5''s container not deleted: HTTP 429') } }
+    ) {
+        $script:jobs.Value = @{ value = @(New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z') }
+        $script:stopResults['job-Completed'] = $Line
+        $coverage = & $script:controlCoverage
+        $coverage.Counts | Should -Be $Counts
+        $coverage.Evidence.lastStopJob | Should -Be $(if ($Counts) { 'Completed (Partial, only T5''s container)' } else { 'Completed (Partial)' })
+    }
+
     It 'counts the on-demand control''s daily T4 safety stop when the nightly one isn''t in place, and names the nightly one''s gap when neither counts' {
         $coverage = & $script:coverage
         $coverage.Counts | Should -BeTrue

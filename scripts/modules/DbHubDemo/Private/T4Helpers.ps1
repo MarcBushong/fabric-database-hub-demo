@@ -2224,10 +2224,15 @@ function Get-DemoT4RestartCoverage {
                 $gap = @('StopJob', ('the nightly safety stop''s last run couldn''t be read ({0}), so it''s taken as failed' -f $runs.Error), 'Run ./scripts/status.ps1 to see it (STATUS.SAFETYSTOP), then run this again.')
             }
             else {
-                $stopStatus = if ($null -ne $runs.Stop) { [string](Get-DemoMemberValue -InputObject $runs.Stop.Result -Name 'status') } else { '' }
-                $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' }) }
+                # A result that is Partial only because of T5's container, from runbooks older than its t5Status, stopped the
+                # VMs and T4 (the re-review of 0590bbe); its job Failed only because Partial fails a Nightly job.
+                $stopOutcome = if ($null -ne $runs.Stop) { Get-DemoStopResultOutcome -Result $runs.Stop.Result } else { $null }
+                $stopStatus = if ($null -ne $stopOutcome) { [string]$stopOutcome.Status } else { '' }
+                $t5Only = $null -ne $stopOutcome -and [bool]$stopOutcome.T5Only
+                $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($t5Only) { 'Partial, only T5''s container' } elseif ($stopStatus) { $stopStatus } else { 'no result line' }) }
+                $jobDone = $null -ne $runs.Stop -and ($runs.Stop.Status -eq 'Completed' -or ($t5Only -and $runs.Stop.Status -eq 'Failed'))
                 # Deferred (2026-11-14): a run was still going, so it changed nothing, by design; it isn't a failed run.
-                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred')) {
+                if ($null -ne $runs.Stop -and (-not $jobDone -or $stopStatus -notin 'Stopped', 'Deferred')) {
                     $when = if ($null -ne $runs.Stop.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$runs.Stop.CreatedUtc) } else { '' }
                     $gap = @('StopJob', ('the nightly safety stop''s last run{0} didn''t finish its work (job {1}), so it may not stop T4' -f $when, $runs.Stop.Status), 'Run ./scripts/status.ps1 to see what it said (STATUS.SAFETYSTOP), fix that, then run this again.')
                 }
@@ -2341,8 +2346,11 @@ function Get-DemoT4ControlRestartCoverage {
             # Completed with status Partial when Azure refused T4's stop, so its own result line decides, as the nightly
             # safety stop's does. One that can't be read is taken as failed (fail safe).
             $stop = if ($job.Id) { Get-DemoSafetyStopJobResult -Name $name -JobName $job.Id } else { $null }
-            $stopStatus = [string](Get-DemoMemberValue -InputObject $stop -Name 'status')
-            $evidence['lastStopJob'] = '{0} ({1})' -f $job.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' })
+            # Partial only because of T5's container, from runbooks older than its t5Status (the re-review of 0590bbe): T4 was
+            # stopped, so it counts.
+            $stopOutcome = Get-DemoStopResultOutcome -Result $stop
+            $stopStatus = [string]$stopOutcome.Status
+            $evidence['lastStopJob'] = '{0} ({1})' -f $job.Status, $(if ($stopOutcome.T5Only) { 'Partial, only T5''s container' } elseif ($stopStatus) { $stopStatus } else { 'no result line' })
             if ($stopStatus -notin 'Stopped', 'Skipped', 'Deferred', 'NoEnvironment') {
                 $when = if ($null -ne $job.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$job.CreatedUtc) } else { '' }
                 $said = (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $stop -Name 'message'))).Trim()

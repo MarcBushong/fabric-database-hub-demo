@@ -975,6 +975,62 @@ function Get-DemoSafetyStopState {
     }
 }
 
+function Get-DemoStopResultOutcome {
+    <#
+    .SYNOPSIS
+    What a DbHub-Stop job's result line (DBHUB-STOP) says it did to the VMs and T4, apart from T5's container (the re-review
+    of 0590bbe): Status, the result's own status, except Stopped for a result that is Partial only because of T5's container;
+    T5Only, true then; and T5Status, what happened to the container (t5Status, or, without it, NotGranted or Failed as the
+    text says). Since 2026-11-19 (review of ab91ee5) the runbooks keep T5's outcome apart (t5Status), so a container they
+    couldn't delete never makes a stop Partial; a result written before then has no t5Status, and is Partial only because of
+    T5 when every entry of its failed list starts with "T5's container" (the nightly safety stop and the auto-stop), or, with
+    no failed list (the daily T4 job), when its t5 text says the container wasn't deleted while T4's stop was accepted and
+    its replica didn't fail. An environment whose runbooks are older counts T4 as stopped then, so its preflight doesn't stop
+    deploy.ps1 before it publishes the runbooks that fix it. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    $status = [string](Get-DemoMemberValue -InputObject $Result -Name 'status')
+    $names = if ($null -eq $Result) { @() } elseif ($Result -is [System.Collections.IDictionary]) { @($Result.Keys | ForEach-Object { [string]$_ }) } else { @($Result.PSObject.Properties.Name) }
+    $outcome = [pscustomobject]@{ Status = $status; T5Only = $false; T5Status = [string](Get-DemoMemberValue -InputObject $Result -Name 't5Status') }
+    if ($status -ne 'Partial' -or $names -contains 't5Status') {
+        return $outcome
+    }
+    $t5Prefix = 'T5''s container'
+    $t5Kind = {
+        param([string] $Text)
+        if ($Text -match 'role can''t delete it') { return 'NotGranted' }
+        return 'Failed'
+    }
+    if ($names -contains 'failed') {
+        # Assigned first: Get-DemoMemberValue returns an array as one object.
+        $failedValue = Get-DemoMemberValue -InputObject $Result -Name 'failed'
+        $failed = @(@($failedValue) | Where-Object { $null -ne $_ -and [string]$_ } | ForEach-Object { [string]$_ })
+        if ($failed.Count -gt 0 -and @($failed | Where-Object { -not $_.StartsWith($t5Prefix, [System.StringComparison]::Ordinal) }).Count -eq 0) {
+            $outcome.Status = 'Stopped'
+            $outcome.T5Only = $true
+            $outcome.T5Status = & $t5Kind ($failed -join ' ')
+        }
+        return $outcome
+    }
+    # The daily T4 job's result (DbHub-Stop -Scope T4) has no failed list: Partial when T4's stop wasn't accepted, its read
+    # replica wasn't stopped, or T5's container wasn't deleted, as its message, replica, and t5 texts say.
+    $t5Text = [string](Get-DemoMemberValue -InputObject $Result -Name 't5')
+    $message = [string](Get-DemoMemberValue -InputObject $Result -Name 'message')
+    $replica = [string](Get-DemoMemberValue -InputObject $Result -Name 'replica')
+    if ($t5Text.StartsWith(($t5Prefix + ' not deleted'), [System.StringComparison]::Ordinal) -and $message -notmatch 'its stop was failed' -and $replica -notmatch '\) not stopped: ') {
+        $outcome.Status = 'Stopped'
+        $outcome.T5Only = $true
+        $outcome.T5Status = & $t5Kind $t5Text
+    }
+    return $outcome
+}
+
 function Get-DemoSafetyStopJobResult {
     # The result line DbHub-Stop wrote in a job's output ('DBHUB-STOP <json>'), parsed, or $null (Job - Get Output:
     # https://learn.microsoft.com/rest/api/automation/job/get-output). -JobName is the job's ID (properties.jobId), which
@@ -1166,7 +1222,10 @@ function Get-DemoSafetyStopStatus {
         }
         else {
             $stopResult = $runs.Stop.Result
-            $stopStatus = [string](Get-DemoMemberValue -InputObject $stopResult -Name 'status')
+            # Partial only because of T5's container, from runbooks older than its t5Status (the re-review of 0590bbe): the
+            # VMs and T4 were stopped, and T5's outcome is said below; its job Failed only because Partial fails a Nightly job.
+            $stopOutcome = Get-DemoStopResultOutcome -Result $stopResult
+            $stopStatus = $stopOutcome.Status
             $stopText = [string](Get-DemoMemberValue -InputObject $stopResult -Name 'message')
             if (-not $stopText) {
                 $stopText = 'its output had no result line'
@@ -1177,12 +1236,12 @@ function Get-DemoSafetyStopStatus {
             $evidence['lastStop'] = $stopStatus
             $parts.Add(('Last run {0:yyyy-MM-dd HH:mm} UTC (job {1}): {2}' -f ([datetime]$runs.Stop.CreatedUtc), $runs.Stop.Status, $stopText.TrimEnd('.') + '.'))
             # Deferred (2026-11-14): a deploy.ps1 run was still going, so it changed nothing, by design.
-            if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred') {
+            if (($runs.Stop.Status -ne 'Completed' -and -not ($stopOutcome.T5Only -and $runs.Stop.Status -eq 'Failed')) -or $stopStatus -notin 'Stopped', 'Deferred') {
                 $problems.Add('its last run didn''t finish its work')
             }
             # T5's container (2026-11-19, ADR 0027) is apart from its status (t5Status, review of ab91ee5), so a container it
             # couldn't delete never makes T4's stop look failed (R910), and it's said here instead.
-            $t5Status = [string](Get-DemoMemberValue -InputObject $stopResult -Name 't5Status')
+            $t5Status = $stopOutcome.T5Status
             $evidence['lastStopT5'] = $t5Status
             if ($t5Status -eq 'NotGranted') {
                 $problems.Add('its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until ./scripts/stop-demo.ps1 deletes it')

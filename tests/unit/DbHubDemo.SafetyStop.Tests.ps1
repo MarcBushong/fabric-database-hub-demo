@@ -814,6 +814,19 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         (& $script:status).status | Should -Be 'Pass'
     }
 
+    It 'says an older runbook''s nightly run that was Partial only because of T5''s container stopped what ran, and names T5''s container instead (the re-review of 0590bbe)' {
+        # Runbooks published before 2026-11-19's t5Status put T5's container in the failed list, and the job Failed for it.
+        Set-FakeInPlace
+        $notGranted = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Failed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Partial'; failed = @($notGranted); t5 = $notGranted; message = ('Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready); failed: {0}.' -f $notGranted) }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Not -Match 'didn''t finish its work'
+        $warned.message | Should -Match 'To check: its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions'
+        $warned.evidence.lastStopT5 | Should -Be 'NotGranted'
+        $warned.remediation | Should -Match '^Run \./scripts/stop-demo\.ps1 after each session'
+    }
+
     It 'warns, with the fix, when <Case>' -ForEach @(
         @{ Case = 'it isn''t set up'; Setup = { }; Match = '^The nightly safety stop isn''t in place \(the schedule dbhub-safety-stop doesn''t exist\), so only the VMs'' own auto-shutdown stops them at 19:00, and nothing stops T4'; Fix = '^Run \./scripts/deploy\.ps1' }
         @{ Case = 'its role isn''t assigned'; Setup = { Set-FakeInPlace; $script:assignments.Clear() }; Match = 'but it can''t stop anything: id-dbhub-demo-safetystop doesn''t hold .* So T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'; Fix = '^An Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json$' }
