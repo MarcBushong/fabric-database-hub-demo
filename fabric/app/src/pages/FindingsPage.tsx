@@ -1,11 +1,12 @@
 import { useMemo } from "react";
-import { Badge, Button, Link, MessageBar, MessageBarBody, Tab, TabList } from "@fluentui/react-components";
+import { Badge, Button, MessageBar, MessageBarBody, Tab, TabList } from "@fluentui/react-components";
 import { Open16Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
 import { EmptyState } from "@/components/EmptyState";
 import { KpiTile } from "@/components/KpiTile";
+import { MigrationCard } from "@/components/MigrationCard";
 import { ProvenanceBadge } from "@/components/ProvenanceBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
@@ -72,8 +73,8 @@ const LIVE_TABS: Partial<Record<FindingCategory, { title: string; view: string; 
     optimization: {
         title: "Optimization, live from Database Hub",
         view: "Optimization",
-        reads: "Each resource's optimization checks: license-model opportunities and sizing.",
-        fallback: "Database Hub's optimization insights are live: migration assessments, license-model opportunities, and SQL Server instances that don't report usage.",
+        reads: "The optimization checks Database Hub raises on each resource: license-model opportunities, usage reporting, and sizing.",
+        fallback: "Database Hub's optimization checks are live: license-model opportunities, SQL Server instances that don't report usage, and sizing.",
         ask: "Which of these optimization opportunities save the most, and what does each one take?",
     },
 };
@@ -198,15 +199,8 @@ export default function FindingsPage() {
             {tab === "security" ? <LiveChecks tab="security" rows={liveSecurity ?? []} answers={[security.answer, inventory.answer]} loading={security.loading || inventory.loading} unavailable={security.unavailable ?? inventory.unavailable} onRefresh={() => (security.refresh(), inventory.refresh())} hubUrl={hubUrl} /> : null}
             {tab === "optimization" ? (
                 <>
-                    <section className="panel span-12 live-panel" aria-label="Migration assessment, in Database Hub">
-                        <h3>Migration assessment, in Database Hub</h3>
-                        <p className="panel-sub">{`T2's SQL Server instance ${t2Instance(t2)} shows as "migration assessment ready" in Database Hub's Optimization view, with its readiness for each Azure SQL target. Azure keeps the assessment on the Arc resource, so it isn't in the history or the app's live routes; deploy.ps1's status page reports it as T2.ARC.MIGRATIONASSESSMENT.`}</p>
-                        <div>
-                            <Link href={hubUrl} target="_blank" rel="noopener noreferrer">
-                                Open Database Hub, then Optimization
-                            </Link>
-                        </div>
-                    </section>
+                    <MigrationCard className="span-12" resourceName={t2Instance(t2)} />
+
                     <LiveChecks tab="optimization" rows={liveOptimization ?? []} answers={[inventory.answer]} loading={inventory.loading} unavailable={inventory.unavailable} onRefresh={inventory.refresh} hubUrl={hubUrl} />
                 </>
             ) : null}

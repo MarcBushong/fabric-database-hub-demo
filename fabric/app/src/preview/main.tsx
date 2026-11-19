@@ -37,6 +37,7 @@ const runtime: AppRuntime = {
         report: "https://app.fabric.microsoft.com/groups/me/reports/sample",
         workspace: "https://app.fabric.microsoft.com/groups/me",
         controlNotebook: "https://app.fabric.microsoft.com/groups/me/synapsenotebooks/sample",
+        t2MigrationAssessment: "https://portal.azure.com/#@00000000-0000-0000-0000-000000000000/resource/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhub-sample/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01",
     },
 };
 

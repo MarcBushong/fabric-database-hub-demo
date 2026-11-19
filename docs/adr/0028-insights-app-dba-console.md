@@ -34,7 +34,7 @@ Left navigation (with a rail mode), a global target and period filter, and drill
 | **Estate** | Every engine and target: SQL Server on an Azure VM (T1), Arc-enabled SQL Server (T2), Azure SQL Database (T3), PostgreSQL (T4) with its read replica, and Azure Cosmos DB (T5) when present; each target's page |
 | **Performance** | CPU, waits, throughput, and their distribution, per target and engine |
 | **Incidents** | The timeline, the replay, what changed, the Database Agent loop on T3 (detect, evidence, respond, verify), and prompts for the agent |
-| **Findings** | Performance, availability, security, optimization, capacity, and telemetry: security and optimization live from Database Hub, the history's findings beside them |
+| **Findings** | Performance, availability, security, optimization, capacity, and telemetry: security and optimization live from Database Hub, the history's findings beside them. **Ready to migrate** (2026-11-18, the coordinator's decision): T2's readiness per Azure SQL target from Database Hub's inventory, on Optimization and on T2's page, because Database Hub doesn't raise a ready assessment as an issue; without the live source, a link to T2's instance in the Azure portal, built at deploy time from its resource ID |
 | **Readiness** | Is the demo ready, and the next step |
 | **Trends** | The history past the telemetry's 7 days, week over week |
 | **Manage** | Bounded, confirmed actions through the demo's own control |

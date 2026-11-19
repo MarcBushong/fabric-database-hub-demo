@@ -16,11 +16,32 @@ export interface LiveResource {
     name: string;
     resourceGroup?: string;
     location?: string;
+    sku?: string;
     status?: string;
     /** Database Hub's issues: what needs attention. */
     issues?: FlagGroups;
     /** Database Hub's enhancements: what it recommends. */
     enhancements?: FlagGroups;
+    /** A SQL Server instance's migration assessment (SQL Server enabled by Azure Arc), when Database Hub's row carries one. */
+    migrationAssessment?: MigrationAssessment;
+}
+
+/**
+ * Database Hub's migration assessment of a SQL Server instance: its inventory row's properties.migrationAssessment, as
+ * the app's function passes it (the chat session's estate types). Database Hub doesn't raise a ready assessment as an
+ * issue, so this is where "which servers can move to Azure, and to what" comes from.
+ */
+export interface MigrationAssessment {
+    enabled: boolean;
+    /** When the instance last uploaded its assessment, or null. */
+    uploadedAt: string | null;
+    /** "Available" with results, "Stale", or "Unavailable". */
+    dataStatus: string;
+    /** Readiness per Azure SQL target, with Database Hub's names and values, for example azureSqlManagedInstance: "Ready". */
+    targets: Record<string, string>;
+    readyTargets?: string[];
+    /** Database Hub's own flag (issues.optimization.hasMigrationAssessmentIssue), when the row has it. */
+    hasIssue?: boolean;
 }
 
 export interface InventoryData {

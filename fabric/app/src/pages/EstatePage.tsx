@@ -9,6 +9,7 @@ import { DataGrid, type GridColumn } from "@/components/DataGrid";
 import { EmptyState } from "@/components/EmptyState";
 import { HealthTile } from "@/components/HealthTile";
 import { KpiTile } from "@/components/KpiTile";
+import { MigrationCard } from "@/components/MigrationCard";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
@@ -322,6 +323,8 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 <KpiTile label="Incident windows" value={formatNumber(incidents.length, "int")} status={incidents.length > 0 ? "Warning" : "Pass"} onOpen={() => navigate("incidents", incidents[0] ? { incident: incidents[0].key } : {})} openLabel="Open its incidents" />
                 <KpiTile label="Telemetry" value={t?.lagMin !== null && t?.lagMin !== undefined ? `${formatNumber(t.lagMin, "minutes")}` : "–"} sub={`${formatNumber(t?.coverageTables ?? null, "int")} tables · newest snapshot ${formatAgo(meta?.latestCapture ?? null)}`} />
             </section>
+
+            {target === "T2" ? <MigrationCard className="span-12" resourceName={names?.resource ?? "arcsql01"} /> : null}
 
             <VisualCard
                 id="estate.target.cpu"

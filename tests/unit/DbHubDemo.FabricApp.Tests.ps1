@@ -1019,6 +1019,43 @@ Describe 'Resolve-DemoFabricAppItem' {
         $result.status | Should -Be 'Warning'
         $result.evidence['links'].Keys | Should -Not -Contain 'report'
     }
+
+    It 'links T2''s SQL Server instance in the Azure portal from its own resource ID, the default instance first (2026-11-18)' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith {
+            $id = switch ($Type) { 'SemanticModel' { $script:modelId } 'KQLDashboard' { $script:dashboardId } 'Report' { $script:reportId } }
+            [pscustomobject]@{ StatusCode = 200; Items = @(if ($id) { [pscustomobject]@{ id = $id; displayName = $DisplayName; type = $Type } }); Error = '' }
+        }
+        $script:armGroup = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lab-demo'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith {
+            $machine = '{0}/providers/Microsoft.HybridCompute/machines/arcsql01' -f $script:armGroup
+            # As the real one returns it: the whole array as one object.
+            return , @(
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01_NAMED' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = $machine; instanceName = 'NAMED' } }
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/sqlvm01' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = ('{0}/providers/Microsoft.Compute/virtualMachines/sqlvm01' -f $script:armGroup); instanceName = 'MSSQLSERVER' } }
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = $machine; instanceName = 'MSSQLSERVER' } }
+            )
+        }
+        $config = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; tenantId = $script:tenantId; prefix = 'lab'; environment = 'demo'; fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @() } }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config
+        $result.evidence['links']['t2MigrationAssessment'] | Should -BeExactly ('https://portal.azure.com/#@{0}/resource{1}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01' -f $script:tenantId.ToLowerInvariant(), $script:armGroup)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 1 -Exactly -ParameterFilter { $Url -match '^https://management\.azure\.com/subscriptions/0{8}-0{4}-0{4}-0{4}-0{12}/resourceGroups/rg-lab-demo/providers/Microsoft\.AzureArcData/sqlServerInstances\?api-version=' }
+    }
+
+    It 'leaves T2''s portal link out when T2 has no instance yet, when Azure can''t be read, or without a tenant' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 200; Items = @([pscustomobject]@{ id = $script:modelId }); Error = '' } }
+        $config = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; tenantId = $script:tenantId; prefix = 'lab'; environment = 'demo'; fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith { return , @() }
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith { throw 'Reading the instances failed: (AuthorizationFailed)' }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'names the Azure portal path' }
+        $config.Remove('tenantId')
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 2 -Exactly
+    }
 }
 
 Describe 'Resolve-DemoFabricAppOperator' {

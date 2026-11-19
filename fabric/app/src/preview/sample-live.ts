@@ -14,13 +14,32 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
             errors: [],
             at,
             data: {
-                totalCount: 6,
-                countByType: { AzureSql: 1, AzureSqlVM: 1, ArcSql: 1, PostgreSql: 2, CosmosDb: 1 },
+                // As the function counts them: sqlvm01 twice, its SQL virtual machine and its SQL Server instance from
+                // unified inventory (live, 2026-11-18). The app shows one row per resource.
+                totalCount: 7,
+                countByType: { AzureSql: 1, AzureSqlVM: 2, ArcSqlServer: 1, PostgreSql: 2, CosmosDb: 1 },
                 complete: true,
                 resources: [
                     { databaseType: "AzureSql", name: "ContosoCare", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online", issues: { security: { hasPublicNetworkAccessIssue: false, hasTdeIssue: false }, optimization: {} }, enhancements: { security: { hasLedgerIssue: true, hasCmkIssue: true }, optimization: {} } },
-                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online", issues: { optimization: { hasPaygLicenseIssue: true } } },
-                    { databaseType: "ArcSql", name: "arcsql01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Connected", issues: { security: {}, optimization: {} } },
+                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Unknown", issues: { security: {}, optimization: { hasPaygLicenseIssue: false } } },
+                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Connected", issues: { security: {}, optimization: {} } },
+                    {
+                        databaseType: "ArcSqlServer",
+                        name: "arcsql01",
+                        resourceGroup: "rg-dbhub-sample",
+                        location: "westus3",
+                        status: "Connected",
+                        issues: { security: {}, optimization: { hasMigrationAssessmentIssue: false, hasPaygLicenseIssue: false, hasUsageReportingIssue: false } },
+                        // Ready to migrate: Database Hub carries it in the row, not as an issue (live on dbhubal, 2026-11-18).
+                        migrationAssessment: {
+                            enabled: true,
+                            uploadedAt: new Date(Date.parse(at) - 3 * 3600000).toISOString(),
+                            dataStatus: "Available",
+                            targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+                            readyTargets: ["azureSqlManagedInstance", "azureSqlVirtualMachine"],
+                            hasIssue: false,
+                        },
+                    },
                     { databaseType: "PostgreSql", name: "pgflex01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Ready", issues: { security: { hasEntraAuthenticationIssue: false } }, enhancements: { security: { hasCmkIssue: true } } },
                     { databaseType: "PostgreSql", name: "pgreplica01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Ready", enhancements: { security: { hasCmkIssue: true } } },
                     { databaseType: "CosmosDb", name: "cosmos01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online" },

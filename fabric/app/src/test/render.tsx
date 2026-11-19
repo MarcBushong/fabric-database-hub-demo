@@ -29,7 +29,11 @@ export const RUNTIME: AppRuntime = {
     itemId: ZERO,
     portalUrl: "https://app.fabric.microsoft.com",
     resourceGroup: "rg-dbhub-test",
-    links: { report: "https://app.fabric.microsoft.com/groups/x/reports/y", controlNotebook: "https://app.fabric.microsoft.com/groups/c/synapsenotebooks/n" },
+    links: {
+        report: "https://app.fabric.microsoft.com/groups/x/reports/y",
+        controlNotebook: "https://app.fabric.microsoft.com/groups/c/synapsenotebooks/n",
+        t2MigrationAssessment: "https://portal.azure.com/#@00000000-0000-0000-0000-000000000000/resource/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhub-test/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01",
+    },
 };
 
 const bins = (target: "T1" | "T2" | "T3" | null, hours: number, base: number): Row[] =>

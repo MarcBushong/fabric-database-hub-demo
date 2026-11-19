@@ -8,12 +8,9 @@ import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import { useLiveEstate, type EstateAnswer, type EstateView, type HealthData, type UsageCounts } from "@/data/live-estate";
 import { formatNumber, sentence } from "@/lib/format";
-import { inventoryMix, liveSecurityRows, targetOfResource } from "@/lib/live-findings";
+import { inventoryMix, isDown, liveSecurityRows, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
 import { ProvenanceBadge } from "./ProvenanceBadge";
-
-/** The states Database Hub reports for a resource that's up. */
-const UP = /^(online|ready|connected|running|succeeded|available)$/i;
 
 function usage(u: UsageCounts | null | undefined): number {
     return u ? u.cpu + u.memory + u.storage : 0;
@@ -45,9 +42,10 @@ export function LiveNow() {
         );
     }
 
-    const inv = inventory.answer?.data;
+    // One row per resource: Database Hub lists a SQL Server on an Azure VM twice (uniqueInventory).
+    const inv = inventory.answer ? uniqueInventory(inventory.answer.data) : undefined;
     const h: HealthData | undefined = health.answer?.data;
-    const down = (inv?.resources ?? []).filter((r) => r.status && !UP.test(r.status));
+    const down = (inv?.resources ?? []).filter((r) => isDown(r.status));
     const warnings = security.answer || inventory.answer ? liveSecurityRows(security.answer?.data, inv).filter((r) => r.attention === "Needs attention") : null;
     const high = h ? usage(h.microsoftSql?.highUsage) + usage(h.postgreSql?.highUsage) : null;
     const cosmos = h?.cosmosDb && h.cosmosDb.totalAccounts > 0 ? h.cosmosDb : null;

@@ -17,6 +17,9 @@ function Resolve-DemoFabricAppItem {
       control's folder, with a public vault) or in the control workspace, found by its name (a private vault). The
       portal path for a notebook isn't documented on Learn, TODO(verify); without it, Manage copies requests and doesn't
       open the notebook.
+    - t2MigrationAssessment: with -Config, T2's SQL Server instance enabled by Azure Arc in the Azure portal (2026-11-18),
+      built from the instance resource's own ID (one read-only ARM list, Get-DemoT2MigrationPortalLink); the app's
+      migration card links to it when Database Hub isn't read live, and names the path, Migration, Assessments.
     Every link carries ?ctid=<tenant>, so it opens in the demo's tenant. The evidence goes only to the Git-ignored
     out/ folder and the stage's public/dbhub-app.json, never to Git.
     No single model with the name is Manual action required (run configure-powerbi.ps1); a missing dashboard or
@@ -115,6 +118,14 @@ function Resolve-DemoFabricAppItem {
     }
     if ($controlNotebookId -match '^[0-9a-fA-F-]{36}$') {
         $links['controlNotebook'] = '{0}/groups/{1}/synapsenotebooks/{2}{3}' -f $portal, $controlWorkspaceId.ToLowerInvariant(), $controlNotebookId.ToLowerInvariant(), $ctid
+    }
+    # T2's migration assessment in the Azure portal (2026-11-18), for the app's migration card when Database Hub isn't
+    # read live: from the Arc SQL Server instance's own resource ID. Without it, the card names the portal path.
+    if ($Config) {
+        $migration = Get-DemoT2MigrationPortalLink -Config $Config
+        if ($migration) {
+            $links['t2MigrationAssessment'] = $migration
+        }
     }
     $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlNotebookId = $controlNotebookId; links = $links }
     if ($problems.Count -gt 0) {

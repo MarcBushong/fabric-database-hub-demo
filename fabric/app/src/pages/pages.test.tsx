@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import EstatePage from "@/pages/EstatePage";
@@ -113,6 +113,16 @@ describe("Estate", () => {
         const ctx = vi.mocked(copilot.ask).mock.calls[0][0];
         expect(ctx.prompt).toMatch(/^Why did T3's CPU reach 120\.0 % at 21 Oct 10:00 UTC when its median/);
         expect(ctx.anomaly).toMatchObject({ metric: "CPU", target: "T3", unit: "%" });
+    });
+
+    it("shows on T2's page whether it's ready to migrate, live; other targets have no migration card", async () => {
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T2" }, live: "sample" });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(within(card).getByText(/^Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database\.$/)).toBeInTheDocument();
+        cleanup();
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T1" }, live: "sample" });
+        expect(await screen.findByRole("heading", { level: 1, name: /^T1 · / })).toBeInTheDocument();
+        expect(screen.queryByRole("region", { name: /migrat/i })).not.toBeInTheDocument();
     });
 
     it("shows T4 and its read replica from the latest PostgreSQL capture", async () => {
@@ -286,13 +296,29 @@ describe("Findings", () => {
         expect(ctx.dax).toBeUndefined();
     });
 
-    it("names T2's SQL Server instance for its migration assessment, and reads the optimization checks live", async () => {
-        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: "sample" });
-        const panel = screen.getByRole("region", { name: "Migration assessment, in Database Hub" });
-        expect(await within(panel).findByText(/T2's SQL Server instance arcsql01 shows as "migration assessment ready"/)).toBeInTheDocument();
-        expect(within(panel).getByRole("link", { name: "Open Database Hub, then Optimization" })).toHaveAttribute("rel", "noopener noreferrer");
-        const grid = await screen.findByRole("table", { name: "Live optimization checks" });
-        await waitFor(() => expect(within(grid).getByText("Pay-as-you-go SQL Server license: a license-model opportunity")).toBeInTheDocument());
+    it("shows T2 ready to migrate, live, with its readiness per Azure SQL target, and never as a Database Hub issue (2026-11-18)", async () => {
+        const { copilot } = renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: "sample" });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(within(card).getByText("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.")).toBeInTheDocument();
+        expect(within(card).getByRole("list", { name: "Readiness per Azure SQL target" }).textContent).toBe("ReadyAzure SQL Managed InstanceReadySQL Server on Azure Virtual MachinesNot readyAzure SQL DatabaseAsk why");
+        expect(within(card).getByText(/assessed by Azure Arc every week; this assessment was uploaded 21 Oct 18:00 UTC/)).toBeInTheDocument();
+        expect(within(card).getByText(/^A ready assessment isn't an issue, so Database Hub's issue lists don't show it\./)).toBeInTheDocument();
+        expect(within(card).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("href", expect.stringMatching(/^https:\/\/portal\.azure\.com\/#@0{8}-0{4}-0{4}-0{4}-0{12}\/resource\/subscriptions\/.+\/sqlServerInstances\/arcsql01$/));
+        fireEvent.click(within(card).getByRole("button", { name: "Ask Copilot" }));
+        expect(vi.mocked(copilot.ask).mock.calls[0][0]).toMatchObject({ prompt: "Which of my servers can move to Azure, and to what?", source: "live", visualId: "migration.readiness", totalRows: 3 });
+        fireEvent.click(within(card).getByRole("button", { name: "Ask why" }));
+        expect(vi.mocked(copilot.ask).mock.calls[1][0].prompt).toMatch(/^Why isn't arcsql01 ready for Azure SQL Database, and what would make it ready\?/);
+        // The optimization checks Database Hub raises: none on this estate, as live.
+        expect(await screen.findByText("Database Hub flags nothing here")).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/Optimization (view|issues?) (shows|lists) (T2|arcsql01)|migration assessment ready/i);
+    });
+
+    it("links T2's migration assessment in the Azure portal when Database Hub isn't read live, and names the path", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" } });
+        const panel = await screen.findByRole("region", { name: "T2's migration assessment" });
+        expect(within(panel).getByText(/In the Azure portal, open arcsql01, then, under Migration, select Assessments\.$/)).toBeInTheDocument();
+        expect(within(panel).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(within(panel).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("rel", "noopener noreferrer");
         expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
     });
 });
