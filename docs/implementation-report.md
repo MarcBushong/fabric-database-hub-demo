@@ -3171,7 +3171,11 @@ The work:
   - Pester (`tests/unit` with the Program Files Pester, because this PC's OneDrive copy isn't hydrated): 4,600 tests; 4,592 passed, 4 failed, and 4 skipped; no unit test reached the Azure CLI.
     - Two of the failures were this change's, and both are fixed: the presenter grant's test compared a hashtable's key order, which changes from one process to the next, and the Database Hub link was a literal URL, which the documented-hosts test forbids in module code. It now comes from `versions.json`, as the Insights app's links do. Their files then passed: 823 passed, and the only failures were the two below.
     - Not this change's: the Fabric App's lockfile test (`DbHubDemo.FabricApp.Tests.ps1`) fails on `fabric/app/package-lock.json` from 935eeed, and the teardown test's child `pwsh` loads this PC's OneDrive Pester.
-- **Live:** the live test follows, in a test environment of its own: deploy `main`, upgrade it with this branch, then Run all, `validate.ps1`, the agent loop, and T2's assessment. Until then, [limitations](limitations.md#not-proven-live-yet) lists what isn't proven live.
+- **After the review's fixes** (2026-11-18, merged with `origin/ignite-updates` at 41a3a1b):
+  - PSScriptAnalyzer: 0 findings in 370 files. markdownlint: 0 issues in 140 files. The Fabric app's `npm run verify`: 149 tests, the license check, and the build pass.
+  - .NET: 581 tests; 562 passed and 19 skipped.
+  - Pester (`tests/unit`, with `Set-StrictMode -Version Latest` as CI runs it, and Python 3 for the notebook simulations): 4,653 tests; 4,648 passed, 1 failed, and 4 skipped; no unit test reached the Azure CLI. The failure is the teardown test's child `pwsh`, which loads this PC's OneDrive Pester, as before.
+- **Live:** in a test environment of its own, `main` deployed, then upgraded with this branch; the results are under **Live** below, and [limitations](limitations.md#not-proven-live-yet) lists what isn't proven live yet.
 
 **The independent review** (2026-11-18, of `935eeed..4c7817a`; three findings, all fixed):
 
