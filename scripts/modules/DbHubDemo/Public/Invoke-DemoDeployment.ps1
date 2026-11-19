@@ -14,7 +14,10 @@ function Invoke-DemoDeployment {
     Stages:
 
     1. Preflight: Invoke-DemoPreflight (subscription guard, P1-P6, region, sizes, quota, policy, cost). Any
-       Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name.
+       Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name. A run that starts
+       after it (a resume) checks the Fabric workspace as preflight does when it reaches the Fabric stage
+       (Get-DemoFabricSharedResult -Resolve; 2026-11-19): one that another demo environment records, and this one
+       doesn't, stops it before anything changes (DEPLOY.FABRIC.SHARED Fail).
     2. Infrastructure: the template without the bootstraps' new settings (Invoke-DemoTemplateDeployment); a
        free-offer rejection falls back to regular serverless with a Warning. With the Key Vault opt-in
        (keyVault.enabled), Initialize-DemoKeyVault then deploys the vault and the operator's access to it; a
@@ -353,6 +356,19 @@ function Invoke-DemoDeployment {
             Write-DemoLog -Level Warning -Message ([string]$tuning.message)
             Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
             return $results.ToArray()
+        }
+    }
+    # The Fabric workspace that another demo environment records (2026-11-19), as preflight checks it, before a stage
+    # writes to Fabric: a configuration edited by hand since the earlier run stops here (DEPLOY.FABRIC.SHARED).
+    if ($startIndex -gt 0 -and -not $whatIf -and -not $SkipFabric -and $stopIndex -ge $fabricIndex) {
+        $sharedCheck = Get-DemoFabricSharedResult -Config $Config -Resolve
+        if ($null -ne $sharedCheck) {
+            $results.Add($sharedCheck)
+            if ([string]$sharedCheck.status -eq 'Fail') {
+                Write-DemoLog -Level Warning -Message ([string]$sharedCheck.message)
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Items' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $sharedCheck.message, $sharedCheck.remediation) -MaxLength 1200
+                return $results.ToArray()
+            }
         }
     }
 

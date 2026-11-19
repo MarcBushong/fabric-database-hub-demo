@@ -139,6 +139,27 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
     }
 
+    It 'fails right after P5 when another demo environment records the workspace P5 found, and adds nothing when nobody else does (DEPLOY.FABRIC.SHARED, 2026-11-19)' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
+            [pscustomobject]@{ Result = (New-DemoResult -CheckId 'PREFLIGHT.P5.WORKSPACE' -Area 'preflight' -Target 'fabric' -Status 'Pass' -Message 'The workspace is ready.' -Evidence ([ordered]@{ workspaceName = 'Database Hub Demo'; workspaceId = 'dddddddd-0000-0000-0000-000000000001' })); Config = $Config; CapacityResult = $null }
+        }
+        $script:recorders = @([pscustomobject]@{ Name = 'rg-dbhubother-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubother-demo'; Tagged = $true; Claims = @('dddddddd-0000-0000-0000-000000000001') })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { [pscustomobject]@{ Ok = $true; Error = ''; Others = $script:recorders; Own = [pscustomobject]@{ Found = $false; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false } } }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $shared = @($results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED')
+        $shared.Count | Should -Be 1
+        $shared[0].status | Should -Be 'Fail' -Because 'a Fail in preflight stops deploy.ps1 before anything is created'
+        $shared[0].message | Should -Match 'is the one rg-dbhubother-demo records as its own, not this environment''s \(rg-dbhub-demo\)'
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.SHARED') | Should -Be ([array]::IndexOf($ids, 'PREFLIGHT.P5.WORKSPACE') + 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -ParameterFilter { $Config['prefix'] -eq 'dbhub' }
+
+        $script:recorders = @()
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        @($results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED').Count | Should -Be 0
+    }
+
     It 'says once that a configuration without activityProfile uses the new default, business-day, before the cost checks that count it (2026-11-03)' {
         Set-HappyAzMock
         $unset = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
@@ -1133,6 +1154,78 @@ Describe 'Test-DemoPermission' {
 
     It 'denies everything with no assignments' {
         Test-DemoPermission -Permission @() -Action 'Microsoft.Resources/deployments/write' | Should -BeFalse
+    }
+}
+
+Describe 'Get-DemoFabricSharedResult: deploy.ps1 never puts an environment in another environment''s Fabric workspace (2026-11-19)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith {}
+        $script:ownerId = 'dddddddd-0000-0000-0000-000000000001'
+        # A second environment, rg-dbhubfn-demo, whose configuration names the owner's workspace (init.ps1 at 9a218e0, or a
+        # hand edit), which rg-dbhub-demo records.
+        $script:second = $config | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+        $script:second['prefix'] = 'dbhubfn'
+        $script:second['fabric']['workspaceName'] = 'Database Hub Demo'
+        $script:others = @([pscustomobject]@{ Name = 'rg-dbhub-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhub-demo'; Tagged = $true; Claims = @($script:ownerId) })
+        $script:own = [pscustomobject]@{ Found = $false; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false }
+        $script:claimOk = $true
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { [pscustomobject]@{ Ok = $script:claimOk; Error = $(if ($script:claimOk) { '' } else { 'AccessDenied' }); Others = $script:others; Own = $script:own } }
+        $script:check = { param([System.Collections.IDictionary] $Config, [string] $Id) InModuleScope DbHubDemo -Parameters @{ Config = $Config; Id = $Id } { Get-DemoFabricSharedResult -Config $Config -WorkspaceId $Id } }
+    }
+
+    It 'is a Fail before anything is created when another environment records the workspace and this new one doesn''t (the final tests'' F5)' {
+        $shared = & $script:check $script:second $script:ownerId
+        $shared.checkId | Should -Be 'DEPLOY.FABRIC.SHARED'
+        $shared.status | Should -Be 'Fail'
+        $shared.message | Should -Be 'The Fabric workspace "Database Hub Demo" (fabric.workspaceName) is the one rg-dbhub-demo records as its own, not this environment''s (rg-dbhubfn-demo), so deploy.ps1 stops before it creates anything: it would put this environment''s lakehouse, history model, report, notebooks, and Insights app there, over the other environment''s.'
+        $shared.remediation | Should -Be 'Give this environment its own workspace: set fabric.workspaceName in its configuration to a name no other environment uses, for example "Database Hub Demo dbhubfn", or run ./scripts/init.ps1 -Force -Prefix dbhubfn -WorkspaceName "Database Hub Demo dbhubfn"; then run ./scripts/deploy.ps1 again.'
+        $shared.evidence.outcome | Should -Be 'claimed'
+        @($shared.evidence.claimedBy) | Should -Be @('rg-dbhub-demo')
+
+        # An environment that records another workspace (its configuration edited by hand since), or none and never finished
+        # a Fabric step (a first run that stopped before it): a Fail too.
+        foreach ($own in @(
+                [pscustomobject]@{ Found = $true; FabricWorkspaceId = 'dddddddd-0000-0000-0000-000000000009'; Claims = @('dddddddd-0000-0000-0000-000000000009'); UsedFabric = $true }
+                [pscustomobject]@{ Found = $true; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false }
+            )) {
+            $script:own = $own
+            (& $script:check $script:second $script:ownerId).status | Should -Be 'Fail'
+        }
+    }
+
+    It 'keeps an environment that shares the workspace already going, with a Warning and how to move, so its update never breaks' {
+        # The existing user who updates: rg-dbhubfn-demo records the workspace too.
+        $script:own = [pscustomobject]@{ Found = $true; FabricWorkspaceId = $script:ownerId; Claims = @($script:ownerId); UsedFabric = $true }
+        $shared = & $script:check $script:second $script:ownerId
+        $shared.status | Should -Be 'Warning'
+        $shared.message | Should -Be 'The Fabric workspace "Database Hub Demo" is this environment''s (rg-dbhubfn-demo records it), and rg-dbhub-demo records it too, so the environments share it: each deploy.ps1 puts its own notebooks there, over the other''s. This run goes on with it, as before.'
+        $shared.remediation | Should -Be 'To move this environment to a workspace of its own, set fabric.workspaceName in its configuration to a name no other environment uses, for example "Database Hub Demo dbhubfn", and run ./scripts/deploy.ps1: it creates that workspace with the demo''s items and records it, and "Database Hub Demo" stays as it is for rg-dbhub-demo.'
+        $shared.evidence.outcome | Should -Be 'shared'
+
+        # One deployed before 2026-11-17 used Fabric and records nothing: it may be its own workspace, so a Warning too.
+        $script:own = [pscustomobject]@{ Found = $true; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $true }
+        $unrecorded = & $script:check $script:second $script:ownerId
+        $unrecorded.status | Should -Be 'Warning'
+        $unrecorded.evidence.outcome | Should -Be 'unrecorded'
+        $unrecorded.message | Should -Match '^The Fabric workspace "Database Hub Demo" is the one rg-dbhub-demo records as its own, and this environment \(rg-dbhubfn-demo\) records none: it was deployed before 2026-11-17'
+    }
+
+    It 'says nothing for a workspace nobody else records or one that doesn''t exist yet, and warns when Resource Graph can''t say' {
+        & $script:check $config 'dddddddd-0000-0000-0000-000000000009' | Should -BeNullOrEmpty
+        & $script:check $script:second '' | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -Because 'a workspace that doesn''t exist yet is nobody''s, so Resource Graph isn''t asked'
+        $script:claimOk = $false
+        $unread = & $script:check $script:second $script:ownerId
+        $unread.status | Should -Be 'Warning' -Because 'never a silent Pass, and never a Fail that a Resource Graph outage causes'
+        $unread.message | Should -Match '^Whether another demo environment records the Fabric workspace "Database Hub Demo" couldn''t be checked before anything is created: AccessDenied\. deploy\.ps1 goes on with it'
+    }
+
+    It 'looks the workspace up by name, read-only, for a run without preflight (-Resolve)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoHubFabricAccess -MockWith { [pscustomobject]@{ Available = $true; Token = [System.Security.SecureString]::new(); Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith { [pscustomobject]@{ WorkspaceId = 'dddddddd-0000-0000-0000-000000000001'; WorkspaceName = 'Database Hub Demo'; Results = @() } }
+        $shared = InModuleScope DbHubDemo -Parameters @{ Config = $script:second } { Get-DemoFabricSharedResult -Config $Config -Resolve }
+        $shared.status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { [bool]$SkipLakehouse -and -not $PesterBoundParameters.ContainsKey('Create') }
     }
 }
 

@@ -172,6 +172,19 @@ Describe 'The first-run setup from deploy.ps1 (brief goal 1)' {
         $dry.Outcome.Kind | Should -Be 'WhatIf'
         $dry.Outcome.Reason | Should -Match 'Nothing was written or deployed\. No configuration file: rg-dbhub-demo is yours, so its configuration would be written'
     }
+
+    It 'names the run''s own -ConfigPath where it says to run deploy.ps1 again, or without -WhatIf (2026-11-19)' {
+        # Before, both said ./scripts/deploy.ps1, which deploys config/demo.config.json: another environment's, for a second one.
+        Mock -ModuleName DbHubDemo -CommandName Initialize-DemoConfig -MockWith {
+            [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'INIT.USER' -Area 'preflight' -Target 'subscription' -Status 'Manual action required' -Message 'No email address.' -Remediation 'Run ./scripts/init.ps1 -OwnerEmail <address> -Force.'); Config = $null; Path = $Path; Written = $false; BackupPath = ''; NextSteps = @() }
+        }
+        $command = './scripts/deploy.ps1 -ConfigPath "{0}"' -f [System.IO.Path]::GetFullPath($script:path)
+        $first = Initialize-DemoFirstRun -ConfigPath $script:path -Environment $script:interactive
+        $first.Outcome.Resume | Should -Be ('If this window closes or the PC restarts, run {0} again; it continues where it stopped.' -f $command)
+        $dry = Initialize-DemoFirstRun -ConfigPath $script:path -Environment $script:interactive -WhatIf
+        $dry.Outcome.Next | Should -Be ('Run {0} without -WhatIf to write the configuration and deploy.' -f $command)
+        $dry.Outcome.Resume | Should -Be $first.Outcome.Resume
+    }
 }
 
 Describe 'What DONE requires (brief item 16)' {

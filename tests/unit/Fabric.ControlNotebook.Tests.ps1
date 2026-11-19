@@ -162,8 +162,8 @@ def iso(value):
 SENT, JOBS, REFS, VALIDATORS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
-# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound" and "full".
-LAKEHOUSE = "" if scenario in ("unbound", "full") else "cccccccc-0000-0000-0000-000000000003"
+# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", and "leftoverjob".
+LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob") else "cccccccc-0000-0000-0000-000000000003"
 
 
 def running_status(session_id, accepted, minutes):
@@ -191,6 +191,23 @@ def with_t5(status, dispatch, minutes=75):
     return status
 
 
+# What a session's stop keeps of its plan since 2026-11-19 (the runbook's Write-DbHubStopStatus).
+PLAN_FIELDS = ("acceptedUtc", "runEndUtc", "dispatchUtc", "t4", "replicaLag", "t5")
+
+
+def stopped_status(session_id, ended, running=None, kept=None):
+    """The status the runbook's Stop now writes: what it did and, since 2026-11-19, the session's plan from running (the
+    status it replaces) and whether it kept it (planKept; kept=False: the status it replaced wasn't this session's). A
+    runbook from before then writes neither (running and kept None)."""
+    status = {"schemaVersion": 1, "sessionId": session_id, "phase": "stopped", "updatedUtc": iso(ended), "stoppedBy": "Stop now",
+              "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "failed": [], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}}
+    if running is not None:
+        status.update({key: running[key] for key in PLAN_FIELDS if key in running}, planKept=True)
+    elif kept is not None:
+        status["planKept"] = kept
+    return status
+
+
 def cosmos_document(session, start, end):
     return {"version": 1, "sessionId": session, "capturedBy": "control", "capturedUtc": iso(end), "startUtc": iso(start), "endUtc": iso(end),
             "windowMinutes": int((end - start).total_seconds() // 60), "intervalMinutes": 1, "accounts": [{"target": "T5", "resourceName": "cosmos01-abc123"}],
@@ -201,17 +218,43 @@ def cosmos_document(session, start, end):
 if scenario in ("active", "stopnow"):
     RUNBOOK.update(session="a" * 32, accepted=Clock.now - real_dt.timedelta(minutes=20), minutes=90)
     VAULT["dbhub-session-status"] = json.dumps(running_status("a" * 32, RUNBOOK["accepted"], 90))
-if scenario == "leftover":
+if scenario in ("leftover", "leftoverplan", "leftoverjob"):
     earlier = Clock.now - real_dt.timedelta(days=1)
     # The runbook writes the metrics compact (ConvertTo-Json -Compress).
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
                                                  "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+    if scenario == "leftoverplan":
+        # Its stop, which keeps its plan (2026-11-19): it ran its 90 minutes, accepted 10 minutes after its metrics start.
+        VAULT["dbhub-session-status"] = json.dumps(stopped_status("e" * 32, earlier, running_status("e" * 32, earlier - real_dt.timedelta(minutes=90), 90)))
 if scenario in ("stoppedend", "stoppedold"):
     # The app's Stop now cancelled the run that was ending session bbbb... while it waited for the telemetry (2026-11-19):
-    # the runbook had stopped it and kept its metrics, 5 minutes ago ("stoppedold": 10 days ago).
+    # the runbook had stopped it and kept its metrics, 5 minutes ago ("stoppedold": 10 days ago). A runbook from before
+    # 2026-11-19 wrote its stopped status, with no plan.
     ended = Clock.now - (real_dt.timedelta(days=10) if scenario == "stoppedold" else real_dt.timedelta(minutes=5))
-    VAULT["dbhub-session-status"] = json.dumps({"schemaVersion": 1, "sessionId": "b" * 32, "phase": "stopped", "updatedUtc": iso(ended), "stoppedBy": "Stop now",
-                                                "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "failed": [], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended))
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "b" * 32, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=90)),
+                                                 "endUtc": iso(ended), "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario in ("stoppedplan", "stoppedplannometrics"):
+    # The same, with the stop of a runbook from 2026-11-19 on, which keeps the session's plan: it ran its 90 minutes, and
+    # its metrics start 10 minutes before it ("stoppedplannometrics": the vault's metrics are an earlier session's).
+    ended = Clock.now - real_dt.timedelta(minutes=5)
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended, running_status("b" * 32, ended - real_dt.timedelta(minutes=90), 90)))
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": ("b" if scenario == "stoppedplan" else "f") * 32, "capturedUtc": iso(ended),
+                                                 "startUtc": iso(ended - real_dt.timedelta(minutes=100)), "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1,
+                                                 "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "stoppedstart":
+    # Stopped during its start, 5 minutes ago, before it had an end: T1 and T3 had their activity, and the vault's metrics
+    # are an earlier session's.
+    ended = Clock.now - real_dt.timedelta(minutes=5)
+    starting = running_status("b" * 32, ended - real_dt.timedelta(minutes=12), 90)
+    starting.update(phase="starting", runEndUtc="", dispatchUtc={key: starting["dispatchUtc"][key] for key in ("T1", "T3")})
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended, starting))
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "f" * 32, "capturedUtc": iso(ended - real_dt.timedelta(days=1)), "startUtc": iso(ended - real_dt.timedelta(days=1, minutes=100)),
+                                                 "endUtc": iso(ended - real_dt.timedelta(days=1)), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "stoppedlost":
+    # A runbook from 2026-11-19 on stopped it when the status it replaced was another session's, so it kept no plan.
+    ended = Clock.now - real_dt.timedelta(minutes=5)
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended, kept=False))
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "b" * 32, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=90)),
                                                  "endUtc": iso(ended), "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
 if scenario == "endedrunning":
@@ -378,6 +421,7 @@ with contextlib.redirect_stdout(buffer):
     try:
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
+                          "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
@@ -1087,8 +1131,14 @@ print(json.dumps(out))
         @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
+        @{ Case = 'an earlier session''s metrics and its stopped status, which keeps its plan: its history is saved with its beats (2026-11-19)'; Scenario = 'leftoverplan'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
+        @{ Case = 'an earlier session''s metrics without its plan, and no demo lakehouse: its history runs as a job, and the Warning says "unless it''s saved already" (2026-11-19)'; Scenario = 'leftoverjob'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 0; Jobs = 2; Validators = 0; Printed = 'NB_DatabaseHub_LiveActivity runs as a job in the demo workspace to save session eeeeeeee''s history\.' }
         @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
         @{ Case = 'Stop now after the run ending a session was cut off before its history: that session''s history is saved once its telemetry is in (2026-11-19)'; Scenario = 'stoppedend'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too, in case the run that was ending it stopped before it saved it \(NB_DatabaseHub_LiveActivity skips a session already saved\)\.\s+Waiting 11 minutes for its last telemetry to arrive \(until 14:10\)\.' }
+        @{ Case = 'Stop now after the run ending a session was cut off, its plan in its stopped status: its history is saved with its beats (2026-11-19)'; Scenario = 'stoppedplan'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too, in case the run that was ending it stopped before it saved it' }
+        @{ Case = 'Stop now when the vault''s metrics are an earlier session''s and the plan is in the stopped status: its history is saved with its beats, without T4''s metrics (2026-11-19)'; Scenario = 'stoppedplannometrics'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too.*\s+Waiting 11 minutes for its last telemetry to arrive \(until 14:10\)\.' }
+        @{ Case = 'Stop now after a session stopped during its start, before it had an end: its window ends at its stop, with no beats and no Warning (2026-11-19)'; Scenario = 'stoppedstart'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too.*\s+Waiting 11 minutes for its last telemetry to arrive \(until 14:10\)\.' }
+        @{ Case = 'Stop now after a stop that didn''t find the session''s plan: its history is saved without its beats, and the Warning names no fix (2026-11-19)'; Scenario = 'stoppedlost'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too' }
         @{ Case = 'Stop now after a session''s end passed with no stop recorded: it ends that session as its end would, its history saved (2026-11-19)'; Scenario = 'endedrunning'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session cccccccc ===' }
         @{ Case = 'Stop now when the last session stopped more than 7 days ago: it stops whatever runs, and saves no history'; Scenario = 'stoppedold'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 0; Jobs = 0; Validators = 0; Printed = 'No session runs \(its status says stopped\), so Stop now stops whatever runs\.' }
         @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'MODE is "check", so nothing was sent\.' }
@@ -1110,13 +1160,45 @@ print(json.dumps(out))
         @($report.validators).Count | Should -Be $Validators -Because 'the readiness check runs once per Run all that follows a running session'
         $report.printed | Should -Match $Printed
         $report.printed | Should -Not -Match 'Warning: the session''s history wasn''t saved'
-        if ($Scenario -eq 'leftover') {
+        # ConvertFrom-Json reads the times as dates.
+        $utc = { param($Value) ([datetime]$Value).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+        # The Warning of a history saved again without its beats (2026-11-19): what's there, and its session row.
+        $beatless = 'without its beats, because {0}: its beats'' correlation, its Database Agent finding, and its beats'' rows in scenario_runs are there only if an earlier save of it wrote them\. Its session row says it''s saved, so it isn''t analyzed again\. {1}'
+        $noFix = 'Only its status had its beats, so they can''t be saved now\.'
+        if ($Scenario -in 'leftover', 'leftoverplan') {
             # Its metrics are read before the start, and its history saved right after the start is sent.
             $session = $report.sent[0].sessionId
             @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'validator', 'sent:stop', ('history:{0}' -f $session.Substring(0, 8)))
             $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
             $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
             $report.refs[1].args.SESSION_ID | Should -Be $session
+            $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+            $plan.sessionId | Should -Be ('e' * 32)
+        }
+        if ($Scenario -eq 'leftover') {
+            # No status names it, so its plan is its window from its metrics, with no beats (2026-11-19): its session row says
+            # it's saved, so no later Run all analyzes it again, and a Warning says so once.
+            @($plan.beats).Count | Should -Be 0
+            (& $utc $plan.startUtc) | Should -Be '2026-11-13T12:20:00Z'
+            (& $utc $plan.endUtc) | Should -Be '2026-11-13T14:00:00Z'
+            ([regex]::Matches($report.printed, ('Warning: session eeeeeeee''s history is saved ' + ($beatless -f 'no status names it', $noFix)))).Count | Should -Be 1
+        }
+        if ($Scenario -eq 'leftoverjob') {
+            # A job's answer isn't read here, so its Warning says "unless it's saved already", once, as it starts.
+            $report.jobs[0].SESSION_ID | Should -Be ('e' * 32)
+            @(($report.jobs[0].SESSION_PLAN | ConvertFrom-Json).beats).Count | Should -Be 0
+            ([regex]::Matches($report.printed, ('Warning: unless session eeeeeeee''s history is saved already, that job saves it ' + ($beatless -f 'no status names it', $noFix)))).Count | Should -Be 1
+            $report.printed | Should -Not -Match 'Warning: session eeeeeeee''s history is saved without its beats'
+            $report.jobs[1].SESSION_ID | Should -Be $report.sent[0].sessionId
+        }
+        if ($Scenario -eq 'leftoverplan') {
+            # Its plan from its stopped status (2026-11-19): its beats, the Database Agent beat, and its own window.
+            @($plan.beats).Count | Should -BeGreaterThan 20
+            @($plan.beats | Where-Object { $_.PSObject.Properties.Name -contains 'agent' -and $_.agent }).Count | Should -Be 1
+            (& $utc $plan.startUtc) | Should -Be '2026-11-13T12:30:00Z'
+            (& $utc $plan.endUtc) | Should -Be '2026-11-13T14:00:00Z'
+            (& $utc $report.refs[0].args.WINDOW_START_UTC) | Should -Be '2026-11-13T12:25:00Z'
+            $report.printed | Should -Not -Match 'without its beats'
         }
         if ($Scenario -eq 'leftovercosmos') {
             # T5's alone: COSMOS_METRICS, and no POSTGRES_METRICS for an empty T4 document.
@@ -1143,6 +1225,43 @@ print(json.dumps(out))
             # Its window from its metrics, five minutes either side (ConvertFrom-Json reads the times as dates).
             ([datetime]$report.refs[0].args.WINDOW_START_UTC).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-14T12:20:00Z'
             ([datetime]$report.refs[0].args.WINDOW_END_UTC).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-14T14:00:00Z'
+            # A runbook from before 2026-11-19 stopped it, so its status has no plan: its window from its metrics, with no
+            # beats, and a Warning once, with the fix.
+            $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+            @($plan.beats).Count | Should -Be 0
+            (& $utc $plan.startUtc) | Should -Be '2026-11-14T12:25:00Z'
+            (& $utc $plan.endUtc) | Should -Be '2026-11-14T13:55:00Z'
+            ([regex]::Matches($report.printed, ('Warning: session bbbbbbbb''s history is saved ' + ($beatless -f 'the runbooks that stopped it are older than 2026-11-19 and kept no plan in its status', 'Fix: \./scripts/deploy\.ps1 republishes the runbooks, so a session''s stop keeps its plan\.')))).Count | Should -Be 1
+        }
+        if ($Scenario -eq 'stoppedstart') {
+            # As its end would save it: no beats, since it had no end, and its window from its start to its stop.
+            $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+            @($plan.beats).Count | Should -Be 0
+            (& $utc $plan.startUtc) | Should -Be '2026-11-14T13:43:00Z'
+            (& $utc $plan.endUtc) | Should -Be '2026-11-14T13:55:00Z'
+            (& $utc $report.refs[0].args.WINDOW_START_UTC) | Should -Be '2026-11-14T13:38:00Z'
+            $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
+            $report.printed | Should -Not -Match 'without its beats|no metrics for it'
+        }
+        if ($Scenario -eq 'stoppedlost') {
+            $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+            @($plan.beats).Count | Should -Be 0
+            ([regex]::Matches($report.printed, ('Warning: session bbbbbbbb''s history is saved ' + ($beatless -f 'the runbook didn''t find its plan when it stopped it \(another session''s status had replaced it, or it couldn''t be read\)', $noFix)))).Count | Should -Be 1
+            $report.printed | Should -Not -Match 'deploy\.ps1 republishes'
+        }
+        if ($Scenario -in 'stoppedplan', 'stoppedplannometrics') {
+            # Its plan from its stopped status (2026-11-19): its beats, the Database Agent beat, and its own window, not its
+            # metrics' (from 10 minutes before it).
+            @($report.order) | Should -Be @('sent:stop', 'history:bbbbbbbb')
+            $report.refs[0].args.SESSION_ID | Should -Be ('b' * 32)
+            $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+            @($plan.beats).Count | Should -BeGreaterThan 20
+            @($plan.beats | Where-Object { $_.PSObject.Properties.Name -contains 'agent' -and $_.agent }).Count | Should -Be 1
+            (& $utc $plan.startUtc) | Should -Be '2026-11-14T12:25:00Z'
+            (& $utc $report.refs[0].args.WINDOW_START_UTC) | Should -Be '2026-11-14T12:20:00Z'
+            $report.printed | Should -Not -Match 'without its beats|no metrics for it'
+            # T4's metrics when the vault's are this session's.
+            ($report.refs[0].args.PSObject.Properties.Name -contains 'POSTGRES_METRICS') | Should -Be ($Scenario -eq 'stoppedplan')
         }
         if ($Scenario -eq 'endedrunning') {
             $report.sent[0].sessionId | Should -Be ('c' * 32)
@@ -1151,6 +1270,450 @@ print(json.dumps(out))
         if ($Scenario -eq 'stoppedold') {
             $report.printed | Should -Not -Match 'already stopped'
         }
+    }
+
+    It 'completes a session''s history that a cancel cut off before scenario_runs, with its plan, and the next Run all doesn''t analyze it again (2026-11-19, needs pandas)' {
+        # The app's Stop now cancels the control's run while it saves a session's history, then runs Stop now. Each Run all
+        # here runs every code cell of the imported control notebook against stand-ins for the vault, the webhook and its
+        # runbook, Fabric, and a clock; its reference runs of NB_DatabaseHub_LiveActivity run that notebook's setup,
+        # section 3, and persist cells against a lakehouse in memory, with stand-ins for its telemetry.
+        $interpreter = $script:pandasPython
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $harness = Join-Path -Path $TestDrive -ChildPath 'resave_history.py'
+        Set-Content -LiteralPath $harness -Encoding utf8NoBOM -Value @'
+import contextlib, datetime as real_dt, io, json, re, sys, types
+import pandas as pd
+
+UTC = real_dt.timezone.utc
+CONTROL = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ACTIVITY = ["".join(cell["source"]) for cell in json.load(open(sys.argv[2], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+SETUP = [cell for cell in ACTIVITY if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+SESSION_CELL = next(cell for cell in ACTIVITY if cell.startswith("# This session"))
+PERSIST = next(cell for cell in ACTIVITY if cell.startswith("# Persist:"))
+
+spark_types = types.ModuleType("pyspark.sql.types")
+for name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, name, type(name, (), {}))
+spark_types.StructField = lambda name, kind, nullable: name
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+
+class Clock:
+    now = None
+    mono = 1000.0
+
+
+class FakeDateTime(real_dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return Clock.now if tz is None else Clock.now.astimezone(tz)
+
+
+fake_dt = types.ModuleType("fake_datetime")
+fake_dt.datetime, fake_dt.timedelta, fake_dt.timezone = FakeDateTime, real_dt.timedelta, real_dt.timezone
+fake_time = types.ModuleType("fake_time")
+
+
+def _sleep(seconds):
+    Clock.now += real_dt.timedelta(seconds=float(seconds))
+    Clock.mono += float(seconds)
+
+
+fake_time.sleep, fake_time.monotonic = _sleep, lambda: Clock.mono
+
+
+def iso(value):
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+SECRET_URL = "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
+PLAN_FIELDS = ("acceptedUtc", "runEndUtc", "dispatchUtc", "t4", "replicaLag", "t5")
+STATE = {}
+
+
+def running_status(session_id, accepted, minutes):
+    end = accepted + real_dt.timedelta(minutes=minutes)
+    dispatch = accepted + real_dt.timedelta(minutes=4)
+    return {"schemaVersion": 1, "sessionId": session_id, "phase": "running", "acceptedUtc": iso(accepted), "runEndUtc": iso(end),
+            "autoStopUtc": iso(end + real_dt.timedelta(minutes=10)), "durationMinutes": minutes, "plannedMinutes": minutes,
+            "names": {"resourceGroup": "rg-dbhub-demo", "deploymentId": "abc123", "sqlVm": "sqlvm01", "t2Guest": "arcsql01",
+                      "t3Server": "azuresql01-abc123", "t3Database": "ContosoCare", "t4Server": "pgflex01-abc123", "t4Replica": "pgreplica01-abc123"},
+            "dispatchUtc": {"T1": iso(dispatch), "T3": iso(dispatch), "T2": iso(dispatch + real_dt.timedelta(minutes=6)), "T4": iso(dispatch + real_dt.timedelta(minutes=5))},
+            "t4": {"state": "Ready", "sku": "Standard_D4ds_v5", "tier": "GeneralPurpose"}, "replica": {"state": "Ready", "note": "", "fix": ""},
+            "replicaLag": {"planned": True, "note": "", "fix": ""}, "steps": [], "message": ""}
+
+
+def runbook(body):
+    """The runbook behind the webhook: a session's start, whose status runs a minute later (vault_read), and its stop,
+    which writes its stopped status and its metrics. The stopped status keeps the session's plan since 2026-11-19
+    (Write-DbHubStopStatus); "oldRunbook" writes it as a runbook from before then did. A stop for no session changes
+    nothing here."""
+    vault = STATE["vault"]
+    if body["action"] == "session":
+        STATE.update(session=body["sessionId"], accepted=Clock.now, minutes=body["durationMinutes"])
+        STATE["sessions"].append(body["sessionId"])
+        vault["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "starting", "acceptedUtc": iso(Clock.now), "steps": []})
+    elif body["action"] == "stop" and body.get("sessionId") and body["sessionId"] == STATE["session"]:
+        running = json.loads(vault["dbhub-session-status"])
+        stopped = {"schemaVersion": 1, "sessionId": body["sessionId"], "phase": "stopped", "updatedUtc": iso(Clock.now), "stoppedBy": "Stop now",
+                   "done": ["T4 stopped", "sqlvm01 deallocated"], "failed": [], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}}
+        if not STATE["oldRunbook"]:
+            stopped.update({key: running[key] for key in PLAN_FIELDS if key in running}, planKept=True)
+        vault["dbhub-session-status"] = json.dumps(stopped)
+        vault["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": body["sessionId"], "capturedUtc": iso(Clock.now),
+                                                     "startUtc": iso(STATE["accepted"] - real_dt.timedelta(minutes=10)), "endUtc": iso(Clock.now),
+                                                     "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+        STATE["session"] = None
+
+
+def vault_read(name):
+    vault = STATE["vault"]
+    if name == "dbhub-session-status" and STATE["session"]:
+        current = json.loads(vault[name])
+        if current.get("phase") == "starting" and Clock.now - STATE["accepted"] >= real_dt.timedelta(seconds=60):
+            vault[name] = json.dumps(running_status(STATE["session"], STATE["accepted"], STATE["minutes"]))
+    return vault[name]
+
+
+class Response:
+    def __init__(self, status, body=None):
+        self.status_code, self._body, self.headers = status, body, {}
+        self.content = b"" if body is None else json.dumps(body).encode("utf-8")
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
+fake_requests = types.ModuleType("requests")
+
+
+class RequestException(Exception):
+    pass
+
+
+def post(url, data=None, headers=None, timeout=None, json=None):
+    if url == SECRET_URL:
+        body = __import__("json").loads(data)
+        STATE["sent"].append(body["action"])
+        runbook(body)
+        return Response(202, {"JobIds": ["job-%d" % len(STATE["sent"])]})
+    if "arcdataservices.com" in url:
+        return Response(401, {})
+    raise AssertionError("unexpected POST " + url)
+
+
+def request(method, url, json=None, headers=None, timeout=None):
+    if method == "GET" and url.startswith("https://api.fabric.microsoft.com/v1/") and "/items?type=" in url:
+        names = {"Notebook": [("NB_DatabaseHub_LiveActivity", "nb-1")], "Report": [("RPT_DatabaseHub_History", "RPT-1")], "KQLDashboard": []}[url.split("type=")[1]]
+        return Response(200, {"value": [{"displayName": name, "id": item} for name, item in names]})
+    raise AssertionError("unexpected %s %s" % (method, url))
+
+
+fake_requests.RequestException, fake_requests.post, fake_requests.request = RequestException, post, request
+sys.modules["requests"] = fake_requests
+
+
+class Cancelled(BaseException):
+    """The app's Stop now cancels the control's run where it is; no except Exception in either notebook catches it."""
+
+
+class NotebookExit(BaseException):
+    """notebookutils.notebook.exit: ends the activity notebook's run, and its value goes back to notebook.run's caller."""
+
+
+class Rows:
+    def __init__(self, lake, rows):
+        self.lake, self.rows = lake, rows
+
+    def filter(self, condition):
+        column, value = re.fullmatch(r"(\w+) = '([^']*)'", condition).groups()
+        return Rows(self.lake, [row for row in self.rows if row.get(column) == value])
+
+    def limit(self, count):
+        return Rows(self.lake, self.rows[:count])
+
+    def count(self):
+        return len(self.rows)
+
+
+class Lake:
+    def __init__(self):
+        self.tables, self.log, self.cancel_at, self.columns = {}, [], None, {}
+        self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
+        self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+
+    def table(self, name):
+        rows = Rows(self, self.tables[name])
+        rows.schema = types.SimpleNamespace(fields=[types.SimpleNamespace(name=column) for column, _ in self.columns[name]])
+        return rows
+
+    def createDataFrame(self, data, schema):
+        lake, rows = self, [dict(zip(schema, values)) for values in data]
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                if table == lake.cancel_at:
+                    raise Cancelled(table)
+                lake.log.append("append %s %d" % (table, len(rows)))
+                lake.tables.setdefault(table, []).extend(rows)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+    def sql(self, statement):
+        result = []
+        delete = re.fullmatch(r"DELETE FROM (\w+) WHERE run_id = '([^']*)'", statement)
+        if delete:
+            table = self.tables[delete.group(1)]
+            table[:] = [row for row in table if row.get("run_id") != delete.group(2)]
+        elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
+            self.tables.setdefault(statement.split()[5], [])
+        elif statement.startswith("SELECT COUNT(*) AS n FROM "):
+            result = [{"n": 0}]
+        elif statement.startswith("DESCRIBE DETAIL "):
+            result = [{"numFiles": 1}]
+        else:
+            raise AssertionError("unexpected statement: " + statement)
+        return types.SimpleNamespace(collect=lambda: result)
+
+
+def run_activity(arguments):
+    """NB_DatabaseHub_LiveActivity as notebookutils.notebook.run runs it: its parameters cell with the arguments over it, its
+    helpers, section 3, what sections 4 to 8 add (stand-ins: T1's CPU, a finding, and from the plan each beat's
+    correlation and the Database Agent beat's finding), and the persist cell. Returns its exit value."""
+    lake, ns = STATE["lake"], {}
+    exec(SETUP[0], ns)
+    ns.update(arguments)
+    for cell in SETUP[1:]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(cell, ns)
+    lake.columns = ns["TABLE_COLUMNS"]
+
+    def leave(value):
+        raise NotebookExit(value)
+
+    def incident_rows():
+        recorded = [ns["_incident_row"]("request:" + row["request_id"], "Recorded request", row["target"], "blocking", row["window_start_utc"],
+                                        row["window_end_utc"], 3.0, scenario=row["profile"].split(":", 1)[1], request_id=row["request_id"])
+                    for row in ns["SESSION_REQUESTS"] if row["profile"].startswith("incident:")]
+        start = pd.Timestamp(ns["WINDOW_START"])
+        detected = [] if recorded else [ns["_incident_row"]("detected:T1:blocking:" + start.strftime("%Y%m%dT%H%M"), "Detected signal", "T1", "blocking",
+                                                            start, start + pd.Timedelta(minutes=10), 3.0)]
+        return recorded, detected
+
+    def merge(session, recorded, detected):
+        table = lake.tables["incident_windows"]
+        for row in recorded + detected:
+            table[:] = [item for item in table if item["incident_key"] != row["incident_key"]] + [dict(row)]
+        lake.log.append("merge incident_windows %d" % len(recorded + detected))
+        return len(recorded + detected), 0
+
+    ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": "lakehouse"}, incident_window_rows=incident_rows,
+              merge_incident_windows=merge, _notebookutils=lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=leave)))
+    plan = json.loads(arguments.get("SESSION_PLAN") or "{}")
+    record = {"session": str(arguments.get("SESSION_ID") or ""), "plan": bool(plan), "beats": len(plan.get("beats") or []),
+              "analyzed": False, "cut": False, "exit": "", "writes": []}
+    STATE["runs"].append(record)
+    before = len(lake.log)
+    lake.cancel_at, STATE["cancelAt"] = STATE["cancelAt"], None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(SESSION_CELL, ns)
+            record["analyzed"] = True
+            start = pd.Timestamp(ns["WINDOW_START"])
+            cpu = pd.DataFrame({"Target": "T1", "Bucket": [start + pd.Timedelta(minutes=minute) for minute in range(6)],
+                                "AvgCPU": [20.0, 85.0, 90.0, 30.0, 25.0, 20.0]})
+            ns["add_snapshot"]("cpu", cpu, ns["WINDOW_START"], ns["WINDOW_END"], metrics=["AvgCPU"], units={"AvgCPU": "percent"})
+            ns["add_finding"]("consumption", "T1", "Warning", "T1's CPU peaked at 90%.", "cpu")
+            for request_id, beat in ns["session_beats"](ns["SESSION"]) if ns["SESSION"] else []:
+                if beat.get("agent"):
+                    ns["add_finding"]("database_agent", beat["target"], "Pass", "Database Agent loop on %s." % beat["target"], request_id, request_id=request_id)
+                elif beat["target"] in ns["SELECTED_TARGETS"]:
+                    ns["add_finding"]("correlation", beat["target"], "Pass", "%s on %s: expected signal observed." % (beat["scenario"], beat["target"]),
+                                      request_id, request_id=request_id)
+            exec(PERSIST, ns)
+    except NotebookExit as value:
+        record["exit"] = str(value)
+    except Cancelled:
+        record["cut"] = True
+        raise
+    finally:
+        lake.cancel_at = None
+        record["writes"] = [entry for entry in lake.log[before:]]
+    return record["exit"]
+
+
+class Notebook:
+    def run(self, path, timeout_seconds=90, arguments=None, workspace=""):
+        if path == "NB_DatabaseHub_Deployment":
+            _sleep(70)
+            return ""
+        assert path == "NB_DatabaseHub_LiveActivity", path
+        _sleep(240)
+        return run_activity(dict(arguments or {}))
+
+
+class Credentials:
+    def getSecret(self, vault, name):
+        return vault_read(name)
+
+    def getToken(self, audience):
+        return "simulated-" + audience
+
+
+def run_all(start, overrides=None, cancel_at=None):
+    """One Run all of the control notebook at start, its parameters overridden as the app's job API passes them."""
+    Clock.now = start
+    STATE.update(sent=[], cancelAt=cancel_at)
+    runs = len(STATE["runs"])
+    context = {"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": "cccccccc-0000-0000-0000-000000000003", "isForInteractive": True}
+    namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(), session=types.SimpleNamespace(stop=lambda: None),
+                                                       runtime=types.SimpleNamespace(context=context))}
+    buffer, cancelled, error = io.StringIO(), False, ""
+    with contextlib.redirect_stdout(buffer):
+        try:
+            exec(CONTROL[0], namespace)
+            namespace.update(overrides or {})
+            for index, source in enumerate(CONTROL[1:], start=1):
+                exec(source, namespace)
+                if index == 2:
+                    namespace["dt"], namespace["time"] = fake_dt, fake_time
+        except Cancelled:
+            cancelled = True
+        except Exception as failure:
+            error = "%s: %s" % (type(failure).__name__, failure)
+    return {"sent": list(STATE["sent"]), "printed": buffer.getvalue(), "cancelled": cancelled, "error": error, "runs": STATE["runs"][runs:]}
+
+
+def lake_state():
+    tables = STATE["lake"].tables
+    return {"counts": {name: len(rows) for name, rows in sorted(tables.items())},
+            "requests": sorted(str(row["request_id"]) for row in tables.get("scenario_runs", [])),
+            "agentFindings": sum(1 for row in tables.get("analysis_findings", []) if row["analysis"] == "database_agent"),
+            "runIds": sorted({row["run_id"] for rows in tables.values() for row in rows})}
+
+
+def flow(old_runbook=False, cancel_at="scenario_runs"):
+    """A session whose end the app's Stop now cancels while it saves the history, the app's Stop now right after, and the
+    next day's Run all, whose pre-check finds the session's metrics in the vault."""
+    STATE.update(lake=Lake(), runs=[], sessions=[], session=None, oldRunbook=old_runbook,
+                 vault={"dbhub-activity-webhook": SECRET_URL, "dbhub-session-status": "{}", "dbhub-session-metrics": "{}"})
+    # Three days ago, so the activity notebook's real clock, which ends its window at its now, is past every time here.
+    day = real_dt.datetime.now(UTC).replace(hour=10, minute=0, second=0, microsecond=0) - real_dt.timedelta(days=3)
+    report = {"first": run_all(day, cancel_at=cancel_at)}
+    report["session"], report["cut"] = STATE["sessions"][0], lake_state()
+    report["stop"] = run_all(Clock.now + real_dt.timedelta(minutes=1), {"STOP_NOW": True})
+    report["saved"] = lake_state()
+    report["later"] = run_all(day + real_dt.timedelta(days=1), {"WAIT_FOR_END": False, "WATCH_MINUTES": 0})
+    report["final"] = lake_state()
+    return report
+
+
+print(json.dumps({"plan": flow(), "oldRunbook": flow(old_runbook=True), "whole": flow(cancel_at=None)}, default=str))
+'@
+        $activity = Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb'
+        $output = & $interpreter $harness (Get-FilledNotebook -Zone 'UTC') $activity 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        foreach ($name in 'plan', 'oldRunbook', 'whole') {
+            foreach ($run in 'first', 'stop', 'later') {
+                $report.$name.$run.error | Should -BeNullOrEmpty -Because ('{0}, {1}' -f $name, $run)
+            }
+        }
+        $beatRows = { param($State, [string] $Session) @($State.requests | Where-Object { $_ -match ('^session:{0}:\d\d$' -f $Session) }).Count }
+
+        # The session's end: its stop, then its history, which the cancel cuts off before scenario_runs.
+        $plan = $report.plan
+        $session = $plan.session
+        $plan.first.cancelled | Should -BeTrue
+        @($plan.first.sent) | Should -Be @('session', 'stop')
+        @($plan.first.runs).Count | Should -Be 1
+        $plan.first.runs[0].cut | Should -BeTrue
+        $plan.first.runs[0].beats | Should -BeGreaterThan 20
+        @($plan.cut.requests) | Should -BeNullOrEmpty
+        $plan.cut.agentFindings | Should -Be 1
+
+        # Stop now's save, with the plan from the session's stopped status: it keeps what the cut-off run saved and writes
+        # the session's row and its beats' rows, the session's row last.
+        @($plan.stop.sent) | Should -Be @('stop')
+        @($plan.stop.runs).Count | Should -Be 1
+        $plan.stop.runs[0].session | Should -Be $session
+        $plan.stop.runs[0].beats | Should -Be $plan.first.runs[0].beats
+        $plan.stop.runs[0].analyzed | Should -BeTrue
+        @($plan.stop.runs[0].writes | Where-Object { $_ -like 'append *' }) | Should -Be @(('append scenario_runs {0}' -f @($plan.saved.requests).Count))
+        @($plan.saved.requests) | Should -Contain ('session:{0}' -f $session)
+        (& $beatRows $plan.saved $session) | Should -BeGreaterThan 10
+        $plan.saved.counts.telemetry_snapshots | Should -Be $plan.cut.counts.telemetry_snapshots
+        $plan.saved.counts.analysis_findings | Should -Be $plan.cut.counts.analysis_findings
+        $plan.saved.counts.incident_windows | Should -Be $plan.cut.counts.incident_windows
+        $plan.saved.agentFindings | Should -Be 1
+        @($plan.saved.runIds) | Should -Be @('session-' + $session)
+        $plan.stop.printed | Should -Match 'Pass: the history is saved; the report and the Insights app show it'
+        $plan.stop.printed | Should -Not -Match 'without its beats'
+
+        # The next day's pre-check finds the session's metrics, and the activity notebook ends at section 3: saved.
+        @($plan.later.sent) | Should -Be @('session')
+        @($plan.later.runs).Count | Should -Be 1
+        $plan.later.runs[0].session | Should -Be $session
+        $plan.later.runs[0].analyzed | Should -BeFalse
+        $plan.later.runs[0].exit | Should -Be ('Session {0} is already saved.' -f $session)
+        @($plan.later.runs[0].writes) | Should -BeNullOrEmpty
+        $plan.later.printed | Should -Match ('An earlier session \({0}, ' -f $session.Substring(0, 8))
+        $plan.later.printed | Should -Not -Match 'without its beats'
+        (ConvertTo-Json -InputObject $plan.final -Depth 4 -Compress) | Should -BeExactly (ConvertTo-Json -InputObject $plan.saved -Depth 4 -Compress)
+
+        # A runbook from before 2026-11-19 stopped the session, so its status has no plan: Stop now saves it with its window
+        # from its metrics, no beats, and its session row, and says so once; the next day it isn't analyzed again.
+        $old = $report.oldRunbook
+        $session = $old.session
+        $old.first.runs[0].cut | Should -BeTrue
+        $old.stop.runs[0].plan | Should -BeTrue
+        $old.stop.runs[0].beats | Should -Be 0
+        $old.stop.runs[0].analyzed | Should -BeTrue
+        @($old.saved.requests) | Should -Be @('session:' + $session)
+        $old.saved.agentFindings | Should -Be 1 -Because 'the cut-off run saved the findings its plan gave it'
+        $old.saved.counts.analysis_findings | Should -Be $old.cut.counts.analysis_findings
+        $warning = 'Warning: session {0}''s history is saved without its beats, because the runbooks that stopped it are older than 2026-11-19 and kept no plan in its status: its beats'' correlation, its Database Agent finding, and its beats'' rows in scenario_runs are there only if an earlier save of it wrote them.' -f $session.Substring(0, 8)
+        ([regex]::Matches($old.stop.printed, [regex]::Escape($warning))).Count | Should -Be 1
+        $old.stop.printed | Should -Match 'Fix: \./scripts/deploy\.ps1 republishes the runbooks, so a session''s stop keeps its plan\.'
+        $old.later.runs[0].analyzed | Should -BeFalse
+        $old.later.runs[0].exit | Should -Be ('Session {0} is already saved.' -f $session)
+        $old.later.printed | Should -Not -Match 'without its beats'
+
+        # A session's end that isn't cut off saves it whole, its session row last, and the next day's pre-check finds it
+        # saved, as before.
+        $whole = $report.whole
+        $session = $whole.session
+        $whole.first.cancelled | Should -BeFalse
+        @($whole.first.runs).Count | Should -Be 1
+        $whole.first.runs[0].writes[-1] | Should -Match '^append scenario_runs \d+$'
+        @($whole.cut.requests) | Should -Contain ('session:{0}' -f $session)
+        (& $beatRows $whole.cut $session) | Should -BeGreaterThan 10
+        $whole.stop.runs[0].analyzed | Should -BeFalse
+        $whole.later.runs[0].analyzed | Should -BeFalse
+        (ConvertTo-Json -InputObject $whole.final -Depth 4 -Compress) | Should -BeExactly (ConvertTo-Json -InputObject $whole.cut -Depth 4 -Compress)
     }
 
     It 'says when a full capacity refuses the history job (HTTP 430), and how the history still gets saved' {
