@@ -8,13 +8,12 @@ import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
 import { clearConversation, contextPrompt, loadAskSettings, loadConversation, recap, reduceConversation, saveConversation, toMarkdown, type AskSettings } from "./conversation";
-import { readEstate, type EstateView } from "./estate";
+import type { EstateView } from "./estate";
 import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
-import { buildSystemMessage } from "./guide";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
-import { createToolRunner, toolSpecs, type ToolRunner } from "./tools";
+import type { ToolRunner } from "./tools";
 import { CopilotContext, type AttachedContext, type CopilotContextValue } from "./use-copilot";
 
 const IDLE_CLOSE_MS = 5 * 60_000;
@@ -41,6 +40,13 @@ function hash(text: string): string {
     let h = 5381;
     for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
     return (h >>> 0).toString(36);
+}
+
+/** The system message (with the model guide) and the page tools, loaded when the first conversation starts rather than with the app. */
+function loadChatModules() {
+    return Promise.all([import("./guide"), import("./tools")]).catch(() => {
+        throw new Error("The chat's tools didn't load. Reload the page and ask again.");
+    });
 }
 
 export function CopilotProvider({ children, initialOpen = false, settings: settingsOverride }: { children: ReactNode; initialOpen?: boolean; settings?: AskSettings }) {
@@ -288,6 +294,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             if (!relay || !settings) throw new RelayError("Ask isn't deployed in this environment.", 0, "off");
             setConnecting(true);
             try {
+                const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
                 runner.current = createToolRunner({
                     runDax: async (query, rowLimit) => {
                         if (!queryClient) throw new Error("The history connector isn't ready yet.");
@@ -296,6 +303,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     },
                     estate: settings.estate
                         ? async (view) => {
+                              const { readEstate } = await import("./estate");
                               const answer = await readEstate(view as EstateView);
                               return { source: answer.source, data: { scope: answer.scope, data: answer.data, errors: answer.errors, at: answer.at } };
                           }
