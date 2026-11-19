@@ -1,13 +1,15 @@
 name: ask-relay-image
 
 # The Ask relay's container image (ask-relay/, ADR 0028): built, tested, and published to GitHub Container Registry
-# by this repository only, tagged with the commit SHA. Users never run it: deploy.ps1 pulls the image by the digest
-# pinned in config/versions.json (askRelay.image). It runs on main when ask-relay/ changes, in a public repository or
-# with the repository variable ASK_RELAY_IMAGE_ENABLED set to true (ADR 0022), and by hand on any branch, so a branch's
-# image can be tried before it merges. The image holds no secret (ask-relay/Dockerfile).
+# by this repository only, tagged with the commit SHA. Users never run it: deploy.ps1 pulls the image anonymously by
+# the digest pinned in config/versions.json (askRelay.image). GitHub creates the package private; only its owner can
+# make it public, once, and it can't be made private again. It runs on a push to main or ignite-updates that changes
+# ask-relay/ or this file, in a public repository or with the repository variable ASK_RELAY_IMAGE_ENABLED set to true
+# (ADR 0022), and by hand on any branch, so a branch's image can be tried before it merges. Never on a pull request,
+# and never in a fork. The image holds no secret (ask-relay/Dockerfile).
 on:
   push:
-    branches: [main]
+    branches: [main, ignite-updates]
     paths:
       - "ask-relay/**"
       - ".github/workflows/ask-relay-image.yml"
@@ -23,7 +25,7 @@ concurrency:
 jobs:
   image:
     name: Build, test, and publish
-    if: github.event_name == 'workflow_dispatch' || github.event.repository.visibility == 'public' || vars.ASK_RELAY_IMAGE_ENABLED == 'true'
+    if: ${{ !github.event.repository.fork && (github.event_name == 'workflow_dispatch' || github.event.repository.visibility == 'public' || vars.ASK_RELAY_IMAGE_ENABLED == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -71,10 +73,13 @@ jobs:
           docker push "${IMAGE}:${SHA}"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${SHA}")"
           docker logout ghcr.io
+          echo "::notice title=Ask relay image to pin (askRelay.image)::${digest}"
           {
             echo "### Ask relay image"
             echo ""
             echo "Built from \`${SHA}\` on \`${GITHUB_REF_NAME}\`. To use it, pin it in config/versions.json (\`askRelay.image\`):"
             echo ""
             echo "\`${digest}\`"
+            echo ""
+            echo "deploy.ps1 pulls it anonymously: until the package is public, the relay isn't deployed (a Warning)."
           } >> "${GITHUB_STEP_SUMMARY}"

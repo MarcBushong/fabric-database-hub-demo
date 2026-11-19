@@ -124,6 +124,16 @@ function Invoke-DemoAskRelaySetup {
     $evidence['seconds'] = $seconds
     if ($run.ExitCode -ne 0) {
         $endpoint = if ($current.Exists) { [string]$current.Endpoint } else { '' }
+        $kept = if ($current.Exists) { ' The relay that was already there keeps running on its earlier image.' } else { '' }
+        $label = Get-DemoAskImageLabel -Image $setting.Image
+        switch (Get-DemoAskImagePullProblem -Text ([string]$run.StdErr)) {
+            'private' {
+                return (& $done (& $result 'Warning' ('Ask''s chat relay wasn''t deployed ({0} s): Container Apps couldn''t pull its image ({1}) without credentials. deploy.ps1 pulls it anonymously, and a GitHub Container Registry package is private until its owner makes it public (or the package doesn''t exist).{2}' -f $seconds, $label, $kept) 'The repository''s owner makes the ask-relay package public once (on GitHub, the package''s Package settings: Change visibility, Public), then run ./scripts/deploy.ps1 again. Or set ask.image in config/demo.config.json to your own image that pulls without credentials, pinned by digest. Everything else in the Insights app works meanwhile.') $endpoint ([string]$current.AllowedOrigins))
+            }
+            'missing' {
+                return (& $done (& $result 'Warning' ('Ask''s chat relay wasn''t deployed ({0} s): its registry has no image with the pinned digest ({1}).{2}' -f $seconds, $label, $kept) 'Pin a digest that .github/workflows/ask-relay-image.yml printed (config/versions.json askRelay.image), or correct ask.image in config/demo.config.json; then run ./scripts/deploy.ps1 again. Everything else in the Insights app works meanwhile.') $endpoint ([string]$current.AllowedOrigins))
+            }
+        }
         return (& $done (& $result 'Warning' ('Ask''s chat relay couldn''t be deployed ({0} s): {1}' -f $seconds, (Get-DemoDeploymentErrorText -Text ([string]$run.StdErr) -MaxLength 600)) $rerun) $endpoint ([string]$current.AllowedOrigins))
     }
     $endpoint = ''

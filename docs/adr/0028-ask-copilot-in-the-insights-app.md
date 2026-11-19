@@ -46,7 +46,7 @@ One GitHub OAuth App, **Database Hub Insights Ask**, owned by MarcBushong, with 
 
 ### Decision 2: the relay's image
 
-A public image on GitHub Container Registry, built and published by this repository's own workflow (`.github/workflows/ask-relay-image.yml`) when `ask-relay/` changes on main, or by hand on any branch; tagged with the commit SHA and pinned by digest in `config/versions.json` (`askRelay.image`). Both base images are Microsoft's Azure Linux Node.js images from MCR, pinned by digest; the runtime is distroless and non-root. Users never run a workflow: `deploy.ps1` pulls the pinned digest. `ask.image` lets an advanced user run their own image, pinned by digest and pullable without credentials. Without an image, Ask isn't deployed: a Warning, and DONE stays.
+A public image on GitHub Container Registry, built and published by this repository's own workflow (`.github/workflows/ask-relay-image.yml`) on a push to `main` or `ignite-updates` that changes `ask-relay/` or the workflow, or by hand on any branch; never on a pull request or in a fork. Tagged with the commit SHA and pinned by digest in `config/versions.json` (`askRelay.image`). GitHub creates the package private; making it public is the owner's one-time decision (2026-11-19: until then, everything else is ready, so their yes and the pin are the only steps left). Both base images are Microsoft's Azure Linux Node.js images from MCR, pinned by digest; the runtime is distroless and non-root. Users never run a workflow: `deploy.ps1` pulls the pinned digest. `ask.image` lets an advanced user run their own image, pinned by digest and pullable without credentials. Without an image, Ask isn't deployed: a Warning, and DONE stays.
 
 ### Decision 3: the live estate
 

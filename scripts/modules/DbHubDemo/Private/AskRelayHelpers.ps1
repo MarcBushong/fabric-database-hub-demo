@@ -176,3 +176,27 @@ function Get-DemoAskImageLabel {
     }
     return $Image
 }
+
+function Get-DemoAskImagePullProblem {
+    # Why Container Apps couldn't pull the relay's image, from a deployment's error text: 'private' when the registry
+    # refused an anonymous pull (a new GitHub Container Registry package is private until its owner makes it public,
+    # and GHCR can answer the same for a package that doesn't exist), 'missing' when no image has the pinned digest,
+    # or '' for any other failure. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Text = ''
+    )
+
+    if ($Text -notmatch '(?i)template\.containers|\bimage\b') {
+        return ''
+    }
+    if ($Text -match '(?i)MANIFEST_UNKNOWN|manifest unknown') {
+        return 'missing'
+    }
+    if ($Text -match '(?i)\bUNAUTHORIZED\b|\bDENIED\b|authentication required|NAME_UNKNOWN') {
+        return 'private'
+    }
+    return ''
+}

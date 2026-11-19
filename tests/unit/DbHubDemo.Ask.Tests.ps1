@@ -39,7 +39,7 @@ BeforeAll {
         $script:azCalls = [System.Collections.Generic.List[string]]::new()
         $script:deployments = [System.Collections.Generic.List[object]]::new()
         $script:providerState = 'Registered'
-        $script:templateFails = $false
+        $script:templateError = ''
         $script:relayExists = $false
         $script:relayOrigins = ''
     }
@@ -74,8 +74,8 @@ BeforeAll {
                 'deployment group create*' {
                     $file = (Get-ArgumentValue $words '--parameters').Substring(1)
                     $script:deployments.Add([pscustomobject]@{ Text = $text; Raw = (Get-Content -LiteralPath $file -Raw); Parameters = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable) })
-                    if ($script:templateFails) {
-                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) Resource ''ca-dbhub-demo-ask'' was disallowed by policy.')
+                    if ($script:templateError) {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:templateError)
                     }
                     $script:relayExists = $true
                     $script:relayOrigins = [string]$script:deployments[-1].Parameters['parameters']['allowedOrigins']['value']
@@ -189,13 +189,27 @@ Describe 'Ask''s relay setup (Invoke-DemoAskRelaySetup)' {
     }
 
     It 'reports a deployment that fails as a Warning with the actual reason, never a Fail, and keeps the relay it had' {
-        $script:templateFails = $true
+        $script:templateError = 'ERROR: (RequestDisallowedByPolicy) Resource ''ca-dbhub-demo-ask'' was disallowed by policy.'
         $script:relayExists = $true
         $out = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
         $out.Results[0].status | Should -Be 'Warning'
         $out.Results[0].message | Should -BeLike '*RequestDisallowedByPolicy*'
         $out.Results[0].remediation | Should -BeLike '*configure-fabric-app.ps1*'
         $out.Endpoint | Should -Be $script:endpoint
+    }
+
+    It 'says why when Container Apps can''t pull the image: a package that isn''t public yet, or a digest that isn''t there (2026-11-19)' {
+        $field = 'ERROR: {"code":"InvalidParameterValueInContainerTemplate","message":"The following field(s) are either invalid or missing. Field ''template.containers.ask.image'' is invalid with details: ''Invalid value: \"ghcr.io/contoso/dbhub/ask-relay@sha256:' + ('a' * 64) + '\": {0}'';."}'
+        $script:templateError = $field.Replace('{0}', 'GET https:?scope=repository:contoso/dbhub/ask-relay:pull&service=ghcr.io: UNAUTHORIZED: authentication required')
+        $denied = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
+        $denied.Results[0].status | Should -Be 'Warning'
+        $denied.Results[0].message | Should -BeLike '*without credentials*private until its owner makes it public*'
+        $denied.Results[0].remediation | Should -BeLike '*Change visibility*ask.image*'
+        $denied.Endpoint | Should -Be ''
+        $script:templateError = $field.Replace('{0}', 'GET https://ghcr.io/v2/contoso/dbhub/ask-relay/manifests/sha256:aaaa: MANIFEST_UNKNOWN: manifest unknown')
+        $missing = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
+        $missing.Results[0].message | Should -BeLike '*no image with the pinned digest*'
+        $missing.Results[0].remediation | Should -BeLike '*ask-relay-image.yml printed*'
     }
 
     It 'deploys nothing without an image (a Warning) or with ask.enabled false (Not selected)' {
@@ -342,7 +356,11 @@ Describe 'Ask''s pins stay in step' {
         # A read-only token at the top; only the job that publishes may write packages (ADR 0022).
         $workflow | Should -Match '(?m)^permissions:\s*\n  contents: read\s*\n\s*\n'
         $workflow | Should -Match '(?m)^    permissions:\s*\n      contents: read\s*\n      packages: write\s*$'
-        $workflow | Should -Match "(?m)^    if: github\.event_name == 'workflow_dispatch' \|\| github\.event\.repository\.visibility == 'public' \|\| vars\.ASK_RELAY_IMAGE_ENABLED == 'true'$"
+        # On a push to main or ignite-updates that changes the relay or this file, or by hand; never on a pull request,
+        # and never in a fork (2026-11-19).
+        $workflow | Should -Match '(?m)^  push:\s*\n    branches: \[main, ignite-updates\]\s*\n    paths:\s*\n      - "ask-relay/\*\*"\s*\n      - "\.github/workflows/ask-relay-image\.yml"\s*\n  workflow_dispatch:\s*$'
+        $workflow | Should -Not -Match '(?m)^\s*pull_request'
+        $workflow | Should -Match '(?m)^    if: \$\{\{ !github\.event\.repository\.fork && \(github\.event_name == ''workflow_dispatch'' \|\| github\.event\.repository\.visibility == ''public'' \|\| vars\.ASK_RELAY_IMAGE_ENABLED == ''true''\) \}\}$'
         foreach ($uses in [regex]::Matches($workflow, 'uses:\s*(\S+)')) {
             $uses.Groups[1].Value | Should -Match '@[0-9a-f]{40}$'
         }
