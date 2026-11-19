@@ -232,6 +232,9 @@ function Get-DemoProgressCatalog {
         # history snapshot have read it, unless a session uses it. Non-blocking: it never keeps the run from DONE.
         $validation.Add((& $step 'T4ReplicaEnd' 'T4''s read replica at the end (deleted unless a session uses it; start-demo.ps1 and Run all create it for each session)' @() $true))
     }
+    # The stop at the end of an update (2026-11-19, Invoke-DemoUpdateEndStop): once the run is DONE, what it started is
+    # stopped again when the demo was stopped when it began. Non-blocking: it never keeps the run from DONE.
+    $validation.Add((& $step 'EndStop' 'Stop at the end (an update stops again what it started, as it found the demo; -KeepRunning keeps it running)' @() $true))
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }

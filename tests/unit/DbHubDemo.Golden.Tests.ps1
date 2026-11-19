@@ -1119,6 +1119,7 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $script:jobs = @{ 'DbHub-Control' = @(); 'DbHub-Stop' = @() }
         $script:jobsFail = ''
         $script:autoStop = ''
+        $script:autoStopDescription = ''
         $script:autoStopFail = $false
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
             if ($Url -match '/jobs$') {
@@ -1129,7 +1130,7 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
             if ($Url -match '/schedules/dbhub-autostop\?') {
                 if ($script:autoStopFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'Timeout' } }
                 if (-not $script:autoStop) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
-                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ startTime = $script:autoStop } }; Error = '' }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ startTime = $script:autoStop; description = $script:autoStopDescription } }; Error = '' }
             }
             throw ('unexpected: {0}' -f $Url)
         }
@@ -1166,6 +1167,16 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'active until 2026-11-04 03:10 UTC'
         ([datetime]$result.evidence['autoStopUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm") | Should -Be '2026-11-04T03:10'
+    }
+
+    It 'says when the pending auto-stop is a start-demo.ps1 session''s, with ./scripts/stop-demo.ps1 first as the fix (the review of 2026-11-19, finding 8)' {
+        $script:autoStop = '2026-11-04T05:00:00Z'
+        $script:autoStopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-11-04T01:00:00Z. Run all, the Insights app''s Start, or a run replaces it with its own plan.'
+        $result = Get-ControlCheck
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Be 'A start-demo.ps1 session runs, and its auto-stop (dbhub-autostop) deallocates archost01 at 2026-11-04 05:00 UTC, which would cut into the capture.'
+        $result.remediation | Should -Be 'Nothing was captured. Run ./scripts/stop-demo.ps1 first: it ends the session and removes its auto-stop, and the capture starts archost01 itself. Then run capture-t2-golden.ps1 again.'
+        $result.evidence['startDemo'] | Should -BeTrue
     }
 
     It 'fails when the jobs or the auto-stop can''t be read, because a run may be active' {

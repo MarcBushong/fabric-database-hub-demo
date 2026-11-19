@@ -364,6 +364,9 @@ function Invoke-DemoParallelDeployment {
        history snapshot and the session control's notebook, it's deleted, so the run leaves nothing new billing between
        sessions, unless a session uses it now (the control's pending auto-stop, or a start-demo.ps1 session's mark on the
        replica); on every run, a NOT DONE one included, never a Fail. The status page's T4ReplicaEnd row shows it.
+    9. After this function, deploy.ps1's ending (2026-11-19; Complete-DemoDeploymentRun, Invoke-DemoUpdateEndStop): a run
+       that ends DONE and found its demo stopped stops again what it started (DEPLOY.ENDSTOP, the EndStop row), from
+       DEPLOY.VMSTART's evidence of what ran when it began (Wait-DemoStoppedStart).
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout

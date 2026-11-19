@@ -62,6 +62,8 @@ BeforeAll {
         $script:groupTags = @{}
         $script:jobs = @()
         $script:autostop = ''
+        $script:autostopDescription = ''
+        $script:backupDescription = ''
         $script:rechecks = @{}
         $script:links = [System.Collections.Generic.List[object]]::new()
         # T1's plugin state, or a script block that returns it for the clock; '' means the agent reports no plugin
@@ -248,10 +250,10 @@ BeforeAll {
             '/schedules/dbhub-autostop-backup$' {
                 if ($Method -eq 'GET') {
                     if (-not $script:backup) { return (New-Response 404) }
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backup } }))
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backup; description = $script:backupDescription } }))
                 }
-                if ($Method -eq 'PUT') { $script:backup = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
-                if ($Method -eq 'DELETE') { $script:backup = ''; return (New-Response 200) }
+                if ($Method -eq 'PUT') { $script:backup = [string]$Body.properties.startTime; $script:backupDescription = [string]$Body.properties.description; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') { $script:backup = ''; $script:backupDescription = ''; return (New-Response 200) }
             }
             '/resourceGroups/rg-dbhub-demo$' {
                 if ($script:group -ne 200) { return (New-Response $script:group) }
@@ -264,12 +266,13 @@ BeforeAll {
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:jobs) } -Depth 8))
             }
             '/schedules/dbhub-autostop$' {
+                # Its description too (2026-11-19): start-demo.ps1's own auto-stop begins with [start-demo.ps1].
                 if ($Method -eq 'GET') {
                     if (-not $script:autostop) { return (New-Response 404) }
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autostop } }))
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autostop; description = $script:autostopDescription } }))
                 }
-                if ($Method -eq 'PUT') { $script:autostop = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
-                if ($Method -eq 'DELETE') { $script:autostop = ''; return (New-Response 200) }
+                if ($Method -eq 'PUT') { $script:autostop = [string]$Body.properties.startTime; $script:autostopDescription = [string]$Body.properties.description; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') { $script:autostop = ''; $script:autostopDescription = ''; return (New-Response 200) }
             }
             '/schedules/(dbhub-monitor-\d+)$' {
                 $name = $Matches[1]
@@ -643,6 +646,27 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $active.Active | Should -BeTrue
         $active.Reason | Should -Match 'Stop now'
         (Get-DbHubActiveRun -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 15, 11, 0, [System.DateTimeKind]::Utc)))).Active | Should -BeFalse
+    }
+
+    It 'lets a run start while only start-demo.ps1''s auto-stop is pending, and replaces it, with its backup, by the run''s own plan (2026-11-19)' {
+        # The newer session's plan wins: start-demo.ps1 marks its auto-stop, so a later Run all or the Insights app's Start
+        # isn't refused, and that start-demo.ps1 auto-stop doesn't cut the run off.
+        $script:autostop = '2026-10-27T18:00:00Z'
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T14:00:00Z.'
+        $script:backup = '2026-10-27T18:30:00Z'
+        $script:backupDescription = '[start-demo.ps1] Stops the demo if the auto-stop of the start-demo.ps1 session that started at 2026-10-27T14:00:00Z didn''t.'
+        $script:links.Add([pscustomobject]@{ Id = 'ffffffff-0000-0000-0000-000000000001'; Schedule = 'dbhub-autostop'; Runbook = 'DbHub-Stop'; Parameters = @{ Scope = 'All' } })
+        $script:links.Add([pscustomobject]@{ Id = 'ffffffff-0000-0000-0000-000000000002'; Schedule = 'dbhub-autostop-backup'; Runbook = 'DbHub-Stop'; Parameters = @{ Scope = 'All' } })
+        $pending = Get-DbHubAutoStopRunEnd -Context (New-TestContext)
+        $pending.State | Should -Be 'None'
+        $pending.StartDemo | Should -BeTrue
+        (Get-DbHubActiveRun -Context (New-TestContext)).Active | Should -BeFalse
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $script:autostop | Should -Be '2026-10-27T15:30:00Z'
+        $script:autostopDescription | Should -Not -Match '^\[start-demo\.ps1\]'
+        $script:backupDescription | Should -Not -Match '^\[start-demo\.ps1\]'
+        @($script:links | Where-Object { $_.Id -in 'ffffffff-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000002' }) | Should -BeNullOrEmpty
     }
 
     It 'treats jobs it can''t read as an active run' {
@@ -1474,6 +1498,38 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.metrics.status | Should -Be 'Pass'
     }
 
+    It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {
+        # The control notebook's Stop now and its next Run all's pre-check rebuild the session's beats from it, to save
+        # its history with them when the run that was ending it stopped first.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        $plan = 'acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc $script:clock)
+        $result.status | Should -Be 'Stopped'
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        $stopped.stoppedBy | Should -Be 'Stop now'
+        $stopped.metrics.status | Should -Be 'Pass'
+        foreach ($name in $plan) {
+            (ConvertTo-Json -InputObject $stopped.$name -Depth 8 -Compress) | Should -BeExactly (ConvertTo-Json -InputObject $running.$name -Depth 8 -Compress) -Because $name
+        }
+        $stopped.planKept | Should -BeTrue
+        $stopped.PSObject.Properties.Name | Should -Not -Contain 'steps'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        # A copy of another session's status (one that started since) gives a stop of this session nothing of it.
+        $script:automationVariables['DbHubSessionStatus'] = '{"sessionId":"fedcba9876543210fedcba9876543210","phase":"running","acceptedUtc":"2026-10-27T18:00:00Z","runEndUtc":"2026-10-27T19:30:00Z","dispatchUtc":{"T1":"2026-10-27T18:04:00Z"}}'
+        $script:groupTags['DbHubSessionId'] = $script:sessionId
+        $null = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc $script:clock)
+        $again = Get-SessionStatus
+        $again.stoppedBy | Should -Be 'Auto-stop'
+        $again.sessionId | Should -Be $script:sessionId
+        foreach ($name in $plan) {
+            $again.PSObject.Properties.Name | Should -Not -Contain $name
+        }
+        $again.planKept | Should -BeFalse -Because 'the notebook says the runbook didn''t find the plan, rather than that the runbooks are old'
+    }
+
     It 'asks T4 to stop again when Azure fails its first stop right after the replica''s delete (SourceReplicasStartStopOrder, live 2026-11-14)' {
         # Live: the session's auto-stop saw the replica's 404 about 20 seconds before its delete finished, and T4's stop,
         # accepted, failed a minute later, which left T4 running.
@@ -2255,6 +2311,37 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         It 'never defers the per-run auto-stop (Scope All): it''s a session''s own end' {
             $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
             $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session' }
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Stopped'
+            @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+        }
+
+        It 'moves start-demo.ps1''s auto-stop to 5 minutes after a deploy.ps1 run that''s still going, keeping its mark, and stops nothing now (2026-11-19)' {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'deploy' }
+            $script:autostop = '2026-10-27T15:00:00Z'
+            $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T11:00:00Z.'
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Deferred'
+            $result.message | Should -Be 'Deferred: deploy.ps1 is still running (busy until 2026-10-27T15:45:00Z), so start-demo.ps1''s auto-stop stopped nothing now; it stops the demo at 2026-10-27T15:50:00Z.'
+            $script:autostop | Should -Be '2026-10-27T15:50:00Z'
+            $script:autostopDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
+            $script:backupDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
+            @($script:links | Where-Object { $_.Schedule -eq 'dbhub-autostop' -and $_.Runbook -eq 'DbHub-Stop' }).Count | Should -Be 1
+            @($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty
+        }
+
+        It 'stops at once for <Case>' -ForEach @(
+            @{ Case = 'a session''s auto-stop from the control notebook while deploy.ps1 runs'; Description = 'Stops the demo after the on-demand run that job aaaaaaaa started (ADR 0020).'; By = 'deploy' }
+            @{ Case = 'start-demo.ps1''s auto-stop once deploy.ps1 has ended (its grace period)'; Description = '[start-demo.ps1] Stops the demo 4 hours after this start.'; By = 'deploy-grace' }
+            @{ Case = 'start-demo.ps1''s auto-stop without a busy marker'; Description = '[start-demo.ps1] Stops the demo 4 hours after this start.'; By = '' }
+        ) {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            if ($By) {
+                $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = $By }
+            }
+            $script:autostop = '2026-10-27T15:00:00Z'
+            $script:autostopDescription = $Description
             $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
             $result.status | Should -Be 'Stopped'
             @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
