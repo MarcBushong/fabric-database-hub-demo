@@ -734,20 +734,11 @@ function Invoke-DemoPreflight {
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
     # a first deployment the nightly safety stop doesn't exist yet, and deploy.ps1 sets it up in this run, after its
-    # template: it counts as in place when the deployer can assign its role (Get-DemoSafetyStopPlan; 2026-11-19, the
-    # coordinator's option 2), and DEPLOY.COST.T4RESTART says so again if its setup then doesn't put it in place.
+    # template: it counts as in place when the deployer can assign its role (Resolve-DemoT4RestartCoverage; 2026-11-19, the
+    # coordinator's option 2, which estimate-cost.ps1 uses too), and DEPLOY.COST.T4RESTART says so again if its setup then
+    # doesn't put it in place.
     if ($t4On) {
-        $coverage = Get-DemoT4RestartCoverage -Config $Config
-        if (-not $coverage.Counts -and [string]$coverage.Missing -in 'SafetyStop', 'Role' -and [string](Get-DemoMemberValue -InputObject $coverage.Evidence -Name 'nightly') -in 'Missing', 'NotScheduled', 'NoRole') {
-            $plan = Get-DemoSafetyStopPlan -Config $Config -Permission $deployer
-            $coverage.Evidence['plan'] = $plan.Evidence
-            if ($plan.Planned) {
-                $coverage.Evidence['counts'] = $true
-                $coverage.Evidence['missing'] = ''
-                $coverage = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = $plan.Reason; Fix = ''; Evidence = $coverage.Evidence; WithoutReason = $coverage.Reason; WithoutFix = $coverage.Fix }
-            }
-        }
-        $costParameters['T4RestartCoverage'] = $coverage
+        $costParameters['T4RestartCoverage'] = (Resolve-DemoT4RestartCoverage -Config $Config -Permission $deployer).Coverage
     }
     $results.Add((New-DemoT4RestartCoverageResult -Config $Config -Coverage $(if ($t4On) { $costParameters['T4RestartCoverage'] } else { $null }) -CheckPrefix 'PREFLIGHT'))
     $estimate = $null

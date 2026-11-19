@@ -36,7 +36,7 @@
   "assumptions": {
     "demoHoursPerSession": 5,
     "lightUseHoursPerMonth": 10,
-    "bastionHoursPerSession": 1,
+    "bastionHoursPerSession": 0,
     "t3ActiveShareOfMaxVcores": 1.0,
     "hoursPerMonth": 730
   }

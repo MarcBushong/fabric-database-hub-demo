@@ -727,8 +727,8 @@ Describe 'Cost area' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
         $script:schedule = @{ properties = @{ status = 'Enabled'; dailyRecurrence = @{ time = '1900' }; timeZoneId = 'Pacific Standard Time' } }
         $script:costResponse = Get-TestAzResponse
-        # The budget at monthlyCeilingUsd's default, 390 for a new configuration since 2026-11-19 (ADR 0016).
-        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '390.0'; timeGrain = 'Monthly' })
+        # The budget at monthlyCeilingUsd's default, 415 for a new configuration since 2026-11-19 (ADR 0016).
+        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '415.0'; timeGrain = 'Monthly' })
         $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()
@@ -845,6 +845,26 @@ Describe 'Security area' {
         $output.evidence.directoriesPruned | Should -Be 1
         @($output.evidence.pruned).Count | Should -Be 1
         @($output.evidence.pruned)[0] | Should -Match 'fabric-app[\\/]node_modules$'
+    }
+
+    It 'warns, naming the folder, when a dependency-named folder outside the Insights app''s build holds what the scan left out (review of ab91ee5)' {
+        # A log in out/venv/ is the demo's own output: left out, the scan must not pass silently.
+        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd('=') }
+        $token = '{0}.{1}.{2}' -f (& $encode '{"alg":"HS256"}'), (& $encode ('{"oid":"' + [guid]::NewGuid().ToString() + '"}')), (& $encode ([guid]::NewGuid().ToString('N')))
+        foreach ($folder in 'venv', 'fabric-app/node_modules/pkg') {
+            New-Item -ItemType Directory -Path (Join-Path -Path $script:scanFolder -ChildPath $folder) -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path -Path $script:scanFolder -ChildPath ('{0}/run.log' -f $folder)) -Value ('token={0}' -f $token) -Encoding utf8NoBOM
+        }
+        $context = New-TestContext
+        $output = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder } { param($X, $P) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' }
+        $output.status | Should -Be 'Warning'
+        $output.message | Should -Match 'but 1 folder\(s\) named like a dependency tree outside the Insights app''s build weren''t read: .*venv\. They could hold this demo''s own output\.'
+        $output.message | Should -Not -Match 'fabric-app[\\/]node_modules\. They could'
+        $output.remediation | Should -Match 'validate\.ps1 -Area Security -ScanPath'
+        @($output.evidence.unexpectedPruned).Count | Should -Be 1
+        @($output.evidence.unexpectedPruned)[0] | Should -Match 'venv$'
+        $output.evidence.directoriesPruned | Should -Be 2
+        ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
     }
 
     It 'warns on role assignments the demo never creates and on a Key Vault, and fails on a public IP or an open inbound rule' {
