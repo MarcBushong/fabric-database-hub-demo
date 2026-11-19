@@ -45,7 +45,7 @@ The Fabric data agent is out of scope: it works over OneLake data, not Database 
 | Requirement | Who provides it | Reference |
 |---|---|---|
 | The tenant setting **Users can access the Database hub (preview)** on, and a Fabric Free license or higher for each presenter (P4) | A Fabric administrator | [Monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql) |
-| My workspace not on a Fabric capacity in North Europe or West Europe | The presenter | [Overview](https://learn.microsoft.com/fabric/database/hub/overview) |
+| Database Hub available in the tenant's region | The presenter | [Region availability](https://learn.microsoft.com/fabric/admin/region-availability) |
 | Reader or higher on the subscription. Contributors have it; others need P8 | A subscription Owner or RBAC administrator | [Monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql) |
 | `Microsoft.Sql` registered (P2) and performance monitoring enabled on each target (Phase 9) | `preflight.ps1` and the deployment | [Add SQL](https://learn.microsoft.com/fabric/database/hub/add-sql) |
 | Copilot enabled for the presenter by the tenant and capacity settings, on a workspace's Fabric capacity | A Fabric administrator | [Copilot in Fabric](https://learn.microsoft.com/fabric/fundamentals/copilot-enable-fabric) |

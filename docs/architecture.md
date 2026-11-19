@@ -1,14 +1,14 @@
 # Architecture
 
-This document describes how the Fabric Database Hub hybrid SQL demo is built and why. Decisions and their evidence are in the [architecture decision records](adr/README.md). What's automated and what isn't is in the [automation support matrix](automation-support-matrix.md). How to present it is in the [demo walkthrough](demo-walkthrough.md) and [presentation surfaces](presentation.md).
+How the demo's parts fit together, and why. The decisions and their evidence are in the [architecture decision records](adr/README.md), what's automated and what isn't in the [automation support matrix](automation-support-matrix.md), and how to present it in the [demo walkthrough](demo-walkthrough.md) and [presentation surfaces](presentation.md).
 
-> **Preview disclosure:** Microsoft Fabric Database Hub is generally available since 2026-11-17, with its Estate, Performance, security, and optimization views, its real-time dashboards for SQL, PostgreSQL, and Cosmos DB, bulk monitoring enablement, the SSMS and VS Code entry points, and the CLI skill. Its Copilot, Database Agents, and alerts, SQL Server on Azure VM performance monitoring, and unified inventory are previews; Learn still labels the SQL telemetry endpoint and the Arc SQL monitoring setting previews; and Fabric Apps, which the Insights app is built on, is a preview too ([limitations](limitations.md#preview-disclosures)). Behavior, prerequisites, and APIs can change. This repo uses only documented interfaces, with one narrow, read-only exception: the Insights app's estate function reads 8 allowlisted Database Hub routes, scoped to the demo's resource group ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)). It validates what it can.
+> **Preview disclosure:** Microsoft Fabric Database Hub is generally available since 2026-11-17. Its Copilot, Database Agents, alerts, SQL Server on Azure VM performance monitoring, and unified inventory are previews, Learn still labels the SQL telemetry endpoint and the Arc SQL monitoring setting previews, and Fabric Apps, which the Insights app is built on, is a preview too ([limitations](limitations.md#preview-disclosures)). Behavior, prerequisites, and APIs can change. This repo uses only documented interfaces, with one narrow, read-only exception: the Insights app's estate function reads 8 allowlisted Database Hub routes, scoped to the demo's resource group ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)).
 
 ## Goal and scope
 
-- **Goal:** a low-cost, repeatable customer demo of Database Hub (generally available) with its Copilot and Database Agents (previews) across five targets (three SQL targets, PostgreSQL, and Azure Cosmos DB) in the demo resource group, with the session control in a resource group of its own.
-- **Minimum permissions:** Contributor on an existing subscription (plan §9.1).
-- **One-click:** one command after `az login` (`scripts/deploy.ps1`) deploys and configures everything that has documented automation, and reports anything else as **Manual action required**. GitHub Actions (`deploy.yml`) is an optional path for maintainers (P7); users never need it.
+- **Goal:** a low-cost, repeatable customer demo of Database Hub, with its Copilot and Database Agents, across five targets (three SQL targets, PostgreSQL, and Azure Cosmos DB) in the demo resource group, with the session control in a resource group of its own.
+- **Minimum permissions:** Contributor on an existing subscription.
+- **One command:** `./scripts/deploy.ps1` after `az login` deploys and configures everything that has documented automation, and reports anything else as **Manual action required**. GitHub Actions (`deploy.yml`) is an optional path for maintainers (P7); users never need it.
 
 | ID | Target | Hosting | Management path | Scenario focus |
 |---|---|---|---|---|
@@ -20,186 +20,79 @@ This document describes how the Fabric Database Hub hybrid SQL demo is built and
 
 Every SQL scenario runs on T1, T2, and T3, because Copilot's target coverage in Database Hub isn't documented, except `plan-regression`, which needs T3's automatic tuning. T4 and T5 have scenarios of their own ([scenarios](../scenarios/README.md)). Database Agents covers Azure SQL Database only, so T3, where the showcase's Database Agent loop runs ([ADR 0013](adr/0013-agent-experience.md#amendment-general-availability-and-the-database-agent-loop-on-t3-2026-11-18)).
 
-## Overview
-
-```mermaid
-flowchart LR
-  subgraph OPS["Operator (Contributor)"]
-    CLI["deploy.ps1 in Cloud Shell or PowerShell 7"]
-  end
-  subgraph GH["GitHub Actions (optional, for maintainers, P7)"]
-    ACT["Workflows: deploy, demo-control, schedules, destroy"]
-  end
-  subgraph CTRL["rg-prefix-control"]
-    UAMI["GitHub identity and federated credentials (optional)"]
-    AUTO["The session control: Automation account, runbooks, and its vault, public or private by policy (ADR 0026)"]
-  end
-  subgraph RG["rg-prefix-env (the demo resource group)"]
-    BUD["Budget with alerts"]
-    SAFE["Nightly safety stop: deallocates the VMs, stops T4, deletes T5's container; ARM only"]
-    subgraph VNET["VNet 10.42.0.0/24, no VM public IPs"]
-      T1["T1 sqlvm01: SQL Server 2022 Std PAYG, SQL IaaS Agent ext, system MI, runner for T1, T3, T4, and T5"]
-      subgraph HOST["archost01: Hyper-V host, NAT 192.168.200.0/24, DNS forwarder"]
-        T2["T2 arcsql01: WS2022 guest from Arc Jumpstart's image by default, SQL Server 2022 Std, Arc agent and SQL ext, runner"]
-      end
-      T4["T4 pgflex01: PostgreSQL flexible server in snet-pg; its read replica pgreplica01 for each session"]
-      BAS["Bastion Basic (on demand only)"]
-    end
-    T3["T3 azuresql01: Azure SQL Database, GP serverless, Entra-only"]
-    T5["T5 cosmos01: Azure Cosmos DB for NoSQL, private endpoint; its container for each session"]
-    ARC["Arc projection: machine and sqlServerInstance"]
-    RELAY["Ask's chat relay: Container App, scales to zero, no credential"]
-  end
-  JS["Arc Jumpstart public storage: the prebuilt SQL Server guest image"]
-  subgraph MS["Microsoft-managed services"]
-    TEL["SQL telemetry pipeline and REST endpoint (preview)"]
-    HUB["Fabric Database Hub (GA), with Copilot and Database Agents (previews)"]
-  end
-  subgraph FAB["Fabric workspace on F or Trial capacity"]
-    NB1["NB_DatabaseHub_Deployment"]
-    NB2["NB_DatabaseHub_LiveActivity"]
-    NB3["NB_DatabaseHub_Control: one Run all per session"]
-    LH["LH_DatabaseHub Delta tables"]
-    APP["APP_DatabaseHub_Insights, the Insights app: history, live estate, Ask, Manage"]
-  end
-  GHC["GitHub Copilot: each viewer's own plan"]
-  AG["Fallback agents: Copilot CLI or VS Code with the GA databasehub-cli skill and microsoft-sql"]
-  CLI -->|"ARM, Run Command, caller token"| RG
-  ACT -->|"OIDC"| UAMI
-  UAMI -->|"Contributor"| RG
-  CLI -.->|"bundle in Run Command chunks"| T1
-  CLI -.->|"bundle in Run Command chunks"| HOST
-  JS -.->|"HTTPS download, checked against its Content-MD5"| HOST
-  T1 -->|"service or private endpoint"| T3
-  T1 -->|"runner, port 5432 in the VNet"| T4
-  T1 -->|"runner, private endpoint, HTTPS"| T5
-  T1 -->|"HTTPS 443"| TEL
-  T2 -->|"HTTPS 443 through host NAT"| TEL
-  T2 -.-> ARC
-  T3 -->|"platform collection"| TEL
-  TEL --> HUB
-  T4 -.->|"Azure Monitor metrics"| HUB
-  T5 -.->|"Azure Monitor metrics"| HUB
-  RG -.->|"Azure Resource Graph"| HUB
-  NB2 -->|"KQL with kusto token"| TEL
-  NB3 -->|"webhook, status and metrics secrets"| AUTO
-  AUTO -->|"start, replica, T5's container, stop; through ARM"| RG
-  NB3 -->|"job at the session's end"| NB2
-  NB1 --> LH
-  NB2 --> LH
-  AG --> HUB
-  AG --> TEL
-  APP -->|"WebSocket, the app's origin only"| RELAY
-  RELAY -->|"the viewer's GitHub token"| GHC
-  APP -->|"read-only DAX, as the viewer"| LH
-  APP -->|"estate function: 8 allowlisted read-only routes, as the app's owner"| HUB
-  APP -->|"Manage: a Run all job, for operators"| NB3
-```
-
 ## At a glance
-
-`deploy.ps1` deploys everything below that has documented automation, with one command after `az login`, in parallel tracks: T1 with T3, T2, T4, and Fabric. T2 needs no person: by default (`JumpstartImage`), the T2 host downloads [Arc Jumpstart](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md)'s prebuilt SQL Server 2022 Standard guest disk and makes it `arcsql01`, and no Bastion is needed. After `az login`, a default deployment needs a person only when you aren't an Owner, for one command that an Owner runs once for the roles of the nightly safety stop and the session control (`./scripts/grant-safety-stop.ps1`). The Insights app deploys with your `az login` too, so it needs a browser sign-in only if Fabric refuses that token. Neither keeps the run from **DONE**. **DONE**'s **Please confirm** lists what only a person can check, such as the optional selection of T3 for Database Agents (`HUB.AGENT.T3`: once per deployment, and only the Database Agent loop needs it). Each viewer of Ask, the Copilot chat in the Insights app, signs in to GitHub once per browser. A clean first deployment took **91 minutes** to **DONE**, measured on 2026-11-06 from a fresh clone, in West US 3 with the default `lowest-cost` profile; [deployment](deployment.md#expected-duration) has the other measured times. [Deploy it, step by step](deployment.md#deploy-it-step-by-step) has every step, and [automated vs manual](automation-support-matrix.md#automated-vs-manual) lists them all, automated or not.
-
-| What | Where | What it is | Deployed by |
-|---|---|---|---|
-| **T1** `sqlvm01` | Azure VM | SQL Server 2022 Standard, pay-as-you-go. Shows in Database Hub through the SQL IaaS Agent extension | `deploy.ps1` |
-| **T2** `arcsql01` | Nested Hyper-V guest on the Azure VM `archost01` | SQL Server 2022 Standard, pay-as-you-go, presented as a **simulated** on-premises server. Shows in Hub through SQL Server enabled by Azure Arc | `deploy.ps1`, unattended: by default (`JumpstartImage`) the guest is Arc Jumpstart's prebuilt SQL Server Standard image, which the host downloads, checks, and makes `arcsql01` ([options](deployment.md#options-t2s-install-modes)). A redeploy can restore the finished guest from an optional golden snapshot ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)), with no manual step |
-| **T3** `azuresql01-<id>` | Azure SQL Database | The `ContosoCare` database, General Purpose serverless, Microsoft Entra-only. Native in Hub | `deploy.ps1` |
-| **T4** `pgflex01-<id>` | Azure Database for PostgreSQL flexible server | PostgreSQL 18 with the `contosocare` database, Microsoft Entra only, no public access. Shows in Hub through Azure Monitor metrics. Its size is `t4SkuName`: General Purpose `Standard_D4ds_v5` (4 vCores) by default since 2026-11-04, with autonomous tuning, which needs 4 vCores; when Azure refuses it, another zone, then `Standard_D4ads_v5`, then `Standard_D2ds_v5` (tuning off; its cost check is a **Warning**). `Standard_B1ms` and `Standard_B2s` only when `t4SkuName` sets them, with tuning off. T4 is part of every deployment since 2026-11-09: a configuration's `t4Enabled: false` is ignored, with a note ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)) | `deploy.ps1` |
-| **T4's read replica** `pgreplica01-<id>` | Azure Database for PostgreSQL flexible server | A same-region read replica of T4, at T4's size, **for each session** (since 2026-11-13): it's created at the start, in about 9 minutes, and deleted at the stop, so nothing bills for it between sessions or after a deployment. Database Hub's Estate lists it, and its **Read replica lag** chart has data; the `replica-lag` scenario makes that lag climb on purpose. When Azure refuses T4's size for it, it tries another zone, then a size with at least T4's vCores, and says what that costs. A Burstable T4 has none: **Not supported**, with the fix ([ADR 0025](adr/0025-t4-read-replica.md)) | `start-demo.ps1` or Run all, for each session; `stop-demo.ps1` or the session's auto-stop deletes it. `deploy.ps1` creates it for its checks and deletes it at its end (since 2026-11-16) |
-| **T5** `cosmos01-<id>` | Azure Cosmos DB for NoSQL | The `contosocare` database and the `patient-events` container (partition key `/patientId`) at 400 RU/s, Microsoft Entra only (keys off), reached only through a private endpoint in both network modes, on the subscription's free tier when it's free and the subscription isn't internal. Shows in Hub through Azure Monitor metrics: normalized RU, requests, throttled requests (429), availability. An account has no stop, so since 2026-11-19 its container exists only during a session: `start-demo.ps1` and Run all create it, and every stop deletes it, so between sessions T5 bills only its private endpoint and DNS zone. Until the session control's role can create the container again (an Owner runs `./scripts/grant-safety-stop.ps1` once), it stays and bills between sessions too ([cost management](cost-management.md#t5-azure-cosmos-db-2026-11-18)). Since 2026-11-18 ([ADR 0027](adr/0027-t5-cosmos-db.md)) | `deploy.ps1`, on a first deployment and on an upgrade |
-| Workload | T1 to T5 | A workload runner with activity profiles and bounded incident scenarios that act only inside `ContosoCare` (`contosocare` on T4 and T5) | `deploy.ps1`; driven by the activity profiles, Run all, and `demo-control.ps1` |
-| Nightly safety stop | Azure Automation in the demo resource group | Every evening at the VMs' auto-shutdown time, it deallocates both VMs and stops T4 if they run, and deletes T5's container when a session left it (since 2026-11-19; the next start creates it again), then reads, through Azure Resource Manager only, whether T3 paused, and stops T4 again if it runs. A read replica that a session left behind is stopped once T4 is, and the job says so, with the fix. It never starts anything or connects to a database. It waits for a `deploy.ps1` that's still running, then stops the demo the same night, 60 minutes after the run ends, and DONE says when (since 2026-11-14). The control's daily T4 safety stop, 15 minutes after the auto-shutdown time, stops T4 and, while T1 is stopped, deletes T5's container too, as a fallback ([what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)) | `deploy.ps1`, on every run; it assigns the safety stop's role when you're an Owner, and otherwise an Owner runs one command once (P16) |
-| The session control | `rg-<prefix>-control` and Fabric | The Automation account `aa-<prefix>-control` with the runbooks `DbHub-Control`, `DbHub-Stop`, and `DbHub-Monitor` and the webhook; the Key Vault `kv-<prefix>-ctl-<suffix>` (the webhook's URL and the session's status and metrics, never a password); the identity `id-<prefix>-automation`; and the notebook `NB_DatabaseHub_Control`, whose **Run all** runs a whole session, with its own auto-stop. Part of every deployment since 2026-11-14 ([ADR 0026](adr/0026-one-run-all-session.md)) | `deploy.ps1`, on every run; it grants the control's roles when you may, and otherwise an Owner runs `./scripts/grant-safety-stop.ps1` once (P15) |
-| Custom roles and role assignments | The subscription | "DbHub Demo Safety Stop" for the nightly safety stop's identity at the demo resource group; "DbHub Demo Activity Operator" for the session control's identity at the demo resource group (A1) and the control's Automation account (A2); "DbHub Demo Session Writer" at the control vault's two session secrets (A4); and Key Vault Secrets User on the vault's three secrets for you (A3) | `deploy.ps1` when you're an Owner or User Access Administrator; otherwise an Owner runs `./scripts/grant-safety-stop.ps1` once (P15, P16) |
-| Administrators' group, budget, deployment record | Microsoft Entra ID and the subscription | The group `<prefix>-<environment>-sql-admins` (P6: T3's and T4's administrator), the budget with alerts, and the subscription deployment record `<prefix>-<environment>-main` | `init.ps1 -CreateAdminGroup`, or `deploy.ps1`'s first run, for the group; `deploy.ps1` for the rest |
-| Fabric notebooks | Fabric workspace | `NB_DatabaseHub_Deployment` (validator) and `NB_DatabaseHub_LiveActivity` (live analysis), which save the demo's history to the lakehouse `LH_DatabaseHub` | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
-| Real-Time Dashboard | Fabric workspace | `RTD_DatabaseHub_LiveView`: the live view, defined as code, over the telemetry endpoint | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
-| Power BI history report | Fabric workspace | `RPT_DatabaseHub_History`: four pages over its Direct Lake semantic model, `SM_DatabaseHub_History` | `deploy.ps1`'s Fabric track (`configure-powerbi.ps1`) |
-| [The Insights app](../fabric/app/README.md) (Fabric Apps, preview) | Fabric workspace | `APP_DatabaseHub_Insights`, a DBA console built with the Rayfin SDK and CLI ([ADR 0029](adr/0029-insights-app-dba-console.md)): the history (read-only DAX on the same model through its connector, as the viewer), the live estate (its functions item, as the app's owner), Ask (the Copilot chat, on each viewer's own GitHub Copilot plan), and Manage (bounded, confirmed session actions for its operators, the deployer and the admin group; for anyone else, it copies the request for Run all), with DAX and CSV export on every visual and ready-made prompts for Database Hub's Database Agent. Its backend adds two user data functions beside it, `APP_DatabaseHub_Insights_connector` and `APP_DatabaseHub_Insights`. Part of every deployment; when it can't be created, the run goes on and still ends **DONE**: the status page's row for the app turns red (Failed), with the actual error and the fix, and a failure there is reported as **Manual action required**, never a **Fail** | `deploy.ps1`'s Fabric track (`configure-fabric-app.ps1`), with your `az login`, once a Fabric administrator has turned on two tenant settings. A browser sign-in is needed only if Fabric refuses that token; `deploy.ps1` then starts it at the beginning of the next run ([prerequisites](prerequisites.md#for-the-insights-app)) |
-| Ask's chat relay | Azure Container Apps, in the demo resource group | `ca-<prefix>-<environment>-ask` in the environment `cae-<prefix>-<environment>-ask` (Consumption, 1 vCPU and 2 GiB, 0 to 1 replica, no Log Analytics workspace, no registry): it relays Ask to each viewer's own GitHub Copilot, holds no credential, and scales to zero about 10 minutes after the last question. Its image is public on ghcr.io, pinned by digest in `config/versions.json` (`askRelay.image`) ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) | `deploy.ps1`'s Fabric track (`configure-fabric-app.ps1`), which registers `Microsoft.App` when it's missing; `"ask": { "enabled": false }` leaves it out |
-| Database Hub | Fabric portal | Nothing to deploy: a portal page that finds the targets through Azure Resource Graph and charts their telemetry and Azure Monitor metrics | — |
-
-Also included: start, stop, reset, status, cost estimate, and destroy, from PowerShell, and whole sessions with **Run all** in Fabric; a [Database Agent prompt pack](../fabric/agent/README.md); and validation in six statuses: **Pass**, **Fail**, **Warning**, **Manual action required**, **Not supported**, and **Not selected**. A successful deployment alone is never **Pass**.
 
 ```mermaid
 flowchart TB
-  OP["You: PowerShell 7, or Run all in Fabric"]
-  subgraph RG["Azure: the demo resource group, deployed with Contributor"]
-    T1["T1 sqlvm01<br/>SQL Server on an Azure VM"]
-    subgraph HOST["archost01: Hyper-V host"]
-      T2["T2 arcsql01<br/>Arc-enabled SQL Server,<br/>simulated on-premises"]
+  PC["Your PC<br/>deploy.ps1"]
+  subgraph FAB["Fabric"]
+    APP["Insights app"]
+    NB["Notebooks<br/>Run all"]
+    HIST["History<br/>lakehouse, model, report"]
+    HUB["Database Hub"]
+  end
+  subgraph AZ["Azure"]
+    CTRL["Session control<br/>rg-dbhub-control"]
+    subgraph RG["rg-dbhub-demo: the demo resource group"]
+      SAFE["Nightly safety stop"]
+      RELAY["Chat relay<br/>Container App"]
+      subgraph TGT["The five targets"]
+        T1["T1 sqlvm01<br/>SQL Server on a VM"]
+        T2["T2 arcsql01<br/>Arc-enabled, nested"]
+        T3["T3 azuresql01<br/>Azure SQL Database"]
+        T4["T4 pgflex01<br/>PostgreSQL, with a replica"]
+        T5["T5 cosmos01<br/>Azure Cosmos DB"]
+      end
     end
-    T3["T3 azuresql01<br/>Azure SQL Database"]
-    T4["T4 pgflex01<br/>Azure Database for PostgreSQL"]
-    T4R["T4's read replica pgreplica01<br/>for each session"]
-    T5["T5 cosmos01<br/>Azure Cosmos DB for NoSQL"]
-    RELAY["Ask's chat relay<br/>Container App, scales to zero"]
   end
-  CTRL["rg-dbhub-control<br/>the session control"]
-  GOLD[("rg-dbhub-golden<br/>T2 golden snapshot, optional")]
-  JS[("Arc Jumpstart<br/>public SQL Server guest image")]
-  TEL["SQL telemetry endpoint (preview)"]
-  HUB["Database Hub (GA), with Copilot and Database Agents (preview)<br/>a Fabric portal page"]
-  GHC["GitHub Copilot<br/>each viewer's own plan"]
-  subgraph WS["Fabric workspace on F capacity"]
-    NB["Notebooks, and NB_DatabaseHub_Control"]
-    LH[("LH_DatabaseHub<br/>history tables")]
-    RTD["Real-Time Dashboard<br/>live, as code"]
-    PBI["Semantic model and<br/>Power BI report: history"]
-    APP["The Insights app (Fabric Apps, preview)<br/>history, live estate, Ask, Manage"]
-  end
-  OP -- "deploy, start, stop, reset, validate, destroy" --> RG
-  OP -- "import and check" --> WS
-  NB -- "Run all: webhook" --> CTRL
-  CTRL -- "start and stop the session" --> RG
-  JS -. "downloaded once per guest build" .-> HOST
-  GOLD -. "restored on a redeploy" .-> HOST
-  T1 --> TEL
-  T2 --> TEL
-  T3 --> TEL
-  RG -. "Estate: Azure Resource Graph" .-> HUB
-  TEL -- "Performance" --> HUB
-  T4 -. "Azure Monitor metrics" .-> HUB
-  T4 -- "replication" --> T4R
-  T4R -. "Azure Monitor metrics: Read replica lag" .-> HUB
-  T5 -. "Azure Monitor metrics: normalized RU, 429s" .-> HUB
-  T1 -- "the runner, through a private endpoint" --> T5
-  TEL -- "KQL as each viewer" --> RTD
-  TEL -- "KQL" --> NB
-  NB --> LH
-  LH -- "Direct Lake" --> PBI
-  PBI -- "semantic model connector" --> APP
-  APP -. "live estate: its function, 8 read-only routes" .-> HUB
-  APP -- "Ask" --> RELAY
-  RELAY --> GHC
-  APP -. "Database Agent prompt, pasted by you" .-> HUB
+  GHC["GitHub Copilot<br/>each viewer's plan"]
+  PC -->|"imports the items"| FAB
+  PC -->|"deploys and upgrades"| AZ
+  APP -->|"Manage: a Run all job"| NB
+  APP -->|"DAX, as the viewer"| HIST
+  NB -->|"saves the history"| HIST
+  APP -->|"live estate, read-only"| HUB
+  NB -->|"Run all: webhook"| CTRL
+  CTRL -->|"starts and stops a session"| TGT
+  SAFE -.->|"stops them nightly"| TGT
+  HUB -.->|"Resource Graph, telemetry, metrics"| TGT
+  APP -->|"Ask"| RELAY
+  RELAY -->|"the viewer's GitHub token"| GHC
 ```
+
+`deploy.ps1` deploys everything in the diagram with one command, in parallel tracks, and keeps it up to date. [What's deployed, and by what](../README.md#whats-deployed-and-by-what) lists each part with what creates and deletes it, and [components and defaults](#components-and-defaults) has each part's details. T2 needs no person: its host downloads [Arc Jumpstart](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md)'s prebuilt SQL Server 2022 Standard guest disk and makes it `arcsql01`, with no Bastion. What needs a person, none of which keeps the run from **DONE**:
+
+- **An Owner's one grant,** only when you aren't an Owner: `./scripts/grant-safety-stop.ps1`, once, for the roles of the nightly safety stop and the session control. **DONE** prints it first.
+- **Optional, once per deployment:** selecting T3 for Database Agents in Database Hub's **Manage agents**, about 30 seconds (`HUB.AGENT.T3`, under **DONE**'s **Please confirm**), which only the Database Agent loop needs.
+- **Each viewer of Ask,** the Copilot chat in the Insights app: a GitHub sign-in once per browser, on their own GitHub Copilot plan.
+- **The Fabric capacity:** you or its administrator resume it before Run all and pause it after. It's outside every estimate, with Fabric and Power BI licenses and each viewer's GitHub Copilot plan.
+- **Only if Fabric refuses your `az login` token:** the Insights app's browser sign-in, `./scripts/configure-fabric-app.ps1 -SignIn`.
+
+Also included: start, stop, reset, status, cost estimate, and destroy from PowerShell, a [Database Agent prompt pack](../fabric/agent/README.md), and validation in six statuses ([validation](#validation)). [Automated vs manual](automation-support-matrix.md#automated-vs-manual) lists every step, and [how long each step takes](deployment.md#how-long-each-step-takes) the measured times.
 
 ## Components and defaults
 
-Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-performance`) only set defaults ([ADR 0016](adr/0016-cost-profiles.md)).
+Every value is a parameter; the profiles (`lowest-cost`, `demo-day`, `enhanced-performance`) only set defaults ([ADR 0016](adr/0016-cost-profiles.md), [configuration](configuration.md)). The names are in [naming and tags](#naming-and-tags).
 
 | Component | Default | Notes |
 |---|---|---|
-| Region | West US 3 | In Hub's performance-monitoring region list and the SQL VM unified-inventory list. Preflight checks sizes and quota and suggests alternatives. |
-| Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` for the session control (and the GitHub identity on the GitHub path); `rg-dbhub-golden` only for an optional T2 golden snapshot | [ADR 0002](adr/0002-resource-group-topology.md) |
-| Network | VNet `10.42.0.0/24`: `snet-sqlvm`, `snet-archost`, `snet-pe` (T5's private endpoint in both modes, and T3's in private mode), `snet-pg` (delegated to T4), `AzureBastionSubnet` | No VM public IPs. [ADR 0007](adr/0007-networking-modes-and-egress.md) |
-| T1 `sqlvm01` | `Standard_D2s_v5` (`lowest-cost`), `MicrosoftSQLServer:sql2022-ws2022:standard-gen2`, OS disk (plus a data disk outside `lowest-cost`), system-assigned identity, SQL connectivity `LOCAL` | `Microsoft.SqlVirtualMachine/sqlVirtualMachines` with license type PAYG. Runs the workload runner for T1, T3, T4, and T5. |
-| T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX (and, in the build modes, its media) use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
-| T2 guest `arcsql01` | Generation 2, 2 vCPU, 8 GiB static memory. By default (`JumpstartImage`, since 2026-11-05) Arc Jumpstart ArcBox's prebuilt guest disk: a dynamic VHDX with a 100 GiB maximum (34 GiB to download), Windows Server 2022 Standard (not an evaluation), and SQL Server 2022 Standard. In the build modes (`ProductKey`, `Developer`, and a kept `PaygWizard` guest): a 64 GB dynamic VHDX, Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and wire server blocked; automatic start and shutdown. [ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md) |
-| T3 `azuresql01` | Logical server `azuresql01-<deploymentId>`, database `ContosoCare`, GP serverless Gen5, 0.5–2 vCores (1 before 2026-11-18), auto-pause 15 minutes, 32 GB maximum size | Entra-only with the P6 group as admin; TLS 1.2 |
-| T4 `pgflex01` | `pgflex01-<deploymentId>`, Azure Database for PostgreSQL flexible server, General Purpose `Standard_D4ds_v5` (4 vCores, 16 GiB) with autonomous tuning, PostgreSQL 18, 32 GiB, the database `contosocare`, virtual network integration in `snet-pg` with its own private DNS zone, in both network modes (`infra/modules/pgflex01.bicep`) | Entra-only with the P6 group as admin; no public access. When Azure refuses the size, the fallback in [T4 as built](#t4-as-built-phase-24). [ADR 0019](adr/0019-t4-postgresql-flexible-server.md) |
-| T4's read replica `pgreplica01` | `pgreplica01-<deploymentId>`, a same-region read replica of T4 at T4's size, in T4's subnet and private DNS zone (`infra/replica/pgreplica01.bicep`), created for each session by `start-demo.ps1` or Run all and deleted by `stop-demo.ps1` or the session's auto-stop; `deploy.ps1` creates it for its checks and deletes it at its end (since 2026-11-16) | Entra-only, inherited from T4; Database Hub's Read replica lag. Not on a Burstable T4. [ADR 0025](adr/0025-t4-read-replica.md) |
-| T5 `cosmos01` | `cosmos01-<deploymentId>`, Azure Cosmos DB for NoSQL, one region, Session consistency; database `contosocare`, container `patient-events` (partition key `/patientId`) at 400 RU/s manual, which exists only during a session since 2026-11-19; the private endpoint `pe-<prefix>-<environment>-cosmos01` in `snet-pe` with `privatelink.documents.azure.com`, in both network modes (`infra/modules/cosmos01.bicep`); the free tier when the subscription's one slot is free and the subscription isn't internal | Entra-only (`disableLocalAuth`), public network access off; T1's identity has Cosmos DB Built-in Data Contributor on the account, a data-plane role assignment that Contributor creates (`infra/modules/cosmos01-access.bicep`). `t5Enabled: false` leaves it out. [ADR 0027](adr/0027-t5-cosmos-db.md) |
-| Budget | `budget-<prefix>-<environment>` at `monthlyCeilingUsd`: $415 a month for a new configuration, a hard ceiling (preflight fails above it; a configuration keeps its own value; [cost management](cost-management.md#at-a-glance)), with alerts at 50%, 80%, and 100% to `ownerEmail` | Resource-group scope |
-| Auto-shutdown | DevTest Labs schedules for T1 and the host | The host's guest shuts down cleanly through its stop action |
-| Nightly safety stop | The identity `id-<prefix>-<environment>-safetystop` and the Automation account `aa-<prefix>-<environment>-safetystop` (Basic, local authentication off) with `DbHub-Stop` on the schedules `dbhub-safety-stop` (at `autoShutdownTime`, 19:00 by default) and `dbhub-safety-t3check` (30 minutes later, or T3's auto-pause delay plus 15 when that's longer), and `dbhub-safety-deferred` only after a `deploy.ps1` run it waited for | At the auto-shutdown time it deallocates both VMs and stops T4, then a read replica a session left running, in Azure's order, and deletes T5's container when a session left it (since 2026-11-19), then reads T3's status. Its custom role "DbHub Demo Safety Stop", at the demo resource group, has 9 actions: read the group, the VMs and their instance view, T3's database, T4, and T5's container; deallocate the VMs; stop T4; and delete T5's container. No start, no Run Command, no data access ([ADR 0024](adr/0024-nightly-safety-stop.md), [ADR 0025](adr/0025-t4-read-replica.md)) |
-| Session control | `rg-<prefix>-control`: the Automation account `aa-<prefix>-control` (runbooks `DbHub-Control`, `DbHub-Stop`, and `DbHub-Monitor`, the webhook, each session's `dbhub-autostop` and, only if that one fails, `dbhub-autostop-backup`, and the control's daily T4 safety stop `dbhub-t4-safety-stop`, 15 minutes after `autoShutdownTime` or at `control.t4SafetyStopTime`), the Key Vault `kv-<prefix>-ctl-<suffix>`, and the identity `id-<prefix>-automation` | Part of every deployment since 2026-11-14; `control.enabled: false` no longer turns it off. Its custom roles: "DbHub Demo Activity Operator" (A1 at the demo resource group, A2 at the control's Automation account, with T5's container read, write, and delete since 2026-11-19) and "DbHub Demo Session Writer" (A4); Key Vault Secrets User on the vault's three secrets (A3) ([ADR 0026](adr/0026-one-run-all-session.md)) |
-| Ask's chat relay | `ca-<prefix>-<environment>-ask` in `cae-<prefix>-<environment>-ask`: Container Apps, Consumption, 1 vCPU and 2 GiB, 0 to 1 replica, external HTTPS ingress | No Log Analytics workspace, no registry, no secret, no managed identity, and no role; the image is public on ghcr.io and pinned by digest (`config/versions.json` `askRelay.image`). `"ask": { "enabled": false }` leaves it out ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) |
-| Bastion | Basic SKU with a Standard public IP, created and removed on demand | Optional: no deployment needs it since the `PaygWizard` guided stop was retired (2026-11-09). Removed automatically after `bastionMaxHours` |
-| Key Vault | The session control's `kv-<prefix>-ctl-<suffix>` in every deployment (ADR 0026): the webhook's URL and the session's status and metrics, never a password; public or private, as the tenant's policy makes new vaults. The host-password vault `kv-<prefix><environment>-<deploymentId>` only with `keyVault.enabled` | The host-password vault is an opt-in since Phase 13 (`keyVault.enabled`, which requires `assignRoles`): an RBAC-mode vault, created on demand like Bastion, for the one-time host password ([ADR 0009](adr/0009-secrets-handling.md)). |
-| Log Analytics, storage accounts | Not deployed | Hub telemetry is Microsoft-managed, and Ask's Container Apps environment has no Log Analytics workspace. The artifact cache storage account was dropped on 2026-10-20 ([ADR 0016](adr/0016-cost-profiles.md), C9). |
+| Region | West US 3 | In Database Hub's performance-monitoring region list and SQL VM unified inventory's; preflight checks sizes and quota, and suggests alternatives |
+| Resource groups | `rg-dbhub-demo`; `rg-dbhub-control` for the session control (and the optional GitHub identity); `rg-dbhub-golden` only for an optional T2 golden snapshot | [ADR 0002](adr/0002-resource-group-topology.md) |
+| T1 | `Standard_D2s_v5` (`lowest-cost`), `MicrosoftSQLServer:sql2022-ws2022:standard-gen2`, an OS disk (and a data disk outside `lowest-cost`), a system-assigned identity, SQL connectivity `LOCAL` | `Microsoft.SqlVirtualMachine/sqlVirtualMachines`, license type PAYG. Runs the workload runner for T1, T3, T4, and T5 |
+| T2 host | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType` `Standard`; in `lowest-cost` the guest's disk (and, in the build modes, its media) use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md)) |
+| T2 guest | Generation 2, 2 vCPU, 8 GiB static memory. `JumpstartImage` (the default): Arc Jumpstart ArcBox's prebuilt disk, a dynamic VHDX of at most 100 GiB (34 GiB to download), with Windows Server 2022 Standard (not an evaluation) and SQL Server 2022 Standard. The build modes (`ProductKey`, `Developer`, and a kept `PaygWizard` guest): a 64 GB dynamic VHDX with Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and the wire server blocked; automatic start and shutdown ([ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md)) |
+| T3 | `ContosoCare`, General Purpose serverless Gen5, 0.5–2 vCores in `lowest-cost`, auto-pause after 15 minutes, 32 GB | An older T3 at 1 vCore is scaled online by the next `deploy.ps1` (`DEPLOY.T3.SCALE`). [T3 as built](#t3-as-built-phase-8) |
+| T4 and its read replica | `Standard_D4ds_v5` (General Purpose, 4 vCores) with autonomous tuning, PostgreSQL 18, 32 GiB, `contosocare`; the replica at T4's size, only during a session | In every deployment ([T4 as built](#t4-as-built)) |
+| T5 | Azure Cosmos DB for NoSQL: `patient-events` at 400 RU/s, only during a session; a private endpoint; the free tier when it's free | [T5 as built](#t5-as-built) |
+| Budget and auto-shutdown | The budget at `monthlyCeilingUsd`, with alerts at 50%, 80%, and 100% to `ownerEmail`; DevTest Labs schedules for T1 and the T2 host at `autoShutdownTime` | The host shuts its guest down cleanly first ([cost](#cost)) |
+| Nightly safety stop | An Automation account (Basic, local authentication off) and its identity, with `DbHub-Stop` on `dbhub-safety-stop` (at `autoShutdownTime`, 19:00 by default), `dbhub-safety-t3check` (30 minutes later, or T3's auto-pause delay plus 15 when that's longer), and `dbhub-safety-deferred` (only after a `deploy.ps1` run it waited for) | [Sessions and stops](#sessions-and-stops) ([ADR 0024](adr/0024-nightly-safety-stop.md)) |
+| Session control | In `rg-<prefix>-control`: an Automation account with the runbooks `DbHub-Control`, `DbHub-Stop`, and `DbHub-Monitor` and the webhook, a Key Vault, and an identity; and the notebook `NB_DatabaseHub_Control` | Part of every deployment; `control.enabled: false` no longer turns it off ([ADR 0026](adr/0026-one-run-all-session.md)) |
+| Key Vault | The session control's, in every deployment: the webhook's URL and the session's status and metrics, never a password; public or private, as the tenant's policy makes new vaults | The host-password vault only with `keyVault.enabled`, which requires `assignRoles`: an RBAC-mode vault, created on demand like Bastion ([ADR 0009](adr/0009-secrets-handling.md)) |
+| Fabric items | In `fabric.workspaceName`, on your F or Trial capacity: the lakehouse; `NB_DatabaseHub_Deployment` (the validator) and `NB_DatabaseHub_LiveActivity` (the live analysis, which saves the history); the Real-Time Dashboard over the telemetry endpoint; the Direct Lake model and its four-page report | `deploy.ps1`'s Fabric track: `configure-fabric.ps1`, `configure-powerbi.ps1`, and `configure-fabric-app.ps1` |
+| The Insights app | `APP_DatabaseHub_Insights` (Fabric Apps, preview), a DBA console: the history (read-only DAX through its connector, as the viewer), the live estate (its functions item, as the app's owner), Ask, and Manage (for its operators, the deployer and the admin group; for anyone else, it copies the request for Run all) | Deploys with your `az login`, after two tenant settings (P12, P13); when it can't be, the run still ends **DONE**, with the app's row red (Failed) on the status page, reported as **Manual action required**, never a **Fail** ([its guide](../fabric/app/README.md), [ADR 0029](adr/0029-insights-app-dba-console.md)) |
+| Ask's chat relay | Container Apps, Consumption, 1 vCPU and 2 GiB, 0 to 1 replica, external HTTPS ingress | Holds no credential, and scales to zero about 10 minutes after the last question. No Log Analytics workspace, registry, secret, managed identity, or role; a public ghcr.io image, pinned by digest (`askRelay.image`). `"ask": { "enabled": false }` leaves it out ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) |
+| Bastion | Basic, with a Standard public IP, on demand | Optional: no deployment needs it. Removed after `bastionMaxHours` |
+| Log Analytics, storage accounts | Not deployed | Database Hub's telemetry is Microsoft-managed, and there's no artifact cache ([ADR 0016](adr/0016-cost-profiles.md)) |
 
 ## Naming and tags
 
@@ -220,11 +113,12 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 | Nightly safety stop | `aa-<prefix>-<environment>-safetystop`, `id-<prefix>-<environment>-safetystop` |
 | Ask's chat relay | `cae-<prefix>-<environment>-ask`, `ca-<prefix>-<environment>-ask` |
 | Session control | `rg-<prefix>-control`: `aa-<prefix>-control`, `kv-<prefix>-ctl-<suffix>`, `id-<prefix>-automation` |
+| Host-password vault (opt-in) | `kv-<prefix><environment>-<deploymentId>` |
 | GitHub identity (optional) | `id-<prefix>-github` in `rg-<prefix>-control` |
 | T2 golden snapshots (optional) | `rg-<prefix>-golden` |
-| Administrators' group (P6) | `<prefix>-<environment>-sql-admins`, unless you supply your own |
+| Administrators' group (P6) | `<prefix>-<environment>-sql-admins`, unless you supply your own: T3's and T4's administrator |
 | Custom roles | "DbHub Demo Safety Stop", "DbHub Demo Activity Operator", and "DbHub Demo Session Writer" (the last two with `control.roleNameSuffix` when it's set) |
-| Fabric items | In the demo's workspace (`fabric.workspaceName`): `LH_DatabaseHub`, `NB_DatabaseHub_Deployment`, `NB_DatabaseHub_LiveActivity`, `RTD_DatabaseHub_LiveView`, `SM_DatabaseHub_History`, `RPT_DatabaseHub_History`, and `APP_DatabaseHub_Insights` with its user data functions `APP_DatabaseHub_Insights_connector` and `APP_DatabaseHub_Insights`. `NB_DatabaseHub_Control` is in the folder "DBHub Control" of that workspace, or, where the control's vault is private, in a workspace of its own: "&lt;workspace&gt; Control" (`control.fabricWorkspaceName`) |
+| Fabric items | In the demo's workspace (`fabric.workspaceName`): `LH_DatabaseHub`, `NB_DatabaseHub_Deployment`, `NB_DatabaseHub_LiveActivity`, `RTD_DatabaseHub_LiveView`, `SM_DatabaseHub_History`, `RPT_DatabaseHub_History`, and `APP_DatabaseHub_Insights` with its user data functions `APP_DatabaseHub_Insights_connector` and `APP_DatabaseHub_Insights`. `NB_DatabaseHub_Control` is in the folder "DBHub Control" of that workspace or, where the control's vault is private, in a workspace of its own: "&lt;workspace&gt; Control" (`control.fabricWorkspaceName`) |
 
 - `deploymentId` is six lowercase alphanumeric characters, deterministic per subscription, prefix, and environment.
 - **Tags on every resource:** `solution`, `environment`, `owner`, `purpose`, `costCenter`, `autoShutdown`, and `deploymentId`.
@@ -232,130 +126,91 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 
 ## Deployment
 
-One command: `scripts/deploy.ps1`, in Cloud Shell, a codespace, or local PowerShell 7, with Contributor. Every step is idempotent, and a plain rerun continues where the last run stopped, from the resource group's state tags (`DbHubDeployStage` and each track's `DbHubTrack*`), as `-Resume` does ([ADR 0011](adr/0011-control-surface-priority.md)). GitHub Actions' `deploy.yml` runs the same tracks, an optional path for maintainers (P7).
+One command, `./scripts/deploy.ps1`, in Cloud Shell, a codespace, or PowerShell 7 on your PC, with Contributor. Every step is idempotent: a plain rerun continues where the last one stopped, from the state tags, as `-Resume` does, and the same command upgrades an existing environment. [Deployment](deployment.md) has every step, option, and duration, and [update an existing environment](deployment.md#update-an-existing-environment) what an upgrade changes.
 
 ```mermaid
 flowchart TD
-  S0["0 Self-update from GitHub's main, and the first run's configuration when there's none"] --> S1["1 Preflight: P1-P6, region, sizes, quota, policy inventory, policy what-if, cost vs ceilings; stopped VMs and T4 start meanwhile"]
-  S1 --> S2["2 Infrastructure: subscription-scope Bicep: the network, T1, the T2 host, T3, T4, T5, the budget"]
-  S2 --> SC["Beside the tracks: the nightly safety stop, the session control's Azure part, T5's container lifecycle"]
-  S2 --> S3["3 Artifacts: bundle and runner in Run Command chunks; the T2 host downloads its guest image or media itself"]
-  S3 --> S4A["4a T1 track: T3 configured from T1 first, T1's bootstrap, monitoring, T4 and T5 set up through T1, the profiles"]
-  S3 --> S4B["4b T2 track: Hyper-V, NAT, the guest from Arc Jumpstart's image by default, Arc onboarding, PAYG, monitoring"]
-  S2 --> S4C["4c T4 track: its checks, its Azure Monitor metrics, its read replica"]
-  S2 --> S4D["4d Fabric track: notebooks, dashboard, history model and report, the Insights app and Ask's chat relay"]
-  S4A --> S5["5 Validation: DONE's checks, every target in Database Hub"]
-  S4B --> S5
-  S4C --> S5
-  S4D --> S5
-  SC --> S5
-  S5 --> S6["6 The activity profile with incidents, the history snapshot, the control's notebook, T4's replica deleted"]
-  S6 --> S7["DONE, or NOT DONE with the exact next command"]
+  A["Self-update from GitHub's main,<br/>and the first run's configuration"] --> B["Preflight<br/>P1-P6, sizes, quota, policy, cost"]
+  B --> C["Template<br/>network, T1, T2 host, T3, T4, T5, budget"]
+  C --> D1["T1 track<br/>T3 from T1, T1, T4 and T5 through T1"]
+  C --> D2["T2 track<br/>host, Jumpstart guest, Arc"]
+  C --> D3["T4 track<br/>checks, metrics, read replica"]
+  C --> D4["Fabric track<br/>notebooks, dashboard, report,<br/>Insights app, chat relay"]
+  C --> D5["Beside the tracks<br/>safety stop, session control,<br/>T5's container lifecycle"]
+  D1 & D2 & D3 & D4 & D5 --> E["Validation<br/>every target in Database Hub"]
+  E --> F["Activity profile, history snapshot,<br/>control notebook, replica deleted"]
+  F --> G["DONE, or NOT DONE<br/>with the next command"]
 ```
 
-- **Subscription guard:** every script passes `--subscription` explicitly and never uses or changes the Azure CLI's default subscription. Before anything is written, the guard checks the configured subscription's sign-in (tenant and `azureAccount`) and runs read-only canaries through every authentication path: Azure Resource Manager through `az` and `az rest`, and Resource Manager, Fabric, Kusto, and Microsoft Graph tokens checked for the configured tenant and caller. Scripts never start an interactive sign-in ([ADR 0011](adr/0011-control-surface-priority.md#guard-update-2026-10-21), [prerequisites](prerequisites.md#target-subscription-configuration-the-subscription-guard)).
-- **In the T1 and T2 tracks:**
-  - Merges the T1 monitoring feature flag with the documented Azure CLI method.
-  - Onboards T2 to Arc with the caller's token ([ADR 0005](adr/0005-arc-onboarding-authentication.md)).
-  - Verifies the Arc SQL instance (Standard edition, license type, monitoring enabled), and turns on T2's migration assessment (`T2.ARC.MIGRATIONASSESSMENT`, since 2026-11-18).
-  - Sets the `baseline` activity profile; once DONE's checks have read what they need, the run switches to the configured `activityProfile`, `business-day` by default.
-- **`JumpstartImage` mode (default since 2026-11-05):** no T2 step needs a person. The T2 host downloads Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard guest disk, makes it `arcsql01` at its first boot while it has no network, checks it, and T2's track onboards it as in the other modes. Nothing switches to another mode by itself: an image that can't be used ends T2 **NOT DONE** with the fix ([ADR 0006](adr/0006-sql-editions-and-licensing.md)).
-- **`PaygWizard` mode (retired 2026-11-09):** no deployment stops for its setup wizard any more. A configuration's `PaygWizard` runs as `JumpstartImage`, a guest whose wizard was never finished is made again from the image, and a finished one is kept ([deployment](deployment.md#an-older-demo-a-plain-deployps1-upgrades-it-2026-11-09)).
-- **Deploy to Azure button:** secondary. It runs stage 2 (infrastructure only), then links to `deploy.ps1 -Resume`, which sends the bootstrap bundle in Run Command chunks, starts the VM bootstraps (stages 3 and 4), and finishes the steps ARM can't do. It needs a public repository, which this one is ([ADR 0001](adr/0001-iac-bicep-avm-compiled-arm.md), [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#phase-6-implementation-notes-2026-10-19)).
-- **Bootstrap delivery (stages 3 and 4):** `deploy.ps1` deploys the VMs, sends each one the bundle with `Send-DemoBootstrapBundle` (SHA-256-checked chunks, one Run Command at a time, each deleted after it succeeds), deploys again with the bundle's SHA-256 and chunk count to add the loader Run Command, and reports the loader's exit code with `Wait-DemoBootstrapLoader` ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#phase-6-implementation-notes-2026-10-19)).
-- **Expected time:** in the default `JumpstartImage` mode, a clean first deployment ended **DONE** in 91 minutes, measured on 2026-11-06: T2's host build, with the image's download, its first boot, and the image check, took about 27 minutes, and its Arc onboarding about 33 ([deployment](deployment.md#expected-duration) has the other measured times).
-- **Parallel tracks and the T2 golden snapshot ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)):** `deploy.ps1` runs preflight and the template in one process, then four tracks at once, each in its own process with its own subscription guard: T1 with T3 (T3 set up from T1 first, then T1's bundle and runner, with `deploy.ps1` running the loader itself, its monitoring, T4's and T5's setup through T1, the profiles, and telemetry), T2 (the host, the guest, Arc onboarding, PAYG, monitoring, and telemetry), T4 (its checks, its Azure Monitor metrics, and its read replica), and Fabric (the notebooks, the dashboard, the history model and report, and the Insights app with Ask's chat relay). The tracks start before the template and wait for it; `-Sequential` runs the same steps one after another. A new `archost01` is restored from a golden snapshot of a finished host in `rg-<prefix>-golden` when one is boot-verified (`t2Source auto`): its OS disk is copied from the snapshot, the guest boots air-gapped, its Arc identity is reset locally, both passwords are rotated, and Arc is onboarded fresh. The snapshot is optional: in the default `JumpstartImage` mode it only saves the image's download and first boot ([deployment](deployment.md#faster-redeploy-phase-22)).
-- **One command ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)):** `deploy.ps1` after `az login` is the whole deployment, and the upgrade of an existing one ([update an existing environment](deployment.md#update-an-existing-environment)). A clean checkout of `main` first updates itself from GitHub, fast-forward only, and starts again with the new code; otherwise it says why, with the exact command, in a `DEPLOY.SELFUPDATE` **Warning** and runs the code it has ([updates from GitHub](deployment.md#updates-from-github-2026-11-09)). With no configuration it writes one first, from what's deployed when the subscription already has your environment (`INIT.EXISTING`). It keeps the PC awake, writes a progress model and a self-refreshing local status page (`status.ps1 -Watch` shows the same), and waits for T2. With `networkMode` `private` the policy inventory runs beside the deployment; T4 falls back to another size when Azure refuses its size (since 2026-11-09, never to no T4); chunk Run Command deletes aren't waited for, extensions settle first, and a watchdog restarts a stuck VM once. Every run ends **DONE** (Database Hub shows every target; what only a person can confirm, such as a tenant setting the run couldn't read or the optional selection of T3 for Database Agents, is listed under **Please confirm** and never blocks it) or **NOT DONE** (the exact next command, which keeps the run's `-ConfigPath`). A plain rerun continues where it stopped: it starts VMs and T4 that were stopped, for example by the nightly safety stop, checks T1's monitoring plugin, which can stop after a restart, and, since 2026-11-06, sends a VM its bootstrap bundle or workload runner again when what this checkout builds differs from what the state tags record for it, and that VM's loader stops a still-running bootstrap of the earlier bundle before it starts the new one ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-11-06-a-fix-pulled-during-a-deployment-reaches-the-vms), [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#amendment-a-changed-bundle-takes-over-from-a-run-thats-still-going-2026-11-06)). No mode stops for a person or needs Bastion to deploy: the `PaygWizard` guided stop was retired on 2026-11-09 ([deployment](deployment.md#one-command-one-guided-stop-phase-28)).
-- **The history report's snapshot (2026-11-06, [ADR 0014](adr/0014-notebook-role-and-capacity.md#amendment-2026-11-06-one-analyze-only-run-at-the-end-of-each-deployment)):** last in every run that reaches its validation, after **DONE**'s checks and the switch to the run's activity profile, `deploy.ps1` runs `NB_DatabaseHub_LiveActivity` once, analyze-only, as the person who ran it, then refreshes the Direct Lake history model, so the history report has the run's data. Its incident measures fill once incidents have run and the notebook runs again. It never blocks **DONE**, and it never resumes a paused capacity ([deployment](deployment.md#the-history-reports-snapshot-at-the-end-2026-11-06)). Then the run imports or updates the session control's notebook, and deletes T4's read replica unless a session uses it (since 2026-11-16, `DEPLOY.T4.REPLICA.END`), so a deployment leaves nothing new billing between sessions.
-
-### T2 host state machine
-
-The host runs a resumable state machine as a SYSTEM scheduled task. State is kept in `C:\ProgramData\DbHubDemo\state.json` ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md)). Since 2026-11-05 the default `JumpstartImage` mode takes the image path: `GuestSource` records where the guest comes from and refuses a mode that an existing guest wasn't made for, `GuestImage` downloads and verifies Jumpstart's image, `GuestFirstBoot` makes it `arcsql01` while its network adapter isn't connected, and `JumpstartImageCheck` checks it before Arc onboarding ([ADR 0006](adr/0006-sql-editions-and-licensing.md)). The build modes take the media path.
-
-```mermaid
-stateDiagram-v2
-  [*] --> CheckNested
-  CheckNested --> InstallHyperV: capable
-  CheckNested --> Failed: not capable
-  InstallHyperV --> NetworkAndDns: after reboot
-  NetworkAndDns --> GuestSource
-  GuestSource --> DataDisk
-  DataDisk --> GuestImage: JumpstartImage, the default
-  DataDisk --> GuestMedia: ProductKey or Developer
-  GuestImage --> CreateGuest: Content-MD5 and length verified
-  GuestMedia --> BuildVhdx: SHA-256 verified
-  BuildVhdx --> CreateGuest
-  CreateGuest --> FirstBoot: JumpstartImage, no network
-  CreateGuest --> HardenGuest: build modes
-  FirstBoot --> HardenGuest: password replaced, renamed, then connected
-  HardenGuest --> ImageCheck: JumpstartImage
-  HardenGuest --> SqlMedia: build modes
-  ImageCheck --> WaitArc: SQL Server 2022 Standard
-  ImageCheck --> Failed: image not usable
-  SqlMedia --> UnattendedInstall: ProductKey or Developer
-  UnattendedInstall --> WaitArc
-  WaitArc --> ConfigureSql: onboarded by orchestrator
-  ConfigureSql --> SeedAndRunner
-  SeedAndRunner --> Ready
-  Ready --> [*]
-```
+- **First,** a clean checkout of `main` updates itself from GitHub (`DEPLOY.SELFUPDATE`), and with no configuration the run writes one (`INIT.EXISTING` when your environment exists). The subscription guard checks the configured subscription's tenant and account on every authentication path; scripts pass `--subscription`, never change the Azure CLI's default subscription, and never sign in ([prerequisites](prerequisites.md#target-subscription-configuration-the-subscription-guard), [ADR 0011](adr/0011-control-surface-priority.md#guard-update-2026-10-21)).
+- **The tracks** run at once, each in its own process with its own guard; `-Sequential` runs them in turn ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)). The T2 host's steps are a resumable state machine, a SYSTEM scheduled task with its state in `C:\ProgramData\DbHubDemo\state.json` ([the host's steps](../vm/bootstrap/README.md)). In `JumpstartImage` mode it downloads the image, checked against its Content-MD5, makes it `arcsql01` at a first boot with no network, and checks it; an image that can't be used ends T2 **NOT DONE** with the fix ([ADR 0006](adr/0006-sql-editions-and-licensing.md)). Arc onboarding uses your token ([ADR 0005](adr/0005-arc-onboarding-authentication.md)). A configuration's retired `PaygWizard` runs as `JumpstartImage`.
+- **Each VM's bootstrap** arrives in SHA-256-checked Run Command chunks, then a loader; a rerun sends a changed bundle or runner again ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#amendment-a-changed-bundle-takes-over-from-a-run-thats-still-going-2026-11-06)). An optional golden snapshot in `rg-<prefix>-golden` restores a new T2 host from a finished one ([faster redeploy](deployment.md#faster-redeploy-phase-22)).
+- **The ending:** the configured activity profile (`business-day` by default), the history report's snapshot (`NB_DatabaseHub_LiveActivity` once, analyze-only, as you; it never blocks **DONE** or resumes a paused capacity; [ADR 0014](adr/0014-notebook-role-and-capacity.md#amendment-2026-11-06-one-analyze-only-run-at-the-end-of-each-deployment)), the control notebook, and T4's read replica deleted unless a session uses it (`DEPLOY.T4.REPLICA.END`). The Deploy to Azure button deploys the infrastructure only, from a public repository, and `deploy.ps1 -Resume` does the rest ([ADR 0001](adr/0001-iac-bicep-avm-compiled-arm.md)).
 
 ## Network
+
+```mermaid
+flowchart LR
+  subgraph VNET["VNet 10.42.0.0/24, no VM public IPs"]
+    T1["snet-sqlvm<br/>T1 and its workload runner"]
+    HOST["snet-archost<br/>archost01: NAT, DNS forwarder"]
+    T2["T2 arcsql01<br/>behind the host's NAT"]
+    PE["snet-pe<br/>private endpoints"]
+    T4["snet-pg<br/>T4 and its replica"]
+    BAS["AzureBastionSubnet<br/>Bastion, on demand"]
+  end
+  T3["T3 azuresql01"]
+  T5["T5 cosmos01"]
+  TEL["SQL telemetry endpoint"]
+  JS["Arc Jumpstart storage"]
+  T1 -->|"5432"| T4
+  T1 -->|"443"| PE
+  PE -->|"T5, both modes"| T5
+  PE -.->|"T3, private mode"| T3
+  T1 -.->|"public mode: a VNet rule"| T3
+  T1 -->|"443"| TEL
+  HOST --- T2
+  T2 -->|"443, through the NAT"| TEL
+  HOST -->|"443, the guest image"| JS
+  BAS -.->|"RDP"| T1
+  BAS -.->|"RDP"| HOST
+```
 
 | Subnet | CIDR | Purpose |
 |---|---|---|
 | `snet-sqlvm` | `10.42.0.0/27` | T1 |
-| `snet-archost` | `10.42.0.32/27` | T2 host; the guest is behind its NAT |
+| `snet-archost` | `10.42.0.32/27` | The T2 host; the guest is behind its NAT (`192.168.200.0/24`) |
 | `snet-pe` | `10.42.0.64/27` | Private endpoints: T5's in both modes, and T3's in private mode |
 | `snet-pg` | `10.42.0.96/28` | T4, delegated to `Microsoft.DBforPostgreSQL/flexibleServers`, with `nsg-<prefix>-<environment>-pg`; its read replica joins it for each session |
 | `AzureBastionSubnet` | `10.42.0.128/26` | On-demand Bastion |
 
-- **Inbound:** RDP only from `AzureBastionSubnet`. From `snet-sqlvm` (T1) only: T4 on TCP 5432 (`Allow-Postgres-From-T1`), T5's private endpoint on TCP 443 (`Allow-Cosmos-From-T1`), and T3's private endpoint on TCP 1433. Everything else from the virtual network or the internet is denied.
-- **Outbound:**
-  - Allowed: TCP 443, and TCP 1688 to the two documented Azure KMS addresses. T1 also gets TCP 1433 and 11000–11999 to `Sql.<region>` for T3 in public mode. DNS, IMDS, and Windows licensing are platform traffic that NSGs allow by default; their service tags can only deny ([ADR 0007](adr/0007-networking-modes-and-egress.md)).
-  - Inside the virtual network, T1 reaches T4 on TCP 5432 and the private endpoints in `snet-pe`; `snet-pg` sends TCP 443 to Azure Storage, for T4's write-ahead log, and to Microsoft Entra ID.
-  - Everything else to the internet is denied.
-  - NSGs can't restrict HTTPS by FQDN; this gap is documented.
-  - In the default T2 mode, `JumpstartImage`, the T2 host also downloads from Arc Jumpstart's public storage (`jumpstartprodsg.blob.core.windows.net`) and from GitHub (`raw.githubusercontent.com`), over the TCP 443 that's already allowed ([outbound access](prerequisites.md#outbound-access)).
-- **Modes:** `public` (T3 reachable only through a VNet rule from `snet-sqlvm`) or `private` (T3 private endpoint plus the `privatelink.database.windows.net` zone). The default, `auto`, is resolved by preflight from Azure Policy: `private` when a policy turns off public network access on SQL servers, otherwise `public` ([ADR 0007](adr/0007-networking-modes-and-egress.md)). T4 (virtual network integration and its own private DNS zone) and T5 (its private endpoint and the `privatelink.documents.azure.com` zone) are private in both modes.
-- **Outbound path:** `outboundMode`. `DefaultOutboundAccess` is the default: the VM subnets set `defaultOutboundAccess: true` explicitly, because subnets are now private by default. `NatGateway` adds a NAT gateway and public IP at extra cost ([ADR 0017](adr/0017-outbound-access.md)).
-- **Lateral movement:** the VM and private-endpoint subnets also deny outbound RDP and SSH into the VNet.
-- **Guest isolation:** the guest firewall blocks IMDS and the wire server, host-enforced Hyper-V port ACLs block them too, and the guest's DNS goes through a forwarder on the host ([ADR 0004](adr/0004-guest-imds-isolation.md)).
-
-Full rules: [ADR 0007](adr/0007-networking-modes-and-egress.md).
+- **Inbound:** RDP only from `AzureBastionSubnet`. From `snet-sqlvm` (T1) only: T4 on TCP 5432 (`Allow-Postgres-From-T1`), T5's private endpoint on TCP 443 (`Allow-Cosmos-From-T1`), and T3's on TCP 1433. Everything else from the virtual network or the internet is denied.
+- **Outbound:** TCP 443, and TCP 1688 to the two documented Azure KMS addresses. T1 also gets TCP 1433 and 11000–11999 to `Sql.<region>` for T3 in public mode, and `snet-pg` sends TCP 443 to Azure Storage, for T4's write-ahead log, and to Microsoft Entra ID. DNS, IMDS, and Windows licensing are platform traffic that NSGs allow by default; their service tags can only deny. Everything else to the internet is denied. NSGs can't restrict HTTPS by FQDN: a documented gap. In `JumpstartImage` mode the T2 host also downloads from Arc Jumpstart's public storage (`jumpstartprodsg.blob.core.windows.net`) and GitHub (`raw.githubusercontent.com`) over that TCP 443 ([outbound access](prerequisites.md#outbound-access)).
+- **Modes:** `public` (T3 reachable only through a VNet rule from `snet-sqlvm`) or `private` (T3's private endpoint and the `privatelink.database.windows.net` zone). The default, `auto`, is resolved by preflight from Azure Policy: `private` when a policy turns off public network access on SQL servers, otherwise `public`. T4 (virtual network integration, with its own private DNS zone) and T5 (its private endpoint and the `privatelink.documents.azure.com` zone) are private in both modes.
+- **Outbound path (`outboundMode`):** `DefaultOutboundAccess`, the default, sets `defaultOutboundAccess: true` on the VM subnets, because subnets are now private by default; `NatGateway` adds a NAT gateway and a public IP at extra cost ([ADR 0017](adr/0017-outbound-access.md)).
+- **Lateral movement and the guest:** the VM and private-endpoint subnets deny outbound RDP and SSH into the VNet. The guest's firewall and host-enforced Hyper-V port ACLs block IMDS and the wire server, and the guest's DNS goes through a forwarder on the host ([ADR 0004](adr/0004-guest-imds-isolation.md)). Full rules: [ADR 0007](adr/0007-networking-modes-and-egress.md).
 
 ## Identity, permissions, and secrets
 
-- **Minimum:** Contributor on the subscription (P1). No role assignments by default (`assignRoles = false`), with two owner-approved exceptions, which `deploy.ps1` grants when the deployer may (an Owner or User Access Administrator), and otherwise an Owner once with `./scripts/grant-safety-stop.ps1`: the nightly safety stop's stop-only role for its own identity at the demo resource group (P16, [ADR 0024](adr/0024-nightly-safety-stop.md)), and the session control's roles, A1 to A4 (P15, [ADR 0026](adr/0026-one-run-all-session.md)); both include T5's container actions since 2026-11-19, which the owner approved that day. T1's Cosmos DB role on T5 is a data-plane `sqlRoleAssignment`, which Contributor creates, not an Azure role assignment. Optional prerequisites P7, P8, P10, and P11 add GitHub one-click, presenter Reader, a product key, and Power BI viewer licenses (P9, notebook triggering, was retired on 2026-11-14), and P12 to P14 are the Insights app's tenant settings and tools ([ADR 0008](adr/0008-identity-rbac-abac.md), [permissions](permissions.md), [prerequisites](prerequisites.md)).
-- **T3 administration:** the P6 group, which the deploying user owns, is the T3 Entra admin. T1's system-assigned identity is added to it, so T1 configures T3 in both network modes. This over-privilege is documented (risk R26), along with a hardened option.
-- **No stored secrets:**
-  - VM passwords are used only at creation; break-glass is a VMAccess reset.
-  - The guest password stays on the host under DPAPI.
-  - In `JumpstartImage` mode, the image's published default credential is read at run time from Jumpstart's pinned script, used once while the guest has no network, and replaced with a random guest password kept the same way ([security model](security-model.md#the-jumpstart-image-jumpstartimage-mode-2026-11-05)).
-  - The Arc token lives in memory only.
-  - The session control's vault holds the webhook's URL and the session's status and metrics, never a password, and Ask's chat relay holds no credential: each viewer's GitHub sign-in is kept in their own browser.
-  - Details: [ADR 0009](adr/0009-secrets-handling.md).
-- **Threat model:** [security model](security-model.md). The T2 host is a trust boundary for the guest.
+- **Minimum:** Contributor on the subscription (P1). No role assignments by default (`assignRoles` false), with two owner-approved exceptions, which `deploy.ps1` grants when you may (an Owner or User Access Administrator), and otherwise an Owner once with `./scripts/grant-safety-stop.ps1`. Without them, nothing stops T4 after Azure's 7-day restart, Run all can't start a session, and T5's container stays between sessions ([permissions](permissions.md)):
+  - **The nightly safety stop's** "DbHub Demo Safety Stop", for its own identity at the demo resource group (P16, [ADR 0024](adr/0024-nightly-safety-stop.md)): 9 actions that read the group, the VMs, T3, T4, and T5's container, deallocate the VMs, stop T4, and delete T5's container. No start, no Run Command, no data access.
+  - **The session control's** "DbHub Demo Activity Operator" for its identity at the demo resource group (A1) and the control's Automation account (A2), with T5's container read, write, and delete; "DbHub Demo Session Writer" at the vault's two session secrets (A4); and Key Vault Secrets User for you on the vault's three secrets (A3) (P15, [ADR 0026](adr/0026-one-run-all-session.md)).
+- **Other access:** T1's role on T5 is a data-plane `sqlRoleAssignment`, which Contributor creates. The P6 group, which you own, is T3's and T4's Microsoft Entra administrator, and T1's system-assigned identity is added to it, so T1 configures T3 in both network modes, and T4: a documented over-privilege, with a hardened option ([permissions](permissions.md)). P7, P8, P10, and P11 are optional, and P12 to P14 are the Insights app's ([prerequisites](prerequisites.md), [ADR 0008](adr/0008-identity-rbac-abac.md)).
+- **No stored secrets:** VM passwords are used only at creation (break-glass is a VMAccess reset), and the guest's stays on the host under DPAPI. In `JumpstartImage` mode, the image's published default credential is read at run time from Jumpstart's pinned script, used once while the guest has no network, and replaced ([security model](security-model.md#the-jumpstart-image-jumpstartimage-mode-2026-11-05)). The Arc token lives in memory only, and Ask's chat relay holds no credential: each viewer's GitHub sign-in stays in their own browser ([ADR 0009](adr/0009-secrets-handling.md)). The [security model](security-model.md) has the threat model; the T2 host is a trust boundary for the guest.
 
 ## Data and workload
 
-- **Database:** `ContosoCare` on T1 to T3, and `contosocare` on T4 and T5. On the SQL targets, the business tables are in schema `care`: `facilities`, `providers`, `patients` (synthetic), `appointments`, `encounters`, `claims`, `orders`, `inventory`, `payments`, `audit_events`, and `work_queues`; control objects in schema `demo`: `scenario_runs`, `scenario_control`, `activity_profile`, and the bounded scenario procedures. T4 has the same two schemas in PostgreSQL ([database/postgresql](../database/postgresql/README.md)). T5 has one container, `patient-events`, and no control tables: its runs are recorded on T1 ([database/cosmosdb](../database/cosmosdb/README.md)).
-- **Seed:** deterministic and set-based, with a fixed seed. Size scales with the profile. All data is obviously synthetic.
-- **Runner:** .NET 10 LTS, `ContosoCare.Workload`, a CLI that the SYSTEM task `DbHubDemo-Workload` runs as a long-running host: on T1 for T1, T3, T4, and T5, and in T2's guest for T2 ([ADR 0010](adr/0010-workload-generator-technology.md)). Every connection is tagged `ContosoCare.Demo/<scenarioId>/<runId>`. Bounds are enforced in T-SQL (and in T4's PostgreSQL functions), in the runner, and by a watchdog.
-- **Activity profiles:**
-  - `baseline`: a steady OLTP mix.
-  - `business-day`: the baseline plus scheduled, bounded incidents (the default).
-  - `showcase`: what Run all starts: the baseline plus a 30-minute cycle of incidents on every target, 90 minutes by default.
-  - `incident:<scenario>`: one bounded incident on a chosen target.
-  - `off`.
+- **Database:** `ContosoCare` on T1 to T3, and `contosocare` on T4 and T5. On the SQL targets, the business tables are in the schema `care` (`facilities`, `providers`, `patients` (synthetic), `appointments`, `encounters`, `claims`, `orders`, `inventory`, `payments`, `audit_events`, and `work_queues`), and the control objects in `demo` (`scenario_runs`, `scenario_control`, `activity_profile`, and the bounded scenario procedures). T4 has the same two schemas in PostgreSQL ([database/postgresql](../database/postgresql/README.md)). T5 has one container, `patient-events`, and no control tables: its runs are recorded on T1 ([database/cosmosdb](../database/cosmosdb/README.md)). The seed is deterministic, set-based, sized by the profile, and obviously synthetic.
+- **Runner:** .NET 10 LTS, `ContosoCare.Workload`, a CLI that the SYSTEM task `DbHubDemo-Workload` runs as a long-running host: on T1 for T1, T3, T4, and T5, and in T2's guest for T2 ([ADR 0010](adr/0010-workload-generator-technology.md)). Every connection is tagged `ContosoCare.Demo/<scenarioId>/<runId>`, and bounds are enforced in T-SQL (and T4's PostgreSQL functions), in the runner, and by a watchdog.
+- **Activity profiles:** `baseline`, a steady OLTP mix; `business-day`, the baseline plus scheduled, bounded incidents (the default); `showcase`, what Run all starts: the baseline plus a 30-minute cycle of incidents on every target, 90 minutes by default; `incident:<scenario>`, one bounded incident on a chosen target; and `off`.
 
-| Target | Default incidents | Hub telemetry evidence | Query-level evidence |
-|---|---|---|---|
-| T1 | Locking and blocking, long transactions | `Processes blocked`, Lock-category waits, `Active Transactions`, `SqlServerActiveSessions` | Blocking chain through SSMS or the `diagnose-blocking-and-deadlocks` skill |
-| T2 | CPU, memory, IO, expensive query, missing index | CPU utilization, memory clerks, `SqlServerStorageIO`, `PAGEIOLATCH` waits | Query Store before and after; remediation is never applied automatically |
-| T3 | Service-objective CPU cap, log-rate governance, serverless resume and warm-up, plan regression | `SqlServerCPUUtilization` against the tier limit, `Log Rate Governor` waits | Query Store; automatic tuning's `FORCE_LAST_GOOD_PLAN`, and Database Agents' issue in the Database Agent loop |
-| T4 | Connection surge, idle in transaction, read replica lag (and CPU, locking, IO, missing index) | Azure Monitor metrics: sessions by state and by wait event type, the oldest transaction, deadlocks, connections, and the replica's Read replica lag | `ContosoCare.Workload status --target T4`; Query Store and autonomous tuning in the Azure portal |
-| T5 | `ru-storm`: a hot partition at the container's 400 RU/s | Azure Monitor metrics: normalized RU consumption at 100%, total requests with 429s | `ContosoCare.Workload status --target T5` |
+| Target | Default incidents | Evidence |
+|---|---|---|
+| T1 | Locking and blocking, long transactions | `Processes blocked`, Lock waits, `Active Transactions`, `SqlServerActiveSessions`; the blocking chain in SSMS or the `diagnose-blocking-and-deadlocks` skill |
+| T2 | CPU, memory, IO, expensive query, missing index | CPU, memory clerks, `SqlServerStorageIO`, `PAGEIOLATCH` waits; Query Store before and after (a fix is never applied automatically) |
+| T3 | Service-objective CPU cap, log-rate governance, serverless resume and warm-up, plan regression | `SqlServerCPUUtilization` against the tier limit, `Log Rate Governor` waits; Query Store, automatic tuning's `FORCE_LAST_GOOD_PLAN`, and Database Agents' issue |
+| T4 | Connection surge, idle in transaction, read replica lag (and CPU, locking, IO, missing index) | Azure Monitor: sessions by state and wait event type, the oldest transaction, deadlocks, connections, Read replica lag; `ContosoCare.Workload status --target T4`, and Query Store and autonomous tuning in the Azure portal |
+| T5 | `ru-storm`: a hot partition at the container's 400 RU/s | Azure Monitor: normalized RU at 100%, requests with 429s; `ContosoCare.Workload status --target T5` |
 
 ## Database Hub integration
 
@@ -363,242 +218,131 @@ Discovery, monitoring, agents, and mirroring are separate concerns.
 
 | Target | Estate (discovery) | Performance prerequisites | How the repo enables it | How it's validated |
 |---|---|---|---|---|
-| T1 | SQL IaaS Agent extension registration; unified inventory (preview) | Standard or Enterprise; extension 2.0.229.0 or later; system-assigned identity; `DatabaseWatcheronAzureVM` merged into the `SqlIaasExtension` settings; `Microsoft.Sql` and `Microsoft.AzureArcData` registered; egress to `telemetry.<region>.arcdataservices.com:443` | Bicep, plus the documented CLI settings merge in T1's track | Extension status shows `DatabaseMonitorArcPlugin` with `MetricsUploadStatus` `OK`; telemetry rows |
-| T2 | Arc machine and the SQL Server extension produce a `sqlServerInstance` | Standard or Enterprise; PAYG or Software Assurance; extension 1.1.2504.99 or later; `properties.monitoring.enabled = true` (API version `2023-09-01-preview`); egress to `*.<region>.arcdataservices.com` | Arc onboarding, the resource-group license tag, and a monitoring update in T2's track | Machine **Connected**; extension version; instance edition, license type, and monitoring; telemetry rows |
-| T3 | Native through Azure Resource Graph | Extended property `MS_EnablePerformanceMonitoringPreview = 'true'` on each user database | T-SQL from T1, first in T1's track | Property present; telemetry rows |
-| T4 | Native through Azure Resource Graph (flexible servers) | Azure Monitor metrics, with enhanced metrics on (`metrics.collector_database_activity`) | The template, and T4's track | `HUB.ESTATE.T4`, `METRICS.T4` |
-| T4's read replica | Native through Azure Resource Graph, while a session has it | Azure Monitor metrics: Read replica lag | `start-demo.ps1` or Run all creates it, and `deploy.ps1` for its checks | `HUB.ESTATE.T4.REPLICA`, `METRICS.T4.REPLICA` |
-| T5 | Native through Azure Resource Graph (Cosmos DB accounts) | Azure Monitor metrics: normalized RU, requests, throttled requests (429), provisioned throughput, availability | The template | `HUB.ESTATE.T5`, `METRICS.T5` |
+| T1 | SQL IaaS Agent extension registration; unified inventory (preview) | Standard or Enterprise; extension 2.0.229.0 or later; a system-assigned identity; `DatabaseWatcheronAzureVM` merged into the `SqlIaasExtension` settings; `Microsoft.Sql` and `Microsoft.AzureArcData` registered; egress to `telemetry.<region>.arcdataservices.com:443` | Bicep, and the documented CLI settings merge in T1's track | The extension's `DatabaseMonitorArcPlugin` with `MetricsUploadStatus` `OK`; telemetry rows |
+| T2 | The Arc machine and the SQL Server extension produce a `sqlServerInstance` | Standard or Enterprise; PAYG or Software Assurance; extension 1.1.2504.99 or later; `properties.monitoring.enabled = true` (API version `2023-09-01-preview`); egress to `*.<region>.arcdataservices.com` | Arc onboarding, the resource group's license tag, and a monitoring update in T2's track | Machine **Connected**; the extension's version; the instance's edition, license type, and monitoring; telemetry rows |
+| T3 | Native, through Azure Resource Graph | `MS_EnablePerformanceMonitoringPreview = 'true'` on each user database | T-SQL from T1, first in T1's track | The property; telemetry rows |
+| T4 | Native, through Azure Resource Graph | Azure Monitor metrics, with enhanced metrics on | The template and T4's track | `HUB.ESTATE.T4`, `METRICS.T4` |
+| T4's read replica | Native, while a session has it | Azure Monitor metrics: Read replica lag | `start-demo.ps1` or Run all, and `deploy.ps1` for its checks | `HUB.ESTATE.T4.REPLICA`, `METRICS.T4.REPLICA` |
+| T5 | Native, through Azure Resource Graph | Azure Monitor metrics: normalized RU, requests, throttled requests (429), provisioned throughput, availability | The template | `HUB.ESTATE.T5`, `METRICS.T5` |
 
-- **Hub users** need Reader at subscription scope (Contributors already have it), `Microsoft.Sql` registered, the Hub tenant setting (P4), and a Fabric Free license.
-- **Migration assessment (T2, since 2026-11-18):** turned on through SQL Server Instances - Update (`migration.assessment.enabled`), with a first run started, so Database Hub's Optimization shows T2's migration readiness. It's free, and runs weekly (`T2.ARC.MIGRATIONASSESSMENT`).
-- **Telemetry validation** uses the documented REST endpoint (`POST https://adx.centralus.arcdataservices.com/kusto/v1/rest/query`, database `ArcSqlTelemetry`, token audience `https://kusto.kusto.windows.net`). Retention is 7 days or less. Tokens are never logged.
-- **Hub validators (Phase 9):** `configure-fabric.ps1` runs the subscription guard, then P4, P5 and the workspace capacity, Estate visibility through Resource Graph (`HUB.ESTATE.*`), telemetry rows, newest sample, and lag per target (`TELEMETRY.T1`–`T3`), and presenter access (`HUB.PRESENTER.*`, only with `assignRoles`). Then it runs the Phase 12 notebook import (`Import-DemoFabricNotebook`), which worked live on 2026-10-21. P4 and P5 call Fabric REST only through Phase 12's `Get-DemoFabricToken` and `Invoke-DemoFabricRequest`. Warm-up uses the T3 readiness gate (`T3.READINESS.*`): T3 is ready only when it's in Resource Graph, its extended property is set, and fresh telemetry arrives; otherwise it's a Warning with the measured lag. The KQL lives in `scripts/modules/DbHubDemo/Kql/` ([ADR 0012](adr/0012-validation-model.md#phase-9-database-hub-checks-2026-10-20)).
-- **Live (2026-10-20 and 2026-10-21):** T1, T2, and T3, the targets then, passed their Estate and telemetry checks: T1 (`T1.SQLVM.MONITORING` **Pass**; 10 telemetry tables), T2 (`HUB.ESTATE.T2` and `TELEMETRY.T2` **Pass**, about 7 minutes after monitoring was turned on), and T3 (first sample 2.8 minutes after creation). The Hub UI itself is the owner's rehearsal.
-- **No Hub API:** Hub has no public API or ARM resource. Saved views, the **Enable Performance Monitoring** button, monitor templates, Copilot, and Database Agents' settings are UI-only, so selecting T3 in **Manage agents** > **Database agent settings** is an optional step, once per deployment and about 30 seconds, that DONE lists under **Please confirm** (`HUB.AGENT.T3`); without it, only the Database Agent loop on T3 has no issue to show. The repo never calls `/v1/databasehub/__private` routes, with one narrow exception since 2026-11-18: the Insights app's estate function reads 8 of them, read-only, for the demo's own resource group, and `tests/unit/DbHubDemo.HubKql.Tests.ps1` pins that list ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)).
-- **Real-Time Dashboard as code (Phase 18):** [`fabric/realtime/`](../fabric/realtime/README.md) defines `RTD_DatabaseHub_LiveView`, a Fabric Real-Time Dashboard over the same telemetry endpoint as an Azure Data Explorer data source with each viewer's identity. Its definition is generated from the live-activity notebook's own KQL, so the two can't drift, and `configure-fabric.ps1 -ImportDashboard` imports it through the generic `Import-DemoFabricItem`, reads it back with Get Item Definition, and checks that every tile gets data by running its KQL read-only against the telemetry endpoint (`Test-DemoRealTimeDashboardData`, also a deploy step). Hub's monitor template wizard builds a similar dashboard by hand. Viewers need Reader like Hub users; Power BI content needs Pro or PPU below F64 (P11, `PREFLIGHT.FABRIC.VIEWERLICENSE`). See [presentation surfaces](presentation.md).
-- **Agents:** Copilot in Database Hub is the presenter-driven showcase, and every proposed action needs human approval. Database Agents raises an issue on T3 in each Run all's second showcase cycle, and the run makes the issue's manual response itself (the Database Agent loop, [walkthrough](demo-walkthrough.md#the-database-agent-loop-on-t3)). Ask, the Copilot chat in the Insights app (a relay in an Azure Container App, each viewer's own GitHub Copilot plan, and read-only tools that run in the page), answers questions on the history and the live estate in the app ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)). The GA `databasehub-cli` skill (in the `fabric-skills` plugin) and the `microsoft-sql` plugin are the presenter's scriptable fallback ([ADR 0013](adr/0013-agent-experience.md)). The install guide, the plugin pins, and the prompt pack are in [`fabric/agent/`](../fabric/agent/README.md) (Phase 10).
-- **Mirroring:** deferred from v1 ([ADR 0015](adr/0015-mirroring-deferral.md)).
+- **Hub users** need Reader at subscription scope (Contributors have it), `Microsoft.Sql` registered, the Hub tenant setting (P4), and a Fabric Free license. T2's migration assessment is on (SQL Server Instances - Update, `migration.assessment.enabled`), so Optimization shows its migration readiness; it's free and weekly (`T2.ARC.MIGRATIONASSESSMENT`).
+- **Telemetry checks** query the documented telemetry endpoint as you ([connections](../fabric/connections/README.md)); tokens are never logged. `configure-fabric.ps1` checks Estate visibility (`HUB.ESTATE.*`), each SQL target's rows, newest sample, and lag (`TELEMETRY.T1`–`T3`), and presenter access (`HUB.PRESENTER.*`, with `assignRoles`). T3's readiness gate (`T3.READINESS.*`) needs T3 in Resource Graph, its extended property set, and fresh telemetry, or it's a **Warning** with the measured lag ([ADR 0012](adr/0012-validation-model.md#phase-9-database-hub-checks-2026-10-20)).
+- **No Hub API:** saved views, **Enable Performance Monitoring**, monitor templates, Copilot, and Database Agents' settings are UI-only, which is why `HUB.AGENT.T3` is a person's step. The repo calls no `/v1/databasehub/__private` route except the estate function's 8 read-only ones, which `tests/unit/DbHubDemo.HubKql.Tests.ps1` pins ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)).
+- **Agents and dashboards:** every action Copilot in Database Hub proposes needs a person's approval, and Run all makes the response to Database Agents' issue on T3 ([the Database Agent loop](demo-walkthrough.md#the-database-agent-loop-on-t3)). Ask's tools are read-only and run in the page ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)). The GA `databasehub-cli` skill and the `microsoft-sql` plugin are the presenter's scriptable fallback ([`fabric/agent/`](../fabric/agent/README.md), [ADR 0013](adr/0013-agent-experience.md)). The [Real-Time Dashboard](../fabric/realtime/README.md) runs the live-activity notebook's own KQL as each viewer, who needs Reader; Power BI content needs Pro or PPU below F64 (P11). Mirroring is deferred ([ADR 0015](adr/0015-mirroring-deferral.md)).
 
-## Control surface and lifecycle
+## Sessions and stops
 
-**Sessions:** deploy with `deploy.ps1`; run a session with **Run all** in `NB_DatabaseHub_Control`, with `start-demo.ps1` and `stop-demo.ps1`, or from the Insights app's **Manage**, for its operators. GitHub Actions is an optional path for maintainers (P7). There's no local web UI ([ADR 0011](adr/0011-control-surface-priority.md)). Every surface calls the same module functions. Every command, with its options, is in the [quick reference](deployment.md#quick-reference-every-command).
+Run a session with **Run all** in `NB_DatabaseHub_Control`, with `start-demo.ps1` and `stop-demo.ps1`, or from the Insights app's **Manage**, for its operators; GitHub Actions is optional, for maintainers (P7), with its schedules off unless the repository variable `DBHUB_SCHEDULES_ENABLED` is `true`. Every surface calls the same module functions, with no local web UI ([ADR 0011](adr/0011-control-surface-priority.md), [quick reference](deployment.md#quick-reference-every-command)).
 
-| Operation | What it does |
-|---|---|
-| `deploy.ps1` | Deploys or upgrades everything, and continues where an earlier run stopped ([deployment](#deployment)). |
-| `init.ps1` | Writes the configuration from your sign-in, and with `-CreateAdminGroup` the P6 group; `deploy.ps1` runs it when there's no configuration. |
-| `start-demo.ps1` | Starts T1, the T2 host (the guest auto-starts), and T4, warms up T3, creates T5's container and T4's read replica (about 9 minutes; `-SkipT4Replica` leaves it out), wakes Ask's chat relay, and sets an activity profile. `-Interactive` creates Bastion; `-ResetAdminPassword` adds a break-glass reset. |
-| `stop-demo.ps1` | Stops the profile, shuts the guest down, deallocates the host and T1, stops T4, deletes T4's read replica and T5's container, lets T3 auto-pause, and removes Bastion; `-SaveHistory` saves the session's history. `-ParkT2` stops only T2. |
-| `demo-control.ps1` | Sets a target's activity profile, or runs one bounded incident on it; during a Run all session it replaces that target's showcase (on T3 it ends the Database Agent loop). |
-| `reset-demo.ps1` | Stops scenarios, verifies no demo transaction is open, and restores the seed state without redeploying. `-RebuildGuest` reports **Not supported**: rebuild T2 with `destroy.ps1`, then `deploy.ps1` (R196), for example when a build mode's evaluation OS has no rearm left (the default `JumpstartImage` guest isn't an evaluation). |
-| `status.ps1` | Health per target, T4 and T5 included, active profile, evaluation-OS days left (the build modes), T2's free disk space and Jumpstart image (`STATUS.T2.DISKSPACE`, `STATUS.T2.IMAGE`), Arc days disconnected, Bastion presence, month-to-date cost, next auto-shutdown, the session control, and the nightly safety stop's last runs |
-| `validate.ps1` | The validation catalog ([ADR 0012](adr/0012-validation-model.md)) |
-| `estimate-cost.ps1` | Live-price estimates per profile against the ceilings |
-| `grant-safety-stop.ps1` | An Owner's one command, once, when `deploy.ps1` couldn't grant the roles: the nightly safety stop's and the session control's |
-| `collect-diagnostics.ps1` | A redacted diagnostics bundle for a **Deployment problem** issue |
-| `destroy.ps1` | Deletes everything `deploy.ps1` created for this environment, each part only when it can tell it's this environment's: the Fabric workspaces (the demo's, with the Insights app and its functions item, and the control's), the session control, the administrators' group `init.ps1` created, T2's Arc resources, T4's read replica, the resource group (with T5 and Ask's chat relay), the deployment record and the budget, and the custom roles no assignment holds any more; then it checks for residual resources, Arc and identities included ([ADR 0002](adr/0002-resource-group-topology.md), [cleanup](cleanup.md)) |
-
-**Scheduled workflows** (optional, for maintainers; off unless the repository variable `DBHUB_SCHEDULES_ENABLED` is `true`):
-
-- `schedule-start.yml`: start with a warm-up before a demo.
-- `schedule-stop.yml`: stop after a demo.
-- `bastion-cleanup.yml`: remove a forgotten Bastion.
-- `expiry.yml`: destroy the environment after its `expiresOn` tag (`destroy.ps1 -IfExpired`); `stop-demo.ps1 -ParkT2` parks T2 by hand.
-
-**The session control** (part of every deployment since 2026-11-14, [ADR 0026](adr/0026-one-run-all-session.md); the on-demand activity control before then, [ADR 0020](adr/0020-on-demand-activity-control.md)): **Run all** in a Fabric notebook runs a whole session without any local tool, and watches it live. The Insights app's **Manage** starts the same notebook as a job, for its operators.
+The session control (formerly the on-demand activity control, [ADR 0020](adr/0020-on-demand-activity-control.md)) runs a whole session from one **Run all**. A Fabric notebook gets no Azure Resource Manager token, so it goes through a webhook:
 
 ```mermaid
-flowchart LR
-  APP["The Insights app's Manage, for operators"] -->|"Run all as a job"| NB
-  NB["NB_DatabaseHub_Control (Fabric)"] -->|"getSecret: the webhook URL, the session's status and metrics"| KV["The control vault (public, or private through a managed private endpoint)"]
-  NB -->|"POST the request"| WH["Webhook"]
-  WH --> RB["DbHub-Control runbook (the control Automation account)"]
-  RB -->|"ARM, as the automation identity (A1, A2)"| DEMO["The demo resource group: start the VMs and T4, create T4's read replica and T5's container; managed Run Command sets the profiles"]
-  RB -->|"the session's status and metrics (A4)"| KV
-  RB -->|"one-time schedules, every 30 minutes"| MON["DbHub-Monitor: brings every target back during the session"]
-  RB -->|"dbhub-autostop, and dbhub-autostop-backup only if it fails"| STOP["DbHub-Stop: deallocate, stop T4, delete T4's replica and T5's container; ARM only"]
-  NB -->|"kusto token, read-only KQL"| TEL["Telemetry endpoint"]
+sequenceDiagram
+  actor You
+  participant NB as NB_DatabaseHub_Control
+  participant KV as The control vault
+  participant RB as DbHub-Control runbook
+  participant RG as The demo resource group
+  You->>NB: Run all, or the Insights app's Manage
+  NB->>KV: read the webhook's URL
+  NB->>RB: the session request, through the webhook
+  RB->>RB: check the allow-lists and that no run is active, create the auto-stop first
+  RB->>RG: start the VMs and T4, create T4's replica and T5's container
+  RB->>RG: set each target's showcase through managed Run Command
+  RB->>KV: the session's status and metrics
+  NB->>KV: follow the status, print the presenter's guide
+  loop every 30 minutes
+    RB->>RG: DbHub-Monitor brings every target back
+  end
+  NB->>RB: Stop now, at the session's end
+  RB->>RG: delete the replica and T5's container, stop T4, deallocate the VMs
+  NB->>NB: NB_DatabaseHub_LiveActivity saves the history
+  Note over RB,RG: dbhub-autostop, 10 minutes after the end, stops what's left, and dbhub-autostop-backup only if it fails
 ```
 
-- Everything lives in `rg-<prefix>-control`, which `destroy.ps1` deletes with the environment when the control serves it (2026-11-17); only A1 reaches into the demo group.
-- The runbook checks every request against the scenario catalog's allow-lists, refuses a run while another is active, creates the run's auto-stop before it starts anything, and sets each target's profile with the same VM-side request as `demo-control.ps1`. The auto-stop runs 10 minutes after the session's end, with a backup 30 minutes later only if the first failed. Stop now and the auto-stop delete T4's read replica and T5's container; the control's daily T4 safety stop, 15 minutes after `autoShutdownTime`, stops T4 and, while T1 is stopped, deletes T5's container. All three go through Azure Resource Manager only.
-- Where the tenant's policy makes new vaults private, the notebook lives in a workspace of its own, "&lt;workspace&gt; Control" (`control.fabricWorkspaceName`; a control set up before 2026-11-14 keeps its "DBHub Control" workspace), because a managed private endpoint turns off starter pools for its whole workspace; otherwise it's in the folder "DBHub Control" of the demo's workspace.
+- The runbook sets each target's profile with the same VM-side request as `demo-control.ps1`, which during a session replaces that target's showcase (on T3 it ends the Database Agent loop). Only A1 reaches from `rg-<prefix>-control` into the demo resource group, and `destroy.ps1` deletes the control with the environment when it serves it.
+- Where the tenant's policy makes new vaults private, the notebook lives in a workspace of its own, "&lt;workspace&gt; Control", because a managed private endpoint turns off starter pools for its whole workspace; otherwise it's in the folder "DBHub Control" of the demo's workspace. A control set up before 2026-11-14 keeps its "DBHub Control" workspace ([the control notebook's guide](../fabric/control/README.md#how-it-works)).
+- **What stops the demo:** Stop now and the session's auto-stop, as above. Every evening at `autoShutdownTime`, the VMs' auto-shutdown deallocates them, and the nightly safety stop deallocates them and stops T4 if they run, then a read replica a session left, and deletes T5's container when a session left it; its T3 check reads, without waking T3, whether T3 paused, and stops T4 again. It waits for a `deploy.ps1` that's still running, then stops the demo 60 minutes after the run (`DEPLOY.NIGHTLYSTOP`). The control's daily T4 safety stop (`dbhub-t4-safety-stop`, 15 minutes after `autoShutdownTime` or at `control.t4SafetyStopTime`) stops T4 and, while T1 is stopped, deletes T5's container, as a fallback. The control's stops and the nightly safety stop use Azure Resource Manager only, never Run Command, and never start anything ([what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)).
 
 ## Validation
 
-- **Statuses:** **Pass**, **Fail**, **Warning**, **Manual action required**, **Not supported**, and **Not selected**.
-- A successful deployment is never reported as **Pass** on its own; every check is functional.
-- **Static checks run in CI:** Bicep build and lint, PSRule, PSScriptAnalyzer, Pester, xUnit, JSON schema, notebook outputs, the Insights app's `npm run verify` (`STATIC.FABRICAPP`), markdownlint (`STATIC.MARKDOWN`), and gitleaks.
-- **Live checks** cover providers, VM and extension health, nested virtualization, guest health, T1 monitoring status, Arc state, T3, T4, and T5 configuration, Hub visibility through Resource Graph, telemetry rows per SQL target and Azure Monitor metrics for T4, its replica, and T5, the Insights app's queries, Ask's chat relay, workload bounds, and zero residuals after destroy.
-- See [ADR 0012](adr/0012-validation-model.md).
+- **Statuses:** **Pass**, **Fail**, **Warning**, **Manual action required**, **Not supported**, and **Not selected**. A successful deployment is never **Pass** on its own; every check is functional ([ADR 0012](adr/0012-validation-model.md)).
+- **Static checks, in CI:** Bicep build and lint, PSRule, PSScriptAnalyzer (`STATIC.PSSCRIPTANALYZER`, with Windows PowerShell 5.1 rules for `vm/`), Pester, xUnit, JSON schema, notebook outputs, the Insights app's `npm run verify` (`STATIC.FABRICAPP`), markdownlint (`STATIC.MARKDOWN`), and gitleaks.
+- **Live checks:** providers, VM and extension health, nested virtualization, the guest, T1's monitoring, Arc, T3's, T4's, and T5's configuration, Hub visibility through Resource Graph, telemetry rows for each SQL target and Azure Monitor metrics for T4, its replica, and T5, the Insights app's queries, Ask's chat relay, workload bounds, and zero residuals after destroy.
 
 ## Cost
 
 - **Ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). Every default stays the cheapest working option, except T4's 4-vCore size.
-- **Live estimates:** `estimate-cost.ps1` prices everything at run time from the Azure Retail Prices API, as hourly, daily-demo, and idle-monthly figures, with `Global` meters for SQL Server licenses and Arc SQL, and the subscription's Microsoft Defender for Cloud plans on their documented billing basis. The Fabric capacity, Fabric and Power BI licenses, and each viewer's GitHub Copilot plan are outside every estimate.
-- **Guardrails C1–C11:** budget alerts, schedules, expiry, Spot, Hybrid Benefit, short T3 auto-pause, Bastion auto-removal, and month-to-date reporting. C9, the artifact cache, was dropped on 2026-10-20. Since 2026-11-05 the nightly safety stop also stops the VMs and T4 each evening, so T4's 7-day restart counts as about a day ([ADR 0024](adr/0024-nightly-safety-stop.md)), and since 2026-11-19 it deletes T5's container when a session left it.
-- **Bills while stopped:** the disks, T3's and T4's storage, T5's private endpoint, T3's private endpoint in private mode, the private DNS zones, the Defender plans where your tenant turns them on, a golden snapshot when you keep one, and anything left on demand (Bastion). T5's container bills between sessions too while the session control's role can't create it again ([cost management](cost-management.md#t5-azure-cosmos-db-2026-11-18)).
-- See [ADR 0016](adr/0016-cost-profiles.md) and [cost management](cost-management.md).
+- **Estimates:** `estimate-cost.ps1` prices everything at run time from the Azure Retail Prices API. The Fabric capacity, Fabric and Power BI licenses, and each viewer's GitHub Copilot plan are outside every estimate.
+- **Between sessions** the disks, storage, private endpoints, and DNS zones bill, with T5's container while the session control's role can't create it again; an environment deployed before 2026-11-19 keeps that container until its next `./scripts/deploy.ps1` ([what it costs](../README.md#what-it-costs), [T5's cost](cost-management.md#t5-azure-cosmos-db-2026-11-18)).
 
 ## Repository layout
 
-The tree follows the brief. Additions are marked **(deviation)** with the reason.
-
-```text
-README.md  LICENSE  SECURITY.md  CONTRIBUTING.md  CHANGELOG.md  CODE_OF_CONDUCT.md
-azuredeploy.json  azuredeploy.parameters.json
-docs/        architecture, prerequisites, deployment, permissions, cost-management,
-             demo-walkthrough, troubleshooting, limitations, cleanup, faq,
-             security-model, automation-support-matrix, implementation-report,
-             references (deviation: the consolidated official sources, Phase 17),
-             presentation (deviation: the presentation surfaces and viewer licensing, Phase 18)
-docs/adr/    ADRs 0001-0029, with their index (README.md)
-infra/       main.bicep, main.bicepparam, modules/,
-             control/ (deviation: the session control's templates, Phase 25c)
-automation/  runbooks/ (deviation: the session control's runbooks, Phase 25c)
-config/      demo.config.example.json, environment.schema.json,
-             versions.json (deviation: single source of pinned versions, plan §9.5)
-scripts/     deploy, preflight, configure-fabric, configure-arc, configure-monitoring,
-             validate, start-demo, stop-demo, reset-demo, status, estimate-cost, destroy (.ps1)
-             setup-github-oidc.ps1 (deviation: one-time GitHub identity bootstrap, plan §4.12)
-             setup-activity-control.ps1 (deviation: the session control's setup and removal, Phase 25c)
-             modules/DbHubDemo/ (deviation: shared module used by every script, plan §4.12)
-vm/          bootstrap/, dsc/, health/, hyperv-guest/,
-             t3/ (deviation: the T1-to-T3 T-SQL runner sent by action Run Command, Phase 8)
-database/    common/, sqlvm01/, arcsql01/, azuresql/
-scenarios/   healthy-baseline/, locking-blocking/, cpu-pressure/, io-pressure/,
-             inefficient-query/, missing-index/,
-             resource-governance/, log-rate-pressure/ (deviation: the T3 incidents, Phase 11)
-             blocking-chain/, deadlock-storm/, tempdb-contention/, memory-grant-pressure/,
-             parallel-scans/, log-flush-waits/, slow-consumer/, capacity-max/
-             (deviation: one scenario per wait family, Phase 25b)
-workload-generator/  src/, tests/, Dockerfile, README.md
-fabric/      notebooks/ (NB_DatabaseHub_Deployment, NB_DatabaseHub_LiveActivity), agent/,
-             connections/, README.md,
-             realtime/ (deviation: the Real-Time Dashboard as code, Phase 18),
-             control/ (deviation: NB_DatabaseHub_Control, the session control's notebook, Phase 25c)
-tests/       unit/, integration/, smoke/, teardown/,
-             Invoke-StaticValidation.ps1 and Install-TestTools.ps1 (the local and CI test runner),
-             PSScriptAnalyzerSettings*.psd1 (scripts, tests, and Windows PowerShell 5.1 rules for vm/)
-.github/     workflows/ (validate, deploy, demo-control, destroy; plus reusable workflows,
-             schedule-start, schedule-stop, bastion-cleanup, expiry, release: deviation, plan §9.4-§9.5),
-             actions/ (deviation: composite actions, plan §9.5), ISSUE_TEMPLATE/,
-             copilot-instructions.md, dependabot.yml, pull_request_template.md, CODEOWNERS
-.devcontainer/  (deviation: identical contributor tooling, plan §9.5)
-.pre-commit-config.yaml  (deviation: gitleaks, notebook output stripping, Bicep format, plan §9.5)
-bicepconfig.json, ps-rule.yaml, .markdownlint-cli2.yaml, .editorconfig, .gitattributes, .gitignore
-             (tool configuration read from the repo root)
-```
+| Folder | What's in it |
+|---|---|
+| `docs/` | These docs; `adr/` holds the decision records 0001 to 0029, with their [index](adr/README.md) |
+| `infra/` | The subscription-scope `main.bicep` and its `modules/`; `control/` (the session control), `safetystop/`, `replica/` (T4's read replica), and `ask/` (the chat relay) |
+| `scripts/` | The entry scripts and the shared module `modules/DbHubDemo/` |
+| `automation/` | The runbooks of the session control and the nightly safety stop |
+| `vm/` | `bootstrap/` (the loader and the state machines), `dsc/`, `health/`, `hyperv-guest/`, and `t3/` (T3's T-SQL, run from T1) |
+| `database/` | Schemas and seeds: `common/`, `sqlvm01/`, `arcsql01/`, `azuresql/`, `postgresql/`, and `cosmosdb/` |
+| `scenarios/` | The bounded scenarios and the activity profiles |
+| `workload-generator/` | The runner `ContosoCare.Workload`, with its tests |
+| `fabric/` | `notebooks/`, `control/`, `realtime/`, `powerbi/`, `app/` (the Insights app), `agent/` (the prompt pack and plugin pins), and `connections/` |
+| `ask-relay/` | The chat relay's source and image |
+| `config/` | The example configuration, the schema, the profiles, and `versions.json`, which pins every version |
+| `tests/` | `unit/`, `integration/`, `smoke/`, and `teardown/`, run by `Invoke-StaticValidation.ps1` |
+| `.github/`, `.devcontainer/` | The workflows (optional, for maintainers), composite actions, issue templates, and the Copilot instructions; the dev container, locally or in GitHub Codespaces |
 
 ## T3 as built (Phase 8)
 
-- **Template:** `infra/modules/azuresql01.bicep`, deployed by `demo.bicep` as `azuresql01`. Parameters: the effective `networkMode`, the P6 group (`t3AdminGroupObjectId`, with its display name as the login), `t3AutoPauseMinutes` (0 means the profile's value), and `t3UseFreeLimit`. Outputs: `t3ServerName`, `t3ServerFqdn`, `t3DatabaseName`, `t3ServerId`, `t3DatabaseId`, and `t3PrivateEndpointId`; nothing secret.
-- **Native resources, not the AVM `sql/server` module.** AVM 0.22.1 supports the free-offer properties, but it turns on server auditing and deploys a connection-policy resource by default, requires an availability-zone setting on each database, and brings about a dozen resource types the demo never creates into the compiled template (customer-managed keys, elastic pools, failover groups, outbound firewall rules, and more), each of which the policy inventory would have to account for. The native module uses exactly the seven resource types that the policy inventory already checks, and sends only the properties the demo sets.
-- **Logical server** `azuresql01-<deploymentId>`: Microsoft Entra-only from creation (`administrators.azureADOnlyAuthentication`, the P6 group as a `Group` administrator), minimum TLS 1.2, no SQL authentication. Public network access is `Disabled` in private mode and `Enabled` in public mode ([ADR 0007](adr/0007-networking-modes-and-egress.md#phase-8-addendum-t3-as-built-2026-10-20)).
-- **Database** `ContosoCare`: General Purpose serverless (`GP_S_Gen5`), the profile's maximum vCores, a 0.5 vCore minimum, 32 GB, regional, with locally redundant backups. With the free offer, `useFreeLimit` and `freeLimitExhaustionBehavior: BillOverUsage` are sent; without it, neither is, because an existing database can't be converted.
-- **Auto-pause:** `t3AutoPauseMinutes` from the configuration (default 15) for every profile when a script deploys; the profile's `autoPauseMinutes` (60 for `demo-day` and `enhanced-performance`) applies only where no configuration is passed, which is the Deploy to Azure button. Set `t3AutoPauseMinutes` to 60 for a long demo-day session without resume pauses.
-- **Configured from T1** (first in T1's track, stage 4a), through module functions that Phase 13's scripts call:
-  1. `Add-DemoT1ToT3AdminGroup` adds T1's identity to the P6 group before T1 first asks for an Azure SQL token (`T3.ADMINGROUP`; [ADR 0008](adr/0008-identity-rbac-abac.md#phase-8-addendum-t1-and-the-p6-group-as-built-2026-10-20)).
-  2. `Invoke-DemoT3SqlFromT1 -Name Setup` runs the common schema and seed, `database/azuresql`, and the seed procedure on T3. The VM-side script (`vm/t3/Invoke-DemoT3Sql.ps1`) travels through action Run Command, gets an Azure SQL token from IMDS, retries the login while the membership applies, and prints one short JSON line ([database/azuresql](../database/azuresql/README.md), [vm/t3](../vm/t3/README.md)).
-  3. `Test-DemoT3` verifies T3 (below), and `Invoke-DemoT3WarmUp` resumes it before a demo and confirms the extended property. The rest of the readiness gate (Resource Graph and telemetry) comes in Phase 9.
-  4. `Remove-DemoT3` deletes the server and its private endpoint between demos and keeps the private DNS zone; the next deployment recreates T3 under the same names.
-  5. `Resolve-DemoT3FreeOfferError` tells `deploy.ps1` when Azure rejected the free offer, so it deploys T3 again without it and records a Warning. Microsoft Learn lists no error codes for this, so the match requires an error that names the offer.
+- **Template:** `infra/modules/azuresql01.bicep`, with native resources rather than the Azure Verified Modules `sql/server` module, which turns on server auditing and a connection policy by default, needs a zone setting on each database, and brings about a dozen resource types the demo never creates; the native module uses exactly the seven resource types the policy inventory checks. Outputs: `t3ServerName`, `t3ServerFqdn`, `t3DatabaseName`, `t3ServerId`, `t3DatabaseId`, and `t3PrivateEndpointId`, nothing secret.
+- **Server and database:** Microsoft Entra only from creation (`administrators.azureADOnlyAuthentication`, the P6 group as a `Group` administrator), TLS 1.2, no SQL authentication; public network access `Disabled` in private mode, `Enabled` in public mode ([ADR 0007](adr/0007-networking-modes-and-egress.md)). `GP_S_Gen5`, the profile's maximum vCores, a 0.5 minimum, 32 GB, locally redundant backups. With the free offer, `useFreeLimit` and `freeLimitExhaustionBehavior: BillOverUsage`; without it, neither, because an existing database can't be converted. A rejected offer is deployed again without it, with a **Warning**.
+- **Auto-pause:** `t3AutoPauseMinutes` (15) for every profile when a script deploys; the profile's `autoPauseMinutes` (60 for `demo-day` and `enhanced-performance`) only from the Deploy to Azure button. Set 60 for a long session without resume pauses.
+- **From T1:** T1's identity joins the P6 group before its first Azure SQL token; the schema and seed then run on T3 through action Run Command with an IMDS token, retrying while the membership applies ([database/azuresql](../database/azuresql/README.md), [vm/t3](../vm/t3/README.md)). `stop-demo.ps1 -RemoveT3` deletes the server and its private endpoint between demos, keeping the DNS zone; the next deployment creates T3 again under the same names.
 
 | Check | Verifies | Status |
 |---|---|---|
 | `T3.ADMINGROUP` | T1's identity is a member of the P6 group | Pass; Warning when Microsoft Graph doesn't report a new membership in time; Manual action required when the caller can't add members; Fail when T1 or its identity is missing |
 | `T3.EXISTS` | The logical server and `ContosoCare` exist | Pass or Fail |
-| `T3.ENTRAONLY` | Entra-only, the P6 group as administrator, TLS 1.2 or later | Pass or Fail |
-| `T3.NETWORK` | Public network access matches the effective mode; private endpoint, zone group, and VNet link, or the `snet-sqlvm` VNet rule and no IP firewall rule | Pass, Warning (extra rules), or Fail |
+| `T3.ENTRAONLY` | Entra only, the P6 group as administrator, TLS 1.2 or later | Pass or Fail |
+| `T3.NETWORK` | Public network access matches the effective mode; the private endpoint, zone group, and VNet link, or the `snet-sqlvm` VNet rule and no IP firewall rule | Pass, Warning (extra rules), or Fail |
 | `T3.DATABASE` | General Purpose serverless with the profile's sizing and the configured auto-pause | Pass, Warning (drift), or Fail |
 | `T3.FREEOFFER` | The free offer with `BillOverUsage`, as preflight decided | Pass, Warning, or Not selected |
 | `T3.PROPERTY` | `MS_EnablePerformanceMonitoringPreview = 'true'`, read on T3 through T1 | Pass, Fail, Warning when T1 can't run the query, or Not selected |
 | `T3.WARMUP` | T3 answered, and how long a resume took | Pass, Warning, or Fail |
 | `T3.REMOVE` | The server and private endpoint are gone | Pass or Fail |
 | `T3.SQL` | Any other T-SQL run from T1 | Pass, Warning, or Fail |
-| `T3.AGENT` | What Database Agents needs from T3 that a script can read (since 2026-11-18): not a one-vCore serverless database, not in an elastic pool, Azure RBAC write on the database for the signed-in account, and performance monitoring on | Pass, or a Warning that names each gap with its fix; never a Fail, because only the Database Agent loop needs it |
-| `T3.AUTOTUNING` | Automatic tuning's `FORCE_LAST_GOOD_PLAN` (for `plan-regression`), and the Database Agent beat's hold on it (since 2026-11-18) | Pass or Warning |
-| `HUB.AGENT.T3` | T3 selected in Database Hub's **Manage agents** > **Database agent settings**, which no API offers: optional, once per deployment, and only the Database Agent loop needs it | Manual action required, listed under DONE's **Please confirm** |
+| `T3.AGENT` | What Database Agents needs from T3 that a script can read: not a one-vCore serverless database, not in an elastic pool, Azure RBAC write on the database for the signed-in account, and performance monitoring on | Pass, or a Warning that names each gap with its fix; never a Fail, because only the Database Agent loop needs it |
+| `T3.AUTOTUNING` | Automatic tuning's `FORCE_LAST_GOOD_PLAN` (for `plan-regression`), and the Database Agent beat's hold on it | Pass or Warning |
+| `HUB.AGENT.T3` | T3 selected in Database Hub's **Manage agents** > **Database agent settings**, which no API offers: optional, once per deployment, and only the Database Agent loop needs it | Manual action required, under **DONE**'s **Please confirm** |
 
-## T4 as built (Phase 24)
+## T4 as built
 
-T4 is an Azure Database for PostgreSQL flexible server, `pgflex01-<deploymentId>`, added at the owner's request with live views first ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)).
+T4 is an Azure Database for PostgreSQL flexible server ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)); its scripts and scenarios are in [database/postgresql](../database/postgresql/README.md).
 
 | Aspect | T4 |
 |---|---|
-| Resource | `Microsoft.DBforPostgreSQL/flexibleServers`, General Purpose `Standard_D4ds_v5` (4 vCores, 16 GiB) by default since 2026-11-04, with autonomous tuning, which needs 4 vCores. When Azure refuses it: another zone, then `Standard_D4ads_v5`, then `Standard_D2ds_v5` (2 vCores, tuning off; its cost check is a **Warning**), and **NOT DONE** with the fix when Azure refuses every size. `t4SkuName` sets a size; the Burstable `Standard_B1ms` and `Standard_B2s` only when it sets them, with tuning off; the tier follows the size. In an optional zone at creation (`t4AvailabilityZone`), 32 GiB (P4) without auto-grow, PostgreSQL 18 (`config/versions.json` `postgresql.majorVersion`), 7-day backups, no HA, the database `contosocare` (`infra/modules/pgflex01.bicep`); in every deployment since 2026-11-09 (a configuration's `t4Enabled: false` is ignored) |
-| Network | Virtual network integration in both network modes: delegated `snet-pg` (10.42.0.96/28), a private DNS zone `<prefix>-<environment>.private.postgres.database.azure.com` linked to the network, no public access; `nsg-<prefix>-<environment>-pg` allows port 5432 from `snet-sqlvm` only |
-| Access | Microsoft Entra only (password authentication off). The P6 group is the administrator; T1's managed identity signs in through it to create the runner's role `contosocare_runner` for its own object ID (`pgaadauth_create_principal_with_oid`), the schema, the seed, and the grants (`Enable-DemoT4Workload`). The runner then signs in as `contosocare_runner` with a token from T1's identity, per connection |
-| Workload | The same runner and interface as T1 to T3 (`--target T4`), Npgsql with TLS `VerifyFull`; scenarios `healthy-baseline`, `cpu-pressure`, `locking-blocking`, `io-pressure`, `connection-surge`, `idle-in-transaction`, `missing-index` (since 2026-11-04), and `replica-lag` with its read replica ([`database/postgresql`](../database/postgresql/README.md)); the activity profile in `C:\ProgramData\DbHubDemo\activity-t4.json` on T1 |
-| Database Hub | Estate lists the flexible server; Performance's **PostgreSQL** dashboard charts its Azure Monitor metrics. No query-level diagnostics (`HUB.ESTATE.T4`, `METRICS.T4`) |
-| Live view | Enhanced metrics on (`metrics.collector_database_activity`): sessions by state and by wait event type, the oldest transaction and query, deadlocks. `status.ps1` (`STATUS.T4`, `STATUS.T4.LIVE` with `-Detail`) and `ContosoCare.Workload status --target T4` show them with the sessions, waits, blockers, and connections against `max_connections` |
-| Lifecycle | `deploy.ps1` starts a stopped T4 before the template, its T4 track checks it, and T1's track sets it up; `start-demo.ps1` and Run all start it; `stop-demo.ps1`, the session's auto-stop, the nightly safety stop, and the control's daily T4 safety stop stop it (a stopped server starts on its own after seven days, and `stop-demo.ps1` and `status.ps1` give that date); `destroy.ps1` removes it with the resource group |
-| Read replica (since 2026-11-13) | `pgreplica01-<deploymentId>`, a same-region read replica at T4's size, for each session: `start-demo.ps1` or Run all creates it once T4 runs (about 9 minutes, with T4's size fallback rules), and `stop-demo.ps1` or the session's auto-stop reads its metrics for the history, then deletes it; `deploy.ps1` creates it for its checks and, since 2026-11-16, deletes it at its end unless a session uses it. A stopped replica starts before T4, and stops after it (Azure's order). Database Hub charts its **Read replica lag**; the `replica-lag` scenario makes it climb ([ADR 0025](adr/0025-t4-read-replica.md)) |
-| History | T4's and the replica's Azure Monitor metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `postgresql`), the history model, and the Insights app (T4 on its Estate page) through the notebook's `POSTGRES_METRICS`, which Run all, `stop-demo.ps1 -SaveHistory`, and `deploy.ps1`'s history snapshot pass |
-| Not included | The history report's pages and a Real-Time Dashboard page for T4 (follow-ups in ADR 0019); high availability, geo-replicas, and promotion |
+| Resource | `Microsoft.DBforPostgreSQL/flexibleServers` (`infra/modules/pgflex01.bicep`): `Standard_D4ds_v5` (General Purpose, 4 vCores, 16 GiB) by default, with autonomous tuning, which needs 4 vCores; 32 GiB (storage tier P4) without auto-grow, PostgreSQL 18 (`postgresql.majorVersion` in `config/versions.json`), 7-day backups, no high availability, and an optional zone (`t4AvailabilityZone`). In every deployment: `t4Enabled: false` is ignored, with a note |
+| Size fallback | When Azure refuses the size (`SkuNotAvailable`): another zone, then `Standard_D4ads_v5`, then `Standard_D2ds_v5` (2 vCores, tuning off; its cost check is a **Warning**). A size `t4SkuName` sets falls back too, cheapest first (`DEPLOY.T4.FALLBACK`); `Standard_B1ms` and `Standard_B2s` (Burstable, tuning off) only when it sets them. **NOT DONE** with the fix when Azure refuses every size. The `DbHubT4Size` and `DbHubT4Refused` tags record it ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md#2026-11-02-the-general-purpose-fallback-phase-28-follow-up)) |
+| Network and access | Virtual network integration in `snet-pg`, in both network modes, with the private DNS zone `<prefix>-<environment>.private.postgres.database.azure.com`; no public access. Microsoft Entra only: T1's managed identity, through the P6 group, creates the runner's role `contosocare_runner` (`pgaadauth_create_principal_with_oid`), the schema, and the seed (`WORKLOAD.T4.ENABLE`); the runner signs in as that role with T1's token, over TLS `VerifyFull`, with its profile in `C:\ProgramData\DbHubDemo\activity-t4.json` on T1 |
+| Database Hub and live view | Estate, and Performance's **PostgreSQL** dashboard over Azure Monitor metrics, with no query-level diagnostics (`HUB.ESTATE.T4`, `METRICS.T4`). Enhanced metrics (`metrics.collector_database_activity`, `T4.ENHANCEDMETRICS`) add sessions by state and wait event type, the oldest transaction, and deadlocks, which `status.ps1` (`STATUS.T4`; `-Detail` adds `STATUS.T4.LIVE`) and `ContosoCare.Workload status --target T4` show |
+| Lifecycle | `deploy.ps1` starts a stopped T4 before the template; the starts start it, and every stop stops it. A stopped server starts on its own after seven days, and `stop-demo.ps1` and `status.ps1` give that date |
+| Read replica | `pgreplica01-<deploymentId>` at T4's size, for each session: `start-demo.ps1` (`-SkipT4Replica` leaves it out) and Run all create it once T4 runs, in about 9 minutes (when Azure refuses T4's size: another zone, then a size with at least T4's vCores); the stops read its metrics for the history, then delete it; `deploy.ps1` creates it for its checks and deletes it at its end unless a session uses it. It starts before T4 and stops after it. A Burstable T4 has none: **Not supported**, with the fix ([ADR 0025](adr/0025-t4-read-replica.md)) |
+| History and gaps | T4's and the replica's metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `postgresql`), the model, and the Insights app through the notebook's `POSTGRES_METRICS`. Not included: T4 pages in the history report and the Real-Time Dashboard (ADR 0019's follow-ups), high availability, geo-replicas, and promotion |
 
-## T5 as built (2026-11-18)
+## T5 as built
 
-T5 is an Azure Cosmos DB for NoSQL account, `cosmos01-<deploymentId>`, added because Database Hub's general availability covers Cosmos DB ([ADR 0027](adr/0027-t5-cosmos-db.md)).
+T5 is an Azure Cosmos DB for NoSQL account, because Database Hub's general availability covers Cosmos DB ([ADR 0027](adr/0027-t5-cosmos-db.md)); its data model is in [database/cosmosdb](../database/cosmosdb/README.md).
 
 | Aspect | T5 |
 |---|---|
-| Resource | `Microsoft.DocumentDB/databaseAccounts` (`GlobalDocumentDB`), one region without zone redundancy, Session consistency; the database `contosocare` and the container `patient-events`, partition key `/patientId` (hash, version 2), 400 RU/s of manual throughput on the container, every path indexed except the documents' `payload` filler (`infra/modules/cosmos01.bicep`, `config/versions.json` `cosmosdb`). The free tier (1000 RU/s and 25 GB free, one account per subscription, set only at creation) when no other account in the subscription has it (`DEPLOY.T5.FREETIER`) |
-| Network | Public network access off in both network modes. The private endpoint `pe-<prefix>-<environment>-cosmos01` in `snet-pe` (group `Sql`), the private DNS zone `privatelink.documents.azure.com` linked to the network; `snet-pe`'s network security group allows TCP 443 from `snet-sqlvm` (`Allow-Cosmos-From-T1`) |
-| Access | Microsoft Entra only: local (key) authentication off, and key-based metadata writes off. T1's managed identity has Cosmos DB Built-in Data Contributor, scoped to the account (`infra/modules/cosmos01-access.bicep`): a `sqlRoleAssignment`, which Contributor creates, not an Azure role assignment. No key exists anywhere |
-| Workload | The same runner and interface as T1 to T4 (`--target T5 --server <account>.documents.azure.com`), the documented REST API over HTTPS with a token for T1's identity; `healthy-baseline` and `ru-storm` (a hot partition drives normalized RU to 100% with 429s, then a calm phase lets it recover; its documents are a bounded set it deletes at its end); the activity profile in `C:\ProgramData\DbHubDemo\activity-t5.json` on T1 |
-| Database Hub | Estate lists the account; its Performance view charts normalized RU consumption, request units, throttled requests (429), provisioned throughput, and availability from Azure Monitor (`HUB.ESTATE.T5`, `METRICS.T5`). Avg Latency stays empty: it charts direct-mode latency, and the runner uses the gateway. The Security page shows no Issue: Entra only, no public access |
-| Lifecycle | `deploy.ps1` creates it with the template (and adds it to an older demo, `DEPLOY.T5.MISSING`), T1's track checks it and the runner's access (`T5.*`, `WORKLOAD.T5.WARMUP`), and the validation reads its metrics. An account has no stop, so since 2026-11-19 the container exists only during a session (the demo resource group's `DbHubT5Container` tag is `Session` once the session control's role can create it again, `DEPLOY.T5.LIFECYCLE`): `start-demo.ps1`, Run all, `demo-control.ps1`, and `deploy.ps1` create it (`START.T5.CONTAINER`, `CONTROL.T5.CONTAINER` for `demo-control.ps1`, and `DEPLOY.T5.CONTAINER`), and `stop-demo.ps1` (`STOP.T5`), Stop now and the session's auto-stop, the nightly safety stop, and the control's daily T4 safety stop delete it; the account stays until `destroy.ps1` removes it with the resource group. `t5Enabled: false` leaves it out |
-| History | T5's Azure Monitor metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `cosmosdb`) and the history model through the notebook's `COSMOS_METRICS`, which the session's stop and `deploy.ps1`'s history snapshot pass |
+| Resource | `Microsoft.DocumentDB/databaseAccounts` (`GlobalDocumentDB`; `infra/modules/cosmos01.bicep`, `cosmosdb` in `config/versions.json`): one region without zone redundancy, Session consistency, and the container `patient-events` at 400 RU/s of manual throughput. The free tier when no other account in the subscription has it and the subscription isn't internal (`DEPLOY.T5.FREETIER`); `t5Enabled: false` leaves T5 out |
+| Network and access | Public network access off in both network modes: the private endpoint (group `Sql`) in `snet-pe`, with the `privatelink.documents.azure.com` zone. Microsoft Entra only, with key authentication and key-based metadata writes off; T1's managed identity has Cosmos DB Built-in Data Contributor on the account (`infra/modules/cosmos01-access.bicep`), and no key exists anywhere |
+| Workload and Database Hub | The runner's `--target T5 --server <account>.documents.azure.com`, over the documented REST API with T1's token: `healthy-baseline` and `ru-storm`. Estate and Performance chart its Azure Monitor metrics (`HUB.ESTATE.T5`, `METRICS.T5`) |
+| Lifecycle | `deploy.ps1` creates it (`DEPLOY.T5.MISSING` in an older demo), and T1's track checks it (`T5.*`, `WORKLOAD.T5.WARMUP`). Its container exists only during a session once the session control's role can create it again (the `DbHubT5Container` tag is `Session`; `DEPLOY.T5.LIFECYCLE`): the starts, `demo-control.ps1`, and `deploy.ps1` create it (`START.T5.CONTAINER`, `CONTROL.T5.CONTAINER`, `DEPLOY.T5.CONTAINER`), and every stop deletes it (`STOP.T5`). `destroy.ps1` removes the account with the resource group ([T5's cost](cost-management.md#t5-azure-cosmos-db-2026-11-18)) |
+| History | T5's metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `cosmosdb`) and the model through the notebook's `COSMOS_METRICS` |
 
-## Changes from the approved plan
+## Notes
 
-These engineering refinements were made while writing the ADRs. None of them changes a user-directed decision.
-
-| # | Change | Why | ADR |
-|---|---|---|---|
-| 1 | The T2 host's `securityType` defaults to `Standard`; T1 uses `TrustedLaunch` only when its image advertises support | Microsoft Q&A answers say nested virtualization isn't supported with Trusted Launch. The Trusted Launch page, re-read in Phase 6, doesn't list it either way, so one live test decides. | 0003 |
-| 2 | In `PaygWizard` mode, Arc onboarding runs before the wizard | The wizard's Azure Extension page then fills in the subscription, resource group, and region from the existing Arc connection. Validated live 2026-10-21: pay-as-you-go still needs the operator's own Azure Login on that page ([deployment](deployment.md#the-paygwizard-manual-step-validated-live-2026-10-21)), an Internet Explorer-based sign-in window, so the guided stop, until its retirement on 2026-11-09, turned IE Enhanced Security Configuration off for administrators in the guest while it was open (live finding, 2026-10-30; [setup's Azure sign-in](deployment.md#setups-azure-sign-in-ie-enhanced-security-configuration)). | 0003, 0005 |
-| 3 | The NSGs allow TCP 1688 to the two Azure KMS addresses, and TCP 1433 and 11000–11999 to `Sql.<region>` from T1 | Azure SQL's redirect connection policy needs the SQL ports; the KMS rule keeps activation working even if the platform's licensing rule is disabled. Keeps the 443-and-DNS intent otherwise (DNS is platform traffic; Phase 5 live finding) | 0007 |
-| 4 | Guest DNS goes through a forwarder on the host, and Hyper-V port ACLs back up the guest firewall | Blocking the wire server also blocks Azure DNS; port ACLs can't be removed from inside the guest | 0004 |
-| 5 | T1 SQL connectivity is `LOCAL` instead of `PRIVATE` | Nothing needs network access to T1's SQL Server | 0007 |
-| 6 | Re-runs omit `osProfile` for VMs that already exist | Passwords aren't stored, and `adminPassword` can't change on an existing VM | 0001, 0009 |
-| 7 | The artifact cache uses shared-key SAS. **Dropped 2026-10-20** with the artifact cache: tenant policies turn off shared-key access | Contributor can't assign the data-plane roles that a user delegation SAS needs | 0009, 0016 |
-| 8 | The guest is Windows Server with Desktop Experience | The setup wizard needs a desktop | 0003, 0006 |
-| 9 | The runner targets .NET 10 LTS | .NET 8 support ends on 2026-11-10 | 0010 |
-| 10 | VM subnets set `defaultOutboundAccess: true` explicitly, with an opt-in NAT gateway mode | Subnets are private by default on newer networking API versions; a NAT gateway would have exceeded the plan's original ceiling, and defaults stay cheapest (Phase 5) | 0017 |
-| 11 | Resource-group tags are merged by passing the existing tags into the template | A subscription-scope resource-group resource replaces tags on every deployment (Phase 5) | 0002 |
-| 12 | Premium SSD v2 for `demo-day` and `enhanced-performance` data disks, where zones allow | Near-Standard-SSD cost with premium performance kept `demo-day` under the plan's original ceiling (Phase 5, C10) | 0016 |
-| 13 | `networkMode` `auto` (default) resolves from Azure Policy; preflight reads the tenant's policies and the Defender plans | Tenant policies can turn off SQL public network access and enforce Defender plans (Phase 5, 2026-10-20) | 0007, 0012, 0016 |
-| 14 | The artifact cache is dropped; the bundle travels in Run Command chunks and media comes straight from Microsoft | Tenant policies turn off shared-key and public access on storage accounts, and Defender for Storage bills each account (2026-10-20) | 0001, 0016 |
-| 15 | The monthly ceiling is a hard one, $415 a month for a new configuration (`monthlyCeilingUsd`: preflight fails above it; a configuration keeps its own value), and a session's is $20 (`sessionCeilingUsd`, a **Warning** above it); [cost management](cost-management.md#at-a-glance) | User-directed, 2026-10-20, 2026-11-04, 2026-11-18, and 2026-11-19 | 0016 |
-| 16 | Premium SSD v2 only when a `zone` is configured; otherwise the profile's regional data-disk tier (E10 for `demo-day`), with P10 only as a `dataDiskSku` opt-in | Premium SSD v2 needs a zonal VM, and a zone is an explicit choice that preflight checks (Phase 6; disk decision of 2026-10-19) | 0016 |
-| 17 | The Deploy to Azure button provisions infrastructure only; the bootstraps start on `deploy.ps1 -Resume` | The portal can't send the bootstrap bundle, so a loader would wait on an artifact that may never arrive (Phase 6) | 0001, 0003 |
-| 18 | The host downloads guest media from the pinned Microsoft URLs and verifies their SHA-256 | The hash pin keeps the build deterministic without a staging step (Phase 6) | 0003, 0006 |
-| 19 | T1 doesn't use SQL VM automated storage configuration | It's documented for Premium SSD with separate data and log disks; T1 has one data disk of varying type, or none in `lowest-cost` (Phase 6) | 0003 |
-| 20 | `lowest-cost` has no separate data disks: SQL Server data on T1 and the guest's VHDX and media on the T2 host use the OS disks, after a free-space check on the host | Keeps the lightest profile as cheap as possible, without the data disks' monthly cost (owner-approved, 2026-10-20; Phase 6) | 0003, 0016 |
-| 21 | The workload runner is a framework-dependent publish that reaches the VMs in Run Command chunks, and runs on a .NET runtime zip downloaded from Microsoft against a pinned SHA-512 | Without the artifact cache, a self-contained build would need hundreds of chunks (Phase 6) | 0010 |
-| 22 | T3 uses native Bicep resources instead of the AVM `sql/server` module | AVM adds auditing, a connection policy, and unused resource types by default; the native module sends only what the demo sets (Phase 8) | 0001, 0007 |
-| 23 | T3 auto-pause follows `t3AutoPauseMinutes` (default 15) on every profile when a script deploys | The cheapest default wins (2026-10-20); the profiles' 60 minutes applies only to the Deploy to Azure button (Phase 8) | 0016 |
-| 24 | T1 runs T3's T-SQL through action Run Command with an IMDS token, and joins the P6 group before its first Azure SQL token | One documented path for both network modes; managed identity tokens are cached for up to about 24 hours (Phase 8) | 0007, 0008 |
-| 25 | The runner is published framework-dependent, and `profile run` is a long-running console host rather than a Windows service, as [Data and workload](#data-and-workload) says | The delivery phases download the pinned .NET runtime from Microsoft, so a small runner fits Run Command chunks; hosting it (for example as a startup task) stays with them (Phase 11) | 0010 |
-| 26 | Two more scenarios, `resource-governance` and `log-rate-pressure`, for the T3 incidents; every scenario runs on every SQL target, T1 to T3 | Plan §9.3 lists them for T3, and Database Agent target coverage is undocumented (Phase 11) | 0010, 0013 |
-| 27 | `deploy.ps1` runs its tracks in parallel (three then; four since T4) and restores a new T2 host from a golden snapshot; a third resource group, `rg-<prefix>-golden`, holds the snapshots and outlives `destroy.ps1` unless `-IncludeGolden` | User-directed, 2026-10-21: a repeatable deploy of 30 minutes or less that keeps the pay-as-you-go wizard state; measured at 38.8 minutes (Phase 20) | 0002, 0003, 0018 |
-| 28 | Eight more scenarios, one per wait family: a deep blocking chain with lock escalation, a deadlock storm, tempdb contention, memory grants, parallelism, log flushes, a slow client, and a target at full capacity; `tempdb-contention`'s own temporary tables are the one write outside `ContosoCare` | User-directed, 2026-10-23: diverse, bounded activity for the Performance page and the Database Agent; every scenario keeps a hard maximum duration, runs on every SQL target, T1 to T3, and touches only `ContosoCare.Demo/` sessions (Phase 25b) | 0010, 0013 |
-| 29 | T2's default install mode is `JumpstartImage`: the guest is Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard image, made `arcsql01` at its first boot with no network; `ProductKey` and `Developer` are opt-in (`PaygWizard` too, until row 30), with no automatic fallback between modes, and the golden snapshot is an optional speed-up | User-directed, 2026-11-05: a one-click deployment that works with no person, for public users in their own subscriptions, reusing Arc Jumpstart's process and prebuilt images | 0006, 0018 |
-| 30 | `PaygWizard` and its guided stop are retired from the one-click deployment: a configuration's `PaygWizard` runs as `JumpstartImage`, a `PaygWizard` guest whose setup wizard was never finished is made again from the image, and a finished one is kept. T4 is part of every deployment, so `t4Enabled: false` is ignored | User-directed, 2026-11-09: "They should not need to manually do a wizard. They should sign into Az login and then have everything deployed." | 0006, 0019 |
-| 31 | T4 gets a same-region read replica for each session: created by `deploy.ps1` and `start-demo.ps1`, deleted by `stop-demo.ps1` after its metrics are read for the history, so it bills only during sessions, has no 7-day restart, and the ceilings, the restart rule, and the roles stay as they were. A bounded `replica-lag` scenario makes Database Hub's Read replica lag climb | User-directed, 2026-11-13 ("Postgres HA/DR"); the per-session lifecycle chosen from a live probe and approved within the owner's delegated scope, with the session ceiling unchanged ([cost management](cost-management.md#at-a-glance)) | 0025 |
-| 32 | `deploy.ps1` deletes T4's read replica at its end, once DONE's checks and the history snapshot have read it, unless a session uses it (a Run all session's auto-stop is pending, or a `start-demo.ps1` session's mark on the replica is ahead), so a deployment or an upgrade leaves nothing new billing between sessions | The project's coordinator for the user, 2026-11-16, reversible before the merge to `main` | 0025 |
-| 33 | T5, an Azure Cosmos DB for NoSQL account at 400 RU/s, Entra only, behind a private endpoint in both network modes, on the free tier when it's free, with `ru-storm` for normalized RU and 429s. It has no stop, so since 2026-11-19 its container (the throughput) exists only during a session, with the session control's and the safety stop's roles gaining container actions, approved by the owner on 2026-11-19 | User-directed, 2026-11-18 (Database Hub GA's Cosmos DB coverage; "one click, repeatable"), with the coordinator's decisions | 0027 |
-
-## Sources (checked 2026-10-19)
-
-- Database Hub: [overview](https://learn.microsoft.com/fabric/database/hub/overview), [monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql), [add SQL](https://learn.microsoft.com/fabric/database/hub/add-sql), [FAQ](https://learn.microsoft.com/fabric/database/hub/faq), [telemetry endpoint](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)
-- SQL Server on Azure VMs: [performance monitoring](https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm), [unified inventory](https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/unified-inventory-sql-vm)
-- SQL Server enabled by Azure Arc: [monitoring](https://learn.microsoft.com/sql/sql-server/azure-arc/sql-monitoring), [license and billing](https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing), [auto-deploy](https://learn.microsoft.com/sql/sql-server/azure-arc/manage-autodeploy), [prerequisites](https://learn.microsoft.com/sql/sql-server/azure-arc/prerequisites)
-- Azure Arc-enabled servers: [`azcmagent connect`](https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-connect), [network requirements](https://learn.microsoft.com/azure/azure-arc/servers/network-requirements), [evaluate on an Azure VM](https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine)
-- Compute: [nested virtualization](https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/nested-virtualization), [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [Trusted Launch](https://learn.microsoft.com/azure/virtual-machines/trusted-launch)
-- Azure SQL Database: [serverless auto-pause](https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-auto-pause-resume), [connectivity architecture](https://learn.microsoft.com/azure/azure-sql/database/connectivity-architecture)
-- Fabric: [licenses](https://learn.microsoft.com/fabric/enterprise/licenses), [`notebookutils` credentials](https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-credentials)
-- ARM and Bicep: [subscription deployments](https://learn.microsoft.com/azure/azure-resource-manager/bicep/deploy-to-subscription), [file functions](https://learn.microsoft.com/azure/azure-resource-manager/bicep/bicep-functions-files), [Deploy to Azure button](https://learn.microsoft.com/azure/azure-resource-manager/templates/deploy-to-azure-button)
+The changes from the approved plan are recorded, with their reasons, in the [decision records](adr/README.md). Sources: [official sources](references.md).
