@@ -181,13 +181,19 @@ RETURN
     ) AS c (scenario_id, max_duration_seconds);
 GO
 
--- One control row per scenario plus '*', the global cap and stop-all row. An operator can lower a limit here; a
--- re-run raises it back to the catalog value but never touches a stop request.
+-- One control row per scenario plus '*', the global cap and stop-all row. An operator can lower a limit here, and a
+-- re-run keeps it: it only lowers a row that's above the catalog value, and never touches a stop request. The one
+-- exception is plan-regression's earlier default, 1200 seconds, which a re-run raises to the catalog's 1800 for the
+-- Database Agent beat's 30 minutes (2026-11-18); any other value an operator set stays as it is.
 UPDATE c
 SET max_duration_seconds = s.max_duration_seconds, updated_at = SYSUTCDATETIME()
 FROM demo.scenario_control AS c
 INNER JOIN demo.fn_scenario_catalog() AS s ON s.scenario_id = c.scenario_id
 WHERE c.max_duration_seconds > s.max_duration_seconds;
+GO
+UPDATE demo.scenario_control
+SET max_duration_seconds = 1800, updated_at = SYSUTCDATETIME()
+WHERE scenario_id = 'plan-regression' AND max_duration_seconds = 1200;
 GO
 INSERT INTO demo.scenario_control (scenario_id, stop_requested, max_duration_seconds, updated_at)
 SELECT s.scenario_id, 0, s.max_duration_seconds, SYSUTCDATETIME()

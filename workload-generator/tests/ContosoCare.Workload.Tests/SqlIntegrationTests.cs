@@ -366,6 +366,51 @@ public sealed class SqlIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task SetupRaisesPlanRegressionsEarlierDefaultAndKeepsALoweredLimit()
+    {
+        // 2026-11-18 (review): setup run again over a database set up before the Database Agent beat. plan-regression's
+        // earlier default, 1200 seconds, goes to the catalog's 1800; a limit an operator lowered, there or elsewhere, stays.
+        await PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        await using var connection = await OpenAsync(SessionNames.ForControl("setup"));
+
+        async Task SetAsync(string scenario, int seconds)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE demo.scenario_control SET max_duration_seconds = @seconds WHERE scenario_id = @scenario;";
+            command.Parameters.Add("@seconds", SqlDbType.Int).Value = seconds;
+            command.Parameters.Add("@scenario", SqlDbType.VarChar, 64).Value = scenario;
+            await command.ExecuteNonQueryAsync(token);
+        }
+
+        async Task<int> LimitAsync(string scenario)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT max_duration_seconds FROM demo.scenario_control WHERE scenario_id = @scenario;";
+            command.Parameters.Add("@scenario", SqlDbType.VarChar, 64).Value = scenario;
+            return Convert.ToInt32(await command.ExecuteScalarAsync(token), System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        try
+        {
+            await SetAsync("plan-regression", 1200);
+            await SetAsync("cpu-pressure", 600);
+            await SqlScripts.ApplyAsync(connection, "110-demo-control.sql", RunnerLog.Null, token);
+            Assert.Equal(1800, await LimitAsync("plan-regression"));
+            Assert.Equal(600, await LimitAsync("cpu-pressure"));
+
+            await SetAsync("plan-regression", 900);
+            await SqlScripts.ApplyAsync(connection, "110-demo-control.sql", RunnerLog.Null, token);
+            Assert.Equal(900, await LimitAsync("plan-regression"));
+        }
+        finally
+        {
+            await SetAsync("plan-regression", 1800);
+            await SetAsync("cpu-pressure", 1800);
+        }
+    }
+
     private static async Task PrepareAsync()
     {
         Assert.SkipUnless(Server is not null, $"Set {ServerVariable} to a disposable SQL Server instance to run the integration tests.");

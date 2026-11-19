@@ -201,6 +201,22 @@ public sealed class SqlScriptTests
     }
 
     [Fact]
+    public void SetupRaisesOnlyPlanRegressionsEarlierDefaultToItsCatalogLimit()
+    {
+        // 2026-11-18 (review): a T3 set up before the Database Agent beat keeps plan-regression at 1200 seconds, and
+        // usp_run_begin clamps a run to it, so the beat's 30 minutes would end at 20. Setup raises exactly that earlier
+        // default to the catalog's 1800 after its lowering pass; any other value an operator set stays.
+        // SqlIntegrationTests.SetupRaisesPlanRegressionsEarlierDefaultAndKeepsALoweredLimit applies it to a database.
+        var script = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql")).Replace("\r\n", "\n", StringComparison.Ordinal);
+        const string raise = "UPDATE demo.scenario_control\nSET max_duration_seconds = 1800, updated_at = SYSUTCDATETIME()\nWHERE scenario_id = 'plan-regression' AND max_duration_seconds = 1200;\nGO";
+        Assert.Equal(1, CountOccurrences(script, raise));
+        Assert.Contains("('plan-regression', 1800)", script, StringComparison.Ordinal);
+        var lower = script.IndexOf("WHERE c.max_duration_seconds > s.max_duration_seconds;", StringComparison.Ordinal);
+        var insert = script.IndexOf("INSERT INTO demo.scenario_control (scenario_id, stop_requested, max_duration_seconds, updated_at)\nSELECT", StringComparison.Ordinal);
+        Assert.True(lower > 0 && lower < script.IndexOf(raise, StringComparison.Ordinal) && script.IndexOf(raise, StringComparison.Ordinal) < insert, "the raise runs after the lowering pass and before the insert of new rows");
+    }
+
+    [Fact]
     public void TheDemoScriptsEmbedInTheRunner()
     {
         var assembly = typeof(Program).Assembly;

@@ -142,7 +142,11 @@ function Get-DemoArcInstanceInfo {
         MonitoringEnabled   = [bool](Get-DemoMemberValue -InputObject $monitoring -Name 'enabled')
         MigrationAssessment = [pscustomobject]@{
             Enabled    = $assessmentEnabled -eq $true -or [string]$assessmentEnabled -eq 'true'
-            UploadedAt = [string](Get-DemoMemberValue -InputObject $assessment -Name 'assessmentUploadTime')
+            # ISO 8601 in UTC, whatever ConvertFrom-Json made of it (live, 2026-11-18: "11/19/2026 02:33:29" otherwise).
+            UploadedAt = $(
+                $uploaded = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $assessment -Name 'assessmentUploadTime')
+                if ($uploaded -is [datetime]) { $uploaded.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$uploaded }
+            )
             Readiness  = Get-DemoArcMigrationReadiness -Assessment $assessment
         }
         LastUsageUploadTime = [string](Get-DemoMemberValue -InputObject $properties -Name 'lastUsageUploadTime')
@@ -523,12 +527,14 @@ function Test-DemoArcMigrationAssessment {
     assessment ready. Internal; see Get-DemoArcCheck.
 
     .DESCRIPTION
-    - Fail: the Arc machine or the assessment is off, or -Problem says turning it on or starting it failed.
+    The assessment is optional, so this check is never a Fail, and it never keeps T2's track or the run from DONE
+    (2026-11-18 review):
     - Pass: an assessment was uploaded (properties.migration.assessment.assessmentUploadTime), with each Azure SQL target
       type's readiness as evidence; or it's on and -RunStatus is the status of the run this call's caller just started.
-    - Warning: it's on, but no assessment was uploaded yet and none was started now, or the Azure extension for SQL Server
-      is older than the documented minimum. There's no SQL Server instance resource yet: a Warning too (Manual action
-      required before the PaygWizard step).
+    - Warning, with the fix: the Arc machine doesn't exist; -Problem says turning it on failed (for example a policy's
+      RequestDisallowedByPolicy) or didn't take effect yet; it's off; it's on, but no assessment was uploaded yet and none
+      was started now; or the Azure extension for SQL Server is older than the documented minimum. There's no SQL Server
+      instance resource yet: a Warning too (Manual action required before the PaygWizard step).
     The assessment is free for every edition, so Developer mode is checked too (migration-assessment).
     #>
     [CmdletBinding()]
@@ -551,9 +557,9 @@ function Test-DemoArcMigrationAssessment {
     $setting = $target.Setting
     $docUrl = $setting.DocUrls['migrationAssessment']
     $checkId = 'T2.ARC.MIGRATIONASSESSMENT'
-    $rerun = 'Run ./scripts/configure-arc.ps1 (or ./scripts/deploy.ps1), which turns it on and starts a run until the first assessment is uploaded.'
+    $rerun = 'Run ./scripts/configure-arc.ps1 (or ./scripts/deploy.ps1) again, which turns it on and starts a run until the first assessment is uploaded. If an Azure Policy denies the change, ask your administrator for an exemption; the assessment is optional and free, and the rest of the demo doesn''t need it.'
     if ($null -eq $State.Machine) {
-        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Fail' -Message ('The Arc machine {0} doesn''t exist, so there''s no migration assessment.' -f $target.MachineName) -Remediation 'Run ./scripts/configure-arc.ps1.' -DocUrl $docUrl)
+        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Warning' -Message ('The Arc machine {0} doesn''t exist, so there''s no migration assessment yet; T2.ARC.CONNECTED says why.' -f $target.MachineName) -Remediation 'Run ./scripts/configure-arc.ps1.' -DocUrl $docUrl)
     }
     $info = Get-DemoArcInstanceInfo -Instance @($State.HostedInstances) -MinimumCores $setting.MinimumCoresPerOse
     if ($null -eq $info) {
@@ -577,10 +583,10 @@ function Test-DemoArcMigrationAssessment {
         minimumVersion   = $minimum
     }
     if ($Problem) {
-        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Fail' -Message ('Migration assessment for {0} wasn''t set up: {1}' -f $info.Name, $Problem) -Evidence $evidence -Remediation $rerun -DocUrl $docUrl)
+        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Warning' -Message ('Migration assessment for {0} isn''t on: {1}. Database Hub''s Optimization can''t show T2 as ready to migrate until it is; nothing else depends on it.' -f $info.Name, $Problem) -Evidence $evidence -Remediation $rerun -DocUrl $docUrl)
     }
     if (-not $assessment.Enabled) {
-        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Fail' -Message ('Migration assessment is off for {0}, so Database Hub''s Optimization can''t show T2 as ready to migrate.' -f $info.Name) -Evidence $evidence -Remediation $rerun -DocUrl $docUrl)
+        return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Warning' -Message ('Migration assessment is off for {0}, so Database Hub''s Optimization can''t show T2 as ready to migrate; nothing else depends on it.' -f $info.Name) -Evidence $evidence -Remediation $rerun -DocUrl $docUrl)
     }
     if ($assessment.UploadedAt) {
         $verdict = if ($readiness.Count -gt 0) { ': {0}' -f ($readiness -join '; ') } else { '; its target recommendations follow once the price estimation finishes' }

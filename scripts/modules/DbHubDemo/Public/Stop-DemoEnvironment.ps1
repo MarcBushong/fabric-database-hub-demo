@@ -20,9 +20,9 @@ function Stop-DemoEnvironment {
       action, ShutDown); then deallocates the T2 VM and sqlvm01. T3 isn't
       touched: with its profile off (the T3 profile is a file on T1, so this doesn't wake it), serverless
       auto-pause stops its compute t3AutoPauseMinutes after the last session. Only when T3's profile went off here,
-      during a session, is T3's FORCE_LAST_GOOD_PLAN read, while T3 is still Online, and set back to Default when a
-      Database Agent beat that held it off stopped with sqlvm01 before putting it back (STOP.T3.AUTOTUNING,
-      Invoke-DemoT3AutoTuningCheck -Restore; 2026-11-18). T4, the PostgreSQL flexible
+      during a session, is T3 touched: before T1 deallocates, the Database Agent beat's hold, if any, is released through
+      T3 itself (Invoke-DemoT3AutoTuningRelease), which puts back only what the hold recorded; after it, T3's
+      FORCE_LAST_GOOD_PLAN is read and reported (STOP.T3.AUTOTUNING; 2026-11-18, review). T4, the PostgreSQL flexible
       server (Phase 24, ADR 0019), gets its profile off and is stopped (STOP.T4.STOP; Servers - Stop). A
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
@@ -267,6 +267,17 @@ function Stop-DemoEnvironment {
         }
     }
 
+    # The Database Agent beat (2026-11-18) holds FORCE_LAST_GOOD_PLAN off until its response, and its run's own cleanup
+    # puts it back when its profile goes off. In case the run stopped before that, the hold is released through T3 itself,
+    # from T1 while it still runs (Invoke-DemoT3AutoTuningRelease): only what a demo hold recorded is put back, so an off a
+    # person set outside the demo stays (2026-11-18 review). T3 is read only when its profile went off here, in a session.
+    $t3Tuning = $null
+    $tuningRelease = $null
+    if (-not $ParkT2 -and 'T3' -in $offTargets) {
+        $t3Tuning = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $tuningRelease = Invoke-DemoT3AutoTuningRelease -Config $Config -T3 $t3Tuning -DeploymentId ([string]$state.Tags['deploymentId'])
+    }
+
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
         # action (ShutDown) shuts it down when the host deallocates otherwise.
@@ -289,10 +300,9 @@ function Stop-DemoEnvironment {
     foreach ($record in $notOff) {
         $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds -DeallocationFailed:(-not [bool]$deallocated[[string]$record.VmName])))
     }
-    if (-not $ParkT2 -and 'T3' -in $offTargets) {
-        # The Database Agent beat (2026-11-18) holds FORCE_LAST_GOOD_PLAN off until its response; a run that stopped with
-        # sqlvm01 before any of its own ways back leaves it off, so it's put back here while T3 is still awake.
-        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 (Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])) -CheckId 'STOP.T3.AUTOTUNING' -Restore -Confirm:$false
+    if ($null -ne $t3Tuning) {
+        # What the release found, read after the deallocation, while T3 is still awake: read-only.
+        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 $t3Tuning -CheckId 'STOP.T3.AUTOTUNING' -Release $tuningRelease
         if ($null -ne $tuning) {
             $results.Add($tuning)
         }
