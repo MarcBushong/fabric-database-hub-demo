@@ -116,7 +116,7 @@
       "uniqueItems": true
     },
     "dataSources": {
-      "description": "hub-estate and hub-performance: what Database Hub shows. databasehub-skill: the microsoft-sql-fdh plugin. telemetry-endpoint: the documented telemetry REST endpoint through the Learn agent instructions block. sql-diagnostics-skills: the microsoft-sql plugin over a SQL connection. scenario-record: demo.scenario_runs, read only. learn-mcp: the Microsoft Learn MCP server.",
+      "description": "hub-estate and hub-performance: what Database Hub shows. databasehub-skill: the GA databasehub-cli skill (the fabric-skills plugin). telemetry-endpoint: the documented telemetry REST endpoint through the Learn agent instructions block. sql-diagnostics-skills: the microsoft-sql plugin over a SQL connection. scenario-record: demo.scenario_runs, read only. learn-mcp: the Microsoft Learn MCP server.",
       "type": "array",
       "items": {
         "enum": [

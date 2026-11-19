@@ -95,6 +95,10 @@ BeforeAll {
             @{ productName = 'Key Vault'; skuName = 'Standard'; meterName = 'Certificate Renewal Request'; retailPrice = 3.0; unitOfMeasure = '1'; tierMinimumUnits = 0 }
             @{ productName = 'Key Vault'; skuName = 'Standard'; meterName = 'Operations'; retailPrice = 0.03; unitOfMeasure = '10K'; tierMinimumUnits = 0 }
         )
+        "serviceName eq 'Azure Container Apps'"                                               = @(
+            @{ productName = 'Azure Container Apps'; skuName = 'Standard'; meterName = 'Standard vCPU Active Usage'; retailPrice = 0.000024; unitOfMeasure = '1 Second' }
+            @{ productName = 'Azure Container Apps'; skuName = 'Standard'; meterName = 'Standard Memory Active Usage'; retailPrice = 0.000003; unitOfMeasure = '1 GiB Second' }
+        )
         "serviceName eq 'Automation'"                                                         = @(
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.002; unitOfMeasure = '1 Minute'; tierMinimumUnits = 500 }
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.0; unitOfMeasure = '1 Minute'; tierMinimumUnits = 0 }
@@ -132,6 +136,8 @@ BeforeAll {
         # T4 (Phase 24) has its own tests below; the others keep their totals with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = $false
         $config['t5Enabled'] = $false
+        # Ask's relay (ADR 0028) has its own test below; the others keep their totals with it off.
+        $config['ask'] = @{ enabled = $false; image = ''; githubClientId = '' }
         foreach ($key in $Override.Keys) { $config[$key] = $Override[$key] }
         return $config
     }
@@ -181,6 +187,18 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.T4RestartHours | Should -Be 720
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message | Should -Match 'OpenSourceRelationalDatabases'
         @($estimate.MissingPrices) | Should -BeNullOrEmpty
+    }
+
+    It 'prices Ask''s chat relay per active second, as running cost only (it scales to zero), from the Container Apps meters' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ ask = @{ enabled = $true; image = ''; githubClientId = '' } }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $defenderPlans
+        $ask = @($estimate.Components | Where-Object { $_.Name -like 'Ask relay*' })
+        $ask.Count | Should -Be 2
+        @($ask | Where-Object Basis -NE 'running') | Should -BeNullOrEmpty -Because 'idle, the relay has no replica and costs nothing'
+        ($ask | Where-Object Name -Like '*vCPU*').Cost | Should -Be ([System.Math]::Round(0.000024 * 3600, 4)) -Because 'one vCPU for an hour'
+        ($ask | Where-Object Name -Like '*memory*').Cost | Should -Be ([System.Math]::Round(0.000003 * 3600 * 2, 4)) -Because '2 GiB for an hour'
+        @($estimate.MissingPrices) | Should -BeNullOrEmpty
+        $off = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $defenderPlans
+        @($off.Components | Where-Object { $_.Name -like 'Ask relay*' }) | Should -BeNullOrEmpty
     }
 
     It 'prices T4''s default, General Purpose Standard_D4ds_v5, as 4 vCore-hours, and the fallback''s Standard_D4ads_v5 from its own series (2026-11-04)' {
@@ -796,6 +814,8 @@ Describe 'Get-DemoCostEstimate' {
         $file | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyPath -Encoding utf8NoBOM
         $legacy = Get-DemoConfig -Path $legacyPath
         $legacy['t4Enabled'] = $false
+        # Ask's relay is priced in its own test; this one checks the ceiling, at the figure below without it.
+        $legacy['ask'] = @{ enabled = $false; image = ''; githubClientId = '' }
         # The fixture's lowest-cost session, 11.70 USD, is between the two ceilings: a Pass against 20, not a Warning against 15.
         $session = (Get-DemoCostEstimate -Config $legacy -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
         $session.status | Should -Be 'Pass'

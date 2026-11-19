@@ -94,12 +94,26 @@ Describe 'Fabric App source' {
         }
     }
 
-    It 'resolves every package from the public npm registry with SHA-512 integrity' {
-        $lock = Get-Content -LiteralPath (Join-Path -Path $script:appRoot -ChildPath 'package-lock.json') -Raw | ConvertFrom-Json -AsHashtable
-        $entries = @($lock['packages'].GetEnumerator() | Where-Object { $_.Key -and $_.Value['resolved'] })
-        $entries.Count | Should -BeGreaterThan 100
-        @($entries | Where-Object { $_.Value['resolved'] -notmatch '^https://registry\.npmjs\.org/' } | ForEach-Object { $_.Key }) | Should -BeNullOrEmpty
-        @($entries | Where-Object { $_.Value['integrity'] -notmatch '^sha512-' } | ForEach-Object { $_.Key }) | Should -BeNullOrEmpty
+    It 'resolves every package of every package-lock.json in the repository from the public npm registry with SHA-512 integrity' {
+        # Every lockfile, not only the app's (2026-11-19): the relay's and the functions' had SHA-1 hashes from an npm feed
+        # proxy, which CI's npm ci then installs. To fix an entry, take the same tarball's SHA-512 (npm pack
+        # <name>@<version> --json prints it) and let npm ci verify it; no .npmrc and no other registry.
+        $lockFiles = @(git -C $repoRoot ls-files --cached --others --exclude-standard -- '*package-lock.json' 2>$null)
+        foreach ($known in 'fabric/app/package-lock.json', 'fabric/app/rayfin/functions/package-lock.json', 'ask-relay/package-lock.json') {
+            $lockFiles | Should -Contain $known
+        }
+        $checked = 0
+        $bad = foreach ($file in $lockFiles) {
+            $lock = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath $file) -Raw | ConvertFrom-Json -AsHashtable
+            foreach ($entry in @($lock['packages'].GetEnumerator() | Where-Object { $_.Key -and -not $_.Value['link'] -and -not $_.Value['inBundle'] })) {
+                $checked++
+                if ([string]$entry.Value['resolved'] -notmatch '^https://registry\.npmjs\.org/' -or [string]$entry.Value['integrity'] -notmatch '^sha512-') {
+                    '{0}: {1}' -f $file, $entry.Key
+                }
+            }
+        }
+        $checked | Should -BeGreaterThan 100
+        @($bad) | Should -BeNullOrEmpty -Because 'every package comes from https://registry.npmjs.org/ with a sha512 integrity'
     }
 
     It 'pins each npm override exactly, as config/versions.json records it, and resolves every copy of the package to it' {

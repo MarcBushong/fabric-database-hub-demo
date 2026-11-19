@@ -174,7 +174,17 @@ the lakehouse tables the history report reads (incident windows, telemetry snaps
 current. It runs analyze-only, scoped to the demo's resource group
 (RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
-lakehouse gets the tables.
+lakehouse gets the tables; that first run waits up to -HistoryRunWaitMinutes, since a busy capacity can keep it queued
+for longer than 10 minutes (#68).
+
+.PARAMETER HistoryRunWaitMinutes
+How long the first history run (step 5 by itself, above) is waited for while it's queued on the capacity or runs
+(default 45; at least -TimeoutSeconds). A run still queued or running then keeps running, and its record says so with
+its location (jobLocation), which deploy.ps1 follows.
+
+.PARAMETER ProgressPath
+The status page's model (deploy-progress.json), which deploy.ps1 passes: while the first history run is queued or runs,
+its Fabric row says so, with the minutes so far and -HistoryRunWaitMinutes.
 
 .PARAMETER LiveActivityWindowMinutes
 With -RunLiveActivity: the notebook's WINDOW_MINUTES and TELEMETRY_LOOKBACK_MINUTES (default 1440, one day).
@@ -269,6 +279,12 @@ param(
 
     [switch] $RunLiveActivity,
 
+    [ValidateRange(5, 120)]
+    [int] $HistoryRunWaitMinutes = 45,
+
+    [AllowEmptyString()]
+    [string] $ProgressPath = '',
+
     [ValidateRange(15, 10080)]
     [int] $LiveActivityWindowMinutes = 1440,
 
@@ -295,6 +311,7 @@ $module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 $PostgresMetricsPath = Resolve-DemoUserPath -Path $PostgresMetricsPath
+$ProgressPath = Resolve-DemoUserPath -Path $ProgressPath
 if ($PostgresMetricsPath) {
     if (-not $RunLiveActivity) {
         throw '-PostgresMetricsPath goes with -RunLiveActivity: the notebook run adds the file''s metrics to the history.'
@@ -694,7 +711,17 @@ if ($RunLiveActivity -or $firstRun) {
                 $results.Add((New-DemoResult -CheckId 'FABRIC.T5.HISTORY' -Area 'fabric' -Target 'T5' -Status 'Warning' -Message 'T5''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them. Azure Monitor keeps them.' -Remediation $(if ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again adds them.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again adds them.' })))
             }
         }
-        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))
+        $runTimeout = [Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0))
+        $runProgress = @{}
+        if (-not $RunLiveActivity) {
+            # The first history run (#68): a busy capacity keeps it queued for a while (live, 2026-11-19: about 15 minutes on
+            # a shared F4), and the history model reads the tables it creates, so it gets a longer wait, on the status page.
+            $runTimeout = [Math]::Max($runTimeout, $HistoryRunWaitMinutes)
+            if ($ProgressPath) {
+                $runProgress = @{ ProgressPath = $ProgressPath; ProgressId = 'Fabric.Items'; ProgressNote = 'It''s the first history run: the history model refreshes once it has run.' }
+            }
+        }
+        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
         $results.Add($run)
         if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.

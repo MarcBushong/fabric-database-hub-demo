@@ -346,6 +346,31 @@
       },
       "default": {}
     },
+    "ask": {
+      "description": "The Insights app's in-app GitHub Copilot chat (Ask, ADR 0028). deploy.ps1 runs its chat relay as an Azure Container App in the demo's resource group (it scales to zero and holds no credentials) and points the app at it; each viewer signs in once with their own GitHub account and Copilot license. When the relay can't be deployed, the status page shows a Warning and DONE stays.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "false: no relay, and the app's Copilot dock says Ask isn't deployed. While nobody asks, the relay has no replica and costs nothing.",
+          "type": "boolean",
+          "default": true
+        },
+        "image": {
+          "description": "Your own relay image instead of the pinned one (config/versions.json askRelay.image): a full reference pinned by digest (registry/repository@sha256:...) that Azure Container Apps can pull without credentials. Empty: the pinned image.",
+          "type": "string",
+          "pattern": "^([a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64})?$",
+          "default": ""
+        },
+        "githubClientId": {
+          "description": "Your own GitHub OAuth App's client ID (device flow on, no client secret) instead of the shared app's in config/versions.json (askRelay.githubClientId). Empty: the shared app, so nobody registers anything.",
+          "type": "string",
+          "pattern": "^([A-Za-z0-9.]{16,40})?$",
+          "default": ""
+        }
+      },
+      "default": {}
+    },
     "hostPriority": {
       "description": "Regular or Spot for the T2 host (ADR 0016, C5).",
       "enum": ["Regular", "Spot"],

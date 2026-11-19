@@ -62,7 +62,7 @@ The view (page, filter, drill-down, replay position) is kept in the frame's addr
 
 ### Copilot in the app
 
-The Copilot chat sits in a dock on the right: it resizes, goes full screen, and keeps its width. **Copilot** in the top bar opens it, and so does every **Ask Copilot** and **Ask why**. It answers from what's on screen and the tools it has, and draws its charts in the app's own chart language (`ChartView`). The chat, its GitHub sign-in, and its tools are documented with its code in `src/copilot/`.
+The Copilot chat sits in a dock on the right: it resizes, goes full screen, and keeps its width. **Copilot** in the top bar opens it, and so does every **Ask Copilot** and **Ask why**. It answers from what's on screen and the tools it has, and draws its charts in the app's own chart language (`ChartView`). [Ask Copilot: the chat in the app](#ask-copilot-the-chat-in-the-app) has what it can do, its sign-in, and its states.
 
 ### Look and feel
 
@@ -72,7 +72,7 @@ The Copilot chat sits in a dock on the right: it resizes, goes full screen, and 
 
 ### Ask the Database Agent
 
-Database Hub's Database Agent (preview) works only in Database Hub's UI and has no API, so the app writes ready-made prompts from the data on screen: copy one, select **Open Database Hub**, and paste it into the agent, or select **Ask Copilot** to ask the in-app Copilot instead. Incidents has each window's prompts (what caused it, what moved with it, against the baseline, the evidence), with the target and its resource name, the UTC window, and the window's own numbers; Estate and Readiness have a prompt library. Every prompt ends with the [prompt pack's](../agent/prompts/README.md) safety sentence ("Don't apply anything; propose only."), the panels say **Preview**, **the agent proposes; you approve each action**, and **investigation only: this app never runs anything**, and the **Copilot CLI · VS Code** switch rewrites the prompts for the documented fallback ([agent guide](../agent/README.md)). Database Hub keeps 7 days of telemetry or less; for an older window the panel says the agent may not see it any more.
+Database Hub's Database Agent (preview) works only in Database Hub's UI and has no API, so the app writes ready-made prompts from the data on screen: copy one, select **Open Database Hub**, and paste it into the agent, or select **Ask Copilot** to ask the in-app Copilot instead. Incidents has each window's prompts (what caused it, what moved with it, against the baseline, the evidence), with the target and its resource name, the UTC window, and the window's own numbers; Estate and Readiness have a prompt library. Every prompt ends with the [prompt pack's](../agent/prompts/README.md) safety sentence ("Don't apply anything; propose only."), the panels say **Preview**, **the agent proposes; you approve each action**, and **investigation only: this app never runs anything**, and the **Copilot CLI · VS Code** switch rewrites the prompts for the documented fallback, GitHub Copilot CLI or VS Code with the GA Database Hub skill (`databasehub-cli`, in the `fabric-skills` plugin) and the `microsoft-sql` plugin ([agent guide](../agent/README.md)). Database Hub keeps 7 days of telemetry or less; for an older window the panel says the agent may not see it any more.
 
 ## Manage: bounded, confirmed actions
 
@@ -92,6 +92,17 @@ Every action says what it does and what bounds it, shows the control request, an
 
 **What the control ran** lists every session plan and activity request the notebooks recorded, newest first.
 
+### Ask Copilot: the chat in the app
+
+**Ask Copilot** opens a chat docked on the right, on the viewer's own GitHub Copilot ([ADR 0028](../../docs/adr/0028-ask-copilot-in-the-insights-app.md)): conversational analytics on the demo's history and its live estate, with the app's own charts.
+
+- **What it can do:** run read-only DAX on `SM_DatabaseHub_History` through the app's delegated connector, as the viewer (`run_dax`; `EVALUATE` only, bounded rows); draw the result with the app's own `ChartView` (`show_chart`); read the live estate from Database Hub through the app's function (`estate_overview`); and suggest follow-ups. Every tool runs in the page; the model gets a guide to the model's names, never data.
+- **Every answer** shows its source (**Show the source**: the DAX, or the Database Hub routes), and can be copied; **Export** saves the conversation as Markdown with every query, and **New chat** starts over. The conversation stays for the browser session.
+- **From any visual:** **Ask Copilot** and **Ask why** pass the visual's title, rows, and DAX to the chat (`useCopilot().ask`, `src/copilot/contract.ts`).
+- **Sign-in:** **Sign in with GitHub**, once per browser: the device flow through the shared OAuth App **Database Hub Insights Ask**, which the relay runs because GitHub's endpoints don't allow browser calls. The account line shows `GitHub: <login> · Copilot <plan>`, with **Switch GitHub account** and **Sign out of GitHub**.
+- **Where it connects:** `public/dbhub-app.json`'s `ask` block, which `configure-fabric-app.ps1` writes in the stage: `relayUrl` (the relay, `ca-<prefix>-<environment>-ask`) and `estate` (the function is deployed). Without a relay, the dock says Ask isn't deployed, and the rest of the app works as before.
+- **Its states:** Ask not deployed; the relay starting from zero (a cold start takes about 15 seconds); GitHub sign-in not set up; the sign-in card with its code; an account without Copilot; an organization that blocks the app; and a sign-in that expired.
+
 ## How it's built
 
 | Part | Choice |
@@ -104,7 +115,7 @@ Every action says what it does and what bounds it, shows the control request, an
 | Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)). Live data from the app's function (`src/copilot/estate.ts`), through `src/data/live-estate.ts` |
 | Queries | `src/data/queries.ts`: 21 DAX queries, each with a row bound (`resultSetRowCountLimit`); results are cached for 5 minutes and shared between visuals. The ones a new environment has no rows for are marked `mayBeEmpty` (the readiness checks, the sessions, the agent loop, and T5), so the deploy-time check says so rather than warns |
 | Hosting | `staticHosting.assetAccess: protected`, set explicitly in `rayfin/rayfin.yml` ([hosting](https://learn.microsoft.com/fabric/apps/hosting)) |
-| Backend services | Auth; with the shared functions project (`rayfin/functions/`), the live estate (`estate.ts`) and Manage (`manage.ts`) functions. No database or storage |
+| Backend services | Auth; and the shared functions project (`rayfin/functions/`): `estateOverview`, the live estate for Ask and the pages, read-only (`estate.ts`), and Manage's `manageAccess`, `manageRequest`, and `manageJob` (`manage.ts`). No database or storage |
 
 Every package is pinned to an exact version in `package.json` and `package-lock.json`, resolved from the public npm registry (`registry.npmjs.org`) with SHA-512 integrity: install new packages with `--registry=https://registry.npmjs.org/`, or fix the lock file's URLs after an install through a mirror. `npm run check:licenses` fails on a production dependency that isn't MIT, ISC, Apache-2.0, BSD, 0BSD, OFL-1.1, BlueOak-1.0.0, Unlicense, or CC0-1.0. The build writes `dist/THIRD_PARTY_NOTICES.txt`. The bundle is about 410 KB gzip in all, and pages load lazily.
 
@@ -119,11 +130,13 @@ fabric/app/
   src/data/                    the DAX catalog, the query client (sources, cache, bounds), typed parsers, and the live estate's loader
   src/lib/                     DAX builders, formatting, CSV, view state, health, insights, Ask Copilot's context, the control's
                                requests, the Manage client, the live findings, and the Database Agent prompts
-  src/copilot/                 the Copilot chat: its contract (contract.ts), provider, dock, and tools (the chat session's code)
+  src/copilot/                 Ask: the Copilot dock and provider, its page-run tools, the relay client, and the model guide (the chat's code)
+  rayfin/functions/            the functions: the live estate (estate.ts, estate-core.ts) and Manage (manage.ts, manage-core.ts); function_app.ts registers each feature's
   src/theme/                   the Fluent themes and their tokens
   src/preview/                 the local preview's sample data (npm run dev:sample); never built into the app
   src/test/                    the test setup and fixtures, and the tests of the npm overrides with Rayfin's code
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
+  scripts/build-model-guide.ts writes src/copilot/model-guide.generated.ts from the model's TMDL (npm run guide:build)
   scripts/check-licenses.mjs   the production license check
 ```
 
@@ -177,6 +190,7 @@ What it does, as ADR 0012 results in `out/configure-fabric-app.jsonl`:
 | Node.js, the sign-in the CLI uses (the Azure CLI's tokens, or its own sign-in to the demo's tenant), and the two tenant settings | `FABRIC.APP.NODE`, `.SIGNIN`, `.TENANTSETTING`, `.EXECUTEQUERIES` |
 | `rayfin up --workspace-id <id> --item-name APP_DatabaseHub_Insights --tenant <id> --yes --json`, then `rayfin up status --json`; when Fabric refuses the Azure CLI's token, the CLI's own sign-in deploys instead | `FABRIC.APP.DEPLOY`, `FABRIC.APP.STATUS`, `FABRIC.APP.TOKEN` (only after a refusal) |
 | Every query in the app's catalog, anchored to the newest telemetry day, under your identity: through the connector's direct route (`rayfin connector invoke`), or, when that route refuses the Azure CLI's token, through Execute Queries with the same token (one query per request, with the app's row bound compared here, since that API has none); `-RayfinSignIn` runs them through the connector with the CLI's own sign-in. Then the hosted app must refuse anonymous requests | `FABRIC.APP.CONNECTOR`, `.QUERIES` (evidence `route`, `auth`, `connectorRefusal`), `.HOSTING` |
+| Ask: before the stage, deploy its chat relay (`infra/ask/ask-relay.bicep`, registering `Microsoft.App` when it isn't) and write its address into `dbhub-app.json`; after `rayfin up`, set the relay's origin to the app's, wake and check it, and read the strict-CSP tenant setting. Never a Fail: Pass, Warning, or Not selected | `ASK.RELAY`, `ASK.RELAY.HEALTH`, `ASK.SIGNIN`, `ASK.CSP` |
 | The browser check: a note when the app is deployed and every query it runs returned its data (2026-11-09). The note says exactly that, and that the app's own route in the browser (its sign-in, then its backend, User Data Functions, and a delegated on-behalf-of call) can't be checked from a script, since neither route above crosses it. Otherwise only a person can do it | `FABRIC.APP.BROWSER` (**Not selected**, "Not needed"; otherwise **Manual action required**) |
 
 Without `-FabricAdmin`, the tenant settings can't be read; a passing deploy proves **Fabric Apps (preview)** and a passing connector check proves **Dataset Execute Queries REST API** (the connector's runtime calls the Execute Queries API, and the check's other route is that API), so both become a **Pass**. With `-FabricAdmin`, they're read through the [admin API](https://learn.microsoft.com/rest/api/fabric/admin/tenants/list-tenant-settings).
@@ -238,6 +252,9 @@ To run the app locally against the deployed backend, work in the stage (`out/fab
 | A page says **Live · unavailable** | The app's live estate function isn't deployed, or Database Hub didn't answer: the line beside it says which. The page shows the history, and Database Hub has the live view |
 | Manage says each action copies its request | The app's Manage function isn't deployed, or it isn't set up, which the message says (`FABRIC.APP.ACTIONS` says why, for example when the session control's notebook wasn't found): paste the copied lines into a new cell under the control notebook's parameters cell, then Run all. With the function set up, operators send from the app |
 | Manage is read-only for you | You aren't one of the demo's operators: the deployer and the members of its admin group. Ask an operator, or one of them redeploys after adding you to the group (`./scripts/deploy.ps1` refreshes the list) |
+| The Copilot dock says Ask isn't deployed | `ASK.RELAY` says why: no image pinned yet, `ask.enabled` false, or the relay's deployment failed; fix it and run `./scripts/configure-fabric-app.ps1` again |
+| The Copilot dock says it can't reach the relay | Wait about 15 seconds (it starts from zero); otherwise `ASK.RELAY.HEALTH` and `ASK.CSP` say why: the relay doesn't allow the app's origin yet, or the strict-CSP tenant setting is on |
+| The Copilot dock says this GitHub account can't use Copilot | Sign in with the GitHub account that has your Copilot license (**Switch GitHub account**); an organization that restricts OAuth apps has an owner approve **Database Hub Insights Ask** |
 | A Real-Time Dashboard link opens the wrong page | The portal path for dashboards isn't documented; use the workspace link and open `RTD_DatabaseHub_LiveView` |
 
 More in [troubleshooting](../../docs/troubleshooting.md).

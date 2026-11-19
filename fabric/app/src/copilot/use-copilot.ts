@@ -1,11 +1,12 @@
-// The Copilot context and its hooks. The shell and the entry points use only useCopilot() and useCopilotDock();
-// the chat replaces the stub behind them (CopilotProvider.tsx) without changing these signatures.
+// The Copilot context and its hooks. The shell and the entry points use only useCopilot(), useCopilotDock(), and
+// useCopilotAccount(); their signatures don't change. The dock reads the chat itself through useCopilotChat().
 
 import { createContext, useContext } from "react";
 
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
+import type { ChatController } from "./chat-types";
 
-/** What the stub keeps: the context the last entry point attached or asked about, for the placeholder dock. */
+/** The context an entry point attached with open(ctx), waiting for the viewer's question. */
 export interface AttachedContext {
     ctx: AskContext;
     /** True when it came from ask(), false from open(ctx). */
@@ -18,6 +19,8 @@ export interface CopilotContextValue {
     dock: CopilotDockState;
     account: CopilotAccountState;
     attached: AttachedContext | null;
+    /** The conversation and its actions, for the dock; absent where only the shell's contract is provided (tests). */
+    chat?: ChatController | null;
 }
 
 export const CopilotContext = createContext<CopilotContextValue | null>(null);
@@ -41,7 +44,12 @@ export function useCopilotAccount(): CopilotAccountState {
     return useContext(CopilotContext)?.account ?? NO_ACCOUNT;
 }
 
-/** The stub's attached context, for its placeholder dock. */
+/** The context an entry point attached, for the dock. */
 export function useCopilotAttached(): AttachedContext | null {
     return useContext(CopilotContext)?.attached ?? null;
+}
+
+/** The conversation, for the dock. */
+export function useCopilotChat(): ChatController | null {
+    return useContext(CopilotContext)?.chat ?? null;
 }

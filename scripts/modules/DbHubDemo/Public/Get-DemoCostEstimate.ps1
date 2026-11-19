@@ -292,6 +292,18 @@ function Get-DemoCostEstimate {
     $ipItem = $ipItems | Where-Object { $_.meterName -eq 'Standard IPv4 Static Public IP' } | Select-Object -First 1
     Add-Component 'Bastion public IP' 'bastion' $ipItem 1 'hour'
 
+    # Ask's chat relay (ADR 0028): billed per second only while its replica runs, that is while someone uses the Copilot
+    # chat in the Insights app (it scales to zero after a few idle minutes), so a running hour is its upper bound; idle,
+    # it costs nothing.
+    $askSetting = Get-DemoAskSetting -Config $Config
+    if ($askSetting.Enabled) {
+        $acaItems = Get-CachedPrice "serviceName eq 'Azure Container Apps' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
+        $askCpu = [double]$askSetting.ContainerApp['cpu']
+        $askMemory = [double](([string]$askSetting.ContainerApp['memory']) -replace 'Gi$', '')
+        Add-Component 'Ask relay vCPU (only while someone uses the Copilot chat)' 'running' ($acaItems | Where-Object { $_.meterName -eq 'Standard vCPU Active Usage' } | Select-Object -First 1) (3600 * $askCpu) 'vCPU-second'
+        Add-Component 'Ask relay memory (only while someone uses the Copilot chat)' 'running' ($acaItems | Where-Object { $_.meterName -eq 'Standard Memory Active Usage' } | Select-Object -First 1) (3600 * $askMemory) 'GiB-second'
+    }
+
     # Always billed (per month). Data disk tiers match the template (Resolve-DemoDataDiskTier, ADR 0016).
     $zone = if ($Config.Contains('zone') -and $Config['zone']) { [string]$Config['zone'] } else { '' }
     $diskOverride = Get-DemoDataDiskOverride -Config $Config
