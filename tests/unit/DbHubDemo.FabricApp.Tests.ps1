@@ -893,19 +893,19 @@ Describe 'Test-DemoFabricApp' {
             $browser.evidence['route'] | Should -Be 'executeQueries'
         }
 
-        It 'says T4''s PostgreSQL page has no capture yet instead of warning, since its rows come after the check (2026-11-13)' {
+        It 'says T4''s metrics have no capture yet instead of warning, since its rows come after the check (2026-11-13)' {
             $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'postgres-series')
             $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed)
             $queries = $results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
             $queries.status | Should -Be 'Pass'
-            $queries.message | Should -Match 'T4''s PostgreSQL page has no capture yet \(postgres-series\): deploy\.ps1''s history snapshot at its end, and stop-demo\.ps1 -SaveHistory, add one\.$'
+            $queries.message | Should -Match 'T4''s metrics in the app have no capture yet \(postgres-series\): deploy\.ps1''s history snapshot at its end, and stop-demo\.ps1 -SaveHistory, add one\.$'
             # Another query without rows is still a Warning, with the same note.
             $script:queryIds = @('connector-check', 'history-meta', 'replay-T3', 'postgres-series')
             $script:checkStage = Join-Path -Path $TestDrive -ChildPath ('check-' + [guid]::NewGuid().ToString('N'))
             $null = New-Item -ItemType Directory -Path $script:checkStage -Force
             $warned = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed) | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
             $warned.status | Should -Be 'Warning'
-            $warned.message | Should -Match '1 returned no rows for the newest telemetry day 2026-10-21: replay-T3\. T4''s PostgreSQL page has no capture yet \(postgres-series\)'
+            $warned.message | Should -Match '1 returned no rows for the newest telemetry day 2026-10-21: replay-T3\. T4''s metrics in the app have no capture yet \(postgres-series\)'
         }
 
         It 'reads the workspace and the model from the stage''s rayfin/.env when they aren''t passed, and fails clearly without them' {

@@ -6,8 +6,9 @@ subscription deployment record, and checks that nothing is left (plan section 9.
 
 .DESCRIPTION
 Arc onboarding creates the T2 guest's Arc resources outside the template, so they're deleted explicitly,
-SQL Server instances first, then machines. Then the resource group goes, with T3, the budget, and Bastion,
-then the subscription-scope deployment record dbhub-<environment>-main. Last, the residual check
+SQL Server instances first, then machines, and T4's read replica before its server. Then the resource group goes
+with everything in it (the VMs, T3, T4, T5, Ask's chat relay, the network, and Bastion), then the subscription-scope
+deployment record <prefix>-<environment>-main and the group's budget, which outlive the group. Last, the residual check
 (Test-DemoTeardownResidue, TEARDOWN.RESIDUAL.*) confirms that nothing carrying the environment's deploymentId, no
 Arc resource, role assignment, managed identity, P6 membership, deployment record, or budget is left
 (DESTROY.RESIDUAL; docs/cleanup.md). Only this environment counts: its resource group by its exact name and its
@@ -16,7 +17,7 @@ deploymentId, never another prefix's environment with the same environment name.
 It deletes the rest of what deploy.ps1 created too, each only when it can tell it's this environment's (2026-11-17):
 the session control in rg-<prefix>-control, when its runbooks serve this environment's resource group; the demo's
 Fabric workspace, when every item in it is one the demo creates, and the control's, when its control notebook serves
-this environment; the T3 administrators' security group, when init.ps1 created it for this environment; and the custom
+this environment; the T3 and T4 administrators' security group, when init.ps1 created it for this environment; and the custom
 role definitions, once no role assignment holds them. What isn't this environment's stays, and the results say why.
 -KeepFabric keeps the Fabric workspaces and the history. The Fabric capacity and your licenses are never touched.
 It asks for confirmation, listing what it deletes and what it keeps, unless -Force.

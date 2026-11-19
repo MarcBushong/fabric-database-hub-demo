@@ -36,7 +36,7 @@ function Invoke-DemoWorkloadCommand {
     .PARAMETER ReadySeconds
     How long the VM side waits for the target to accept connections before an activity command ('profile set' other
     than off, or 'run'; 0 to 1800). The default 0 doesn't wait, so a module caller's time stays bounded by its own
-    retries (Set-DemoTargetProfile spends one budget across its attempts); the Fabric control's runbooks send their
+    retries (Set-DemoTargetProfile spends one budget across its attempts); the session control's runbooks send their
     own (ADR 0020).
 
     .EXAMPLE

@@ -816,7 +816,7 @@ function Get-DemoHostGuestSourceFailure {
     if ($Reason) {
         $why = ' {0}' -f $Reason
     }
-    return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} was {1}, but t2SqlInstallMode is now {2}, and an existing guest never changes its source.{3} Set t2SqlInstallMode back in config/demo.config.json, then run ./scripts/deploy.ps1 -FromStage Infrastructure, which brings the setting to the host; or rebuild T2 for the new mode: ./scripts/destroy.ps1, then ./scripts/deploy.ps1 (ADR 0006).' -f $Context.GuestName, $was, $Context.Mode, $why))
+    return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} was {1}, but t2SqlInstallMode is now {2}, and an existing guest never changes its source.{3} Set t2SqlInstallMode back in config/demo.config.json, then run ./scripts/deploy.ps1 -FromStage Infrastructure, which brings the setting to the host; or rebuild T2 for the new mode: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1 (ADR 0006).' -f $Context.GuestName, $was, $Context.Mode, $why))
 }
 
 # ---- An unfinished PaygWizard guest rebuilt, and a finished guest's mode kept (ADR 0006, amendment of 2026-11-09) ----
@@ -1434,7 +1434,7 @@ function Get-DemoGuestRearmDecision {
         return [pscustomobject]@{ Action = 'None'; Reason = ('{0} evaluation day(s) left; a rearm comes at {1} or fewer.' -f $License.daysLeft, $RearmDays) }
     }
     if ($null -eq $License.rearmCount -or [int]$License.rearmCount -le 0) {
-        return [pscustomobject]@{ Action = 'Warn'; Reason = ('{0} evaluation day(s) left and no rearm left: rebuild T2 before the evaluation ends (./scripts/destroy.ps1, then ./scripts/deploy.ps1).' -f $License.daysLeft) }
+        return [pscustomobject]@{ Action = 'Warn'; Reason = ('{0} evaluation day(s) left and no rearm left: rebuild T2 before the evaluation ends (./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1).' -f $License.daysLeft) }
     }
     if ($ProfileActive) {
         return [pscustomobject]@{ Action = 'None'; Reason = ('{0} evaluation day(s) left; the rearm waits until no activity profile runs, because it restarts the guest.' -f $License.daysLeft) }

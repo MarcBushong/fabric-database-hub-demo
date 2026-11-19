@@ -1522,7 +1522,8 @@ Describe 'T1 SQL VM performance monitoring' {
         # configure-monitoring.ps1 never does.
         $pending.message | Should -Match 'reports ''NotRunning'''
         $pending.remediation | Should -Match 'start-demo\.ps1, which restarts the SQL IaaS Agent service'
-        $pending.remediation | Should -Match ([regex]::Escape("--name sqlvm01 --command-id RunPowerShellScript --scripts 'Restart-Service -Name SQLIaaSExtension -Force'"))
+        $pending.remediation | Should -Match 'deploy\.ps1, which repairs T1''s SQL IaaS Agent extension'
+        $pending.remediation | Should -Not -Match 'az vm run-command' -Because 'a person never repairs it by hand (AGENTS.md)'
         $pending.remediation | Should -Not -Match 'configure-monitoring'
         $noStatus = & $convert (New-SqlVmState -Settings $flag -Message 'SqlIaasAgent: OK')
         $noStatus.status | Should -Be 'Warning'

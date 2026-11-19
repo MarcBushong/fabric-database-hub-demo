@@ -377,7 +377,7 @@ function Test-DemoArcSqlExtension {
     if ($null -eq $extension) {
         $evidence = [ordered]@{ sqlDetected = $sqlDetected }
         if (-not $sqlDetected -and $target.InstallMode -eq 'PaygWizard') {
-            return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Manual action required' -Message 'SQL Server isn''t installed in arcsql01 yet: finish the PaygWizard setup-wizard step. The extension is deployed when SQL Server is detected.' -Evidence $evidence -Remediation 'Follow the setup-wizard steps in docs/deployment.md (health.json on the host lists them), then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
+            return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Manual action required' -Message 'SQL Server isn''t installed in arcsql01 yet: finish the PaygWizard setup-wizard step. The extension is deployed when SQL Server is detected.' -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard, and the extension follows.' -DocUrl $setting.DocUrls['autoDeploy'])
         }
         if (-not $sqlDetected) {
             return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Warning' -Message ('The Arc machine {0} doesn''t report SQL Server yet, so the extension isn''t deployed yet.' -f $target.MachineName) -Evidence $evidence -Remediation 'Wait for the host to finish setting up SQL Server in the guest, then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
@@ -430,7 +430,7 @@ function Test-DemoArcSqlInstance {
     if ($null -eq $info) {
         $sqlDetected = Test-DemoArcSqlDetected -Machine $State.Machine
         if (-not $sqlDetected -and $target.InstallMode -eq 'PaygWizard') {
-            return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Manual action required' -Message 'There''s no SQL Server instance resource yet: SQL Server is installed by the PaygWizard setup-wizard step, which is still pending.' -Remediation 'Follow the setup-wizard steps in docs/deployment.md, then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
+            return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Manual action required' -Message 'There''s no SQL Server instance resource yet: SQL Server is installed by the PaygWizard setup-wizard step, which is still pending.' -Remediation 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard, and the instance resource follows.' -DocUrl $setting.DocUrls['autoDeploy'])
         }
         return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Warning' -Message ('There''s no SQL Server instance resource for {0} yet; the extension creates it within minutes of detecting SQL Server.' -f $target.MachineName) -Evidence ([ordered]@{ sqlDetected = $sqlDetected }) -Remediation 'Run configure-arc.ps1 again in a few minutes.' -DocUrl $setting.DocUrls['autoDeploy'])
     }
@@ -452,7 +452,7 @@ function Test-DemoArcSqlInstance {
     $editionOk = $info.Edition -in $expectation.Editions
     $licenseOk = $expectation.LicenseTypes.Count -eq 0 -or ($info.LicenseType -in $expectation.LicenseTypes)
     if (-not $editionOk) {
-        return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Fail' -Message ('The SQL Server instance {0} is {1} edition; {2} mode expects {3}.' -f $info.Name, $info.Edition, $target.InstallMode, ($expectation.Editions -join ' or ')) -Evidence $evidence -Remediation 'Rebuild the guest with the intended install mode (reset-demo.ps1 -RebuildGuest), or change t2SqlInstallMode to match.' -DocUrl $setting.DocUrls['licenseBilling'])
+        return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Fail' -Message ('The SQL Server instance {0} is {1} edition; {2} mode expects {3}.' -f $info.Name, $info.Edition, $target.InstallMode, ($expectation.Editions -join ' or ')) -Evidence $evidence -Remediation 'Set t2SqlInstallMode to the mode this guest was built in, then run ./scripts/deploy.ps1. To rebuild T2 in the intended mode instead, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1: it deploys the environment again and keeps the Fabric workspaces with their history.' -DocUrl $setting.DocUrls['licenseBilling'])
     }
     if (-not $licenseOk) {
         return (New-DemoArcResult -CheckId 'T2.ARC.SQLINSTANCE' -Target $target -Status 'Fail' -Message ('The SQL Server instance {0} has license type ''{1}''; {2} mode expects {3}.' -f $info.Name, $info.LicenseType, $target.InstallMode, ($expectation.LicenseTypes -join ' or ')) -Evidence $evidence -Remediation 'Run ./scripts/configure-arc.ps1, which sets the host license type; the instance follows within minutes.' -DocUrl $setting.DocUrls['configuration'])
@@ -486,7 +486,7 @@ function Test-DemoArcMonitoring {
     if ($null -eq $info) {
         $sqlDetected = Test-DemoArcSqlDetected -Machine $State.Machine
         if (-not $sqlDetected -and $target.InstallMode -eq 'PaygWizard') {
-            return (New-DemoArcResult -CheckId 'T2.ARC.MONITORING' -Target $target -Status 'Manual action required' -Message 'Monitoring is turned on once SQL Server exists: the PaygWizard setup-wizard step is still pending.' -Remediation 'Finish the setup-wizard step, then run configure-arc.ps1 again.' -DocUrl $docUrl)
+            return (New-DemoArcResult -CheckId 'T2.ARC.MONITORING' -Target $target -Status 'Manual action required' -Message 'Monitoring is turned on once SQL Server exists: this PaygWizard guest''s SQL Server setup was never finished.' -Remediation 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard, and turns monitoring on.' -DocUrl $docUrl)
         }
         return (New-DemoArcResult -CheckId 'T2.ARC.MONITORING' -Target $target -Status 'Warning' -Message 'There''s no SQL Server instance resource yet, so monitoring can''t be turned on yet.' -Remediation 'Run configure-arc.ps1 again in a few minutes.' -DocUrl $docUrl)
     }
@@ -564,7 +564,7 @@ function Test-DemoArcMigrationAssessment {
     $info = Get-DemoArcInstanceInfo -Instance @($State.HostedInstances) -MinimumCores $setting.MinimumCoresPerOse
     if ($null -eq $info) {
         if (-not (Test-DemoArcSqlDetected -Machine $State.Machine) -and $target.InstallMode -eq 'PaygWizard') {
-            return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Manual action required' -Message 'Migration assessment is turned on once SQL Server exists: the PaygWizard setup-wizard step is still pending.' -Remediation 'Finish the setup-wizard step, then run configure-arc.ps1 again.' -DocUrl $docUrl)
+            return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Manual action required' -Message 'Migration assessment is turned on once SQL Server exists: this PaygWizard guest''s SQL Server setup was never finished.' -Remediation 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard, and turns the assessment on.' -DocUrl $docUrl)
         }
         return (New-DemoArcResult -CheckId $checkId -Target $target -Status 'Warning' -Message 'There''s no SQL Server instance resource yet, so migration assessment can''t be turned on yet.' -Remediation 'Run configure-arc.ps1 again in a few minutes.' -DocUrl $docUrl)
     }
@@ -644,7 +644,7 @@ function Test-DemoArcDisconnection {
     $evidence = [ordered]@{ status = $status; lastStatusChange = $changed.ToString('o'); daysDisconnected = $days; payAsYouGo = $payg }
     $lapse = if ($payg) { 'pay-as-you-go expires after more than 30 days disconnected, and then you''re no longer authorized to use the software' } else { 'a long disconnection can expire the agent''s connection' }
     if ($days -gt 30) {
-        return (New-DemoArcResult -CheckId 'T2.ARC.DISCONNECTEDDAYS' -Target $target -Status 'Fail' -Message ('The Arc machine {0} has been disconnected for {1} days: {2}.' -f $target.MachineName, $days, $lapse) -Evidence $evidence -Remediation 'Start archost01 so the guest reconnects and check T2.ARC.CONNECTED; if it doesn''t recover, rebuild T2 (reset-demo.ps1 -RebuildGuest) or destroy it.' -DocUrl $docUrl)
+        return (New-DemoArcResult -CheckId 'T2.ARC.DISCONNECTEDDAYS' -Target $target -Status 'Fail' -Message ('The Arc machine {0} has been disconnected for {1} days: {2}.' -f $target.MachineName, $days, $lapse) -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1: it starts archost01, so the guest reconnects, and checks T2.ARC.CONNECTED again. If it doesn''t recover, deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history.' -DocUrl $docUrl)
     }
     if ($days -ge 28) {
         return (New-DemoArcResult -CheckId 'T2.ARC.DISCONNECTEDDAYS' -Target $target -Status 'Warning' -Message ('Reconnect now: the Arc machine {0} has been disconnected for {1} days, and {2}.' -f $target.MachineName, $days, $lapse) -Evidence $evidence -Remediation 'Start the demo today (./scripts/start-demo.ps1), or park or destroy T2 on purpose.' -DocUrl $docUrl)

@@ -245,7 +245,7 @@ Describe 'The GuestSource step (2026-11-09)' {
         $result = Invoke-DemoHostGuestSourceStep -Context $script:context
         $result.Outcome | Should -Be 'Failed'
         $result.Message | Should -Match 'deliberate choice'
-        $result.Message | Should -Match 'destroy\.ps1, then \./scripts/deploy\.ps1'
+        $result.Message | Should -Match 'destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1'
         Should -Invoke -CommandName Remove-DemoHostGuest -Times 0 -Exactly
     }
 

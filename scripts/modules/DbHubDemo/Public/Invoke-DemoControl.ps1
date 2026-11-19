@@ -1,11 +1,11 @@
 function Invoke-DemoControl {
     <#
     .SYNOPSIS
-    Changes the activity on the demo's targets, as demo-control.yml and the live-activity notebook ask:
+    Changes the activity on the demo's targets, as demo-control.ps1 and the optional demo-control.yml workflow ask:
     a profile (baseline, business-day, off) or one bounded incident (incident:<scenario>) (ADR 0010, ADR 0011).
 
     .DESCRIPTION
-    The inputs are the ones the notebook dispatches (Phase 12), as strings or their typed equivalents:
+    The inputs are the ones demo-control.yml declares (Phase 12), as strings or their typed equivalents:
     environment (the caller's), target (all, T1, T2, T3, T4, or T5), scenario (baseline, business-day, off, or
     incident:<scenario>), duration (1-240 minutes), concurrency (0 for the scenario's default, or 1-64),
     intensity (0, or 1-10), reset-before, and auto-cleanup.
@@ -14,8 +14,8 @@ function Invoke-DemoControl {
     through archost01 for T2): --name, and unless the profile is off, --duration <minutes>m and --not-after the
     next auto-shutdown, plus --concurrency, --intensity, --reset-before, and --no-auto-cleanup when asked. The
     runner clamps everything to the scenario's limits. An incident on 'all' runs on the scenario's default
-    target (scenarios/<id>/scenario.json), as the notebook does. A target whose runner isn't installed yet
-    (T2 before its guest has SQL Server) reports Warning, not Fail. 'all' includes T4 when t4Enabled and T5, the Azure
+    target (scenarios/<id>/scenario.json). A target whose runner isn't installed yet (T2 before its guest has
+    SQL Server) reports Warning, not Fail. 'all' includes T4, which every deployment has, and T5, the Azure
     Cosmos DB account (2026-11-18, ADR 0027), when t5Enabled; T5 has no stop or start, so its activity needs sqlvm01 and,
     since 2026-11-19, its container, which exists only during a session: it's created first when a stop deleted it
     (CONTROL.T5.CONTAINER, New-DemoT5Container).
@@ -26,7 +26,7 @@ function Invoke-DemoControl {
     Configuration from Get-DemoConfig.
 
     .PARAMETER Target
-    all, T1, T2, T3, T4 (the PostgreSQL flexible server, when t4Enabled; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
+    all, T1, T2, T3, T4 (the PostgreSQL flexible server; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
     account, when t5Enabled; ADR 0027).
 
     .PARAMETER Scenario

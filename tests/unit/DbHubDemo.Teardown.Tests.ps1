@@ -599,7 +599,7 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $manifestPath = Join-Path -Path $TestDrive -ChildPath 'out/destroy-manifest.json'
         $results = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
         # T4's read replica (ADR 0025) is read before the group, by the manifest's deploymentId; there's none here.
-        $script:order | Should -Be @('Manifest', 'Extra', 'rest --method get', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
+        $script:order | Should -Be @('Manifest', 'Extra', 'rest --method get', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'group exists --name', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.DEPLOYMENT' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.BUDGET' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
@@ -610,8 +610,25 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     It 'finishes the cleanup when the group is already gone, the other parts included (2026-11-17)' {
         $script:groupExists = $false
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
-        $script:order | Should -Be @('Manifest', 'Extra', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123')
+        $script:order | Should -Be @('Manifest', 'Extra', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'group exists --name', 'Residue:abc123')
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
+    }
+
+    It 'says no golden group stays when the prefix never had one, and what stays when it does (review, 2026-11-19)' {
+        $golden = @(Remove-DemoEnvironment -Config $config -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN' }
+        $golden.status | Should -Be 'Not selected'
+        $golden.message | Should -Be 'rg-dbhub-golden doesn''t exist, so no golden snapshot stays.'
+
+        $script:goldenGroupExists = $true
+        $golden = @(Remove-DemoEnvironment -Config $config -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN' }
+        $golden.message | Should -Be 'rg-dbhub-golden stays, with no golden snapshot in it; destroy.ps1 -IncludeGolden deletes it.'
+
+        $script:goldenSnapshots = @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202610221230' })
+        $script:order.Clear()
+        $golden = @(Remove-DemoEnvironment -Config $config -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN' }
+        $golden.message | Should -Be 'rg-dbhub-golden stays with 1 golden snapshot(s); destroy.ps1 -IncludeGolden deletes it.'
+        $golden.evidence.snapshots | Should -Be @('snap-dbhub-t2golden-202610221230')
+        $script:order | Should -Not -Contain 'group exists --name' -Because 'the snapshots already show that the group exists'
     }
 
     It 'deletes the nightly safety stop''s role once no assignment holds it, and keeps it while one does, such as another environment''s (2026-11-17)' {

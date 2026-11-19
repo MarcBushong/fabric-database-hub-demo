@@ -254,7 +254,7 @@ function Get-DemoSignInDataResult {
     $autoLogon = @($parts | Where-Object { [int](Get-DemoMemberValue -InputObject $_.Actions -Name 'autologon') -gt 0 })
     if ($autoLogon.Count -gt 0) {
         $message = 'Windows automatic sign-in was left armed on {0}, and the cleanup turned it off and deleted its LSA secret and Winlogon values; no sign-in data is left on {1}.' -f (($autoLogon | ForEach-Object { $_.Label }) -join ' and '), $names
-        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message (& $withNote $message) -Evidence $evidence -Remediation 'The PaygWizard guided stop''s own cleanup hadn''t finished. Nothing more to do; if it happens again, read docs/troubleshooting.md (the guided stop).' -DocUrl 'https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password')
+        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message (& $withNote $message) -Evidence $evidence -Remediation 'An older PaygWizard guided stop''s cleanup hadn''t finished. Nothing more to do: since 2026-11-09 a configuration''s PaygWizard runs as JumpstartImage, with no guided stop.' -DocUrl 'https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password')
     }
     $cleared = @($parts | ForEach-Object { foreach ($log in @($_.Cleared)) { '{0} on {1}' -f $log, $_.Label } })
     if ($cleared.Count -gt 0) {

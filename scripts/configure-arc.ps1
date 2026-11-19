@@ -19,9 +19,8 @@ context. Then, through managed Run Commands on the T2 host (Invoke-DemoArcConfig
    guest build is deleted first, its SQL Server instances before it, so a rebuild never leaves duplicates.
 3. Converges the Azure extension for SQL Server, the PAYG license type, the sqlServerInstances resource,
    monitoring, and migration assessment (2026-11-18: turned on, with a run started until the first assessment is
-   uploaded, for Database Hub's Optimization; free for every edition). In PaygWizard mode the host then asks for the
-   documented setup-wizard step (health.json has the instructions); run this script again after the wizard to finish
-   the configuration.
+   uploaded, for Database Hub's Optimization; free for every edition). A configuration's PaygWizard runs as
+   JumpstartImage, so there's no setup-wizard step to wait for.
 4. Reports T2.ARC.CONNECTED, T2.ARC.NODUPLICATES, and T2.ARC.DISCONNECTEDDAYS.
 Every step is re-runnable. Results go to the console and, as JSON lines, to -OutputPath.
 
@@ -33,9 +32,7 @@ Prompt for the SQL Server product key (input hidden). ProductKey mode only.
 
 .PARAMETER Force
 Onboard even when the host doesn't wait for onboarding, for example to repair a connection after the host
-finished. A stale Arc machine is still deleted before onboarding. In PaygWizard mode it also configures the
-license type and monitoring without waiting for the host's setup check, so use it only when SQL Server Standard
-already runs in arcsql01.
+finished. A stale Arc machine is still deleted before onboarding.
 
 .PARAMETER UseHostIdentity
 Require the host identity id-<prefix>-<env>-arc-onboard: fail when it isn't attached to archost01 instead of

@@ -663,7 +663,7 @@ function Restore-DemoGoldenCaptureSource {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $evidence = [ordered]@{ foundPowerState = $FoundPowerState; airGapUtc = $AirGapUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hostStarted = $false; release = ''; releaseStatus = ''; arcStatus = ''; arcLastStatusChange = ''; arcProof = ''; arcSeconds = 0; hostAfter = '' }
-    $retry = 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends this capture''s marker and releases the source. ./scripts/start-demo.ps1 releases it too once this capture''s snapshot exists (T2.GOLDEN.SOURCE ends the marker then), and so does a start of T2 from the Fabric control once no capture marker holds it back (6 hours at most). Each is safe to repeat.'
+    $retry = 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends this capture''s marker and releases the source. ./scripts/start-demo.ps1 releases it too once this capture''s snapshot exists (T2.GOLDEN.SOURCE ends the marker then), and so does a session''s start of T2 (Run all in NB_DatabaseHub_Control) once no capture marker holds it back (6 hours at most). Each is safe to repeat.'
     $new = { param([string] $Status, [string] $Message, [string] $Remediation = '') New-DemoResult -CheckId 'GOLDEN.CAPTURE.SOURCE' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl }
 
     # 1. The host.
@@ -839,7 +839,7 @@ function Get-DemoT2GuestStateResult {
     $captureState = [string](Get-DemoMemberValue -InputObject $capture -Name 'state')
     if ($captureState -eq 'Unreadable') {
         $evidence['capture'] = [ordered]@{ state = $captureState; snapshotName = [string](Get-DemoMemberValue -InputObject $capture -Name 'snapshotName') }
-        return (& $new 'Warning' ('A golden capture marker on archost01 can''t be read, and only a capture writes it, so {0} is left as it is: the Fabric control and every release but the capture''s own leave it alone (2026-11-04).' -f $guestName) 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends the marker and releases the source. ./scripts/start-demo.ps1 ends it too once that capture''s snapshot exists.')
+        return (& $new 'Warning' ('A golden capture marker on archost01 can''t be read, and only a capture writes it, so {0} is left as it is: a session''s start of T2 and every release but the capture''s own leave it alone (2026-11-04).' -f $guestName) 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends the marker and releases the source. ./scripts/start-demo.ps1 ends it too once that capture''s snapshot exists.')
     }
     if ($captureState -in 'Active', 'Unknown') {
         # The health read's JSON may turn its ISO times into dates: one format for both.
@@ -851,7 +851,7 @@ function Get-DemoT2GuestStateResult {
         }
         $evidence['capture'] = [ordered]@{ state = $captureState; snapshotName = [string](Get-DemoMemberValue -InputObject $capture -Name 'snapshotName'); sinceUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'sinceUtc')); untilUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'untilUtc')) }
         $where = if ($captureState -eq 'Active') { 'on archost01' } else { 'on archost01 (its marker is recent, and archost01''s Azure VM ID couldn''t be read to confirm it''s the host the marker names)' }
-        return (& $new 'Warning' ('A golden capture is in progress {0}: snapshot {1}, since {2}. {3} stays off and air-gapped until the capture returns its source to service (GOLDEN.CAPTURE.SOURCE), and a start of T2 from the Fabric control is refused meanwhile.' -f $where, $evidence['capture']['snapshotName'], $evidence['capture']['sinceUtc'], $guestName) ('Let ./scripts/capture-t2-golden.ps1 finish. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again: it ends the marker and releases the source before anything else; ./scripts/start-demo.ps1 does too once that capture''s snapshot exists. From {0} the marker no longer holds a Fabric start back, and that start releases the source too.' -f $evidence['capture']['untilUtc']))
+        return (& $new 'Warning' ('A golden capture is in progress {0}: snapshot {1}, since {2}. {3} stays off and air-gapped until the capture returns its source to service (GOLDEN.CAPTURE.SOURCE), and a session''s start of T2 (Run all in NB_DatabaseHub_Control) is refused meanwhile.' -f $where, $evidence['capture']['snapshotName'], $evidence['capture']['sinceUtc'], $guestName) ('Let ./scripts/capture-t2-golden.ps1 finish. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again: it ends the marker and releases the source before anything else; ./scripts/start-demo.ps1 does too once that capture''s snapshot exists. From {0} the marker no longer holds a session''s start back, and that start releases the source too.' -f $evidence['capture']['untilUtc']))
     }
     $seen = '{0}, automatic start {1}, {2} of {3} adapter(s) connected' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' }), $(if ($evidence['startAction']) { $evidence['startAction'] } else { 'unknown' }), $evidence['connected'], $evidence['adapters']
     if (-not $evidence['present']) {
@@ -861,11 +861,11 @@ function Get-DemoT2GuestStateResult {
         }
         return (& $new 'Not selected' ('The guest {0} doesn''t exist yet: archost01''s bootstrap is {1}{2}.' -f $guestName, $(if ($hostState) { $hostState } else { 'starting' }), $(if ([string](Get-DemoMemberValue -InputObject $Health -Name 'currentStep')) { ' at {0}' -f (Get-DemoMemberValue -InputObject $Health -Name 'currentStep') } else { '' })))
     }
-    $fabricStart = 'a start of T2 from the Fabric control (NB_DatabaseHub_Control)'
+    $fabricStart = 'a session''s start of T2 (Run all in NB_DatabaseHub_Control)'
     if ($null -ne $golden -and -not $evidence['golden']['released']) {
         switch ($evidence['golden']['role']) {
             'Source' {
-                return (& $new 'Fail' ('{0} is still air-gapped by a golden capture ({1}): T2 is missing from Database Hub until its source is released.' -f $guestName, $seen) 'Start T2 from the Fabric control (NB_DatabaseHub_Control): archost01 releases its source itself. ./scripts/start-demo.ps1 releases it too (T2.GOLDEN.SOURCE) once a golden snapshot names archost01 as its source; a capture stopped before its snapshot is released by the next ./scripts/capture-t2-golden.ps1. The release only reconnects the guest and restores its automatic start, because its Arc identity is its own.')
+                return (& $new 'Fail' ('{0} is still air-gapped by a golden capture ({1}): T2 is missing from Database Hub until its source is released.' -f $guestName, $seen) 'Run all in NB_DatabaseHub_Control: its start of T2 has archost01 release its source itself. ./scripts/start-demo.ps1 releases it too (T2.GOLDEN.SOURCE) once a golden snapshot names archost01 as its source; a capture stopped before its snapshot is released by the next ./scripts/capture-t2-golden.ps1. The release only reconnects the guest and restores its automatic start, because its Arc identity is its own.')
             }
             'Copy' {
                 if ($evidence['golden']['reset']) {
@@ -882,10 +882,10 @@ function Get-DemoT2GuestStateResult {
         # Only the capture's source may carry a released record without a reset (review, 2026-11-04).
         switch ($evidence['golden']['role']) {
             'Copy' {
-                return (& $new 'Fail' ('{0} runs on a copy restored from a golden snapshot whose record says released, but its Arc identity was never reset, so it may hold the captured identity ({1}); the Fabric control won''t use it.' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track resets the restored copy. Don''t start or connect the guest by hand.')
+                return (& $new 'Fail' ('{0} runs on a copy restored from a golden snapshot whose record says released, but its Arc identity was never reset, so it may hold the captured identity ({1}); a session won''t use it.' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track resets the restored copy. Don''t start or connect the guest by hand.')
             }
             'Unknown' {
-                return (& $new 'Warning' ('archost01''s Azure VM ID couldn''t be read, so its released golden record can''t be told from a copy''s that was never reset ({0}); the Fabric control leaves {1} alone until it can.' -f $seen, $guestName) 'Run status.ps1 again in a few minutes; if it persists, run ./scripts/deploy.ps1.')
+                return (& $new 'Warning' ('archost01''s Azure VM ID couldn''t be read, so its released golden record can''t be told from a copy''s that was never reset ({0}); a session leaves {1} alone until it can.' -f $seen, $guestName) 'Run status.ps1 again in a few minutes; if it persists, run ./scripts/deploy.ps1.')
             }
         }
     }
@@ -919,7 +919,7 @@ function Get-DemoGoldenCaptureControlResult {
     <#
     .SYNOPSIS
     GOLDEN.CAPTURE.CONTROL: capture-t2-golden.ps1 runs only while no on-demand run is active (review, 2026-11-04). A run
-    from the Fabric control starts archost01 and dispatches T2, and its auto-stop deallocates archost01, which would cut
+    from the session control starts archost01 and dispatches T2, and its auto-stop deallocates archost01, which would cut
     into the capture or its return of the source. Internal.
     https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
     https://learn.microsoft.com/rest/api/automation/schedule/get

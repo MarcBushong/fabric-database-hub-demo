@@ -73,7 +73,7 @@ function Reset-DemoWorkload {
     $hostVm = Get-DemoHostVmName -Config $Config
 
     if ($RebuildGuest) {
-        $results.Add((New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status 'Not supported' -Message 'Rebuilding the T2 guest isn''t supported yet: the host''s bootstrap state machine skips guest steps that succeeded, and resetting them safely is a follow-up.' -Remediation 'To start T2 over, run ./scripts/destroy.ps1, then ./scripts/deploy.ps1. To return its data to a known state, run reset-demo.ps1 -Target T2 -Reseed.'))
+        $results.Add((New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status 'Not supported' -Message 'Rebuilding the T2 guest isn''t supported yet: the host''s bootstrap state machine skips guest steps that succeeded, and resetting them safely is a follow-up.' -Remediation 'To start T2 over, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history. To return its data to a known state, run ./scripts/reset-demo.ps1 -Target T2 -Reseed.'))
     }
 
     $targets = if ($Target -eq 'all') { @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2') } else { @($Target) }

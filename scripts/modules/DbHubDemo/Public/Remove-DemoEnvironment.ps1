@@ -12,7 +12,8 @@ function Remove-DemoEnvironment {
        explicitly, children first: every Microsoft.AzureArcData/sqlServerInstances resource in the group (T1's
        unified-inventory instance too), then every Microsoft.HybridCompute/machines resource (its extensions go
        with it).
-    3. 'az group delete' removes everything else, including T3 and the on-demand Bastion, and the function
+    3. T4's read replica goes first, when a session left one; then 'az group delete' removes everything else, including
+       T3, T4, T5, Ask's chat relay, and the on-demand Bastion, and the function
        waits until the group is gone. T1's managed identity, and with it its membership in the P6 group, goes
        with the VM. With the Key Vault opt-in, the vault goes into soft delete with the group (DESTROY.KEYVAULT
        says for how long); a later deploy.ps1 recovers it.
@@ -23,7 +24,7 @@ function Remove-DemoEnvironment {
        tags, Arc resources, role assignments, the identities and their P6 membership, deployments, and the
        budget (TEARDOWN.RESIDUAL.*). DESTROY.RESIDUAL sums it up: Pass only when every check is clean (ADR
        0002, step 5).
-    The session control in rg-<prefix>-control, the Fabric workspaces, the T3 administrators' security group, and the
+    The session control in rg-<prefix>-control, the Fabric workspaces, the T3 and T4 administrators' security group, and the
     custom roles (2026-11-17): read before the confirmation, which lists what goes and what stays
     (Get-DemoDestroyExtraPlan), and deleted before the group (Invoke-DemoDestroyExtra), each only when it's this
     environment's. The control goes when its runbooks' settings name this environment's resource group, as
@@ -93,11 +94,12 @@ function Remove-DemoEnvironment {
     How long the residual check waits for Azure Resource Graph and Microsoft Entra to catch up.
 
     .PARAMETER IncludeGolden
-    Also delete rg-<prefix>-golden and its golden snapshots (ADR 0018). The next deploy then builds T2 and, in
-    PaygWizard mode, needs the setup-wizard step again.
+    Also delete rg-<prefix>-golden and its golden snapshots (ADR 0018). The next deploy then makes T2 from the
+    Jumpstart image again, with no setup wizard.
 
     .PARAMETER WithoutGolden
-    Accept losing a PaygWizard install when no boot-verified golden snapshot keeps it.
+    Changes nothing since 2026-11-09, when a configuration's PaygWizard started to run as JumpstartImage; until then it
+    accepted losing a PaygWizard install that no boot-verified golden snapshot kept.
 
     .PARAMETER KeepFabric
     Keep the demo's and the control's Fabric workspaces, with their items and the history in the lakehouse.
@@ -251,7 +253,7 @@ function Remove-DemoEnvironment {
             }
             elseif ($WithoutGolden -or $IncludeGolden -or $IfExpired) {
                 $why = if ($IncludeGolden) { '-IncludeGolden deletes the golden snapshots too' } elseif ($WithoutGolden) { 'no boot-verified golden snapshot keeps it (-WithoutGolden accepts that)' } else { 'no boot-verified golden snapshot keeps it, and the environment expired (-IfExpired)' }
-                $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN.GUARD' -Area 'teardown' -Target 'T2' -Status 'Warning' -Message ('archost01''s PaygWizard install (the setup-wizard step) is lost: {0}. The next deploy builds T2 and waits for the wizard again.' -f $why) -DocUrl $goldenDoc))
+                $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN.GUARD' -Area 'teardown' -Target 'T2' -Status 'Warning' -Message ('archost01''s PaygWizard install (the setup-wizard step) is lost: {0}. The next deploy makes T2 from the Jumpstart image, with no setup wizard.' -f $why) -DocUrl $goldenDoc))
             }
             else {
                 $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN.GUARD' -Area 'teardown' -Target 'T2' -Status 'Fail' -Message ('Nothing was deleted: archost01 holds a PaygWizard install (the setup-wizard step, which no script can redo), and no boot-verified golden snapshot in {0} keeps it.' -f $goldenGroup) -Remediation 'Capture and prove one first (./scripts/capture-t2-golden.ps1, then ./scripts/test-t2-golden.ps1 -Onboard), or accept losing the wizard state: destroy.ps1 -WithoutGolden.' -DocUrl $goldenDoc))
@@ -348,7 +350,7 @@ function Remove-DemoEnvironment {
         # A run after an interruption can find the group still being deleted (ResourceGroupBeingDeleted): wait.
         $deleting = [string]$delete.StdErr -match '(?i)ResourceGroupBeingDeleted|deprovisioning state'
         if ($delete.ExitCode -ne 0 -and -not $deleting -and -not (Test-DemoAzNotFound -Text ([string]$delete.StdErr))) {
-            $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('Deleting {0} failed: {1}' -f $resourceGroupName, (Get-DemoDeploymentErrorText -Text $delete.StdErr -MaxLength 600)) -Remediation 'A resource lock or a policy may block it; remove the lock (enableLock) and run destroy.ps1 again.' -DocUrl $docUrl))
+            $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('Deleting {0} failed: {1}' -f $resourceGroupName, (Get-DemoDeploymentErrorText -Text $delete.StdErr -MaxLength 600)) -Remediation 'A resource lock or a policy may block it: remove the lock (the template adds one when its enableLocks parameter is true), then run destroy.ps1 again.' -DocUrl $docUrl))
             return $results.ToArray()
         }
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -445,7 +447,22 @@ function Remove-DemoEnvironment {
         Write-DemoLog -Level Warning -Message ('The golden snapshots couldn''t be listed: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
     if (-not $IncludeGolden) {
-        $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('{0} stays with {1} golden snapshot(s); destroy.ps1 -IncludeGolden deletes it.' -f $goldenGroup, $goldenSnapshots.Count) -Evidence ([ordered]@{ snapshots = @($goldenSnapshots | ForEach-Object { $_.Name }) }) -DocUrl $goldenDoc))
+        # A prefix that never captured a snapshot has no golden group, and nothing stays (review, 2026-11-19).
+        $goldenMissing = $false
+        if ($goldenSnapshots.Count -eq 0) {
+            $goldenProbe = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $goldenGroup) -AllowFailure
+            $goldenMissing = ($goldenProbe.ExitCode -eq 0 -and ([string]$goldenProbe.StdOut).Trim() -eq 'false')
+        }
+        $goldenMessage = if ($goldenMissing) {
+            '{0} doesn''t exist, so no golden snapshot stays.' -f $goldenGroup
+        }
+        elseif ($goldenSnapshots.Count -eq 0) {
+            '{0} stays, with no golden snapshot in it; destroy.ps1 -IncludeGolden deletes it.' -f $goldenGroup
+        }
+        else {
+            '{0} stays with {1} golden snapshot(s); destroy.ps1 -IncludeGolden deletes it.' -f $goldenGroup, $goldenSnapshots.Count
+        }
+        $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message $goldenMessage -Evidence ([ordered]@{ snapshots = @($goldenSnapshots | ForEach-Object { $_.Name }) }) -DocUrl $goldenDoc))
     }
     else {
         $goldenExists = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $goldenGroup) -AllowFailure

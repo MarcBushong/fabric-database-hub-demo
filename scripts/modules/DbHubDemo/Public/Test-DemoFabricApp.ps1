@@ -39,7 +39,7 @@ function Test-DemoFabricApp {
        user steps). The note says exactly what was verified, and that the app's own route in the browser can't be
        checked from a script, with the link to open it. Otherwise Manual action required: open the app from its item
        in the Fabric workspace (the supported entry point: it runs embedded and signs in with initEmbeddedAuth,
-       https://learn.microsoft.com/fabric/apps/fabric-authentication) and confirm the Live links page shows the
+       https://learn.microsoft.com/fabric/apps/fabric-authentication) and confirm the Live views page shows the
        connector check. Opening the hosted URL directly is a known preview limitation: the sign-in pop-up stops at
        "Page not accessible directly".
 
@@ -53,8 +53,8 @@ function Test-DemoFabricApp {
     The app item's page in the Fabric portal, for the browser steps.
 
     .PARAMETER Queries
-    All runs the whole catalog (21 queries since 2026-11-18, with T4's PostgreSQL page's two, which may be empty until a
-    capture of T4's metrics exists, and the ones the catalog marks mayBeEmpty, such as the sessions, which may be empty
+    All runs the whole catalog (21 queries since 2026-11-18, with the two for T4's metrics, which may be empty until a
+    capture of them exists, and the ones the catalog marks mayBeEmpty, such as the sessions, which may be empty
     until the first session; all of them are said, not warned about); Probe runs only the connector check.
 
     .PARAMETER TimeoutSeconds
@@ -383,14 +383,14 @@ function Test-DemoFabricApp {
                 }
                 $failed = @($outcomes | Where-Object { -not $_.Ok })
                 $empty = @($outcomes | Where-Object { $_.Ok -and $_.Rows -eq 0 })
-                # T4's PostgreSQL page (2026-11-13) has rows only after a capture of T4's and its read replica's metrics, which
+                # T4's metrics (the PostgreSQL page's, 2026-11-13) have rows only after a capture of T4's and its read replica's, which
                 # deploy.ps1's history snapshot takes at its end, after this check, and stop-demo.ps1 -SaveHistory at a
                 # session's end; so its queries' being empty is said, not warned about.
                 $notYet = @($empty | Where-Object { $_.Id -like 'postgres-*' })
                 # The app's catalog marks the other queries that are empty until a session (mayBeEmpty, 2026-11-18): said too.
                 $untilSession = @($empty | Where-Object { $_.Id -notlike 'postgres-*' -and $_.MayBeEmpty })
                 $empty = @($empty | Where-Object { $_.Id -notlike 'postgres-*' -and -not $_.MayBeEmpty })
-                $notYetText = if ($notYet.Count -gt 0) { ' T4''s PostgreSQL page has no capture yet ({0}): deploy.ps1''s history snapshot at its end, and stop-demo.ps1 -SaveHistory, add one.' -f (($notYet | ForEach-Object { $_.Id }) -join ', ') } else { '' }
+                $notYetText = if ($notYet.Count -gt 0) { ' T4''s metrics in the app have no capture yet ({0}): deploy.ps1''s history snapshot at its end, and stop-demo.ps1 -SaveHistory, add one.' -f (($notYet | ForEach-Object { $_.Id }) -join ', ') } else { '' }
                 if ($untilSession.Count -gt 0) {
                     $notYetText += ' No rows yet, as expected: {0}.' -f (($untilSession | ForEach-Object { '{0} ({1})' -f $_.Id, $_.MayBeEmpty }) -join '; ')
                 }
@@ -498,6 +498,6 @@ function Test-DemoFabricApp {
         return $results.ToArray()
     }
     $why = if (-not ($connectorPassed -and $null -ne $queriesRecord)) { 'its queries didn''t all run here (FABRIC.APP.CONNECTOR, FABRIC.APP.QUERIES)' } else { 'that it''s deployed wasn''t confirmed here (no deploy in this run, and FABRIC.APP.HOSTING didn''t pass)' }
-    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('A person must confirm the app in the browser: {0}, and its own route there (its sign-in, then its deployed route to the model) can''t be checked from a script.' -f $why) -Evidence @{ entryPoint = 'workspace item page (embedded)' } -Remediation ('In the Fabric portal, signed in as a user with access to the workspace, open {0}. The app opens embedded and signs in by itself. On Live links it shows "Connector check passed" with the validation, telemetry, and incident counts. Don''t open the hosted URL directly: that is a known preview limitation (the sign-in pop-up stops at "Page not accessible directly").' -f $where) -DocUrl 'https://learn.microsoft.com/fabric/apps/fabric-authentication'))
+    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('A person must confirm the app in the browser: {0}, and its own route there (its sign-in, then its deployed route to the model) can''t be checked from a script.' -f $why) -Evidence @{ entryPoint = 'workspace item page (embedded)' } -Remediation ('In the Fabric portal, signed in as a user with access to the workspace, open {0}. The app opens embedded and signs in by itself. On Live views it shows "Connector check passed" with the validation, telemetry, and incident counts. Don''t open the hosted URL directly: that is a known preview limitation (the sign-in pop-up stops at "Page not accessible directly").' -f $where) -DocUrl 'https://learn.microsoft.com/fabric/apps/fabric-authentication'))
     return $results.ToArray()
 }

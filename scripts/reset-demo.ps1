@@ -11,8 +11,8 @@ profile to off unless -KeepProfile. -Reseed restores the seed data; -UndoRemedia
 missing-index remediation, so that scenario starts again from 'before'. It acts only inside ContosoCare.
 
 Resetting T3 connects to it, which resumes a paused serverless database; with its profile off it pauses
-again t3AutoPauseMinutes later. -RebuildGuest reports Not supported for now (destroy.ps1 then deploy.ps1
-rebuilds everything).
+again t3AutoPauseMinutes later. -RebuildGuest reports Not supported for now (destroy.ps1 -KeepFabric, then deploy.ps1,
+rebuilds everything and keeps the Fabric workspaces with their history).
 
 It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't need to change the Azure CLI's default subscription.
 

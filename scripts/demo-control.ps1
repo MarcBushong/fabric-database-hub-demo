@@ -1,11 +1,11 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-Changes the activity on the demo's targets: a profile or one bounded incident (demo-control.yml and the
-live-activity notebook call it; ADR 0010, ADR 0011).
+Changes the activity on the demo's targets: a profile or one bounded incident, from a terminal or the optional
+demo-control.yml workflow (ADR 0010, ADR 0011). A demo session needs neither: Run all in NB_DatabaseHub_Control runs it.
 
 .DESCRIPTION
-Takes the inputs demo-control.yml declares, with the names the live-activity notebook dispatches:
+Takes the inputs demo-control.yml declares:
 target (all, T1, T2, T3, T4, or T5), scenario (baseline, business-day, off, or incident:<scenario>), duration
 (1-240 minutes), concurrency (0 or 1-64), intensity (0 or 1-10), reset-before, and auto-cleanup. Each target
 gets 'profile set' through Run Command; everything ends before the next auto-shutdown, and the runner clamps
@@ -15,7 +15,7 @@ it to the scenario's limits. An incident on 'all' runs on the scenario's default
 Demo configuration (default: config/demo.config.json).
 
 .PARAMETER Target
-all, T1, T2, T3, T4 (the PostgreSQL flexible server, when t4Enabled; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
+all, T1, T2, T3, T4 (the PostgreSQL flexible server; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
 account, when t5Enabled; ADR 0027).
 
 .PARAMETER Scenario

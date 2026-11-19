@@ -138,7 +138,7 @@ function Test-DemoHubEstate {
         elseif ($machine) {
             $evidence = [ordered]@{ machineResourceId = Get-RowValue $machine 'id'; machineStatus = Get-RowValue $machine 'status'; t2SqlInstallMode = $installMode }
             if ($installMode -eq 'PaygWizard') {
-                Add-TargetResult 'T2' 'Manual action required' 'The Arc machine arcsql01 is in Azure Resource Graph, but no SQL Server instance is yet: the PaygWizard setup-wizard step is still pending.' $evidence 'Finish the setup-wizard step in docs/deployment.md ("The PaygWizard manual step"); the Azure extension for SQL Server then reports the instance.'
+                Add-TargetResult 'T2' 'Manual action required' 'The Arc machine arcsql01 is in Azure Resource Graph, but no SQL Server instance is yet: the PaygWizard setup-wizard step is still pending.' $evidence 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard; the Azure extension for SQL Server then reports the instance.'
             }
             else {
                 Add-TargetResult 'T2' 'Warning' 'The Arc machine arcsql01 is in Azure Resource Graph, but the Azure extension for SQL Server hasn''t reported its SQL Server instance yet.' $evidence 'Check the extension with scripts/configure-arc.ps1 and run again in a few minutes.'
