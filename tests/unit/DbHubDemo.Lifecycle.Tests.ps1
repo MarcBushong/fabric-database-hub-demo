@@ -996,6 +996,20 @@ Describe 'Invoke-DemoDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
     }
 
+    It 'checks T5 in the T4 stage when t4Enabled is false too (-Sequential; review, 2026-11-19)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { $script:order.Add('TestT4'); New-TestResult 'T4.SERVER' 'Pass' 't4' 'T4' }
+        $script:state = New-TestState @{ Stage = 'T3'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        $results = @(Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -Resume -StopAfter T4)
+        $script:order | Should -Contain 'TestT5'
+        $script:order | Should -Contain 'WarmT5'
+        $script:order | Should -Not -Contain 'TestT4'
+        ($results | Where-Object { $_.checkId -eq 'T5.ACCOUNT' }).status | Should -Be 'Pass'
+        ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T5.WARMUP' }).status | Should -Be 'Pass'
+    }
+
     It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
         $pinned = New-TestConfig -WithT4
         $pinned['t4SkuName'] = 'Standard_B1ms'

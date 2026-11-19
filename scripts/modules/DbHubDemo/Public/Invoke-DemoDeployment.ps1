@@ -716,6 +716,18 @@ function Invoke-DemoDeployment {
                 & $stageResult 'T3' 'Pass' 'T3 is configured from T1 and checked.'
             }
             'T4' {
+                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
+                # DB account's checks, then T1's access through the runner's warmup. First, so a configuration with t4Enabled
+                # false still checks it (review, 2026-11-19). A T5 failure doesn't stop the stage; DONE needs HUB.ESTATE.T5 and
+                # METRICS.T5.
+                if (Test-DemoT5Enabled -Config $Config) {
+                    $t5Checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $t5Checks
+                    $t5Current = Get-DemoDeploymentState -Config $Config
+                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
+                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
+                    }
+                }
                 # T4 (Phase 24, ADR 0019): the server's checks, then T1 sets it up through the P6 group (already
                 # joined in the T3 stage), then its Azure Monitor metrics. A T4 failure doesn't stop the run.
                 if (-not (Test-DemoT4Enabled -Config $Config)) {
@@ -756,17 +768,6 @@ function Invoke-DemoDeployment {
                     $results.Add((Test-DemoT4ReplicaServer -Config $Config))
                     $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
                     $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
-                }
-                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
-                # DB account's checks, then T1's access through the runner's warmup. A T5 failure doesn't stop the stage; DONE
-                # needs HUB.ESTATE.T5 and METRICS.T5.
-                if (Test-DemoT5Enabled -Config $Config) {
-                    $t5Checks = @(Test-DemoT5 -Config $Config)
-                    & $addAll $t5Checks
-                    $t5Current = Get-DemoDeploymentState -Config $Config
-                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
-                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
-                    }
                 }
                 & $recordStage 'T4'
                 if ((& $hasStatus $t4Checks 'Fail') -or ($null -ne $t4Enable -and $t4Enable.status -eq 'Fail')) {
