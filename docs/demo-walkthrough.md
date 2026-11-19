@@ -615,13 +615,14 @@ Use it when the Database Agent or Copilot isn't visible in your tenant, declines
 ### The ladder
 
 1. **The Database Agent in Database Hub:** the showcase.
-2. **The same scenario's skills prompts** (`<scenario>.skills.md`) in GitHub Copilot CLI, the primary host, or VS Code, after [session-setup.skills](../fabric/agent/prompts/session-setup.skills.md):
+2. **The Copilot chat in the Insights app:** select **Ask Copilot** in `APP_DatabaseHub_Insights` and ask the same question. It answers from the demo's history and the live estate, on your own GitHub Copilot, with the query or the source behind every answer, and needs nothing installed ([the Copilot chat in the Insights app](../README.md#the-copilot-chat-in-the-insights-app), [ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)).
+3. **The same scenario's skills prompts** (`<scenario>.skills.md`) in GitHub Copilot CLI, the primary host, or VS Code, after [session-setup.skills](../fabric/agent/prompts/session-setup.skills.md):
    - **The GA Database Hub skill, `databasehub-cli`** (in the `fabric-skills` plugin from [`microsoft/skills-for-fabric`](https://github.com/microsoft/skills-for-fabric/tree/main/skills/databasehub-cli), the Database Hub CLI skill of the [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview); it replaced the `microsoft-sql-fdh` plugin on 2026-11-18): inventory; CPU, storage, and memory health for SQL and PostgreSQL; Azure Cosmos DB's availability and RU use; and security posture. It's read-only and runs as your delegated sign-in.
    - **The telemetry agent instructions block** on Learn ([Query performance monitoring telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry), "Agent instructions block"): the connection contract and the rules for querying the documented telemetry endpoint. The session-setup prompt has the agent read it through the Learn MCP server. The repo links to it and never copies it. It covers every incident on every target.
    - **The Microsoft Learn MCP server** at `https://learn.microsoft.com/api/mcp`, for grounding. It needs no sign-in ([Microsoft Learn MCP Server overview](https://learn.microsoft.com/training/support/mcp)).
    - **The `microsoft-sql` plugin's diagnostics skills** (blocking and deadlocks, resource pressure, slow queries, plans): optional, and **Not selected** by default. They need a SQL connection from inside the virtual network, through Bastion, and they're written for Azure SQL Database, so on T1 and T2 they can decline.
-3. **No agent at all:** the Database Hub pages, plus the Learn sample queries that each prompt file names, in the [Azure Data Explorer web UI](https://dataexplorer.azure.com) ([Azure Data Explorer web UI query overview](https://learn.microsoft.com/azure/data-explorer/web-ui-query-overview)), or the telemetry tables from [beat 9](#beat-9-26002900-the-notebooks)'s fallback.
-4. **Last resort:** the rehearsal screenshots.
+4. **No agent at all:** the Database Hub pages, plus the Learn sample queries that each prompt file names, in the [Azure Data Explorer web UI](https://dataexplorer.azure.com) ([Azure Data Explorer web UI query overview](https://learn.microsoft.com/azure/data-explorer/web-ui-query-overview)), or the telemetry tables from [beat 9](#beat-9-26002900-the-notebooks)'s fallback.
+5. **Last resort:** the rehearsal screenshots.
 
 ### Run it in the session
 

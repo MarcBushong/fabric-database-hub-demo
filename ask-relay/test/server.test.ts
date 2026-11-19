@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
+import { connect } from "node:net";
 import WebSocket from "ws";
 
 import type { SessionHost, SessionLike } from "../src/bridge.js";
 import type { RelayConfig } from "../src/config.js";
-import { createRelay, RateLimiter } from "../src/server.js";
+import { clientKey, createRelay, MAX_SOCKETS_PER_CLIENT, RateLimiter } from "../src/server.js";
 
 const APP = "https://dbhub-westus3.webapp.fabricapps.net";
 const fakeToken = () => ["gho", "C".repeat(36)].join("_");
@@ -60,12 +61,30 @@ afterEach(async () => {
     stop = null;
 });
 
-async function listen(calls: string[] = []) {
-    const relay = createRelay(config, { host, fetch: githubFake(calls), log: () => undefined });
+async function listen(calls: string[] = [], options: { host?: SessionHost; startDeadlineMs?: number } = {}) {
+    const relay = createRelay(config, { host: options.host ?? host, fetch: githubFake(calls), log: () => undefined, startDeadlineMs: options.startDeadlineMs });
     await new Promise<void>((resolve) => relay.server.listen(0, "127.0.0.1", () => resolve()));
     stop = relay.close;
     const port = (relay.server.address() as AddressInfo).port;
-    return { base: `http://127.0.0.1:${port}`, ws: `ws://127.0.0.1:${port}`, relay };
+    return { base: `http://127.0.0.1:${port}`, ws: `ws://127.0.0.1:${port}`, relay, port };
+}
+
+/** Sends a request exactly as written (fetch would normalize the target) and returns the response's status line. */
+function rawRequest(port: number, request: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        let data = "";
+        const socket = connect(port, "127.0.0.1", () => socket.write(request));
+        const done = () => {
+            socket.destroy();
+            resolve(data.split("\r\n")[0] ?? "");
+        };
+        socket.on("data", (chunk) => {
+            data += chunk.toString();
+            if (data.includes("\r\n")) done();
+        });
+        socket.on("close", done);
+        socket.on("error", reject);
+    });
 }
 
 describe("relay HTTP", () => {
@@ -104,6 +123,34 @@ describe("relay HTTP", () => {
         const copilot = await (await fetch(`${base}/auth/copilot`, { headers: { Origin: APP, Authorization: `Bearer ${fakeToken()}` } })).json();
         expect(copilot).toEqual({ ok: true, login: "octo", plan: "enterprise" });
     });
+
+    it("answers request targets that new URL() can't read, and keeps serving (security review, 2026-11-19)", async () => {
+        const { base, port } = await listen();
+        for (const target of ["//x:a", "/\\x:a"]) {
+            const status = await rawRequest(port, `GET ${target} HTTP/1.1\r\nHost: relay\r\nOrigin: ${APP}\r\nConnection: close\r\n\r\n`);
+            expect(status).toMatch(/^HTTP\/1\.1 4\d\d /);
+        }
+        expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    });
+
+    it("runs one new Copilot check per client at a time, and answers a second with busy (security review, 2026-11-19)", async () => {
+        let finish: () => void = () => undefined;
+        const slow: SessionHost = { ...host, probe: () => new Promise((resolve) => (finish = () => resolve({ login: "octo", copilotPlan: "enterprise" }))) };
+        const { base } = await listen([], { host: slow });
+        const check = (token: string) => fetch(`${base}/auth/copilot`, { headers: { Origin: APP, Authorization: `Bearer ${token}` } });
+        const first = check(fakeToken());
+        await new Promise((r) => setTimeout(r, 50));
+        const second = await check(["gho", "D".repeat(36)].join("_"));
+        expect(second.status).toBe(503);
+        expect(await second.json()).toMatchObject({ error: "busy" });
+        finish();
+        expect((await first).status).toBe(200);
+        // The client's place is free again: its next new check runs.
+        const again = check(["gho", "D".repeat(36)].join("_"));
+        await new Promise((r) => setTimeout(r, 50));
+        finish();
+        expect((await again).status).toBe(200);
+    });
 });
 
 describe("relay WebSocket", () => {
@@ -133,6 +180,76 @@ describe("relay WebSocket", () => {
         expect(relay.sessions()).toBe(1);
         ws.close();
     });
+
+    const startOn = (ws: WebSocket) =>
+        new Promise<Record<string, unknown>>((resolve) => {
+            ws.once("message", (data) => resolve(JSON.parse(String(data))));
+            ws.send(JSON.stringify({ type: "start", token: fakeToken(), systemMessage: "g", tools: [] }));
+        });
+    const closeCode = (ws: WebSocket) => new Promise<number>((resolve) => ws.on("close", (code) => resolve(code)));
+
+    it("refuses an upgrade whose target new URL() can't read, and keeps serving (security review, 2026-11-19)", async () => {
+        const { base, port } = await listen();
+        const status = await rawRequest(
+            port,
+            `GET /\\x:a HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: ${APP}\r\n\r\n`,
+        );
+        expect(status).toMatch(/^HTTP\/1\.1 4\d\d /);
+        expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    });
+
+    it("closes a socket that doesn't start in time, so it holds no place (security review, 2026-11-19)", async () => {
+        const { ws: url } = await listen([], { startDeadlineMs: 100 });
+        const { ws } = await open(url, APP);
+        expect(await closeCode(ws)).toBe(4001);
+    });
+
+    it("closes the socket of a start that failed, and frees its place (security review, 2026-11-19)", async () => {
+        const failing: SessionHost = {
+            ...host,
+            create: async () => {
+                throw new Error("401 Unauthorized");
+            },
+        };
+        const { ws: url, relay } = await listen([], { host: failing });
+        const { ws } = await open(url, APP);
+        const closed = closeCode(ws);
+        expect(await startOn(ws)).toMatchObject({ type: "error", fatal: true });
+        expect(await closed).toBe(4002);
+        expect(relay.sessions()).toBe(0);
+    });
+
+    it("counts a conversation against the limit from its start, not from its socket (security review, 2026-11-19)", async () => {
+        const { ws: url, relay } = await listen();
+        const sockets = await Promise.all([open(url, APP), open(url, APP), open(url, APP)]);
+        // Three sockets with maxSessions 2: none has started, so none is refused.
+        expect(sockets.map((s) => s.status)).toEqual([null, null, null]);
+        expect(await startOn(sockets[0].ws)).toMatchObject({ type: "ready" });
+        expect(await startOn(sockets[1].ws)).toMatchObject({ type: "ready" });
+        const closed = closeCode(sockets[2].ws);
+        expect(await startOn(sockets[2].ws)).toMatchObject({ type: "error", code: "relay_busy", fatal: true });
+        expect(await closed).toBe(4003);
+        expect(relay.sessions()).toBe(2);
+        for (const s of sockets) s.ws.close();
+    });
+
+    it("caps the sockets one client holds open (security review, 2026-11-19)", async () => {
+        const { ws: url } = await listen();
+        const held = await Promise.all(Array.from({ length: MAX_SOCKETS_PER_CLIENT }, () => open(url, APP)));
+        expect(held.every((s) => s.status === null)).toBe(true);
+        expect((await open(url, APP)).status).toBe(429);
+        for (const s of held) s.ws.close();
+    });
+});
+
+describe("clientKey", () => {
+    it("takes the address Container Apps' ingress appended, not one the client wrote (security review, 2026-11-19)", () => {
+        const req = (forwarded?: string) =>
+            ({ headers: forwarded === undefined ? {} : { "x-forwarded-for": forwarded }, socket: { remoteAddress: "10.0.0.9" } }) as unknown as Parameters<typeof clientKey>[0];
+        expect(clientKey(req("6.6.6.6, 203.0.113.7"))).toBe("203.0.113.7");
+        expect(clientKey(req("203.0.113.7"))).toBe("203.0.113.7");
+        expect(clientKey(req())).toBe("10.0.0.9");
+    });
 });
 
 describe("RateLimiter", () => {
@@ -142,5 +259,17 @@ describe("RateLimiter", () => {
         expect([limiter.allow("a"), limiter.allow("a"), limiter.allow("a"), limiter.allow("b")]).toEqual([true, true, false, true]);
         t = 1000;
         expect(limiter.allow("a")).toBe(true);
+    });
+
+    it("forgets only windows that ended when it's full, never every counter (security review, 2026-11-19)", () => {
+        let t = 0;
+        const limiter = new RateLimiter(1, 1000, () => t, 2);
+        expect([limiter.allow("a"), limiter.allow("b")]).toEqual([true, true]);
+        // Full of live windows: a new client waits, and a's count stays.
+        expect(limiter.allow("c")).toBe(false);
+        expect(limiter.allow("a")).toBe(false);
+        t = 1000;
+        expect(limiter.allow("c")).toBe(true);
+        expect(limiter.size).toBe(1);
     });
 });
