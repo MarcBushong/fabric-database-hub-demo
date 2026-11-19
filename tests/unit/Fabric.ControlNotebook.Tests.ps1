@@ -831,7 +831,7 @@ print(json.dumps(out))
         $job.SESSION_ID | Should -Be $report.sent[0].sessionId
         ($job.SESSION_PLAN | ConvertFrom-Json).beats.Count | Should -BeGreaterThan 20
         # The Database Agent beat carries when its run regresses and responds, for the history's database_agent finding.
-        $agentBeats = @(($job.SESSION_PLAN | ConvertFrom-Json).beats | Where-Object { $_.agent })
+        $agentBeats = @(($job.SESSION_PLAN | ConvertFrom-Json).beats | Where-Object { $_.PSObject.Properties.Name -contains 'agent' -and $_.agent })
         $agentBeats.Count | Should -Be 1
         $agentBeats[0].target | Should -Be 'T3'
         $agentBeats[0].scenario | Should -Be 'plan-regression'

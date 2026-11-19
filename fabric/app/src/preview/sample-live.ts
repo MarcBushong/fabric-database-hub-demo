@@ -9,7 +9,7 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
     return {
         inventory: {
             view: "inventory",
-            source: ["POST /v1/databasehub/__private/savedView/resources/list"],
+            source: ["POST /savedView/resources/list"],
             scope: SCOPE,
             errors: [],
             at,
@@ -29,7 +29,7 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
         },
         health: {
             view: "health",
-            source: ["POST /v1/databasehub/__private/health/v2/filtered-summary", "POST /v1/databasehub/__private/postgreSql/health/v2/summary", "POST /v1/databasehub/__private/cosmosDb/health/summary"],
+            source: ["POST /health/v2/filtered-summary", "POST /postgreSql/health/v2/summary", "POST /cosmosDb/health/summary"],
             scope: SCOPE,
             errors: [],
             at,
@@ -42,7 +42,7 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
         },
         security: {
             view: "security",
-            source: ["GET /v1/databasehub/__private/auth/warnings", "GET /v1/databasehub/__private/auditing/warnings", "GET /v1/databasehub/__private/cmk/warnings"],
+            source: ["GET /auth/warnings", "GET /auditing/warnings", "GET /cmk/warnings"],
             scope: SCOPE,
             errors: [],
             at,

@@ -41,6 +41,12 @@ function Invoke-DemoArcOnboarding {
        Fail (ADR 0009).
     5. Waits up to -ConnectWaitMinutes for the Azure machine to report Connected.
 
+    PowerShell Direct into the guest that breaks while the guest runs with a healthy heartbeat (issue #65, 2026-11-18: an
+    update's WriteMarker failed with "The Hyper-V socket target process has ended") is cleared on the host: it restarts
+    the guest once for this run (deploy.ps1's recovery key, Get-DemoRunRecoveryKey) and runs the action again once
+    (Invoke-DemoArcOnboardWithRecovery). The evidence then has guestRecovery, which deploy.ps1 reports as
+    DEPLOY.T2.GUESTRESTART.
+
     In the opt-in evaluation-only mode (t2Mode EvaluationOnlyAzureVm, ADR 0006) the same steps run on the Azure
     VM arcsql01 itself, and the result is labeled EVALUATION ONLY. Under -WhatIf nothing runs.
 
@@ -172,8 +178,16 @@ function Invoke-DemoArcOnboarding {
 
     # 2. Probe the guest (read-only), and 3. read the Azure machine.
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
+    # Issue #65: the host restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
+    $recoveryKey = Get-DemoRunRecoveryKey
+    $probeParameters = @{ Action = 'Probe'; MachineName = $target.MachineName; Mode = $target.T2Mode }
+    if ($recoveryKey) {
+        $probeParameters['RecoveryKey'] = $recoveryKey
+    }
     try {
-        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $target.MachineName; Mode = $target.T2Mode } -TimeoutSeconds 600 -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
+        # 25 minutes: a probe takes about a minute, but one that finds the channel broken restarts the guest and waits for
+        # it (issue #65), and Run Command ends a script at its timeout.
+        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter $probeParameters -TimeoutSeconds 1500 -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The guest could not be probed: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 again; a conflict with an extension that a policy installs clears within minutes.')
@@ -189,7 +203,7 @@ function Invoke-DemoArcOnboarding {
         $evidence['probeError'] = if ($probeRun.Error) { $probeRun.Error } else { $probeRun.Output }
     }
     if ($null -ne $probe) {
-        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus') {
+        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus', 'guestRecovery') {
             $evidence[$name] = Get-DemoMemberValue -InputObject $probe -Name $name
         }
         # Get-DemoMemberValue returns an array whole, so @() around the call would nest it: [[...]] in the evidence.
@@ -235,6 +249,9 @@ function Invoke-DemoArcOnboarding {
     $parameters['Cloud'] = $setting.Cloud
     $parameters['CorrelationId'] = [guid]::NewGuid().ToString()
     $parameters['TokenSource'] = 'Parameter'
+    if ($recoveryKey) {
+        $parameters['RecoveryKey'] = $recoveryKey
+    }
     $evidence['correlationId'] = $parameters['CorrelationId']
     $protected = @{}
     if ($parameters['Action'] -eq 'Onboard') {
@@ -304,6 +321,11 @@ function Invoke-DemoArcOnboarding {
     }
     foreach ($name in 'outcome', 'resourceId', 'agentVersion', 'agentStatus', 'guestVmId', 'taskStarted', 'tokenPassedBy', 'connectAttempts', 'authorizationWaitSeconds') {
         $evidence[$name] = Get-DemoMemberValue -InputObject $outcome -Name $name
+    }
+    # A restart the action made; one the probe made stays when the action made none.
+    $actionRecovery = Get-DemoMemberValue -InputObject $outcome -Name 'guestRecovery'
+    if ($null -ne $actionRecovery) {
+        $evidence['guestRecovery'] = $actionRecovery
     }
 
     # 5b. The token's carriers (ADR 0009): the Run Command is already deleted. Run Command passes protected

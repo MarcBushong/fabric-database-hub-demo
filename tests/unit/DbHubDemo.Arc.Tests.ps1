@@ -597,6 +597,31 @@ Describe 'Invoke-DemoArcOnboarding' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 0 -Exactly
     }
 
+    It 'gives the host the run''s recovery key, and keeps a guest restart the probe made in the evidence (issue #65)' {
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:probe.guestRecovery = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $true; seconds = 95; restartUtc = '2026-11-18T18:52:10.0000000Z'; stoppedBy = 'Shutdown'; by = 'Arc onboarding'; key = 'deploy-aaaaaaaaaaaa'; reason = 'The Hyper-V socket target process has ended.' }
+        $script:machine = New-TestMachine
+        InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key 'deploy-aaaaaaaaaaaa' }
+        try {
+            $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        }
+        finally {
+            InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key '' }
+        }
+        $result.evidence.guestRecovery.restarted | Should -BeTrue
+        $result.evidence.guestRecovery.restartUtc | Should -Not -BeNullOrEmpty
+        @($script:runs | Where-Object { $_.Name -in 'DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard' }).Count | Should -Be 2
+        foreach ($run in @($script:runs | Where-Object { $_.Name -in 'DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard' })) {
+            $run.Parameter['RecoveryKey'] | Should -Be 'deploy-aaaaaaaaaaaa' -Because $run.Name
+        }
+        # Outside a deploy.ps1 run, the host uses its own hourly key.
+        $script:runs.Clear()
+        $null = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $script:runs[0].Parameter.ContainsKey('RecoveryKey') | Should -BeFalse
+    }
+
     It 'rewrites the marker without a token when the guest is already Connected' {
         $script:probe.agentStatus = 'Connected'
         $script:probe.agentResourceName = 'arcsql01'

@@ -196,6 +196,9 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.ArcOnboarding' 'Arc onboarding' @('T2/T2')))
     $t2.Add((& $step 'T2.Monitoring' 'PAYG, monitoring, and migration assessment' @('T2/T2')))
     $t2.Add((& $step 'T2.Telemetry' 'Telemetry in Database Hub' @('T2/Telemetry')))
+    # Displayed when it happens (issue #65, 2026-11-18): archost01 restarts its guest once for the run when PowerShell
+    # Direct into it breaks while it runs; the T2 track and the run's end set it (Set-DemoGuestRecoveryProgress).
+    $t2.Add((& $step 'T2.GuestRestart' 'Recovery of PowerShell Direct into arcsql01 (only when it breaks: the step runs again, after one restart of arcsql01 when it stays broken)' @()))
     $tracks.Add([ordered]@{ name = 'T2'; label = 'T2: Arc-enabled SQL Server (arcsql01 on archost01)'; steps = $t2.ToArray() })
     $validation = [System.Collections.Generic.List[object]]::new()
     $validation.Add((& $step 'Validation' 'Estate, checklist, and timing' @('Validation')))
@@ -404,6 +407,8 @@ function Set-DemoProgressPlan {
     $map['Fabric.History'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
     # The T2 host's rebuild (2026-11-17) happens only when its agent stays down; the T2 track sets the row when it does.
     $map['T2.HostRebuild'] = if (@($Plan.Tracks['T2']).Count -gt 0) { 'Rebuild' } else { 'Skip' }
+    # The guest's restart (issue #65) happens only when PowerShell Direct into it breaks; the T2 track sets the row then.
+    $map['T2.GuestRestart'] = if (@($Plan.Tracks['T2']).Count -gt 0) { 'GuestRestart' } else { 'Skip' }
     Update-DemoProgress -Path $Path -Data @{ Map = $map; Notes = $notes } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime
@@ -416,6 +421,7 @@ function Set-DemoProgressPlan {
                     'Resend' { [string]$Change['Notes'][[string]$item['id']] }
                     'Skip' { 'Not part of this run.' }
                     'Rebuild' { 'Only when archost01''s VM agent stays down and a deallocate and start doesn''t bring it back: deploy.ps1 then deletes the host and creates it again, once.' }
+                    'GuestRestart' { 'Only when PowerShell Direct into arcsql01 breaks while it runs with a healthy heartbeat: the step runs again once arcsql01 answers, and when it stays broken, archost01 restarts arcsql01 once for this run first.' }
                     'Golden' { 'Restored from the golden snapshot: no build.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
                     default { '' }
