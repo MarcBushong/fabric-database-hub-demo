@@ -1679,7 +1679,8 @@ function Invoke-DemoDeploymentTrack {
                     if ($onboarding.Count -gt 0) {
                         & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
                     }
-                    if (& $hasStatus $arc 'Fail') {
+                    # The migration assessment is optional (2026-11-18 review): its result never ends T2's track.
+                    if (& $hasStatus @($arc | Where-Object { [string]$_.checkId -ne 'T2.ARC.MIGRATIONASSESSMENT' }) 'Fail') {
                         $outcome = 'Fail'
                         break
                     }
@@ -1725,6 +1726,20 @@ function Invoke-DemoDeploymentTrack {
                         else {
                             $why = if ([bool](Get-DemoMemberValue -InputObject $wait -Name 'Full')) { 'its health couldn''t be read for 15 minutes, because Azure keeps archost01''s Run Commands in Deleting (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01)' } else { 'state {0}: {1}' -f $state, $message }
                             & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes ({1}); its profile is set anyway.' -f $minutes, $why) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
+                        }
+                    }
+                    # T2's first migration assessment (2026-11-18 live finding): right after it's turned on, Azure refuses a
+                    # run until the Azure extension for SQL Server has the setting, and a try minutes later is taken. When
+                    # this run's row says none started, the track tries again now, every 2 minutes for at most
+                    # T2AssessmentRetryMinutes (10), and the new row replaces the old one, on the status page too.
+                    $assessmentRows = @($arc | Where-Object { Test-DemoArcMigrationAssessmentRetry -Result $_ })
+                    if ($assessmentRows.Count -gt 0) {
+                        $later = Invoke-DemoArcMigrationAssessmentRetry -Config $Config -WaitMinutes ([int](& $option 'T2AssessmentRetryMinutes' 10))
+                        $at = $results.IndexOf($assessmentRows[0])
+                        if ($null -ne $later -and $at -ge 0) {
+                            $results[$at] = $later
+                            $arc = @($arc | ForEach-Object { if ([object]::ReferenceEquals($_, $assessmentRows[0])) { $later } else { $_ } })
+                            & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION', 'T2.ARC.MIGRATIONASSESSMENT' })
                         }
                     }
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))

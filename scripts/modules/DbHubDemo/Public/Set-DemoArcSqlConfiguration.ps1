@@ -96,12 +96,17 @@ function Set-DemoArcSqlConfiguration {
                     $actions.Add(('Turned on monitoring for {0} (api-version {1}).' -f $info.Name, $setting.MonitoringApiVersion))
                 }
                 # Migration assessment (2026-11-18), for Database Hub's Optimization: on, and a run until the first assessment
-                # is uploaded. Its own result says what went wrong, so the rest of the configuration still counts.
+                # is uploaded. It's optional, so its own result says what went wrong, as a Warning, and the rest of the
+                # configuration still counts (2026-11-18 review).
                 if ($null -ne $info) {
                     try {
                         if (-not $info.MigrationAssessment.Enabled) {
-                            Invoke-DemoArcMigrationAssessmentUpdate -Target $target -InstanceName $info.Name -Confirm:$false
-                            $actions.Add(('Turned on migration assessment for {0}.' -f $info.Name))
+                            if (Invoke-DemoArcMigrationAssessmentUpdate -Target $target -InstanceName $info.Name -Confirm:$false) {
+                                $actions.Add(('Turned on migration assessment for {0}.' -f $info.Name))
+                            }
+                            else {
+                                $assessmentProblem = 'Azure accepted turning it on, but it didn''t read as on within 3 minutes'
+                            }
                         }
                     }
                     catch {
@@ -130,7 +135,9 @@ function Set-DemoArcSqlConfiguration {
     catch {
         $message = 'Azure couldn''t be read: {0}' -f $_.Exception.Message
         foreach ($id in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLEXTENSION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.MIGRATIONASSESSMENT') {
-            New-DemoArcResult -CheckId $id -Target $target -Status 'Fail' -Message $message -DocUrl $docUrl
+            # The migration assessment is optional (2026-11-18 review): never a Fail.
+            $status = if ($id -eq 'T2.ARC.MIGRATIONASSESSMENT') { 'Warning' } else { 'Fail' }
+            New-DemoArcResult -CheckId $id -Target $target -Status $status -Message $message -DocUrl $docUrl
         }
         return
     }

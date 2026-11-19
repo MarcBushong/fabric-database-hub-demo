@@ -77,24 +77,84 @@ function Get-DemoT3AutoTuning {
     return [pscustomobject]@{ Read = $true; Desired = [string]$option['desiredState']; Actual = [string]$option['actualState']; Reason = [string]$option['reasonDesc']; Error = '' }
 }
 
+function Invoke-DemoT3AutoTuningRelease {
+    <#
+    .SYNOPSIS
+    stop-demo.ps1's release of the Database Agent beat's hold (2026-11-18 review): runs demo.usp_release_auto_tuning_hold on
+    T3 from T1 (Invoke-DemoT3SqlFromT1), before T1 deallocates, and returns Ran, Released, RestoredState, and Error.
+    Internal.
+
+    .DESCRIPTION
+    The procedure puts back only what a demo hold recorded (demo.auto_tuning_hold), so a FORCE_LAST_GOOD_PLAN that
+    someone set off outside the demo stays off, and it does nothing without a hold. @force releases a hold whose run is
+    still finishing, because the session ends now, and the release is logged as auto-tuning-restored "by stop-demo.ps1".
+    Bounded: one Run Command, no login or resume wait, a 120-second batch. It runs only while T3 is Online, because a
+    paused serverless database would wake; Ran is false otherwise, or when T1 can't run it, with Error saying why.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [object] $T3,
+
+        [AllowEmptyString()]
+        [string] $DeploymentId = ''
+    )
+
+    $outcome = [ordered]@{ Ran = $false; Released = $false; RestoredState = ''; Error = '' }
+    if (-not [bool](Get-DemoMemberValue -InputObject $T3 -Name 'Exists')) {
+        $outcome.Error = 'T3 doesn''t exist'
+        return [pscustomobject]$outcome
+    }
+    $status = [string](Get-DemoMemberValue -InputObject $T3 -Name 'Status')
+    if ($status -ne 'Online') {
+        $outcome.Error = 'T3 is {0}, and running T-SQL there would wake it' -f $(if ($status) { $status } else { 'in an unknown state' })
+        return [pscustomobject]$outcome
+    }
+    $query = "DECLARE @released bit, @restored nvarchar(60); EXEC demo.usp_release_auto_tuning_hold @force = 1, @by = N'stop-demo.ps1', @released = @released OUTPUT, @restored_state = @restored OUTPUT; SELECT released = CAST(ISNULL(@released, 0) AS int), restored_state = @restored;"
+    try {
+        $run = Invoke-DemoT3SqlFromT1 -Config $Config -Query $query -DeploymentId $DeploymentId -CheckId 'STOP.T3.AUTOTUNING' -MaxLoginWaitSeconds 0 -MaxResumeWaitSeconds 0 -BatchTimeoutSeconds 120 -RunCommandAttempts 1 -Confirm:$false
+    }
+    catch {
+        $outcome.Error = Protect-DemoText -Text $_.Exception.Message
+        return [pscustomobject]$outcome
+    }
+    if ([string]$run.Status -ne 'Pass') {
+        $outcome.Error = Protect-DemoText -Text ([string]$run.Message)
+        return [pscustomobject]$outcome
+    }
+    $row = @($run.Rows) | Select-Object -First 1
+    $outcome.Ran = $true
+    $outcome.Released = [int](Get-DemoMemberValue -InputObject $row -Name 'released') -eq 1
+    $outcome.RestoredState = [string](Get-DemoMemberValue -InputObject $row -Name 'restored_state')
+    return [pscustomobject]$outcome
+}
+
 function Invoke-DemoT3AutoTuningCheck {
     <#
     .SYNOPSIS
-    T3's FORCE_LAST_GOOD_PLAN for status.ps1 (-CheckId STATUS.T3.AUTOTUNING) and, with -Restore, stop-demo.ps1 (-CheckId
-    STOP.T3.AUTOTUNING), 2026-11-18. Returns $null when T3 doesn't exist.
+    T3's FORCE_LAST_GOOD_PLAN for status.ps1 (-CheckId STATUS.T3.AUTOTUNING) and stop-demo.ps1 (-CheckId
+    STOP.T3.AUTOTUNING, with -Release), 2026-11-18. Read-only. Returns $null when T3 doesn't exist.
 
     .DESCRIPTION
     Read only while T3 is Online (Get-DemoT3State's Status), because reading a paused serverless database's tuning
-    options can wake it: otherwise Not selected, saying that the next run on T3, reset, or deploy.ps1 puts it back. Pass
-    when it's on. Off with a desired state of Off is what the Database Agent beat leaves while it holds it, from the
-    regression to its response; after a session it means the run that held it stopped with the VMs, before any of its
-    own ways back. Then status.ps1 reports a Warning with the fix, and stop-demo.ps1 (-Restore, the user's own rights,
-    ADR 0024's rule that the safety stop changes nothing stays) sets its desired state back to Default with Database
-    Automatic Tuning - Update. Inside T3, the next run's start, reset, and setup put back what the hold recorded, logged
-    as auto-tuning-restored (demo.usp_release_auto_tuning_hold). A desired state of Default or On that isn't in effect
-    (Query Store read-only, for example) is a Warning with its reason. A read that fails is a Warning. Never a Fail.
+    options can wake it: otherwise Not selected, saying what puts it back. Pass when it's on. Off with a desired state of
+    Off is what the Database Agent beat leaves while it holds it, from the regression to its response. The holds are put
+    back inside T3, where the hold recorded what it found (demo.usp_release_auto_tuning_hold, logged as
+    auto-tuning-restored): by the run's response and end, auto-cleanup, the next run's start, reset, deploy.ps1's setup,
+    and stop-demo.ps1 before it deallocates T1 (Invoke-DemoT3AutoTuningRelease, whose outcome -Release passes here). So
+    nothing here changes the setting, and an off that a person set outside the demo stays as it is (2026-11-18 review).
+    - status.ps1: off is a Warning that says the beat holds it during a session and what puts it back.
+    - stop-demo.ps1: Pass when the release put it back, or it's on; when it's off and T3 had no demo hold, a Warning that
+      says it was set outside the demo and is left as it is; when the release couldn't run, a Warning with what puts it
+      back.
+    A desired state of Default or On that isn't in effect (Query Store read-only, for example) is a Warning with its
+    reason. A read that fails is a Warning. Never a Fail.
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
@@ -107,7 +167,8 @@ function Invoke-DemoT3AutoTuningCheck {
         [ValidateSet('STATUS.T3.AUTOTUNING', 'STOP.T3.AUTOTUNING')]
         [string] $CheckId,
 
-        [switch] $Restore
+        [AllowNull()]
+        [object] $Release = $null
     )
 
     if (-not [bool](Get-DemoMemberValue -InputObject $T3 -Name 'Exists')) {
@@ -120,38 +181,41 @@ function Invoke-DemoT3AutoTuningCheck {
         param([string] $State, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '')
         New-DemoResult -CheckId $CheckId -Area $area -Target 'T3' -Status $State -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $script:DemoAutoTuningDocUrl
     }
-    $putBack = 'The next run on T3 puts it back when it starts, and so do reset, ./scripts/stop-demo.ps1 while T3 is awake, and ./scripts/deploy.ps1.'
+    $putBack = 'If a session''s Database Agent beat held it, the next run on T3 puts it back when it starts, and so do ./scripts/reset-demo.ps1 and ./scripts/deploy.ps1.'
+    $released = [bool](Get-DemoMemberValue -InputObject $Release -Name 'Released')
+    $ran = [bool](Get-DemoMemberValue -InputObject $Release -Name 'Ran')
+    $releaseEvidence = if ($null -ne $Release) { [ordered]@{ ran = $ran; released = $released; restoredState = [string](Get-DemoMemberValue -InputObject $Release -Name 'RestoredState'); error = [string](Get-DemoMemberValue -InputObject $Release -Name 'Error') } } else { $null }
     if ($status -ne 'Online') {
-        return (& $result 'Not selected' ('T3 is {0}, so FORCE_LAST_GOOD_PLAN wasn''t read: reading it could wake T3. If a session''s Database Agent beat left it off, {1}' -f $(if ($status) { $status } else { 'unknown' }), ($putBack.Substring(0, 1).ToLowerInvariant() + $putBack.Substring(1))) ([ordered]@{ t3Status = $status }))
+        $evidence = [ordered]@{ t3Status = $status }
+        if ($null -ne $releaseEvidence) {
+            $evidence['release'] = $releaseEvidence
+        }
+        return (& $result 'Not selected' ('T3 is {0}, so FORCE_LAST_GOOD_PLAN wasn''t read: reading it could wake T3. {1}' -f $(if ($status) { $status } else { 'unknown' }), $putBack) $evidence)
     }
     $read = Get-DemoT3AutoTuning -Config $Config -ServerName $server
     $evidence = [ordered]@{ t3Status = $status; desiredState = $read.Desired; actualState = $read.Actual; reason = $read.Reason }
+    if ($null -ne $releaseEvidence) {
+        $evidence['release'] = $releaseEvidence
+    }
+    $putBackNow = if ($released) { 'stop-demo.ps1 put back what the Database Agent beat''s hold recorded ({0}). ' -f [string](Get-DemoMemberValue -InputObject $Release -Name 'RestoredState') } else { '' }
     if (-not $read.Read) {
-        return (& $result 'Warning' ('T3''s FORCE_LAST_GOOD_PLAN couldn''t be read: {0}.' -f $read.Error.TrimEnd('.')) $evidence ('Run the script again. {0}' -f $putBack))
+        return (& $result 'Warning' ('{0}T3''s FORCE_LAST_GOOD_PLAN couldn''t be read: {1}.' -f $putBackNow, $read.Error.TrimEnd('.')) $evidence ('Run the script again. {0}' -f $putBack))
     }
     if ($read.Desired -eq 'Off') {
-        if (-not $Restore) {
+        if ($CheckId -eq 'STATUS.T3.AUTOTUNING') {
             return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is off on T3 (actual {0}). A session''s Database Agent beat holds it off from the regression to its response, so during that beat this is expected; after a session, the run that held it stopped before putting it back, and automatic tuning doesn''t correct plan regressions until it''s back.' -f $read.Actual) $evidence $putBack)
         }
-        if (-not $PSCmdlet.ShouldProcess($server, 'Set FORCE_LAST_GOOD_PLAN back to Default')) {
-            return (& $result 'Not selected' 'What if: FORCE_LAST_GOOD_PLAN would be set back to Default on T3.' $evidence)
+        if ($ran -and -not $released) {
+            return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is off on T3 (actual {0}), and no Database Agent beat holds it, so it was set outside the demo, and stop-demo.ps1 leaves it as it is. Automatic tuning doesn''t correct plan regressions while it''s off.' -f $read.Actual) $evidence 'If you didn''t mean to turn it off, set it back on ContosoCare: ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = DEFAULT).')
         }
-        $body = '{"properties":{"options":{"forceLastGoodPlan":{"desiredState":"Default"}}}}'
-        $update = Invoke-DemoRestRequest -SubscriptionId ([string]$Config['subscriptionId']) -Method PATCH -Uri (Get-DemoT3AgentUri -Config $Config -ServerName $server) -Body $body
-        if ($update.ExitCode -ne 0) {
-            $why = Protect-DemoText -Text $(if ($update.StdErr) { [string]$update.StdErr } else { 'HTTP {0}' -f $update.StatusCode })
-            return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is off on T3, and it couldn''t be set back to Default: {0}' -f $why) $evidence $putBack)
-        }
-        $after = Get-DemoT3AutoTuning -Config $Config -ServerName $server
-        $evidence['desiredStateAfter'] = $after.Desired
-        $evidence['actualStateAfter'] = $after.Actual
-        Write-DemoLog -Message ('T3''s FORCE_LAST_GOOD_PLAN was off, held by a Database Agent beat that stopped with the session; stop-demo.ps1 set it back to Default (now {0}).' -f $(if ($after.Actual) { $after.Actual } else { 'not read' }))
-        return (& $result 'Pass' ('FORCE_LAST_GOOD_PLAN was off on T3, held by a Database Agent beat that stopped with the session; it''s back to Default ({0}), so automatic tuning corrects plan regressions again.' -f $(if ($after.Actual) { 'now ' + $after.Actual } else { 'not read again' })) $evidence)
+        $why = if ($null -eq $Release) { 'whether a Database Agent beat holds it wasn''t checked' } elseif ($released) { 'it still reads as off right after the release' } else { 'whether a Database Agent beat holds it couldn''t be checked ({0})' -f ([string](Get-DemoMemberValue -InputObject $Release -Name 'Error')).TrimEnd('.') }
+        return (& $result 'Warning' ('{0}FORCE_LAST_GOOD_PLAN is off on T3 (actual {1}), and {2}.' -f $putBackNow, $read.Actual, $why) $evidence $putBack)
     }
     if ($read.Actual -eq 'On') {
-        return (& $result 'Pass' ('T3''s FORCE_LAST_GOOD_PLAN is on (desired {0}): automatic tuning corrects plan regressions, as the showcase''s third cycle shows.' -f $read.Desired) $evidence)
+        $how = if ($released) { $putBackNow } else { '' }
+        return (& $result 'Pass' ('{0}T3''s FORCE_LAST_GOOD_PLAN is on (desired {1}): automatic tuning corrects plan regressions, as the showcase''s third cycle shows.' -f $how, $read.Desired) $evidence)
     }
-    return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN''s desired state on T3 is {0}, but it''s {1} ({2}), so automatic tuning doesn''t correct plan regressions.' -f $read.Desired, $(if ($read.Actual) { $read.Actual } else { 'not reported' }), $(if ($read.Reason) { $read.Reason } else { 'no reason given' })) $evidence 'Query Store must be READ_WRITE on ContosoCare: ./scripts/validate.ps1 -Area T3 shows its state.')
+    return (& $result 'Warning' ('{0}FORCE_LAST_GOOD_PLAN''s desired state on T3 is {1}, but it''s {2} ({3}), so automatic tuning doesn''t correct plan regressions.' -f $putBackNow, $read.Desired, $(if ($read.Actual) { $read.Actual } else { 'not reported' }), $(if ($read.Reason) { $read.Reason } else { 'no reason given' })) $evidence 'Query Store must be READ_WRITE on ContosoCare: ./scripts/validate.ps1 -Area T3 shows its state.')
 }
 
 function ConvertTo-DemoT3AutoTuningResult {

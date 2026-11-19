@@ -1841,20 +1841,24 @@ Describe 'Stop-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { @() }
         # T3's FORCE_LAST_GOOD_PLAN (2026-11-18) has its own tests (DbHubDemo.T3Agent.Tests.ps1).
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT3State -MockWith { [pscustomobject]@{ Exists = $true; Status = 'Online'; ServerName = 'azuresql01-abc123'; DeploymentId = 'abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { [pscustomobject]@{ Ran = $true; Released = $false; RestoredState = ''; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $null }
     }
 
-    It 'puts T3''s FORCE_LAST_GOOD_PLAN back after the deallocation only when T3''s profile went off during a session (2026-11-18)' {
+    It 'releases the beat''s hold through T3 before T1 deallocates, and reports FORCE_LAST_GOOD_PLAN after, only when T3''s profile went off during a session (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { $script:order.Add('Release'); [pscustomobject]@{ Ran = $true; Released = $true; RestoredState = 'DEFAULT'; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $script:order.Add('AutoTuning'); New-TestResult 'STOP.T3.AUTOTUNING' 'Pass' 'infra' 'T3' }
         $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
-        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'AutoTuning')
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Release', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'AutoTuning')
         @($results | Where-Object { $_.checkId -eq 'STOP.T3.AUTOTUNING' }).Count | Should -Be 1
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly -ParameterFilter { $Restore -and $CheckId -eq 'STOP.T3.AUTOTUNING' -and $T3.ServerName -eq 'azuresql01-abc123' }
-        # sqlvm01 deallocated already: no session ran, so T3 isn't read (it would wake a paused T3); -ParkT2 leaves T3 alone.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -Times 1 -Exactly -ParameterFilter { $T3.ServerName -eq 'azuresql01-abc123' -and $DeploymentId -eq 'abc123' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'STOP.T3.AUTOTUNING' -and $Release.Released -and $T3.ServerName -eq 'azuresql01-abc123' }
+        # sqlvm01 deallocated already: no session ran, so T3 isn't touched (it would wake a paused T3); -ParkT2 leaves T3 alone.
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
         Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Stop-DemoEnvironment -Config $config -ParkT2 -Confirm:$false | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -Times 1 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly
     }
 

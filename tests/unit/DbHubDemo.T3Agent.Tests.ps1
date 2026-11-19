@@ -36,21 +36,17 @@ Describe 'T3''s FORCE_LAST_GOOD_PLAN in status.ps1 and stop-demo.ps1 (Invoke-Dem
     BeforeEach {
         $script:calls = [System.Collections.Generic.List[object]]::new()
         $script:tuning = New-Tuning -Desired 'Default' -Actual 'On'
-        $script:patch = New-RestAnswer -Json @{}
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
             $script:calls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($PesterBoundParameters.ContainsKey('Body')) { $PesterBoundParameters['Body'] } else { $null }) })
-            if ($Method -eq 'PATCH') {
-                if ($script:patch.ExitCode -eq 0) {
-                    $script:tuning = New-Tuning -Desired 'Default' -Actual 'On'
-                }
-                return $script:patch
-            }
             if ($script:tuning -is [pscustomobject]) {
                 return $script:tuning
             }
             return (New-RestAnswer -Json $script:tuning)
         }
+        $script:released = [pscustomobject]@{ Ran = $true; Released = $true; RestoredState = 'DEFAULT'; Error = '' }
+        $script:noHold = [pscustomobject]@{ Ran = $true; Released = $false; RestoredState = ''; Error = '' }
+        $script:notRun = [pscustomobject]@{ Ran = $false; Released = $false; RestoredState = ''; Error = 'T1 (sqlvm01) isn''t running' }
     }
 
     It 'reads it with Database Automatic Tuning - Get on T3''s database, and passes when it''s on' {
@@ -64,9 +60,9 @@ Describe 'T3''s FORCE_LAST_GOOD_PLAN in status.ps1 and stop-demo.ps1 (Invoke-Dem
 
     It 'doesn''t read a T3 that isn''t Online, because reading it could wake it, and returns nothing without T3' {
         $paused = [pscustomobject]@{ Exists = $true; Status = 'Paused'; ServerName = 'azuresql01-abc123' }
-        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $paused } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Restore -Confirm:$false }
+        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $paused } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' }
         $result.status | Should -Be 'Not selected'
-        $result.message | Should -Match '^T3 is Paused, so FORCE_LAST_GOOD_PLAN wasn''t read: reading it could wake T3\. If a session''s Database Agent beat left it off, the next run on T3 puts it back'
+        $result.message | Should -Match '^T3 is Paused, so FORCE_LAST_GOOD_PLAN wasn''t read: reading it could wake T3\. If a session''s Database Agent beat held it, the next run on T3 puts it back'
         $missing = [pscustomobject]@{ Exists = $false; Status = ''; ServerName = 'azuresql01-abc123' }
         InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $missing } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STATUS.T3.AUTOTUNING' } | Should -BeNullOrEmpty
         $script:calls.Count | Should -Be 0
@@ -77,44 +73,89 @@ Describe 'T3''s FORCE_LAST_GOOD_PLAN in status.ps1 and stop-demo.ps1 (Invoke-Dem
         $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STATUS.T3.AUTOTUNING' }
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'A session''s Database Agent beat holds it off from the regression to its response'
-        $result.remediation | Should -Match 'The next run on T3 puts it back when it starts, and so do reset, \./scripts/stop-demo\.ps1 while T3 is awake, and \./scripts/deploy\.ps1\.'
-        @($script:calls | Where-Object Method -eq 'PATCH').Count | Should -Be 0
+        $result.remediation | Should -Match 'the next run on T3 puts it back when it starts, and so do \./scripts/reset-demo\.ps1 and \./scripts/deploy\.ps1\.'
+        @($script:calls | Where-Object Method -ne 'GET').Count | Should -Be 0
     }
 
-    It 'sets it back to Default in stop-demo.ps1, with only that option in the body, and says what it is now' {
-        $script:tuning = New-Tuning -Desired 'Off' -Actual 'Off'
-        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Restore -Confirm:$false }
+    It 'reports in stop-demo.ps1 what the release through T3 put back, and never writes through Azure Resource Manager (2026-11-18 review)' {
+        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online; R = $script:released } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Release $R }
         $result.status | Should -Be 'Pass'
         $result.area | Should -Be 'infra'
-        $result.message | Should -Match 'it''s back to Default \(now On\)'
-        $patch = @($script:calls | Where-Object Method -eq 'PATCH')
-        $patch.Count | Should -Be 1
-        $patch[0].Body | Should -BeExactly '{"properties":{"options":{"forceLastGoodPlan":{"desiredState":"Default"}}}}'
-        $patch[0].Uri | Should -Match '/automaticTuning/current\?api-version=2025-01-01$'
+        $result.message | Should -Match '^stop-demo\.ps1 put back what the Database Agent beat''s hold recorded \(DEFAULT\)\. T3''s FORCE_LAST_GOOD_PLAN is on'
+        $result.evidence.release.released | Should -BeTrue
+        @($script:calls | Where-Object Method -ne 'GET').Count | Should -Be 0
     }
 
-    It 'sends nothing with -WhatIf, and warns with the fix when Azure refuses the change or the read' {
+    It 'leaves an off that was set outside the demo as it is, and says so (2026-11-18 review)' {
         $script:tuning = New-Tuning -Desired 'Off' -Actual 'Off'
-        $whatIf = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Restore -WhatIf }
-        $whatIf.status | Should -Be 'Not selected'
-        @($script:calls | Where-Object Method -eq 'PATCH').Count | Should -Be 0
-        $script:patch = New-RestAnswer -ExitCode 1 -StdErr 'AuthorizationFailed: no write access' -StatusCode 403
-        $refused = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Restore -Confirm:$false }
-        $refused.status | Should -Be 'Warning'
-        $refused.message | Should -Match 'couldn''t be set back to Default: AuthorizationFailed'
-        $refused.remediation | Should -Match 'The next run on T3 puts it back'
+        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online; R = $script:noHold } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Release $R }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'no Database Agent beat holds it, so it was set outside the demo, and stop-demo\.ps1 leaves it as it is'
+        $result.remediation | Should -Match 'FORCE_LAST_GOOD_PLAN = DEFAULT'
+        @($script:calls | Where-Object Method -ne 'GET').Count | Should -Be 0
+    }
+
+    It 'warns with what puts it back when the release couldn''t run, or the read fails' {
+        $script:tuning = New-Tuning -Desired 'Off' -Actual 'Off'
+        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online; R = $script:notRun } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STOP.T3.AUTOTUNING' -Release $R }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'whether a Database Agent beat holds it couldn''t be checked \(T1 \(sqlvm01\) isn''t running\)'
+        $result.remediation | Should -Match 'the next run on T3 puts it back'
         $script:tuning = New-RestAnswer -ExitCode 1 -StdErr 'ResourceNotFound' -StatusCode 404
         $unread = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STATUS.T3.AUTOTUNING' }
         $unread.status | Should -Be 'Warning'
         $unread.message | Should -Match 'couldn''t be read: ResourceNotFound'
+        @($script:calls | Where-Object Method -ne 'GET').Count | Should -Be 0
     }
 
     It 'warns with the reason when its desired state isn''t in effect' {
         $script:tuning = New-Tuning -Desired 'Default' -Actual 'Off' -Reason 'QueryStoreReadOnly'
-        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STATUS.T3.AUTOTUNING' -Restore -Confirm:$false }
+        $result = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningCheck -Config $C -T3 $T -CheckId 'STATUS.T3.AUTOTUNING' }
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'desired state on T3 is Default, but it''s Off \(QueryStoreReadOnly\)'
-        @($script:calls | Where-Object Method -eq 'PATCH').Count | Should -Be 0
+    }
+}
+
+Describe 'stop-demo.ps1 releases the Database Agent beat''s hold through T3 itself (Invoke-DemoT3AutoTuningRelease, 2026-11-18 review)' {
+    BeforeEach {
+        $script:sql = [System.Collections.Generic.List[object]]::new()
+        $script:answer = [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = ''; Rows = @([pscustomobject]@{ released = 1; restored_state = 'DEFAULT' }) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith {
+            $script:sql.Add([pscustomobject]@{ Query = @($Query) -join "`n"; Login = $MaxLoginWaitSeconds; Resume = $MaxResumeWaitSeconds; Batch = $BatchTimeoutSeconds; Attempts = $RunCommandAttempts; DeploymentId = $DeploymentId })
+            $script:answer
+        }
+    }
+
+    It 'runs the release once, bounded, with @force and who did it, and returns what it put back' {
+        $outcome = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningRelease -Config $C -T3 $T -DeploymentId 'abc123' }
+        $outcome.Ran | Should -BeTrue
+        $outcome.Released | Should -BeTrue
+        $outcome.RestoredState | Should -Be 'DEFAULT'
+        $script:sql.Count | Should -Be 1
+        $script:sql[0].Query | Should -Match "EXEC demo\.usp_release_auto_tuning_hold @force = 1, @by = N'stop-demo\.ps1'"
+        $script:sql[0].Login | Should -Be 0
+        $script:sql[0].Resume | Should -Be 0
+        $script:sql[0].Batch | Should -Be 120
+        $script:sql[0].Attempts | Should -Be 1
+        $script:sql[0].DeploymentId | Should -Be 'abc123'
+    }
+
+    It 'says when there was no hold, and doesn''t run on a T3 that isn''t Online or when T1 can''t run it' {
+        $script:answer = [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = ''; Rows = @([pscustomobject]@{ released = 0; restored_state = $null }) }
+        $none = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningRelease -Config $C -T3 $T }
+        $none.Ran | Should -BeTrue
+        $none.Released | Should -BeFalse
+
+        $paused = [pscustomobject]@{ Exists = $true; Status = 'Paused'; ServerName = 'azuresql01-abc123' }
+        $skipped = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $paused } { Invoke-DemoT3AutoTuningRelease -Config $C -T3 $T }
+        $skipped.Ran | Should -BeFalse
+        $skipped.Error | Should -Match 'T3 is Paused, and running T-SQL there would wake it'
+        $script:sql.Count | Should -Be 1
+
+        $script:answer = [pscustomobject]@{ Status = 'Fail'; Reason = 'T1NotRunning'; Message = 'T1 (sqlvm01) isn''t running (VM deallocated), so it can''t run T-SQL on T3.'; Rows = @() }
+        $failed = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); T = $script:online } { Invoke-DemoT3AutoTuningRelease -Config $C -T3 $T }
+        $failed.Ran | Should -BeFalse
+        $failed.Error | Should -Match 'isn''t running'
     }
 }
 

@@ -1100,7 +1100,7 @@ Describe 'T2 Arc checks' {
         $result.status | Should -Be 'Not supported'
     }
 
-    It 'checks migration assessment: uploaded is Pass with each target type''s readiness, off is Fail, none uploaded yet is a Warning (2026-11-18)' {
+    It 'checks migration assessment: uploaded is Pass with each target type''s readiness; off, none uploaded yet, or no machine is a Warning, never a Fail (2026-11-18)' {
         $ready = [pscustomobject]@{
             enabled                  = $true
             assessmentUploadTime     = '2026-11-18T22:10:00Z'
@@ -1117,7 +1117,9 @@ Describe 'T2 Arc checks' {
         $pass.docUrl | Should -Be 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment'
 
         $off = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance) -Extension (New-TestExtension -Version '1.1.2600.1'))
-        $off.status | Should -Be 'Fail'
+        # Optional (2026-11-18 review): a Warning with the fix, so it never ends T2's track or keeps the run from DONE.
+        $off.status | Should -Be 'Warning'
+        $off.message | Should -Match 'nothing else depends on it'
         $off.remediation | Should -Match 'configure-arc\.ps1'
 
         $pending = [pscustomobject]@{ enabled = $true }
@@ -1128,7 +1130,7 @@ Describe 'T2 Arc checks' {
         # Free for every edition: Developer mode is checked too.
         $developer = New-TestConfig -Override @{ t2SqlInstallMode = 'Developer' }
         (Invoke-Check 'MigrationAssessment' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -Assessment $ready) -Extension (New-TestExtension -Version '1.1.2600.1'))).status | Should -Be 'Pass'
-        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Fail'
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Warning'
     }
 
     It 'checks monitoring and its documented prerequisites' {
@@ -1223,7 +1225,7 @@ Describe 'Set-DemoArcSqlConfiguration turns on migration assessment and starts i
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { New-TestState -Config $script:config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $script:assessment) -Extension (New-TestExtension -Version '1.1.2600.1') }
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoArcSqlInstance -MockWith { , @(New-TestInstance -Assessment $script:assessment) }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMonitoringUpdate -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true }; $true }
         Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { 'InProgress' }
     }
 
@@ -1245,20 +1247,127 @@ Describe 'Set-DemoArcSqlConfiguration turns on migration assessment and starts i
         ($results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Pass'
     }
 
-    It 'says on its own row when Azure refuses it, and the rest of the configuration still counts' {
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { throw 'Turning on migration assessment for arcsql01 failed: (AuthorizationFailed)' }
+    It 'says on its own row, as a Warning, when a policy denies it, and the rest of the configuration still counts (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { throw 'Turning on migration assessment for arcsql01 failed: (RequestDisallowedByPolicy) Resource ''arcsql01'' was disallowed by policy.' }
         $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
         ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        @($results | Where-Object status -EQ 'Fail') | Should -BeNullOrEmpty
         $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
-        $row.status | Should -Be 'Fail'
-        $row.message | Should -Match 'AuthorizationFailed'
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'RequestDisallowedByPolicy'
+        $row.remediation | Should -Match 'exemption'
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
 
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true }; $true }
         Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { throw 'Starting a migration assessment of arcsql01 failed: (Conflict)' }
         $script:assessment = $null
         $again = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
         ($again | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Warning'
+    }
+
+    It 'is a Warning, and starts no run, when Azure accepted it but the setting doesn''t read as on yet (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $false }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'didn''t read as on within 3 minutes'
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').message | Should -Not -Match 'Turned on migration assessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+    }
+}
+
+Describe 'Invoke-DemoArcMigrationAssessmentUpdate reads the setting back after its PATCH (2026-11-18 review)' {
+    BeforeEach {
+        $script:target = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = (New-TestConfig) } { param($C) Get-DemoArcTarget -Config $C }
+        $script:reads = 0
+        $script:onAfter = 2
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith {
+            $script:reads++
+            $enabled = $script:onAfter -gt 0 -and $script:reads -ge $script:onAfter
+            , @(New-TestInstance -Assessment ([pscustomobject]@{ enabled = $enabled }))
+        }
+    }
+
+    It 'waits through a 202 Accepted until the setting reads as on' {
+        $on = InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -WaitSeconds 60 -PollSeconds 15 -Confirm:$false }
+        $on | Should -BeTrue
+        $script:reads | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '--method patch' }
+    }
+
+    It 'returns false, without throwing, when the setting still reads as off after the wait' {
+        $script:onAfter = 0
+        $on = InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -WaitSeconds 60 -PollSeconds 15 -Confirm:$false }
+        $on | Should -BeFalse
+        $script:reads | Should -Be 5
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'didn''t read as on within 60 seconds' }
+    }
+
+    It 'throws the refusal, redacted, when Azure denies the PATCH, and reads nothing' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (RequestDisallowedByPolicy) Resource ''arcsql01'' was disallowed by policy.' } }
+        { InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -Confirm:$false } } | Should -Throw '*RequestDisallowedByPolicy*'
+        $script:reads | Should -Be 0
+    }
+}
+
+Describe 'T2''s first migration assessment is tried again later in the run (2026-11-18 live finding)' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:assessment = [pscustomobject]@{ enabled = $true }
+        $script:tries = 0
+        $script:refusals = 2
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { New-TestState -Config $script:config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $script:assessment) -Extension (New-TestExtension -Version '1.1.3579.481') }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith {
+            $script:tries++
+            if ($script:tries -le $script:refusals) {
+                throw 'Starting a migration assessment of arcsql01 failed: ERROR: Internal Server Error({"error":{"code":"InternalServerError","message":"There was an unexpected problem communicating with the Arc Sql Extension"}})'
+            }
+            'InProgress'
+        }
+    }
+
+    It 'tries every 2 minutes until Azure takes the run, which is Pass' {
+        $row = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C -WaitMinutes 10 }
+        $script:tries | Should -Be 3
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 120 }
+        $row.checkId | Should -Be 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Pass'
+        $row.message | Should -Match 'first run started \(InProgress\)'
+    }
+
+    It 'stops at its deadline with a Warning that keeps Azure''s last answer' {
+        $script:refusals = 99
+        $row = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C -WaitMinutes 0 }
+        $script:tries | Should -Be 1
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'communicating with the Arc Sql Extension'
+    }
+
+    It 'starts nothing when the assessment is off or already uploaded' {
+        foreach ($assessment in @([pscustomobject]@{ enabled = $false }, [pscustomobject]@{ enabled = $true; assessmentUploadTime = '2026-11-19T02:33:29Z' })) {
+            $script:assessment = $assessment
+            $null = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C }
+        }
+        $script:tries | Should -Be 0
+    }
+
+    It 'retries only a Warning whose assessment is on, with none uploaded and no run started' {
+        $retry = {
+            param([string] $Status, [object] $Evidence, [string] $CheckId = 'T2.ARC.MIGRATIONASSESSMENT')
+            $result = New-DemoResult -CheckId $CheckId -Area 't2' -Target 'T2' -Status $Status -Message 'm' -Evidence $Evidence
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ R = $result } { param($R) Test-DemoArcMigrationAssessmentRetry -Result $R }
+        }
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = '' }) | Should -BeTrue
+        & $retry 'Warning' ([ordered]@{ enabled = $false; uploadedAt = ''; runStarted = '' }) | Should -BeFalse
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = '2026-11-19T02:33:29Z'; runStarted = '' }) | Should -BeFalse
+        & $retry 'Pass' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = 'InProgress' }) | Should -BeFalse
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = '' }) 'T2.ARC.MONITORING' | Should -BeFalse
+        InModuleScope -ModuleName DbHubDemo { Test-DemoArcMigrationAssessmentRetry -Result $null } | Should -BeFalse
     }
 }
 
