@@ -258,7 +258,8 @@ Describe 'The status page''s banner: exactly one of three states' {
         $done = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
         $done.Kind | Should -Be 'Done'
         ($done.Lines -join ' ') | Should -Match 'The demo is complete'
-        ($done.Lines -join ' ') | Should -Match 'capture-t2-golden\.ps1'
+        ($done.Lines -join ' ') | Should -Match 'investigate what you see with Copilot in Database Hub\.'
+        ($done.Lines -join ' ') | Should -Not -Match 'with the Database Agent|capture-t2-golden' -Because 'DONE''s own lines name Copilot, and suggest no golden snapshot, which bills every month (S6)'
         ($done.Lines -join ' ') | Should -Not -Match '(?i)optional'
         @($done.Problems) | Should -Be @('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): Capacity is paused. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.')
 

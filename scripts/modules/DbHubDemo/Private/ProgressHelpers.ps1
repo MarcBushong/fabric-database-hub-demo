@@ -1118,12 +1118,13 @@ function Get-DemoProgressBanner {
                 $lines.Add(('- {0}' -f [string]$entry))
             }
         }
-        $lines.Add('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.')
+        # DONE's own wording (2026-11-19): Copilot investigates, and where Run all is comes in the reason's notes
+        # (DEPLOY.CONTROL). No golden-snapshot suggestion: a snapshot bills every month, also after destroy.ps1 (S6).
+        $lines.Add('Where to look: open Database Hub in the Fabric portal, look at Estate and Performance, and investigate what you see with Copilot in Database Hub.')
         # What runs now, and how to choose the other profile (2026-11-03); a model from before it has no activity.
         if ([string]$run['activity']) {
             $lines.Add([string]$run['activity'])
         }
-        $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip T2''s build.')
         return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Problems = $problems; Command = '' }
     }
     $stale = Test-DemoProgressStale -Model $Model -NowUnix $NowUnix -HeartbeatMinutes $HeartbeatMinutes
