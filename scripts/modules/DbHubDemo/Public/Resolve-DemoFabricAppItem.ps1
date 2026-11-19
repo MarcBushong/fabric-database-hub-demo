@@ -13,6 +13,10 @@ function Resolve-DemoFabricAppItem {
     - realTimeDashboard: the dashboard's page; the Fabric portal path for a Real-Time Dashboard isn't documented on
       Learn, TODO(verify), and the workspace link is the fallback.
     - report: the report's page (the same path the Power BI REST API returns as webUrl).
+    - controlNotebook: NB_DatabaseHub_Control's page (2026-11-18), for the app's Manage page: in the demo workspace (the
+      control's folder, with a public vault) or in the control workspace, found by its name (a private vault). The
+      portal path for a notebook isn't documented on Learn, TODO(verify); without it, Manage copies requests and doesn't
+      open the notebook.
     Every link carries ?ctid=<tenant>, so it opens in the demo's tenant. The evidence goes only to the Git-ignored
     out/ folder and the stage's public/dbhub-app.json, never to Git.
     No single model with the name is Manual action required (run configure-powerbi.ps1); a missing dashboard or
@@ -26,6 +30,10 @@ function Resolve-DemoFabricAppItem {
 
     .PARAMETER Token
     A Fabric REST API token, as a SecureString.
+
+    .PARAMETER Config
+    The demo's configuration, for the control's Fabric workspace (control.fabricWorkspaceName, or its default), where a
+    private vault's control notebook is; without it, only the demo workspace is searched for the notebook.
 
     .EXAMPLE
     Resolve-DemoFabricAppItem -WorkspaceId $ws -TenantId $tenant -Token $token
@@ -42,7 +50,9 @@ function Resolve-DemoFabricAppItem {
         [string] $TenantId,
 
         [Parameter(Mandatory)]
-        [securestring] $Token
+        [securestring] $Token,
+
+        [System.Collections.IDictionary] $Config
     )
 
     $settings = Get-DemoFabricAppSetting
@@ -81,7 +91,32 @@ function Resolve-DemoFabricAppItem {
     if ($reportId) {
         $links['report'] = '{0}/groups/{1}/reports/{2}{3}' -f $portal, $workspace, $reportId.ToLowerInvariant(), $ctid
     }
-    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; links = $links }
+    # The control notebook, for Manage (2026-11-18): the demo workspace's control folder (a public vault), else the
+    # control workspace (a private vault). Not finding it changes nothing but the link.
+    $controlWorkspaceId = ''
+    $controlNotebookId = ''
+    $notebook = Find-DemoFabricItem -WorkspaceId $WorkspaceId -DisplayName 'NB_DatabaseHub_Control' -Type 'Notebook' -Token $fabricToken
+    if ($notebook.StatusCode -eq 200 -and @($notebook.Items).Count -eq 1) {
+        $controlWorkspaceId = $WorkspaceId
+        $controlNotebookId = [string](Get-DemoMemberValue -InputObject @($notebook.Items)[0] -Name 'id')
+    }
+    elseif ($Config) {
+        $ControlWorkspaceName = (Get-DemoActivityControlSetting -Config $Config).FabricWorkspaceName
+        $workspaces = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces' -f $script:FabricApiBaseUri) -Token $fabricToken
+        $control = @($workspaces.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'displayName') -ceq $ControlWorkspaceName }) | Select-Object -First 1
+        $controlId = if ($null -ne $control) { [string](Get-DemoMemberValue -InputObject $control -Name 'id') } else { '' }
+        if ($controlId -match '^[0-9a-fA-F-]{36}$') {
+            $notebook = Find-DemoFabricItem -WorkspaceId $controlId -DisplayName 'NB_DatabaseHub_Control' -Type 'Notebook' -Token $fabricToken
+            if ($notebook.StatusCode -eq 200 -and @($notebook.Items).Count -eq 1) {
+                $controlWorkspaceId = $controlId
+                $controlNotebookId = [string](Get-DemoMemberValue -InputObject @($notebook.Items)[0] -Name 'id')
+            }
+        }
+    }
+    if ($controlNotebookId -match '^[0-9a-fA-F-]{36}$') {
+        $links['controlNotebook'] = '{0}/groups/{1}/synapsenotebooks/{2}{3}' -f $portal, $controlWorkspaceId.ToLowerInvariant(), $controlNotebookId.ToLowerInvariant(), $ctid
+    }
+    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlNotebookId = $controlNotebookId; links = $links }
     if ($problems.Count -gt 0) {
         $evidence['problems'] = @($problems)
     }

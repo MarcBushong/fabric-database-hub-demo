@@ -93,6 +93,7 @@
         'Remove-DemoT3'
         'Reset-DemoWorkload'
         'Resolve-DemoFabricAppItem'
+        'Resolve-DemoFabricAppOperator'
         'Resolve-DemoFabricConfig'
         'Resolve-DemoNetworkMode'
         'Resolve-DemoT1SecurityType'

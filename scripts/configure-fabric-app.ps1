@@ -333,7 +333,12 @@ if ($capacity) {
     $capacityReady = $capacity.status -eq 'Pass' -or ($capacity.status -eq 'Warning' -and $capacityId -match $guidPattern -and $progress -ne 'InProgress')
 }
 
-$itemsResult = Resolve-DemoFabricAppItem -WorkspaceId $targetWorkspaceId -TenantId $tenantId -Token $FabricToken
+# With the configuration, the items include the control notebook, which the app's Manage page opens (2026-11-18).
+$itemArguments = @{ WorkspaceId = $targetWorkspaceId; TenantId = $tenantId; Token = $FabricToken }
+if ($config) {
+    $itemArguments['Config'] = $config
+}
+$itemsResult = Resolve-DemoFabricAppItem @itemArguments
 $results.Add($itemsResult)
 $modelId = [string]$itemsResult.evidence['semanticModelId']
 $links = $itemsResult.evidence['links']

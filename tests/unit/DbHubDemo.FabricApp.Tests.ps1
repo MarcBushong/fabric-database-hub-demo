@@ -989,6 +989,25 @@ Describe 'Resolve-DemoFabricAppItem' {
         $links['databaseHub'] | Should -Match '^https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid='
     }
 
+    It 'links the control notebook in the demo workspace, or in the control workspace by its name (2026-11-18)' {
+        $script:notebookId = '0b0b0b0b-0000-0000-0000-000000000000'
+        $script:controlWorkspaceId = '0c0c0c0c-0000-0000-0000-000000000000'
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith {
+            $id = switch ($Type) { 'SemanticModel' { $script:modelId } 'KQLDashboard' { $script:dashboardId } 'Report' { $script:reportId } 'Notebook' { if ($WorkspaceId -eq $script:controlWorkspaceId) { $script:notebookId } } }
+            [pscustomobject]@{ StatusCode = 200; Items = @(if ($id) { [pscustomobject]@{ id = $id; displayName = $DisplayName; type = $Type } }); Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @([pscustomobject]@{ id = $script:controlWorkspaceId; displayName = 'Lab Control' }) } }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config @{ fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        $result.status | Should -Be 'Pass'
+        $result.evidence['links']['controlNotebook'] | Should -Be "https://app.fabric.microsoft.com/groups/$script:controlWorkspaceId/synapsenotebooks/$($script:notebookId)?ctid=$script:tenantId"
+        $result.evidence['controlNotebookId'] | Should -Be $script:notebookId
+
+        # Without the configuration, only the demo workspace is searched, and no link isn't a problem.
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token
+        $result.status | Should -Be 'Pass'
+        $result.evidence['links'].Keys | Should -Not -Contain 'controlNotebook'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -Times 1 -Exactly
+    }
     It 'needs the model, and only warns about a missing dashboard or report' {
         Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 200; Items = @(); Error = '' } }
         (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token).status | Should -Be 'Manual action required'
@@ -1002,6 +1021,46 @@ Describe 'Resolve-DemoFabricAppItem' {
     }
 }
 
+Describe 'Resolve-DemoFabricAppOperator' {
+    BeforeAll {
+        $script:operatorConfig = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; t3AdminGroupObjectId = 'aaaaaaaa-0000-0000-0000-000000000000' }
+        $script:answer = { param([object] $Body) [pscustomobject]@{ ExitCode = 0; StdOut = ($Body | ConvertTo-Json -Depth 8); StdErr = ''; StatusCode = 200 } }
+    }
+
+    It 'resolves the deployer and the admin group''s users, every page, once each, lowercased (2026-11-18)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Uri -match '/me\?') { return (& $script:answer @{ id = 'D0000000-0000-0000-0000-000000000000'; userPrincipalName = 'Deployer@Contoso.example'; mail = $null }) }
+            if ($Uri -like '*skiptoken*') { return (& $script:answer @{ value = @(@{ id = 'd0000000-0000-0000-0000-000000000000'; userPrincipalName = 'deployer@contoso.example' }, @{ id = 'b0000000-0000-0000-0000-000000000000'; userPrincipalName = 'dba2@contoso.example'; mail = 'DBA2@contoso.example' }) }) }
+            & $script:answer @{ value = @(@{ id = 'a0000000-0000-0000-0000-000000000000'; userPrincipalName = 'dba1@contoso.example'; mail = 'dba.one@contoso.example' }); '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/groups/x/members/microsoft.graph.user?$skiptoken=2' }
+        }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'The app''s Manage actions are for you and 2 other members of the demo''s admin group; every deploy refreshes the list.'
+        $operators = @($result.evidence['operators'])
+        @($operators | ForEach-Object { $_['objectId'] }) | Should -Be @('d0000000-0000-0000-0000-000000000000', 'a0000000-0000-0000-0000-000000000000', 'b0000000-0000-0000-0000-000000000000')
+        $operators[0]['names'] | Should -Be @('deployer@contoso.example')
+        $operators[1]['names'] | Should -Be @('dba1@contoso.example', 'dba.one@contoso.example')
+        $operators[2]['source'] | Should -Be 'adminGroup'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -Times 1 -Exactly -ParameterFilter { $Uri -like '*/groups/aaaaaaaa-0000-0000-0000-000000000000/members/microsoft.graph.user?*' }
+    }
+
+    It 'falls back to the deployer only, with a Warning, when the group''s members can''t be read; and fails without the deployer' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Uri -match '/me\?') { return (& $script:answer @{ id = 'd0000000-0000-0000-0000-000000000000'; userPrincipalName = 'deployer@contoso.example' }) }
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'Forbidden: Insufficient privileges'; StatusCode = 403 }
+        }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The admin group''s members couldn''t be read \(Forbidden: Insufficient privileges\), so the app''s Manage actions are yours only\.$'
+        @($result.evidence['operators']).Count | Should -Be 1
+        $result.remediation | Should -Match 'every deploy refreshes the list'
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'not signed in'; StatusCode = 401 } }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Fail'
+        @($result.evidence['operators']).Count | Should -Be 0
+    }
+}
 Describe 'configure-fabric-app.ps1' {
     BeforeAll {
         $script:passResult = { param([string] $CheckId, [hashtable] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ok' -Evidence $Evidence }
