@@ -607,7 +607,7 @@ Start it outside this repo, with the deny rules, and approve one read command at
 ### Out of scope
 
 - **The Fabric data agent:** it works over OneLake data, not Database Hub signals.
-- **Custom agents or scripts that call undocumented Database Hub routes, or automate the portal:** never.
+- **Custom agents or scripts that call undocumented Database Hub routes, or automate the portal:** never, with one exception for the routes only: the Insights app's estate function reads the GA `databasehub-cli` skill's 8 read-only routes, scoped to the demo's resource group ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)).
 
 ## Recovery playbook
 

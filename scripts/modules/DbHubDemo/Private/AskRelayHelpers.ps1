@@ -179,8 +179,8 @@ function Get-DemoAskImageLabel {
 
 function Get-DemoAskImagePullProblem {
     # Why Container Apps couldn't pull the relay's image, from a deployment's error text: 'private' when the registry
-    # refused an anonymous pull (a GitHub Container Registry package follows its repository's visibility, so a fork's
-    # or a private copy's is private, and GHCR answers the same for a package that doesn't exist), 'missing' when no
+    # refused an anonymous pull (a new GitHub Container Registry package can start private, GitHub's default, so a
+    # fork's or a private copy's may be, and GHCR answers the same for a package that doesn't exist), 'missing' when no
     # image has the pinned digest, or '' for any other failure. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
