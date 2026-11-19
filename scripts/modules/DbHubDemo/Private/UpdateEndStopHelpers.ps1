@@ -162,6 +162,35 @@ function Get-DemoUpdateStopHoldText {
     return ('A session from the control notebook (Run all, or the Insights app''s Start) uses the demo, so this run leaves it running: its auto-stop stops it{0}.' -f $when)
 }
 
+function Get-DemoLastNightlyStopUtc {
+    <#
+    .SYNOPSIS
+    The last nightly stop at or before -BeforeUtc (2026-11-19, the re-review of the stop at the end of an update): the time
+    the nightly safety stop and the VMs' auto-shutdown stop the demo, autoShutdownTime in its time zone, in UTC; $null for a
+    time that isn't HHmm. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [datetime] $BeforeUtc
+    )
+
+    $shutdown = Get-DemoAutoShutdownSetting -Config $Config
+    $before = if ($BeforeUtc.Kind -eq [System.DateTimeKind]::Local) { $BeforeUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($BeforeUtc, [System.DateTimeKind]::Utc) }
+    # Each one from two days earlier up to -BeforeUtc: daylight saving time makes a day 23 or 25 hours long.
+    $last = $null
+    $next = Get-DemoDailyNextUtc -Time $shutdown.Time -Zone $shutdown.Zone -AfterUtc $before.AddDays(-2)
+    while ($null -ne $next -and $next -le $before) {
+        $last = $next
+        $next = Get-DemoDailyNextUtc -Time $shutdown.Time -Zone $shutdown.Zone -AfterUtc $next
+    }
+    return $last
+}
+
 function Get-DemoUpdateStopSession {
     <#
     .SYNOPSIS
@@ -174,11 +203,12 @@ function Get-DemoUpdateStopSession {
     and the VMs (Stop-DemoEnvironment -UpdateEnd), so a session that starts meanwhile isn't cut off:
     - Get-DemoT4ReplicaHold: a pending auto-stop of Run all, the Insights app's Start, or start-demo.ps1, or a start-demo.ps1
       session's mark on T4's read replica. A start-demo.ps1 auto-stop from a session that started before -SinceUtc (when
-      this run began, and found the demo stopped) is left over: the nightly stop or the VMs' auto-shutdown ended that
-      session without removing it, so it doesn't count (Ignored), and the stop removes it.
+      this run began, and found the demo stopped), with a nightly stop between (Get-DemoLastNightlyStopUtc), is left over:
+      the nightly stop or the VMs' auto-shutdown ended that session without removing it, so it doesn't count (Ignored), and
+      the stop removes it. With no nightly stop between, it counts (the re-review of 2026-11-19).
     - The resource group's tags: Run all's busy marker (DbHubBusyBy session, while it's ahead), and DbHubStartDemoUtc,
-      which start-demo.ps1 sets as it starts: one after -SinceUtc is a session that began while this run went on, with or
-      without an auto-stop (no session control role).
+      which start-demo.ps1 sets as it starts and again once it has asked for the VMs' starts: one after -SinceUtc is a
+      session that began while this run went on, with or without an auto-stop (no session control role).
     - A DbHub-Control job that's queued or running: Run all, or a request from the Insights app, on its way.
     Anything that can't be read keeps the demo running too: Held, By Unknown.
     https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
@@ -307,9 +337,11 @@ function Resolve-DemoUpdateStopNightly {
     .SYNOPSIS
     Stop-DemoEnvironment -UpdateEnd's last step (2026-11-19, the review's findings 2 and 4): it settles the nightly stop
     (Resolve-DemoBusyNightlyStop) only once the VMs, T4 and its read replica, and T5's container are stopped, so a stop cut
-    short (Ctrl+C) or one that failed leaves tonight's stop in place (DEPLOY.NIGHTLYSTOP), which stops what still runs. Not
-    while Run all's busy marker says a session started meanwhile. Returns STOP.NIGHTLYSTOP, or nothing. Never throws.
-    Internal.
+    short (Ctrl+C) or one that failed leaves tonight's stop in place (DEPLOY.NIGHTLYSTOP), which stops what still runs. T5's
+    container counts as stopped once STOP.T5 deleted it, found it gone, or kept it on purpose (outcome Kept: its lifecycle
+    keeps it between sessions, so the nightly stop wouldn't delete it either); a delete that failed is a Warning, which
+    leaves tonight's stop to delete it (the re-review of 2026-11-19). Not while Run all's busy marker says a session started
+    meanwhile. Returns STOP.NIGHTLYSTOP, or nothing. Never throws. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -321,7 +353,11 @@ function Resolve-DemoUpdateStopNightly {
         [object[]] $Result = @()
     )
 
-    $left = @($Result | Where-Object { $null -ne $_ -and (([string]$_.checkId -like 'STOP.VM_*' -and [string]$_.status -ne 'Pass') -or ([string]$_.checkId -in 'STOP.T4.STOP', 'STOP.T4.REPLICA' -and [string]$_.status -in 'Fail', 'Warning') -or ([string]$_.checkId -eq 'STOP.T5' -and [string]$_.status -eq 'Fail')) })
+    $t5Left = {
+        param([object] $Item)
+        [string]$Item.status -in 'Fail', 'Warning' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Item -Name 'evidence') -Name 'outcome') -ne 'Kept'
+    }
+    $left = @($Result | Where-Object { $null -ne $_ -and (([string]$_.checkId -like 'STOP.VM_*' -and [string]$_.status -ne 'Pass') -or ([string]$_.checkId -in 'STOP.T4.STOP', 'STOP.T4.REPLICA' -and [string]$_.status -in 'Fail', 'Warning') -or ([string]$_.checkId -eq 'STOP.T5' -and (& $t5Left $_))) })
     if ($left.Count -gt 0) {
         Write-DemoLog -Message ('Tonight''s nightly stop stays as it is, because not all of the demo stopped ({0}).' -f ((@($left) | ForEach-Object { [string]$_.checkId }) -join ', '))
         return @()

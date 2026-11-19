@@ -654,18 +654,45 @@ Describe 'Whether a session uses T4''s read replica, as the stop at the end of a
         (Get-Hold).Held | Should -BeFalse
     }
 
-    It 'leaves out a start-demo.ps1 auto-stop from a session that started before this run, and still reads the replica''s mark (finding 3)' {
-        Set-StartDemoAutoStop -StartedAt '2026-11-19T16:30:00Z'
-        $since = [datetime]::new(2026, 11, 19, 19, 15, 0, [System.DateTimeKind]::Utc)
+    It 'leaves out a start-demo.ps1 auto-stop from a session that the nightly stop ended before this run, and still reads the replica''s mark (finding 3)' {
+        # 16:30 PST on 11-18 the session starts, the nightly stop at 19:00 ends it, the update starts at 19:15 and ends at
+        # 20:45, and the auto-stop moved past it to 21:30 (Get-DbHubStartDemoDeferral).
+        $script:now = [datetime]::new(2026, 11, 19, 4, 45, 0, [System.DateTimeKind]::Utc)
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T00:30:00Z' -Due '2026-11-19T05:30:00Z'
+        $since = [datetime]::new(2026, 11, 19, 3, 15, 0, [System.DateTimeKind]::Utc)
         $hold = Get-Hold -Since $since
         $hold.Held | Should -BeFalse
-        $hold.Ignored | Should -Be ([datetime]::new(2026, 11, 19, 21, 30, 0, [System.DateTimeKind]::Utc))
+        $hold.Ignored | Should -Be ([datetime]::new(2026, 11, 19, 5, 30, 0, [System.DateTimeKind]::Utc))
         $script:replica = New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5'
         $script:replica.Server = [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123'; DbHubSessionUntilUtc = '2026-11-20T03:00:00Z' } }
         $hold = Get-Hold -Since $since
         $hold.Held | Should -BeTrue
         $hold.By | Should -Be 'StartDemo'
         $hold.UntilUtc | Should -Be ([datetime]::new(2026, 11, 20, 3, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'counts a start-demo.ps1 auto-stop from a session that started just before this run, with no nightly stop between: its VMs weren''t started yet when the run began (the re-review of 2026-11-19)' {
+        # start-demo.ps1 records its start at 10:00:05 PST and asks for the VMs' starts a minute later; deploy.ps1 starts at
+        # 10:00:30 and finds them stopped.
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T18:00:05Z' -Due '2026-11-19T22:00:00Z'
+        $hold = Get-Hold -Since ([datetime]::new(2026, 11, 19, 18, 0, 30, [System.DateTimeKind]::Utc))
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.UntilUtc | Should -Be ([datetime]::new(2026, 11, 19, 22, 0, 0, [System.DateTimeKind]::Utc))
+        $hold.Ignored | Should -BeNullOrEmpty
+    }
+
+    It 'finds the last nightly stop at or before a time, also across a change of daylight saving time' -ForEach @(
+        @{ Before = '2026-11-19T18:00:30Z'; Last = '2026-11-19T03:00:00Z' }
+        @{ Before = '2026-11-19T03:00:00Z'; Last = '2026-11-19T03:00:00Z' }
+        @{ Before = '2026-11-19T02:59:59Z'; Last = '2026-11-18T03:00:00Z' }
+        # 2026-11-01 ends daylight saving time: 19:00 PDT on 10-31 is 02:00 UTC, and 19:00 PST on 11-01 is 03:00 UTC, 25 hours on.
+        @{ Before = '2026-11-02T02:30:00Z'; Last = '2026-11-01T02:00:00Z' }
+    ) {
+        # Not $before or $last: PowerShell's variable names don't tell case apart, so those would replace the test's data.
+        $beforeUtc = [datetime]::Parse($Before, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        $found = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); BeforeUtc = $beforeUtc } { Get-DemoLastNightlyStopUtc -Config $Config -BeforeUtc $BeforeUtc }
+        $found.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $Last
     }
 
     It 'counts a start-demo.ps1 auto-stop from a session that started during this run, and every one when there''s no run to compare (the replica''s deploy end)' {
