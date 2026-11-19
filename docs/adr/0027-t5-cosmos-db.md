@@ -84,7 +84,7 @@
 ## Validation
 
 - **Unit tests:** `tests/unit/DbHubDemo.T5.Tests.ps1` (names, the free tier, the upgrade's resume, `Test-DemoT5`, `METRICS.T5`, `STOP.T5`, the warmup's retry), the cost estimate's T5 components (`DbHubDemo.Cost.Tests.ps1`), the tracks and the status page (`DbHubDemo.Tracks.Tests.ps1`, `DbHubDemo.Progress.Tests.ps1`), and the runner's own tests.
-- **Live (pending):** a net-new deployment with DONE and no Fail, Run all with ru-storm, `validate.ps1`, the DBA moment in Database Hub (normalized RU at 100% with 429s, then the recovery), an upgrade from `main`, and the teardown with a clean residual check. Results go here.
+- **Live** (2026-11-18, `rg-dbhubc5-demo`, West US 3, private mode, an internal subscription; the [implementation report](../implementation-report.md#t5-azure-cosmos-db-for-nosql-2026-11-18) has the details): an environment that `main` deployed upgraded to T5 with a plain `./scripts/deploy.ps1` and ended **DONE** with no Fail, after two live findings fixed the same evening (a `METRICS.T5` crash when nothing was throttled, and the free tier in an internal subscription, which Azure refuses); `ru-storm` took normalized RU to 100% with up to 2,481 throttled requests a minute, then back to the baseline's 4% with no 429s, with Availability at 100%; Run all's 30-minute session ended its T5 activity at its baseline before the session's end and saved T5's history (`cosmosdb.T5.recovery` **Pass**). Database Hub's own pages have no API, so seeing T5 there stays a manual check.
 
 ## Sources
 
