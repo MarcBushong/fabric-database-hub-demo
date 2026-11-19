@@ -12,13 +12,13 @@ import { KpiTile } from "@/components/KpiTile";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { beatFor, FAMILY_LABEL, toAgentBeats, toBins, toIncidents, toSessions, toTargetNames, toWaitBins, toWaitFlows, type AgentBeat, type Incident, type SessionRun } from "@/data/model";
+import { beatFor, FAMILY_LABEL, toAgentBeats, toBins, toIncidents, toSessions, toTargetNames, toWaitBins, toWaitFlows, withCategoryWaits, type AgentBeat, type Incident, type SessionRun } from "@/data/model";
 import { agentLoopQuery, incidentSeriesQuery, incidentsQuery, incidentWaitsQuery, sessionsQuery, targetNamesQuery, waitsQuery, type ColumnSpec } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { binMinutes, hubUrlOf, incidentPrompts, olderThanRetention, TELEMETRY_RETENTION_DAYS, windowPhrase, type AgentSurface } from "@/lib/agent-prompts";
 import { TARGETS } from "@/lib/estate";
 import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc } from "@/lib/format";
-import { compareIncident, familySignal, incidentInsight, incidentPadMinutes, incidentsOverview, waitFamilyInsight, type IncidentComparison } from "@/lib/insights";
+import { baselineText, compareIncident, familySignal, incidentInsight, incidentPadMinutes, incidentsOverview, signalValue, timesShort, timesText, waitFamilyInsight, type IncidentComparison } from "@/lib/insights";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
 import { IncidentReplay } from "@/visuals/IncidentReplay";
@@ -112,7 +112,8 @@ function responseFor(incident: Incident, sessions: readonly SessionRun[]): Sessi
 /** Detect, evidence, respond, verify: the Database Agent loop as the history shows it. */
 function AgentLoop(props: { incident: Incident; comparison: IncidentComparison | null; after: number | null; beat: AgentBeat | null; response: SessionRun | null; hubUrl?: string }) {
     const { incident, comparison, after, beat, response } = props;
-    const signal = familySignal(incident.family);
+    // The replay's own signal when its bins are loaded, so the loop's words and numbers match the tiles above it.
+    const signal = comparison ? { label: comparison.signal, kind: comparison.kind } : familySignal(incident.family);
     const recovered = after !== null && comparison?.baseline !== null && comparison?.baseline !== undefined ? after <= comparison.baseline * 1.25 : null;
     const respond = beat?.respondAt
         ? `${beat.regressAt ? `The plan regressed at ${formatTimeUtc(beat.regressAt)} UTC; t` : "T"}he run forced the last good plan through Query Store at ${formatTimeUtc(beat.respondAt)} UTC, the documented response.`
@@ -140,7 +141,7 @@ function AgentLoop(props: { incident: Incident; comparison: IncidentComparison |
                 </strong>
                 <span>
                     {comparison?.ratio
-                        ? `${comparison.ratio >= 10 ? Math.round(comparison.ratio) : comparison.ratio.toFixed(1)} times its baseline during the window; the replay and the waits below show what moved.`
+                        ? `${timesText(comparison.ratio)} its baseline during the window; the replay and the waits below show what moved.`
                         : "The replay and the waits below show what moved during the window."}
                 </span>
                 {props.hubUrl && incident.target === "T3" ? (
@@ -195,13 +196,13 @@ export default function IncidentsPage() {
     const spotSpec = useMemo(() => (range ? incidentWaitsQuery(range) : null), [range]);
     const series = useQuery(seriesSpec);
     const spot = useQuery(spotSpec);
-    const bins = useMemo(() => (selected ? toBins(series.data?.rows ?? [], selected.target) : []), [series.data, selected]);
+    const bins = useMemo(() => (selected ? withCategoryWaits(toBins(series.data?.rows ?? [], selected.target), toWaitBins(spot.data?.rows ?? [])) : []), [series.data, spot.data, selected]);
     const spotRows = useMemo(() => (selected ? spotlightRows(selected, toWaitBins(spot.data?.rows ?? []), incidentPadMinutes(selected)) : []), [spot.data, selected]);
     const comparison = useMemo(() => (selected && bins.length ? compareIncident(selected, bins) : null), [selected, bins]);
     const after = useMemo(() => {
         if (!selected || bins.length === 0) return null;
-        const field = familySignal(selected.family).field;
-        const values = bins.filter((b) => b.at >= selected.end).map((b) => b[field] as number | null).filter((v): v is number => v !== null);
+        const own = familySignal(selected.family, bins);
+        const values = bins.filter((b) => b.at >= selected.end).map((b) => signalValue(own, b)).filter((v): v is number => v !== null);
         return values.length ? values.reduce((a, v) => a + v, 0) / values.length : null;
     }, [selected, bins]);
     const response = selected ? responseFor(selected, sessions) : null;
@@ -234,7 +235,7 @@ export default function IncidentsPage() {
         selected && olderThanRetention(selected.end)
             ? `This window ended more than ${TELEMETRY_RETENTION_DAYS} days ago. Database Hub keeps ${TELEMETRY_RETENTION_DAYS} days of telemetry or less, so the agent may not see it any more; this app's history still has it.`
             : null;
-    const signal = selected ? familySignal(selected.family) : null;
+    const signal = selected ? familySignal(selected.family, bins) : null;
     const spotChartRows = spotRows.map((r) => ({ category: r.category.replace(" (PAGEIOLATCH)", ""), Before: r.before, During: r.during }));
 
     return (
@@ -285,7 +286,7 @@ export default function IncidentsPage() {
                                     ) : undefined
                                 }
                             />
-                            <KpiTile label="Against its baseline" value={comparison?.ratio ? `${comparison.ratio >= 10 ? Math.round(comparison.ratio) : comparison.ratio.toFixed(1)}×` : "–"} sub={comparison?.baseline !== null && comparison?.baseline !== undefined ? `baseline ${formatNumber(comparison.baseline, comparison.kind)} per bin` : "No bins before the window"} />
+                            <KpiTile label="Against its baseline" value={comparison?.ratio ? timesShort(comparison.ratio) : "–"} sub={comparison?.baseline !== null && comparison?.baseline !== undefined ? baselineText(comparison.baseline, comparison.kind) : "No bins before the window"} />
                             <KpiTile label="Duration" value={formatDuration(selected.durationMin)} sub={selected.scenario ? `scenario ${selected.scenario}` : "detected in the telemetry"} />
                         </section>
                     ) : null}

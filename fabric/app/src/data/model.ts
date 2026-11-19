@@ -293,6 +293,8 @@ export interface Bin {
     ioMb: number | null;
     batch: number | null;
     sessions: number | null;
+    /** The bin's wait seconds per category, when the incident's waits query read them (withCategoryWaits). */
+    waits?: Readonly<Record<string, number>>;
 }
 
 export function toBins(rows: readonly Row[], target?: TargetKey): Bin[] {
@@ -344,6 +346,22 @@ export function toWaitBins(rows: readonly Row[]): WaitBin[] {
         if (at && seconds !== null && text(r.Metric)) out.push({ at, category: text(r.Metric), seconds });
     }
     return out;
+}
+
+/** The bins with their waits per category from the same window's waits query, so a wait family's own series (Tran Log
+ *  IO, Buffer Latch, Network IO...) can be read bin by bin. A bin that query has no row for keeps none. */
+export function withCategoryWaits(bins: readonly Bin[], waits: readonly WaitBin[]): Bin[] {
+    const byAt = new Map<number, Record<string, number>>();
+    for (const w of waits) {
+        const categories = byAt.get(w.at.getTime()) ?? {};
+        categories[w.category] = (categories[w.category] ?? 0) + w.seconds;
+        byAt.set(w.at.getTime(), categories);
+    }
+    if (byAt.size === 0) return [...bins];
+    return bins.map((b) => {
+        const categories = byAt.get(b.at.getTime());
+        return categories ? { ...b, waits: categories } : b;
+    });
 }
 
 export interface Incident {

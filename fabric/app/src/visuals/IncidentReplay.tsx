@@ -9,7 +9,7 @@ import { TARGETS } from "@/lib/estate";
 import { FAMILY_LABEL, type Bin, type Incident } from "@/data/model";
 import { formatDateTimeUtc, formatNumber, formatTimeUtc, type NumberKind } from "@/lib/format";
 import { useElementSize } from "@/lib/hooks";
-import { compareIncident, familySignal, incidentPadMinutes } from "@/lib/insights";
+import { compareIncident, familySignal, incidentPadMinutes, signalValue, timesShort } from "@/lib/insights";
 import { binMinutes, phaseOf } from "./layout";
 
 interface Lane {
@@ -35,7 +35,7 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
     const [playing, setPlaying] = useState(false);
     const [speed, setSpeed] = useState(1);
     const clipId = useId().replace(/:/g, "");
-    const focus = familySignal(incident.family);
+    const focus = useMemo(() => familySignal(incident.family, bins), [incident.family, bins]);
     const accent = TARGETS[incident.target].color;
     const comparison = useMemo(() => compareIncident(incident, bins), [incident, bins]);
     const step = binMinutes(bins);
@@ -62,23 +62,23 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
     const t1 = new Date((bins[bins.length - 1]?.at ?? incident.end).getTime() + step * 60000);
     const x = scaleUtc().domain([t0, t1]).range([left, w - right]);
     const mid = (b: Bin) => x(new Date(b.at.getTime() + (step * 60000) / 2));
-    const focusValues = bins.map((b) => (b[focus.field] as number | null) ?? null);
+    const focusValues = bins.map((b) => signalValue(focus, b));
     const focusMax = Math.max(1e-9, ...focusValues.map((v) => v ?? 0), comparison.baseline ?? 0);
-    const y = scaleLinear().domain([0, focusMax * 1.15]).range([mainH - 24, 16]);
-    const defined = bins.filter((b) => b[focus.field] !== null);
+    const y = scaleLinear().domain([0, focusMax * 1.25]).range([mainH - 24, 16]);
+    const defined = bins.filter((b) => signalValue(focus, b) !== null);
     const focusArea = area<Bin>()
         .x(mid)
         .y0(mainH - 24)
-        .y1((b) => y((b[focus.field] as number) ?? 0))
+        .y1((b) => y(signalValue(focus, b) ?? 0))
         .curve(curveMonotoneX);
     const focusLine = line<Bin>()
         .x(mid)
-        .y((b) => y((b[focus.field] as number) ?? 0))
+        .y((b) => y(signalValue(focus, b) ?? 0))
         .curve(curveMonotoneX);
     const headX = current ? mid(current) : left;
     const ticks = x.ticks(Math.max(2, Math.floor(w / 140)));
     const phase = current ? phaseOf(incident, current.at) : "before";
-    const value = current ? (current[focus.field] as number | null) : null;
+    const value = current ? signalValue(focus, current) : null;
     const ratio = value !== null && comparison.baseline ? value / comparison.baseline : null;
     const peakBin = comparison.peakAt ? bins.find((b) => b.at.getTime() === comparison.peakAt?.getTime()) : undefined;
 
@@ -126,14 +126,20 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
                     <g>
                         <line x1={left} x2={w - right} y1={y(comparison.baseline)} y2={y(comparison.baseline)} stroke="var(--colorNeutralForeground3)" strokeDasharray="6 5" strokeWidth="1.5" />
                         <text x={w - right} y={y(comparison.baseline) - 6} textAnchor="end">
-                            {`baseline ${formatNumber(comparison.baseline, focus.kind)}`}
+                            {formatNumber(comparison.baseline, focus.kind) === formatNumber(0, focus.kind) ? "baseline near zero" : `baseline ${formatNumber(comparison.baseline, focus.kind)}`}
                         </text>
                     </g>
                 ) : null}
                 {peakBin && comparison.peak !== null ? (
                     <g>
                         <circle cx={mid(peakBin)} cy={y(comparison.peak)} r="5" fill="var(--colorNeutralBackground1)" stroke={accent} strokeWidth="2.5" />
-                        <text x={mid(peakBin)} y={y(comparison.peak) - 12} textAnchor="middle" className="label-strong">
+                        {/* Beside its marker, so it never sits on the window's label when the peak opens the window. */}
+                        <text
+                            x={mid(peakBin) > w - right - 100 ? mid(peakBin) - 10 : mid(peakBin) + 10}
+                            y={y(comparison.peak) + 4}
+                            textAnchor={mid(peakBin) > w - right - 100 ? "end" : "start"}
+                            className="label-strong"
+                        >
                             {`peak ${formatNumber(comparison.peak, focus.kind)}`}
                         </text>
                     </g>
@@ -213,7 +219,7 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
             <p className="replay-readout" aria-live="polite">
                 <strong>{current ? `${formatDateTimeUtc(current.at)}` : ""}</strong>
                 {` · ${phase === "during" ? "inside the incident window" : phase === "before" ? "before the window" : "after the window"} · ${focus.label} ${formatNumber(value, focus.kind)}`}
-                {ratio !== null && Number.isFinite(ratio) ? ` (${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}× the baseline)` : ""}
+                {ratio !== null && Number.isFinite(ratio) ? ` (${timesShort(ratio)} the baseline)` : ""}
                 {` · ${step}-minute bins, padded ${incidentPadMinutes(incident)} minutes each side`}
             </p>
         </div>

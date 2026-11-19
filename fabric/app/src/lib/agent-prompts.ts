@@ -88,6 +88,7 @@ function joinList(items: readonly string[]): string {
 
 /** "about 4 times", "about 1.8 times" */
 export function timesPhrase(ratio: number): string {
+    if (ratio >= 100) return "more than 100 times";
     return ratio >= 3 ? `about ${Math.round(ratio)} times` : `about ${ratio.toFixed(1)} times`;
 }
 
@@ -109,7 +110,7 @@ function valuePhrase(value: number, kind: NumberKind, bin: number | null | undef
 
 /** The incident's own signal in one clause: the replay's peak and baseline when its bins are loaded, else the recorded peak. */
 export function signalClause(incident: Incident, comparison: IncidentComparison | null, bin?: number | null): string {
-    const signal = familySignal(incident.family);
+    const signal = comparison ? { label: comparison.signal, kind: comparison.kind } : familySignal(incident.family);
     if (comparison && comparison.peak !== null) {
         let clause = `${signal.label} peaked at ${valuePhrase(comparison.peak, signal.kind, bin)}`;
         if (comparison.ratio !== null && comparison.baseline !== null && comparison.ratio >= 1.2) {
@@ -194,7 +195,7 @@ export function incidentPrompts(incident: Incident, comparison: IncidentComparis
     const target = describeTarget(incident.target, context.names);
     const pad = incidentPadMinutes(incident);
     const baselineStart = new Date(incident.start.getTime() - pad * 60000);
-    const signal = familySignal(incident.family);
+    const signal = comparison ? { label: comparison.signal, kind: comparison.kind } : familySignal(incident.family);
     const id = (name: string) => `${incident.key}:${surface}:${name}`;
 
     if (surface === "hub") {
