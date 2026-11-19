@@ -759,6 +759,18 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Get-Priced -State $script:fromMain -Permission ([pscustomobject]@{ CanDefine = $false; CanAssign = $true; Error = '' }) -ThisRunDeploys | Should -Be 'AlwaysOn'
     }
 
+    It 'prices an update from main whose session control never got a role (a Contributor deployed it) Session for a Contributor, since Run all can''t start a session there' {
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $true; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+    }
+
+    It 'prices a new environment AlwaysOn only for a deployer who can assign the shared role but not add its actions, where another environment''s older code left it without them' {
+        $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+        Get-Priced -State $script:new -Permission ([pscustomobject]@{ CanDefine = $false; CanAssign = $true; Error = '' }) -ThisRunDeploys | Should -Be 'AlwaysOn'
+        Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
+        Get-Priced -State $script:new -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+    }
     It 'prices a control whose role already has the container''s actions Session, and one that holds another role AlwaysOn, for any deployer' {
         $script:control = [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false }
         Get-Priced -State $script:fromMain -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
