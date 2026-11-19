@@ -314,22 +314,53 @@ describe("Trends", () => {
 });
 
 describe("Manage", () => {
-    it("is read-only with the reason, and still says exactly what an action would do", async () => {
-        renderWithApp(<ManagePage />);
-        expect(await screen.findByText("Read-only for you.")).toBeInTheDocument();
+    const writeText = vi.fn(async (text: string) => {
+        void text;
+    });
+
+    beforeEach(() => {
+        writeText.mockClear();
+        vi.stubGlobal("isSecureContext", true);
+        Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    });
+
+    afterEach(() => {
+        Reflect.deleteProperty(navigator, "clipboard");
+    });
+
+    it("without the Manage function, copies each request for Run all in the control notebook and opens it", async () => {
+        const open = vi.spyOn(window, "open").mockImplementation(() => null);
+        const { notify } = renderWithApp(<ManagePage />);
+        expect(await screen.findByText("Each action copies its request for the control notebook.")).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
         const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
         expect(within(dialog).getByText(/Ends after 90 minutes: saves T4's metrics, deletes the read replica/)).toBeInTheDocument();
-        expect(within(dialog).getByText(/MODE = "session"/)).toBeInTheDocument();
-        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(within(dialog).getByRole("button", { name: "Copy and open the notebook" }));
+        await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringMatching(/\nMODE = "session"\nDURATION_MINUTES = 90\nWAIT_FOR_END = True$/)));
+        expect(open).toHaveBeenCalledWith(expect.stringMatching(/^https:\/\//), "_blank", "noopener,noreferrer");
+        expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Copied: paste it into a new cell under the parameters cell/), "success");
+        open.mockRestore();
     });
 
-    it("lets an operator confirm a bounded action", async () => {
-        const { notify } = renderWithApp(<ManagePage />, { manage: { canRun: true, reason: "" } });
-        fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
+    it("is read-only with the reason for a viewer who isn't an operator", async () => {
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: false, reason: "Only the demo's operators send actions from the app.", running: null } });
+        expect(await screen.findByText("Read-only for you.")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Stop now…" }));
         const dialog = await screen.findByRole("dialog", { name: "Stop now" });
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        expect(within(dialog).getByText("Only the demo's operators send actions from the app.")).toBeInTheDocument();
+    });
+
+    it("lets an operator send a bounded action, and says a new session replaces the one running", async () => {
+        const send = vi.fn(async () => ({ started: true, jobInstance: "0d5c1f00-0000-4000-8000-000000000000", reason: "", requestedBy: "app/ops@contoso.example" }));
+        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: { startedAt: "2026-10-21T20:00:00.000Z" }, send } });
+        expect(await screen.findByText("You can run these actions, as ops@contoso.example.")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
+        expect(within(dialog).getByText("It replaces the session that's running.")).toBeInTheDocument();
         fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
-        expect(notify).toHaveBeenCalledWith("Stop now: sent to the session control", "success");
+        await waitFor(() => expect(send).toHaveBeenCalledWith({ action: "session", durationMinutes: 90 }));
+        expect(notify).toHaveBeenCalledWith("Start a 90-minute session: NB_DatabaseHub_Control started as app/ops@contoso.example (run 0d5c1f00)", "success");
     });
 
     it("lists what the control ran", async () => {
@@ -337,7 +368,6 @@ describe("Manage", () => {
         expect(await screen.findByText(/^Session abcd1234's Database Agent beat: the plan regresses at 10:03 UTC/)).toBeInTheDocument();
     });
 });
-
 describe("Live views", () => {
     it("passes the connector check and opens every link in a new tab", async () => {
         renderWithApp(<LinksPage />);

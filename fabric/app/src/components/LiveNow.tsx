@@ -82,18 +82,18 @@ export function LiveNow() {
                 </h2>
                 {at ? <ProvenanceBadge provenance="live" asOf={new Date(at)} /> : <ProvenanceBadge provenance="live" compact />}
                 {loading ? <Spinner size="extra-tiny" label="Reading Database Hub: a first read takes 5 to 12 seconds" labelPosition="after" /> : null}
-                {failed.length > 0 ? <span className="vcard-partial">{`Partial: ${failed.length} routes failed`}</span> : null}
+                {failed.length > 0 ? <span className="vcard-partial">{`Partial: ${failed.length} API calls failed`}</span> : null}
                 <span className="live-now-tools">
                     <Button size="small" appearance="subtle" className="ask-copilot" icon={<Sparkle16Filled />} onClick={ask} disabled={answers.length === 0}>
                         Ask Copilot
                     </Button>
                     <Popover withArrow>
                         <PopoverTrigger disableButtonEnhancement>
-                            <Tooltip content="The Database Hub routes behind these tiles" relationship="label">
+                            <Tooltip content="The Database Hub API calls behind these tiles" relationship="label">
                                 <Button size="small" appearance="subtle" icon={<Code16Regular />} disabled={routes.length === 0} />
                             </Tooltip>
                         </PopoverTrigger>
-                        <PopoverSurface aria-label="Database Hub routes">
+                        <PopoverSurface aria-label="Database Hub API">
                             <pre className="vcard-routes">{[...routes, ...failed.map((e) => `failed: ${e}`)].join("\n")}</pre>
                         </PopoverSurface>
                     </Popover>

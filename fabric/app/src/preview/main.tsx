@@ -1,5 +1,5 @@
 // The local preview: the app with made-up history and no Fabric sign-in, for development and screenshots
-// (npm run dev:sample opens /preview.html). Query parameters: theme=light|dark|contrast, copilot=open, manage=on,
+// (npm run dev:sample opens /preview.html). Query parameters: theme=light|dark|contrast, copilot=open, manage=operator|viewer|running,
 // empty=1 (no history: the first-run state), live=off (no live estate source). Vite builds only index.html, so none of
 // this ships in the app.
 
@@ -62,7 +62,16 @@ const auth = {
 } as unknown as AuthContextValue;
 
 const theme = params.get("theme");
-const manage: ManageAccess = params.get("manage") === "on" ? { canRun: true, reason: "" } : MANAGE_READ_ONLY;
+// manage=operator (or on): actions run from the app; manage=viewer: read-only with the reason; manage=running: an operator
+// while a session runs; otherwise the copy mode of a deployment without the Manage function.
+const manageParam = params.get("manage");
+const sampleSend: ManageAccess["send"] = async (request) => ({ started: true, jobInstance: "5a1e0000-0000-4000-8000-000000000000", reason: "", requestedBy: `app/presenter@contoso.example (${request.action})`.split(" ")[0] });
+const manage: ManageAccess =
+    manageParam === "operator" || manageParam === "on" || manageParam === "running"
+        ? { mode: "run", canRun: true, reason: "", who: "presenter@contoso.example", running: manageParam === "running" ? { startedAt: new Date(Date.now() - 25 * 60000).toISOString() } : null, send: sampleSend }
+        : manageParam === "viewer"
+          ? { mode: "run", canRun: false, reason: "Only the demo's operators send actions from the app: the deployer and the members of its admin group. A redeploy refreshes the list.", who: "viewer@contoso.example", running: null }
+          : MANAGE_READ_ONLY;
 
 createRoot(document.getElementById("root")!).render(
     <AppThemeProvider initialChoice={isThemeChoice(theme) ? theme : undefined}>

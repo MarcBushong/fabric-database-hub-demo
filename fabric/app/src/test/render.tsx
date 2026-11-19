@@ -29,7 +29,7 @@ export const RUNTIME: AppRuntime = {
     itemId: ZERO,
     portalUrl: "https://app.fabric.microsoft.com",
     resourceGroup: "rg-dbhub-test",
-    links: { report: "https://app.fabric.microsoft.com/groups/x/reports/y" },
+    links: { report: "https://app.fabric.microsoft.com/groups/x/reports/y", controlNotebook: "https://app.fabric.microsoft.com/groups/c/synapsenotebooks/n" },
 };
 
 const bins = (target: "T1" | "T2" | "T3" | null, hours: number, base: number): Row[] =>

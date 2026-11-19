@@ -83,11 +83,11 @@ export interface EstateDataByView {
 
 export interface EstateAnswer<V extends EstateView = EstateView> {
     view: V;
-    /** The Database Hub routes that answered: what the visual shows instead of DAX. */
+    /** The Database Hub API calls that answered, "<METHOD> /<route>" relative to the API: what the visual shows instead of DAX. */
     source: string[];
     scope: { subscriptionId: string; resourceGroups: string[] };
     data: EstateDataByView[V];
-    /** The routes that failed; a partial answer keeps what it read. */
+    /** The API calls that failed; a partial answer keeps what it read. */
     errors: string[];
     /** When the answer was read (ISO 8601). */
     at: string;

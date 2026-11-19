@@ -8,6 +8,7 @@ import { flagText, inventoryMix, liveOptimizationRows, liveSecurityRows, targetO
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { buildAskContext } from "@/lib/ask";
 import { describeRequest, notebookParameters, validateRequest } from "@/lib/control";
+import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
 import { DEFAULT_VIEW, mergeView, parseHash, toHash } from "@/lib/view-state";
@@ -102,6 +103,16 @@ describe("the control's requests", () => {
         expect(describeRequest({ action: "session" }).effects[2]).toMatch(/^Includes T3's Database Agent beat/);
     });
 
+    it("copies a request as Python lines for a new cell under the control notebook's parameters cell", () => {
+        expect(parameterCellText({ action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10, intensity: 6 }).split("\n").slice(1)).toEqual([
+            'MODE = "activities"',
+            'ACTIVITIES = [{"target":"T3","scenario":"cpu-pressure","intensity":6}]',
+            "DURATION_MINUTES = 10",
+            "WATCH_MINUTES = 0",
+        ]);
+        expect(parameterCellText({ action: "reset", targets: ["T1", "T3"] })).toMatch(/\nRESET_NOW = True\nRESET_TARGETS = \["T1","T3"\]$/);
+        expect(parameterCellText({ action: "stop" })).toMatch(/^# From the Insights app: stop\. .+\nSTOP_NOW = True$/);
+    });
     it("offers exactly the scenarios in scenarios/*/scenario.json, with their targets and bounds", () => {
         const root = join(process.cwd(), "..", "..", "scenarios");
         const fromRepo = readdirSync(root, { withFileTypes: true })

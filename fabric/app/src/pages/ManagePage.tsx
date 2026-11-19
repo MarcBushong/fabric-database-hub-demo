@@ -14,9 +14,10 @@ import {
     MessageBarTitle,
     Option,
     SpinButton,
+    Spinner,
     Tooltip,
 } from "@fluentui/react-components";
-import { ArrowCounterclockwise20Regular, Flash20Regular, LockClosed16Regular, Open16Regular, Play20Regular, ShieldCheckmark16Regular, Stop20Regular } from "@fluentui/react-icons";
+import { ArrowCounterclockwise20Regular, Copy16Regular, Flash20Regular, LockClosed16Regular, Open16Regular, Play20Regular, ShieldCheckmark16Regular, Stop20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { EmptyState } from "@/components/EmptyState";
@@ -26,7 +27,9 @@ import { VisualCard } from "@/components/VisualCard";
 import { toSessions } from "@/data/model";
 import { sessionsQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
+import { copyText } from "@/lib/clipboard";
 import { describeRequest, notebookParameters, validateRequest, type ControlAction, type ControlRequest } from "@/lib/control";
+import { parameterCellText } from "@/lib/manage-client";
 import { formatAgo, formatDateTimeUtc, formatDuration } from "@/lib/format";
 import { profileLabel, SCENARIOS, SESSION_MINUTES } from "@/lib/scenarios";
 import type { FilterTarget } from "@/lib/view-state";
@@ -98,9 +101,10 @@ function RequestForm({ request, onChange }: { request: ControlRequest; onChange:
 }
 
 function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; onClose: () => void }) {
-    const { manage, notify } = useApp();
+    const { manage, notify, runtime } = useApp();
     const [draft, setDraft] = useState<ControlRequest | null>(request);
     const [prev, setPrev] = useState<ControlRequest | null>(request);
+    const [sending, setSending] = useState(false);
     if (request !== prev) {
         setPrev(request);
         setDraft(request);
@@ -109,6 +113,29 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
     const summary = describeRequest(draft);
     const problem = validateRequest(draft);
     const params = notebookParameters(draft);
+    const replaces = manage.mode === "run" && manage.running && draft.action === "session" ? manage.running : null;
+
+    const copyAndOpen = async () => {
+        const copied = await copyText(parameterCellText(draft));
+        if (runtime.links.controlNotebook) window.open(runtime.links.controlNotebook, "_blank", "noopener,noreferrer");
+        notify(copied ? "Copied: paste it into a new cell under the parameters cell of NB_DatabaseHub_Control, then Run all" : "Copy is blocked here: select the request under The control request and press Ctrl+C", copied ? "success" : "info");
+        onClose();
+    };
+
+    const send = async () => {
+        if (!manage.send || problem) return;
+        setSending(true);
+        try {
+            const answer = await manage.send(draft);
+            if (answer.started) notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy} (run ${answer.jobInstance.slice(0, 8)})`, "success");
+            else notify(`${summary.title} wasn't sent: ${answer.reason}`, "error");
+            onClose();
+        } catch (error) {
+            notify(`${summary.title} wasn't sent: ${error instanceof Error ? error.message : String(error)}`, "error");
+        } finally {
+            setSending(false);
+        }
+    };
 
     return (
         <Dialog open={request !== null} onOpenChange={(_, d) => !d.open && onClose()}>
@@ -117,6 +144,14 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
                     <DialogTitle>{summary.title}</DialogTitle>
                     <DialogContent>
                         <RequestForm request={draft} onChange={setDraft} />
+                        {replaces ? (
+                            <MessageBar intent="warning">
+                                <MessageBarBody>
+                                    <MessageBarTitle>It replaces the session that's running.</MessageBarTitle>
+                                    {`The control's run started ${formatDateTimeUtc(new Date(replaces.startedAt))} follows the newest request, so this one takes over.`}
+                                </MessageBarBody>
+                            </MessageBar>
+                        ) : null}
                         <p className="confirm-head">This will:</p>
                         <ol className="confirm-list">
                             {summary.effects.map((e) => (
@@ -129,17 +164,19 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
                                 <li key={b}>{b}</li>
                             ))}
                         </ul>
-                        <details className="confirm-details">
+                        <details className="confirm-details" open={manage.mode === "copy"}>
                             <summary>The control request</summary>
-                            <p className="muted">NB_DatabaseHub_Control runs with these parameters; no credential is in it or in this app.</p>
-                            <code className="params">{Object.entries(params).map(([k, v]) => `${k} = ${JSON.stringify(v.value)}`).join("\n")}</code>
+                            <p className="muted">
+                                {manage.mode === "copy" ? "Paste it into a new cell under NB_DatabaseHub_Control's parameters cell, then Run all; the notebook checks it and sends it. No credential is in it." : "NB_DatabaseHub_Control runs with these parameters; no credential is in them or in this app."}
+                            </p>
+                            <code className="params">{manage.mode === "copy" ? parameterCellText(draft) : Object.entries(params).map(([k, v]) => `${k} = ${JSON.stringify(v.value)}`).join("\n")}</code>
                         </details>
                         {problem ? (
                             <MessageBar intent="error">
                                 <MessageBarBody>{problem}</MessageBarBody>
                             </MessageBar>
                         ) : null}
-                        {!manage.canRun ? (
+                        {manage.mode === "run" && !manage.canRun ? (
                             <MessageBar intent="info" icon={<LockClosed16Regular />}>
                                 <MessageBarBody>{manage.reason}</MessageBarBody>
                             </MessageBar>
@@ -149,26 +186,23 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
                         <Button appearance="secondary" onClick={onClose}>
                             Cancel
                         </Button>
-                        <Tooltip content={manage.canRun ? "Send it to the session control" : manage.reason} relationship="description">
-                            <Button
-                                appearance="primary"
-                                disabledFocusable={!manage.canRun || problem !== null}
-                                onClick={() => {
-                                    if (!manage.canRun || problem) return;
-                                    notify(`${summary.title}: sent to the session control`, "success");
-                                    onClose();
-                                }}
-                            >
-                                Confirm
+                        {manage.mode === "copy" ? (
+                            <Button appearance="primary" icon={<Copy16Regular />} disabledFocusable={problem !== null} onClick={() => void copyAndOpen()}>
+                                {runtime.links.controlNotebook ? "Copy and open the notebook" : "Copy the request"}
                             </Button>
-                        </Tooltip>
+                        ) : (
+                            <Tooltip content={manage.canRun ? "Send it to the session control" : manage.reason} relationship="description">
+                                <Button appearance="primary" disabledFocusable={!manage.canRun || problem !== null || sending} icon={sending ? <Spinner size="tiny" /> : undefined} onClick={() => void send()}>
+                                    {sending ? "Sending…" : "Confirm"}
+                                </Button>
+                            </Tooltip>
+                        )}
                     </DialogActions>
                 </DialogBody>
             </DialogSurface>
         </Dialog>
     );
 }
-
 const DEFAULTS: Record<ControlAction, ControlRequest> = {
     session: { action: "session", durationMinutes: SESSION_MINUTES.default },
     run: { action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10 },
@@ -199,12 +233,30 @@ export default function ManagePage() {
                 }
             />
 
-            <MessageBar intent={manage.canRun ? "success" : "info"} icon={manage.canRun ? <ShieldCheckmark16Regular /> : <LockClosed16Regular />}>
-                <MessageBarBody>
-                    <MessageBarTitle>{manage.canRun ? "You can run these actions." : "Read-only for you."}</MessageBarTitle>
-                    {manage.canRun ? "Every action asks for confirmation first. The control's allow-lists and caps apply to each request." : manage.reason}
-                </MessageBarBody>
-            </MessageBar>
+            {manage.checking ? (
+                <MessageBar intent="info" icon={<Spinner size="extra-tiny" />}>
+                    <MessageBarBody>{manage.reason}</MessageBarBody>
+                </MessageBar>
+            ) : manage.mode === "copy" ? (
+                <MessageBar intent="info" icon={<Copy16Regular />}>
+                    <MessageBarBody>
+                        <MessageBarTitle>Each action copies its request for the control notebook.</MessageBarTitle>
+                        {manage.reason}
+                    </MessageBarBody>
+                </MessageBar>
+            ) : (
+                <MessageBar intent={manage.canRun ? "success" : "info"} icon={manage.canRun ? <ShieldCheckmark16Regular /> : <LockClosed16Regular />}>
+                    <MessageBarBody>
+                        <MessageBarTitle>{manage.canRun ? `You can run these actions${manage.who ? `, as ${manage.who}` : ""}.` : "Read-only for you."}</MessageBarTitle>
+                        {manage.canRun ? "Every action asks for confirmation first. The control's allow-lists and caps apply to each request, and it records who sent it." : manage.reason}
+                    </MessageBarBody>
+                </MessageBar>
+            )}
+            {manage.mode === "run" && manage.running ? (
+                <MessageBar intent="warning">
+                    <MessageBarBody>{`The control is running a request, started ${formatDateTimeUtc(new Date(manage.running.startedAt))}. A new session replaces it: the control follows the newest request.`}</MessageBarBody>
+                </MessageBar>
+            ) : null}
 
             <section className="actions-grid span-12" aria-label="Actions">
                 {ACTIONS.map((a) => (
@@ -218,7 +270,7 @@ export default function ManagePage() {
                             <Button appearance={a.tone === "primary" ? "primary" : "secondary"} onClick={() => setPending(DEFAULTS[a.action])}>
                                 {a.button}
                             </Button>
-                            {!manage.canRun ? (
+                            {manage.mode === "run" && !manage.canRun && !manage.checking ? (
                                 <span className="muted">
                                     <LockClosed16Regular aria-hidden={true} /> Read-only
                                 </span>
@@ -262,9 +314,10 @@ export default function ManagePage() {
                 <ul className="confirm-list">
                     <li>Run all in NB_DatabaseHub_Control stays the demo's one action; these come in addition to it and do the same things.</li>
                     <li>No secret reaches the browser: the control's webhook URL stays in Key Vault, read by the control notebook.</li>
-                    <li>Every request goes through the control's allow-lists and caps, and the runbook checks it again: the targets, the catalog's scenarios, and their maximum durations.</li>
+                    <li>From the app, only operators send: the app's function verifies who you are from your sign-in, never from what the browser sends, and checks the operators list deploy.ps1 writes (the deployer and the demo's admin group; a redeploy refreshes it).</li>
+                    <li>Every request goes through the control's allow-lists and caps, and the runbook checks it again: the targets, the catalog's scenarios, and their maximum durations. The control records who sent it.</li>
                     <li>The workload acts only inside ContosoCare, on sessions tagged ContosoCare.Demo/.</li>
-                    <li>Viewers without the control's rights see this page read-only, with the reason.</li>
+                    <li>Without the app's function, each action copies its request for the control notebook instead; viewers who aren't operators see this page read-only, with the reason.</li>
                 </ul>
             </section>
 
