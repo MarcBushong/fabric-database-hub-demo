@@ -10,6 +10,14 @@ function Invoke-DemoSignInDataAction {
     its output holds counts and locations only, and the Run Command is deleted afterward
     (Invoke-DemoVmRunCommand). A Clean clears a PowerShell or Application event log only when it holds a
     token-shaped value, and never the Security log, unless an operator asks for it with -ClearSecurityLog.
+
+    With Scope Guest or Both (2026-11-19, dbhubfn: a first onboarding's sweep failed to connect to the guest while the
+    host's own sign-in cleanup checked it), the script first waits, up to LockMinutes, for the T2 host's bootstrap pass to
+    end and holds its lock (bootstrap.lock), so the host's own sign-in cleanup never sweeps the guest at the same time; a
+    lock that isn't free in time sweeps nothing, which Get-DemoSignInDataResult reports as a Fail (fail closed). A guest
+    sweep that fails while the guest runs runs again, up to three more times after pauses of 10, 30, and 60 seconds, with
+    issue #65's recovery on the host first, which restarts the guest at most once for RecoveryKey (deploy.ps1's run) when
+    its PowerShell Direct channel stays broken; the output's guestRecovery says what was done.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -36,7 +44,13 @@ function Invoke-DemoSignInDataAction {
         [string] $ResourceGroupName = '',
 
         [ValidateRange(300, 7200)]
-        [int] $TimeoutSeconds = 2400
+        [int] $TimeoutSeconds = 2400,
+
+        [ValidateRange(0, 60)]
+        [int] $LockMinutes = 20,
+
+        [AllowEmptyString()]
+        [string] $RecoveryKey = ''
     )
 
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoSignInResidue.ps1') -Raw
@@ -46,6 +60,20 @@ function Invoke-DemoSignInDataAction {
         IncludeBrowserCache = $(if ($IncludeBrowserCache) { 'true' } else { 'false' })
         ClearEventLogs      = $(if ($KeepEventLogs) { 'false' } else { 'true' })
         ClearSecurityLog    = $(if ($ClearSecurityLog) { 'true' } else { 'false' })
+    }
+    if ($Scope -in 'Guest', 'Both') {
+        if ($LockMinutes -gt 0) {
+            $values['ResidueLockMinutes'] = [string]$LockMinutes
+            # The wait for the host's pass comes first, then the sweep and up to three more tries, with a restart of the
+            # guest when its channel stays broken (about 17 minutes at most).
+            $TimeoutSeconds = [System.Math]::Min(7200, [System.Math]::Max($TimeoutSeconds, $LockMinutes * 60 + 3600))
+        }
+        if (-not $PSBoundParameters.ContainsKey('RecoveryKey')) {
+            $RecoveryKey = Get-DemoRunRecoveryKey
+        }
+        if ($RecoveryKey) {
+            $values['RecoveryKey'] = $RecoveryKey
+        }
     }
     $arguments = @{
         Config              = $Config
@@ -108,10 +136,23 @@ function Get-DemoSignInDataSummary {
     $reachable = [bool](Get-DemoMemberValue -InputObject $Part -Name 'reachable')
     $found = Get-DemoMemberValue -InputObject $Part -Name 'found'
     $remaining = Get-DemoMemberValue -InputObject $Part -Name 'remaining'
+    # Why a machine couldn't be reached: its state and PowerShell Direct's own error, which the status page shows
+    # (2026-11-19, dbhubfn: "couldn't be reached (Running)" said nothing more).
+    $state = [string](Get-DemoMemberValue -InputObject $Part -Name 'state')
+    $shorten = {
+        param([string] $Text)
+        $Text = (Protect-DemoText -Text $Text).Trim()
+        if ($Text.Length -gt 220) { $Text.Substring(0, 217).TrimEnd() + '...' } else { $Text }
+    }
+    $partError = & $shorten ([string](Get-DemoMemberValue -InputObject $Part -Name 'error'))
+    $firstError = & $shorten ([string](Get-DemoMemberValue -InputObject $Part -Name 'firstError'))
     $left = [System.Collections.Generic.List[string]]::new()
     if (-not $reachable) {
-        $state = [string](Get-DemoMemberValue -InputObject $Part -Name 'state')
-        $left.Add(('{0} couldn''t be reached ({1})' -f $Label, $(if ($state) { $state } else { 'no answer' })))
+        $why = if ($state) { $state } else { 'no answer' }
+        if ($partError) {
+            $why = '{0}: {1}' -f $why, $partError.TrimEnd('.')
+        }
+        $left.Add(('{0} couldn''t be reached ({1})' -f $Label, $why))
     }
     else {
         $userData = (& $count $remaining 'user') + (& $count $remaining 'other')
@@ -142,6 +183,9 @@ function Get-DemoSignInDataSummary {
         Label      = $Label
         Reachable  = $reachable
         Pass       = $reachable -and [bool](Get-DemoMemberValue -InputObject $Part -Name 'pass')
+        State      = $state
+        Error      = $partError
+        FirstError = $firstError
         Found      = $found
         Remaining  = $remaining
         Left       = $left.ToArray()
@@ -204,6 +248,23 @@ function Get-DemoSignInDataResult {
     }
     $data = $Outcome.Data
     $evidence['action'] = [string](Get-DemoMemberValue -InputObject $data -Name 'action')
+    # The host bootstrap's lock, which a guest sweep waits for so it never runs beside the host's own sign-in cleanup
+    # (2026-11-19): one that wasn't free in time swept nothing (fail closed).
+    $lock = Get-DemoMemberValue -InputObject $data -Name 'lock'
+    if ($null -ne $lock) {
+        $evidence['lockSeconds'] = [int](Get-DemoMemberValue -InputObject $lock -Name 'seconds')
+        if ([bool](Get-DemoMemberValue -InputObject $lock -Name 'timedOut')) {
+            $evidence['lockTimedOut'] = $true
+            $guestText = if ($GuestName) { ' or in {0}' -f $GuestName } else { '' }
+            $message = 'Sign-in data on {0}{1} wasn''t checked, so it''s treated as left (fail closed): {0}''s own bootstrap pass held its lock for {2} minutes, and the check never sweeps beside it.' -f $VmName, $guestText, [int][System.Math]::Round([int]$evidence['lockSeconds'] / 60)
+            return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Fail' -Message $message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl)
+        }
+    }
+    # Issue #65's recovery of the guest sweep: what broke, what the host did, and whether the sweep then ran.
+    $recovery = Get-DemoMemberValue -InputObject $data -Name 'guestRecovery'
+    if ($null -ne $recovery) {
+        $evidence['guestRecovery'] = $recovery
+    }
     $parts = @(
         Get-DemoSignInDataSummary -Part (Get-DemoMemberValue -InputObject $data -Name 'local') -Label $VmName
         if ($GuestName) { Get-DemoSignInDataSummary -Part (Get-DemoMemberValue -InputObject $data -Name 'guest') -Label ('{0} (guest)' -f $GuestName) }
@@ -222,12 +283,39 @@ function Get-DemoSignInDataResult {
             foundAt   = $part.FoundAt
             leftAt    = $part.LeftAt
         }
+        if (-not $part.Reachable) {
+            $evidence[$part.Label]['state'] = $part.State
+            $evidence[$part.Label]['error'] = $part.Error
+            if ($part.FirstError) {
+                $evidence[$part.Label]['firstError'] = $part.FirstError
+            }
+        }
     }
     $failed = @($parts | Where-Object { -not $_.Pass })
     $cleaned = $evidence['action'] -eq 'Clean'
     if ($failed.Count -gt 0) {
         $detail = @($failed | ForEach-Object { '{0}: {1}' -f $_.Label, ($(if ($_.Left.Count) { $_.Left -join ', ' } else { 'not verified' })) }) -join '; '
         $message = '{0}sign-in data is left (fail closed): {1}.' -f $(if ($cleaned) { 'After the cleanup, ' } else { '' }), $detail
+        # What the guest sweep's recovery did before it gave up (issue #65's bounded recovery and the tries after it, 2026-11-19).
+        if ($null -ne $recovery -and @($failed | Where-Object { -not $_.Reachable -and $_.Label -like '* (guest)' }).Count -gt 0) {
+            $recoveryText = (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $recovery -Name 'message'))).Trim()
+            $ranAgain = [bool](Get-DemoMemberValue -InputObject $recovery -Name 'ranAgain')
+            $restarted = [bool](Get-DemoMemberValue -InputObject $recovery -Name 'restarted')
+            $more = [int](Get-DemoMemberValue -InputObject $recovery -Name 'tries') - 1
+            if ($ranAgain -and $more -lt 1) {
+                $more = 1
+            }
+            $times = if ($more -gt 1) { '{0} more times, and each failed too' -f $more } else { 'once more, and that failed too' }
+            $message += if ($ranAgain -and $restarted) {
+                ' It ran {0}, after {1} restarted {2} once for this run.' -f $times, $VmName, $GuestName
+            }
+            elseif ($ranAgain) {
+                ' It ran {0}.' -f $times
+            }
+            else {
+                ' It didn''t run once more: {0}' -f $(if ($recoveryText) { $recoveryText } else { 'the guest didn''t answer again.' })
+            }
+        }
         return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Fail' -Message $message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl)
     }
     $names = ($parts | ForEach-Object { $_.Label }) -join ' and '
