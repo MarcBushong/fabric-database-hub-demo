@@ -1038,6 +1038,62 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $rebuild[0].status | Should -Be 'Warning'
     }
 
+    It 'shows what failed in the sign-in data check after the Arc onboarding on its own row, and its guest recovery on T2''s restart row (2026-11-19, dbhubfn)' {
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboarding'; message = 'Waiting for the orchestrator.' }; TimedOut = $false; Failed = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray() } }
+        $script:atUtc = [DateTime]::UtcNow.AddMinutes(1).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:sweepRecord = [ordered]@{
+            status        = 'Fail'
+            message       = 'After the cleanup, sign-in data is left (fail closed): arcsql01 (guest): arcsql01 (guest) couldn''t be reached (Running: The Hyper-V socket target process has ended. (PSSessionStateBroken)). It ran 3 more times, and each failed too, after archost01 restarted arcsql01 once for this run.'
+            seconds       = 412
+            guestRecovery = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $false; ranAgain = $true; seconds = 140; atUtc = $script:atUtc; restartUtc = $script:atUtc; stoppedBy = 'Shutdown'; by = 'the sign-in data cleanup'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith {
+            New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Fail' -Message ('arcsql01 is onboarded, but the onboarding token''s traces couldn''t be removed and verified: {0}' -f $script:sweepRecord['message']) -Evidence ([ordered]@{ signInData = $script:sweepRecord }) -Remediation 'Run ./scripts/deploy.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself, and T2 goes on once it passes.'
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Fail'
+        $restart = @($outcome.Results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUESTRESTART' })
+        $restart.Count | Should -Be 1
+        $restart[0].status | Should -Be 'Fail'
+        $restart[0].message | Should -Match 'the sign-in data cleanup restarted arcsql01 once for this run'
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['T2.SignInCleanup']['state'] | Should -Be 'Failed'
+        $rows['T2.SignInCleanup']['status'] | Should -Be 'Fail'
+        $rows['T2.SignInCleanup']['message'] | Should -Match 'couldn''t be reached \(Running: The Hyper-V socket target process has ended'
+        $rows['T2.SignInCleanup']['message'] | Should -Match '\./scripts/deploy\.ps1 runs it again'
+        $rows['T2.GuestRestart']['state'] | Should -Be 'Failed'
+        $rows['T2.GuestRestart']['message'] | Should -Match 'the sign-in data cleanup restarted arcsql01'
+
+        # A sweep whose retry got through (the break was over): T2 goes on, and the restart row says so as a Warning.
+        $script:sweepRecord = [ordered]@{ status = 'Pass'; message = 'Sign-in data was removed from archost01 and arcsql01 (guest), and none is left.'; seconds = 230; guestRecovery = [ordered]@{ action = 'Healed'; restarted = $false; recovered = $true; ranAgain = $true; seconds = 0; atUtc = $script:atUtc; restartUtc = ''; stoppedBy = ''; by = 'the sign-in data cleanup'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith {
+            New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'arcsql01 is onboarded and Connected; the host continues its bootstrap.' -Evidence ([ordered]@{ signInData = $script:sweepRecord })
+            New-DemoResult -CheckId 'T2.ARC.CONNECTED' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.'
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        $retry = @($outcome.Results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUESTRETRY' })
+        $retry.Count | Should -Be 1
+        $retry[0].status | Should -Be 'Warning'
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['T2.SignInCleanup']['state'] | Should -Be 'Done'
+        $rows['T2.GuestRestart']['state'] | Should -Be 'Done'
+        $rows['T2.GuestRestart']['status'] | Should -Be 'Warning'
+        $rows['T2.GuestRestart']['message'] | Should -Match 'the sign-in data cleanup waited until arcsql01 answered again'
+    }
+
     It 'clears what an earlier guided stop left open before the T2 host''s loader starts a new generation, and nothing without it (review of 849d4c2, 2026-11-09)' {
         # The T2 host runs a guest built in PaygWizard mode as JumpstartImage now, so an earlier guided stop's request there
         # would keep that guest waiting for a person: it goes before the loader, with Bastion and a handed-over host password.

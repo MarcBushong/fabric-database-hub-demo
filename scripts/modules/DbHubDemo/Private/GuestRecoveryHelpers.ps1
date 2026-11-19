@@ -149,7 +149,8 @@ function ConvertTo-DemoGuestRecovery {
 function Get-DemoGuestRecoveryRunResult {
     <#
     .SYNOPSIS
-    For each recovery from a broken PowerShell Direct channel since SinceUtc that Result's evidence (guestRecovery) or
+    For each recovery from a broken PowerShell Direct channel since SinceUtc that Result's evidence (guestRecovery, or
+    signInData.guestRecovery: the sign-in data sweep after an Arc onboarding, 2026-11-19) or
     Health (the T2 host's guestRecovery) shows and Result doesn't report yet: <CheckPrefix>.T2.GUESTRETRY, a Warning, when
     the break was over and the step ran again; <CheckPrefix>.T2.GUESTRESTART, a Warning that says what broke and that the
     guest's restart cleared it, or a Fail when the guest still didn't answer. One per recovery (by its time). Pure.
@@ -186,9 +187,17 @@ function Get-DemoGuestRecoveryRunResult {
             [void]$reported.Add((ConvertTo-DemoRecoveryUtcText -Value (Get-DemoMemberValue -InputObject $evidence -Name 'atUtc')))
             continue
         }
-        $recovery = ConvertTo-DemoGuestRecovery -InputObject (Get-DemoMemberValue -InputObject $evidence -Name 'guestRecovery')
-        if ($null -ne $recovery) {
-            $found.Add([pscustomobject]@{ Recovery = $recovery; From = [string]$item.checkId })
+        # The step's own recovery, and the sign-in data sweep's after an Arc onboarding (2026-11-19), which recovers its own
+        # PowerShell Direct calls into the guest.
+        $sources = @(
+            Get-DemoMemberValue -InputObject $evidence -Name 'guestRecovery'
+            Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $evidence -Name 'signInData') -Name 'guestRecovery'
+        )
+        foreach ($source in $sources) {
+            $recovery = ConvertTo-DemoGuestRecovery -InputObject $source
+            if ($null -ne $recovery) {
+                $found.Add([pscustomobject]@{ Recovery = $recovery; From = [string]$item.checkId })
+            }
         }
     }
     $fromHealth = ConvertTo-DemoGuestRecovery -InputObject (Get-DemoMemberValue -InputObject $Health -Name 'guestRecovery')

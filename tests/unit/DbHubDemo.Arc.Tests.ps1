@@ -536,6 +536,13 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:sweepPart = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 1; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 1; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @('Windows PowerShell|u1 a0 o0|..'); found_at = @(); left_at = @(); seconds = 9 }
         # The guest's part when a test sets it; the host's otherwise.
         $script:sweepGuest = $null
+        # The sweep's other output (lock, guestRecovery) when a test sets it (2026-11-19).
+        $script:sweepExtra = [ordered]@{}
+        # The resource group's record that a sweep after onboarding is owed (DbHubArcSweepUtc): none unless a test sets it.
+        $script:sweepOwed = ''
+        $script:owedWrites = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcSweepOwed -MockWith { $script:sweepOwed }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoArcSweepOwed -MockWith { $script:owedWrites.Add([string]$Value); $script:sequence.Add($(if ($Value) { 'owed' } else { 'owed-cleared' })); $true }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ state = $script:hostState; message = 'host message' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { $script:machine }
@@ -559,7 +566,20 @@ Describe 'Invoke-DemoArcOnboarding' {
                 foreach ($key in $PesterBoundParameters['Parameter'].Keys) { $parameterCopy[$key] = $PesterBoundParameters['Parameter'][$key] }
             }
             $script:runs.Add([pscustomobject]@{ Name = $RunCommandName; Parameter = $parameterCopy; Protected = $protectedCopy; VmName = $PesterBoundParameters['VmName'] })
-            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $(if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }) } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
+            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') {
+                $script:probe | ConvertTo-Json -Compress
+            }
+            elseif ($RunCommandName -eq 'DbHubDemo-SignInData') {
+                $guestPart = if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }
+                $sweepOut = [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass -and [bool]$guestPart.pass; local = $script:sweepPart; guest = $guestPart }
+                foreach ($key in $script:sweepExtra.Keys) {
+                    $sweepOut[$key] = $script:sweepExtra[$key]
+                }
+                $sweepOut | ConvertTo-Json -Compress -Depth 6
+            }
+            else {
+                '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}'
+            }
             [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
         }
     }
@@ -744,7 +764,7 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:machine = New-TestMachine -Status 'Disconnected'
         $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
         $result.status | Should -Be 'Pass'
-        $script:sequence | Should -Be @('DbHubDemo-ArcProbe', 'cleanup', 'identity', 'token', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $script:sequence | Should -Be @('DbHubDemo-ArcProbe', 'cleanup', 'identity', 'token', 'owed', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData', 'owed-cleared') -Because 'the sweep is recorded as owed before the token goes to the host, and cleared once it passed (2026-11-19)'
         $result.evidence.tokenSource | Should -Be 'Caller'
         $onboard = $script:runs[1]
         $onboard.VmName | Should -Be 'archost01'
@@ -877,6 +897,111 @@ Describe 'Invoke-DemoArcOnboarding' {
         $result.evaluationOnly | Should -BeTrue
         $script:runs[0].VmName | Should -Be 'arcsql01'
         $script:runs[0].Parameter['Mode'] | Should -Be 'EvaluationOnlyAzureVm'
+    }
+
+    It 'sweeps only after the host''s own bootstrap pass (its lock), with the run''s recovery key, and reports the guest restart that cleared the sweep''s broken channel (2026-11-19, dbhubfn)' {
+        $script:sweepExtra['lock'] = [ordered]@{ minutes = 30; seconds = 312; timedOut = $false }
+        $script:sweepExtra['guestRecovery'] = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $true; ranAgain = $true; seconds = 95; atUtc = '2026-11-19T19:44:02.0000000Z'; restartUtc = '2026-11-19T19:44:31.0000000Z'; stoppedBy = 'Shutdown'; by = 'the sign-in data cleanup'; key = 'deploy-bbbbbbbbbbbb'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'; message = 'arcsql01 was restarted once (a clean shutdown, 95 s) and answers over PowerShell Direct again.'; guest = 'arcsql01' }
+        InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key 'deploy-bbbbbbbbbbbb' }
+        try {
+            $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        }
+        finally {
+            InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key '' }
+        }
+        $result.status | Should -Be 'Pass'
+        $sweep = @($script:runs | Where-Object Name -EQ 'DbHubDemo-SignInData')[0]
+        $sweep.Parameter['ResidueScope'] | Should -Be 'Both'
+        $sweep.Parameter['ResidueLockMinutes'] | Should -Be '30' -Because 'the host''s own sign-in cleanup must never sweep the guest at the same time'
+        $sweep.Parameter['RecoveryKey'] | Should -Be 'deploy-bbbbbbbbbbbb'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'waits for archost01''s own bootstrap pass first \(at most 30 minutes\), so the two never sweep arcsql01 at the same time' }
+        $result.evidence.signInData.lockSeconds | Should -Be 312
+        $result.evidence.signInData.guestRecovery.restarted | Should -BeTrue
+        # deploy.ps1 reports it once, as it does the onboarding's own restart (issue #65).
+        $restarts = @(InModuleScope DbHubDemo -Parameters @{ R = $result } { param($R) Get-DemoGuestRecoveryRunResult -Result @($R) -CheckPrefix 'DEPLOY' })
+        $restarts.Count | Should -Be 1
+        $restarts[0].checkId | Should -Be 'DEPLOY.T2.GUESTRESTART'
+        $restarts[0].status | Should -Be 'Warning'
+        $restarts[0].message | Should -Match 'the sign-in data cleanup restarted arcsql01 once for this run'
+        $restarts[0].message | Should -Match 'Hyper-V socket target process has ended'
+    }
+
+    It 'fails closed with PowerShell Direct''s own error when the guest still can''t be reached, keeps the record, and NOT DONE''s one next step is ./scripts/deploy.ps1 (2026-11-19, dbhubfn)' {
+        $script:sweepGuest = [ordered]@{ reachable = $false; state = 'Running'; pass = $false; error = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' }
+        $script:sweepExtra['guestRecovery'] = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $false; tries = 4; ranAgain = $true; seconds = 140; atUtc = '2026-11-19T19:44:02.0000000Z'; restartUtc = '2026-11-19T19:44:31.0000000Z'; stoppedBy = 'Shutdown'; by = 'the sign-in data cleanup'; key = 'deploy-bbbbbbbbbbbb'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'; message = 'arcsql01 was restarted once (a clean shutdown, 140 s) and answers over PowerShell Direct again.'; guest = 'arcsql01' }
+        $failed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'traces couldn''t be removed and verified'
+        $failed.message | Should -Match 'arcsql01 \(guest\) couldn''t be reached \(Running: The Hyper-V socket target process has ended'
+        $failed.message | Should -Match 'It ran 3 more times, and each failed too, after archost01 restarted arcsql01 once for this run'
+        $failed.evidence.signInData.error | Should -Match 'PSSessionStateBroken'
+        $failed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself'
+        # Owed before the onboarding, and again after the failed sweep; never cleared.
+        $script:owedWrites.Count | Should -Be 2
+        $script:owedWrites | Should -Not -Contain ''
+        # Live, NOT DONE said to run check-sign-in-data.ps1 until it passes, then configure-arc.ps1, then deploy.ps1 (F8).
+        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ R = $failed; S = $state; C = (New-TestConfig) } { param($R, $S, $C) Get-DemoDeploymentOutcome -Result @($R) -State $S -Config $C -Command './scripts/deploy.ps1' }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Match '^Run \./scripts/deploy\.ps1 again: '
+        $outcome.Next | Should -Not -Match 'check-sign-in-data|configure-arc|Then run'
+    }
+
+    It 'sweeps again by itself on a later run while the record says it''s owed, whatever the host''s state, and clears it once it passes (2026-11-19, dbhubfn)' {
+        $script:sweepOwed = '2026-11-19T19:37:17Z'
+        # A Ready host, where onboarding ran nothing before.
+        $script:hostState = 'Ready'
+        $ready = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Match 'is Ready, so it isn''t waiting for onboarding'
+        $ready.message | Should -Match 'which didn''t pass then, passed now: Sign-in data was removed from archost01 and arcsql01 \(guest\), and none is left'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-SignInData')
+        $script:runs[0].Parameter['ResidueScope'] | Should -Be 'Both'
+        $script:runs[0].Parameter['ResidueLockMinutes'] | Should -Be '30'
+        $script:owedWrites | Should -Be @('')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
+
+        # Past onboarding and already Connected, while the host's pass still runs.
+        $script:hostState = 'InProgress'
+        $script:machine = New-TestMachine
+        $script:runs.Clear()
+        $script:owedWrites.Clear()
+        $connected = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Pass'
+        $connected.message | Should -Match 'already Connected.*passed now'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-SignInData')
+        $script:owedWrites | Should -Be @('')
+
+        # -Force on a guest that's Connected (a golden copy): after the marker.
+        $script:hostState = 'WaitingForArcOnboarding'
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:runs.Clear()
+        $script:owedWrites.Clear()
+        $marker = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $marker.status | Should -Be 'Pass'
+        $marker.message | Should -Match 'the marker was written again.*passed now'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $script:runs[1].Parameter['Action'] | Should -Be 'WriteMarker'
+        $script:owedWrites | Should -Be @('')
+
+        # A sweep that fails again keeps the record, with the same time, and the same one fix.
+        $script:hostState = 'Ready'
+        $script:sweepGuest = [ordered]@{ reachable = $false; state = 'Running'; pass = $false; error = 'Cannot find path ''C:\Windows\Temp\x.log'' because it does not exist. (PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand)' }
+        $script:owedWrites.Clear()
+        $again = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $again.status | Should -Be 'Fail'
+        $again.message | Should -Match 'PathNotFound'
+        $again.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+        $script:owedWrites | Should -Be @('2026-11-19T19:37:17Z')
+
+        # Without the record, a Ready host runs nothing, as before.
+        $script:sweepOwed = ''
+        $script:runs.Clear()
+        (Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1).message | Should -Not -Match 'passed now'
+        $script:runs.Count | Should -Be 0
     }
 }
 

@@ -1642,7 +1642,7 @@ function Invoke-DemoDeploymentTrack {
                         Update-DemoT2InstallModeRecord -Config $Config -Health $build.Health -State $sent -Confirm:$false
                         $left = [int][System.Math]::Max(30, ($t2Deadline - [DateTime]::UtcNow).TotalMinutes)
                         $arcArguments['WaitForHostMinutes'] = [System.Math]::Min(360, $left)
-                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database.'
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database; deploy.ps1''s own check after the onboarding waits for that pass, so the two never sweep arcsql01 at the same time.'
                     }
                     else {
                         $arcArguments['WaitForHostMinutes'] = 0
@@ -1673,11 +1673,22 @@ function Invoke-DemoDeploymentTrack {
                     # Its Run Commands that ran under a fresh name (2026-11-13 live finding) show on the onboarding's row.
                     $arcStuck = @(Get-DemoRunCommandStuckResult -Clear)
                     & $addAll $arcStuck
-                    # A guest restart that cleared a broken PowerShell Direct channel during onboarding (issue #65).
+                    # A guest restart that cleared a broken PowerShell Direct channel during onboarding (issue #65), its sign-in
+                    # data sweep's included (2026-11-19).
                     & $reportGuestRestart $null
                     $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
                     if ($onboarding.Count -gt 0) {
                         & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
+                    }
+                    # The sign-in data check after the onboarding says on its own row what failed (2026-11-19, dbhubfn: the row
+                    # kept its Running text, and the guest's error was dropped), in the build path and the golden one.
+                    $sweepRecord = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject ($arc | Where-Object { [string]$_.checkId -eq 'T2.ARC.ONBOARDING' } | Select-Object -First 1) -Name 'evidence') -Name 'signInData'
+                    $sweepStatus = [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'status')
+                    if ($sweepStatus -eq 'Fail') {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Failed' -Status 'Fail' -Message ('The sign-in data check after the Arc onboarding: {0} ./scripts/deploy.ps1 runs it again.' -f [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'message'))
+                    }
+                    elseif ($sweepStatus -eq 'Manual action required') {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Action needed' -Status 'Manual action required' -Message ('The sign-in data check after the Arc onboarding: {0}' -f [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'message'))
                     }
                     # The migration assessment is optional (2026-11-18 review): its result never ends T2's track.
                     if (& $hasStatus @($arc | Where-Object { [string]$_.checkId -ne 'T2.ARC.MIGRATIONASSESSMENT' }) 'Fail') {
