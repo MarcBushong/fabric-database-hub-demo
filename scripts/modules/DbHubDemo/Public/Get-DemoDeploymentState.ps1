@@ -27,7 +27,9 @@ function Get-DemoDeploymentState {
     last replica was created with, in the DbHubT4ReplicaSize tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
     nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
     ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
-    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), and Tags
+    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), T5Refused (when
+    Azure didn't create T5's account and the run deployed the rest without it, in DbHubT5Refused; 2026-11-19,
+    Resolve-DemoT5LeftOut), and Tags
     (every tag on the group). Read-only.
 
     .PARAMETER Config
@@ -87,6 +89,7 @@ function Get-DemoDeploymentState {
         BusyBy            = & $read 'BusyBy'
         FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
         ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
+        T5Refused         = & $read 'T5Refused'
         Tags              = $tags
     }
 }

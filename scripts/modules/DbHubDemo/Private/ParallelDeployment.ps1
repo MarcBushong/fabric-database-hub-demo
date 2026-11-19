@@ -582,6 +582,14 @@ function Invoke-DemoParallelDeployment {
     # deploys the template.
     $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
+    # A resume after an earlier run left T5 out because Azure didn't create its account (DbHubT5Refused; review, 2026-11-19):
+    # this run leaves it out too, said once and on its rows; a run that deploys the template tries T5 again.
+    $t5Resume = if ($whatIf) { $null } else { Resolve-DemoT5LeftOut -Config $Config -State $state -TemplateRuns:$templateRuns }
+    if ($null -ne $t5Resume) {
+        $Config = $t5Resume.Config
+        $results.Add($t5Resume.Result)
+        Write-DemoLog -Level Warning -Message ([string]$t5Resume.Result.message)
+    }
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
     $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks) -ReopenFabric:$reopenFabric
     if ($whatIf) {
@@ -604,6 +612,10 @@ function Invoke-DemoParallelDeployment {
     if ($null -ne $t5Off -and -not $whatIf) {
         $results.Add($t5Off)
         Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Not selected' -Message ([string]$t5Off.message)
+    }
+    # T5 left out by an earlier run (review, 2026-11-19): its rows say why.
+    if ($null -ne $t5Resume) {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message ([string]$t5Resume.Result.message)
     }
     # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
     # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
@@ -1092,6 +1104,16 @@ function Invoke-DemoParallelDeployment {
                     $skipT4 = -not [bool]$deployedT4
                 }
             }
+            # T5 left out because Azure didn't create its account (review, 2026-11-19): the rest of the run, the tracks
+            # included, goes on without it, and its rows say why.
+            $t5LeftOutText = ''
+            $deployedT5 = Get-DemoMemberValue -InputObject $deployment -Name 'T5Enabled'
+            if ($null -ne $deployedT5 -and -not [bool]$deployedT5 -and (Test-DemoT5Enabled -Config $Config)) {
+                $t5LeftOutText = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T5LeftOut')
+                $Config = Copy-DemoT5OffConfig -Config $Config -Reason $t5LeftOutText
+                $t5Warning = @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T5' }) | Select-Object -Last 1
+                Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message $(if ($null -ne $t5Warning) { [string]$t5Warning.message } else { 'T5 is left out of this run: Azure didn''t create its account.' })
+            }
             if ($firstDeployment) {
                 # What the template created runs and bills from now on, even when the run stops: the ending names it when
                 # the run isn't DONE. Only after the template succeeded, and T4 only when it was deployed (Phase 28 review:
@@ -1111,6 +1133,9 @@ function Invoke-DemoParallelDeployment {
             if ($t4NoteValue) {
                 $infrastructureText += ' ' + $t4NoteValue
             }
+            if ($t5LeftOutText) {
+                $infrastructureText += ' T5 is left out of this run: Azure didn''t create its account (DEPLOY.T5 says why, with the fix).'
+            }
             # T4's row on the status page says an automatic size change too (2026-11-09): its track gets the notice.
             # Get-DemoMemberValue keeps an array whole, so the results are unrolled from a variable.
             $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
@@ -1118,7 +1143,7 @@ function Invoke-DemoParallelDeployment {
             $context['T4Notice'] = if ($null -ne $sizeChange) { [string]$sizeChange.message } else { '' }
             # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the step is a Warning.
             $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
-            & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $infrastructureText
+            & $stageResult 'Infrastructure' $(if ($overCeiling -or $t5LeftOutText) { 'Warning' } else { 'Pass' }) $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }
@@ -1146,7 +1171,7 @@ function Invoke-DemoParallelDeployment {
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
-            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); T4Notice = [string]$context['T4Notice']; Message = '' }) -Confirm:$false
+            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); T4Notice = [string]$context['T4Notice']; T5Enabled = (Test-DemoT5Enabled -Config $Config); T5LeftOut = [string]$Config['t5LeftOut']; Message = '' }) -Confirm:$false
         }
         elseif ($needsArtifacts) {
             try {

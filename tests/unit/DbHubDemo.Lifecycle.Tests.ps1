@@ -1010,6 +1010,22 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T5.WARMUP' }).status | Should -Be 'Pass'
     }
 
+    It 'goes on without T5 when the template left it out, and says so on the Infrastructure stage (-Sequential; review, 2026-11-19)' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+            $script:order.Add('Template')
+            [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{}; Changes = @(); T3UseFreeLimit = $T3UseFreeLimit; T5Enabled = $false; T5LeftOut = 'ServiceUnavailable: high demand' }
+        }
+        $results = @(Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -StopAfter T4)
+        $script:order | Should -Contain 'Template'
+        $script:order | Should -Not -Contain 'TestT5'
+        $script:order | Should -Not -Contain 'WarmT5'
+        $infrastructure = $results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }
+        $infrastructure.status | Should -Be 'Warning'
+        $infrastructure.message | Should -Match 'T5 is left out of this run'
+    }
+
     It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
         $pinned = New-TestConfig -WithT4
         $pinned['t4SkuName'] = 'Standard_B1ms'

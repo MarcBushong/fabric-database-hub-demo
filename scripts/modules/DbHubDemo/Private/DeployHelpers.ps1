@@ -121,6 +121,10 @@ function Get-DemoDeploymentStateTagName {
         # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
         FabricWorkspaceId        = 'DbHubFabricWorkspaceId'
         ControlWorkspaceId       = 'DbHubControlWorkspaceId'
+        # 2026-11-19 (review of T5): when Azure didn't create T5's account and deploy.ps1 deployed the rest without it (UTC),
+        # so a resume leaves T5 out instead of starting from preflight (Resolve-DemoT5LeftOut); a template run that creates
+        # T5 clears it.
+        T5Refused                = 'DbHubT5Refused'
     }
 }
 

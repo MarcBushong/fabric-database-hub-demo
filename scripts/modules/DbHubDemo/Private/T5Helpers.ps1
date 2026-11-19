@@ -390,6 +390,11 @@ function Get-DemoT5MissingResult {
     if (-not (Test-DemoT5Enabled -Config $Config)) {
         return $null
     }
+    # An earlier run recorded that Azure didn't create the account (DbHubT5Refused; review, 2026-11-19): a resume leaves T5
+    # out (Resolve-DemoT5LeftOut) instead of starting from preflight, which would fail the same way.
+    if ([string](Get-DemoMemberValue -InputObject $State -Name 'T5Refused')) {
+        return $null
+    }
     $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
     $deploymentId = ''
     if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) {
@@ -407,9 +412,189 @@ function Get-DemoT5MissingResult {
     return (New-DemoResult -CheckId 'DEPLOY.T5.MISSING' -Area 't5' -Target 'T5' -Status 'Pass' -Message $message -Evidence ([ordered]@{ accountName = $accountName; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage'); state = [string]$current.State }) -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))
 }
 
+# T5's nested deployments, the module names in infra/modules/demo.bicep (Get-DemoT5OnlyFailure; review, 2026-11-19).
+$script:T5DeploymentNames = @('cosmos01', 'cosmos01-access')
+
+function Get-DemoT5OnlyFailure {
+    <#
+    .SYNOPSIS
+    Whether a failed template deployment failed in T5's resources alone (review, 2026-11-19): every innermost error of its
+    failed operations (Get-DemoDeploymentFailure's Errors) is T5's or, when Azure refused the deployment before it ran,
+    every resource a policy disallowed is. Returns T5Only and Text (Azure's reason, redacted). Pure. Internal.
+
+    .DESCRIPTION
+    T5's resources (infra/modules/cosmos01.bicep and cosmos01-access.bicep): the Microsoft.DocumentDB types, the nested
+    deployments cosmos01 and cosmos01-access, the private endpoint pe-<prefix>-<environment>-cosmos01 with its DNS zone
+    group, and the private DNS zone privatelink.documents.azure.com with its link. A failure without an error that names
+    a resource is never T5's alone.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Cause,
+
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $ErrorText = ''
+    )
+
+    $names = Get-DemoT5Name -Config $Config -NoLookup
+    $prefix = [string](Get-DemoCosmosSetting)['accountNamePrefix']
+    $isT5 = {
+        param([string] $Type, [string] $Name)
+        $first = ($Name -split '/')[0]
+        if ($Type -like 'Microsoft.DocumentDB/*') {
+            return $true
+        }
+        if ($Type -eq 'Microsoft.Resources/deployments') {
+            return ($first -in $script:T5DeploymentNames)
+        }
+        if ($Type -like 'Microsoft.Network/privateEndpoints*') {
+            return ($first -eq $names.PrivateEndpointName)
+        }
+        if ($Type -like 'Microsoft.Network/privateDnsZones*') {
+            return ($first -eq $names.PrivateDnsZoneName)
+        }
+        if (-not $Type) {
+            return ($first -like ('{0}-*' -f $prefix) -or $first -eq $names.PrivateEndpointName -or $first -eq $names.PrivateDnsZoneName)
+        }
+        return $false
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $causeErrors = Get-DemoMemberValue -InputObject $Cause -Name 'Errors'
+    $errors = @(@($causeErrors) | Where-Object { $null -ne $_ })
+    if ($errors.Count -gt 0) {
+        $t5 = @($errors | Where-Object { & $isT5 ([string]$_.ResourceType) ([string]$_.ResourceName) })
+        return [pscustomobject]@{ T5Only = ($t5.Count -eq $errors.Count); Text = [string](Get-DemoMemberValue -InputObject $Cause -Name 'Text') }
+    }
+    # Refused before it ran (InvalidTemplateDeployment): a policy names each resource it disallowed.
+    $text = [string]$ErrorText
+    $disallowed = @([regex]::Matches($text, '(?i)Resource ''([^'']+)'' was disallowed by policy') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    if ($disallowed.Count -gt 0 -and $text -match '(?i)\bRequestDisallowedByPolicy\b') {
+        $t5 = @($disallowed | Where-Object { & $isT5 '' $_ })
+        return [pscustomobject]@{ T5Only = ($t5.Count -eq $disallowed.Count); Text = (Protect-DemoText -Text ('RequestDisallowedByPolicy: Azure Policy disallowed {0}' -f ($disallowed -join ', '))) }
+    }
+    return [pscustomobject]@{ T5Only = $false; Text = '' }
+}
+
+function Copy-DemoT5OffConfig {
+    # A copy of the configuration with T5 left out of this run (review, 2026-11-19): t5Enabled false, and t5LeftOut, why, so
+    # the run says T5 is left out rather than off in the configuration (New-DemoT5OffResult). The file isn't changed. Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $Reason = ''
+    )
+
+    $copy = [ordered]@{}
+    foreach ($key in $Config.Keys) {
+        $copy[$key] = $Config[$key]
+    }
+    $copy['t5Enabled'] = $false
+    $copy['t5LeftOut'] = if ($Reason) { $Reason } else { 'Azure didn''t create its account' }
+    return $copy
+}
+
+function New-DemoT5LeftOutResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T5, a Warning (review, 2026-11-19): this run leaves T5 out because Azure didn't create its account, from the
+    template's failure (-Cause, Azure's reason) or, in a resume, from an earlier run's record (-RecordedUtc,
+    DbHubT5Refused). Its evidence's leftOut tells DONE not to wait for T5's checks (Test-DemoT5LeftOut). Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $Cause = '',
+
+        [AllowEmptyString()]
+        [string] $RecordedUtc = ''
+    )
+
+    $message = if ($Cause) {
+        'Azure didn''t create T5''s Azure Cosmos DB account ({0}), and nothing else failed, so the template was deployed again without T5: this run finishes the rest, and Database Hub shows T1 to T4.' -f $Cause.TrimEnd('.')
+    }
+    else {
+        'Azure didn''t create T5''s Azure Cosmos DB account in an earlier run of this deployment ({0}), so this resume leaves T5 out too, and Database Hub shows T1 to T4.' -f $(if ($RecordedUtc) { 'recorded ' + $RecordedUtc } else { 'recorded on the resource group' })
+    }
+    $remediation = 'Nothing to do when it was temporary: the next ./scripts/deploy.ps1 that deploys the template (one that isn''t a resume) tries T5 again. When Azure keeps refusing it (a region without capacity for new Azure Cosmos DB accounts, or a policy that denies them), set "t5Enabled": false in config/demo.config.json, or deploy the demo in another region.'
+    return (New-DemoResult -CheckId 'DEPLOY.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message $message -Evidence ([ordered]@{ leftOut = $true; cause = $Cause; recordedUtc = $RecordedUtc }) -Remediation $remediation -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))
+}
+
+function Test-DemoT5LeftOut {
+    # True when this run left T5 out (DEPLOY.T5 with leftOut, New-DemoT5LeftOutResult): DONE doesn't wait for T5's checks
+    # then, though the configuration has T5 on (review, 2026-11-19). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    foreach ($item in @($Result)) {
+        if ($null -ne $item -and [string](Get-DemoMemberValue -InputObject $item -Name 'checkId') -eq 'DEPLOY.T5' -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name 'leftOut')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Resolve-DemoT5LeftOut {
+    <#
+    .SYNOPSIS
+    A resume after an earlier run of this deployment left T5 out because Azure didn't create its account (DbHubT5Refused;
+    review, 2026-11-19): returns Config (Copy-DemoT5OffConfig) and Result (DEPLOY.T5, a Warning) when T5 is on, the record
+    is there, this run doesn't deploy the template, and the account doesn't exist; otherwise $null, and a run that deploys
+    the template tries T5 again. An account that can't be read keeps T5 on. A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State,
+
+        [switch] $TemplateRuns
+    )
+
+    if ($TemplateRuns -or -not (Test-DemoT5Enabled -Config $Config)) {
+        return $null
+    }
+    $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T5Refused')
+    if (-not $recorded) {
+        return $null
+    }
+    $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+    $deploymentId = if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) { [string]$tags['deploymentId'] } else { '' }
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return $null
+    }
+    $current = Get-DemoT5State -Config $Config -DeploymentId $deploymentId
+    if ($current.Exists -or [string]$current.State -eq 'Unknown') {
+        return $null
+    }
+    $result = New-DemoT5LeftOutResult -RecordedUtc $recorded
+    return [pscustomobject]@{ Config = (Copy-DemoT5OffConfig -Config $Config -Reason ('Azure didn''t create its account in an earlier run ({0})' -f $recorded)); Result = $result }
+}
+
 function New-DemoT5OffResult {
     # DEPLOY.T5.OFF: the configuration turns T5 off (t5Enabled false), so this run neither creates nor checks it, and an
-    # existing account stays as it is; $null when T5 is on. Internal.
+    # existing account stays as it is; $null when T5 is on, or when this run left it out (t5LeftOut, DEPLOY.T5 says why).
+    # Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -418,7 +603,7 @@ function New-DemoT5OffResult {
         [System.Collections.IDictionary] $Config
     )
 
-    if (Test-DemoT5Enabled -Config $Config) {
+    if ((Test-DemoT5Enabled -Config $Config) -or [string]$Config['t5LeftOut']) {
         return $null
     }
     return (New-DemoResult -CheckId 'DEPLOY.T5.OFF' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 (Azure Cosmos DB) is off in this configuration (t5Enabled is false), so this run neither creates nor checks it, and Database Hub shows T1 to T4 only. An account an earlier run created stays as it is, and keeps billing its throughput.' -Remediation 'To add T5, remove t5Enabled from the configuration (or set it to true) and run ./scripts/deploy.ps1. To remove an existing account, ./scripts/destroy.ps1 removes it with the resource group.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor']))

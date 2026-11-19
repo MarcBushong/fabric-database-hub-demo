@@ -604,6 +604,21 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $stand = @(New-DoneResult) + @(New-TestResult 'DEPLOY.STAGE.VALIDATION')
         (InModuleScope DbHubDemo -Parameters @{ Result = $stand; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $null -Config $Config -Sequential }).Kind | Should -Be 'Done'
     }
+
+    It 'is DONE without T5''s checks when the run left T5 out because Azure didn''t create its account (DEPLOY.T5; review, 2026-11-19)' {
+        # deploy.ps1 judges with the configuration file, where T5 is on.
+        $config = New-TestConfig -WithT5
+        $withoutT5 = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -SkipT5 } | ForEach-Object { New-TestResult $_ })
+        $leftOut = New-DemoResult -CheckId 'DEPLOY.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message 'Azure didn''t create T5''s Azure Cosmos DB account (ServiceUnavailable: high demand), and nothing else failed.' -Evidence @{ leftOut = $true; cause = 'ServiceUnavailable: high demand' }
+        $done = InModuleScope DbHubDemo -Parameters @{ Result = @($withoutT5 + @($leftOut)); State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $done.Kind | Should -Be 'Done'
+        $done.Missing | Should -BeNullOrEmpty
+        # Without it, T5's estate and metrics are still required.
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = $withoutT5; State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $notDone.Kind | Should -Be 'NotDone'
+        $notDone.Missing | Should -Contain 'HUB.ESTATE.T5'
+        $notDone.Missing | Should -Contain 'METRICS.T5'
+    }
 }
 
 Describe 'NOT DONE names the exact command its fix needs, with the run''s -ConfigPath (live finding, 2026-11-06)' {

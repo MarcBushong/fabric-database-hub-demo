@@ -331,6 +331,15 @@ function Invoke-DemoDeployment {
     # the template.
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
+    # A resume after an earlier run left T5 out because Azure didn't create its account (DbHubT5Refused; review, 2026-11-19):
+    # this run leaves it out too, with DEPLOY.T5; a run that deploys the template tries T5 again.
+    $t5Resume = if ($whatIf) { $null } else { Resolve-DemoT5LeftOut -Config $Config -State $state -TemplateRuns:($startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex) }
+    if ($null -ne $t5Resume) {
+        $Config = $t5Resume.Config
+        $results.Add($t5Resume.Result)
+        Write-DemoLog -Level Warning -Message ([string]$t5Resume.Result.message)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message ([string]$t5Resume.Result.message)
+    }
     # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them as
     # PREFLIGHT.T4.TUNING does, so a t4SkuName that can't run the tuning t4AutonomousTuning asks for is a Fail before
     # anything changes.
@@ -555,12 +564,22 @@ function Invoke-DemoDeployment {
                         $Config = if ([bool]$deployedT4 -and $deployedSku) { Copy-DemoT4Config -Config $Config -Source deployed -SkuName $deployedSku } else { Copy-DemoT4Config -Config $Config -Source deployed -Off }
                     }
                 }
+                # T5 left out because Azure didn't create its account (review, 2026-11-19): the later stages go on without
+                # it, the Bootstraps stage's template included, and its rows say why.
+                $t5LeftOutText = ''
+                $deployedT5 = Get-DemoMemberValue -InputObject $deployment -Name 'T5Enabled'
+                if ($null -ne $deployedT5 -and -not [bool]$deployedT5 -and (Test-DemoT5Enabled -Config $Config)) {
+                    $t5LeftOutText = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T5LeftOut')
+                    $Config = Copy-DemoT5OffConfig -Config $Config -Reason $t5LeftOutText
+                    $t5Warning = @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T5' }) | Select-Object -Last 1
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message $(if ($null -ne $t5Warning) { [string]$t5Warning.message } else { 'T5 is left out of this run: Azure didn''t create its account.' })
+                }
                 & $recordStage 'Infrastructure' @{ NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName }
                 $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
                 # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the stage is a Warning.
                 $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
                 $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
-                & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
+                & $stageResult 'Infrastructure' $(if ($overCeiling -or $t5LeftOutText) { 'Warning' } else { 'Pass' }) ((@($(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' }), $(if ($t5LeftOutText) { 'T5 is left out of this run: Azure didn''t create its account (DEPLOY.T5 says why, with the fix).' })) | Where-Object { $_ }) -join ' ')
                 if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                     # Opt-in, and only start-demo.ps1 -Interactive needs it, so a vault Fail is reported (it
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.

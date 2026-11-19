@@ -263,6 +263,74 @@ Describe 'T5 in an existing demo: DEPLOY.T5.MISSING and DEPLOY.T5.OFF' {
     }
 }
 
+Describe 'T5 left out when Azure doesn''t create its account (review, 2026-11-19)' {
+    BeforeEach {
+        Initialize-T5AzMock
+        $script:t5.Account = $null
+        $script:recordedState = [pscustomobject]@{ Stage = 'T3'; T5Refused = '2026-11-19T05:00:00Z'; Tags = @{ deploymentId = 'abc123' } }
+    }
+
+    It 'knows T5''s resources from the failed operations, and nothing else counts' {
+        $config = New-TestConfig
+        $t5Errors = @(
+            [pscustomobject]@{ ResourceType = 'Microsoft.DocumentDB/databaseAccounts'; ResourceName = 'cosmos01-abc123'; Code = 'ServiceUnavailable'; Message = 'high demand' }
+            [pscustomobject]@{ ResourceType = 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments'; ResourceName = 'cosmos01-abc123/55555555-5555-5555-5555-555555555555'; Code = 'NotFound'; Message = 'no account' }
+            [pscustomobject]@{ ResourceType = 'Microsoft.Resources/deployments'; ResourceName = 'cosmos01-access'; Code = 'InvalidTemplateDeployment'; Message = 'RequestDisallowedByPolicy' }
+            [pscustomobject]@{ ResourceType = 'Microsoft.Network/privateEndpoints'; ResourceName = 'pe-dbhub-demo-cosmos01'; Code = 'Canceled'; Message = 'canceled' }
+            [pscustomobject]@{ ResourceType = 'Microsoft.Network/privateDnsZones/virtualNetworkLinks'; ResourceName = 'privatelink.documents.azure.com/link-vnet-dbhub-demo'; Code = 'Canceled'; Message = 'canceled' }
+        )
+        $only = InModuleScope DbHubDemo -Parameters @{ Config = $config; Cause = [pscustomobject]@{ Errors = $t5Errors; Text = 'T5 failed' } } { Get-DemoT5OnlyFailure -Config $Config -Cause $Cause }
+        $only.T5Only | Should -BeTrue
+        $only.Text | Should -Be 'T5 failed'
+        # T3's private endpoint and its zone, another deployment, or no error that names a resource: never T5's alone.
+        foreach ($other in @(
+                [pscustomobject]@{ ResourceType = 'Microsoft.Network/privateEndpoints'; ResourceName = 'pe-dbhub-demo-azuresql01'; Code = 'Canceled'; Message = 'canceled' }
+                [pscustomobject]@{ ResourceType = 'Microsoft.Network/privateDnsZones'; ResourceName = 'privatelink.database.windows.net'; Code = 'Conflict'; Message = 'busy' }
+                [pscustomobject]@{ ResourceType = 'Microsoft.Resources/deployments'; ResourceName = 'azuresql01'; Code = 'DeploymentFailed'; Message = 'failed' }
+            )) {
+            $mixed = InModuleScope DbHubDemo -Parameters @{ Config = $config; Cause = [pscustomobject]@{ Errors = @($t5Errors[0], $other); Text = 'both' } } { Get-DemoT5OnlyFailure -Config $Config -Cause $Cause }
+            $mixed.T5Only | Should -BeFalse -Because ('{0} {1} isn''t T5''s' -f $other.ResourceType, $other.ResourceName)
+        }
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT5OnlyFailure -Config $Config -Cause $null -ErrorText 'ERROR: (Conflict) Another operation is in progress.' }).T5Only | Should -BeFalse
+        # A policy's refusal before the deployment ran names each resource it disallowed.
+        $policy = 'ERROR: {"error":{"code":"InvalidTemplateDeployment","details":[{"code":"RequestDisallowedByPolicy","message":"Resource ''cosmos01-abc123'' was disallowed by policy."},{"code":"RequestDisallowedByPolicy","message":"Resource ''pe-dbhub-demo-cosmos01'' was disallowed by policy."}]}}'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config; Text = $policy } { Get-DemoT5OnlyFailure -Config $Config -Cause $null -ErrorText $Text }).T5Only | Should -BeTrue
+        $both = $policy -replace 'pe-dbhub-demo-cosmos01', 'sqlvm01'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config; Text = $both } { Get-DemoT5OnlyFailure -Config $Config -Cause $null -ErrorText $Text }).T5Only | Should -BeFalse
+    }
+
+    It 'names T5''s nested deployments as infra/modules/demo.bicep does' {
+        $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw
+        foreach ($name in (& (Get-Module -Name DbHubDemo) { $script:T5DeploymentNames })) {
+            $bicep | Should -Match ("module \w+ 'cosmos01[^']*\.bicep' = if \(t5Enabled\) \{\s+name: '" + [regex]::Escape($name) + "'")
+        }
+    }
+
+    It 'doesn''t start a resume from preflight after a recorded failure, and the resume leaves T5 out with DEPLOY.T5' {
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:recordedState } { Get-DemoT5MissingResult -Config $Config -State $State } | Should -BeNullOrEmpty
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:recordedState } { Resolve-DemoT5LeftOut -Config $Config -State $State }
+        $resolved.Config['t5Enabled'] | Should -BeFalse
+        $resolved.Config['t5LeftOut'] | Should -Match '2026-11-19T05:00:00Z'
+        $resolved.Result.checkId | Should -Be 'DEPLOY.T5'
+        $resolved.Result.status | Should -Be 'Warning'
+        $resolved.Result.message | Should -Match 'this resume leaves T5 out too'
+        $resolved.Result.remediation | Should -Match '"t5Enabled": false'
+        InModuleScope DbHubDemo -Parameters @{ Result = @($resolved.Result) } { Test-DemoT5LeftOut -Result $Result } | Should -BeTrue
+        InModuleScope DbHubDemo -Parameters @{ Config = $resolved.Config } { New-DemoT5OffResult -Config $Config } | Should -BeNullOrEmpty -Because 'T5 is left out of this run, not off in the configuration'
+    }
+
+    It 'keeps T5 on when this run deploys the template, the account exists or can''t be read, or nothing is recorded' {
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:recordedState } { Resolve-DemoT5LeftOut -Config $Config -State $State -TemplateRuns } | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = [pscustomobject]@{ Stage = 'T3'; T5Refused = ''; Tags = @{ deploymentId = 'abc123' } } } { Resolve-DemoT5LeftOut -Config $Config -State $State } | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Override @{ t5Enabled = $false }); State = $script:recordedState } { Resolve-DemoT5LeftOut -Config $Config -State $State } | Should -BeNullOrEmpty
+        $script:t5.Account = New-AccountJson
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:recordedState } { Resolve-DemoT5LeftOut -Config $Config -State $State } | Should -BeNullOrEmpty
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $false; State = 'Unknown'; FreeTier = $false; Account = $null; Error = 'throttled' } }
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:recordedState } { Resolve-DemoT5LeftOut -Config $Config -State $State } | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo -Parameters @{ Result = @(New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message 'free tier') } { Test-DemoT5LeftOut -Result $Result } | Should -BeFalse
+    }
+}
+
 Describe 'Test-DemoT5' {
     BeforeEach {
         Initialize-T5AzMock

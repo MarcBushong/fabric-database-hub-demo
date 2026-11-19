@@ -1644,7 +1644,9 @@ function Get-DemoDeploymentOutcome {
         }
     }
     $outcome.Unfinished = $unfinished.ToArray()
-    $t5On = Test-DemoT5Enabled -Config $Config
+    # T5 left out by this run because Azure didn't create its account (DEPLOY.T5; review, 2026-11-19): DONE doesn't wait
+    # for its checks, though the configuration has it on.
+    $t5On = (Test-DemoT5Enabled -Config $Config) -and -not (Test-DemoT5LeftOut -Result @($all))
     $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:(-not $t5On))
     $outcome.Missing = @($evidence.Missing)
     if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter -and -not $leftover) {

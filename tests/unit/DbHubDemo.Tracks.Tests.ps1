@@ -2670,6 +2670,41 @@ Describe 'Invoke-DemoParallelDeployment' {
         @($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.FALLBACK' }).Count | Should -Be 1
     }
 
+    It 'goes on without T5 when the template left it out, says why on the Infrastructure step and T5''s rows, and gives the tracks the same (review, 2026-11-19)' {
+        $withT5 = New-TestConfig -WithT5
+        $script:cause = 'Microsoft.DocumentDB/databaseAccounts cosmos01-abc123: ServiceUnavailable: Sorry, we are currently experiencing high demand in West US 3 region'
+        $script:leftOut = New-DemoResult -CheckId 'DEPLOY.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Azure didn''t create T5''s Azure Cosmos DB account ({0}), and nothing else failed, so the template was deployed again without T5.' -f $script:cause) -Evidence @{ leftOut = $true; cause = $script:cause }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+            [pscustomobject]@{ Succeeded = $true; Results = @((New-TestResult 'DEPLOY.TEMPLATE'), $script:leftOut); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $false; T4SkuName = ''; T4Note = ''; T5Enabled = $false; T5LeftOut = $script:cause }
+        }
+        $script:t5InTracks = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:t5InTracks.Add(('{0}:{1}:{2}' -f $Track, [bool]$Config['t5Enabled'], [string]$Config['t5LeftOut']))
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                default { @() }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T5Enabled)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT5; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+        $script:t5InTracks | Should -Contain ('T1:False:{0}' -f $script:cause)
+        $script:calls | Should -Contain 'estate T1,T3,T2' -Because 'DONE''s checks leave T5 out'
+        $infrastructure = $results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }
+        $infrastructure.status | Should -Be 'Warning'
+        $infrastructure.message | Should -Match 'T5 is left out of this run: Azure didn''t create its account \(DEPLOY\.T5 says why, with the fix\)\.'
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T5.OFF' }) | Should -BeNullOrEmpty -Because 'the configuration has T5 on'
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -in 'T5.Checks', 'T5.Telemetry') { $item } } })
+        $rows.Count | Should -Be 2
+        foreach ($row in $rows) {
+            $row['status'] | Should -Be 'Warning'
+            $row['message'] | Should -Match 'high demand in West US 3'
+        }
+    }
+
     It 'stops the clock only when T4''s estate and metrics passed too, when T4 is on (ADR 0018 as amended)' {
         $withT4 = New-TestConfig -WithT4
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-TestResult 'DEPLOY.T4.START' 'Not selected' }
