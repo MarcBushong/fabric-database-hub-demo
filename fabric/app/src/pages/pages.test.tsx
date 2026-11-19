@@ -10,6 +10,8 @@ import OverviewPage from "@/pages/OverviewPage";
 import PerformancePage from "@/pages/PerformancePage";
 import ReadinessPage from "@/pages/ReadinessPage";
 import TrendsPage from "@/pages/TrendsPage";
+import { liveDataOf, type EstateAnswer, type EstateReader } from "@/data/live-estate";
+import { sampleLiveAnswers } from "@/preview/sample-live";
 import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
 
 /** A storage the test owns: newer Node versions put their own, empty localStorage in front of jsdom's. */
@@ -83,6 +85,32 @@ describe("Overview", () => {
         expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
         expect(screen.queryByText(/^Live$/)).not.toBeInTheDocument();
     });
+
+    it("says why when the function answers with no data, instead of tiles that keep reading", async () => {
+        const reason = "The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1.";
+        const noScope: EstateReader = (view) => Promise.resolve({ view, source: [], scope: { subscriptionId: "", resourceGroups: [] }, data: {}, errors: [reason], at: "2026-10-21T21:00:00.000Z" });
+        renderWithApp(<OverviewPage />, { live: noScope });
+        const line = await screen.findByText(/^The estate function has no scope: deploy the app with scripts\/configure-fabric-app\.ps1\. Every page shows the history/);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+    });
+
+    it("reads health as the function passes it: a count it leaves out is zero, and Cosmos DB shows without an account count", async () => {
+        const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        const health = liveDataOf(sample.health);
+        if (!health?.microsoftSql || !health.postgreSql) throw new Error("The sample has SQL and PostgreSQL health.");
+        const partial: EstateAnswer<"health"> = {
+            ...sample.health,
+            data: { ...health, microsoftSql: { ...health.microsoftSql, highUsage: { cpu: 2 } }, postgreSql: { ...health.postgreSql, highUsage: {} }, cosmosDb: { ...health.cosmosDb, totalAccounts: null } },
+        };
+        const reader: EstateReader = (view) => Promise.resolve((view === "health" ? partial : sample[view]) as never);
+        renderWithApp(<OverviewPage />, { live: reader });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        const high = await within(live).findByRole("button", { name: /^High usage, last 24 hours: 2\./ });
+        expect(within(high).getByText("SQL: CPU 2")).toBeInTheDocument();
+        expect(within(live).getByRole("button", { name: /^Cosmos DB, last 24 hours: 100(\.0)? ?%\./ })).toBeInTheDocument();
+    });
+
     it("on the first run, says the one action that fills it: Run all in NB_DatabaseHub_Control", async () => {
         renderWithApp(<OverviewPage />, { client: fakeQueryClient({ "history-meta": [] }), metaEmpty: true });
         expect(await screen.findByText("No history yet")).toBeInTheDocument();
