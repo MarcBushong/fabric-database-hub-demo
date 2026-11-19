@@ -147,6 +147,9 @@ $goldenSnapshots = @()
 $t4RestartCoverage = $null
 $t5FreeTier = $null
 $t5Lifecycle = if ($T5ContainerLifecycle) { $T5ContainerLifecycle } else { '' }
+# Priced all month only because nothing automatic deletes the container after a session (the re-review of 0590bbe): the
+# monthly ceiling is then a Warning, not a Fail, when the month fits with it for the running hours only.
+$t5ManualDeleteOnly = $false
 if ($config['subscriptionId'] -eq '00000000-0000-0000-0000-000000000000') {
     Write-DemoLog -Level Warning -Message 'The configuration has no subscription yet, so the estimate excludes Defender for Cloud and prices T3 as regular serverless.'
 }
@@ -252,7 +255,9 @@ else {
             else {
                 try {
                     if ($firstRun) {
-                        $t5Lifecycle = & $module { param($Settings, $State, $Permission) Get-DemoT5CostLifecycle -Config $Settings -State $State -ThisRunDeploys -Permission $Permission } $config $environmentState $deployer
+                        $t5Cost = & $module { param($Settings, $State, $Permission) Get-DemoT5CostLifecycle -Config $Settings -State $State -ThisRunDeploys -Permission $Permission -Detail } $config $environmentState $deployer
+                        $t5Lifecycle = $t5Cost.Lifecycle
+                        $t5ManualDeleteOnly = [bool]$t5Cost.ManualDeleteOnly
                         $t5Text = if ($t5Lifecycle -ceq 'Session') {
                             'for the running hours only: no environment yet, and deploy.ps1 gives the session control its role with your rights, which creates the container for each session and deletes it after'
                         }
@@ -266,7 +271,9 @@ else {
                     }
                     else {
                         # The shared rule (review of ab91ee5): Session only where something automatic deletes the container after a session.
-                        $t5Lifecycle = & $module { param($Settings, $State) Get-DemoT5CostLifecycle -Config $Settings -State $State } $config $environmentState
+                        $t5Cost = & $module { param($Settings, $State) Get-DemoT5CostLifecycle -Config $Settings -State $State -Detail } $config $environmentState
+                        $t5Lifecycle = $t5Cost.Lifecycle
+                        $t5ManualDeleteOnly = [bool]$t5Cost.ManualDeleteOnly
                         Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month' } else { 'it exists only during a session, so its throughput bills only while the demo runs' }))
                     }
                 }
@@ -304,6 +311,9 @@ $summary = foreach ($name in $profileNames) {
     }
     if ($t5Lifecycle) {
         $parameters['T5ContainerLifecycle'] = $t5Lifecycle
+    }
+    if ($t5ManualDeleteOnly) {
+        $parameters['T5ManualDeleteOnly'] = $true
     }
     $estimate = Get-DemoCostEstimate @parameters
     foreach ($result in $estimate.Results) {

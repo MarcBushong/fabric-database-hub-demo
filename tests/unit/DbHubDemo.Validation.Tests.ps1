@@ -867,6 +867,22 @@ Describe 'Security area' {
         ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
     }
 
+    It 'passes once the folder the Warning names is scanned on purpose with -ScanPath, its own site-packages left out (the re-review of 0590bbe)' {
+        foreach ($file in 'venv/run.log', 'venv/Lib/site-packages/pkg/module.py', 'logs/deploy.log') {
+            $path = Join-Path -Path $script:scanFolder -ChildPath $file
+            New-Item -ItemType Directory -Path (Split-Path -Path $path -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $path -Value 'nothing secret here' -Encoding utf8NoBOM
+        }
+        $context = New-TestContext
+        $scan = { param([string[]] $Extra) @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder; S = $Extra } { param($X, $P, $S) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P -ScanPath $S }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' } }
+        (& $scan @()).status | Should -Be 'Warning'
+        $output = & $scan @((Join-Path -Path $script:scanFolder -ChildPath 'venv'))
+        $output.status | Should -Be 'Pass' -Because 'the remediation clears its own Warning'
+        $output.evidence.filesScanned | Should -Be 3 -Because 'out/venv/run.log is read through -ScanPath, with out/clean.log and out/logs/deploy.log'
+        @($output.evidence.unexpectedPruned).Count | Should -Be 0
+        $output.message | Should -Match 'Dependency trees \(node_modules and package caches\) aren''t scanned \(2 left out: '
+    }
+
     It 'warns on role assignments the demo never creates and on a Key Vault, and fails on a public IP or an open inbound rule' {
         $script:securityResponse['^role assignment list'] = Get-TestAzOk @(@{ roleDefinitionName = 'Owner'; principalType = 'User'; scope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo' }, @{ roleDefinitionName = 'Contributor'; principalType = 'User'; scope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/other' })
         $script:securityResponse['^resource list .*KeyVault'] = Get-TestAzOk @(@{ name = 'kv-left-behind' })

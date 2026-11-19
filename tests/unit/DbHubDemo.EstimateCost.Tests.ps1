@@ -93,7 +93,7 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         It 'counts, for an Owner, the nightly safety stop that deploy.ps1''s first run sets up, and T5''s container for the running hours, and says so' {
             Invoke-TestEstimate
             Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 1 -Exactly -Because 'your permissions are read once, for T4 and T5'
-            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T4RestartCoverage.Counts -and $T4RestartCoverage.Planned -and $T5ContainerLifecycle -ceq 'Session' }
+            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T4RestartCoverage.Counts -and $T4RestartCoverage.Planned -and $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
             Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'No environment yet, so the estimate prices what deploy.ps1''s first run sets up with your rights, as its preflight does*' }
             Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: about a day each, counting the nightly safety stop that deploy.ps1 sets up in its first run, since you can assign its role*' }
             Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: for the running hours only: no environment yet, and deploy.ps1 gives the session control its role with your rights*' }
@@ -103,7 +103,9 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         It 'counts, for a Contributor, T4''s restart for the rest of the month and T5''s container all month, and names the grant' {
             Mock -ModuleName DbHubDemo Get-DemoDeployerRolePermission { [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' } }
             Invoke-TestEstimate
-            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts -and $T5ContainerLifecycle -ceq 'AlwaysOn' }
+            # Priced all month only because nothing automatic will delete it, so the hard ceiling warns, as preflight's does
+            # (the re-review of 0590bbe).
+            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts -and $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly }
             Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: the rest of the month: no environment yet, and you can''t assign the nightly safety stop''s role*Once it''s deployed, an Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath *' }
             Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: all month: no environment yet, and you can''t assign roles, so the session control gets none and only ./scripts/stop-demo.ps1 deletes the container after a session*grant-safety-stop.ps1*' }
             Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
@@ -165,11 +167,15 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
     It 'prices a recorded Session all month when nothing automatic deletes the container: no session-control role and no nightly safety stop that can (review of ab91ee5)' {
         Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('a'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
         Invoke-TestEstimate
-        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' }
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly }
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month*' }
         Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDelete { $true }
         Invoke-TestEstimate
-        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' }
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
+        # A session-control role without the container's actions: all month for real, with nothing to excuse.
+        Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'Lacking'; Why = 'its role doesn''t have the container''s actions'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('a'); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        Invoke-TestEstimate
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and -not $T5ManualDeleteOnly }
     }
 
     It 'prices -T5ContainerLifecycle as given, without reading the environment''s, and assumes Session when the tag can''t be read (2026-11-19)' {

@@ -39,7 +39,8 @@ function Invoke-DemoValidationSecurity {
         # the Insights app's build, and reading them kept this area busy for more than 37 minutes.
         # Only the Insights app's build stage, out/fabric-app, is expected to hold them (npm fills it from the repository's
         # lockfiles); one anywhere else is left out too, but makes this a Warning that names it (review of ab91ee5), since it
-        # could hold the demo's own output, such as out/venv/run.log.
+        # could hold the demo's own output, such as out/venv/run.log. -ScanPath <that folder> reads it and clears the Warning
+        # (the re-review of 0590bbe).
         $scan = Find-DemoSecretLeak -Path $roots -DependencyRoot (Join-Path -Path $OutputRoot -ChildPath 'fabric-app')
         $unexpectedCount = [int](Get-DemoMemberValue -InputObject $scan -Name 'UnexpectedPrunedCount')
         $unexpectedList = Get-DemoMemberValue -InputObject $scan -Name 'UnexpectedPruned'

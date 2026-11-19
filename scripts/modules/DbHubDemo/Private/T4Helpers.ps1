@@ -912,7 +912,11 @@ function Get-DemoT4GeneralPurposeCost {
         # A safety stop caps the restart worst case when it's fully in place (2026-11-04, ADR 0024); never throws.
         $shared['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
         # T5's container lifecycle (2026-11-19, ADR 0027), as the other estimates price it; never throws.
-        $shared['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config
+        $t5Cost = Get-DemoT5CostLifecycle -Config $Config -Detail
+        $shared['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+        if ($t5Cost.ManualDeleteOnly) {
+            $shared['T5ManualDeleteOnly'] = $true
+        }
         foreach ($key in $shared.Keys) {
             $parameters[$key] = $shared[$key]
         }
@@ -2220,10 +2224,15 @@ function Get-DemoT4RestartCoverage {
                 $gap = @('StopJob', ('the nightly safety stop''s last run couldn''t be read ({0}), so it''s taken as failed' -f $runs.Error), 'Run ./scripts/status.ps1 to see it (STATUS.SAFETYSTOP), then run this again.')
             }
             else {
-                $stopStatus = if ($null -ne $runs.Stop) { [string](Get-DemoMemberValue -InputObject $runs.Stop.Result -Name 'status') } else { '' }
-                $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' }) }
+                # A result that is Partial only because of T5's container, from runbooks older than its t5Status, stopped the
+                # VMs and T4 (the re-review of 0590bbe); its job Failed only because Partial fails a Nightly job.
+                $stopOutcome = if ($null -ne $runs.Stop) { Get-DemoStopResultOutcome -Result $runs.Stop.Result } else { $null }
+                $stopStatus = if ($null -ne $stopOutcome) { [string]$stopOutcome.Status } else { '' }
+                $t5Only = $null -ne $stopOutcome -and [bool]$stopOutcome.T5Only
+                $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($t5Only) { 'Partial, only T5''s container' } elseif ($stopStatus) { $stopStatus } else { 'no result line' }) }
+                $jobDone = $null -ne $runs.Stop -and ($runs.Stop.Status -eq 'Completed' -or ($t5Only -and $runs.Stop.Status -eq 'Failed'))
                 # Deferred (2026-11-14): a run was still going, so it changed nothing, by design; it isn't a failed run.
-                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred')) {
+                if ($null -ne $runs.Stop -and (-not $jobDone -or $stopStatus -notin 'Stopped', 'Deferred')) {
                     $when = if ($null -ne $runs.Stop.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$runs.Stop.CreatedUtc) } else { '' }
                     $gap = @('StopJob', ('the nightly safety stop''s last run{0} didn''t finish its work (job {1}), so it may not stop T4' -f $when, $runs.Stop.Status), 'Run ./scripts/status.ps1 to see what it said (STATUS.SAFETYSTOP), fix that, then run this again.')
                 }
@@ -2244,15 +2253,15 @@ function Get-DemoT4RestartCoverage {
         else {
             $gap = @('SafetyStop', ('the nightly safety stop isn''t in place yet ({0})' -f $nightly.Missing), ('./scripts/deploy.ps1 sets it up after its template, so the checks after that run count about a day per restart (a first deployment''s own preflight can''t: it runs before the template); when deploy.ps1 can''t assign its role, an Owner runs {0} once.' -f $grant))
         }
-        # The on-demand control's own daily T4 safety stop still covers T4 when it's fully in place (ADR 0020).
-        if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
-            $control = Get-DemoT4ControlRestartCoverage -Config $Config -ConfigPath $ConfigPath
-            $evidence['control'] = $control.Evidence
-            if ($control.Counts) {
-                $evidence['counts'] = $true
-                $evidence['missing'] = ''
-                return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = $control.Reason; Fix = ''; Evidence = $evidence }
-            }
+        # The session control's own daily T4 safety stop still covers T4 when it's fully in place (ADR 0020). deploy.ps1 sets
+        # the control up whatever an older configuration's control.enabled says (DEPLOY.CONTROL.ON, ADR 0026), so only its
+        # state reads decide (the docs audit, 2026-11-19).
+        $control = Get-DemoT4ControlRestartCoverage -Config $Config -ConfigPath $ConfigPath
+        $evidence['control'] = $control.Evidence
+        if ($control.Counts) {
+            $evidence['counts'] = $true
+            $evidence['missing'] = ''
+            return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = $control.Reason; Fix = ''; Evidence = $evidence }
         }
         return (& $missing $gap[0] $gap[1] $gap[2] $evidence)
     }
@@ -2268,11 +2277,13 @@ function Get-DemoT4ControlRestartCoverage {
     <#
     .SYNOPSIS
     Whether the on-demand control's daily T4 safety stop (ADR 0020) caps T4's 7-day automatic restart: the second check of
-    Get-DemoT4RestartCoverage, after the nightly safety stop. Returns Counts, Missing (Control, Schedule, A1, StopJob, or
-    ''), Reason, Fix, and Evidence. Never throws. Internal.
+    Get-DemoT4RestartCoverage, after the nightly safety stop. Returns Counts, Missing (Schedule, A1, StopJob, or ''), Reason,
+    Fix, and Evidence. Never throws. Internal.
 
     .DESCRIPTION
-    It counts only when all three hold:
+    deploy.ps1 sets the control up whatever an older configuration's control.enabled says (DEPLOY.CONTROL.ON, ADR 0026), so
+    that setting isn't read: only the control's state decides (the docs audit, 2026-11-19). It counts only when all three
+    hold:
     - the schedule dbhub-t4-safety-stop exists, is enabled, and is linked to DbHub-Stop (Get-DemoT4SafetyStopState);
     - A1, the control identity's custom role on the demo's resource group, is assigned: DbHub-Stop can't stop T4 without
       it, and destroy deletes it with the group, so only assignRoles or -GrantRole grants it again;
@@ -2301,10 +2312,6 @@ function Get-DemoT4ControlRestartCoverage {
     }
     $evidence = [ordered]@{}
     try {
-        if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
-            $evidence['control'] = 'off'
-            return (& $missing 'Control' 'the on-demand activity control isn''t set up (control.enabled is false), so nothing here stops T4 after Azure starts it again' ('Set control.enabled to true and run {0}; an Owner then runs {1} once (ADR 0020).' -f $setup, $grant) $evidence)
-        }
         $state = [string](Get-DemoT4SafetyStopState -Config $Config).State
         $evidence['schedule'] = $state
         if ($state -ne 'Scheduled') {
@@ -2337,8 +2344,11 @@ function Get-DemoT4ControlRestartCoverage {
             # Completed with status Partial when Azure refused T4's stop, so its own result line decides, as the nightly
             # safety stop's does. One that can't be read is taken as failed (fail safe).
             $stop = if ($job.Id) { Get-DemoSafetyStopJobResult -Name $name -JobName $job.Id } else { $null }
-            $stopStatus = [string](Get-DemoMemberValue -InputObject $stop -Name 'status')
-            $evidence['lastStopJob'] = '{0} ({1})' -f $job.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' })
+            # Partial only because of T5's container, from runbooks older than its t5Status (the re-review of 0590bbe): T4 was
+            # stopped, so it counts.
+            $stopOutcome = Get-DemoStopResultOutcome -Result $stop
+            $stopStatus = [string]$stopOutcome.Status
+            $evidence['lastStopJob'] = '{0} ({1})' -f $job.Status, $(if ($stopOutcome.T5Only) { 'Partial, only T5''s container' } elseif ($stopStatus) { $stopStatus } else { 'no result line' })
             if ($stopStatus -notin 'Stopped', 'Skipped', 'Deferred', 'NoEnvironment') {
                 $when = if ($null -ne $job.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$job.CreatedUtc) } else { '' }
                 $said = (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $stop -Name 'message'))).Trim()
