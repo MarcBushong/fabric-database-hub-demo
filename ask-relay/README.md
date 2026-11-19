@@ -1,6 +1,6 @@
 # Ask's chat relay
 
-The relay connects the Insights app's Copilot dock (Ask) with each viewer's own GitHub Copilot. It's a small Node.js service on the [GitHub Copilot SDK](https://github.com/microsoft/copilot-sdk), which runs GitHub Copilot's runtime. `deploy.ps1` runs it as an Azure Container App in the demo's resource group ([ADR 0027](../docs/adr/0027-ask-copilot-in-the-insights-app.md)).
+The relay connects the Insights app's Copilot dock (Ask) with each viewer's own GitHub Copilot. It's a small Node.js service on the [GitHub Copilot SDK](https://github.com/microsoft/copilot-sdk), which runs GitHub Copilot's runtime. `deploy.ps1` runs it as an Azure Container App in the demo's resource group ([ADR 0028](../docs/adr/0028-ask-copilot-in-the-insights-app.md)).
 
 The relay holds no Azure, Fabric, or GitHub credential and runs no tool. The page sends the viewer's GitHub token at the start of a conversation, and the relay keeps it in memory for that conversation only. Copilot's tools are declared by the page, and each call goes back to the page to run there, with the viewer's own access: read-only DAX through the app's connector, the app's own charts, and the live estate through the app's function.
 

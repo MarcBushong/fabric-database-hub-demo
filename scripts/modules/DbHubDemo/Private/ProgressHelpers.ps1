@@ -132,6 +132,8 @@ function Get-DemoProgressCatalog {
 
         [switch] $T4Enabled,
 
+        [switch] $T5Enabled,
+
         [switch] $SkipFabric
     )
 
@@ -171,12 +173,21 @@ function Get-DemoProgressCatalog {
                 )
             })
     }
+    if ($T5Enabled) {
+        # T5 (2026-11-18, ADR 0027): the Cosmos DB account's checks and T1's access to it run in T1's track, because the
+        # access check is the runner's warmup on sqlvm01, which runs one Run Command at a time.
+        $tracks.Add([ordered]@{ name = 'T5'; label = 'T5: Azure Cosmos DB'; steps = @(
+                    (& $step 'T5.Checks' 'Account checks and T1''s access (the data-plane role)' @('T1/T5'))
+                    (& $step 'T5.Telemetry' 'Metrics in Azure Monitor (normalized RU, requests, 429s)' @('Validation'))
+                )
+            })
+    }
     if (-not $SkipFabric) {
         $tracks.Add([ordered]@{ name = 'Fabric'; label = 'Fabric'; steps = @(
                     (& $step 'Fabric.Items' 'Workspace, notebooks, and the Real-Time Dashboard' @('Fabric/Fabric'))
                     (& $step 'Fabric.Report' 'History report' @('Fabric/Fabric'))
                     (& $step 'Fabric.App' 'Insights app' @('Fabric/Fabric') $true)
-                    # Ask (ADR 0027): the app's Copilot chat relay, set up by the app's step (configure-fabric-app.ps1).
+                    # Ask (ADR 0028): the app's Copilot chat relay, set up by the app's step (configure-fabric-app.ps1).
                     (& $step 'Fabric.Ask' 'Copilot chat in the app (Ask: its relay scales to zero; each viewer signs in with GitHub once)' @('Fabric/Fabric') $true)
                 )
             })
@@ -240,6 +251,7 @@ function Get-DemoProgressStepId {
         'T1/Bootstraps' { return @('T1.Bootstraps') }
         'T1/T3' { return @('T3.Checks') }
         'T1/T4' { return @('T4.Setup') }
+        'T1/T5' { return @('T5.Checks') }
         'T1/Activity' { return @('T1.Activity') }
         'T1/Monitoring' { return @('T1.Monitoring') }
         'T1/Telemetry' { return @('T1.Telemetry') }
@@ -274,7 +286,7 @@ function Get-DemoProgressStepLabel {
         [string] $InstallMode = 'JumpstartImage'
     )
 
-    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled -InstallMode $InstallMode)) {
+    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled -T5Enabled -InstallMode $InstallMode)) {
         foreach ($item in @($track['steps'])) {
             if ([string]$item['id'] -ne $Id) {
                 continue
@@ -284,7 +296,7 @@ function Get-DemoProgressStepLabel {
                 $label = [string][char]::ToLowerInvariant($label[0]) + $label.Substring(1)
             }
             $group = ($Id -split '\.')[0]
-            if ($group -in 'T3', 'T4') {
+            if ($group -in 'T3', 'T4', 'T5') {
                 $label = '{0} {1}' -f $group, ($label -replace '^set up\b', 'setup')
             }
             return $label

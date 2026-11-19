@@ -38,7 +38,7 @@ Describe 'Test-DemoHubEstate' {
     It 'passes every target that Resource Graph lists, through the documented Resources API with a body file' {
         Initialize-HubAzMock -Token (Get-HubFakeToken) -GraphRow (Get-HubGraphRow)
         $results = @(Test-DemoHubEstate -Config $config)
-        ($results | ForEach-Object { $_.checkId }) | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4')
+        ($results | ForEach-Object { $_.checkId }) | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4', 'HUB.ESTATE.T5')
         $results | ForEach-Object { $_.status | Should -Be 'Pass' }
         $results[3].evidence.state | Should -Be 'Ready'
         $results[3].message | Should -Match 'metrics only'
@@ -63,6 +63,18 @@ Describe 'Test-DemoHubEstate' {
         $result.message | Should -Match 'pgflex01-abc123'
         $config['t4Enabled'] = $false
         @(Test-DemoHubEstate -Config $config -Target T4)[3].status | Should -Be 'Not selected'
+    }
+
+    It 'fails T5 when its Cosmos DB account isn''t listed, with the upgrade''s command, and leaves it out when T5 is off (ADR 0027)' {
+        Initialize-HubAzMock -Token (Get-HubFakeToken) -GraphRow (Get-HubGraphRow -Without 'microsoft.documentdb/databaseaccounts|cosmos01-abc123')
+        $result = @(Test-DemoHubEstate -Config $config -Target T5) | Where-Object checkId -EQ 'HUB.ESTATE.T5'
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'cosmos01-abc123'
+        $result.remediation | Should -Match 'deploy\.ps1'
+        Initialize-HubAzMock -Token (Get-HubFakeToken) -GraphRow (Get-HubGraphRow)
+        (@(Test-DemoHubEstate -Config $config -Target T5) | Where-Object checkId -EQ 'HUB.ESTATE.T5').status | Should -Be 'Pass'
+        $config['t5Enabled'] = $false
+        (@(Test-DemoHubEstate -Config $config -Target T5) | Where-Object checkId -EQ 'HUB.ESTATE.T5').status | Should -Be 'Not selected'
     }
 
     It 'fails T1 when the VM has no SQL virtual machine resource' {

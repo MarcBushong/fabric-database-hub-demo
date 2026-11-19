@@ -1,4 +1,4 @@
-# ADR 0027: Ask: GitHub Copilot chat in the Insights app
+# ADR 0028: Ask: GitHub Copilot chat in the Insights app
 
 - **Status:** Accepted. Proven live on 2026-11-18: sign-in, the Copilot SDK on a viewer's Copilot Enterprise, the relay on Azure Container Apps with the app's origin, and the live-estate core. The in-browser check of the Fabric-hosted app waits for the owner's rehearsal.
 - **Date:** 2026-11-18

@@ -55,7 +55,7 @@ To skip one night, turn off its schedule `dbhub-safety-stop` in `aa-<prefix>-<en
 
 ## Ask, the Copilot chat in the Insights app
 
-Ask ([ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md)) is part of every deployment, and its defaults need no edit: `deploy.ps1` deploys its chat relay with the Insights app, and each viewer signs in to GitHub once per browser with their own Copilot license.
+Ask ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) is part of every deployment, and its defaults need no edit: `deploy.ps1` deploys its chat relay with the Insights app, and each viewer signs in to GitHub once per browser with their own Copilot license.
 
 ```json
 "ask": {

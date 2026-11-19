@@ -1,4 +1,4 @@
-# Ask (ADR 0027): the Insights app's in-app GitHub Copilot chat. Its chat relay is an Azure Container App in the demo
+# Ask (ADR 0028): the Insights app's in-app GitHub Copilot chat. Its chat relay is an Azure Container App in the demo
 # resource group (infra/ask/ask-relay.bicep). Internal helpers for Invoke-DemoAskRelaySetup, Test-DemoAskRelay, and
 # Test-DemoAskCspSetting. Every result about Ask is Pass, Warning, or Not selected: Ask never blocks DONE.
 

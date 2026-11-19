@@ -1,5 +1,5 @@
 BeforeAll {
-    # Ask, the Copilot chat in the Insights app (ADR 0027): its settings and names, its relay's setup against a fake Azure
+    # Ask, the Copilot chat in the Insights app (ADR 0028): its settings and names, its relay's setup against a fake Azure
     # (the template, its parameters, the origin it keeps, a failure as a Warning), the relay's health and sign-in checks,
     # the strict-CSP tenant setting, and how deploy.ps1 shows it (never blocking DONE). Azure is a fake behind
     # Invoke-DemoAzCli, so Invoke-DemoAz (the subscription guard) and the private parameters file run for real. IDs and

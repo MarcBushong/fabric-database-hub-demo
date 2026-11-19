@@ -1,7 +1,7 @@
 function Invoke-DemoAskRelaySetup {
     <#
     .SYNOPSIS
-    Sets up Ask's chat relay (ADR 0027) in the demo resource group: infra/ask/ask-relay.bicep, the Container Apps
+    Sets up Ask's chat relay (ADR 0028) in the demo resource group: infra/ask/ask-relay.bicep, the Container Apps
     environment cae-<prefix>-<environment>-ask and the relay ca-<prefix>-<environment>-ask, on the pinned image. Returns
     Results (ASK.RELAY), Endpoint (the relay's https address, '' when there's none), AllowedOrigins, and ClientIdSource (where the GitHub OAuth App's client ID came from: pinned, config, or '').
 

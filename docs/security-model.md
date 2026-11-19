@@ -200,7 +200,7 @@ Until 2026-11-09, one more token reached the guest outside the scripts: in `Payg
 
 ## Ask, the Copilot chat in the Insights app (2026-11-18)
 
-[ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md). The chat runs on each viewer's own GitHub Copilot, through a relay that holds no credential.
+[ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md). The chat runs on each viewer's own GitHub Copilot, through a relay that holds no credential.
 
 - **What reaches GitHub Copilot:** the viewer's questions; a guide to the history model (table, column, and measure names, never data); the answers of the read-only tools the viewer's Copilot calls: DAX results (at most 120 rows each) and the live estate (resource names, health counts, and security findings, for the demo's resource group only); and, when the viewer selects **Ask Copilot** or **Ask why**, that visual's title, DAX, and at most 200 of its rows. Never an Azure or Fabric token (the app's code never has one), a password, or a key.
 - **The tools run in the page, as the viewer:** DAX goes through the app's delegated semantic model connector, so it returns only what the viewer may read. Only `EVALUATE` queries are accepted, and the relay itself runs no tool and turns every built-in Copilot tool, agent, and skill off.
@@ -217,6 +217,14 @@ Until 2026-11-09, one more token reached the guest outside the scripts: in `Payg
 - **Least privilege for the workload:** the runner's role `contosocare_runner` is a non-administrator role mapped to T1's identity, with the demo's tables and functions in `contosocare` and `pg_read_all_stats` (read-only statistics, for the live view) when the service allows it. It can end only its own sessions, and the session tools filter on `ContosoCare.Demo/` names in `contosocare` as well.
 - **Network:** virtual network integration with no public access, TLS verified by host name (`VerifyFull`), and port 5432 open only from T1's subnet.
 - **Hub posture:** Hub evaluates four PostgreSQL assessments; T4 is built to pass Entra authentication enabled and enforced and public network access disabled; customer-managed keys stay a suggestion (service-managed encryption) ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)).
+
+## T5, the Azure Cosmos DB account (2026-11-18)
+
+- **No secret exists:** local (key) authentication is off (`disableLocalAuth`), and key-based metadata writes too, so no account key works for data and nothing stores one; Microsoft Entra is the only way in ([ADR 0027](adr/0027-t5-cosmos-db.md), [role-based access control](https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control)).
+- **No token travels:** T1's runner asks its own managed identity for a token for the account (the `https://<account>.documents.azure.com` audience), sends it in each request's `Authorization` header over HTTPS, and keeps it in memory only; nothing is written to disk, a log, or a Run Command. The operator's token is never sent to T1 for T5.
+- **Least privilege for the workload:** T1's identity has Cosmos DB Built-in Data Contributor on the account only (a data-plane role assignment, not an Azure role), and the runner acts only in `contosocare`/`patient-events`, on documents it wrote: a bounded set it deletes after `ru-storm`.
+- **Network:** public network access is off in both network modes; a private endpoint in `snet-pe` with the `privatelink.documents.azure.com` zone is the only way in, and `snet-pe`'s network security group allows TCP 443 from T1's subnet only.
+- **Hub posture:** Database Hub's Security page evaluates Microsoft Entra-only access, public network access, and customer-managed keys for Cosmos DB; T5 is built to pass the first two, and customer-managed keys stay a suggestion (service-managed encryption) ([monitor Azure Cosmos DB](https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db)).
 
 ## The on-demand activity control (Phase 25c)
 

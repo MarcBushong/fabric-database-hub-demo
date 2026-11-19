@@ -151,7 +151,7 @@ $activityDone = $false
 try {
     $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipT4Replica:$SkipT4Replica -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
 
-    # Ask (ADR 0027): wakes the Copilot chat's relay, which scales to zero, so the session's first question in the
+    # Ask (ADR 0028): wakes the Copilot chat's relay, which scales to zero, so the session's first question in the
     # Insights app is fast. A relay that doesn't answer is a Warning; nothing here stops the session.
     if (-not $whatIf) {
         try {

@@ -16,6 +16,10 @@ function Invoke-DemoValidation {
     - T3: Test-DemoT3.
     - T4 (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics: the PostgreSQL flexible server, Entra-only, its
       network, administrator, database, enhanced metrics, and METRICS.T4 (Azure Monitor has its metrics).
+    - T5 (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics: the Azure Cosmos DB for NoSQL account, Entra-only, its
+      private endpoint, container and throughput, free tier, T1's data-plane role, and METRICS.T5 (Azure Monitor has its
+      requests and normalized RU). Without requests while sqlvm01, which runs T5's workload, is deallocated, METRICS.T5
+      is a Warning.
     - Hub: Test-DemoFabricHubSetting (P4), Test-DemoFabricWorkspace (P5), Test-DemoHubEstate, and presenter
       access (Set-DemoPresenterAccess in what-if mode whenever it would assign a role).
     - Telemetry: Test-DemoHubTelemetry over the retention window, and the T3 readiness gate
@@ -44,7 +48,7 @@ function Invoke-DemoValidation {
     The areas to run; all of them by default.
 
     .PARAMETER Target
-    The targets whose checks run; all four by default.
+    The targets whose checks run; all five by default.
 
     .PARAMETER WaitMinutes
     How long the telemetry checks keep polling for fresh rows. 0 checks once.
@@ -76,11 +80,11 @@ function Invoke-DemoValidation {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')]
-        [string[]] $Area = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown'),
+        [ValidateSet('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')]
+        [string[]] $Area = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown'),
 
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
-        [string[]] $Target = @('T1', 'T2', 'T3', 'T4'),
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
+        [string[]] $Target = @('T1', 'T2', 'T3', 'T4', 'T5'),
 
         [ValidateRange(0, 120)]
         [int] $WaitMinutes = 0,
@@ -111,18 +115,18 @@ function Invoke-DemoValidation {
 
     $context = New-DemoValidationContext -Config $Config -Target $Target -DeploymentId $DeploymentId -Results $results
     # Areas that read a deployed environment; without the resource group, Infrastructure reports it once.
-    $deployedOnly = @('T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload')
+    $deployedOnly = @('T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload')
     $resultAreas = @{
-        Preflight = 'preflight'; Infrastructure = 'infra'; T1 = 't1'; T2 = 't2'; T3 = 't3'; T4 = 't4'; Hub = 'hub'; Telemetry = 'hub'
+        Preflight = 'preflight'; Infrastructure = 'infra'; T1 = 't1'; T2 = 't2'; T3 = 't3'; T4 = 't4'; T5 = 't5'; Hub = 'hub'; Telemetry = 'hub'
         Workload = 'workload'; Cost = 'cost'; Security = 'security'; Teardown = 'teardown'
     }
-    $order = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
+    $order = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
     $groupReported = 'Infrastructure' -in $Area
     foreach ($name in $order) {
         if ($name -notin $Area) {
             continue
         }
-        if ($name -in 'T1', 'T2', 'T3', 'T4' -and $name -notin $Target) {
+        if ($name -in 'T1', 'T2', 'T3', 'T4', 'T5' -and $name -notin $Target) {
             continue
         }
         if ($name -in $deployedOnly -and -not $context.GroupExists) {
@@ -142,6 +146,7 @@ function Invoke-DemoValidation {
                 'T2' { Invoke-DemoValidationT2 -Context $context }
                 'T3' { Invoke-DemoValidationT3 -Context $context }
                 'T4' { Invoke-DemoValidationT4 -Context $context }
+                'T5' { Invoke-DemoValidationT5 -Context $context }
                 'Hub' { Invoke-DemoValidationHub -Context $context -FabricAdmin:$FabricAdmin }
                 'Telemetry' { Invoke-DemoValidationTelemetry -Context $context -WaitMinutes $WaitMinutes }
                 'Workload' { Invoke-DemoValidationWorkload -Context $context }

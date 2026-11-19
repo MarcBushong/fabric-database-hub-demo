@@ -187,6 +187,22 @@ var privateEndpointRules = [
       destinationPortRange: '1433'
     }
   }
+  // T5 (ADR 0027): the workload runner on T1 reaches the Cosmos DB account's private endpoint through its gateway, HTTPS
+  // only, in both network modes.
+  {
+    name: 'Allow-Cosmos-From-T1'
+    properties: {
+      description: 'Only T1 reaches the T5 private endpoint, over HTTPS.'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 110
+      protocol: 'Tcp'
+      sourceAddressPrefix: subnetPrefixes.sqlvm
+      sourcePortRange: '*'
+      destinationAddressPrefix: '*'
+      destinationPortRange: '443'
+    }
+  }
   {
     name: 'Deny-VNet-Inbound'
     properties: {
@@ -570,7 +586,7 @@ var natGatewayId = outboundMode == 'NatGateway' ? natGateway.id : null
 
 // privateEndpointNetworkPolicies is set on every subnet, because what-if reports a change from the live value
 // (Disabled) to Enabled when it's omitted. snet-pe keeps NetworkSecurityGroupEnabled so nsg-pe filters traffic
-// to the T3 private endpoint.
+// to the T3 and T5 private endpoints.
 module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.2' = {
   name: 'vnet'
   params: {

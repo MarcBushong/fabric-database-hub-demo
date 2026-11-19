@@ -11,7 +11,7 @@ Checks:
 - Pester: the unit tests in tests/unit, including schema, notebook, link, workflow-pin, and convention tests, with the
   Azure CLI guard of tests/TestAzGuard.ps1 on: a call a unit test makes to az is stopped and listed (STATIC.PESTER.AZURECLI).
 - Bicep: build, lint, and the azuredeploy.json sync check, plus build and lint of the standalone templates in
-  infra/control (ADR 0020), infra/safetystop (ADR 0024), infra/replica (ADR 0025), and infra/ask (ADR 0027). Not selected
+  infra/control (ADR 0020), infra/safetystop (ADR 0024), infra/replica (ADR 0025), and infra/ask (ADR 0028). Not selected
   until infra/main.bicep exists.
 - PSRule: PSRule for Azure (Well-Architected rules) on infra/main.bicepparam, with the suppressions in ps-rule.yaml.
 - DotNet: restore (locked mode), build, and test the workload generator.
@@ -152,7 +152,7 @@ if ('Bicep' -in $Check) {
         $buildExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'build', '--file', $mainBicep, '--outfile', $built)
         $lintExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'lint', '--file', $mainBicep)
         # The standalone templates (ADR 0020's on-demand activity control, ADR 0024's nightly safety stop, ADR 0025's T4 read
-        # replica, ADR 0027's chat relay) aren't modules of main.bicep: build and lint each one.
+        # replica, ADR 0028's chat relay) aren't modules of main.bicep: build and lint each one.
         $standalone = @(foreach ($folder in 'infra/control', 'infra/safetystop', 'infra/replica', 'infra/ask') {
                 Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath $folder) -Filter '*.bicep' -File -ErrorAction SilentlyContinue
             })

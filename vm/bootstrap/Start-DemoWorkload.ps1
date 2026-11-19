@@ -13,6 +13,8 @@ Reads workload-install.json, which the WorkloadRunner step writes, then:
    PostgreSQL flexible server, joins the same way once Enable-DemoT4Workload has recorded t4-workload.json
    (Phase 24, ADR 0019); its sessions sign in as the runner's role with T1's managed identity. T4's read
    replica goes with T4 by name (ADR 0025), for an incident:replica-lag; it exists only during a session.
+   T5, the Azure Cosmos DB account (ADR 0027), joins as soon as the install record names it and its documents host
+   resolves: its data-plane role comes with the template, so it has no setup step and no marker.
 3. Sets every target's activity profile to the configured one (activityProfile, baseline by default), ending
    before the next auto-shutdown: once after each install (a deployment), and once per boot only when
    activityProfileOnBoot is true. It's false by default: a VM that starts (a manual start, a scheduled
@@ -371,6 +373,21 @@ function Invoke-DemoWorkloadHost {
         }
     }
 
+    # T5 (ADR 0027): the Cosmos DB account's documents host, which resolves to its private endpoint through the linked zone.
+    $t5Host = ''
+    $t5 = Get-DemoWorkloadValue -InputObject $install -Name 't5'
+    if ($primary -eq 'T1' -and $null -ne $t5) {
+        $accountHost = ([string](Get-DemoWorkloadValue -InputObject $t5 -Name 'accountHost')).ToLowerInvariant()
+        if ($accountHost -match '^[a-z0-9][a-z0-9-]{1,42}[a-z0-9]\.documents\.azure\.com$') {
+            if (Test-DemoWorkloadNameResolve -HostName $accountHost) {
+                $t5Host = $accountHost
+            }
+            else {
+                Write-DemoWorkloadLog -Level 'Warning' -Message ('T5 ({0}) does not resolve, so the host runs without it.' -f $accountHost)
+            }
+        }
+    }
+
     $installedUtc = ConvertTo-DemoWorkloadStamp -Value (Get-DemoWorkloadValue -InputObject $install -Name 'installedUtc')
     $bootUtc = Get-DemoWorkloadBootTime
     $bootPath = Join-Path -Path $StateRoot -ChildPath 'workload-boot.json'
@@ -400,6 +417,9 @@ function Invoke-DemoWorkloadHost {
         if ($t4Fqdn) {
             $targets += 'T4'
         }
+        if ($t5Host) {
+            $targets += 'T5'
+        }
         $results = [ordered]@{}
         foreach ($target in $targets) {
             $arguments = @('profile', 'set', '--target', $target, '--name', $activityProfile, '--requested-by', 'DbHubDemo-Workload')
@@ -411,6 +431,9 @@ function Invoke-DemoWorkloadHost {
             }
             if ($target -eq 'T4') {
                 $arguments += @('--server', $t4Fqdn)
+            }
+            if ($target -eq 'T5') {
+                $arguments += @('--server', $t5Host)
             }
             $exitCode = 1
             # SQL Server may still be starting after a boot: retry for about five minutes.
@@ -445,12 +468,16 @@ function Invoke-DemoWorkloadHost {
             $hostArguments += @('--t4-replica-server', $t4ReplicaFqdn)
         }
     }
-    $targetText = $primary
-    if ($t3Fqdn) {
-        $targetText = $primary + ' and T3'
+    if ($t5Host) {
+        $hostArguments += @('--t5-server', $t5Host)
     }
-    if ($t4Fqdn) {
-        $targetText = $targetText.Replace(' and ', ', ') + ' and T4'
+    $hosted = @($primary) + @(if ($t3Fqdn) { 'T3' }) + @(if ($t4Fqdn) { 'T4' }) + @(if ($t5Host) { 'T5' })
+    $targetText = $hosted[0]
+    if ($hosted.Count -eq 2) {
+        $targetText = '{0} and {1}' -f $hosted[0], $hosted[1]
+    }
+    elseif ($hosted.Count -gt 2) {
+        $targetText = '{0}, and {1}' -f (($hosted | Select-Object -First ($hosted.Count - 1)) -join ', '), $hosted[-1]
     }
     Write-DemoWorkloadLog -Message ('Hosting the activity profiles for {0} until {1}.' -f $targetText, $notAfter)
     $code = Invoke-DemoWorkloadRunner -DotNetExe $dotnet -RunnerDll $runner -ArgumentList $hostArguments -TimeoutSeconds 0 -LogName 'host'

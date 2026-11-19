@@ -1,4 +1,4 @@
-// The Insights app's Copilot chat relay (Ask, ADR 0027) in the demo resource group. scripts/configure-fabric-app.ps1
+// The Insights app's Copilot chat relay (Ask, ADR 0028) in the demo resource group. scripts/configure-fabric-app.ps1
 // deploys it before the app on every run (Invoke-DemoAskRelaySetup), and again with the app's origin once the app is
 // deployed; destroy.ps1 deletes it with the group:
 // - cae-<prefix>-<environment>-ask: a Container Apps environment on the Consumption workload profile, with no Log

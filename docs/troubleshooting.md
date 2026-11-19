@@ -336,6 +336,26 @@ The host's bootstrap clears a broken channel the same way, once per bundle, for 
 | The Insights app's PostgreSQL page, or the history report, has no T4 rows | The history gets T4's and the replica's metrics only from `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s history snapshot, and `configure-fabric.ps1 -RunLiveActivity`: a notebook run started in Fabric can't read Azure Monitor, and a deleted replica's metrics are gone | End the next session with `./scripts/stop-demo.ps1 -SaveHistory`, which reads them before it deletes the replica |
 | `STOP.T4.HISTORY.PENDING` is a **Warning**: "The session's history wasn't saved ..., and T4's read replica is deleted, and Azure Monitor no longer has its metrics: the metrics captured before the delete ... are kept in `./out/history-pending/postgres-metrics-<resource group>-<time>.json`" | `stop-demo.ps1 -SaveHistory` read the session's metrics before it deleted the replica, but the notebook run that adds them to the history didn't run or failed: most often the Fabric capacity was paused (`STOP.FABRIC.SAVEHISTORY` says why) | Once the capacity runs, run the command it names, `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath <file>` (add `-ConfigPath` for another configuration). After a run that passed, the file moves to `out/history-pending/saved` |
 
+## T5: Azure Cosmos DB
+
+`cosmos01-<deploymentId>`, the Azure Cosmos DB for NoSQL account ([ADR 0027](adr/0027-t5-cosmos-db.md); [in the deployment](deployment.md#t5-in-the-deployment-2026-11-18)). `./scripts/status.ps1` shows it as `STATUS.T5`, and `./scripts/validate.ps1 -Area T5` checks it.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `STATUS.T5`, `START.T5`, `T5.ACCOUNT`, or `HUB.ESTATE.T5` says T5 "doesn't exist" | A demo deployed before 2026-11-18, or an account that was deleted | Run `./scripts/deploy.ps1`: it creates T5 with the template, with nothing else to do (`DEPLOY.T5.MISSING` when it resumes an unfinished run) |
+| `DEPLOY.T5.FREETIER` is a **Warning**: "The subscription's one free-tier Azure Cosmos DB account is `<name>` ..." | A subscription has one free-tier account at most, and another account has it | Nothing to do: T5 bills its throughput at list price (`./scripts/estimate-cost.ps1` prices it). To have the free tier, delete that account before T5 is created; an existing T5 keeps what it was created with |
+| `DEPLOY.T5.FREETIER` is a **Warning**: "Azure Cosmos DB's free tier isn't offered to this subscription (an internal subscription, ...)" | Azure doesn't offer the free tier to internal subscriptions ("Free tier is not supported for Internal subscriptions", live 2026-11-18) | Nothing to do: T5 bills its throughput at list price, about $31.41 a month (2026-11-18 list prices) |
+| `DEPLOY.T5.FREETIER` is a **Warning**: "Azure refused T5's free tier (...), so the template was deployed again without it" | Azure refused it at creation: the reason in brackets is Azure's, such as an internal subscription whose offer the run couldn't read, or another account that took the free tier between the check and the creation | Nothing to do: the run deployed T5 without it |
+| `WORKLOAD.T5.WARMUP` is a **Fail** with 401 or 403 after 10 minutes | T1's data-plane role assignment hasn't taken effect, or it's missing (`T5.ACCESS`) | Run `./scripts/deploy.ps1` again: the template assigns the role (Cosmos DB Built-in Data Contributor, a data-plane role assignment Contributor can create), and the warmup tries again. `./scripts/validate.ps1 -Area T5` shows `T5.ACCESS` |
+| `WORKLOAD.T5.WARMUP` fails with "could not be resolved" or a time-out | sqlvm01 doesn't resolve `cosmos01-<id>.documents.azure.com` to the private endpoint yet, or `snet-pe`'s network security group doesn't allow TCP 443 from `snet-sqlvm` | `./scripts/validate.ps1 -Area T5` (`T5.NETWORK` checks the private endpoint), then `./scripts/deploy.ps1` again, which sets the DNS zone group and the rule `Allow-Cosmos-From-T1` |
+| `T5.ENTRAONLY` or `T5.NETWORK` is a **Fail** | Someone turned local (key) authentication or public network access back on | Run `./scripts/deploy.ps1`, which sets them back; Database Hub's Security page shows the same as an Issue |
+| `T5.CONTAINER` is a **Warning**: "has `<n>` RU/s, not 400" | The throughput was changed by hand | Run `./scripts/deploy.ps1`, which sets it back to 400 RU/s, the size `ru-storm` is made for |
+| `METRICS.T5` is a **Warning**: "no request metrics for T5 from the last 15 minutes" | Nothing sent T5 requests: sqlvm01 is deallocated, or T5 has no activity profile | `./scripts/start-demo.ps1`, or Run all, then `./scripts/validate.ps1 -Area T5` again in a few minutes |
+| `STOP.T5` is **Not supported** | An Azure Cosmos DB account can't be stopped or paused: that's the platform, not a failure | Nothing to do. It says what bills between sessions; `./scripts/destroy.ps1` is the way to stop paying for T5 |
+| Database Hub's T5 **Avg Latency** chart is empty | It charts direct-mode latency, and the runner reaches T5 through the gateway (HTTPS) | Expected; normalized RU, request units, throttled requests, and availability have data |
+| `ru-storm` shows no 429s in Database Hub yet | Database Hub's charts use an hourly grain, and Azure Monitor's metrics arrive within minutes | Wait a few minutes after the storm's first wave, and look at **Normalized RU Consumption** and **Throttled Requests** for the hour it's in. `./scripts/status.ps1` shows the last 15 minutes' requests, 429s, and normalized RU from Azure Monitor |
+| Storm documents are left in `patient-events` | The VM was deallocated or the run was cut off mid-storm, before its cleanup | `./scripts/reset-demo.ps1 -Target T5` removes them; the next `ru-storm` cleans up after itself too |
+
 ## Database Hub and telemetry
 
 | Symptom | Likely cause | Fix |
@@ -389,7 +409,7 @@ The app's own guide has more ([fabric/app](../fabric/app/README.md#troubleshooti
 
 ### Ask, the Copilot chat in the Insights app (2026-11-18)
 
-Ask never blocks **DONE**: each of its results is a **Pass**, a **Warning**, or **Not selected**, on the console, the status page's **Copilot chat in the Insights app (Ask)** row, and in **DONE**'s notes. Everything else in the app works without it ([ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md), [the security model](security-model.md#ask-the-copilot-chat-in-the-insights-app-2026-11-18)).
+Ask never blocks **DONE**: each of its results is a **Pass**, a **Warning**, or **Not selected**, on the console, the status page's **Copilot chat in the Insights app (Ask)** row, and in **DONE**'s notes. Everything else in the app works without it ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md), [the security model](security-model.md#ask-the-copilot-chat-in-the-insights-app-2026-11-18)).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -539,7 +559,7 @@ Write-DemoResultReport -Result @(Invoke-DemoSafetyStopSetup -Config $config -Con
 
 | Dependency | When it isn't available | Fallback |
 |---|---|---|
-| In-Hub Database Agent (preview) | Missing, slow, or declines a target | The Insights app's Copilot chat (Ask), then the GA `databasehub-cli` and telemetry skills in GitHub Copilot CLI, then the Azure Data Explorer web UI, then rehearsal screenshots ([ADR 0013](adr/0013-agent-experience.md), [ADR 0027](adr/0027-ask-copilot-in-the-insights-app.md)) |
+| In-Hub Database Agent (preview) | Missing, slow, or declines a target | The Insights app's Copilot chat (Ask), then the GA `databasehub-cli` and telemetry skills in GitHub Copilot CLI, then the Azure Data Explorer web UI, then rehearsal screenshots ([ADR 0013](adr/0013-agent-experience.md), [ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) |
 | Database Hub UI | Not reachable | Estate through Azure Resource Graph (`HUB.ESTATE.*`) and telemetry through the documented endpoint (`TELEMETRY.*`) |
 | Notebook `kusto` token | Not accepted | Printed KQL for the Azure Data Explorer web UI, and `validate.ps1` |
 | Nested virtualization | Not available | The opt-in evaluation-only Azure VM, labeled **evaluation only** everywhere, with `ProductKey` or `Developer`: `JumpstartImage` needs the nested host |
@@ -547,6 +567,7 @@ Write-DemoResultReport -Result @(Invoke-DemoSafetyStopSetup -Config $config -Con
 | The `PaygWizard` step | Retired (2026-11-09) | A configuration's `PaygWizard` runs as `JumpstartImage` (the default), fully unattended with Hub Performance; `ProductKey` mode (P10) is fully unattended too, and `Developer` mode unattended but Estate only |
 | T4's default size | Azure refuses `Standard_B1ms` (and `Standard_B2s`) | `Standard_B2s` by itself (Phase 28); when both are refused, General Purpose `Standard_D2ds_v5` after its cost check against both ceilings, which only reports since 2026-11-09; when Azure refuses every size, the run ends **NOT DONE** with the fix (Phase 28 follow-up) |
 | T4's read replica's size | Azure refuses T4's size for the replica | T4's size in another zone, then the next documented size with at least T4's vCores, with a **Warning** that gives both prices (`DEPLOY.T4.REPLICA.FALLBACK`); when Azure refuses every size, `deploy.ps1` ends **NOT DONE** with the fix, and `start-demo.ps1` starts the session without the replica ([above](#t4s-read-replica)) |
+| T5's free tier | Another account in the subscription has it, the subscription is internal, or Azure refuses it at creation | T5 without the free tier, at list price, with a **Warning** that names the account that has it or the subscription's offer (`DEPLOY.T5.FREETIER`); a refusal deploys the template again without it, once, with Azure's reason ([above](#t5-azure-cosmos-db)) |
 | The Insights app's tenant settings | Not on | Preflight warns (`PREFLIGHT.FABRIC.APPSETTINGS`); the app isn't created, the deployment goes on and still ends **DONE**, and the status page shows the app's step as **Failed**, with the settings to turn on and the command that adds it later |
 | Azure SQL free offer | Not available | Regular General Purpose serverless, with a **Warning** |
 | Public SQL endpoint | Denied by policy | Private mode with a private endpoint |

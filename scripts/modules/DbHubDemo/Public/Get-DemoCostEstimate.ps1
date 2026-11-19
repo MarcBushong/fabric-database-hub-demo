@@ -22,7 +22,10 @@ function Get-DemoCostEstimate {
     - Defender for open-source relational databases (OpenSourceRelationalDatabases): the T4 server, per month,
       stopped or not (Phase 24, ADR 0019), and T4's read replica for the hours it exists (ADR 0025).
     - Defender CSPM (CloudPosture): T1 and the T2 host while they aren't deallocated, the T4 server all month, T4's read
-      replica while it exists, and the T3 server all month. Arc machines aren't billable resources.
+      replica while it exists, and the T3 server all month. Arc machines aren't billable resources, and neither is an
+      Azure Cosmos DB account (https://learn.microsoft.com/azure/defender-for-cloud/concept-cloud-security-posture-management).
+    - Defender for Azure Cosmos DB (CosmosDbs): T5's provisioned throughput, per 100 RU/s an hour, all month (2026-11-18,
+      ADR 0027).
     - Defender for Storage: the deployment creates no storage accounts, so it adds nothing.
     Subscription-wide plans, such as Defender for Resource Manager, aren't attributed to the demo.
     Without -DefenderPlans the estimate excludes Defender and reports a Warning.
@@ -83,6 +86,13 @@ function Get-DemoCostEstimate {
     Otherwise, or without it, the worst case counts T4 running for the rest of the month. PREFLIGHT.COST.MONTHLY says which
     one applies and why.
 
+    .PARAMETER T5FreeTier
+    Whether T5's Azure Cosmos DB account has, or gets, the subscription's free tier (Get-DemoT5FreeTierStatus; 2026-11-18,
+    ADR 0027): true prices its throughput and storage with the Free Tier meters (the first 1000 RU/s and 25 GB of an account
+    are free, so its 400 RU/s cost nothing); false, or $null when it wasn't checked, at list price, an upper bound, and
+    PREFLIGHT.COST.MONTHLY says which. T5 has no stop, so its throughput, storage, private endpoint, and private DNS zone,
+    and Defender for Azure Cosmos DB when its plan (CosmosDbs) is on Standard, are idle costs: they bill all month.
+
     .PARAMETER SkipCeilingReference
     Internal (2026-11-09): skips the reference size's estimate behind PREFLIGHT.COST.MONTHLY's Warning instead of a Fail
     when only a T4 size the person didn't choose puts the month over monthlyCeilingUsd: monthlyCeilingUsd at exactly 250,
@@ -135,6 +145,9 @@ function Get-DemoCostEstimate {
 
         [AllowNull()]
         [object] $T4RestartCoverage = $null,
+
+        [AllowNull()]
+        [object] $T5FreeTier = $null,
 
         [switch] $SkipCeilingReference
     )
@@ -279,7 +292,7 @@ function Get-DemoCostEstimate {
     $ipItem = $ipItems | Where-Object { $_.meterName -eq 'Standard IPv4 Static Public IP' } | Select-Object -First 1
     Add-Component 'Bastion public IP' 'bastion' $ipItem 1 'hour'
 
-    # Ask's chat relay (ADR 0027): billed per second only while its replica runs, that is while someone uses the Copilot
+    # Ask's chat relay (ADR 0028): billed per second only while its replica runs, that is while someone uses the Copilot
     # chat in the Insights app (it scales to zero after a few idle minutes), so a running hour is its upper bound; idle,
     # it costs nothing.
     $askSetting = Get-DemoAskSetting -Config $Config
@@ -377,6 +390,26 @@ function Get-DemoCostEstimate {
 
     # T2 golden snapshots (ADR 0018): incremental snapshots are stored as Standard HDD, LRS or ZRS
     # (https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots).
+    # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): an account has no stop, so its provisioned throughput, its
+    # storage, its private endpoint, and its private DNS zone bill all month, in both network modes. On the free tier (the
+    # first 1000 RU/s and 25 GB of one account per subscription, https://learn.microsoft.com/azure/cosmos-db/free-tier), its
+    # throughput and storage are priced with the Free Tier meters, which cost nothing. Its periodic backup's two copies are
+    # free.
+    $t5On = Test-DemoT5Enabled -Config $Config
+    $t5Free = if ($null -eq $T5FreeTier) { $null } else { [bool]$T5FreeTier }
+    $t5Units = 0.0
+    if ($t5On) {
+        $cosmos = Get-DemoCosmosSetting
+        $t5Units = [double]$cosmos['throughputRUs'] / 100.0
+        $cosmosItems = Get-CachedPrice "serviceName eq 'Azure Cosmos DB' and armRegionName eq '$location' and productName eq 'Azure Cosmos DB' and priceType eq 'Consumption'"
+        $t5Sku = if ($t5Free -eq $true) { 'Free Tier' } else { 'RUs' }
+        $t5Label = if ($t5Free -eq $true) { 'free tier' } else { 'list price' }
+        Add-Component ('T5 throughput ({0} RU/s manual, {1})' -f $cosmos['throughputRUs'], $t5Label) 'idle' ($cosmosItems | Where-Object { $_.skuName -eq $t5Sku -and $_.meterName -eq '100 RU/s' -and $_.unitOfMeasure -match '^1\s*/?\s*Hour$' } | Select-Object -First 1) ($t5Units * $hoursPerMonth) '100 RU/s-hour'
+        Add-Component ('T5 storage (about {0} GB, {1})' -f $cosmos['estimatedStorageGB'], $t5Label) 'idle' ($cosmosItems | Where-Object { $_.skuName -eq $t5Sku -and $_.meterName -eq 'Data Stored' } | Select-Object -First 1) ([double]$cosmos['estimatedStorageGB']) 'GB-month'
+        Add-Component 'T5 private endpoint' 'idle' (Select-HourlyPrice "serviceName eq 'Virtual Network' and productName eq 'Virtual Network Private Link' and skuName eq 'Standard'" 'Standard Private Endpoint') $hoursPerMonth 'hour'
+        $t5DnsItems = Get-CachedPrice "serviceName eq 'Azure DNS' and skuName eq 'Private' and meterName eq 'Private Zone' and priceType eq 'Consumption'"
+        Add-Component 'T5 private DNS zone' 'idle' ($t5DnsItems | Where-Object { $_.armRegionName -notmatch 'Gov' } | Sort-Object -Property tierMinimumUnits, armRegionName | Select-Object -First 1) 1 'zone-month'
+    }
     foreach ($snapshot in @($GoldenSnapshots | Where-Object { $null -ne $_ })) {
         $snapshotSku = [string](Get-DemoMemberValue -InputObject $snapshot -Name 'Sku')
         $redundancy = if ($snapshotSku -match 'ZRS') { 'ZRS' } else { 'LRS' }
@@ -479,7 +512,14 @@ function Get-DemoCostEstimate {
             Add-Component 'Defender for open-source relational databases (T4 read replica, for each session only)' 'running' $ossItem (1.0 / $hoursPerMonth) 'server-month' -Defender
         }
     }
-    $attributed = @('VirtualMachines', 'SqlServerVirtualMachines', 'SqlServers', 'CloudPosture', 'StorageAccounts') + @(if ($t4On) { 'OpenSourceRelationalDatabases' })
+    if ($t5On -and $standardPlans.Contains('CosmosDbs')) {
+        # Defender for Azure Cosmos DB bills an account's provisioned throughput per 100 RU/s an hour, whether the demo runs
+        # or not (https://azure.microsoft.com/pricing/details/defender-for-cloud/).
+        $billedPlans.Add('CosmosDbs')
+        $item = Select-HourlyPrice "serviceFamily eq 'Security' and productName eq 'Microsoft Defender for Azure Cosmos DB' and skuName eq 'Standard'" 'Standard 100 RU/s'
+        Add-Component ('Defender for Azure Cosmos DB (T5, {0:N0} RU/s)' -f ($t5Units * 100)) 'idle' $item ($t5Units * $hoursPerMonth) '100 RU/s-hour' -Defender
+    }
+    $attributed = @('VirtualMachines', 'SqlServerVirtualMachines', 'SqlServers', 'CloudPosture', 'StorageAccounts') + @(if ($t4On) { 'OpenSourceRelationalDatabases' }) + @(if ($t5On) { 'CosmosDbs' })
     $notAttributed = @($standardPlans.Keys | Where-Object { $_ -notin $attributed })
 
     $sum = {
@@ -531,6 +571,14 @@ function Get-DemoCostEstimate {
         }
     }
     $t4FixedMonthly = if ($t4On) { [System.Math]::Round($t4Fixed, 2) } else { $null }
+    # T5's month (ADR 0027): everything it bills, all of it idle, because an account has no stop.
+    $t5Fixed = 0.0
+    foreach ($component in $components) {
+        if ($component.Basis -eq 'idle' -and $component.Name -match '^T5 |\(T5[,)]') {
+            $t5Fixed += [double]$component.Cost
+        }
+    }
+    $t5FixedMonthly = if ($t5On) { [System.Math]::Round($t5Fixed, 2) } else { $null }
 
     $results = [System.Collections.Generic.List[object]]::new()
     $evidence = @{
@@ -563,6 +611,11 @@ function Get-DemoCostEstimate {
         $evidence['t4ReplicaHourly'] = [System.Math]::Round($replicaRunning, 4)
         $evidence['t4ReplicaSession'] = [System.Math]::Round($replicaRunning * $DemoHours, 2)
         $evidence['t4ReplicaMonthly'] = [System.Math]::Round($replicaRunning * $LightUseHoursPerMonth, 2)
+    }
+    $evidence['t5Enabled'] = [bool]$t5On
+    if ($t5On) {
+        $evidence['t5FixedMonthly'] = $t5FixedMonthly
+        $evidence['t5FreeTier'] = $t5Free
     }
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
@@ -656,6 +709,21 @@ function Get-DemoCostEstimate {
         }
         if ($networkModeAssumed) {
             $monthlyMessage += ' networkMode auto isn''t resolved yet, so the estimate assumes private mode (private endpoint and private DNS zone).'
+        }
+        if ($t5On) {
+            # T5 (ADR 0027): no stop, so all of it is in the idle month; the free tier, when it was checked, prices it.
+            $t5Culture = [System.Globalization.CultureInfo]::InvariantCulture
+            $t5Defender = if ($billedPlans -contains 'CosmosDbs') { ', and Defender for Azure Cosmos DB' } else { '' }
+            $t5FreeText = if ($t5Free -eq $true) {
+                ' It has the subscription''s free tier, so its throughput and storage cost nothing.'
+            }
+            elseif ($t5Free -eq $false) {
+                ' It doesn''t have the free tier (another account in the subscription has it, or t5UseFreeTier is false), so its throughput is at list price.'
+            }
+            else {
+                ' Whether it can have the subscription''s free tier wasn''t checked, so its throughput is at list price, an upper bound; preflight checks it, and on the free tier it costs nothing.'
+            }
+            $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) has no stop, so it costs {0:N2} USD a month whether the demo runs or not (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}).{3}', [double]$t5FixedMonthly, (Get-DemoCosmosSetting)['throughputRUs'], $t5Defender, $t5FreeText)
         }
         if ($t3UsesFreeOffer) {
             $monthlyMessage += ' T3 uses the Azure SQL Database free offer, whose monthly allowance covers {0:N2} USD of T3 compute and 32 GB of data.' -f $t3FreeCreditMonthly
@@ -754,6 +822,9 @@ function Get-DemoCostEstimate {
         T4ReplicaMonthly               = $(if ($t4On) { $evidence['t4ReplicaMonthly'] } else { $null })
         SessionCostWithoutReplica      = $sessionCostWithoutReplica
         LightUseMonthlyWithoutReplica  = $lightUseMonthlyWithoutReplica
+        T5Enabled                      = [bool]$t5On
+        T5FixedMonthly                 = $t5FixedMonthly
+        T5FreeTier                     = $t5Free
         T3FreeOffer                    = [bool]$t3UsesFreeOffer
         T3FreeOfferUnchecked           = $t3FreeOfferUnchecked
         T3FreeOfferCreditMonthly       = $t3FreeCreditMonthly

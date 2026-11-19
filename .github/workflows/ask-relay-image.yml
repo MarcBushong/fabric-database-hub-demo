@@ -1,6 +1,6 @@
 name: ask-relay-image
 
-# The Ask relay's container image (ask-relay/, ADR 0027): built, tested, and published to GitHub Container Registry
+# The Ask relay's container image (ask-relay/, ADR 0028): built, tested, and published to GitHub Container Registry
 # by this repository only, tagged with the commit SHA. Users never run it: deploy.ps1 pulls the image by the digest
 # pinned in config/versions.json (askRelay.image). It runs on main when ask-relay/ changes, in a public repository or
 # with the repository variable ASK_RELAY_IMAGE_ENABLED set to true (ADR 0022), and by hand on any branch, so a branch's

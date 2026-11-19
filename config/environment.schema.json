@@ -150,6 +150,16 @@
       "enum": ["", "1", "2", "3"],
       "default": ""
     },
+    "t5Enabled": {
+      "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId> (2026-11-18, ADR 0027): Microsoft Entra only (local authentication off), a private endpoint in both network modes with public network access off, and the patient-events container at 400 RU/s of manual throughput, which Database Hub charts from Azure Monitor (normalized RU, throttled requests, availability). On by default, in every deployment and in an upgrade of an existing demo. Cosmos DB has no stop: its throughput bills every hour, about 0.032 USD at list price (2026-11-18), or nothing on the subscription's free-tier account (t5UseFreeTier), and its private endpoint about 0.01 USD; estimate-cost.ps1 prices them. Set false only when your subscription can't have a Cosmos DB account (for example, a policy that denies the resource type); deploy.ps1 then says T5 is off (DEPLOY.T5.OFF) and leaves an existing account as it is.",
+      "type": "boolean",
+      "default": true
+    },
+    "t5UseFreeTier": {
+      "description": "T5 uses the subscription's free-tier account, the first 1,000 RU/s and 25 GB of one Azure Cosmos DB account a subscription gets free, when no other account in the subscription has it and the subscription isn't internal, which Azure refuses it in (true, the default). Azure sets free tier only when an account is created, so an existing T5 keeps what it has. deploy.ps1 reads the subscription's accounts through Azure Resource Graph before it creates T5, says which one has the free tier when another account does (DEPLOY.T5.FREETIER), and deploys T5 again without it when Azure refuses it. false never uses it (ADR 0027).",
+      "type": "boolean",
+      "default": true
+    },
     "activityProfile": {
       "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (the steady Contoso Care mix), business-day (default since 2026-11-03: the baseline plus bounded incidents at fixed minutes past each UTC hour, so Database Hub's Performance page has problems to show), or incident:<scenario> (ADR 0010). A profile with incidents starts as baseline, and the run switches to it once its own Run Commands on a VM are done; the VMs set baseline in its place by themselves (after a runner install, and at a boot with activityProfileOnBoot). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
       "type": "string",
@@ -337,7 +347,7 @@
       "default": {}
     },
     "ask": {
-      "description": "The Insights app's in-app GitHub Copilot chat (Ask, ADR 0027). deploy.ps1 runs its chat relay as an Azure Container App in the demo's resource group (it scales to zero and holds no credentials) and points the app at it; each viewer signs in once with their own GitHub account and Copilot license. When the relay can't be deployed, the status page shows a Warning and DONE stays.",
+      "description": "The Insights app's in-app GitHub Copilot chat (Ask, ADR 0028). deploy.ps1 runs its chat relay as an Azure Container App in the demo's resource group (it scales to zero and holds no credentials) and points the app at it; each viewer signs in once with their own GitHub account and Copilot license. When the relay can't be deployed, the status page shows a Warning and DONE stays.",
       "type": "object",
       "additionalProperties": false,
       "properties": {

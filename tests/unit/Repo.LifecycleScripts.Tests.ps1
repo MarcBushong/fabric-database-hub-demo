@@ -237,7 +237,7 @@ Describe 'Lifecycle scripts' {
         Mock -CommandName Write-DemoDeploymentOutcome -MockWith { }
         # Stop-DemoEnvironment's rotation and start-demo.ps1's handover record never reach Azure here.
         Mock -CommandName Set-DemoDeploymentState -MockWith { $capture['state'] = $Value }
-        # start-demo.ps1 wakes Ask's chat relay (ADR 0027); the lookup and the check have their own tests (DbHubDemo.Ask.Tests.ps1).
+        # start-demo.ps1 wakes Ask's chat relay (ADR 0028); the lookup and the check have their own tests (DbHubDemo.Ask.Tests.ps1).
         Mock -CommandName Get-DemoAskRelayEndpoint -MockWith { '' }
     }
 
@@ -581,7 +581,8 @@ Describe 'Lifecycle scripts' {
             foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = ''; Data = $null; Seconds = 1 } }
         }
         { & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -OutputPath $outputPath } | Should -Throw '*the start was stopped*'
-        $capture['order'] | Should -Be @('Switch:T1,T3,T4=business-day:0')
+        # sqlvm01 runs T1's, T3's, T4's, and T5's activity (T5 since 2026-11-18, ADR 0027).
+        $capture['order'] | Should -Be @('Switch:T1,T3,T4,T5=business-day:0')
     }
 
     It 'start-demo.ps1 with the Key Vault opt-in stores the password before it sets it, and never uses the clipboard' {
@@ -677,10 +678,11 @@ Describe 'Lifecycle scripts' {
         Should -Invoke -CommandName Invoke-DemoControl -Times 1 -Exactly -ParameterFilter { $DurationMinutes -eq 15 -and $Concurrency -eq 0 -and $ResetBefore -eq $true -and $AutoCleanup -eq $false }
     }
 
-    It 'demo-control.ps1 and Invoke-DemoControl accept every target demo-control.yml offers, T4 included (Phase 24)' {
+    It 'demo-control.ps1 and Invoke-DemoControl accept every target demo-control.yml offers, T4 (Phase 24) and T5 (ADR 0027) included' {
         $workflow = Get-WorkflowText 'demo-control.yml'
         $options = @([regex]::Match($workflow, '(?ms)^\s+target:.*?options:\s*\n((?:\s+- \S+\s*\n)+)').Groups[1].Value -split '\n' | ForEach-Object { $_.Trim().TrimStart('-').Trim() } | Where-Object { $_ })
         $options | Should -Contain 'T4'
+        $options | Should -Contain 'T5'
         $script = (Get-Command -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/demo-control.ps1')).Parameters['Target'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
         $module = (Get-Command -Name Invoke-DemoControl).Parameters['Target'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
         foreach ($option in $options) {

@@ -87,6 +87,16 @@ table 'Analysis Findings'
         formatString: #,0
         displayFolder: Findings
 
+    /// T5's throttling episodes that the notebook detected: runs of intervals with throttled requests (429s), an ru-storm's waves in one slot joined (the cosmosdb.T5.throttle.<start> findings).
+    measure 'Throttling Episodes' =
+            CALCULATE (
+                DISTINCTCOUNT ( 'Analysis Findings'[Finding ID] ),
+                KEEPFILTERS ( 'Analysis Findings'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( CONTAINSSTRING ( 'Analysis Findings'[Finding ID], ".throttle." ) )
+            )
+        formatString: #,0
+        displayFolder: Findings
+
     /// Estate page title: SQL targets reporting and findings that need attention, or an empty-state sentence.
     measure 'Estate Headline' =
             VAR Reporting = [Targets Reporting]

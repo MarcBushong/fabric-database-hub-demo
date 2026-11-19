@@ -147,7 +147,7 @@ Describe 'Get-DemoFabricSemanticModelDefinition' {
         $paths | Should -Not -Contain '.platform'
         @($paths | Where-Object { $_ -match '\\' }) | Should -BeNullOrEmpty
         $model.Evidence.tables | Should -Be 10
-        $model.Evidence.measures | Should -Be 103
+        $model.Evidence.measures | Should -Be 114
         $expressions = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((@($model.Definition.parts) | Where-Object { $_.path -eq 'definition/expressions.tmdl' }).payload))
         $expressions | Should -Match ([regex]::Escape("https://onelake.dfs.fabric.microsoft.com/$script:workspaceId/$script:lakehouseId"))
         foreach ($part in $model.Definition.parts) {
@@ -294,12 +294,12 @@ Describe 'Test-DemoSemanticModelData' {
         $script:queriesUri = '^' + [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/executeQueries") + '$'
     }
 
-    It 'evaluates all 103 measures: values Pass, blanks Warning, DAX errors Fail, and INFO.MEASURES() is Not supported' {
+    It 'evaluates all 114 measures: values Pass, blanks Warning, DAX errors Fail, and INFO.MEASURES() is Not supported' {
         Set-WebMock @(@{ Method = 'Post'; Match = $script:queriesUri; Respond = (Get-DaxResponder -Blank @('Scenario Requests') -Broken @('Focus Verdict') -Rows @{ 'Scenario Runs' = 0 }) })
         $results = @(Test-DemoSemanticModelData -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Token $script:token)
         $measures = @($results | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' })
-        $measures.Count | Should -Be 103
-        @($measures.checkId | Sort-Object -Unique).Count | Should -Be 103
+        $measures.Count | Should -Be 114
+        @($measures.checkId | Sort-Object -Unique).Count | Should -Be 114
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.SCENARIO_RUNS.SCENARIO_REQUESTS' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.SCENARIO_RUNS.SCENARIO_REQUESTS' }).message | Should -Match 'scenario_runs has no rows yet'
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.INCIDENT_WINDOWS.FOCUS_VERDICT' }).status | Should -Be 'Fail'

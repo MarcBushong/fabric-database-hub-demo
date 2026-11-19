@@ -1175,7 +1175,7 @@ function Invoke-DemoInsightsAppStep {
             # The console says so at once, as for any other step (Phase 28 live finding), and that the run goes on.
             Write-DemoLog -Level Warning -Message ('The Insights app step failed; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $app.Reason, $app.HowTo)
         }
-        # Ask (ADR 0027): the app's step sets up its chat relay; without any ASK.* record, it stopped before that.
+        # Ask (ADR 0028): the app's step sets up its chat relay; without any ASK.* record, it stopped before that.
         $ask = Get-DemoAskSummary -Result $records
         if ($null -eq $ask) {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Skipped' -Status 'Not selected' -Message 'Not set up: the Insights app''s step stopped before it (the Insights app row says why). The next run sets it up.' -MaxLength 1200

@@ -12,6 +12,8 @@
 #
 # The stop path (Stop-DbHubDemo) deallocates the VMs and stops T4 through Azure Resource Manager only, never through
 # Run Command, which waited more than 10 minutes on a saturated sqlvm01 in Phase 25a.
+# T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop and nothing to start: T1's runner drives it from
+# sqlvm01, so its activity ends with sqlvm01, and its provisioned throughput keeps billing every hour.
 
 $script:DbHubArmRoot = 'https://management.azure.com'
 $script:DbHubActiveJobStatuses = @('New', 'Activating', 'Running', 'Resuming', 'Blocked', 'Stopping', 'Suspending')
@@ -375,8 +377,8 @@ function Test-DbHubControlRequest {
       (2026-11-14): the whole demo session, the showcase on every target, T4's read replica, the busy marker, and the
       session's status in the control vault (Start-DbHubSession). durationMinutes is optional (the showcase's default),
       minSessionMinutes to the showcase's maximum.
-    - {"action": "capture", "sessionId": "..."}: T4's and its read replica's Azure Monitor metrics into the control vault,
-      for the history (Save-DbHubSessionMetric); nothing is started or stopped.
+    - {"action": "capture", "sessionId": "..."}: T4's and its read replica's Azure Monitor metrics, and T5's (2026-11-18),
+      into the control vault, for the history (Save-DbHubSessionMetric); nothing is started or stopped.
     - "sessionId" is also allowed on stop, whose status then names the session.
     - "requestedBy" is optional on any action: 1-64 letters, digits, or . _ @ / - (a name, never a secret).
     Unknown fields, other values, free text, and a body that isn't a JSON object are refused.
@@ -1397,7 +1399,7 @@ function Get-DbHubWorkloadScript {
     <#
     .SYNOPSIS
     The managed Run Command script for one VM: the module's workload-control template (Get-DemoWorkloadControlTemplate,
-    baked into the settings) once per target, in order. T1's runner drives T1, T3, and T4 on sqlvm01; archost01
+    baked into the settings) once per target, in order. T1's runner drives T1, T3, T4, and T5 on sqlvm01; archost01
     relays T2 into its guest. For T2 the script first waits, at most 12 minutes, for the guest's Hyper-V heartbeat,
     because a host that was just started runs its guest a few minutes later; a guest that's off and doesn't start by
     itself (its automatic start action isn't Start: a golden capture's air gap, or a guest that was shut down) isn't
@@ -1463,7 +1465,7 @@ function Get-DbHubWorkloadScript {
     }
     foreach ($item in $Request) {
         $target = [string](Get-DbHubMember -InputObject $item -Name 'target')
-        if ($target -notmatch '^T[1-4]$') {
+        if ($target -notmatch '^T[1-5]$') {
             throw 'A request has no valid target.'
         }
         $json = $item | ConvertTo-Json -Depth 6 -Compress
@@ -1918,6 +1920,8 @@ function Stop-DbHubDemo {
     -OnlyVm, -KeepT4, and -RemoveReplica (#27, user-directed 2026-11-17) scope it to what a run that sent no activity
     started itself (Start-DbHubActivityRun): only those VMs are deallocated, and with -KeepT4, T4 and its read replica stay
     as they are, unless -RemoveReplica (the replica that run's session asked for), which is deleted.
+    T5 (2026-11-18, ADR 0027) has no stop: a whole stop says it's left running and keeps billing its throughput, when its
+    account is there (Get-DbHubT5StopText).
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -2053,6 +2057,13 @@ function Stop-DbHubDemo {
         }
         elseif ($replicaText) {
             $done.Add($replicaText)
+        }
+    }
+    if ($null -eq $OnlyVm) {
+        # T5 (2026-11-18, ADR 0027) has no stop: its activity ended with sqlvm01, and its throughput keeps billing.
+        $t5Text = Get-DbHubT5StopText -Context $Context -Tags $Tags
+        if ($t5Text) {
+            $done.Add($t5Text)
         }
     }
     if ($session -and $busy.By -eq 'session') {
@@ -2231,8 +2242,9 @@ function Invoke-DbHubNightlyStop {
     The nightly safety stop (ADR 0024), DbHub-Stop -Scope Nightly at the VMs' auto-shutdown time: deallocates each demo
     VM that isn't deallocated (a VM stopped from inside the guest still bills its compute), and stops T4 when it runs
     (Invoke-DbHubT4NightlyStop). The T2 guest shuts down with its host. Azure Resource Manager only: it never starts anything,
-    never uses Run Command, never connects to a database, and never touches the control's schedules. Returns Done,
-    Failed, Vms (each VM's outcome), and T4 (its outcome).
+    never uses Run Command, never connects to a database, and never touches the control's schedules. T5 (2026-11-18, ADR
+    0027) has no stop, so the nightly stop leaves it alone and says nothing of it. Returns Done, Failed, Vms (each VM's
+    outcome), and T4 (its outcome).
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -2694,7 +2706,7 @@ function Get-DbHubRequester {
 }
 
 function Get-DbHubTargetVm {
-    # The VM whose runner drives a target: archost01 relays T2 into its guest; sqlvm01 drives T1, T3, and T4.
+    # The VM whose runner drives a target: archost01 relays T2 into its guest; sqlvm01 drives T1, T3, T4, and T5.
     param(
         [Parameter(Mandatory = $true)]
         [object] $Settings,
@@ -2707,6 +2719,144 @@ function Get-DbHubTargetVm {
         return [string]$Settings.hostVmName
     }
     return [string]$Settings.sqlVmName
+}
+
+function Get-DbHubT5Account {
+    # T5's Azure Cosmos DB account, <t5AccountPrefix><deploymentId> (2026-11-18, ADR 0027), or '' when the settings don't
+    # name T5 (it's off, or they predate it) or the demo resource group has no deploymentId tag.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $prefix = [string](Get-DbHubMember -InputObject $Settings -Name 't5AccountPrefix')
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($prefix -notmatch '^[a-z0-9][a-z0-9-]{0,30}$' -or $deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return ''
+    }
+    return ('{0}{1}' -f $prefix, $deploymentId)
+}
+
+function Get-DbHubT5StopText {
+    # What Stop now and the auto-stop say about T5 (2026-11-18, ADR 0027): Azure Cosmos DB has no stop, so it's left running
+    # and its throughput keeps billing; '' without T5, or when its account isn't there. Whether it's there comes from Azure
+    # Monitor, whose metrics answer 404 for an account that doesn't exist, because the control's role reads metrics and not
+    # the account (https://learn.microsoft.com/rest/api/monitor/metrics/list).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $account = Get-DbHubT5Account -Settings $Context.Settings -Tags $Tags
+    if (-not $account) {
+        return ''
+    }
+    $now = Get-DbHubUtcNow
+    $end = New-Object -TypeName DateTime -ArgumentList ($now.Ticks - ($now.Ticks % [TimeSpan]::TicksPerMinute)), ([System.DateTimeKind]::Utc)
+    $path = '{0}/providers/Microsoft.DocumentDB/databaseAccounts/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $account
+    $probe = Read-DbHubMetric -Context $Context -ServerPath $path -Name @('ProvisionedThroughput') -Aggregation 'Maximum' -Timespan ('{0}/{1}' -f (ConvertTo-DbHubTimeText -Value $end.AddHours(-1)), (ConvertTo-DbHubTimeText -Value $end)) -IntervalMinutes 60
+    if ([int]$probe.StatusCode -eq 404) {
+        return ''
+    }
+    return ('T5 {0} not stopped (Cosmos DB has no stop; its throughput keeps billing)' -f $account)
+}
+
+function Get-DbHubT5ShowcaseMinute {
+    <#
+    .SYNOPSIS
+    How many minutes T5's showcase runs when AvailableMinutes are left at its dispatch (2026-11-18, user-directed: ru-storm
+    repeats cleanly in every session). The runner starts T5's cycles when its profile is set and clips a slot at the
+    profile's end, so an end inside one of T5's slots, or less than RecoveryMinutes after it, moves back to that slot's
+    start: no ru-storm still runs when T5's profile ends, and T5 is back at its baseline, with no throttling (429s). Slot
+    holds T5's slots in a cycle (startMinute and durationMinutes), each taken as running in every cycle. Pure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $AvailableMinutes,
+
+        [Parameter(Mandatory = $true)]
+        [int] $CycleMinutes,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]] $Slot = @(),
+
+        [int] $RecoveryMinutes = 2
+    )
+
+    if ($AvailableMinutes -le 0) {
+        return 0
+    }
+    $slots = @(@($Slot) | Where-Object { $null -ne $_ })
+    if ($CycleMinutes -le 0 -or $slots.Count -eq 0) {
+        return $AvailableMinutes
+    }
+    $minutes = $AvailableMinutes
+    $moved = $true
+    while ($moved -and $minutes -gt 0) {
+        $moved = $false
+        # The cycle the end falls in, and the one before it, whose last slot's recovery can reach past the cycle's start.
+        $cycleStart = [int]([System.Math]::Floor($minutes / $CycleMinutes)) * $CycleMinutes
+        foreach ($base in @($cycleStart, ($cycleStart - $CycleMinutes))) {
+            if ($base -lt 0 -or $moved) {
+                continue
+            }
+            foreach ($item in $slots) {
+                $start = $base + [int](Get-DbHubMember -InputObject $item -Name 'startMinute')
+                $end = $start + [int](Get-DbHubMember -InputObject $item -Name 'durationMinutes') + $RecoveryMinutes
+                if ($minutes -gt $start -and $minutes -lt $end) {
+                    # Each move goes back, so the loop ends.
+                    $minutes = $start
+                    $moved = $true
+                    break
+                }
+            }
+        }
+    }
+    return $minutes
+}
+
+function Set-DbHubT5ShowcaseMinute {
+    <#
+    .SYNOPSIS
+    At T5's dispatch (2026-11-18, user-directed): a profile's minutes (the showcase's) from NowUtc to the run's end (its
+    NotAfterUtc less the runner's 2 minutes), less StartMinutes for its Run Command to set the profile on sqlvm01, cut back
+    by Get-DbHubT5ShowcaseMinute to end at T5's baseline. Returns the UTC time T5's profile then ends, or $null for an
+    activity it doesn't apply to: another target, off, the baseline, or an incident, which ends by its own duration.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes only the planned activity in memory, before its dispatch.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Activity,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc,
+
+        [int] $StartMinutes = 2
+    )
+
+    $notAfter = Get-DbHubMember -InputObject $Activity -Name 'NotAfterUtc'
+    if ([string]$Activity.Target -ne 'T5' -or $null -eq $notAfter) {
+        return $null
+    }
+    $definition = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $Settings -Name 'profiles') -Name ([string]$Activity.Scenario)
+    if ($null -eq $definition) {
+        return $null
+    }
+    $available = [int]([System.Math]::Floor((([datetime]$notAfter).AddMinutes(-2) - $NowUtc).TotalMinutes)) - $StartMinutes
+    $minutes = Get-DbHubT5ShowcaseMinute -AvailableMinutes $available -CycleMinutes ([int](Get-DbHubMember -InputObject $definition -Name 'cycleMinutes')) -Slot @(Get-DbHubMember -InputObject $definition -Name 't5Slots')
+    # At least a minute of the baseline: a profile set needs a duration, and no slot starts in its first minutes.
+    $Activity.Minutes = [System.Math]::Max(1, [System.Math]::Min([int]$Activity.Minutes, $minutes))
+    return $NowUtc.AddMinutes([int]$Activity.Minutes)
 }
 
 function Get-DbHubLeftRunning {
@@ -2784,6 +2934,9 @@ function Start-DbHubActivityRun {
     and T4 when it started it (Stop-DbHubDemo -OnlyVm -KeepT4); a VM or T4 that ran before stays as it was, and the
     result's message, left, and leftFix say what that is, that the nightly safety stop still stops it, and how to stop
     everything now (Get-DbHubLeftRunning).
+    T5 (2026-11-18, ADR 0027) needs nothing started: Azure Cosmos DB has no stop, and its activity goes out with sqlvm01's
+    (its profile is a file on T1). A showcase on T5 is cut back at its dispatch so that no ru-storm still runs when it
+    ends (Set-DbHubT5ShowcaseMinute, user-directed 2026-11-18), and OnProgress gets t5-end with when it ends.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -2806,7 +2959,7 @@ function Start-DbHubActivityRun {
         [AllowNull()]
         [object] $Plan = $null,
 
-        # Called with a kind (autostop, backup, vm-start, t4-start, dispatched, or skipped) and a detail, for a session's status.
+        # Called with a kind (autostop, backup, vm-start, t4-start, dispatched, skipped, or t5-end) and a detail, for a session's status.
         [AllowNull()]
         [scriptblock] $OnProgress = $null,
 
@@ -3021,6 +3174,12 @@ function Start-DbHubActivityRun {
     $dispatch = {
         param([string] $VmName, [object[]] $Chosen, [string] $Name)
         $runNames.Add($Name)
+        # T5's showcase ends at its baseline, with no ru-storm still running (2026-11-18, user-directed): its minutes are
+        # counted from now.
+        $t5End = $null
+        foreach ($item in @($Chosen | Where-Object { [string]$_.Target -eq 'T5' -and $_.Scenario -cne 'off' })) {
+            $t5End = Set-DbHubT5ShowcaseMinute -Settings $settings -Activity $item -NowUtc (Get-DbHubUtcNow)
+        }
         if (Send-DbHubDispatch -Context $Context -VmName $VmName -Activity $Chosen -Name $Name -RequestedBy $who) {
             $sentCommands.Add([ordered]@{ vm = $VmName; name = $Name; targets = @($Chosen | ForEach-Object { [string]$_.Target }) })
             foreach ($item in $Chosen) {
@@ -3032,6 +3191,9 @@ function Start-DbHubActivityRun {
                     $sent.Activities++
                     & $progress 'dispatched' ('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes)
                 }
+            }
+            if ($null -ne $t5End) {
+                & $progress 't5-end' (ConvertTo-DbHubTimeText -Value $t5End)
             }
         }
         else {
@@ -3170,8 +3332,8 @@ function Start-DbHubActivityRun {
 }
 
 function Reset-DbHubActivity {
-    # The reset action: the runner's reset on each requested target whose VM runs (T4 only when Ready). Nothing is
-    # started.
+    # The reset action: the runner's reset on each requested target whose VM runs (T4 only when Ready; T5, which has no
+    # stop, with sqlvm01). Nothing is started.
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
@@ -3257,7 +3419,9 @@ function Reset-DbHubActivity {
 # the session's own auto-stop, and writes its progress to the control vault for the notebook, which can't read a job's
 # output. The runbook can't reach a private vault's data plane, so it writes through Azure Resource Manager (Secrets -
 # Create Or Update), which a vault's network rules don't apply to. The stop reads T4's and the replica's Azure Monitor
-# metrics into the vault for the history, then deletes the replica: a deleted server's metrics can't be read.
+# metrics into the vault for the history, then deletes the replica: a deleted server's metrics can't be read. T5's
+# (2026-11-18, ADR 0027) go into the same secret, as its cosmos member, with the identity's Microsoft.Insights/metrics/read
+# at the demo resource group.
 
 # What the history keeps of each server, one Metrics - List read per aggregation, as the module's
 # Get-DemoPostgresHistoryParameter reads them: Read Replica Lag exists on a replica only, and Max Physical Replication Lag
@@ -3275,6 +3439,20 @@ $script:DbHubMetricReads = @{
 $script:DbHubMetricIntervals = @(1, 5, 15, 30, 60, 180, 360, 720, 1440)
 # Decimals kept per Azure Monitor unit; any other unit keeps two.
 $script:DbHubMetricDecimals = @{ Percent = 1; Seconds = 1; Count = 0; Bytes = 0 }
+# What the history keeps of T5 (2026-11-18, ADR 0027), as the module's Get-DemoCosmosHistoryParameter reads it: the
+# signals Database Hub's Cosmos DB views chart, one Metrics - List read each. ThrottledRequests is TotalRequests filtered to
+# StatusCode 429; ProvisionedThroughput and ServiceAvailability have no grain under 5 minutes and an hour, so they're read
+# hourly (Interval 60).
+# https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-documentdb-databaseaccounts-metrics
+$script:DbHubCosmosReads = @(
+    @{ Metric = 'NormalizedRUConsumption'; Name = 'NormalizedRUConsumption'; Aggregation = 'Maximum'; StatusCode = ''; Interval = 1 }
+    @{ Metric = 'TotalRequestUnits'; Name = 'TotalRequestUnits'; Aggregation = 'Total'; StatusCode = ''; Interval = 1 }
+    @{ Metric = 'TotalRequests'; Name = 'TotalRequests'; Aggregation = 'Count'; StatusCode = ''; Interval = 1 }
+    @{ Metric = 'ThrottledRequests'; Name = 'TotalRequests'; Aggregation = 'Count'; StatusCode = '429'; Interval = 1 }
+    @{ Metric = 'ServerSideLatencyGateway'; Name = 'ServerSideLatencyGateway'; Aggregation = 'Average'; StatusCode = ''; Interval = 1 }
+    @{ Metric = 'ProvisionedThroughput'; Name = 'ProvisionedThroughput'; Aggregation = 'Maximum'; StatusCode = ''; Interval = 60 }
+    @{ Metric = 'ServiceAvailability'; Name = 'ServiceAvailability'; Aggregation = 'Average'; StatusCode = ''; Interval = 60 }
+)
 
 function ConvertTo-DbHubTimeText {
     # A time as UTC yyyy-MM-ddTHH:mm:ssZ, or '' for anything that isn't a time. A time without a kind is taken as UTC.
@@ -3378,7 +3556,8 @@ function Set-DbHubResourceGroupTag {
 
 function New-DbHubSessionStatus {
     # The session's status (schemaVersion 1), which the control notebook reads from the control vault: names, times, each
-    # step in plain words with its fix, the dispatches, T4, its read replica, and the replica-lag beat's windows.
+    # step in plain words with its fix, the dispatches, T4, its read replica, the replica-lag beat's windows, and T5's
+    # showcase end (2026-11-18).
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
     param(
         [Parameter(Mandatory = $true)]
@@ -3400,7 +3579,7 @@ function New-DbHubSessionStatus {
     if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
         $deploymentId = ''
     }
-    $names = [ordered]@{ resourceGroup = [string]$settings.demoResourceGroup; deploymentId = $deploymentId; sqlVm = [string]$settings.sqlVmName; hostVm = [string]$settings.hostVmName; t2Guest = [string](Get-DbHubMember -InputObject $settings -Name 't2GuestName'); t3Server = ''; t3Database = [string]$settings.demoDatabase; t4Server = ''; t4Replica = '' }
+    $names = [ordered]@{ resourceGroup = [string]$settings.demoResourceGroup; deploymentId = $deploymentId; sqlVm = [string]$settings.sqlVmName; hostVm = [string]$settings.hostVmName; t2Guest = [string](Get-DbHubMember -InputObject $settings -Name 't2GuestName'); t3Server = ''; t3Database = [string]$settings.demoDatabase; t4Server = ''; t4Replica = ''; t5Account = '' }
     if ($deploymentId) {
         $names['t3Server'] = '{0}{1}' -f $settings.t3ServerPrefix, $deploymentId
         $names['t4Server'] = '{0}{1}' -f $settings.t4ServerPrefix, $deploymentId
@@ -3408,6 +3587,8 @@ function New-DbHubSessionStatus {
         if ($prefix) {
             $names['t4Replica'] = '{0}{1}' -f $prefix, $deploymentId
         }
+        # T5's Azure Cosmos DB account (2026-11-18, ADR 0027), when the settings name it.
+        $names['t5Account'] = Get-DbHubT5Account -Settings $settings -Tags $Tags
     }
     return [ordered]@{
         schemaVersion     = 1
@@ -3438,13 +3619,16 @@ function New-DbHubSessionStatus {
         dispatchUtc       = [ordered]@{}
         replica           = [ordered]@{ state = ''; sizeAsked = ''; sizeUsed = ''; attempts = @(); readyUtc = ''; note = ''; fix = '' }
         replicaLag        = [ordered]@{ planned = $false; windows = @(); note = ''; fix = '' }
+        # When T5's showcase ends (2026-11-18, user-directed): after its last ru-storm and its baseline's recovery, before the
+        # session's end (Set-DbHubT5ShowcaseMinute); empty without T5's showcase.
+        t5                = [ordered]@{ endUtc = '' }
         message           = ''
     }
 }
 
 function Add-DbHubSessionStep {
-    # One step of the session for the notebook: what (Plan, Busy, Start, Activity, T4, Replica, ReplicaLag, Stop, Capture),
-    # its state (Pass, Warning, Fail, or Info), and the message and fix in plain words. The last 60 are kept.
+    # One step of the session for the notebook: what (Plan, Busy, Start, Activity, T4, Replica, ReplicaLag, T5, Stop,
+    # Capture), its state (Pass, Warning, Fail, or Info), and the message and fix in plain words. The last 60 are kept.
     param(
         [Parameter(Mandatory = $true)]
         [System.Collections.IDictionary] $Status,
@@ -3620,7 +3804,7 @@ function Get-DbHubDispatchFailure {
     The targets a dispatch Run Command's script says didn't get their activity (#28, 2026-11-17): its last
     DBHUB-DISPATCH line (Get-DbHubWorkloadScript), within the end of its output that the instance view keeps. Returns
     Target, Status, Message, and OldRunner (the target's runner refused the profile or an option, #21) for each target
-    named T1 to T4; nothing for output without that line, or one that can't be read.
+    named T1 to T5; nothing for output without that line, or one that can't be read.
     #>
     param(
         [AllowNull()]
@@ -3640,7 +3824,7 @@ function Get-DbHubDispatchFailure {
     }
     foreach ($item in @(Get-DbHubMember -InputObject $parsed -Name 'failed')) {
         $target = [string](Get-DbHubMember -InputObject $item -Name 'target')
-        if ($target -notmatch '^T[1-4]$') {
+        if ($target -notmatch '^T[1-5]$') {
             continue
         }
         $old = Get-DbHubMember -InputObject $item -Name 'oldRunner'
@@ -3690,7 +3874,7 @@ function Get-DbHubSessionHealth {
             continue
         }
         $entry = & $addHost $vm
-        $targets = @(@(Get-DbHubMember -InputObject $command -Name 'targets') | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-4]$' })
+        $targets = @(@(Get-DbHubMember -InputObject $command -Name 'targets') | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-5]$' })
         $entry.Commands.Add([pscustomobject]@{ Name = $name; Targets = $targets })
         foreach ($target in $targets) {
             if (-not $entry.Targets.Contains($target)) {
@@ -3700,7 +3884,7 @@ function Get-DbHubSessionHealth {
     }
     if ($hosts.Count -eq 0) {
         foreach ($target in @(Get-DbHubPropertyName -InputObject (Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'))) {
-            if ($target -match '^T[1-4]$') {
+            if ($target -match '^T[1-5]$') {
                 $entry = & $addHost (Get-DbHubTargetVm -Settings $settings -Target $target)
                 if (-not $entry.Targets.Contains($target)) {
                     $entry.Targets.Add($target)
@@ -4619,8 +4803,9 @@ function Get-DbHubReplicaLagPlan {
 function Read-DbHubMetric {
     <#
     .SYNOPSIS
-    One Metrics - List read for one server: Name with one Aggregation, every IntervalMinutes over Timespan. Returns Series
-    (Metric, Unit, Aggregation, and Points: UTC time to value, only the points that have one) and Error. Never throws.
+    One Metrics - List read for one resource: Name with one Aggregation, every IntervalMinutes over Timespan, and with
+    Filter, a dimension filter such as StatusCode eq '429' (T5's throttled requests, 2026-11-18). Returns Series (Metric,
+    Unit, Aggregation, and Points: UTC time to value, only the points that have one), StatusCode, and Error. Never throws.
     https://learn.microsoft.com/rest/api/monitor/metrics/list
     #>
     param(
@@ -4634,13 +4819,16 @@ function Read-DbHubMetric {
         [string[]] $Name,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Maximum', 'Total', 'Average', 'Minimum')]
+        [ValidateSet('Maximum', 'Total', 'Average', 'Minimum', 'Count')]
         [string] $Aggregation,
 
         [Parameter(Mandatory = $true)]
         [string] $Timespan,
 
-        [int] $IntervalMinutes = 1
+        [int] $IntervalMinutes = 1,
+
+        [AllowEmptyString()]
+        [string] $Filter = ''
     )
 
     $series = New-Object -TypeName 'System.Collections.Generic.List[object]'
@@ -4652,13 +4840,16 @@ function Read-DbHubMetric {
             $interval = 'PT1H'
         }
         $query = '{0}/providers/Microsoft.Insights/metrics?timespan={1}&interval={2}&metricnames={3}&aggregation={4}' -f $ServerPath, $Timespan, $interval, ($Name -join ','), $Aggregation
+        if ($Filter) {
+            $query = '{0}&$filter={1}' -f $query, [uri]::EscapeDataString($Filter)
+        }
         $read = Invoke-DbHubArm -Context $Context -Method GET -Path $query -ApiVersion (Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Insights/metrics')
         if ($read.StatusCode -ne 200) {
             $why = $read.Error
             if (-not $why) {
                 $why = 'HTTP {0}' -f $read.StatusCode
             }
-            return [pscustomobject]@{ Series = $series.ToArray(); Error = $why }
+            return [pscustomobject]@{ Series = $series.ToArray(); StatusCode = $read.StatusCode; Error = $why }
         }
         foreach ($metric in @(Get-DbHubMember -InputObject $read.Body -Name 'value')) {
             $metricName = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $metric -Name 'name') -Name 'value')
@@ -4681,9 +4872,9 @@ function Read-DbHubMetric {
         }
     }
     catch {
-        return [pscustomobject]@{ Series = $series.ToArray(); Error = (ConvertTo-DbHubSafeText -Text $_.Exception.Message) }
+        return [pscustomobject]@{ Series = $series.ToArray(); StatusCode = 0; Error = (ConvertTo-DbHubSafeText -Text $_.Exception.Message) }
     }
-    return [pscustomobject]@{ Series = $series.ToArray(); Error = '' }
+    return [pscustomobject]@{ Series = $series.ToArray(); StatusCode = 200; Error = '' }
 }
 
 function ConvertTo-DbHubMetricPoint {
@@ -4903,13 +5094,200 @@ function Get-DbHubPostgresMetricDocument {
     return (& $answer $status $message $json $servers.Count $series.Count $points $interval $hasReplica)
 }
 
+function Read-DbHubCosmosMetricSeries {
+    <#
+    .SYNOPSIS
+    T5's Azure Monitor metrics from StartUtc to EndUtc for the history (2026-11-18, ADR 0027): one Metrics - List read per
+    signal ($script:DbHubCosmosReads), every minute, and hourly for ProvisionedThroughput and ServiceAvailability. Returns
+    Account ('' without T5), Found (whether any point was read), Series (Metric, Aggregation, Unit, StatusCode, Interval, and
+    Points), Failed, Notes, StartUtc, EndUtc, and Message (why none were captured). Reads only; never throws for an Azure
+    error. An account that isn't there (HTTP 404) is left out with a note.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $StartUtc,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $EndUtc
+    )
+
+    $settings = $Context.Settings
+    $account = Get-DbHubT5Account -Settings $settings -Tags $Tags
+    $series = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $end = [DateTime]::SpecifyKind($EndUtc, [System.DateTimeKind]::Utc)
+    $end = New-Object -TypeName DateTime -ArgumentList ($end.Ticks - ($end.Ticks % [TimeSpan]::TicksPerMinute)), ([System.DateTimeKind]::Utc)
+    $start = [DateTime]::SpecifyKind($StartUtc, [System.DateTimeKind]::Utc)
+    $start = New-Object -TypeName DateTime -ArgumentList ($start.Ticks - ($start.Ticks % [TimeSpan]::TicksPerMinute)), ([System.DateTimeKind]::Utc)
+    if ($start -ge $end) {
+        $start = $end.AddMinutes(-15)
+    }
+    $answer = {
+        param([bool] $Found, [bool] $Failed, [string] $Message)
+        [pscustomobject]@{ Account = $account; Found = $Found; Series = $series.ToArray(); Failed = $Failed; Notes = $notes.ToArray(); StartUtc = $start; EndUtc = $end; Message = $Message }
+    }
+    if (-not $account) {
+        return (& $answer $false $false '')
+    }
+    $path = '{0}/providers/Microsoft.DocumentDB/databaseAccounts/{1}' -f (Get-DbHubDemoPath -Settings $settings), $account
+    # The hourly reads start on the hour, so their one point per hour covers the whole hour.
+    $hourStart = New-Object -TypeName DateTime -ArgumentList $start.Year, $start.Month, $start.Day, $start.Hour, 0, 0, ([System.DateTimeKind]::Utc)
+    $failed = $false
+    foreach ($item in $script:DbHubCosmosReads) {
+        $from = $start
+        if ([int]$item.Interval -eq 60) {
+            $from = $hourStart
+        }
+        $filter = ''
+        if ($item.StatusCode) {
+            $filter = "StatusCode eq '{0}'" -f $item.StatusCode
+        }
+        $metrics = Read-DbHubMetric -Context $Context -ServerPath $path -Name @($item.Name) -Aggregation $item.Aggregation -Timespan ('{0}/{1}' -f (ConvertTo-DbHubTimeText -Value $from), (ConvertTo-DbHubTimeText -Value $end)) -IntervalMinutes ([int]$item.Interval) -Filter $filter
+        if ([int](Get-DbHubMember -InputObject $metrics -Name 'StatusCode') -eq 404) {
+            $series.Clear()
+            $notes.Add(('{0} isn''t there, so T5 is left out.' -f $account))
+            return (& $answer $false $false ('No Azure Cosmos DB metrics were captured: {0}' -f ($notes -join ' ')))
+        }
+        if ($metrics.Error) {
+            $failed = $true
+            $notes.Add(('{0}''s {1} couldn''t be read: {2}' -f $account, $item.Metric, $metrics.Error))
+            continue
+        }
+        $points = $null
+        $unit = ''
+        foreach ($entry in @($metrics.Series)) {
+            $points = $entry.Points
+            $unit = [string]$entry.Unit
+        }
+        if ($null -eq $points) {
+            $points = New-Object -TypeName 'System.Collections.Generic.SortedDictionary[datetime,double]'
+        }
+        if (-not $unit -and $item.Aggregation -in 'Count', 'Total') {
+            $unit = 'Count'
+        }
+        $series.Add([pscustomobject]@{ Metric = $item.Metric; Aggregation = $item.Aggregation; Unit = $unit; StatusCode = $item.StatusCode; Interval = [int]$item.Interval; Points = $points })
+    }
+    if (@($series | Where-Object { $_.Points.Count -gt 0 }).Count -eq 0) {
+        $series.Clear()
+        if (-not $failed) {
+            $notes.Add(('{0} had no Azure Monitor data in the window, so T5 is left out.' -f $account))
+        }
+        return (& $answer $false $failed ('No Azure Cosmos DB metrics were captured: {0}' -f ($notes -join ' ')))
+    }
+    # A series without a point is left out, but the throttled requests (429) stay: read, and none throttled.
+    $kept = @($series | Where-Object { $_.Points.Count -gt 0 -or $_.Metric -eq 'ThrottledRequests' })
+    $series.Clear()
+    foreach ($item in $kept) {
+        $series.Add($item)
+    }
+    return (& $answer $true $failed '')
+}
+
+function ConvertTo-DbHubCosmosMetricDocument {
+    <#
+    .SYNOPSIS
+    T5's metrics (Read-DbHubCosmosMetricSeries) as NB_DatabaseHub_LiveActivity's COSMOS_METRICS document (version 1, as the
+    module's Get-DemoCosmosHistoryParameter builds it), with the session's ID: at most MaxBytes of UTF-8, with coarser
+    intervals until it fits (an hourly series stays hourly or coarser). Count combines as a sum, and availability keeps
+    two decimals. Returns Json ('' when it doesn't fit), Status (Pass or Warning), Message, SeriesCount, PointCount,
+    IntervalMinutes, Bytes, CapturedUtc, StartUtc, EndUtc, and WindowMinutes. No resource ID, subscription, or credential. Pure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Read,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [int] $MaxBytes = 24000
+    )
+
+    $start = $Read.StartUtc
+    $end = $Read.EndUtc
+    $window = [int][System.Math]::Round(($end - $start).TotalMinutes)
+    $json = ''
+    $bytes = 0
+    $interval = 1
+    $points = 0
+    foreach ($step in $script:DbHubMetricIntervals) {
+        $interval = $step
+        $points = 0
+        $out = @()
+        foreach ($item in @($Read.Series)) {
+            $seriesInterval = [System.Math]::Max($step, [int]$item.Interval)
+            $combine = [string]$item.Aggregation
+            if ($combine -eq 'Count') {
+                $combine = 'Total'
+            }
+            $unit = [string]$item.Unit
+            if ($item.Metric -eq 'ServiceAvailability') {
+                # Two decimals, so 99.95 % isn't written as 100.
+                $unit = ''
+            }
+            $converted = ConvertTo-DbHubMetricPoint -Point $item.Points -Aggregation $combine -Unit $unit -IntervalMinutes $seriesInterval
+            $points += @($converted).Count
+            $entry = [ordered]@{ resourceName = [string]$Read.Account; metric = [string]$item.Metric; aggregation = [string]$item.Aggregation; unit = [string]$item.Unit }
+            if ($item.StatusCode) {
+                $entry['statusCode'] = [string]$item.StatusCode
+            }
+            $entry['intervalMinutes'] = $seriesInterval
+            $entry['points'] = $converted
+            $out += , $entry
+        }
+        $document = [ordered]@{
+            version         = 1
+            sessionId       = $SessionId
+            capturedBy      = 'control'
+            capturedUtc     = (ConvertTo-DbHubTimeText -Value $end)
+            startUtc        = (ConvertTo-DbHubTimeText -Value $start)
+            endUtc          = (ConvertTo-DbHubTimeText -Value $end)
+            windowMinutes   = $window
+            intervalMinutes = $step
+            accounts        = @([ordered]@{ target = 'T5'; resourceName = [string]$Read.Account })
+            series          = $out
+        }
+        $json = ConvertTo-Json -InputObject $document -Depth 8 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
+        if ($bytes -le $MaxBytes) {
+            break
+        }
+    }
+    $answer = [ordered]@{ Json = $json; Status = 'Pass'; Message = ''; SeriesCount = @($Read.Series).Count; PointCount = $points; IntervalMinutes = $interval; Bytes = $bytes; CapturedUtc = (ConvertTo-DbHubTimeText -Value $end); StartUtc = (ConvertTo-DbHubTimeText -Value $start); EndUtc = (ConvertTo-DbHubTimeText -Value $end); WindowMinutes = $window }
+    if ($bytes -gt $MaxBytes) {
+        $answer.Json = ''
+        $answer.Bytes = 0
+        $answer.Status = 'Warning'
+        $answer.Message = 'T5''s metrics are too large for the control vault even at {0}-minute intervals ({1:N0} bytes), so none were kept.' -f $interval, $bytes
+        return [pscustomobject]$answer
+    }
+    if ($Read.Failed) {
+        $answer.Status = 'Warning'
+    }
+    $answer.Message = 'Azure Monitor metrics of T5 for the history: {0}, {1} series and {2:N0} points from {3:HH:mm} to {4:HH:mm} UTC, every {5} minute(s) ({6:N1} KB).' -f $Read.Account, @($Read.Series).Count, $points, $start, $end, $interval, ($bytes / 1024.0)
+    if (@($Read.Notes).Count -gt 0) {
+        $answer.Message = '{0} {1}' -f $answer.Message, (@($Read.Notes) -join ' ')
+    }
+    return [pscustomobject]$answer
+}
+
 function Save-DbHubSessionMetric {
     <#
     .SYNOPSIS
     The session's history metrics into the control vault (metricsName), for the control notebook to hand to
     NB_DatabaseHub_LiveActivity, which can't read Azure Monitor: from 10 minutes before the session's start (the group's
     DbHubSessionStartUtc, at most 6 hours back; 3 hours without one) to now. Returns Status (Pass, Warning, Skipped, or
-    Failed), Message, Bytes, and Replica.
+    Failed), Message, Bytes, Replica, and Cosmos.
+
+    .DESCRIPTION
+    T5's metrics (2026-11-18, ADR 0027) go in the same secret, as the cosmos member of T4's document (or of an empty one
+    when T4 has none), because the identity may write only the two session secrets. They're read first: with them, T4's
+    document gets at most half of the secret's 24,000-byte bound, and T5's the rest.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -4932,9 +5310,39 @@ function Save-DbHubSessionMetric {
     if ($null -ne $started -and $started -lt $now -and $started -gt $now.AddHours(-6)) {
         $from = $started.AddMinutes(-10)
     }
-    $document = Get-DbHubPostgresMetricDocument -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now -SessionId $session
-    if (-not $document.Json) {
-        return [pscustomobject]@{ Status = $document.Status; Message = $document.Message; Bytes = 0; Replica = $false }
+    $cosmos = Read-DbHubCosmosMetricSeries -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now
+    $bound = 24000
+    if ($cosmos.Found) {
+        $bound = 12000
+    }
+    $document = Get-DbHubPostgresMetricDocument -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now -SessionId $session -MaxBytes $bound
+    $cosmosDocument = $null
+    if ($cosmos.Found) {
+        $cosmosDocument = ConvertTo-DbHubCosmosMetricDocument -Read $cosmos -SessionId $session -MaxBytes (24000 - $document.Bytes - 16)
+    }
+    $hasCosmos = $null -ne $cosmosDocument -and [bool]$cosmosDocument.Json
+    $messages = @($document.Message)
+    if ($null -ne $cosmosDocument) {
+        $messages += $cosmosDocument.Message
+    }
+    elseif ($cosmos.Message) {
+        $messages += $cosmos.Message
+    }
+    $message = (@($messages | Where-Object { $_ }) -join ' ')
+    $json = [string]$document.Json
+    if ($hasCosmos) {
+        if (-not $json) {
+            # T5's alone, in a T4 document without servers, which the notebook reads as no T4 metrics.
+            $json = ConvertTo-Json -InputObject ([ordered]@{ version = 1; sessionId = $session; capturedBy = 'control'; capturedUtc = $cosmosDocument.CapturedUtc; startUtc = $cosmosDocument.StartUtc; endUtc = $cosmosDocument.EndUtc; windowMinutes = $cosmosDocument.WindowMinutes; intervalMinutes = $cosmosDocument.IntervalMinutes; servers = @(); series = @() }) -Depth 4 -Compress
+        }
+        $json = '{0},"cosmos":{1}}}' -f $json.Substring(0, $json.Length - 1), $cosmosDocument.Json
+    }
+    if (-not $json) {
+        return [pscustomobject]@{ Status = $document.Status; Message = $message; Bytes = 0; Replica = $false; Cosmos = $false }
+    }
+    $status = 'Pass'
+    if ($document.Status -ne 'Pass' -or $cosmos.Failed -or ($null -ne $cosmosDocument -and $cosmosDocument.Status -ne 'Pass')) {
+        $status = 'Warning'
     }
     $name = [string](Get-DbHubMember -InputObject $Context.Settings -Name 'metricsName')
     if (-not $name) {
@@ -4944,12 +5352,16 @@ function Save-DbHubSessionMetric {
     if ($document.Replica) {
         $replicaText = 'yes'
     }
-    $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $document.Json -Tags @{ sessionId = $session; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); replica = $replicaText }
-    if (-not $written.Ok) {
-        return [pscustomobject]@{ Status = 'Failed'; Message = ('The history''s metrics couldn''t be written to the control vault: {0}' -f $written.Error); Bytes = 0; Replica = $document.Replica }
+    $cosmosText = 'no'
+    if ($hasCosmos) {
+        $cosmosText = 'yes'
     }
-    Write-DbHubLog -Context $Context -Message $document.Message
-    return [pscustomobject]@{ Status = $document.Status; Message = $document.Message; Bytes = $document.Bytes; Replica = $document.Replica }
+    $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $json -Tags @{ sessionId = $session; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); replica = $replicaText; t5 = $cosmosText }
+    if (-not $written.Ok) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = ('The history''s metrics couldn''t be written to the control vault: {0}' -f $written.Error); Bytes = 0; Replica = $document.Replica; Cosmos = $false }
+    }
+    Write-DbHubLog -Context $Context -Message $message
+    return [pscustomobject]@{ Status = $status; Message = $message; Bytes = [System.Text.Encoding]::UTF8.GetByteCount($json); Replica = $document.Replica; Cosmos = $hasCosmos }
 }
 
 function Start-DbHubSession {
@@ -4971,6 +5383,8 @@ function Start-DbHubSession {
        Once T4 is Ready, its read replica is asked for (Start-DbHubSessionReplica), and after the dispatches the job waits
        for it (Complete-DbHubSessionReplica).
     5. The replica-lag beat's windows from when T4's profile was set (Get-DbHubReplicaLagPlan), or why it won't run.
+    6. T5's showcase (2026-11-18, ADR 0027): its activity goes out with sqlvm01's, cut back so that it ends at its baseline,
+       with no ru-storm still running, before the session's end (Set-DbHubT5ShowcaseMinute); a T5 step says when.
     The job ends with the session going on; its auto-stop ends it.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -5104,7 +5518,7 @@ function Start-DbHubSession {
             'dispatched' {
                 Add-DbHubSessionStep -Status $shared.Status -Step 'Activity' -State 'Pass' -Message $Detail
                 $target = ($Detail -split ':')[0]
-                if ($target -match '^T[1-4]$') {
+                if ($target -match '^T[1-5]$') {
                     $shared.Status['dispatchUtc'][$target] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
                 }
                 if ($Detail -like 'T4:*') {
@@ -5112,6 +5526,7 @@ function Start-DbHubSession {
                 }
             }
             'skipped' { Add-DbHubSessionStep -Status $shared.Status -Step 'Activity' -State 'Warning' -Message $Detail }
+            't5-end' { $shared.Status['t5']['endUtc'] = $Detail }
         }
         $now = Get-DbHubUtcNow
         if (($now - $shared.LastWriteUtc).TotalSeconds -ge 40) {
@@ -5240,6 +5655,13 @@ function Start-DbHubSession {
         Add-DbHubSessionStep -Status $status -Step 'ReplicaLag' -State $lagLevel -Message $lag['note'] -Fix $lag['fix']
     }
 
+    # T5's showcase (2026-11-18, ADR 0027, user-directed): it ends at its baseline, with no ru-storm still running, before the
+    # session's end (Set-DbHubT5ShowcaseMinute), so ru-storm repeats cleanly in every session.
+    $t5End = ConvertTo-DbHubUtc -Value $status['t5']['endUtc']
+    if ($null -ne $t5End) {
+        Add-DbHubSessionStep -Status $status -Step 'T5' -State 'Pass' -Message ('T5 ({0}): its showcase ends at {1} ({2}), after its last ru-storm and at least 2 minutes of its baseline, so T5 is back at its baseline, with no throttled requests (429s), before the session ends at {3}; the next Run all starts its ru-storm cycles again from the first.' -f $status['names']['t5Account'], (& $clock $t5End), $settings.autoShutdownTimeZone, (& $clock $plan.RunEndUtc))
+    }
+
     # The session's hosts as its start ends (2026-11-16): a VM whose start failed or that stopped, or a dispatch Run
     # Command that failed, is a Warning now; DbHub-Monitor's re-checks look again while the session runs.
     $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status)
@@ -5256,8 +5678,8 @@ function Start-DbHubSession {
 }
 
 function Invoke-DbHubCapture {
-    # The capture action (2026-11-14): T4's and its read replica's Azure Monitor metrics into the control vault, for the
-    # history; nothing is started or stopped.
+    # The capture action (2026-11-14): T4's and its read replica's Azure Monitor metrics, and T5's (2026-11-18), into the
+    # control vault, for the history; nothing is started or stopped.
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -5280,7 +5702,7 @@ function Invoke-DbHubCapture {
     elseif ($saved.Status -ne 'Pass') {
         $state = 'Failed'
     }
-    return [pscustomobject]@{ action = 'capture'; status = $state; message = $saved.Message; sessionId = [string]$Request.SessionId; bytes = $saved.Bytes; replica = $saved.Replica }
+    return [pscustomobject]@{ action = 'capture'; status = $state; message = $saved.Message; sessionId = [string]$Request.SessionId; bytes = $saved.Bytes; replica = $saved.Replica; cosmos = [bool](Get-DbHubMember -InputObject $saved -Name 'Cosmos') }
 }
 
 function Write-DbHubStopStatus {

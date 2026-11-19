@@ -20,9 +20,10 @@ BeforeAll {
     $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
     # The prompt pack covers the SQL targets (ADR 0013). T4-only scenarios (connection-surge, idle-in-transaction)
     # have no prompts: Database Hub monitors PostgreSQL with metrics only, and the Database Agent's PostgreSQL
-    # coverage isn't documented (Phase 24, ADR 0019).
+    # coverage isn't documented (Phase 24, ADR 0019). The same for T5-only ones (ru-storm): Database Hub monitors Azure
+    # Cosmos DB through Azure Monitor metrics (2026-11-18, ADR 0027).
     $scenarioFolders = @(Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'scenarios') -Directory | Where-Object {
-            @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
+            @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -notin 'T4', 'T5' }).Count -gt 0
         } | ForEach-Object { $_.Name })
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
 

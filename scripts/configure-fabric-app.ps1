@@ -371,7 +371,7 @@ $deployFile = [ordered]@{
     resourceGroup    = $resourceGroupName
     links            = $links
 }
-# The Copilot dock (Ask, ADR 0027): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
+# The Copilot dock (Ask, ADR 0028): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
 # gets the relay's address, and the live estate function's scope. -DryRun and -CheckOnly only look for the relay.
 $functionScope = $null
 $ask = $null

@@ -69,7 +69,7 @@ Database Hub has a built-in Database Agent (preview). It works only in Database 
 
 ### Ask Copilot: the chat in the app
 
-**Ask Copilot** opens a chat docked on the right, on the viewer's own GitHub Copilot ([ADR 0027](../../docs/adr/0027-ask-copilot-in-the-insights-app.md)): conversational analytics on the demo's history and its live estate, with the app's own charts.
+**Ask Copilot** opens a chat docked on the right, on the viewer's own GitHub Copilot ([ADR 0028](../../docs/adr/0028-ask-copilot-in-the-insights-app.md)): conversational analytics on the demo's history and its live estate, with the app's own charts.
 
 - **What it can do:** run read-only DAX on `SM_DatabaseHub_History` through the app's delegated connector, as the viewer (`run_dax`; `EVALUATE` only, bounded rows); draw the result with the app's own `ChartView` (`show_chart`); read the live estate from Database Hub through the app's function (`estate_overview`); and suggest follow-ups. Every tool runs in the page; the model gets a guide to the model's names, never data.
 - **Every answer** shows its source (**Show the source**: the DAX, or the Database Hub routes), and can be copied; **Export** saves the conversation as Markdown with every query, and **New chat** starts over. The conversation stays for the browser session.
