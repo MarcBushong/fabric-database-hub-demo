@@ -15,6 +15,7 @@ import {
     isOperator,
     jobParameters,
     requestedByOf,
+    STOP_WAIT_MS,
     verifyCaller,
     type ControlCatalog,
     type ManageSettings,
@@ -22,7 +23,7 @@ import {
     type VerifiedCaller,
 } from "../../rayfin/functions/src/manage-core";
 import { notebookParameters, type ControlRequest } from "./control";
-import { functionsManageApi, manageAccessOf } from "./manage-client";
+import { ACCESS_TIMEOUT_MS, functionsManageApi, manageAccessOf, REQUEST_TIMEOUT_MS } from "./manage-client";
 import { SESSION_MINUTES } from "./scenarios";
 
 const API = "https://example.invalid/v1/tenants/t/workspaces/w/appbackends/a/BaaSService/";
@@ -87,7 +88,7 @@ describe("the Manage function's caller", () => {
         const { jwk, sign } = await signer();
         const fetch = jwksAt([jwk]);
         const caller = await verifyCaller(await sign(claims()), BINDING, { fetch, now: () => NOW });
-        expect(caller).toEqual({ verified: true, objectId: ZERO, names: ["ops@contoso.example"], display: "ops@contoso.example" });
+        expect(caller).toEqual({ verified: true, objectId: ZERO, appEmail: "", names: ["ops@contoso.example"], display: "ops@contoso.example" });
         expect(fetch).toHaveBeenCalledWith("https://example.invalid/v1/tenants/t/workspaces/w/appbackends/a/BaaSService/.well-known/jwks.json", { headers: { "X-Publishable-Key": "pk-test" } });
         expect(fetch.mock.calls.every(([url]) => String(url).startsWith(API))).toBe(true);
     });
@@ -121,29 +122,53 @@ describe("the Manage function's caller", () => {
         expect(await reason(claims({ aud: [OTHER, `api://${APP}`] }))).toBe("");
         expect(await reason(claims({ iss: undefined }))).toBe("the caller's token names no issuer");
         expect(await reason(claims({ iss: "https://elsewhere.example.invalid/" }), { ...BINDING, issuer: ISSUER })).toBe("the caller's token is from another issuer");
-        expect(await reason(claims(), { ...BINDING, audience: "api://dbhub-insights" })).toBe("the caller's token is for another audience");
-        expect(await reason(claims({ aud: "api://dbhub-insights" }), { ...BINDING, issuer: ISSUER, audience: "api://dbhub-insights" })).toBe("");
-        expect(await reason(claims({ oid: undefined, email: undefined }))).toBe("the caller's token names no object ID or sign-in name");
+        expect(await reason(claims(), { ...BINDING, audience: `api://${APP}` })).toBe("the caller's token is for another audience");
+        expect(await reason(claims({ aud: `api://${APP}` }), { ...BINDING, issuer: ISSUER, audience: `api://${APP}` })).toBe("");
+        // A pinned audience that doesn't name this app's ID doesn't tie a token to it: every environment of the demo shares
+        // the app's name, so its token needs this app's subject path too.
+        expect(await reason(claims({ aud: "api://dbhub-insights" }), { ...BINDING, issuer: ISSUER, audience: "api://dbhub-insights" })).toBe("the caller's token isn't for this app");
+        expect(await reason(managed({ aud: "api://dbhub-insights" }), { ...BINDING, issuer: ISSUER, audience: "api://dbhub-insights" })).toBe("");
+        // Names can change, so a token with no object ID and no Fabric email for this app names no one.
+        expect(await reason(claims({ oid: undefined, email: undefined }))).toBe("the caller's token names no object ID, and no sign-in email from Fabric for this app");
+        expect(await reason(claims({ oid: undefined, upn: "ops@contoso.example" }))).toBe("the caller's token names no object ID, and no sign-in email from Fabric for this app");
     });
 
     it("reads Fabric's managed token: this app's user path in this tenant, and its email for this app only", async () => {
         const { jwk, sign } = await signer();
         const deps = { fetch: jwksAt([jwk]), now: () => NOW };
-        expect(await verifyCaller(await sign(managed()), BINDING, deps)).toEqual({ verified: true, objectId: "", names: ["ops@contoso.example"], display: "ops@contoso.example" });
+        expect(await verifyCaller(await sign(managed()), BINDING, deps)).toEqual({ verified: true, objectId: "", appEmail: "ops@contoso.example", names: ["ops@contoso.example"], display: "ops@contoso.example" });
         const elsewhere = await verifyCaller(await sign(managed({ sub: `/tenants/${TENANT}/workspaces/${WORKSPACE}/appbackends/${OTHER}/users/u-1` })), BINDING, deps);
         expect(elsewhere).toEqual({ verified: false, reason: "the caller's token isn't for this app" });
         const otherTenant = await verifyCaller(await sign(managed({ sub: `/tenants/${OTHER}/workspaces/${WORKSPACE}/appbackends/${APP}/users/u-1` })), BINDING, deps);
         expect(otherTenant).toEqual({ verified: false, reason: "the caller's token is for another tenant" });
     });
 
-    it("finds operators by object ID only when the token has one, else by name, and records who sent a request in the control's characters", () => {
+    it("ties a token to this app only by its audience or its subject path, never by a key among its attributes", async () => {
+        const { jwk, sign } = await signer();
+        const deps = { fetch: jwksAt([jwk]), now: () => NOW };
+        const reason = async (c: Record<string, unknown>) => {
+            const caller = await verifyCaller(await sign(c), BINDING, deps);
+            return caller.verified ? "" : caller.reason;
+        };
+        // In this tenant, with this app's key among its attributes, but neither its audience nor its subject names this app.
+        expect(await reason(managed({ sub: "user-1", tid: TENANT }))).toBe("the caller's token isn't for this app");
+        expect(await reason(claims({ aud: "fabric-apps", xms_attr: { [APP]: { rfn_email: "ops@contoso.example" } } }))).toBe("the caller's token isn't for this app");
+        // Tied by its subject path, its email for another app doesn't name the caller here.
+        expect(await reason(managed({ xms_attr: { [OTHER]: { rfn_email: "ops@contoso.example" } } }))).toBe("the caller's token names no object ID, and no sign-in email from Fabric for this app");
+        // Tied by its audience, an Entra token's email for this app is read.
+        expect(await verifyCaller(await sign(claims({ oid: undefined, email: undefined, xms_attr: { [APP]: { rfn_email: "Ops@Contoso.example" } } })), BINDING, deps)).toMatchObject({ verified: true, objectId: "", appEmail: "ops@contoso.example" });
+    });
+
+    it("finds operators by object ID only when the token has one, else by Fabric's email for this app alone, and records who sent a request in the control's characters", () => {
         const operators = { operators: [{ objectId: ZERO, names: ["ops@contoso.example"] }] };
-        const caller: VerifiedCaller = { verified: true, objectId: ZERO, names: ["ops@contoso.example"], display: "ops@contoso.example" };
+        const caller: VerifiedCaller = { verified: true, objectId: ZERO, appEmail: "", names: ["ops@contoso.example"], display: "ops@contoso.example" };
         expect(isOperator(caller, operators)).toBe(true);
-        // Names can change: with an object ID that isn't an operator's, a matching name doesn't count.
-        expect(isOperator({ ...caller, objectId: OTHER }, operators)).toBe(false);
-        expect(isOperator({ ...caller, objectId: "" }, operators)).toBe(true);
-        expect(isOperator({ ...caller, objectId: "", names: ["dba@contoso.example"] }, operators)).toBe(false);
+        // Names can change: with an object ID that isn't an operator's, a matching name or email doesn't count.
+        expect(isOperator({ ...caller, objectId: OTHER, appEmail: "ops@contoso.example" }, operators)).toBe(false);
+        // Without an object ID, Fabric's email for this app is the one name that counts; the token's other names never do.
+        expect(isOperator({ ...caller, objectId: "", appEmail: "ops@contoso.example" }, operators)).toBe(true);
+        expect(isOperator({ ...caller, objectId: "" }, operators)).toBe(false);
+        expect(isOperator({ ...caller, objectId: "", appEmail: "dba@contoso.example" }, operators)).toBe(false);
         expect(requestedByOf(caller)).toBe("app/ops@contoso.example");
         expect(requestedByOf({ ...caller, display: "Ops Person (DBA)" })).toBe("app/Ops-Person--DBA-");
         expect(requestedByOf({ ...caller, display: "x".repeat(100) })).toHaveLength(64);
@@ -221,38 +246,70 @@ describe("the Manage function's answers", () => {
         catalog: controlCatalog(),
     };
     const JOBS = `https://api.fabric.microsoft.com/v1/workspaces/${ZERO}/items/${ZERO}/jobs/instances`;
-    const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    // The control's run in progress, which Stop now cancels; ZERO is a run that ended, and the one each start creates.
+    const RUN = "55555555-5555-5555-5555-555555555555";
+    const json = (body: unknown, status = 200, retryAfter = "") => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...(retryAfter ? { "retry-after": retryAfter } : {}) } });
     const accepted = () => new Response(null, { status: 202, headers: { location: `${JOBS}/${ZERO}` } });
+    const capacityFull = () => json({ errorCode: "TooManyRequestsForCapacity", message: "This Spark job can't be run because you have hit a Spark compute or API rate limit." }, 430, "30");
     // A viewer whose token has another object ID: an operator's name wouldn't make them one.
     const viewer = { email: "ops@contoso.example", oid: OTHER };
 
-    /** A stand-in for the app's API (its keys) and Fabric's job API; it records every Fabric call. */
-    async function world(run: () => Response | Promise<Response> = accepted) {
+    interface WorldOptions {
+        /** The control's run in progress (RUN) in the job API's list. */
+        active?: boolean;
+        /** The list's answer, when it isn't the runs. */
+        list?: () => Response | Promise<Response>;
+        /** Each start's answer, in order; the last one repeats. */
+        starts?: Array<() => Response | Promise<Response>>;
+        /** Each read of the cancelled run, after its cancel: its state, and the Retry-After Fabric sends; the last one repeats. */
+        reads?: Array<{ status: string; retryAfter?: string }>;
+        /** The cancel's answer: 202 Accepted, with the Retry-After given. */
+        cancelRetryAfter?: string;
+    }
+
+    /** A stand-in for the app's API (its keys) and Fabric's job API, with a clock of its own; it records every Fabric call and every wait. */
+    async function world(options: WorldOptions = {}) {
         const { jwk, sign } = await signer();
         const fabric: Array<{ url: string; init?: RequestInit }> = [];
+        const slept: number[] = [];
+        let clock = NOW;
+        let starts = 0;
+        let reads = 0;
+        const startAnswers = options.starts ?? [accepted];
+        const readAnswers = options.reads ?? [{ status: "Cancelled" }];
         const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
             const u = String(url);
             if (u.startsWith(API)) return json({ keys: [jwk] }, u.endsWith("/.well-known/jwks.json") ? 200 : 404);
             fabric.push({ url: u, init });
-            if (u === `${JOBS}?jobType=RunNotebook`) return run();
-            if (u === JOBS) return json({ value: [{ id: ZERO, status: "Completed" }, { id: ZERO, status: "InProgress", invokeType: "Manual", startTimeUtc: "2026-11-18T11:30:00.1234567" }] });
-            if (u === `${JOBS}/${ZERO}/cancel`) return new Response(null, { status: 202 });
+            if (u === `${JOBS}?jobType=RunNotebook`) return startAnswers[Math.min(starts++, startAnswers.length - 1)]();
+            if (u === JOBS) {
+                if (options.list) return options.list();
+                return json({ value: [{ id: ZERO, status: "Completed" }, ...(options.active ? [{ id: RUN, status: "InProgress", invokeType: "Manual", startTimeUtc: "2026-11-18T11:30:00.1234567" }] : [])] });
+            }
+            if (u === `${JOBS}/${RUN}/cancel`) return new Response(null, { status: 202, headers: { location: `${JOBS}/${RUN}`, ...(options.cancelRetryAfter ? { "retry-after": options.cancelRetryAfter } : {}) } });
+            if (u === `${JOBS}/${RUN}`) {
+                const read = readAnswers[Math.min(reads++, readAnswers.length - 1)];
+                return json({ id: RUN, status: read.status }, 200, read.retryAfter);
+            }
             if (u === `${JOBS}/${ZERO}`) return json({ id: ZERO, status: "Failed", startTimeUtc: "2026-11-18T11:30:00", endTimeUtc: "2026-11-18T11:31:00", failureReason: { errorCode: "NotebookFailed", message: "The webhook refused it." } });
             return json({}, 404);
         });
         const fabricToken = vi.fn(() => "fabric-token-from-the-runtime");
         const call = async (extra: Record<string, unknown> = {}) => ({ token: await sign(claims(extra)), publishableKey: "pk-test", fabricToken });
-        return { fabric, fabricToken, call, sign, deps: { fetch, now: () => NOW } };
+        const sleep = async (ms: number) => {
+            slept.push(ms);
+            clock += ms;
+        };
+        return { fabric, fabricToken, call, sign, slept, calls: () => fabric.map((c) => `${c.init?.method ?? "GET"} ${c.url.replace(JOBS, "jobs")}`), deps: { fetch, now: () => clock, sleep } };
     }
 
     it("runs NB_DatabaseHub_Control for a verified operator, with REQUESTED_BY from the verified caller", async () => {
         const w = await world();
         const answer = await answerRequest({ action: "run", scenario: "ru-storm", target: "T5", durationMinutes: 10 }, await w.call(), SETTINGS, w.deps);
         expect(answer).toEqual({ started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [] });
-        expect(w.fabric).toHaveLength(1);
-        const [{ url, init }] = w.fabric;
-        expect(url).toBe(`${JOBS}?jobType=RunNotebook`);
-        expect(init?.method).toBe("POST");
+        // It reads the control's runs first: it takes one request at a time.
+        expect(w.calls()).toEqual(["GET jobs", "POST jobs?jobType=RunNotebook"]);
+        const { init } = w.fabric[1];
         expect(init?.headers).toEqual({ Authorization: "Bearer fabric-token-from-the-runtime", "Content-Type": "application/json" });
         expect(JSON.parse(String(init?.body))).toEqual({
             executionData: {
@@ -267,7 +324,8 @@ describe("the Manage function's answers", () => {
         });
         // The browser can't name the caller: a request that tries is refused before anything runs.
         expect(await answerRequest({ action: "stop", requestedBy: "app/someone-else" }, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, copy: false, reason: "Unknown fields: requestedBy." });
-        expect(w.fabric).toHaveLength(1);
+        expect(w.fabric).toHaveLength(2);
+        expect(w.slept).toEqual([]);
     });
 
     it("keeps Manage read-only for a verified viewer who isn't an operator, before any Fabric call", async () => {
@@ -311,9 +369,27 @@ describe("the Manage function's answers", () => {
         expect(w.fabric).toHaveLength(0);
     });
 
-    it("offers copy mode when the job API refuses the run, can't be reached, or the runtime gave no Fabric token", async () => {
+    it("refuses every action but Stop now while one of the control's runs is in progress: it takes one request at a time", async () => {
+        const w = await world({ active: true });
+        const call = await w.call();
+        const running = { id: RUN, status: "InProgress", startedAt: "2026-11-18T11:30:00.1234567Z", invokeType: "Manual" };
+        for (const request of [{ action: "session" }, { action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10 }, { action: "reset", targets: ["T1"] }]) {
+            expect(await answerRequest(request, call, SETTINGS, w.deps)).toEqual({
+                started: false,
+                jobInstance: "",
+                reason: "NB_DatabaseHub_Control's run 55555555 is in progress, and the control takes one request at a time: wait for it to end, or use Stop now, which ends the session as its end would.",
+                requestedBy: "app/ops@contoso.example",
+                copy: false,
+                cancelled: [],
+                running,
+            });
+        }
+        expect(w.calls()).toEqual(["GET jobs", "GET jobs", "GET jobs"]);
+    });
+
+    it("offers copy mode when the job API refuses the run, can't be reached, can't list the control's runs, or the runtime gave no Fabric token", async () => {
         const run = { action: "run", scenario: "healthy-baseline", target: "T3", durationMinutes: 30 };
-        let w = await world(() => json({ errorCode: "InsufficientPrivileges", message: "The caller does not have  permission." }, 403));
+        let w = await world({ starts: [() => json({ errorCode: "InsufficientPrivileges", message: "The caller does not have  permission." }, 403)] });
         expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toEqual({
             started: false,
             jobInstance: "",
@@ -322,38 +398,69 @@ describe("the Manage function's answers", () => {
             copy: true,
             cancelled: [],
         });
-        w = await world(() => new Response("upstream timeout", { status: 504 }));
+        w = await world({ starts: [() => new Response("upstream timeout", { status: 504 })] });
         expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ copy: true, reason: "Fabric didn't start NB_DatabaseHub_Control (HTTP 504). Run all in the notebook sends the same request." });
-        w = await world(() => Promise.reject(new TypeError("fetch failed")));
+        w = await world({ starts: [() => Promise.reject(new TypeError("fetch failed"))] });
         expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ copy: true, reason: "NB_DatabaseHub_Control wasn't started (fetch failed). Run all in the notebook sends the same request." });
+        // A full capacity refuses a run other than Stop now once: the app says so, and Run all sends it once the capacity is free.
+        w = await world({ starts: [capacityFull] });
+        expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ copy: true, reason: expect.stringMatching(/^Fabric didn't start NB_DatabaseHub_Control \(HTTP 430, TooManyRequestsForCapacity: /) });
+        expect(w.slept).toEqual([]);
+        // Without the list, the app can't tell whether a run is in progress, so it doesn't start one.
+        w = await world({ list: () => json({ errorCode: "Forbidden", message: "No access." }, 403) });
+        expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, copy: true, reason: "Fabric didn't list NB_DatabaseHub_Control's runs (HTTP 403, Forbidden: No access), so the app can't tell whether one is in progress. Run all in the notebook sends the same request." });
+        expect(w.calls()).toEqual(["GET jobs"]);
         w = await world();
         w.fabricToken.mockImplementation(() => {
             throw new Error("No token was minted for the audience Fabric.");
         });
-        expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, copy: true, reason: "NB_DatabaseHub_Control wasn't started (No token was minted for the audience Fabric). Run all in the notebook sends the same request." });
+        expect(await answerRequest(run, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: false, copy: true, reason: "Fabric didn't list NB_DatabaseHub_Control's runs (No token was minted for the audience Fabric), so the app can't tell whether one is in progress. Run all in the notebook sends the same request." });
         expect(w.fabric).toHaveLength(0);
     });
 
-    it("cancels the control's run in progress before Stop now, so the stop can start on a small capacity", async () => {
-        const w = await world();
-        expect(await answerRequest({ action: "stop" }, await w.call(), SETTINGS, w.deps)).toEqual({ started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [ZERO] });
-        expect(w.fabric.map((c) => `${c.init?.method ?? "GET"} ${c.url}`)).toEqual([`GET ${JOBS}`, `POST ${JOBS}/${ZERO}/cancel`, `POST ${JOBS}?jobType=RunNotebook`]);
-        expect(JSON.parse(String(w.fabric[2].init?.body)).executionData.parameters.STOP_NOW).toEqual({ value: true, type: "bool" });
+    it("cancels the control's run in progress before Stop now, and starts the stop once that run has ended", async () => {
+        const w = await world({ active: true });
+        expect(await answerRequest({ action: "stop" }, await w.call(), SETTINGS, w.deps)).toEqual({ started: true, jobInstance: ZERO, reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [RUN] });
+        expect(w.calls()).toEqual(["GET jobs", `POST jobs/${RUN}/cancel`, `GET jobs/${RUN}`, "POST jobs?jobType=RunNotebook"]);
+        expect(JSON.parse(String(w.fabric[3].init?.body)).executionData.parameters.STOP_NOW).toEqual({ value: true, type: "bool" });
+        expect(w.slept).toEqual([5_000]);
+    });
+
+    it("waits as Fabric asks (Retry-After) for the cancelled run to end, and asks again while the capacity refuses the stop (HTTP 430)", async () => {
+        const w = await world({ active: true, cancelRetryAfter: "10", reads: [{ status: "InProgress", retryAfter: "15" }, { status: "Cancelled" }], starts: [capacityFull, accepted] });
+        expect(await answerRequest({ action: "stop" }, await w.call(), SETTINGS, w.deps)).toMatchObject({ started: true, jobInstance: ZERO, cancelled: [RUN] });
+        expect(w.calls()).toEqual(["GET jobs", `POST jobs/${RUN}/cancel`, `GET jobs/${RUN}`, `GET jobs/${RUN}`, "POST jobs?jobType=RunNotebook", "POST jobs?jobType=RunNotebook"]);
+        expect(w.slept).toEqual([10_000, 15_000, 30_000]);
+    });
+
+    it("says that the session is no longer followed when it cancelled the control's run but the capacity kept refusing the stop", async () => {
+        const w = await world({ active: true, starts: [capacityFull] });
+        const answer = await answerRequest({ action: "stop" }, await w.call(), SETTINGS, w.deps);
+        expect(answer).toMatchObject({ started: false, copy: true, cancelled: [RUN], requestedBy: "app/ops@contoso.example" });
+        expect(answer.reason).toMatch(/^Stop now cancelled NB_DatabaseHub_Control's run 55555555, but Fabric didn't start the stop \(HTTP 430, TooManyRequestsForCapacity: .+\)\. Nothing is stopping the session now: Run all in the notebook sends the same request, or \.\/scripts\/stop-demo\.ps1 -SaveHistory stops it from a PC\. Its auto-stop still stops everything at its end, and the next Run all saves its history\.$/);
+        // Within its budget: the function itself runs at most 240 seconds.
+        expect(w.slept.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(STOP_WAIT_MS);
+        expect(w.calls().filter((c) => c.endsWith("?jobType=RunNotebook")).length).toBeGreaterThan(1);
+        // A cancelled run that never ends: Stop now still asks once, by its deadline.
+        const stuck = await world({ active: true, reads: [{ status: "InProgress" }], starts: [capacityFull] });
+        expect(await answerRequest({ action: "stop" }, await stuck.call(), SETTINGS, stuck.deps)).toMatchObject({ started: false, copy: true, cancelled: [RUN] });
+        expect(stuck.slept.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(STOP_WAIT_MS);
+        expect(stuck.calls().filter((c) => c.endsWith("?jobType=RunNotebook"))).toHaveLength(1);
     });
 
     it("reads the control's run in progress for an operator, with its ID, the control's targets, and one run's outcome, in UTC", async () => {
-        const w = await world();
+        const w = await world({ active: true });
         expect(await answerAccess(await w.call(), SETTINGS, w.deps)).toEqual({
             configured: true,
             operator: true,
             reason: "",
             who: "ops@contoso.example",
-            running: { id: ZERO, status: "InProgress", startedAt: "2026-11-18T11:30:00.1234567Z", invokeType: "Manual" },
+            running: { id: RUN, status: "InProgress", startedAt: "2026-11-18T11:30:00.1234567Z", invokeType: "Manual" },
             targets: ["T1", "T2", "T3", "T4", "T5"],
         });
         expect(await answerJob(ZERO, await w.call(), SETTINGS, w.deps)).toEqual({ status: "Failed", startedAt: "2026-11-18T11:30:00Z", endedAt: "2026-11-18T11:31:00Z", failureReason: "NotebookFailed: The webhook refused it." });
         expect(await answerJob("../../items", await w.call(), SETTINGS, w.deps)).toEqual({ status: "Unknown", startedAt: null, endedAt: null, failureReason: "That isn't a job instance ID." });
-        expect(w.fabric.map((c) => c.url)).toEqual([JOBS, `${JOBS}/${ZERO}`]);
+        expect(w.calls()).toEqual(["GET jobs", `GET jobs/${ZERO}`]);
     });
 
     it("hands over to copy mode when this deployment's function isn't set up, before reading anything", async () => {
@@ -391,7 +498,11 @@ describe("the app's side of the Manage function", () => {
         const api = functionsManageApi({ functions: { manageAccess: { invoke }, manageRequest: { invoke } } });
         expect(await api.access()).toMatchObject({ operator: true });
         expect(await api.request({ action: "reset", targets: ["T5"] })).toMatchObject({ started: true });
-        expect(invoke).toHaveBeenLastCalledWith({ request: { action: "reset", targets: ["T5"] } }, { timeoutMs: 60_000 });
+        // A request waits for Stop now's own waits, within what a function may run (240 seconds); the other calls a minute.
+        expect(invoke).toHaveBeenLastCalledWith({ request: { action: "reset", targets: ["T5"] } }, { timeoutMs: REQUEST_TIMEOUT_MS });
+        expect(REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(STOP_WAIT_MS + 30_000);
+        expect(REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(240_000);
+        expect(invoke).toHaveBeenCalledWith(undefined, { timeoutMs: ACCESS_TIMEOUT_MS });
         await expect(api.job(ZERO)).rejects.toThrow("This deployment has no Manage function.");
     });
 });

@@ -54,12 +54,14 @@ export interface AppProps {
 /** Which way Manage sends actions here, from the Manage function's answer about the signed-in viewer. */
 function useManageAccess(fixed: ManageAccess | undefined, api: ManageApi | undefined): ManageAccess {
     const [detected, setDetected] = useState<ManageAccess | null>(null);
+    const [refreshing, setRefreshing] = useState(false);
+    const fallBack = useCallback((reason: string) => setDetected({ ...MANAGE_READ_ONLY, reason }), []);
     useEffect(() => {
         if (fixed || !api) return;
         let alive = true;
         api.access().then(
             (a) => {
-                if (alive) setDetected(manageAccessOf(a, api, (reason) => setDetected({ ...MANAGE_READ_ONLY, reason })));
+                if (alive) setDetected(manageAccessOf(a, api, fallBack));
             },
             () => {
                 if (alive) setDetected(MANAGE_READ_ONLY);
@@ -68,10 +70,25 @@ function useManageAccess(fixed: ManageAccess | undefined, api: ManageApi | undef
         return () => {
             alive = false;
         };
-    }, [fixed, api]);
+    }, [fixed, api, fallBack]);
+    // The control's run in progress, read again before each action and after a start: the control takes one request at a
+    // time, and the function refuses any other while one runs. Copy mode, once a request fell back to it, stays.
+    const refresh = useCallback(async () => {
+        if (!api) return;
+        setRefreshing(true);
+        try {
+            const a = await api.access();
+            setDetected((current) => (current && current.mode === "copy" ? current : manageAccessOf(a, api, fallBack)));
+        } catch {
+            // What the page had stays; the function checks each request again anyway.
+        } finally {
+            setRefreshing(false);
+        }
+    }, [api, fallBack]);
+    const live = useMemo(() => (detected && detected.mode === "run" ? { ...detected, refresh, refreshing } : detected), [detected, refresh, refreshing]);
     if (fixed) return fixed;
     if (!api) return MANAGE_READ_ONLY;
-    return detected ?? { ...MANAGE_READ_ONLY, checking: true, reason: "Checking whether this app can send actions…" };
+    return live ?? { ...MANAGE_READ_ONLY, checking: true, reason: "Checking whether this app can send actions…" };
 }
 
 export default function App({ runtime, provenance = "history", manage: fixedManage, manageApi }: AppProps) {

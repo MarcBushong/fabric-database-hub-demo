@@ -448,9 +448,28 @@ describe("Manage", () => {
         expect(await screen.findByText(/^The control's run: run 00000000 is in progress, since /)).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
         const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
-        expect(within(dialog).getByText(/^A run of NB_DatabaseHub_Control is in progress, since .+\. The control follows a session that's running instead of starting another: Stop now first, then start a new one\.$/)).toBeInTheDocument();
+        expect(within(dialog).getByText(/^A run of NB_DatabaseHub_Control is in progress, since .+, and the control takes one request at a time: wait for it to end\. Stop now ends whatever it runs, as a session's end would, its history saved\.$/)).toBeInTheDocument();
         expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
         expect(send).not.toHaveBeenCalled();
+    });
+
+    it("reads the control's run in progress again when an action opens, waits for that read, and reads it again after a start", async () => {
+        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [] }));
+        const refresh = vi.fn(async () => undefined);
+        const manage = { mode: "run" as const, canRun: true, reason: "", who: "ops@contoso.example", running: null, send, job: vi.fn(inProgress), refresh, refreshing: true };
+        const { unmount } = renderWithApp(<ManagePage />, { manage });
+        fireEvent.click(await screen.findByRole("button", { name: "Run an incident…" }));
+        expect(refresh).toHaveBeenCalledTimes(1);
+        const reading = await screen.findByRole("dialog", { name: /^Run / });
+        expect(within(reading).getByText("Checking NB_DatabaseHub_Control's runs…")).toBeInTheDocument();
+        expect(within(reading).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        unmount();
+        renderWithApp(<ManagePage />, { manage: { ...manage, refreshing: false } });
+        fireEvent.click(await screen.findByRole("button", { name: "Run an incident…" }));
+        const dialog = await screen.findByRole("dialog", { name: /^Run / });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
     });
 
     it("says Stop now cancels the control's run in progress first", async () => {
@@ -458,7 +477,21 @@ describe("Manage", () => {
         fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
         const dialog = await screen.findByRole("dialog", { name: "Stop now" });
         expect(within(dialog).getByText("Stop now cancels the control's run first.")).toBeInTheDocument();
+        expect(within(dialog).getByText(/If that run was ending a session, Stop now saves the session's history itself/)).toBeInTheDocument();
         expect(within(dialog).getByRole("button", { name: "Confirm" })).not.toHaveAttribute("aria-disabled", "true");
+    });
+
+    it("says when Stop now cancelled the control's run but the stop didn't start, and copies the request", async () => {
+        const reason = "Stop now cancelled NB_DatabaseHub_Control's run 55555555, but Fabric didn't start the stop (HTTP 430, TooManyRequestsForCapacity). Nothing is stopping the session now: Run all in the notebook sends the same request, or ./scripts/stop-demo.ps1 -SaveHistory stops it from a PC. Its auto-stop still stops everything at its end, and the next Run all saves its history.";
+        const send = vi.fn(async () => ({ started: false, jobInstance: "", reason, requestedBy: "app/ops@contoso.example", copy: true, cancelled: ["55555555-5555-5555-5555-555555555555"] }));
+        const fallBack = vi.fn();
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send, job: vi.fn(inProgress), fallBack } });
+        fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Stop now" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(fallBack).toHaveBeenCalledWith(reason));
+        expect(await within(dialog).findByText("Stop now cancelled the control's run, but the stop didn't start.")).toBeInTheDocument();
+        expect(within(dialog).getByText(`${reason} Copy it below instead.`)).toBeInTheDocument();
     });
 
     it("hands a request the function couldn't send over to copy mode, with the reason", async () => {

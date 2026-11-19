@@ -205,6 +205,18 @@ if scenario == "leftover":
     # The runbook writes the metrics compact (ConvertTo-Json -Compress).
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
                                                  "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario in ("stoppedend", "stoppedold"):
+    # The app's Stop now cancelled the run that was ending session bbbb... while it waited for the telemetry (2026-11-19):
+    # the runbook had stopped it and kept its metrics, 5 minutes ago ("stoppedold": 10 days ago).
+    ended = Clock.now - (real_dt.timedelta(days=10) if scenario == "stoppedold" else real_dt.timedelta(minutes=5))
+    VAULT["dbhub-session-status"] = json.dumps({"schemaVersion": 1, "sessionId": "b" * 32, "phase": "stopped", "updatedUtc": iso(ended), "stoppedBy": "Stop now",
+                                                "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "failed": [], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "b" * 32, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=90)),
+                                                 "endUtc": iso(ended), "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "endedrunning":
+    # Session cccc...'s end passed 10 minutes ago, and nothing stopped it: the run that was ending it was cancelled first.
+    RUNBOOK.update(session="c" * 32, accepted=Clock.now - real_dt.timedelta(minutes=100), minutes=90)
+    VAULT["dbhub-session-status"] = json.dumps(running_status("c" * 32, RUNBOOK["accepted"], 90))
 if scenario == "leftovercosmos":
     # T5's metrics alone (2026-11-18): an empty T4 document carries them as its cosmos member.
     earlier = Clock.now - real_dt.timedelta(days=1)
@@ -364,7 +376,8 @@ error = ""
 with contextlib.redirect_stdout(buffer):
     try:
         exec(code[0], namespace)
-        namespace.update({"stopnow": {"STOP_NOW": True}, "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
+        namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
+                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
             if index == 2:
@@ -1070,6 +1083,9 @@ print(json.dumps(out))
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
+        @{ Case = 'Stop now after the run ending a session was cut off before its history: that session''s history is saved once its telemetry is in (2026-11-19)'; Scenario = 'stoppedend'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = 'Session bbbbbbbb already stopped: its history is saved here too, in case the run that was ending it stopped before it saved it \(NB_DatabaseHub_LiveActivity skips a session already saved\)\.\s+Waiting 11 minutes for its last telemetry to arrive \(until 14:10\)\.' }
+        @{ Case = 'Stop now after a session''s end passed with no stop recorded: it ends that session as its end would, its history saved (2026-11-19)'; Scenario = 'endedrunning'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session cccccccc ===' }
+        @{ Case = 'Stop now when the last session stopped more than 7 days ago: it stops whatever runs, and saves no history'; Scenario = 'stoppedold'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 0; Jobs = 0; Validators = 0; Printed = 'No session runs \(its status says stopped\), so Stop now stops whatever runs\.' }
         @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'MODE is "check", so nothing was sent\.' }
         @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Validators = 1; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
         @{ Case = 'a runbook that refuses the session: the reason and the fix'; Scenario = 'refused'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Validators = 0; Printed = '(?s)A run is already active.*Fix: Wait until it ends, or run the notebook''s Stop now cell first\..*Nothing runs: A run is already active' }
@@ -1112,6 +1128,23 @@ print(json.dumps(out))
         }
         if ($Scenario -in 'active', 'stopnow') {
             $report.sent[0].sessionId | Should -Be ('a' * 32)
+        }
+        if ($Scenario -eq 'stoppedend') {
+            # A plain stop for whatever runs, then that session's history, with its metrics and window, after its telemetry.
+            $report.sent[0].PSObject.Properties.Name | Should -Not -Contain 'sessionId'
+            @($report.order) | Should -Be @('sent:stop', 'history:bbbbbbbb')
+            $report.refs[0].args.SESSION_ID | Should -Be ('b' * 32)
+            $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
+            # Its window from its metrics, five minutes either side (ConvertFrom-Json reads the times as dates).
+            ([datetime]$report.refs[0].args.WINDOW_START_UTC).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-14T12:20:00Z'
+            ([datetime]$report.refs[0].args.WINDOW_END_UTC).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-14T14:00:00Z'
+        }
+        if ($Scenario -eq 'endedrunning') {
+            $report.sent[0].sessionId | Should -Be ('c' * 32)
+            $report.refs[0].args.SESSION_ID | Should -Be ('c' * 32)
+        }
+        if ($Scenario -eq 'stoppedold') {
+            $report.printed | Should -Not -Match 'already stopped'
         }
     }
 
