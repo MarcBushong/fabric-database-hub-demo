@@ -27,6 +27,8 @@ function Initialize-DemoConfig {
        (-OwnerEmail with its recorded budget address claims it); otherwise the first prefix after it that's yours, or
        that's free (<prefix>2 to <prefix>99), with its own group and the Fabric workspace "Database Hub Demo <prefix>"
        (Warning). A read that fails is a Fail, and nothing is written. Parameters you pass win over what's recovered.
+       A new environment gets "Database Hub Demo <prefix>" for every prefix but the default, whether -Prefix named it or
+       the run picked it (2026-11-19), so a second environment never shares the first one's workspace.
     5. P1 (INIT.P1.CONTRIBUTOR): the caller's permissions on the subscription, as preflight reads them; without
        Contributor, Manual action required with the Owner's exact command.
     6. Fabric (INIT.FABRIC.CAPACITY, INIT.FABRIC.WORKSPACE): the capacities you can assign (Capacities - List
@@ -36,7 +38,12 @@ function Initialize-DemoConfig {
        notebooks that are missing, except a recovered environment's own (4b): the workspace its resource group records,
        one that holds only what the demo creates, or one the demo's notebooks are already in (Items - List Items,
        read-only), gets true, as the update republishes its notebooks (Resolve-DemoRecoveredNotebookImport), and
-       INIT.EXISTING says which and why. Nothing is created in Fabric here.
+       INIT.EXISTING says which and why. Nothing is created in Fabric here. A workspace that exists is checked against
+       what the other demo environments record (2026-11-19: one Azure Resource Graph query, Get-DemoFabricWorkspaceClaim;
+       Resolve-DemoFabricWorkspaceClaim), and one that another records is never a Pass: a default name gives way to the
+       environment's own, "Database Hub Demo <prefix>" (a Warning that says so); a -WorkspaceName that names one is
+       Manual action required, with the environment that records it; an environment's own that another records too is
+       a Warning, with how to move; and a Resource Graph that can't answer is a Warning.
     7. P6 (INIT.P6.GROUP): the Microsoft Entra security group by -AdminGroupObjectId, or by name (default
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
@@ -65,6 +72,7 @@ function Initialize-DemoConfig {
     - Permissions - List For Resource Group, subscription scope: https://learn.microsoft.com/rest/api/authorization/permissions
     - List Capacities: https://learn.microsoft.com/rest/api/fabric/core/capacities/list-capacities
     - List Workspaces: https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces
+    - Azure Resource Graph, query scope (checked 2026-11-19): https://learn.microsoft.com/azure/governance/resource-graph/concepts/query-language#query-scope
 
     .PARAMETER Path
     The configuration file to write.
@@ -87,7 +95,8 @@ function Initialize-DemoConfig {
     question (2026-11-09). PaygWizard is retired from the one-click deployment.
 
     .PARAMETER WorkspaceName
-    The Fabric workspace's name (default "Database Hub Demo").
+    The Fabric workspace's name (default "Database Hub Demo", and "Database Hub Demo <prefix>" for a new environment whose
+    prefix isn't the default). One that another demo environment records is Manual action required.
 
     .PARAMETER LakehouseName
     The lakehouse's name (default LH_DatabaseHub).
@@ -349,10 +358,12 @@ function Initialize-DemoConfig {
     #region Defaults
     $example = Get-Content -LiteralPath $ExamplePath -Raw | ConvertFrom-Json -AsHashtable -Depth 32
     $schemaDefaults = Get-DemoSchemaDefault -Node (Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64)
-    $effectivePrefix = if ($Prefix) { $Prefix } elseif ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
+    $defaultPrefix = if ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
+    $effectivePrefix = if ($Prefix) { $Prefix } else { $defaultPrefix }
     $environment = if ($example['environment']) { [string]$example['environment'] } else { 'demo' }
     $exampleFabric = if ($example['fabric'] -is [System.Collections.IDictionary]) { $example['fabric'] } else { @{} }
-    $workspace = if ($WorkspaceName) { $WorkspaceName.Trim() } elseif ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
+    $defaultWorkspace = if ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
+    $workspace = if ($WorkspaceName) { $WorkspaceName.Trim() } else { $defaultWorkspace }
     $lakehouse = if ($LakehouseName) { $LakehouseName.Trim() } elseif ($exampleFabric['lakehouseName']) { [string]$exampleFabric['lakehouseName'] } else { 'LH_DatabaseHub' }
     #endregion Defaults
 
@@ -372,9 +383,11 @@ function Initialize-DemoConfig {
         return (& $finish $false)
     }
     $effectivePrefix = [string]$existing.Prefix
-    if ($existing.Kind -eq 'NewPrefix' -and -not $WorkspaceName) {
-        # The new environment's own workspace, so it never shares the other environment's ("Database Hub Demo <prefix>").
-        $workspace = '{0} {1}' -f $workspace, $effectivePrefix
+    if ($existing.Kind -in 'New', 'NewPrefix' -and -not $WorkspaceName -and $effectivePrefix -cne $defaultPrefix) {
+        # A new environment's own workspace, so it never shares another environment's: "Database Hub Demo <prefix>" for every
+        # prefix but the default, whether -Prefix named it or the run picked it. Before 2026-11-19 an explicit -Prefix kept
+        # "Database Hub Demo", the default prefix's environment's (the final tests' F5).
+        $workspace = '{0} {1}' -f $defaultWorkspace, $effectivePrefix
     }
     # The budget alerts' address and the owner tag: -OwnerEmail, else what the environment records, else your sign-in.
     $emailSource = if ($OwnerEmail) { 'option' } else { 'sign-in' }
@@ -427,8 +440,6 @@ function Initialize-DemoConfig {
     $workspaceExists = $false
     $fabricToken = $null
     # A recovered environment's workspaces and capacity come from what's deployed (issue 60, Resolve-DemoRecoveredWorkspace).
-    $defaultPrefix = if ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
-    $defaultWorkspace = if ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
     $workspaceSource = ''
     $controlWorkspace = ''
     $controlEnabled = $false
@@ -470,6 +481,23 @@ function Initialize-DemoConfig {
             if (-not $WorkspaceName) {
                 $workspace = [string]$place.WorkspaceName
             }
+        }
+        # A workspace that another demo environment records (2026-11-19) is never this environment's by default, and never a
+        # silent Pass (Resolve-DemoFabricWorkspaceClaim): one Azure Resource Graph query, only for a workspace that exists.
+        $claimOutcome = $null
+        if ($workspaceList.Succeeded -and @(Select-DemoFabricNamed -Items $shared -Name $workspace).Count -eq 1) {
+            $claim = Get-DemoFabricWorkspaceClaim -Config ([ordered]@{ subscriptionId = $subscription; prefix = $effectivePrefix; environment = $environment })
+            $origin = if ($WorkspaceName) { 'option' } elseif ($recovered) { 'recovered' } else { 'default' }
+            $claimOutcome = Resolve-DemoFabricWorkspaceClaim -WorkspaceName $workspace -Workspace $shared -Claim $claim -Origin $origin -OwnId @((& $recordedId 'FabricWorkspaceId'), (& $recordedId 'ControlWorkspaceId')) -Prefix $effectivePrefix -DefaultName $defaultWorkspace -ResourceGroup ([string]$existing.ResourceGroup)
+            if ($claimOutcome.Renamed) {
+                $workspace = [string]$claimOutcome.WorkspaceName
+                if ($recovered) {
+                    # Not the workspace it had, so INIT.EXISTING doesn't list it among what was recovered.
+                    $workspaceSource = 'renamed'
+                }
+            }
+        }
+        if ($recovered) {
             # Its workspace keeps the capacity it's on, so there's nothing to ask (a workspace with a capacity is never moved).
             $current = @(Select-DemoFabricNamed -Items $shared -Name $workspace) | Select-Object -First 1
             $currentCapacity = if ($null -ne $current) { ([string](Get-DemoMemberValue -InputObject $current -Name 'capacityId')).ToLowerInvariant() } else { '' }
@@ -545,19 +573,31 @@ function Initialize-DemoConfig {
         }
         else {
             $found = @(Select-DemoFabricNamed -Items $shared -Name $workspace)
-            if ($found.Count -gt 1) {
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('More than one workspace named "{0}" is visible to you.' -f $workspace) @{ workspaceName = $workspace; matches = $found.Count } 'Run init.ps1 -Force -WorkspaceName with a name no other workspace uses.' $docs.Workspaces
+            # What another demo environment's record changes here (Resolve-DemoFabricWorkspaceClaim, 2026-11-19).
+            $claimStatus = if ($null -ne $claimOutcome) { [string]$claimOutcome.Status } else { '' }
+            $claimNote = if ($claimStatus -eq 'Warning') { ' ' + [string]$claimOutcome.Note } else { '' }
+            $claimFix = if ($claimStatus) { [string]$claimOutcome.Remediation } else { '' }
+            $claimedBy = if ($null -ne $claimOutcome) { @($claimOutcome.ClaimedBy) } else { @() }
+            $passOrWarn = if ($claimStatus) { 'Warning' } else { 'Pass' }
+            $note = if ($workspaceNote) { ' ' + $workspaceNote } else { '' }
+            if ($claimStatus -eq 'Manual action required') {
+                # Kept as it's named, so deploy.ps1 stops before it creates anything there too (DEPLOY.FABRIC.SHARED).
+                $workspaceExists = $found.Count -eq 1
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ([string]$claimOutcome.Note) ([ordered]@{ workspaceName = $workspace; recordedBy = $claimedBy }) $claimFix $docs.Workspaces
+            }
+            elseif ($found.Count -gt 1) {
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('More than one workspace named "{0}" is visible to you.' -f $workspace) @{ workspaceName = $workspace; matches = $found.Count } ('Run init.ps1 -Force -Prefix {0} -WorkspaceName with a name no other workspace uses.' -f $effectivePrefix) $docs.Workspaces
             }
             elseif ($found.Count -eq 1) {
                 $workspaceExists = $true
                 $notebooks = if ($null -ne $notebookImport -and $notebookImport.Import) { 'deploy.ps1 updates its notebooks, as an update does (fabric.importNotebooks true; INIT.EXISTING says why)' } else { 'deploy.ps1 adds only the notebooks that are missing' }
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" exists; the scripts use it, and {1}.{2}' -f $workspace, $notebooks, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace } '' $docs.Workspaces
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' $passOrWarn ('The Fabric workspace "{0}" exists; the scripts use it, and {1}.{2}{3}' -f $workspace, $notebooks, $note, $claimNote) ([ordered]@{ workspaceName = $workspace; recordedBy = $claimedBy }) $claimFix $docs.Workspaces
             }
             elseif ($capacityChosen) {
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" doesn''t exist yet: deploy.ps1 creates it on "{1}" with the lakehouse "{2}", and imports the notebooks (fabric.importNotebooks true). Creating it needs the Fabric tenant setting "Create workspaces" for you.{3}' -f $workspace, $capacityChosen, $lakehouse, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace; capacityName = $capacityChosen } '' 'https://learn.microsoft.com/fabric/admin/portal-workspace'
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' $passOrWarn ('The Fabric workspace "{0}" doesn''t exist yet: deploy.ps1 creates it on "{1}" with the lakehouse "{2}", and imports the notebooks (fabric.importNotebooks true). Creating it needs the Fabric tenant setting "Create workspaces" for you.{3}{4}' -f $workspace, $capacityChosen, $lakehouse, $note, $claimNote) ([ordered]@{ workspaceName = $workspace; capacityName = $capacityChosen; recordedBy = $claimedBy }) $claimFix 'https://learn.microsoft.com/fabric/admin/portal-workspace'
             }
             else {
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('The Fabric workspace "{0}" doesn''t exist yet, and no capacity is chosen to create it on.' -f $workspace) @{ workspaceName = $workspace } 'Fix INIT.FABRIC.CAPACITY above, or create the workspace on an F or Trial capacity yourself and add a lakehouse named LH_DatabaseHub; then run init.ps1 -Force.' $docs.Workspaces
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('The Fabric workspace "{0}" doesn''t exist yet, and no capacity is chosen to create it on.{1}' -f $workspace, $claimNote) @{ workspaceName = $workspace } 'Fix INIT.FABRIC.CAPACITY above, or create the workspace on an F or Trial capacity yourself and add a lakehouse named LH_DatabaseHub; then run init.ps1 -Force.' $docs.Workspaces
             }
         }
     }

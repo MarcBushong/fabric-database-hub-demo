@@ -986,6 +986,10 @@ Describe 'Invoke-DemoDeployment' {
             $script:replicaEnd.Add([pscustomobject]@{ Before = $script:order.ToArray(); Snapshots = $script:history.Count })
             New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
         }
+        # A run without preflight's check of the Fabric workspace that another environment records (2026-11-19) has its own
+        # tests (DbHubDemo.Preflight.Tests.ps1): here nobody else records it unless a test says so.
+        $script:fabricShared = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -MockWith { $script:fabricShared }
     }
 
     It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
@@ -1034,6 +1038,20 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Fail'
         $script:order | Should -Not -Contain 'Preflight'
         @($script:order | Where-Object { $_ -like 'Template*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'checks the Fabric workspace that another environment records when -FromStage skips preflight, and stops at a Fail before anything changes (2026-11-19)' {
+        $script:fabricShared = New-DemoResult -CheckId 'DEPLOY.FABRIC.SHARED' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The Fabric workspace "Database Hub Demo" (fabric.workspaceName) is the one rg-dbhub-demo records as its own.' -Remediation 'Give this environment its own workspace.'
+        $results = @(Invoke-DemoDeployment -Config $config -FromStage Infrastructure)
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.SHARED' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'Preflight'
+        @($script:order | Where-Object { $_ -like 'Template*' }) | Should -BeNullOrEmpty
+        $script:order | Should -Not -Contain 'Fabric'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 1 -Exactly -ParameterFilter { [bool]$Resolve }
+        # A run that stops before the Fabric stage, or skips it, changes nothing in Fabric, so it isn't read.
+        $null = Invoke-DemoDeployment -Config $config -FromStage Infrastructure -StopAfter T3
+        $null = Invoke-DemoDeployment -Config $config -FromStage Infrastructure -SkipFabric
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 1 -Exactly
     }
 
     It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {

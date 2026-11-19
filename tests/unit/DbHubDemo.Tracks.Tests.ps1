@@ -1930,6 +1930,10 @@ Describe 'Invoke-DemoParallelDeployment' {
         # the profile's unless a test says not.
         $script:t3Scale = $null
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT3ScaleResult -MockWith { $script:calls.Add('t3 scale check'); $script:t3Scale }
+        # A run without preflight's check of the Fabric workspace that another environment records (2026-11-19) has its own
+        # tests (DbHubDemo.Preflight.Tests.ps1): here nobody else records it unless a test says so.
+        $script:fabricShared = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -MockWith { $script:fabricShared }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -2154,6 +2158,27 @@ Describe 'Invoke-DemoParallelDeployment' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 1 -Exactly
+    }
+
+    It 'checks the Fabric workspace that another environment records when -FromStage skips preflight, and stops before any track at a Fail (2026-11-19)' {
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $script:fabricShared = New-DemoResult -CheckId 'DEPLOY.FABRIC.SHARED' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The Fabric workspace "Database Hub Demo" (fabric.workspaceName) is the one rg-dbhub-demo records as its own.' -Remediation 'Give this environment its own workspace.'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.SHARED' }).status | Should -Be 'Fail'
+        $script:calls | Should -Not -Contain 'preflight'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 1 -Exactly -ParameterFilter { [bool]$Resolve }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -Times 1 -Exactly -ParameterFilter { @($Id) -contains 'Fabric.Items' -and $State -eq 'Failed' -and $Message -match 'records as its own\. Give this environment its own workspace\.$' } -Because 'the status page''s Fabric row says it, with the fix'
+
+        # An environment that shares it already: a Warning, and the run goes on; with -SkipFabric nothing in Fabric changes,
+        # so it isn't read.
+        $script:fabricShared = New-DemoResult -CheckId 'DEPLOY.FABRIC.SHARED' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The environments share it.'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.SHARED' }).status | Should -Be 'Warning'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 1 -Exactly
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' -SkipFabric }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 2 -Exactly
     }
 
     It 'has the template price T4''s creation only when -FromStage skips preflight, and shows one over a ceiling as a Warning on the Infrastructure step (#26)' {
