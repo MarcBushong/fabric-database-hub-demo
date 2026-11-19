@@ -393,6 +393,7 @@ function Get-DemoCostEstimate {
     $t4WorstCase = $null
     $t4Restart = $null
     $t4WorstCaseWithout = $null
+    $t4WorstCaseCapped = $null
     $t4ReplicaOn = $false
     if ($t4On -and $null -ne $sizing.t4) {
         # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
@@ -419,6 +420,12 @@ function Get-DemoCostEstimate {
             if ($t4Capped -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Planned')) {
                 $t4Uncapped = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $false -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
                 $t4WorstCaseWithout = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Uncapped.Hours, 2)
+            }
+            # With a safety stop in place, whatever this estimate counts (the re-review of 0590bbe): the month after an Owner's
+            # grant-safety-stop.ps1, which T5's ceiling exception names.
+            $t4WorstCaseCapped = if ($t4Capped) { $t4WorstCase } else {
+                $t4CappedHours = (Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $true -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])).Hours
+                [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4CappedHours, 2)
             }
         }
         # T4's read replica (2026-11-13, ADR 0025): created for each session and deleted after it, so everything it bills is
@@ -685,6 +692,7 @@ function Get-DemoCostEstimate {
     if ($t4On) {
         $evidence['t4FixedMonthly'] = $t4FixedMonthly
         $evidence['t4AutoRestartWorstCaseMonthly'] = $t4WorstCase
+        $evidence['t4AutoRestartWithSafetyStopMonthly'] = $t4WorstCaseCapped
         $evidence['t4RestartAssumption'] = if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } else { 'RestOfMonth' }
         $evidence['t4RestartHours'] = if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null }
         $evidence['t4RestartMissing'] = if ($null -eq $T4RestartCoverage) { 'NotChecked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Missing') }
@@ -906,15 +914,14 @@ function Get-DemoCostEstimate {
                 # After an Owner's grant: the container for the running hours only, and T4's restart about a day each, since
                 # the nightly safety stop then holds its role.
                 $grantMonth = $sessionMonth
-                if ($t4On -and $null -ne $t4ComputeItem -and $null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
-                    $capped = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $true -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
-                    $grantMonth = [System.Math]::Round($sessionMonth - [double]$t4WorstCase + [double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $capped.Hours, 2)
+                if ($t4On -and $null -ne $t4WorstCase -and $null -ne $t4WorstCaseCapped) {
+                    $grantMonth = [System.Math]::Round($sessionMonth - [double]$t4WorstCase + [double]$t4WorstCaseCapped, 2)
                 }
                 $evidence['t5CeilingException'] = [ordered]@{ sessionMonthlyUsd = $sessionMonth; t5AlwaysOnExtraMonthly = [double]$t5AlwaysOnExtra; grantMonthlyUsd = $grantMonth }
-                $exceptionText = [string]::Format($exceptionCulture, 'This is a Warning, not a Fail: T5''s container is priced all month, {0:N2} USD more than for the running hours only, because no role can delete it automatically after a session (the session control has no role, and the nightly safety stop''s role can''t delete it), so only ./scripts/stop-demo.ps1 does; with it deleted after each session, the month would be {1:N2} USD, within the ceiling.', [double]$t5AlwaysOnExtra, $sessionMonth)
-                $monthlyMessage += ' ' + $exceptionText
-                $evidence['ceilingWarning'] = [string]::Format($exceptionCulture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $exceptionText)
-                $monthlyRemediation = [string]::Format($exceptionCulture, 'deploy.ps1 and start-demo.ps1 go on. To clear it, any one of these: an Owner of the subscription runs, once: {0}, which gives the session control and the nightly safety stop their roles, so the worst case falls to about {1:N2} USD; or raise monthlyCeilingUsd to at least {2:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure); or set t5Enabled to false, which leaves T5 out. Until then, run ./scripts/stop-demo.ps1 after each session: it deletes T5''s container.', (Get-DemoSafetyStopCommand), $grantMonth, [System.Math]::Ceiling($worstMonth))
+                $exception = Get-DemoT5CeilingExceptionText -ExtraMonthly ([double]$t5AlwaysOnExtra) -SessionMonthly $sessionMonth -GrantMonthly $grantMonth -WorstMonthly $worstMonth
+                $monthlyMessage += ' ' + $exception.Text
+                $evidence['ceilingWarning'] = [string]::Format($exceptionCulture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $exception.Text)
+                $monthlyRemediation = $exception.Fix
             }
         }
         # T4's read replica (ADR 0025): its share of the session, which start-demo.ps1 -SkipT4Replica leaves out.

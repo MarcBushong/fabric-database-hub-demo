@@ -315,6 +315,8 @@ Describe 'Get-DemoCostEstimate' {
             $exception.t5AlwaysOnExtraMonthly | Should -Be $extra
             # After an Owner's grant: T4's restart about a day each (96 hours) instead of the rest of the month (720), at 0.18 an hour.
             [System.Math]::Abs($exception.grantMonthlyUsd - ($exception.sessionMonthlyUsd - 0.18 * 720 + 0.18 * 96)) | Should -BeLessOrEqual 0.011
+            $monthly.evidence.t4AutoRestartWorstCaseMonthly | Should -Be 129.6
+            $monthly.evidence.t4AutoRestartWithSafetyStopMonthly | Should -Be 17.28 -Because 'DEPLOY.T5.LIFECYCLE names the same month after a grant'
             $monthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of {2} USD\.' -f (& $money $alwaysMonth), (& $money ($alwaysMonth - $ceiling)), (& $money $ceiling))
             $monthly.message | Should -Match 'its container exists only during a session, but only \./scripts/stop-demo\.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t'
             $monthly.message | Should -Match ('This is a Warning, not a Fail: T5''s container is priced all month, {0} USD more than for the running hours only, because no role can delete it automatically after a session \(the session control has no role, and the nightly safety stop''s role can''t delete it\), so only \./scripts/stop-demo\.ps1 does; with it deleted after each session, the month would be {1} USD, within the ceiling\.$' -f (& $money $extra), (& $money $exception.sessionMonthlyUsd))

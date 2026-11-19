@@ -784,6 +784,43 @@ function Get-DemoT5CostLifecycle {
     return (& $reply $script:T5LifecycleSession 'Unread')
 }
 
+function Get-DemoT5CeilingExceptionText {
+    <#
+    .SYNOPSIS
+    Why a month over monthlyCeilingUsd is a Warning and never a Fail when it's over only because T5's container is priced
+    all month while nothing automatic deletes it after a session (2026-11-19, the re-review of 0590bbe; ADR 0016's
+    exceptions): Text, the sentence that says so, and Fix, the three ways to clear it. PREFLIGHT.COST.MONTHLY (preflight and
+    start-demo.ps1) and DEPLOY.T5.LIFECYCLE's worst case after the run say the same. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        # What pricing the container all month adds, in USD a month.
+        [Parameter(Mandatory)]
+        [double] $ExtraMonthly,
+
+        # The month with the container for the running hours only: within the ceiling.
+        [Parameter(Mandatory)]
+        [double] $SessionMonthly,
+
+        # The month after an Owner's grant-safety-stop.ps1: the container for the running hours only, and T4's restart
+        # about a day each.
+        [Parameter(Mandatory)]
+        [double] $GrantMonthly,
+
+        # The month's worst case, over the ceiling.
+        [Parameter(Mandatory)]
+        [double] $WorstMonthly,
+
+        [string] $ConfigPath = ''
+    )
+
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $text = [string]::Format($culture, 'This is a Warning, not a Fail: T5''s container is priced all month, {0:N2} USD more than for the running hours only, because no role can delete it automatically after a session (the session control has no role, and the nightly safety stop''s role can''t delete it), so only ./scripts/stop-demo.ps1 does; with it deleted after each session, the month would be {1:N2} USD, within the ceiling.', $ExtraMonthly, $SessionMonthly)
+    $fix = [string]::Format($culture, 'deploy.ps1 and start-demo.ps1 go on. To clear it, any one of these: an Owner of the subscription runs, once: {0}, which gives the session control and the nightly safety stop their roles, so the worst case falls to about {1:N2} USD; or raise monthlyCeilingUsd to at least {2:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure); or set t5Enabled to false, which leaves T5 out. Until then, run ./scripts/stop-demo.ps1 after each session: it deletes T5''s container.', (Get-DemoSafetyStopCommand -ConfigPath $ConfigPath), $GrantMonthly, [System.Math]::Ceiling($WorstMonthly))
+    return [pscustomobject]@{ Text = $text; Fix = $fix }
+}
+
 function Get-DemoT5ContainerBody {
     <#
     .SYNOPSIS
