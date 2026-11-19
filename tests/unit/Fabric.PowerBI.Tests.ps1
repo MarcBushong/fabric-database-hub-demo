@@ -99,7 +99,7 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         $target = [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Target.tmdl'))
         $target | Should -Match '\{ "T5", "T5 . Azure Cosmos DB", "T5", "Cosmos DB target", "Azure Cosmos DB for NoSQL account", 6 \},'
         $target | Should -Match '\{ "repo", "Repository", "Repo", "Platform scope", "Static checks", 12 \}'
-        [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Analysis.tmdl')) | Should -Match '\{ "cosmosdb", "Azure Cosmos DB \(Azure Monitor\)", "Cosmos DB", "Per bin", 18 \}'
+        [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Analysis.tmdl')) | Should -Match '\{ "cosmosdb", "Azure Cosmos DB \(Azure Monitor\)", "Cosmos DB", "Per bin", 19 \}'
         # The notebook's own names for T5's rows: analysis, target, and the metrics it writes.
         $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"

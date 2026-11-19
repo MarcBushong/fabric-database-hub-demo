@@ -2204,7 +2204,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($calls, 't3 scale check') | Should -BeGreaterOrEqual 0
         [array]::IndexOf($calls, 'preflight') | Should -BeGreaterThan ([array]::IndexOf($calls, 't3 scale check'))
         $calls | Should -Contain 'template disk=golden'
-        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,T5,Activity,Monitoring,Telemetry'
         @($results | Where-Object { $_.checkId -eq 'DEPLOY.T3.SCALE' }).Count | Should -Be 1
 
         # T3 at the profile's maximum changes nothing: the run continues as recorded.

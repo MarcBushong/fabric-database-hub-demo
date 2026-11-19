@@ -209,7 +209,7 @@ Describe 'Resolve-DemoT5FreeTier' {
         InModuleScope DbHubDemo { Test-DemoT5FreeTierRefusal -Text 'ERROR: (BadRequest) Free tier has already been applied to another Azure Cosmos DB account in this subscription.' } | Should -BeTrue
         InModuleScope DbHubDemo { Test-DemoT5FreeTierRefusal -Text 'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3.' } | Should -BeFalse
         # The live refusal's text (2026-11-18), as az prints the nested deployment error.
-        $live = 'ERROR: {"status":"Failed","error":{"details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 936fc553-6833-40bb-98a8-379a4bfc7b8e, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}}'
+        $live = 'ERROR: {"status":"Failed","error":{"details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}}'
         InModuleScope DbHubDemo -Parameters @{ Text = $live } { Test-DemoT5FreeTierRefusal -Text $Text } | Should -BeTrue
         InModuleScope DbHubDemo -Parameters @{ Text = $live } { Get-DemoT5FreeTierRefusalReason -Text $Text } | Should -Match '"Free tier is not supported for Internal subscriptions"'
         InModuleScope DbHubDemo { Get-DemoT5FreeTierRefusalReason -Text 'ERROR: (BadRequest) Free tier has already been applied.' } | Should -Match 'taken'

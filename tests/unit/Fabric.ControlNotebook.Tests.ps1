@@ -913,7 +913,7 @@ print(json.dumps(out))
         $report.error | Should -BeNullOrEmpty
         $report.leaked | Should -BeFalse
         $report.printed | Should -Match ([regex]::Escape('The targets: T1 sqlvm01 | T2 arcsql01 | T3 azuresql01-abc123/ContosoCare | T4 pgflex01-abc123 | T4''s read replica pgreplica01-abc123 | T5 cosmos01-abc123'))
-        $report.printed | Should -Match 'Estate: View Microsoft SQL, then View PostgreSQL, then View Azure Cosmos DB \| Performance: the Microsoft SQL and PostgreSQL dashboards, and Azure Cosmos DB with T5''s account selected'
+        $report.printed | Should -Match 'Estate: View Microsoft SQL, then View PostgreSQL, then View Azure Cosmos DB \| Performance: the real-time dashboards for Microsoft SQL and PostgreSQL, and Azure Cosmos DB with T5''s account selected \| Optimization: '
         # The user (2026-11-18): every Run all leaves T5 back at its baseline, with no ru-storm still running, at its end.
         $report.printed | Should -Match 'T5: its last ru-storm ends, and T5 is back at its baseline with no throttled requests \(429s\), by 15:22, before the session ends at 15:30; every Run all repeats its storms from the first\.'
         $report.printed | Should -Match 'T5 is Azure Cosmos DB: show it in Estate \(View: Azure Cosmos DB, cosmos01-abc123\) and on Performance: Peak Norm RU % at 100% and Throttled Requests \(429s\) during each ru-storm'
