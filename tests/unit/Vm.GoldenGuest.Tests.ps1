@@ -253,3 +253,32 @@ Describe 'The capture marker (review, 2026-11-04)' {
         }
     }
 }
+
+Describe 'Wait-GoldenGuest and a broken PowerShell Direct channel (issue #65)' {
+    BeforeAll {
+        if (-not (Get-Command -Name 'Get-VM' -ErrorAction SilentlyContinue)) {
+            # A stand-in with the parameter the code uses, so Pester can mock it where the Hyper-V module isn't installed.
+            New-Item -Path 'function:global:Get-VM' -Value ([scriptblock]::Create('[CmdletBinding()] param([string] $Name)')) | Out-Null
+        }
+    }
+
+    BeforeEach {
+        $script:uptime = [timespan]::FromMinutes(42)
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = 'Running'; Heartbeat = 'OkApplicationsUnknown'; Uptime = $script:uptime } }
+        Mock -CommandName Get-GoldenSecretPath -MockWith { Join-Path -Path $TestDrive -ChildPath 'guest-administrator.bin' }
+        Mock -CommandName Get-GoldenGuestCredential -MockWith { $script:credential }
+        Mock -CommandName Invoke-Command -MockWith { throw 'The background process reported an error with the following message: "The Hyper-V socket target process has ended.".' }
+        # Real time passes, a little, so the wait's own clock moves.
+        Mock -CommandName Start-Sleep -MockWith { [System.Threading.Thread]::Sleep(100) }
+    }
+
+    It 'ends the wait with the channel''s error once it stays broken for BrokenChannelSeconds, so the relay can restart the guest' {
+        { Wait-GoldenGuest -UserName 'Administrator' -TimeoutSeconds 60 -BrokenChannelSeconds 1 } | Should -Throw '*stays broken while it runs: *Hyper-V socket target process has ended*'
+    }
+
+    It 'waits out its timeout as before without BrokenChannelSeconds, or while the guest has just started' {
+        { Wait-GoldenGuest -UserName 'Administrator' -TimeoutSeconds 1 } | Should -Throw '*did not answer over PowerShell Direct within 1 seconds*'
+        $script:uptime = [timespan]::FromMinutes(2)
+        { Wait-GoldenGuest -UserName 'Administrator' -TimeoutSeconds 2 -BrokenChannelSeconds 1 } | Should -Throw '*did not answer over PowerShell Direct within 2 seconds*'
+    }
+}

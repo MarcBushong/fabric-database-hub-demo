@@ -1556,6 +1556,11 @@ function Get-DemoDeploymentOutcome {
     if ($hostNote) {
         $notes.Add($hostNote)
     }
+    # The T2 guest, restarted in this run because PowerShell Direct into it broke (issue #65).
+    $guestNote = Get-DemoGuestRestartNote -Result $all
+    if ($guestNote) {
+        $notes.Add($guestNote)
+    }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')
     }

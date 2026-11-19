@@ -106,6 +106,8 @@ $ProgressPreference = 'SilentlyContinue'
 
 $script:JwtPattern = 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 $script:Notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
+# The last PowerShell Direct failure Test-GoldenGuestSession saw (Wait-GoldenGuest -BrokenChannelSeconds; issue #65).
+$script:GoldenSessionError = ''
 
 function Add-GoldenNote {
     param([string] $Text)
@@ -384,20 +386,39 @@ function Test-GoldenGuestSession {
     param([pscredential] $Credential)
     try {
         $name = Invoke-Command -VMName $GuestName -Credential $Credential -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop
+        $script:GoldenSessionError = ''
         return [bool]$name
     }
     catch {
+        $script:GoldenSessionError = ('{0} ({1})' -f [string]$_.Exception.Message, [string]$_.FullyQualifiedErrorId)
         return $false
     }
 }
 
+function Test-GoldenChannelBroken {
+    # The last PowerShell Direct failure was a broken channel (issue #65) while the guest runs with a healthy heartbeat
+    # for at least 5 minutes, so it isn't starting.
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    if (-not $vm -or [string]$vm.State -ne 'Running' -or [string]$vm.Heartbeat -notlike 'Ok*') {
+        return $false
+    }
+    $uptime = $vm.PSObject.Properties['Uptime']
+    if ($null -eq $uptime -or $null -eq $uptime.Value -or ([timespan]$uptime.Value).TotalMinutes -lt 5) {
+        return $false
+    }
+    return ([string]$script:GoldenSessionError -match '(?i)Hyper-V socket target process has ended|PSSessionStateBroken')
+}
+
 function Wait-GoldenGuest {
     # Waits for PowerShell Direct and returns the credential that signed in. A pending password left by a
-    # rotation that stopped midway is tried too, and promoted when it's the one that works.
-    param([string] $UserName, [int] $TimeoutSeconds = 900)
+    # rotation that stopped midway is tried too, and promoted when it's the one that works. With -BrokenChannelSeconds,
+    # a channel that stays broken that long while the guest runs (Test-GoldenChannelBroken) ends the wait at once with
+    # its error, so the caller can restart the guest instead of waiting for the whole timeout (issue #65).
+    param([string] $UserName, [int] $TimeoutSeconds = 900, [int] $BrokenChannelSeconds = 0)
     $secretPath = Get-GoldenSecretPath
     $pendingPath = $secretPath + '.pending'
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $brokenSince = -1.0
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         $main = Get-GoldenGuestCredential -UserName $UserName
         if (Test-GoldenGuestSession -Credential $main) {
@@ -409,6 +430,19 @@ function Wait-GoldenGuest {
                 Move-Item -LiteralPath $pendingPath -Destination $secretPath -Force
                 Add-GoldenNote 'A pending guest password from an earlier rotation was the one that worked, so it was promoted.'
                 return [pscustomobject]@{ Credential = $pending; Seconds = [int]$watch.Elapsed.TotalSeconds }
+            }
+        }
+        if ($BrokenChannelSeconds -gt 0) {
+            if (Test-GoldenChannelBroken) {
+                if ($brokenSince -lt 0) {
+                    $brokenSince = $watch.Elapsed.TotalSeconds
+                }
+                elseif ($watch.Elapsed.TotalSeconds - $brokenSince -ge $BrokenChannelSeconds) {
+                    throw ('PowerShell Direct into {0} stays broken while it runs: {1}' -f $GuestName, $script:GoldenSessionError)
+                }
+            }
+            else {
+                $brokenSince = -1.0
             }
         }
         Start-Sleep -Seconds 10
