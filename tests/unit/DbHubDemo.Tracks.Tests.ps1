@@ -1865,6 +1865,10 @@ Describe 'Invoke-DemoParallelDeployment' {
         # exists unless a test says not.
         $script:hostMissing = $null
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2HostMissingResult -MockWith { $script:calls.Add('host check'); $script:hostMissing }
+        # A resume's check of T3's maximum vCores (2026-11-18) has its own tests (DbHubDemo.OneClick.Tests.ps1): here T3 has
+        # the profile's unless a test says not.
+        $script:t3Scale = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT3ScaleResult -MockWith { $script:calls.Add('t3 scale check'); $script:t3Scale }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -2185,6 +2189,28 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'host check'
+        $script:calls | Should -Not -Contain 'preflight'
+    }
+
+    It 'starts from preflight, so the template scales T3, when T3''s database doesn''t have the profile''s maximum vCores, and says so (2026-11-18)' {
+        # lowest-cost's T3 went from 1 to 2 maximum vCores (the owner's decision: Database Agents doesn't support one-vCore
+        # serverless databases); a resume past the template would skip the deployment that scales it.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state }
+        $script:t3Scale = New-TestResult 'DEPLOY.T3.SCALE'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 't3 scale check') | Should -BeGreaterOrEqual 0
+        [array]::IndexOf($calls, 'preflight') | Should -BeGreaterThan ([array]::IndexOf($calls, 't3 scale check'))
+        $calls | Should -Contain 'template disk=golden'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T3.SCALE' }).Count | Should -Be 1
+
+        # T3 at the profile's maximum changes nothing: the run continues as recorded.
+        $script:calls.Clear()
+        $script:t3Scale = $null
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
+        $script:calls | Should -Contain 't3 scale check'
         $script:calls | Should -Not -Contain 'preflight'
     }
 

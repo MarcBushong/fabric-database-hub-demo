@@ -585,7 +585,7 @@ Describe 'Test-DemoT3' {
             publicNetworkAccess = 'Disabled'; minimalTlsVersion = '1.2'
             administrators = @{ administratorType = 'ActiveDirectory'; azureAdOnlyAuthentication = $true; principalType = 'Group'; sid = '77777777-7777-7777-7777-777777777777'; login = 'sg-test' }
         }
-        $script:database = @{ name = 'ContosoCare'; status = 'Paused'; currentSku = @{ name = 'GP_S_Gen5'; tier = 'GeneralPurpose'; capacity = 1 }; autoPauseDelay = 15; minCapacity = 0.5; maxSizeBytes = 34359738368; useFreeLimit = $true; freeLimitExhaustionBehavior = 'BillOverUsage' }
+        $script:database = @{ name = 'ContosoCare'; status = 'Paused'; currentSku = @{ name = 'GP_S_Gen5'; tier = 'GeneralPurpose'; capacity = 2 }; autoPauseDelay = 15; minCapacity = 0.5; maxSizeBytes = 34359738368; useFreeLimit = $true; freeLimitExhaustionBehavior = 'BillOverUsage' }
         $script:firewallRules = @()
         $script:vnetRules = @()
         $script:endpoint = @{ name = 'pe-dbhub-demo-azuresql01'; provisioningState = 'Succeeded'; privateLinkServiceConnections = @(@{ privateLinkServiceId = $script:serverId; privateLinkServiceConnectionState = @{ status = 'Approved' } }) }
@@ -606,13 +606,17 @@ Describe 'Test-DemoT3' {
             }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith {
-            [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = 'ok'; Data = @{}; Rows = @(@{ performance_monitoring = 'true'; seed_status = 'Completed'; query_store_state = 'READ_WRITE' }); Result = [pscustomobject]@{ remediation = '' } }
+            [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = 'ok'; Data = @{}; Rows = @(@{ performance_monitoring = 'true'; seed_status = 'Completed'; query_store_state = 'READ_WRITE'; force_last_good_plan_desired = 'DEFAULT'; force_last_good_plan_actual = 'ON' }); Result = [pscustomobject]@{ remediation = '' } }
+        }
+        # T3.AGENT (2026-11-18) reads the signed-in account's permissions on the database (DbHubDemo.T3Agent.Tests.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{"value":[{"actions":["*"],"notActions":["Microsoft.Authorization/*/Write"]}]}'; StdErr = ''; StatusCode = 200 }
         }
     }
 
     It 'passes every check for a healthy private-mode T3 on the free offer' {
         $results = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true
-        @($results.checkId) | Should -Be @('T3.EXISTS', 'T3.ENTRAONLY', 'T3.NETWORK', 'T3.DATABASE', 'T3.FREEOFFER', 'T3.PROPERTY')
+        @($results.checkId) | Should -Be @('T3.EXISTS', 'T3.ENTRAONLY', 'T3.NETWORK', 'T3.DATABASE', 'T3.FREEOFFER', 'T3.PROPERTY', 'T3.AUTOTUNING', 'T3.AGENT')
         $results | Where-Object { $_.status -ne 'Pass' } | Should -BeNullOrEmpty
         ($results | Where-Object checkId -eq 'T3.NETWORK').evidence.privateEndpointConnection | Should -Be 'Approved'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -Times 1 -Exactly -ParameterFilter { $Name -eq 'Status' -and $CheckId -eq 'T3.PROPERTY' }
@@ -671,6 +675,13 @@ Describe 'Test-DemoT3' {
         $database = Test-DemoT3 -Config $config -NetworkMode private -SkipSqlCheck | Where-Object checkId -eq 'T3.DATABASE'
         $database.status | Should -Be 'Pass'
         $database.message | Should -Match 'auto-pause after 60 minutes'
+    }
+
+    It 'warns about a lowest-cost T3 still at 1 maximum vCore, the size before 2026-11-18, until deploy.ps1 scales it' {
+        $script:database.currentSku.capacity = 1
+        $database = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -SkipSqlCheck | Where-Object checkId -eq 'T3.DATABASE'
+        $database.status | Should -Be 'Warning'
+        $database.message | Should -Match '1 maximum vCores, not 2'
     }
 
     It 'fails the property check when the property is missing, and warns when T1 can''t run the query' {

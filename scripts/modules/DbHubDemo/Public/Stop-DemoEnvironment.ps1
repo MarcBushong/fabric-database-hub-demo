@@ -19,7 +19,10 @@ function Stop-DemoEnvironment {
       doesn't finish in time is a Warning: the host's deallocation shuts the guest down through its automatic stop
       action, ShutDown); then deallocates the T2 VM and sqlvm01. T3 isn't
       touched: with its profile off (the T3 profile is a file on T1, so this doesn't wake it), serverless
-      auto-pause stops its compute t3AutoPauseMinutes after the last session. T4, the PostgreSQL flexible
+      auto-pause stops its compute t3AutoPauseMinutes after the last session. Only when T3's profile went off here,
+      during a session, is T3's FORCE_LAST_GOOD_PLAN read, while T3 is still Online, and set back to Default when a
+      Database Agent beat that held it off stopped with sqlvm01 before putting it back (STOP.T3.AUTOTUNING,
+      Invoke-DemoT3AutoTuningCheck -Restore; 2026-11-18). T4, the PostgreSQL flexible
       server (Phase 24, ADR 0019), gets its profile off and is stopped (STOP.T4.STOP; Servers - Stop). A
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
@@ -270,6 +273,14 @@ function Stop-DemoEnvironment {
     }
     foreach ($record in $notOff) {
         $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds -DeallocationFailed:(-not [bool]$deallocated[[string]$record.VmName])))
+    }
+    if (-not $ParkT2 -and 'T3' -in $offTargets) {
+        # The Database Agent beat (2026-11-18) holds FORCE_LAST_GOOD_PLAN off until its response; a run that stopped with
+        # sqlvm01 before any of its own ways back leaves it off, so it's put back here while T3 is still awake.
+        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 (Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])) -CheckId 'STOP.T3.AUTOTUNING' -Restore -Confirm:$false
+        if ($null -ne $tuning) {
+            $results.Add($tuning)
+        }
     }
     if (-not $ParkT2 -and $t4On -and -not $t4Missing) {
         if ($replicaDeleting) {

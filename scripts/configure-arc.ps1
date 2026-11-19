@@ -17,9 +17,11 @@ context. Then, through managed Run Commands on the T2 host (Invoke-DemoArcConfig
    host's PowerShell as an argument, where process auditing and endpoint protection can record it, and the
    sweep right after onboarding removes what it left (ADR 0009). An Arc machine left over from an earlier
    guest build is deleted first, its SQL Server instances before it, so a rebuild never leaves duplicates.
-3. Converges the Azure extension for SQL Server, the PAYG license type, the sqlServerInstances resource, and
-   monitoring. In PaygWizard mode the host then asks for the documented setup-wizard step (health.json has
-   the instructions); run this script again after the wizard to finish the configuration.
+3. Converges the Azure extension for SQL Server, the PAYG license type, the sqlServerInstances resource,
+   monitoring, and migration assessment (2026-11-18: turned on, with a run started until the first assessment is
+   uploaded, for Database Hub's Optimization; free for every edition). In PaygWizard mode the host then asks for the
+   documented setup-wizard step (health.json has the instructions); run this script again after the wizard to finish
+   the configuration.
 4. Reports T2.ARC.CONNECTED, T2.ARC.NODUPLICATES, and T2.ARC.DISCONNECTEDDAYS.
 Every step is re-runnable. Results go to the console and, as JSON lines, to -OutputPath.
 

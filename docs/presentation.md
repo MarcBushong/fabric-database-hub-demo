@@ -2,7 +2,7 @@
 
 How to present the demo, and to whom. Four surfaces show the same SQL estate: two live views, a history report, and a Fabric app. This page says what each one is, when to use it, and what a viewer needs. The scripts are in the [demo walkthrough](demo-walkthrough.md).
 
-> **Preview disclosure:** Database Hub, its telemetry endpoint, and the Database Agent are previews ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). The live views can change with them; the history report reads only what the demo saved.
+> **Preview disclosure:** Database Hub is generally available since 2026-11-17, with its real-time dashboards for Microsoft SQL, PostgreSQL, and Azure Cosmos DB ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)); its Copilot, Database Agents, and alerts are previews, and Learn still labels its SQL telemetry endpoint a preview ([limitations](limitations.md#preview-disclosures)). The live views can change with them; the history report reads only what the demo saved.
 
 **Status (2026-10-22, Phases 18 and 19):** Database Hub and the Real-Time Dashboard are ready: the dashboard is imported, read back, and every tile gets data ([its guide](../fabric/realtime/README.md#live-results-2026-10-21)). The Power BI report and its semantic model deploy by script with `configure-powerbi.ps1` ([the history report's guide](../fabric/powerbi/README.md)). The Fabric app is a separate item: a Fabric Apps (preview) item built with the Rayfin SDK and CLI (Phase 19b).
 
@@ -12,7 +12,7 @@ How to present the demo, and to whom. Four surfaces show the same SQL estate: tw
 
 | Surface | What it is | Needs |
 |---|---|---|
-| [Database Hub](https://powerbi.com/workloads/fdh/databaseHub) | The live view: a Fabric portal page, not a workspace item | A Fabric Free license, no capacity, Azure read access |
+| [Database Hub](https://powerbi.com/workloads/fdh/databaseHub) | The live view: a Fabric portal page, not a workspace item, with its own real-time dashboards for Microsoft SQL, PostgreSQL (T4), and Azure Cosmos DB on **Performance**, and Copilot and Database Agents (previews) | A Fabric Free license, no capacity, Azure read access; Copilot needs the workspace's capacity |
 | [Real-Time Dashboard](../fabric/realtime/README.md) | The live view, as code, in the workspace | Capacity; viewers need Azure read access to the targets through the telemetry endpoint |
 | [Power BI report](../fabric/powerbi/README.md) | History over lakehouse snapshots: `RPT_DatabaseHub_History`, four pages (Phase 19) | Viewers on F16 need Pro or PPU |
 | [Fabric app](../fabric/app/README.md) | History again, as a custom app: the Insights app `APP_DatabaseHub_Insights`, a Fabric Apps (preview) item built with the Rayfin SDK and CLI over the report's semantic model, `SM_DatabaseHub_History`, with its own visuals, insight cards, DAX and CSV export on every visual, and ready-made Database Agent prompts (Phase 19b) | Access to the app item; Read and Build on the history model |
@@ -41,7 +41,7 @@ The rule for Power BI content, from Microsoft Learn: "On F SKUs smaller than F64
 | Surface | License to view | Azure access | Fabric access | Capacity |
 |---|---|---|---|---|
 | Database Hub | Fabric Free | Reader on the subscription; for T2's performance data, Reader-only users also need the Arc telemetry role on the demo resource group (P8) | The tenant setting (P4), and My workspace on a capacity outside North Europe and West Europe | None |
-| Real-Time Dashboard | Fabric Free: it isn't Power BI content | The same as Database Hub: the dashboard queries the telemetry endpoint as the viewer (pass-through) | A workspace role, or the dashboard shared with them | The workspace's Fabric capacity |
+| Real-Time Dashboard | Fabric Free: it isn't Power BI content | The same as Database Hub: the dashboard queries the telemetry endpoint as the viewer (pass-through) | A workspace role, or the dashboard shared with them: `deploy.ps1` gives the presenters in `presenterObjectIds` the Viewer role on the demo workspace (`FABRIC.PRESENTER.VIEWER`, since 2026-11-18) | The workspace's Fabric capacity |
 | Power BI report (Phase 19) | Pro, PPU, or an individual trial below F64; Fabric Free and a viewer role on F64 or larger | None: it reads the lakehouse | A workspace role, or the report shared with them | The workspace's Fabric capacity |
 | Fabric app (Phase 19b) | Learn doesn't list a Fabric App item as Power BI content, but its data comes from the semantic model as the viewer; plan for the report's rule until that's verified, TODO(verify) | None: it reads the lakehouse through the model | Access to the app item; Read and Build on `SM_DatabaseHub_History`; the tenant settings Fabric Apps (preview) and Dataset Execute Queries REST API | The workspace's Fabric capacity |
 | A presenter sharing their screen | Their own | Their own | Their own | As for the surface shown |
@@ -52,7 +52,7 @@ The rule for Power BI content, from Microsoft Learn: "On F SKUs smaller than F64
 
 ## Cost
 
-- **Database Hub** is free and needs no capacity ([Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq)).
+- **Database Hub** is free and needs no capacity ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). Copilot, custom alerts, and shared dashboards need a Fabric capacity: the workspace's, which the demo's notebooks and app use too.
 - **The Real-Time Dashboard, the report, the app, and the notebooks** are Fabric items, so they need the workspace's capacity running. The shared capacity runs at the owner's choice, bills while it runs, and is outside the demo's resource group: it isn't in `estimate-cost.ps1`, and it's outside the demo's $375-a-month ceiling ($250 before 2026-11-04; [ADR 0016](adr/0016-cost-profiles.md)). Never pause or resize it for a demo; ask the owner.
 - **Licenses** for viewers below F64 (Pro, PPU, or a trial) are per-user costs outside Azure. This page quotes no prices.
 - **The Fabric app** (the Insights app, Phase 19b) runs as Fabric Apps services that consume the workspace capacity's units ([Fabric Apps overview](https://learn.microsoft.com/fabric/apps/overview)); it has no database, storage, or functions, so it uses capacity only when a deployment deploys and checks it (every `deploy.ps1` does, since 2026-11-05) and while someone loads it and its queries run. Like the rest of the capacity, that's outside the demo's ceiling and in no estimate.

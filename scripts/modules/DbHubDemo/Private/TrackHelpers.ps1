@@ -1578,7 +1578,7 @@ function Invoke-DemoDeploymentTrack {
                     else {
                         $arcArguments['WaitForHostMinutes'] = 0
                     }
-                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, and monitoring.'
+                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, monitoring, and migration assessment.'
                     $plainKey = [string]$env:DBHUB_SQL_PRODUCT_KEY
                     $secureKey = $null
                     if ($plainKey) {
@@ -1625,7 +1625,7 @@ function Invoke-DemoDeploymentTrack {
                         }
                         break
                     }
-                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION' })
+                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION', 'T2.ARC.MIGRATIONASSESSMENT' })
                     # The guest is built, set up, onboarded, and monitored: its bootstrap generation's record goes (review follow-up).
                     & $recordT2Build ''
                     if (-not $golden) {

@@ -18,6 +18,8 @@ function Get-DemoArcCheck {
       cores, and the billable-core estimate as evidence.
     - Monitoring (T2.ARC.MONITORING): properties.monitoring.enabled is true and the documented
       prerequisites hold; Not supported in Developer mode.
+    - MigrationAssessment (T2.ARC.MIGRATIONASSESSMENT, 2026-11-18): migration assessment is on and an assessment was
+      uploaded, with each Azure SQL target type's readiness; a Warning while none was uploaded yet, Fail when it's off.
     - DisconnectedDays (T2.ARC.DISCONNECTEDDAYS): Warning at 21 days disconnected, a stronger Warning at 28,
       and Fail after 30, when pay-as-you-go lapses (ADR 0006).
 
@@ -43,8 +45,8 @@ function Get-DemoArcCheck {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('Connected', 'NoDuplicates', 'SqlExtension', 'SqlInstance', 'Monitoring', 'DisconnectedDays')]
-        [string[]] $Check = @('Connected', 'NoDuplicates', 'SqlExtension', 'SqlInstance', 'Monitoring', 'DisconnectedDays'),
+        [ValidateSet('Connected', 'NoDuplicates', 'SqlExtension', 'SqlInstance', 'Monitoring', 'MigrationAssessment', 'DisconnectedDays')]
+        [string[]] $Check = @('Connected', 'NoDuplicates', 'SqlExtension', 'SqlInstance', 'Monitoring', 'MigrationAssessment', 'DisconnectedDays'),
 
         [datetime] $Now = [datetime]::UtcNow
     )
@@ -54,8 +56,9 @@ function Get-DemoArcCheck {
         NoDuplicates     = 'T2.ARC.NODUPLICATES'
         SqlExtension     = 'T2.ARC.SQLEXTENSION'
         SqlInstance      = 'T2.ARC.SQLINSTANCE'
-        Monitoring       = 'T2.ARC.MONITORING'
-        DisconnectedDays = 'T2.ARC.DISCONNECTEDDAYS'
+        Monitoring          = 'T2.ARC.MONITORING'
+        MigrationAssessment = 'T2.ARC.MIGRATIONASSESSMENT'
+        DisconnectedDays    = 'T2.ARC.DISCONNECTEDDAYS'
     }
     try {
         $state = Get-DemoArcState -Config $Config -IncludeHostPowerState:('Connected' -in $Check)
@@ -75,6 +78,7 @@ function Get-DemoArcCheck {
             'SqlExtension' { Test-DemoArcSqlExtension -State $state }
             'SqlInstance' { Test-DemoArcSqlInstance -State $state }
             'Monitoring' { Test-DemoArcMonitoring -State $state }
+            'MigrationAssessment' { Test-DemoArcMigrationAssessment -State $state }
             'DisconnectedDays' { Test-DemoArcDisconnection -State $state -Now $Now }
         }
     }

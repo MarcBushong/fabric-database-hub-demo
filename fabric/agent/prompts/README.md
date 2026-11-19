@@ -4,10 +4,11 @@ Every prompt in the pack, by scenario and surface. The install steps, the safety
 
 ## How to run a demo with the pack
 
-1. **Skills surface only:** start each Copilot CLI or VS Code session with [session-setup.skills](session-setup.skills.md).
-2. **Before:** run the healthy baseline prompts while the `baseline` profile runs.
-3. **Incident:** start one scenario on one target, wait for a few minutes of samples, then run that scenario's prompts on the in-Hub surface first and the skills surface as the fallback.
-4. **Wrap-up:** finish with the incident wrap-up prompts on the same surface.
+1. **Open at Overview:** [overview.in-hub](overview.in-hub.md), Copilot's three starting questions since Database Hub's general availability (2026-11-17): what changed, what to investigate next, and which security findings come first.
+2. **Skills surface only:** start each Copilot CLI or VS Code session with [session-setup.skills](session-setup.skills.md).
+3. **Before:** run the healthy baseline prompts while the `baseline` profile runs.
+4. **Incident:** start one scenario on one target, wait for a few minutes of samples, then run that scenario's prompts on the in-Hub surface first and the skills surface as the fallback.
+5. **Wrap-up:** finish with the incident wrap-up prompts on the same surface.
 
 Every incident prompt works on T1, T2, and T3, because the Database Agent's target coverage isn't documented. Each file says which signals to expect on each target and which data sources apply there.
 
@@ -27,6 +28,7 @@ Replace these before you send a prompt. Nothing else in a prompt needs editing.
 | Prompt file | Scenario | Surface | Targets | Default target | ADR 0013 prompts |
 |---|---|---|---|---|---|
 | [session-setup.skills](session-setup.skills.md) | setup | skills | T1, T2, T3 | | none (session rules) |
+| [overview.in-hub](overview.in-hub.md) | any (Overview) | in-Hub agent | T1, T2, T3 | | estate health summary; target with the most pressure; safest next action |
 | [healthy-baseline.in-hub](healthy-baseline.in-hub.md) | healthy-baseline | in-Hub agent | T1, T2, T3 | | estate health summary; target with the most pressure; baseline |
 | [healthy-baseline.skills](healthy-baseline.skills.md) | healthy-baseline | skills | T1, T2, T3 | | estate health summary; target with the most pressure; baseline |
 | [locking-blocking.in-hub](locking-blocking.in-hub.md) | locking-blocking | in-Hub agent | T1, T2, T3 | T1 | investigate locking; correlate; evidence |

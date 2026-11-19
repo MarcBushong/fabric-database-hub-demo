@@ -366,7 +366,9 @@ function Invoke-DemoParallelDeployment {
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
     builds, and a VM track whose VM doesn't goes back to its Artifacts step, with the steps after it, and says why
-    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); -ProgressPath is the status
+    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); a resume starts from preflight
+    instead when T4's server doesn't exist (DEPLOY.T4.MISSING) or T3's database doesn't have the profile's maximum vCores
+    (DEPLOY.T3.SCALE, 2026-11-18), so the template creates or scales it; -ProgressPath is the status
     page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
@@ -512,6 +514,16 @@ function Invoke-DemoParallelDeployment {
                 $Resume = [switch]::new($false)
             }
             $state = Get-DemoDeploymentState -Config $Config
+        }
+    }
+    # 2026-11-18 (the owner's decision): T3's database at other maximum vCores than the profile sets, as an existing
+    # lowest-cost T3 at 1 vCore: a resume would skip the template that scales it, so this run starts from preflight too.
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $scaleT3 = Get-DemoT3ScaleResult -Config $Config -State $state
+        if ($null -ne $scaleT3) {
+            $results.Add($scaleT3)
+            Write-DemoLog -Message $scaleT3.message
+            $Resume = [switch]::new($false)
         }
     }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
@@ -1237,6 +1249,14 @@ function Invoke-DemoParallelDeployment {
         if ($t1Done -and $current.RunnerSha256) {
             $status = Invoke-DemoWorkloadCommand -Config $Config -Target 'T1' -ArgumentList 'status', '--json' -TimeoutSeconds 300 -Confirm:$false
             $results.Add($status.Result)
+        }
+        if ($t1Done) {
+            # The Database Agent loop's one manual step, once per deployment (2026-11-18): under "Please confirm" on the
+            # status page and in the run's summary, with Database Hub's link and T3's exact database (HUB.AGENT.T3).
+            $agentItem = Get-DemoT3AgentSetupItem -Config $Config -ServerName ('azuresql01-{0}' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Tags') -Name 'deploymentId'))
+            if ($null -ne $agentItem) {
+                $results.Add($agentItem)
+            }
         }
         if ($fabricDone) {
             # The T3 gate's extended property: T1's track read it (T3.PROPERTY); a resumed run reads it from T1 now.

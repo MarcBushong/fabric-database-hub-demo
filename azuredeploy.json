@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9528227165614826831"
+      "templateHash": "14341287179647251852"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -650,7 +650,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "6759720116500439876"
+              "templateHash": "1027808182072343467"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -997,7 +997,7 @@
                 },
                 "t3": {
                   "minVcores": "[json('0.5')]",
-                  "maxVcores": 1,
+                  "maxVcores": 2,
                   "maxSizeGB": 32,
                   "autoPauseMinutes": 15
                 },

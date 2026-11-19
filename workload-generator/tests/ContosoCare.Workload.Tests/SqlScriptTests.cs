@@ -176,6 +176,31 @@ public sealed class SqlScriptTests
     }
 
     [Fact]
+    public void OnlyTheDatabaseAgentBeatTouchesAutomaticTuningAndEveryWayBackPutsItBack()
+    {
+        // 2026-11-18 (ADR 0010): FORCE_LAST_GOOD_PLAN is the one database option a demo script changes. plan-regression's
+        // worker 1 holds it off only after demo.auto_tuning_hold records how it was, and demo.usp_release_auto_tuning_hold
+        // puts that back; the response, the run's end, auto-cleanup, a stale run's recovery, reset, and setup call it.
+        var withAlter = Procedures().Where(p => p.Text.Contains("ALTER DATABASE", StringComparison.OrdinalIgnoreCase)).Select(p => p.Name).Order(StringComparer.Ordinal).ToList();
+        Assert.Equal(["demo.usp_release_auto_tuning_hold", "demo.usp_scenario_plan_regression"], withAlter);
+
+        var regression = ProcedureText("demo.usp_scenario_plan_regression");
+        Assert.True(regression.IndexOf("INSERT INTO demo.auto_tuning_hold", StringComparison.Ordinal) < regression.IndexOf("FORCE_LAST_GOOD_PLAN = OFF", StringComparison.Ordinal), "the hold is recorded before the option goes off");
+        Assert.Equal(1, CountOccurrences(regression, "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = OFF)"));
+        Assert.Equal(2, CountOccurrences(regression, "EXEC demo.usp_release_auto_tuning_hold @run_id = @run_id"));
+        Assert.Contains("EXEC sys.sp_query_store_force_plan", regression, StringComparison.Ordinal);
+
+        var release = ProcedureText("demo.usp_release_auto_tuning_hold");
+        Assert.Contains("SERVERPROPERTY('EngineEdition') AS int) <> 5", release, StringComparison.Ordinal);
+        foreach (var caller in new[] { "demo.usp_recover_stale_runs", "demo.usp_cleanup_scenario", "demo.usp_reset" })
+        {
+            Assert.Contains("EXEC demo.usp_release_auto_tuning_hold", ProcedureText(caller), StringComparison.Ordinal);
+        }
+
+        Assert.EndsWith("EXEC demo.usp_release_auto_tuning_hold @by = N'setup (deploy.ps1)';\nGO", File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql")).Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TheDemoScriptsEmbedInTheRunner()
     {
         var assembly = typeof(Program).Assembly;
@@ -389,7 +414,24 @@ public sealed class SqlScriptTests
 
         public override void Visit(ShutdownStatement node) => Findings.Add($"line {node.StartLine}: SHUTDOWN");
 
-        public override void Visit(AlterDatabaseStatement node) => Findings.Add($"line {node.StartLine}: ALTER DATABASE");
+        public override void Visit(AlterDatabaseStatement node)
+        {
+            // The one database option a demo script may change (2026-11-18, ADR 0010's Database Agent beat): ContosoCare's own
+            // FORCE_LAST_GOOD_PLAN, on CURRENT, which plan-regression holds off and demo.usp_release_auto_tuning_hold puts back.
+            if (IsForceLastGoodPlanOnCurrent(node))
+            {
+                return;
+            }
+
+            Findings.Add($"line {node.StartLine}: ALTER DATABASE");
+        }
+
+        internal static bool IsForceLastGoodPlanOnCurrent(AlterDatabaseStatement node) =>
+            node is AlterDatabaseSetStatement { UseCurrent: true } set
+            && set.Options.Count == 1
+            && set.Options[0] is AutomaticTuningDatabaseOption tuning
+            && tuning.Options.Count == 1
+            && tuning.Options[0] is AutomaticTuningForceLastGoodPlanOption;
 
         public override void Visit(CreateDatabaseStatement node) => Findings.Add($"line {node.StartLine}: CREATE DATABASE");
 
