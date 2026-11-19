@@ -3273,8 +3273,10 @@ function Get-DbHubT5LastStormEnd {
     session's status (t5.endUtc) and the notebook's guide. The showcase's profile ends at its minutes from when it's set,
     or 2 minutes before its NotAfterUtc when that's earlier (the runner's end), and Get-DbHubT5LastStormMinute applies the
     runner's rule to it, less StartMinutes for its Run Command to set the profile on sqlvm01, so a ru-storm that only fits
-    when the profile is set at once isn't counted. Nothing is cut: T5's baseline runs on until the session ends. Returns
-    $null for an activity it doesn't apply to (another target, off, the baseline, or an incident) or when no ru-storm runs.
+    when the profile is set at once isn't counted. The profile's minutes count from when it's set, at most StartMinutes
+    after now, so the time is that much later too (review of ab91ee5), and T5 is back at its baseline by then. Nothing is
+    cut: T5's baseline runs on until the session ends. Returns $null for an activity it doesn't apply to (another target,
+    off, the baseline, or an incident) or when no ru-storm runs.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -3307,7 +3309,7 @@ function Get-DbHubT5LastStormEnd {
     if ($minute -le 0) {
         return $null
     }
-    return $NowUtc.AddMinutes($minute)
+    return $NowUtc.AddMinutes($StartMinutes + $minute)
 }
 
 function Get-DbHubLeftRunning {

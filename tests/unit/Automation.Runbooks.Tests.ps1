@@ -1624,12 +1624,14 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $t5 = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
         # The profile ends at 16:30, the runner's 2 minutes before --not-after: 86 minutes from 15:04, less 2 for its Run Command,
         # 84, so the third cycle's second ru-storm (minutes 78 to 86, and 2 of recovery) doesn't run, and T5 is back at its
-        # baseline at minute 75, after the first one.
-        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $t5 -NowUtc $now | Should -Be $now.AddMinutes(75)
+        # baseline at minute 75 of its profile, after the first one. Its profile starts when the Run Command sets it, at most 2
+        # minutes after the dispatch, so that's by minute 77 from the dispatch (review of ab91ee5).
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $t5 -NowUtc $now | Should -Be $now.AddMinutes(77)
         $t5.Minutes | Should -Be 90 -Because 'nothing is cut: T5''s baseline runs on until the run ends'
-        # A profile whose own minutes end first: 60, less 2, is 58, the end of the second cycle's second storm and its recovery.
+        # A profile whose own minutes end first: 60, less 2, is 58, the end of the second cycle's second storm and its recovery,
+        # by minute 60 from the dispatch.
         $short = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 60; NotAfterUtc = $notAfter }
-        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $short -NowUtc $now | Should -Be $now.AddMinutes(58)
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $short -NowUtc $now | Should -Be $now.AddMinutes(60)
         foreach ($other in @(
                 [pscustomobject]@{ Target = 'T1'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
                 [pscustomobject]@{ Target = 'T5'; Scenario = 'ru-storm'; Intensity = 0; Concurrency = 0; Minutes = 10; NotAfterUtc = $null }
@@ -1672,9 +1674,10 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $arguments[[array]::IndexOf($arguments, '--duration') + 1] | Should -Be '90m'
         @($status.dispatched) | Should -Contain 'T5: showcase for 90 minutes'
         # The session ends at 16:30; from 15:00:30 the profile has 89 minutes, less 2 for its Run Command, 87: the third
-        # cycle's second ru-storm and its recovery (to minute 88) don't fit, so T5 is back at its baseline at minute 75, 16:15:30.
+        # cycle's second ru-storm and its recovery (to minute 88) don't fit, so T5 is back at its baseline at minute 75 of its
+        # profile, which starts at most 2 minutes after the dispatch: by 16:17:30.
         $t5End = ConvertTo-DbHubUtc -Value $status.t5.endUtc
-        $t5End | Should -Be $dispatch.AddMinutes(75)
+        $t5End | Should -Be $dispatch.AddMinutes(77)
         $steps = @($status.steps | Where-Object step -EQ 'T5')
         @($steps | ForEach-Object state) | Should -Be @('Pass', 'Pass')
         $steps[0].message | Should -Be 'T5''s container contosocare/patient-events (cosmos01-abc123) was created for this session, with its 400 RU/s; the stop at its end deletes it, so it bills only while the demo runs.'
