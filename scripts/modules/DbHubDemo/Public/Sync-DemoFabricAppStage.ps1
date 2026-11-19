@@ -9,7 +9,8 @@ function Sync-DemoFabricAppStage {
     rayfin/.env, .env.local). Keeping that folder under out/ keeps every real ID out of Git. Each run:
     1. Mirrors the source into the stage: copies every file except build output, packages, and local files, and
        removes stage files the source no longer has. The CLI's own files (rayfin/.deployments.json, rayfin/.env,
-       .env.local, rayfin/.temp) and node_modules stay.
+       .env.local, rayfin/.temp) and node_modules stay; with -WorkspaceId, rayfin/.deployments.json loses its records of
+       other workspaces.
     2. Sets the connector's IDs in rayfin/.env (-EnvValues; rayfin.yml reads them as ${NAME}, so the committed file
        holds only placeholders) and writes public/dbhub-app.json (-DeployFile: the live links and the expected
        account, which the app reads at run time).
@@ -29,6 +30,11 @@ function Sync-DemoFabricAppStage {
     .PARAMETER DeployFile
     The content of public/dbhub-app.json: links (databaseHub, realTimeDashboard, report, workspace),
     expectedAccount, and expectedTenantId.
+
+    .PARAMETER WorkspaceId
+    The Fabric workspace the app deploys to. The stage then drops rayfin up's records of other workspaces
+    (Remove-DemoFabricAppStaleDeployment): rayfin up finds its record by the workspace's name, so after destroy.ps1 a
+    new workspace with the same name would reuse the deleted one's app. Without it, the records stay as they are.
 
     .PARAMETER SkipInstall
     Don't run npm ci (the dependencies result is Not selected).
@@ -55,6 +61,9 @@ function Sync-DemoFabricAppStage {
         # The live estate function's scope (rayfin/functions/src/scope.generated.ts): subscriptionId and resourceGroups.
         # Without it, the stage gets an empty scope and the function answers that it has none.
         [System.Collections.IDictionary] $FunctionScope = $null,
+
+        [AllowEmptyString()]
+        [string] $WorkspaceId = '',
 
         [switch] $SkipInstall,
 
@@ -108,6 +117,7 @@ function Sync-DemoFabricAppStage {
 
     $copied = 0
     $removed = 0
+    $stale = @()
     try {
         $null = New-Item -ItemType Directory -Path $stage -Force
         foreach ($file in $sourceFiles) {
@@ -131,6 +141,9 @@ function Sync-DemoFabricAppStage {
             Sort-Object -Property { $_.FullName.Length } -Descending |
             Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force | Select-Object -First 1) } |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+        if ($WorkspaceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -and $WorkspaceId -ne [guid]::Empty.ToString()) {
+            $stale = @(Remove-DemoFabricAppStaleDeployment -StagePath $stage -WorkspaceId $WorkspaceId -Confirm:$false)
+        }
 
         if ($EnvValues.Count -gt 0) {
             Set-DemoFabricAppEnvValue -Path (Join-Path -Path $stage -ChildPath 'rayfin/.env') -Values $EnvValues -Confirm:$false
@@ -147,7 +160,13 @@ function Sync-DemoFabricAppStage {
         return $results.ToArray()
     }
     $evidence = [ordered]@{ files = $sourceFiles.Count; copied = $copied; removed = $removed; envValues = @($EnvValues.Keys | Sort-Object); deployFileLinks = @(if ($DeployFile['links']) { $DeployFile['links'].Keys | Sort-Object }) }
-    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('The deploy stage {0} matches fabric/app ({1} files; {2} copied, {3} removed) and has the deploy-time values.' -f $StagePath, $sourceFiles.Count, $copied, $removed) -Evidence $evidence -DocUrl $docUrl))
+    $message = 'The deploy stage {0} matches fabric/app ({1} files; {2} copied, {3} removed) and has the deploy-time values.' -f $StagePath, $sourceFiles.Count, $copied, $removed
+    if ($stale.Count -gt 0) {
+        # Another workspace's record, which a destroyed environment leaves: rayfin up would reuse its deleted app.
+        $evidence['droppedDeployments'] = @($stale | ForEach-Object { [ordered]@{ key = $_.Key; workspaceId = $_.WorkspaceId; itemName = $_.ItemName } })
+        $message += ' It dropped rayfin up''s record of {0} other Fabric workspace(s) ({1}), which a deleted environment leaves behind, so rayfin up doesn''t reuse that app.' -f $stale.Count, (($stale | ForEach-Object { $_.Key }) -join ', ')
+    }
+    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl $docUrl))
 
     # Dependencies: npm ci in the app and in its functions project, each when its lock file changed since its last install.
     $installDoc = 'https://docs.npmjs.com/cli/commands/npm-ci'

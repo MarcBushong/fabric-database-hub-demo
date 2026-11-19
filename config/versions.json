@@ -46,6 +46,21 @@
     },
     "itemName": "APP_DatabaseHub_Insights",
     "itemType": "AppBackend",
+    "backendItems": {
+      "note": "2026-11-19: what the app's backend creates in the demo's workspace beside the app item (itemType, itemName), by type and display name; {itemName} is itemName. It creates a user data function for the app's connectors when rayfin up applies their configuration ({itemName}_connector, seen live on 2026-11-17), and one for its functions when rayfin up deploys services.functions ({itemName}, the app's own name: the live estate and Manage, since 2026-11-18). Seen live on 2026-11-19: the probe app APP_InsightsProbe's workspace held AppBackend and UserDataFunction APP_InsightsProbe, and dbhubc6's destroy kept its workspace for UserDataFunction APP_DatabaseHub_Insights. destroy.ps1 deletes the demo's workspace only when everything in it is the demo's (Get-DemoFabricDemoItem reads this list), so a backend item missing here keeps every workspace. The pinned CLI (Rayfin CLI 1.36.2) creates nothing else: no Fabric connection, Microsoft Entra app, or service principal, and a lakehouse or SQL database only for services.data or services.storage, which rayfin.yml leaves off; a Pester test holds this list to rayfin.yml.",
+      "items": [
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}_connector",
+          "for": "connectors"
+        },
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}",
+          "for": "functions"
+        }
+      ]
+    },
     "connectorName": "history",
     "assetAccess": "protected",
     "semanticModelName": "SM_DatabaseHub_History",
