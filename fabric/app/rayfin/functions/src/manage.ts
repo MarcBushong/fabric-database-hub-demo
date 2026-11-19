@@ -1,4 +1,4 @@
-// Manage's functions (ADR 0028, A): manageAccess says whether the signed-in viewer can send actions from the app,
+// Manage's functions (ADR 0029, A): manageAccess says whether the signed-in viewer can send actions from the app,
 // manageRequest runs NB_DatabaseHub_Control with a checked request through the Fabric job API, and manageJob reads that
 // run. The checks and answers are in manage-core.ts, the deploy-time settings in manage.generated.ts. The caller comes
 // only from the Rayfin runtime (ctx.accessToken, which the app's backend checked, verified again with the app's own

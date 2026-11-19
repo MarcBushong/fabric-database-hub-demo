@@ -59,7 +59,7 @@ function useManageAccess(fixed: ManageAccess | undefined, api: ManageApi | undef
         let alive = true;
         api.access().then(
             (a) => {
-                if (alive) setDetected(manageAccessOf(a, api));
+                if (alive) setDetected(manageAccessOf(a, api, (reason) => setDetected({ ...MANAGE_READ_ONLY, reason })));
             },
             () => {
                 if (alive) setDetected(MANAGE_READ_ONLY);

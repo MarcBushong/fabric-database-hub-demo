@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
     Button,
     Dialog,
@@ -28,9 +28,9 @@ import { toSessions } from "@/data/model";
 import { sessionsQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { copyText } from "@/lib/clipboard";
-import { describeRequest, notebookParameters, validateRequest, type ControlAction, type ControlRequest } from "@/lib/control";
-import { parameterCellText } from "@/lib/manage-client";
-import { formatAgo, formatDateTimeUtc, formatDuration } from "@/lib/format";
+import { describeRequest, notebookParameters, runMinutes, validateRequest, type ControlAction, type ControlRequest } from "@/lib/control";
+import { parameterCellText, type ManageJobAnswer } from "@/lib/manage-client";
+import { clause, formatAgo, formatDateTimeUtc, formatDuration } from "@/lib/format";
 import { profileLabel, SCENARIOS, SESSION_MINUTES } from "@/lib/scenarios";
 import type { FilterTarget } from "@/lib/view-state";
 import { PageHeader } from "@/shell/PageHeader";
@@ -52,6 +52,9 @@ const ACTIONS: ActionInfo[] = [
 ];
 
 function RequestForm({ request, onChange }: { request: ControlRequest; onChange: (next: ControlRequest) => void }) {
+    const { manage } = useApp();
+    // The control's own targets when the Manage function says (T5 only while it's on); else the catalog's.
+    const allowed = (targets: readonly FilterTarget[]) => targets.filter((t) => manage.mode !== "run" || !manage.targets || manage.targets.includes(t));
     if (request.action === "session") {
         return (
             <Field label="Duration (minutes)" hint={`${SESSION_MINUTES.min} to ${SESSION_MINUTES.max}`}>
@@ -60,7 +63,10 @@ function RequestForm({ request, onChange }: { request: ControlRequest; onChange:
         );
     }
     if (request.action === "run") {
-        const scenario = SCENARIOS.find((s) => s.id === request.scenario) ?? SCENARIOS[0];
+        const choices = SCENARIOS.filter((s) => allowed(s.targets).length > 0);
+        const scenario = choices.find((s) => s.id === request.scenario) ?? choices[0] ?? SCENARIOS[0];
+        const targets = allowed(scenario.targets);
+        const minutes = runMinutes(scenario);
         return (
             <div className="form-grid">
                 <Field label="Scenario">
@@ -68,11 +74,12 @@ function RequestForm({ request, onChange }: { request: ControlRequest; onChange:
                         value={scenario.title}
                         selectedOptions={[scenario.id]}
                         onOptionSelect={(_, d) => {
-                            const next = SCENARIOS.find((s) => s.id === d.optionValue) ?? scenario;
-                            onChange({ ...request, scenario: next.id, target: next.targets.includes(request.target ?? "T1") ? request.target : next.targets[0], durationMinutes: next.defaultMinutes });
+                            const next = choices.find((s) => s.id === d.optionValue) ?? scenario;
+                            const nextTargets = allowed(next.targets);
+                            onChange({ ...request, scenario: next.id, target: nextTargets.includes(request.target ?? "T1") ? request.target : nextTargets[0], durationMinutes: runMinutes(next).default });
                         }}
                     >
-                        {SCENARIOS.map((s) => (
+                        {choices.map((s) => (
                             <Option key={s.id} value={s.id} text={s.title}>
                                 {s.title}
                             </Option>
@@ -81,15 +88,15 @@ function RequestForm({ request, onChange }: { request: ControlRequest; onChange:
                 </Field>
                 <Field label="Target">
                     <Dropdown value={request.target ?? ""} selectedOptions={request.target ? [request.target] : []} onOptionSelect={(_, d) => onChange({ ...request, target: d.optionValue as FilterTarget })}>
-                        {scenario.targets.map((t) => (
+                        {targets.map((t) => (
                             <Option key={t} value={t} text={t}>
                                 <TargetChip target={t} full />
                             </Option>
                         ))}
                     </Dropdown>
                 </Field>
-                <Field label="Duration (minutes)" hint={`5 to ${scenario.maxMinutes}`}>
-                    <SpinButton min={5} max={scenario.maxMinutes} value={request.durationMinutes ?? scenario.defaultMinutes} onChange={(_, d) => onChange({ ...request, durationMinutes: Number(d.value ?? d.displayValue) })} />
+                <Field label="Duration (minutes)" hint={`${minutes.min} to ${minutes.max}`}>
+                    <SpinButton min={minutes.min} max={minutes.max} value={request.durationMinutes ?? minutes.default} onChange={(_, d) => onChange({ ...request, durationMinutes: Number(d.value ?? d.displayValue) })} />
                 </Field>
                 <Field label="Intensity" hint="1 to 10; empty is the scenario's default">
                     <SpinButton min={1} max={10} value={request.intensity ?? null} onChange={(_, d) => onChange({ ...request, intensity: d.value === null || d.value === undefined ? undefined : Number(d.value) })} />
@@ -100,20 +107,25 @@ function RequestForm({ request, onChange }: { request: ControlRequest; onChange:
     return null;
 }
 
-function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; onClose: () => void }) {
+function ConfirmDialog({ request, onClose, onStarted }: { request: ControlRequest | null; onClose: () => void; onStarted: (run: { id: string; title: string }) => void }) {
     const { manage, notify, runtime } = useApp();
     const [draft, setDraft] = useState<ControlRequest | null>(request);
     const [prev, setPrev] = useState<ControlRequest | null>(request);
     const [sending, setSending] = useState(false);
+    const [notice, setNotice] = useState<string | null>(null);
     if (request !== prev) {
         setPrev(request);
         setDraft(request);
+        setNotice(null);
     }
     if (!draft) return null;
     const summary = describeRequest(draft);
-    const problem = validateRequest(draft);
     const params = notebookParameters(draft);
-    const replaces = manage.mode === "run" && manage.running && draft.action === "session" ? manage.running : null;
+    // The control takes one request at a time, and follows a session that's running instead of starting another.
+    const running = manage.mode === "run" ? (manage.running ?? null) : null;
+    const runningText = running ? `A run of NB_DatabaseHub_Control is ${running.status === "NotStarted" ? "queued" : "in progress"}${running.startedAt ? `, since ${formatDateTimeUtc(new Date(running.startedAt))}` : ""}` : "";
+    const busy = running && draft.action !== "stop" ? (draft.action === "session" ? `${runningText}. The control follows a session that's running instead of starting another: Stop now first, then start a new one.` : `${runningText}, and the control takes one request at a time: wait for it to end, or Stop now first.`) : null;
+    const problem = validateRequest(draft, manage.mode === "run" ? manage.targets : undefined) ?? busy;
 
     const copyAndOpen = async () => {
         const copied = await copyText(parameterCellText(draft));
@@ -127,11 +139,28 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
         setSending(true);
         try {
             const answer = await manage.send(draft);
-            if (answer.started) notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy}${answer.jobInstance ? ` (run ${answer.jobInstance.slice(0, 8)})` : ""}`, "success");
-            else notify(`${summary.title} wasn't sent: ${answer.reason}`, "error");
-            onClose();
+            if (answer.started) {
+                const cancelled = answer.cancelled?.length ? ", after cancelling the run in progress" : "";
+                notify(`${summary.title}: NB_DatabaseHub_Control started as ${answer.requestedBy}${answer.jobInstance ? ` (run ${answer.jobInstance.slice(0, 8)})` : ""}${cancelled}`, "success");
+                if (answer.jobInstance) onStarted({ id: answer.jobInstance, title: summary.title });
+                onClose();
+            } else if (answer.copy && manage.fallBack) {
+                // The function couldn't send it, but Run all can: this dialog and the page now copy the request instead.
+                setNotice(answer.reason);
+                manage.fallBack(answer.reason);
+            } else {
+                notify(`${summary.title} wasn't sent: ${answer.reason}`, "error");
+                onClose();
+            }
         } catch (error) {
-            notify(`${summary.title} wasn't sent: ${error instanceof Error ? error.message : String(error)}`, "error");
+            const reason = `The app couldn't reach its Manage function (${clause(error instanceof Error ? error.message : String(error))}), so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.`;
+            if (manage.fallBack) {
+                setNotice(reason);
+                manage.fallBack(reason);
+            } else {
+                notify(`${summary.title} wasn't sent: ${reason}`, "error");
+                onClose();
+            }
         } finally {
             setSending(false);
         }
@@ -143,12 +172,20 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
                 <DialogBody>
                     <DialogTitle>{summary.title}</DialogTitle>
                     <DialogContent>
-                        <RequestForm request={draft} onChange={setDraft} />
-                        {replaces ? (
+                        {notice ? (
                             <MessageBar intent="warning">
                                 <MessageBarBody>
-                                    <MessageBarTitle>It replaces the session that's running.</MessageBarTitle>
-                                    {`The control's run started ${formatDateTimeUtc(new Date(replaces.startedAt))} follows the newest request, so this one takes over.`}
+                                    <MessageBarTitle>The app couldn't send it.</MessageBarTitle>
+                                    {notice} Copy it below instead.
+                                </MessageBarBody>
+                            </MessageBar>
+                        ) : null}
+                        <RequestForm request={draft} onChange={setDraft} />
+                        {running && draft.action === "stop" ? (
+                            <MessageBar intent="warning">
+                                <MessageBarBody>
+                                    <MessageBarTitle>Stop now cancels the control's run first.</MessageBarTitle>
+                                    {`${runningText}. On a small capacity, Stop now couldn't start until it ended, so it's cancelled first; the session still ends as its end would, its history saved.`}
                                 </MessageBarBody>
                             </MessageBar>
                         ) : null}
@@ -203,6 +240,65 @@ function ConfirmDialog({ request, onClose }: { request: ControlRequest | null; o
         </Dialog>
     );
 }
+/** Polls one of the control's runs until it ends (every 10 seconds, then every 30 after two minutes), for its real state. */
+function useControlRun(id: string | null, read: ((jobInstance: string) => Promise<ManageJobAnswer>) | undefined): ManageJobAnswer | null {
+    const [state, setState] = useState<{ id: string; answer: ManageJobAnswer } | null>(null);
+    useEffect(() => {
+        if (!id || !read) return;
+        let alive = true;
+        let polls = 0;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const next = () => {
+            polls += 1;
+            if (alive && polls < 240) timer = setTimeout(poll, polls < 12 ? 10_000 : 30_000);
+        };
+        const poll = () => {
+            read(id).then(
+                (answer) => {
+                    if (!alive) return;
+                    setState({ id, answer });
+                    if (answer.status === "NotStarted" || answer.status === "InProgress" || answer.status === "Unknown") next();
+                },
+                () => next(),
+            );
+        };
+        poll();
+        return () => {
+            alive = false;
+            if (timer) clearTimeout(timer);
+        };
+    }, [id, read]);
+    return state && state.id === id ? state.answer : null;
+}
+
+/** A run's real state, as the Fabric job API has it, failures included. */
+function RunState({ title, id, job }: { title: string; id: string; job: ManageJobAnswer | null }) {
+    const run = `run ${id.slice(0, 8)}`;
+    const at = (value: string | null | undefined) => (value ? formatDateTimeUtc(new Date(value)) : "");
+    const bar = (intent: "info" | "success" | "warning" | "error", text: string, busy = false) => (
+        <MessageBar intent={intent} icon={busy ? <Spinner size="extra-tiny" /> : undefined} aria-live="polite">
+            <MessageBarBody>{text}</MessageBarBody>
+        </MessageBar>
+    );
+    if (!job) return bar("info", `${title}: reading ${run}…`, true);
+    switch (job.status) {
+        case "NotStarted":
+            return bar("info", `${title}: ${run} is queued. On a small capacity (F2 or F4), it waits for the capacity's Spark session.`, true);
+        case "InProgress":
+            return bar("info", `${title}: ${run} is in progress${job.startedAt ? `, since ${at(job.startedAt)}` : ""}.`, true);
+        case "Completed":
+            return bar("success", `${title}: ${run} completed${job.endedAt ? ` at ${at(job.endedAt)}` : ""}.`);
+        case "Failed":
+            return bar("error", `${title}: ${run} failed${job.endedAt ? ` at ${at(job.endedAt)}` : ""}: ${clause(job.failureReason || "Fabric gave no reason")}. Its output is in the notebook's run history.`);
+        case "Cancelled":
+            return bar("warning", `${title}: ${run} was cancelled.`);
+        case "Deduped":
+            return bar("info", `${title}: Fabric merged ${run} with a run already queued.`);
+        default:
+            return bar("warning", `${title}: ${run}'s state couldn't be read (${clause(job.failureReason || "no answer")}).`);
+    }
+}
+
 const DEFAULTS: Record<ControlAction, ControlRequest> = {
     session: { action: "session", durationMinutes: SESSION_MINUTES.default },
     run: { action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10 },
@@ -213,6 +309,10 @@ const DEFAULTS: Record<ControlAction, ControlRequest> = {
 export default function ManagePage() {
     const { filters, manage, runtime } = useApp();
     const [pending, setPending] = useState<ControlRequest | null>(null);
+    // The run this page follows: the one it just started, else the control's run in progress.
+    const [started, setStarted] = useState<{ id: string; title: string } | null>(null);
+    const followed = started ?? (manage.mode === "run" && manage.running ? { id: manage.running.id, title: "The control's run" } : null);
+    const job = useControlRun(followed?.id ?? null, manage.mode === "run" ? manage.job : undefined);
     const sessionsSpec = useMemo(() => sessionsQuery(filters), [filters]);
     const sessionsState = useQuery(sessionsSpec);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
@@ -252,11 +352,7 @@ export default function ManagePage() {
                     </MessageBarBody>
                 </MessageBar>
             )}
-            {manage.mode === "run" && manage.running ? (
-                <MessageBar intent="warning">
-                    <MessageBarBody>{`The control is running a request, started ${formatDateTimeUtc(new Date(manage.running.startedAt))}. A new session replaces it: the control follows the newest request.`}</MessageBarBody>
-                </MessageBar>
-            ) : null}
+            {followed ? <RunState title={followed.title} id={followed.id} job={job} /> : null}
 
             <section className="actions-grid span-12" aria-label="Actions">
                 {ACTIONS.map((a) => (
@@ -317,11 +413,11 @@ export default function ManagePage() {
                     <li>From the app, only operators send: the app's function verifies who you are from your sign-in, never from what the browser sends, and checks the operators list deploy.ps1 writes (the deployer and the demo's admin group; a redeploy refreshes it).</li>
                     <li>Every request goes through the control's allow-lists and caps, and the runbook checks it again: the targets, the catalog's scenarios, and their maximum durations. The control records who sent it.</li>
                     <li>The workload acts only inside ContosoCare, on sessions tagged ContosoCare.Demo/.</li>
-                    <li>Without the app's function, each action copies its request for the control notebook instead; viewers who aren't operators see this page read-only, with the reason.</li>
+                    <li>Without the app's function, or when it can't confirm who you are or start the run, each action copies its request for the control notebook instead; viewers who aren't operators see this page read-only, with the reason.</li>
                 </ul>
             </section>
 
-            <ConfirmDialog request={pending} onClose={() => setPending(null)} />
+            <ConfirmDialog request={pending} onClose={() => setPending(null)} onStarted={setStarted} />
         </div>
     );
 }

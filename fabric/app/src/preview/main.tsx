@@ -66,10 +66,12 @@ const theme = params.get("theme");
 // manage=operator (or on): actions run from the app; manage=viewer: read-only with the reason; manage=running: an operator
 // while a session runs; otherwise the copy mode of a deployment without the Manage function.
 const manageParam = params.get("manage");
-const sampleSend: ManageAccess["send"] = async (request) => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: `app/presenter@contoso.example (${request.action})`.split(" ")[0] });
+const SAMPLE_RUN = "00000000-0000-0000-0000-000000000000";
+const sampleSend: ManageAccess["send"] = async (request) => ({ started: true, jobInstance: SAMPLE_RUN, reason: "", requestedBy: `app/presenter@contoso.example (${request.action})`.split(" ")[0], copy: false, cancelled: [] });
+const sampleJob: ManageAccess["job"] = async () => ({ status: "InProgress", startedAt: new Date(Date.now() - 25 * 60000).toISOString(), endedAt: null, failureReason: null });
 const manage: ManageAccess =
     manageParam === "operator" || manageParam === "on" || manageParam === "running"
-        ? { mode: "run", canRun: true, reason: "", who: "presenter@contoso.example", running: manageParam === "running" ? { startedAt: new Date(Date.now() - 25 * 60000).toISOString() } : null, send: sampleSend }
+        ? { mode: "run", canRun: true, reason: "", who: "presenter@contoso.example", running: manageParam === "running" ? { id: SAMPLE_RUN, status: "InProgress", startedAt: new Date(Date.now() - 25 * 60000).toISOString() } : null, targets: ["T1", "T2", "T3", "T4", "T5"], send: sampleSend, job: sampleJob }
         : manageParam === "viewer"
           ? { mode: "run", canRun: false, reason: "Only the demo's operators send actions from the app: the deployer and the members of its admin group. A redeploy refreshes the list.", who: "viewer@contoso.example", running: null }
           : MANAGE_READ_ONLY;

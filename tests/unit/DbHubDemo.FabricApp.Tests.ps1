@@ -1111,7 +1111,7 @@ Describe 'Set-DemoFabricAppManageSetting' {
             if ($ApiUrl) {
                 # Built at run time, so no scanner takes it for a key.
                 $key = 'pk_' + ('k' * 21)
-                $record = @{ active = 'dbhub'; deployments = @{ dbhub = @{ itemName = 'APP_DatabaseHub_Insights'; fabricItemId = '00000000-0000-0000-0000-000000000000'; fabricWorkspaceId = '00000000-0000-0000-0000-000000000000'; fabricApiUrl = $ApiUrl; publishableKey = $key; hostingUrl = 'https://example.invalid/'; fabricDeepLink = 'https://app.fabric.microsoft.com/' } } }
+                $record = @{ active = 'dbhub'; deployments = @{ dbhub = @{ itemName = 'APP_DatabaseHub_Insights'; fabricItemId = '00000000-0000-0000-0000-000000000000'; fabricWorkspaceId = '00000000-0000-0000-0000-000000000000'; fabricTenantId = '00000000-0000-0000-0000-000000000000'; fabricApiUrl = $ApiUrl; publishableKey = $key; hostingUrl = 'https://example.invalid/'; fabricDeepLink = 'https://app.fabric.microsoft.com/' } } }
                 Set-Content -LiteralPath (Join-Path -Path $stage -ChildPath 'rayfin/.deployments.json') -Value ($record | ConvertTo-Json -Depth 5) -Encoding utf8NoBOM
             }
             return $stage
@@ -1129,10 +1129,10 @@ Describe 'Set-DemoFabricAppManageSetting' {
         $script:manageIds = @{ ControlWorkspaceId = 'C0000000-0000-0000-0000-000000000000'; ControlNotebookId = 'E0000000-0000-0000-0000-000000000000' }
     }
 
-    It 'writes the app''s API, NB_DatabaseHub_Control''s IDs, and the operators for the Manage function, never the publishable key (ADR 0029)' {
+    It 'writes the app''s API and IDs, NB_DatabaseHub_Control''s IDs, the operators, and the control''s catalog for the Manage function, never the publishable key (ADR 0029)' {
         $stage = & $script:newManageStage
         $ids = $script:manageIds
-        $result = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Confirm:$false
+        $result = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false
         $result.status | Should -Be 'Pass'
         $result.message | Should -BeExactly 'Manage sends its actions from the app for 1 operator: its function checks each caller with the app''s own keys, and runs NB_DatabaseHub_Control through the Fabric job API after the caller confirms.'
         $result.evidence['apiUrl'] | Should -BeExactly $script:manageApi
@@ -1140,6 +1140,16 @@ Describe 'Set-DemoFabricAppManageSetting' {
         $settings.apiUrl | Should -BeExactly $script:manageApi
         $settings.controlWorkspaceId | Should -BeExactly 'c0000000-0000-0000-0000-000000000000'
         $settings.controlNotebookId | Should -BeExactly 'e0000000-0000-0000-0000-000000000000'
+        foreach ($name in 'tenantId', 'workspaceId', 'appId') {
+            $settings.$name | Should -BeExactly '00000000-0000-0000-0000-000000000000' -Because $name
+        }
+        $settings.issuer | Should -BeExactly ''
+        $settings.audience | Should -BeExactly ''
+        @($settings.catalog.targets) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
+        $settings.catalog.scenarios.PSObject.Properties.Name | Should -Not -Contain 'healthy-baseline'
+        @($settings.catalog.scenarios.'ru-storm'.targets) | Should -Be @('T5')
+        $settings.catalog.minDurationMinutes | Should -Be 5
+        $settings.catalog.maxDurationMinutes | Should -Be 120
         @($settings.operators).Count | Should -Be 1
         $settings.operators[0].objectId | Should -BeExactly 'd0000000-0000-0000-0000-000000000000'
         @($settings.operators[0].names) | Should -Be @('deployer@contoso.example')
@@ -1153,20 +1163,38 @@ Describe 'Set-DemoFabricAppManageSetting' {
         $stage = & $script:newManageStage -ApiUrl ''
         $result = Set-DemoFabricAppManageSetting -StagePath $stage -Operator @() -Confirm:$false
         $result.status | Should -Be 'Warning'
-        $result.message | Should -BeExactly 'Manage''s function is missing the app''s API (its first deploy records it), NB_DatabaseHub_Control, and operators, so the app copies each request for Run all in NB_DatabaseHub_Control instead of sending it.'
+        $result.message | Should -BeExactly 'Manage''s function is missing the app''s API and IDs (its first deploy records them), NB_DatabaseHub_Control, the control''s catalog, and operators, so the app copies each request for Run all in NB_DatabaseHub_Control instead of sending it.'
         $result.remediation | Should -Match 'configure-fabric-app\.ps1 again'
         (& $script:readManage $stage).apiUrl | Should -BeExactly ''
 
         $ids = $script:manageIds
         $stage = & $script:newManageStage -ApiUrl 'http://example.invalid/api/'
-        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Confirm:$false).message | Should -Match '^Manage''s function is missing the app''s API \(its first deploy records it\), so'
+        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false).message | Should -Match '^Manage''s function is missing the app''s API and IDs \(its first deploy records them\), so'
 
         $stage = & $script:newManageStage -Functions $false
-        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Confirm:$false).status | Should -Be 'Not supported'
+        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false).status | Should -Be 'Not supported'
 
         $stage = & $script:newManageStage
-        $null = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -WhatIf
+        $null = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -WhatIf
         Test-Path -LiteralPath (& $script:manageFile $stage) | Should -BeFalse
+    }
+
+    It 'gives the function the control''s own catalog: the runbook settings'' targets, incidents, and bounds, with T5 only while it''s on' {
+        foreach ($t5 in $true, $false) {
+            $config = Get-HubTestConfig
+            $config['t5Enabled'] = $t5
+            $catalog, $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } {
+                (Get-DemoFabricAppManageCatalog -Config $Config), (Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '00000000-0000-0000-0000-000000000000')
+            }
+            @($catalog['targets']) | Should -Be @($setting['targets'].Keys) -Because ('t5Enabled {0}' -f $t5)
+            @($catalog['targets']) -contains 'T5' | Should -Be $t5
+            ($catalog['scenarios'] | ConvertTo-Json -Depth 6 -Compress) | Should -BeExactly ($setting['scenarios'] | ConvertTo-Json -Depth 6 -Compress)
+            $catalog['minDurationMinutes'] | Should -Be $setting['minDurationMinutes']
+            $catalog['maxDurationMinutes'] | Should -Be $setting['maxDurationMinutes']
+            $catalog['session']['minMinutes'] | Should -Be $setting['minSessionMinutes']
+            $catalog['session']['maxMinutes'] | Should -Be $setting['profiles']['showcase']['maxMinutes']
+            $catalog['session']['defaultMinutes'] | Should -Be $setting['profiles']['showcase']['defaultMinutes']
+        }
     }
 }
 Describe 'configure-fabric-app.ps1' {

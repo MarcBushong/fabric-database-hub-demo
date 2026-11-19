@@ -397,16 +397,54 @@ describe("Manage", () => {
         expect(within(dialog).getByText("Only the demo's operators send actions from the app.")).toBeInTheDocument();
     });
 
-    it("lets an operator send a bounded action, and says a new session replaces the one running", async () => {
-        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example" }));
-        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: { startedAt: "2026-10-21T20:00:00.000Z" }, send } });
+    it("lets an operator send a bounded action, then follows its run to how it ended", async () => {
+        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [] }));
+        const job = vi.fn(async () => ({ status: "Failed", startedAt: "2026-10-21T20:00:00Z", endedAt: "2026-10-21T20:01:00Z", failureReason: "NotebookFailed: The webhook refused it." }));
+        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: null, send, job } });
         expect(await screen.findByText("You can run these actions, as ops@contoso.example.")).toBeInTheDocument();
         fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
         const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
-        expect(within(dialog).getByText("It replaces the session that's running.")).toBeInTheDocument();
         fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
         await waitFor(() => expect(send).toHaveBeenCalledWith({ action: "session", durationMinutes: 90 }));
         expect(notify).toHaveBeenCalledWith("Start a 90-minute session: NB_DatabaseHub_Control started as app/ops@contoso.example (run 00000000)", "success");
+        expect(await screen.findByText(/^Start a 90-minute session: run 00000000 failed at .+: NotebookFailed: The webhook refused it\. Its output is in the notebook's run history\.$/)).toBeInTheDocument();
+        expect(job).toHaveBeenCalledWith("00000000-0000-0000-0000-000000000000");
+    });
+
+    const running = { id: "00000000-0000-0000-0000-000000000000", status: "InProgress", startedAt: "2026-10-21T20:00:00Z" };
+    const inProgress = async () => ({ status: "InProgress", startedAt: "2026-10-21T20:00:00Z", endedAt: null, failureReason: null });
+
+    it("takes one request at a time while the control runs one, and shows that run", async () => {
+        const send = vi.fn();
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send, job: vi.fn(inProgress) } });
+        expect(await screen.findByText(/^The control's run: run 00000000 is in progress, since /)).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
+        expect(within(dialog).getByText(/^A run of NB_DatabaseHub_Control is in progress, since .+\. The control follows a session that's running instead of starting another: Stop now first, then start a new one\.$/)).toBeInTheDocument();
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    it("says Stop now cancels the control's run in progress first", async () => {
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send: vi.fn(), job: vi.fn(inProgress) } });
+        fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Stop now" });
+        expect(within(dialog).getByText("Stop now cancels the control's run first.")).toBeInTheDocument();
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).not.toHaveAttribute("aria-disabled", "true");
+    });
+
+    it("hands a request the function couldn't send over to copy mode, with the reason", async () => {
+        const reason = "Fabric didn't start NB_DatabaseHub_Control (HTTP 403, InsufficientPrivileges). Run all in the notebook sends the same request.";
+        const send = vi.fn(async () => ({ started: false, jobInstance: "", reason, requestedBy: "app/ops@contoso.example", copy: true, cancelled: [] }));
+        const fallBack = vi.fn();
+        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: null, send, fallBack } });
+        fireEvent.click(await screen.findByRole("button", { name: "Reset…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Reset every running target" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(fallBack).toHaveBeenCalledWith(reason));
+        expect(await within(dialog).findByText("The app couldn't send it.")).toBeInTheDocument();
+        expect(within(dialog).getByText(`${reason} Copy it below instead.`)).toBeInTheDocument();
+        expect(notify).not.toHaveBeenCalledWith(expect.stringMatching(/wasn't sent/), "error");
     });
 
     it("lists what the control ran", async () => {

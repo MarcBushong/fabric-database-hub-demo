@@ -1,16 +1,16 @@
 // How the Manage page reaches the demo's session control. A (decided 2026-11-18): the app's Manage function (rayfin/
 // functions/src/manage.ts) verifies the caller, checks the operators list and the control's bounds, and runs
-// NB_DatabaseHub_Control through the Fabric job API. C, the automatic fallback when that function isn't deployed: the
-// app copies the request's parameters and opens the notebook, where Run all sends it. No secret reaches the browser in
-// either: the control's webhook URL stays in Key Vault, read by the notebook.
+// NB_DatabaseHub_Control through the Fabric job API. C, the automatic fallback when that function isn't deployed or
+// isn't set up: the app copies the request's parameters and opens the notebook, where Run all sends it. No secret
+// reaches the browser in either: the control's webhook URL stays in Key Vault, read by the notebook.
 
-import type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer } from "../../rayfin/functions/src/manage-core";
+import type { ControlRun, ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer } from "../../rayfin/functions/src/manage-core";
 import { MANAGE_READ_ONLY, type ManageAccess } from "../app-context";
 import type { ControlRequest, NotebookParameter } from "./control";
 import { notebookParameters } from "./control";
 
 // The Manage function's answers, defined once beside its checks.
-export type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer };
+export type { ControlRun, ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer };
 
 /** The Manage function's schema, for `client.functions` (the shared functions project registers it in manage.ts). */
 export type ManageFunctionsSchema = {
@@ -56,11 +56,23 @@ export function functionsManageApi(client: unknown): ManageApi {
 
 /**
  * Which way Manage sends actions, from the function's answer about the viewer: copy mode (C), with the function's reason,
- * when this deployment's function isn't set up; otherwise the app sends, or it's read-only for a viewer who isn't an operator.
+ * when the function can't send for anyone (it isn't set up, or it couldn't confirm the caller); otherwise the app sends,
+ * or it's read-only for a verified viewer who isn't an operator. `fallBack` switches to copy mode, for a request the
+ * function couldn't send.
  */
-export function manageAccessOf(answer: ManageAccessAnswer, api: Pick<ManageApi, "request">): ManageAccess {
+export function manageAccessOf(answer: ManageAccessAnswer, api: Pick<ManageApi, "request" | "job">, fallBack?: (reason: string) => void): ManageAccess {
     if (answer.configured === false) return { ...MANAGE_READ_ONLY, reason: answer.reason || MANAGE_READ_ONLY.reason };
-    return { mode: "run", canRun: answer.operator, reason: answer.operator ? "" : answer.reason, who: answer.who, running: answer.running, send: (r) => api.request(r) };
+    return {
+        mode: "run",
+        canRun: answer.operator,
+        reason: answer.operator ? "" : answer.reason,
+        who: answer.who,
+        running: answer.running,
+        targets: Array.isArray(answer.targets) && answer.targets.length > 0 ? answer.targets : undefined,
+        send: (r) => api.request(r),
+        job: (id) => api.job(id),
+        fallBack,
+    };
 }
 
 function literal(name: string, p: NotebookParameter): string {

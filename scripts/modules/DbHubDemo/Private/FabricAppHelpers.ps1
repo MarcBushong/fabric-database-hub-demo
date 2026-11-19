@@ -867,3 +867,36 @@ function Get-DemoT2MigrationPortalLink {
     }
     return ''
 }
+
+function Get-DemoFabricAppManageCatalog {
+    <#
+    .SYNOPSIS
+    The session control's own rules for the Insights app's Manage function (ADR 0029), from the same runbook settings the
+    control's runbooks and NB_DatabaseHub_Control's CATALOG_JSON come from: its targets (T5 only while it's on), its
+    incidents, a run's minutes, and a session's (the showcase's). So the function sends only what the control accepts.
+    Names and numbers only. Null when the settings can't be built. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    try {
+        # The identity's client ID only goes into the runbooks' own copy, so the placeholder changes nothing here.
+        $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '00000000-0000-0000-0000-000000000000'
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The control''s catalog for the Insights app''s Manage function couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $null
+    }
+    $showcase = $setting['profiles']['showcase']
+    return [ordered]@{
+        targets            = @($setting['targets'].Keys | ForEach-Object { [string]$_ })
+        scenarios          = $setting['scenarios']
+        minDurationMinutes = [int]$setting['minDurationMinutes']
+        maxDurationMinutes = [int]$setting['maxDurationMinutes']
+        session            = [ordered]@{ minMinutes = [int]$setting['minSessionMinutes']; maxMinutes = [int]$showcase['maxMinutes']; defaultMinutes = [int]$showcase['defaultMinutes'] }
+    }
+}

@@ -409,7 +409,7 @@ $manageResult = $null
 if ($config -and $guarded -and -not $CheckOnly -and -not $DryRun -and $blocking.Count -eq 0 -and $capacityReady) {
     $operatorResult = Resolve-DemoFabricAppOperator -Config $config
     $results.Add($operatorResult)
-    $manage = @{ StagePath = $stage; ControlWorkspaceId = [string]$itemsResult.evidence['controlWorkspaceId']; ControlNotebookId = [string]$itemsResult.evidence['controlNotebookId']; Operator = @($operatorResult.evidence['operators']) }
+    $manage = @{ StagePath = $stage; ControlWorkspaceId = [string]$itemsResult.evidence['controlWorkspaceId']; ControlNotebookId = [string]$itemsResult.evidence['controlNotebookId']; Operator = @($operatorResult.evidence['operators']); Config = $config }
     $manageResult = Set-DemoFabricAppManageSetting @manage -Confirm:$false
 }
 #endregion Step 5b: Manage's settings
