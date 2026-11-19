@@ -15,7 +15,7 @@ A low-cost, repeatable customer demo of **Microsoft Fabric Database Hub**, gener
 5. **Stop now, if you need to:** `./scripts/stop-demo.ps1`. A new deployment keeps running until you do, or until the nightly safety stop at 19:00, which catches whatever you forget; a `start-demo.ps1` session stops by itself after 4 hours.
 6. **Later:** update with `./scripts/deploy.ps1` again ([upgrading](#upgrading-an-existing-demo)); delete everything with `./scripts/destroy.ps1` ([delete everything](#delete-everything)).
 
-**Already have a demo in this subscription?** A fresh clone's first `./scripts/deploy.ps1` finds the one that's yours and updates it. For a second, separate environment beside it, run `./scripts/init.ps1 -Prefix <prefix> -CreateAdminGroup` first, then `./scripts/deploy.ps1`. It gets its own Fabric workspace, "Database Hub Demo &lt;prefix&gt;", unless `-WorkspaceName` names another.
+**Already have a demo in this subscription?** A fresh clone's first `./scripts/deploy.ps1` finds the one that's yours and updates it. For a second, separate environment beside it, run `./scripts/init.ps1 -Prefix <prefix> -CreateAdminGroup` first, then `./scripts/deploy.ps1`. It gets its own Fabric workspace, "Database Hub Demo &lt;prefix&gt;", unless `-WorkspaceName` names another. If `init.ps1` asks for something, such as which capacity, run the command it prints: it keeps your `-Prefix`.
 
 ```powershell
 git clone https://github.com/MarcBushong/fabric-database-hub-demo.git   # or "Use this template", or a codespace
