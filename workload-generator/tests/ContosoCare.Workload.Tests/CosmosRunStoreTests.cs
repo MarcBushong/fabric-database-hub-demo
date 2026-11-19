@@ -217,6 +217,29 @@ public sealed class CosmosRunStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ResetHasNoStormDocumentToDeleteWhenT5sContainerDoesntExistNow()
+    {
+        // Between sessions T5's container doesn't exist (it exists only during a session): nothing is left to clean, a Pass.
+        var store = new CosmosRunStore(StorePath);
+        var account = new FakeCosmosAccount { ContainerMissing = true };
+        using var client = new CosmosRestClient(CosmosEndpoint.Create("cosmos01-abc123.documents.azure.com", null), new FakeTokens(), account);
+        var token = TestContext.Current.CancellationToken;
+
+        var checks = await CosmosReset.RunAsync(store, client, new ResetOptions("tester", 0, true, false, false, false), TimeProvider.System, token);
+        var cleanup = await StormCleanup.RunAsync(client, "ContosoCare.Demo/control/test", TimeProvider.System, TimeSpan.FromSeconds(30), token);
+
+        var removed = checks.Single(c => c.CheckId == "storm-documents-removed");
+        Assert.Equal("Pass", removed.Status);
+        Assert.Equal("T5's container doesn't exist now (it exists only during a session), so no storm document is left.", removed.Message);
+        Assert.Equal("Pass", checks.Single(c => c.CheckId == "no-running-runs").Status);
+        Assert.True(cleanup.Complete);
+        Assert.Equal(0, cleanup.Deleted);
+        Assert.True(cleanup.ContainerMissing);
+        Assert.Null(cleanup.Error);
+        Assert.Equal(2, account.Requests.Count);
+    }
+
+    [Fact]
     public void TheRunStoreAndProfileFileSitNextToTheOthers()
     {
         Assert.EndsWith("activity-t5.json", FileProfileStore.DefaultPathFor(DemoTarget.T5), StringComparison.Ordinal);

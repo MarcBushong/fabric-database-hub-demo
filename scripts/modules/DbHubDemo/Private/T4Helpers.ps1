@@ -911,6 +911,8 @@ function Get-DemoT4GeneralPurposeCost {
         }
         # A safety stop caps the restart worst case when it's fully in place (2026-11-04, ADR 0024); never throws.
         $shared['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+        # T5's container lifecycle (2026-11-19, ADR 0027), as the other estimates price it; never throws.
+        $shared['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config
         foreach ($key in $shared.Keys) {
             $parameters[$key] = $shared[$key]
         }
@@ -2475,7 +2477,7 @@ function Get-DemoT4Resource {
 
     .DESCRIPTION
     -Child is the path under the server, for example 'databases/contosocare', 'administrators', or
-    'configurations/metrics.collector_database_activity'. A read: it works while the server is stopped.
+    'configurations/metrics.collector_database_activity'. A read: the server's own properties answer while it's stopped, but a child resource such as a parameter or a database answers ServerStoppedError then (live, 2026-11-18), which Test-DemoT4 reports as a Warning.
     Source: https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/get
     #>
     [CmdletBinding()]
@@ -2785,7 +2787,7 @@ function Get-DemoT4ParameterState {
 
     .DESCRIPTION
     PendingRestart is isConfigPendingRestart: a static parameter's new value waits for a server restart before it takes
-    effect. A read: it works while the server is stopped.
+    effect. A read: a stopped server answers ServerStoppedError for its parameters (live, 2026-11-18), which Test-DemoT4 reports as a Warning.
     Source (checked 2026-11-03): https://learn.microsoft.com/rest/api/postgresql/configurations/get
     #>
     [CmdletBinding()]
@@ -3054,7 +3056,7 @@ function Test-DemoT4MetricFlow {
         return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message 'T4''s server is being deleted (Dropping), so it isn''t deployed and sends no metrics.' -Evidence ([ordered]@{ state = $State }) -Remediation 'Run ./scripts/deploy.ps1 once Azure has removed it: it creates T4 again.' -DocUrl $docUrl)
     }
     if ($State -ne 'Ready') {
-        return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4 is {0}, so it sends no fresh metrics.' -f $State) -Evidence ([ordered]@{ state = $State }) -Remediation 'start-demo.ps1 starts it; metrics arrive within a few minutes.' -DocUrl $docUrl)
+        return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4 is {0}, so it sends no fresh metrics.' -f $State) -Evidence ([ordered]@{ state = $State }) -Remediation './scripts/start-demo.ps1 or the control notebook''s Run all starts it; metrics arrive within a few minutes.' -DocUrl $docUrl)
     }
     $deadline = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
     while ($true) {

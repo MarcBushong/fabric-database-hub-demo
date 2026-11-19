@@ -439,48 +439,112 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
 
-    It 'prices T5 all month, because a Cosmos DB account has no stop: list price, the free tier at zero, and an unchecked free tier at list price (ADR 0027)' {
-        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $listPrice = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $false
-        $t5 = @($listPrice.Components | Where-Object Name -Match '^T5 ')
-        # 400 RU/s = 4 x 100 RU/s, 730 hours, at 0.008; 1 GB at 0.25; the private endpoint in public mode too (0.01 x 730); one DNS zone.
-        ($t5 | Where-Object Name -Match 'throughput').Cost | Should -Be 23.36
-        ($t5 | Where-Object Name -Match 'throughput').Basis | Should -Be 'idle'
-        ($t5 | Where-Object Name -Match 'storage').Cost | Should -Be 0.25
+    It 'prices T5''s container for the running hours only with the Session lifecycle, the default, and its private endpoint and DNS zone all month (2026-11-19, ADR 0027)' {
+        # 40 running hours a month, so the container's share differs from the 10-hour default's.
+        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $session = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $false
+        $t5 = @($session.Components | Where-Object Name -Match '^T5 ')
+        # 400 RU/s = 4 x 100 RU/s at 0.008 for each hour the container exists; about 1 GB at 0.25 a GB-month, by the hour.
+        $throughput = $t5 | Where-Object Name -Match '^T5 throughput'
+        $throughput.Basis | Should -Be 'running'
+        $throughput.Quantity | Should -Be 4
+        $throughput.Cost | Should -Be 0.032
+        $storage = $t5 | Where-Object Name -Match '^T5 storage'
+        $storage.Basis | Should -Be 'running'
+        $storage.Quantity | Should -Be (1.0 / 730)
+        # The account's private endpoint (in public mode too: 0.01 x 730) and its DNS zone stay between sessions.
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
         ($t5 | Where-Object Name -EQ 'T5 private endpoint').Cost | Should -Be 7.3
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
         ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Cost | Should -Be 0.5
-        $listPrice.T5FixedMonthly | Should -Be 31.41
-        $listPrice.HourlyRunning | Should -Be $base.HourlyRunning -Because 'nothing of T5 is a running cost'
-        $listPrice.IdleMonthly | Should -Be ([System.Math]::Round($base.IdleMonthly + 31.41, 2))
-        $monthly = $listPrice.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
-        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) has no stop, so it costs 31\.41 USD a month'
+        $session.T5ContainerLifecycle | Should -Be 'Session'
+        $session.T5FixedMonthly | Should -Be 7.8
+        $session.T5RunningHourly | Should -Be 0.0323
+        $session.IdleMonthly | Should -Be ([System.Math]::Round($base.IdleMonthly + 7.8, 2))
+        # The light-use month bills the container for its 40 running hours only, and a 5-hour session for 5.
+        [System.Math]::Round($session.LightUseMonthly - $base.LightUseMonthly, 2) | Should -Be ([System.Math]::Round(7.8 + 0.0323 * 40, 2))
+        [System.Math]::Round($session.SessionCost - $base.SessionCost, 2) | Should -Be ([System.Math]::Round(0.0323 * 5, 2))
+        # What AlwaysOn adds: the container's month, 23.36 + 0.25, less its 40 running hours.
+        $session.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(23.61 - 0.0323 * 40, 2))
+        $monthly = $session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) costs 7\.80 USD a month whether the demo runs or not \(its private endpoint and private DNS zone\)\. Its container exists only during a session \(.+\), so its 400 RU/s of throughput and its storage add 0\.032 USD a running hour\.'
         $monthly.message | Should -Match 'doesn''t have the free tier'
+        $monthly.message | Should -Match 'If the session control''s role can''t be updated \(no Owner has run \./scripts/grant-safety-stop\.ps1\), the container stays between sessions and adds about 22\.32 USD a month\.'
+        $monthly.evidence.t5ContainerLifecycle | Should -Be 'Session'
+        @($session.MissingPrices) | Should -BeNullOrEmpty
 
-        $free = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $true
-        ($free.Components | Where-Object Name -Match '^T5 throughput').Cost | Should -Be 0
-        ($free.Components | Where-Object Name -Match '^T5 throughput').Meter | Should -Match 'Free Tier'
-        $free.T5FixedMonthly | Should -Be 7.8 -Because 'the private endpoint and its DNS zone still bill'
-        ($free.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'has the subscription''s free tier'
-
-        $unchecked = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $unchecked.T5FixedMonthly | Should -Be 31.41
+        $unchecked = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $unchecked.T5RunningHourly | Should -Be 0.0323 -Because 'an unchecked free tier is priced at list price, an upper bound'
         $unchecked.T5FreeTier | Should -BeNullOrEmpty
         ($unchecked.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'wasn''t checked, so its throughput is at list price, an upper bound'
-        @($unchecked.MissingPrices) | Should -BeNullOrEmpty
     }
 
-    It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput all month when its plan is on Standard, and attributes the plan (ADR 0027)' {
+    It 'prices T5''s container all month with the AlwaysOn lifecycle, while the session control''s role can''t create it (2026-11-19, ADR 0027)' {
+        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $alwaysOn = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle AlwaysOn
+        $t5 = @($alwaysOn.Components | Where-Object Name -Match '^T5 ')
+        # 400 RU/s = 4 x 100 RU/s for 730 hours at 0.008; 1 GB at 0.25; the private endpoint and its DNS zone as with Session.
+        ($t5 | Where-Object Name -Match '^T5 throughput').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -Match '^T5 throughput').Cost | Should -Be 23.36
+        ($t5 | Where-Object Name -Match '^T5 storage').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -Match '^T5 storage').Cost | Should -Be 0.25
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Cost | Should -Be 7.3
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Cost | Should -Be 0.5
+        $alwaysOn.T5ContainerLifecycle | Should -Be 'AlwaysOn'
+        $alwaysOn.T5FixedMonthly | Should -Be 31.41
+        $alwaysOn.T5RunningHourly | Should -Be 0
+        $alwaysOn.HourlyRunning | Should -Be $base.HourlyRunning -Because 'nothing of T5 is a running cost while its container stays'
+        [System.Math]::Round($alwaysOn.LightUseMonthly - $base.LightUseMonthly, 2) | Should -Be 31.41 -Because 'all month, however many hours the demo runs'
+        $alwaysOn.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(23.61 - 0.0323 * 40, 2)) -Because 'what the Session lifecycle saves'
+        $monthly = $alwaysOn.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) costs 31\.41 USD a month whether the demo runs or not \(its 400 RU/s of throughput, storage, private endpoint, and private DNS zone\): its container stays between sessions until the session control''s role can create it\.'
+        $monthly.message | Should -Match 'Once \./scripts/deploy\.ps1 runs as an Owner of the subscription, or an Owner runs \./scripts/grant-safety-stop\.ps1 once, the container exists only during a session, which saves about 22\.32 USD a month\.'
+        $monthly.evidence.t5ContainerLifecycle | Should -Be 'AlwaysOn'
+    }
+
+    It 'prices T5''s throughput at zero on the free tier with the <Lifecycle> lifecycle, so its private endpoint and DNS zone are all it bills (2026-11-19, ADR 0027)' -ForEach @(
+        @{ Lifecycle = 'Session'; Basis = 'running' }
+        @{ Lifecycle = 'AlwaysOn'; Basis = 'idle' }
+    ) {
+        $free = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $true -T5ContainerLifecycle $Lifecycle
+        $throughput = $free.Components | Where-Object Name -Match '^T5 throughput'
+        $throughput.Meter | Should -Match 'Free Tier'
+        $throughput.Basis | Should -Be $Basis
+        $throughput.Cost | Should -Be 0
+        ($free.Components | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
+        ($free.Components | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
+        $free.T5FixedMonthly | Should -Be 7.8 -Because 'the private endpoint and its DNS zone still bill'
+        $free.T5RunningHourly | Should -Be 0
+        $free.T5AlwaysOnExtraMonthly | Should -Be 0 -Because 'the free tier covers the container whenever it exists'
+        $monthly = ($free.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message
+        $monthly | Should -Match 'has the subscription''s free tier'
+        $monthly | Should -Not -Match 'adds about|saves about'
+    }
+
+    It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput while its container exists, and attributes the plan (2026-11-19, ADR 0027)' {
         $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'CosmosDbs'; pricingTier = 'Standard'; subPlan = $null })
-        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true
-        $defender = $estimate.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
+        $session = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true
+        $defender = $session.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
         $defender.Meter | Should -Match 'Standard 100 RU/s$' -Because 'the Standard meter, not the trial'
-        $defender.Cost | Should -Be 3.504 -Because '4 x 100 RU/s for 730 hours at 0.0012, free tier or not'
-        $defender.Basis | Should -Be 'idle'
-        $estimate.T5FixedMonthly | Should -Be 11.3
-        $message = ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message
+        $defender.Basis | Should -Be 'running'
+        $defender.Cost | Should -Be 0.0048 -Because '4 x 100 RU/s at 0.0012 for each hour the container exists, free tier or not'
+        $session.T5FixedMonthly | Should -Be 7.8
+        $session.T5RunningHourly | Should -Be 0.0048
+        $session.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(3.504 - 0.0048 * 10, 2))
+        ($session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'so its 400 RU/s of throughput, its storage, and Defender for Azure Cosmos DB add 0\.005 USD a running hour\.'
+        $message = ($session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message
         $message | Should -Match 'CosmosDbs'
         $message | Should -Not -Match 'not attributed to the demo: [^.]*CosmosDbs'
-        @($estimate.Components | Where-Object { $_.Name -match 'CSPM' -and $_.Name -match 'T5' }) | Should -BeNullOrEmpty -Because 'Defender CSPM doesn''t bill Cosmos DB accounts'
+        @($session.Components | Where-Object { $_.Name -match 'CSPM' -and $_.Name -match 'T5' }) | Should -BeNullOrEmpty -Because 'Defender CSPM doesn''t bill Cosmos DB accounts'
+
+        $alwaysOn = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true -T5ContainerLifecycle AlwaysOn
+        $defender = $alwaysOn.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
+        $defender.Basis | Should -Be 'idle'
+        $defender.Cost | Should -Be 3.504 -Because '4 x 100 RU/s for 730 hours at 0.0012, free tier or not'
+        $alwaysOn.T5FixedMonthly | Should -Be 11.3
+        [System.Math]::Abs(($alwaysOn.DefenderMonthly - $session.DefenderMonthly) - (3.504 - 0.0048 * 10)) | Should -BeLessOrEqual 0.011
     }
 
     It 'counts business-day''s T3 incidents, which the shipped share already prices at T3''s maximum, so both ceilings hold as before (2026-11-03)' {
@@ -796,6 +860,8 @@ Describe 'Get-DemoCostEstimate' {
         $file | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyPath -Encoding utf8NoBOM
         $legacy = Get-DemoConfig -Path $legacyPath
         $legacy['t4Enabled'] = $false
+        # T5's container bills by the running hour since 2026-11-19 (ADR 0027); off here, as in New-TestConfig.
+        $legacy['t5Enabled'] = $false
         # The fixture's lowest-cost session, 11.70 USD, is between the two ceilings: a Pass against 20, not a Warning against 15.
         $session = (Get-DemoCostEstimate -Config $legacy -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
         $session.status | Should -Be 'Pass'

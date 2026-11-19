@@ -1450,6 +1450,9 @@ function Invoke-DemoDeploymentTrack {
                         }
                         break
                     }
+                    # The container exists only during a session (2026-11-19): the template creates it, but a resumed run skips
+                    # the template, and a stop since may have deleted it, so it's made sure of before the checks and the warmup.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
                     $checks = @(Test-DemoT5 -Config $Config)
                     & $addAll $checks
                     if (& $hasStatus $checks 'Fail') {

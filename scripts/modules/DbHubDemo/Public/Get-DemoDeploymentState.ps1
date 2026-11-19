@@ -24,7 +24,9 @@ function Get-DemoDeploymentState {
     runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the
     DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), T4Replica (Session once deploy.ps1 has set up T4's
     read replica for this environment, in the DbHubT4Replica tag; 2026-11-13, ADR 0025), T4ReplicaSize (the size and zone the
-    last replica was created with, in the DbHubT4ReplicaSize tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
+    last replica was created with, in the DbHubT4ReplicaSize tag), T5Container (2026-11-19, ADR 0027: Session once the session
+    control's role can create T5's container, so it exists only during a session; AlwaysOn while it can't; in the
+    DbHubT5Container tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
     nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
     ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
     ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), T5Refused (when
@@ -85,6 +87,7 @@ function Get-DemoDeploymentState {
         T2InstallMode     = & $read 'T2InstallMode'
         T4Replica         = & $read 'T4Replica'
         T4ReplicaSize     = & $read 'T4ReplicaSize'
+        T5Container       = & $read 'T5Container'
         BusyUntilUtc      = & $read 'BusyUntilUtc'
         BusyBy            = & $read 'BusyBy'
         FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()

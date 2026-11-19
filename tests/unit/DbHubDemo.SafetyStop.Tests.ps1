@@ -21,6 +21,9 @@ BeforeAll {
         'Microsoft.Sql/servers/databases/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+        # T5's session-only container (2026-11-19, ADR 0024's amendment, provisionally approved by the coordinator for the owner).
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
     )
     $script:now = [datetime]::new(2026, 11, 5, 18, 0, 0, [System.DateTimeKind]::Utc)
 
@@ -376,14 +379,15 @@ Describe 'The nightly safety stop''s names, role, and times (ADR 0024)' {
         $name.RoleName | Should -Be 'DbHub Demo Safety Stop'
     }
 
-    It 'has exactly the owner-approved actions, as ADR 0024 lists them, and nothing that starts, writes, or deletes' {
+    It 'has exactly the owner-approved actions, as ADR 0024 lists them, nothing that starts or writes, and no delete but T5''s session-only container''s' {
         $definition = InModuleScope DbHubDemo { Get-DemoSafetyStopRoleDefinition -SubscriptionId '11111111-2222-3333-4444-555555555555' }
         $actions = @($definition.properties.permissions[0].actions)
         $actions | Should -Be $script:approvedActions
         @($definition.properties.permissions[0].notActions) | Should -BeNullOrEmpty
         @($definition.properties.permissions[0].dataActions) | Should -BeNullOrEmpty
         @($definition.properties.assignableScopes) | Should -Be @('/subscriptions/11111111-2222-3333-4444-555555555555')
-        @($actions | Where-Object { $_ -match '\*|/start/|/write$|/delete$|runCommand|Microsoft\.Authorization|Microsoft\.Automation|Microsoft\.KeyVault' }) | Should -BeNullOrEmpty
+        @($actions | Where-Object { $_ -match '\*|/start/|/write$|/delete$|runCommand|Microsoft\.Authorization|Microsoft\.Automation|Microsoft\.KeyVault' }) | Should -Be @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete')
+        $definition.properties.description | Should -Match 'read and delete its session-only Azure Cosmos DB container'
         $adr = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'docs/adr/0024-nightly-safety-stop.md') -Raw
         $section = [regex]::Match($adr, '(?s)### The role: DbHub Demo Safety Stop(.+?)\n### ').Groups[1].Value
         @([regex]::Matches($section, '(?m)^- `([^`]+)`$') | ForEach-Object { $_.Groups[1].Value }) | Should -Be $script:approvedActions
@@ -839,13 +843,18 @@ Describe 'scripts/grant-safety-stop.ps1, the Owner''s one command' {
         Mock -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
         # The session control's roles too (2026-11-14, ADR 0026): one grant script for everything deploy.ps1 couldn't assign.
         Mock -CommandName Invoke-DemoActivityControlSetup -MockWith { New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
+        # Then T5's container lifecycle (2026-11-19, ADR 0027): once a session can create the container again, it exists only
+        # during a session.
+        Mock -CommandName Update-DemoT5ContainerLifecycle -MockWith { New-DemoResult -CheckId 'GRANT.T5.LIFECYCLE' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s container exists only during a session from now on.' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/grant-safety-stop.ps1') -ConfigPath $configPath -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 0
         Should -Invoke -CommandName Invoke-DemoSafetyStopSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
         Should -Invoke -CommandName Invoke-DemoActivityControlSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
+        Should -Invoke -CommandName Update-DemoT5ContainerLifecycle -Times 1 -ParameterFilter { $Purpose -eq 'Grant' }
         $written = Get-Content -LiteralPath $outputPath -Raw
         $written | Should -Match 'SAFETYSTOP\.ROLE'
         $written | Should -Match 'CONTROL\.ROLE\.A1'
+        $written | Should -Match 'GRANT\.T5\.LIFECYCLE'
     }
 }
 

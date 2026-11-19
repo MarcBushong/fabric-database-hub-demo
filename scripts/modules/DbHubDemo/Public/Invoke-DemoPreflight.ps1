@@ -724,6 +724,9 @@ function Invoke-DemoPreflight {
     }
     # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # T5's container lifecycle (2026-11-19): its throughput bills for the running hours only, unless the environment exists
+    # and its container stays between sessions.
+    $costParameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $Config
     # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On

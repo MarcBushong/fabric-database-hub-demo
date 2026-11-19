@@ -27,9 +27,12 @@ function Stop-DemoEnvironment {
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
       storage and the Defender plans a tenant policy enables are billed while it's stopped.
-      T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off; an account has no stop, so STOP.T5
-      (Not supported) says what bills on between sessions: its provisioned throughput (nothing on the free tier), its
-      storage, and its private endpoint (Get-DemoT5StopResult). destroy.ps1 deletes it.
+      T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off. An account has no stop, and a
+      container's throughput can't be taken away, so its container is deleted at the end (2026-11-19, STOP.T5,
+      Invoke-DemoT5ContainerStop): its throughput stops billing until the next session creates it again, and only its
+      private endpoint and DNS zone bill between sessions. It's kept, with a Warning and the grant command, while Run all
+      couldn't create it again (the session control's role lacks the container's actions; the DbHubT5Container tag isn't
+      Session), so a session never runs without it. destroy.ps1 deletes the account.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
       it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP). The busy marker (2026-11-14) is cleared, a
       deferred nightly pass removed, and the VMs' auto-shutdown put back at autoShutdownTime, since everything stops now
@@ -325,11 +328,6 @@ function Stop-DemoEnvironment {
     elseif (-not $ParkT2 -and $t4On) {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))
     }
-    # T5 (2026-11-18, ADR 0027): an Azure Cosmos DB account has no stop or pause. Its activity is off now (above) and the
-    # runner ended with sqlvm01, so it serves no requests, but what it provisions bills on: said here, once per stop.
-    if (-not $ParkT2 -and (Test-DemoT5Enabled -Config $Config)) {
-        $results.Add((Get-DemoT5StopResult -State $(if ($t5Missing) { $null } else { $t5Read })))
-    }
 
     if (-not $ParkT2) {
         # Phase 26b (ADR 0023): the session's history first, then the capacity the demo resumed, because a pause would
@@ -373,6 +371,12 @@ function Stop-DemoEnvironment {
         else {
             $results.Add((Suspend-DemoFabricCapacity -Config $Config -State $state -CheckPrefix STOP -Confirm:$false))
         }
+    }
+    # T5 (ADR 0027): an Azure Cosmos DB account has no stop or pause. Its activity is off now (above), the runner ended with
+    # sqlvm01, and its metrics were read for the history, so its container is deleted (2026-11-19): its throughput stops
+    # billing until the next session creates it again. It's kept when Run all couldn't create it again; STOP.T5 says why.
+    if (-not $ParkT2 -and (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((Invoke-DemoT5ContainerStop -Config $Config -State $(if ($t5Missing) { $null } else { $t5Read }) -DeploymentState $state -Confirm:$false))
     }
 
     if ($RemoveT3) {

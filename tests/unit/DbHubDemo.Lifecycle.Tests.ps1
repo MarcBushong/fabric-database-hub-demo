@@ -2103,6 +2103,23 @@ Describe 'Start-DemoEnvironment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: business-day:*set activityProfile to baseline for a quiet demo*' } -Times 1 -Exactly
     }
 
+    It 'creates T5''s container while the VMs boot, before T5''s profile, and leaves T5''s activity off when it can''t (2026-11-19)' {
+        $withT5 = New-TestConfig -WithT5
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ Enabled = $true; AccountName = 'cosmos01-abc123'; ContainerName = 'patient-events' }; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        $script:containerStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { $script:order.Add('T5Container'); New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container wasn''t there, so it was created.' }
+        $results = @(Start-DemoEnvironment -Config $withT5 -Confirm:$false)
+        ($results | Where-Object { $_.checkId -eq 'START.T5.CONTAINER' }).status | Should -Be 'Pass'
+        $script:order.IndexOf('T5Container') | Should -BeGreaterThan $script:order.IndexOf('Request:archost01') -Because 'it runs while the VMs boot'
+        $script:order.IndexOf('T5Container') | Should -BeLessThan $script:order.IndexOf('Profile:T5=baseline')
+        $script:order.Clear()
+        $script:containerStatus = 'Fail'
+        $results = @(Start-DemoEnvironment -Config $withT5 -Confirm:$false)
+        ($results | Where-Object { $_.checkId -eq 'START.T5.CONTAINER' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'Profile:T5=baseline'
+        ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T5' }).message | Should -Match 'START\.T5\.CONTAINER'
+    }
+
     It 'clears an earlier run''s record that left T4 out, which no longer holds, and keeps any other record (2026-11-09)' {
         $script:recorded = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add($Value) }
@@ -3196,6 +3213,8 @@ Describe 'Invoke-DemoControl' {
     }
 
     It 'sends T5 its activity on sqlvm01 with all when T5 is on, an ru-storm on T5, and nothing to T5 when it''s off (2026-11-18, ADR 0027)' {
+        $script:containerStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container is there.' -Evidence @{ action = 'none' } }
         $withT5 = New-TestConfig -WithT5
         $null = Invoke-DemoControl -Config $withT5 -Target all -Scenario baseline -DurationMinutes 30 -Confirm:$false
         $script:calls.Target | Should -Be @('T1', 'T2', 'T3', 'T5')
@@ -3209,6 +3228,21 @@ Describe 'Invoke-DemoControl' {
         $script:calls.Count | Should -Be 0
         ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).status | Should -Be 'Not selected'
         ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).message | Should -Match 't5Enabled is false'
+    }
+
+    It 'makes sure T5''s container exists before an activity on T5, and sends T5 nothing when it can''t be created (2026-11-19)' {
+        $script:containerStatus = 'Fail'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container couldn''t be created.' -Evidence @{ action = 'create' } }
+        $withT5 = New-TestConfig -WithT5
+        $results = Invoke-DemoControl -Config $withT5 -Target all -Scenario baseline -DurationMinutes 30 -Confirm:$false
+        $script:calls.Target | Should -Be @('T1', 'T2', 'T3')
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5.CONTAINER' }).status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoT5Container -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'CONTROL.T5.CONTAINER' }
+        # Turning T5's activity off needs no container.
+        $script:calls.Clear()
+        $null = Invoke-DemoControl -Config $withT5 -Target T5 -Scenario off -Confirm:$false
+        $script:calls.Target | Should -Be @('T5')
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoT5Container -Times 1 -Exactly
     }
 
     It 'runs an incident on all on the scenario''s default target' {

@@ -777,7 +777,7 @@ internal static partial class CommandLine
 
     private static Command SetupCommand()
     {
-        var command = new Command("setup", "Create or update the demo objects (control tables, procedures) in ContosoCare. Run it as an administrator; it's idempotent. On T5: verify the container (the template creates it) and, with --seed-scale, write the patient documents.");
+        var command = new Command("setup", "Create or update the demo objects (control tables, procedures) in ContosoCare. Run it as an administrator; it's idempotent. On T5: verify the container (it exists only during a session: start-demo.ps1 or deploy.ps1 creates it) and, with --seed-scale, write the patient documents.");
         var target = new TargetOptions(command);
         var baseSchema = new Option<bool>("--include-base-schema") { Description = "Also apply 010-schema.sql and 020-seed.sql (the bootstraps normally do; T4's setup applies them itself)." };
         var seedScale = new Option<int?>("--seed-scale") { Description = "Run demo.usp_seed_contosocare at this scale (1 to 50) unless that seed is already complete. On T5: upsert scale x 100 patient profile documents (p-0001 and on)." };
@@ -801,7 +801,7 @@ internal static partial class CommandLine
                 {
                     if (parseResult.GetValue(baseSchema) || parseResult.GetValue(grant) is not null || parseResult.GetValue(entraObject) is not null || parseResult.GetValue(runnerRole) is not null)
                     {
-                        throw new ScenarioRequestException("--include-base-schema, --grant-windows-login, --grant-entra-object-id, and --runner-role are for the SQL targets and T4: T5's database and container come from the template, and T1's data-plane role from deploy.ps1.");
+                        throw new ScenarioRequestException("--include-base-schema, --grant-windows-login, --grant-entra-object-id, and --runner-role are for the SQL targets and T4: T5's database comes from the template, its container (only during a session) from start-demo.ps1 or deploy.ps1, and T1's data-plane role from deploy.ps1.");
                     }
 
                     return await SetupT5Async(parseResult, target.ResolveCosmos(parseResult), parseResult.GetValue(seedScale), parseResult.GetValue(json), cancellationToken).ConfigureAwait(false);
@@ -1099,7 +1099,7 @@ internal static partial class CommandLine
     private static string Remediation(string command, DemoTarget target, CheckRecord check) => check.Status is "Pass" or "Not selected" ? string.Empty : target switch
     {
         DemoTarget.T5 when IsThrottleCheck(check) => "Wait for the storm to end, or stop it ('ContosoCare.Workload stop --target T5 --scenario ru-storm'), then try again.",
-        DemoTarget.T5 when command is "setup" or "warmup" => "Run deploy.ps1, which creates T5's database and container and assigns T1's data-plane role, then 'ContosoCare.Workload setup --target T5 --server <host>' on T1.",
+        DemoTarget.T5 when command is "setup" or "warmup" => "T5's container exists only during a session: run ./scripts/start-demo.ps1 (or deploy.ps1, which also creates T5's database and assigns T1's data-plane role), then 'ContosoCare.Workload setup --target T5 --server <host>' on T1.",
         DemoTarget.T5 => "Run 'ContosoCare.Workload reset --target T5' on T1, then 'status --target T5 --server <host>'.",
         _ => "Run 'ContosoCare.Workload reset' as an administrator on the target, then 'status'.",
     };

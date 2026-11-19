@@ -14,7 +14,9 @@ namespace ContosoCare.Workload.Tests;
 /// <summary>
 /// T5's runner on an accelerated clock against a fake account: healthy-baseline's mix stays in its bounded id space,
 /// ru-storm alternates waves and calms, counts its 429s, and deletes its documents at the end, a stop ends a run within
-/// seconds, and the deadline ends it. Also status's JSON and T5's command line. No Cosmos DB account is needed.
+/// seconds, and the deadline ends it. A container that doesn't exist now (it exists only during a session) is a refusal
+/// the profile host tries again, with nothing for a cleanup to delete. Also status's JSON and T5's command line. No Cosmos
+/// DB account is needed.
 /// </summary>
 public sealed class CosmosRunnerTests : IDisposable
 {
@@ -168,20 +170,143 @@ public sealed class CosmosRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task AMissingContainerOrAnotherTargetIsARefusalThatDoesntPass()
+    public async Task AMissingContainerIsARefusalThatPassesOnceASessionCreatesIt()
     {
-        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount { ContainerMissing = true });
-        var runner = new CosmosScenarioRunner(client, new CosmosRunStore(StorePath), RunnerLog.Null, TimeProvider.System);
+        // T5's container exists only during a session: a run before a session's start creates it, or after its end deleted
+        // it, is refused ("request", as before) with that reason, and the profile host tries it again.
+        var account = new FakeCosmosAccount { ContainerMissing = true };
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), account);
+        var store = new CosmosRunStore(StorePath);
+        var runner = new CosmosScenarioRunner(client, store, RunnerLog.Null, TimeProvider.System);
         var token = TestContext.Current.CancellationToken;
 
-        var missing = await runner.RunAsync(Plan("healthy-baseline", TimeSpan.FromSeconds(60), 1, 2, TimeProvider.System), token);
-        var baseline = ScenarioCatalog.Default.Get("healthy-baseline");
-        var elsewhere = await runner.RunAsync(RunBounds.Plan(baseline, new RunRequest { ScenarioId = baseline.Id, Target = DemoTarget.T1, Duration = TimeSpan.FromSeconds(60) }, DateTimeOffset.UtcNow), token);
+        var missing = await runner.RunAsync(Plan("ru-storm", TimeSpan.FromSeconds(60), 1, 2, TimeProvider.System), token);
 
+        Assert.Equal("Refused", missing.Status);
         Assert.Equal("request", missing.RefusalReason);
-        Assert.Contains("deploy.ps1", missing.Outcome, StringComparison.Ordinal);
+        Assert.Equal("T5's container contosocare/patient-events doesn't exist now: it exists only during a session, so ./scripts/start-demo.ps1 or the control notebook's Run all creates it first.", missing.Outcome);
+        Assert.True(missing.CanRetryRefusal);
+        Assert.Single(account.Requests);
+        Assert.Empty((await store.ReadAsync(token)).Runs!);
+    }
+
+    [Fact]
+    public async Task AnotherTargetIsARefusalThatDoesntPass()
+    {
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount());
+        var runner = new CosmosScenarioRunner(client, new CosmosRunStore(StorePath), RunnerLog.Null, TimeProvider.System);
+        var baseline = ScenarioCatalog.Default.Get("healthy-baseline");
+
+        var elsewhere = await runner.RunAsync(RunBounds.Plan(baseline, new RunRequest { ScenarioId = baseline.Id, Target = DemoTarget.T1, Duration = TimeSpan.FromSeconds(60) }, DateTimeOffset.UtcNow), TestContext.Current.CancellationToken);
+
         Assert.Equal("request", elsewhere.RefusalReason);
         Assert.False(elsewhere.CanRetryRefusal);
+    }
+
+    [Fact]
+    public async Task TheProfileHostTriesAMissingContainerAgainUntilASessionCreatesIt()
+    {
+        // A T5 profile set a little before the session's start creates the container: each start is refused, tried again
+        // after the host's retry delay (30 seconds; shorter here), never sooner, and the baseline starts once the container
+        // exists. The host neither crashes nor gives up.
+        Directory.CreateDirectory(folder);
+        var account = new FakeCosmosAccount { ContainerMissing = true };
+        using var writer = new StringWriter();
+        using var log = new RunnerLog(writer);
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), account);
+        var runner = new CosmosScenarioRunner(client, new CosmosRunStore(StorePath), log, TimeProvider.System);
+        var profiles = new FileProfileStore(Path.Combine(folder, "activity-t5.json"));
+        var token = TestContext.Current.CancellationToken;
+        await profiles.SetAsync("baseline", "tester", DateTimeOffset.UtcNow.AddMinutes(30), null, null, token);
+        var options = new ProfileHostOptions { Poll = TimeSpan.FromMilliseconds(50), SupervisorInterval = TimeSpan.FromMilliseconds(50), RefusedRetryDelay = TimeSpan.FromMilliseconds(200), ShutdownWait = TimeSpan.FromSeconds(10) };
+        var host = new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options);
+        using var stop = new CancellationTokenSource();
+        var hosting = Task.Run(() => host.RunAsync([new ProfileTarget(DemoTarget.T5, runner, profiles)], null, stop.Token), token);
+
+        await WaitForAsync(() => Task.FromResult(ContainerReads(account).Count >= 3), token);
+        account.ContainerMissing = false;
+        await WaitForAsync(() => Task.FromResult(account.Requests.Any(r => r.Path.StartsWith(FakeCosmosAccount.DocumentsPath, StringComparison.Ordinal) && r.Header("User-Agent")!.StartsWith("ContosoCare.Demo/healthy-baseline/", StringComparison.Ordinal))), token);
+        await stop.CancelAsync();
+        await hosting.WaitAsync(TimeSpan.FromSeconds(30), token);
+
+        var reads = ContainerReads(account);
+        for (var i = 1; i < reads.Count; i++)
+        {
+            Assert.True(reads[i] - reads[i - 1] >= options.RefusedRetryDelay - TimeSpan.FromMilliseconds(15), $"The container was read again {(reads[i] - reads[i - 1]).TotalMilliseconds:0} ms after a refusal.");
+        }
+
+        var text = writer.ToString();
+        Assert.Contains(CosmosEndpoint.ContainerMissingMessage, text, StringComparison.Ordinal);
+        Assert.Contains("profile.start-retry", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("profile.start-gave-up", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("profile.lane-crashed", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WarmupSaysTheContainerExistsOnlyDuringASession()
+    {
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount { ContainerMissing = true });
+
+        var failure = await Assert.ThrowsAsync<CosmosException>(() => CosmosAccount.WarmupAsync(client, TimeProvider.System, TestContext.Current.CancellationToken));
+
+        Assert.Equal(CosmosFailure.NotFound, failure.Failure);
+        Assert.Equal(CosmosEndpoint.ContainerMissingMessage, failure.Message);
+    }
+
+    [Fact]
+    public async Task SetupsContainerCheckFailsWithTheSessionsFixWhenTheContainerDoesntExistNow()
+    {
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount { ContainerMissing = true });
+
+        var (check, container) = await CosmosAccount.VerifyContainerAsync(client, "ContosoCare.Demo/control/setup", TimeProvider.System, TestContext.Current.CancellationToken);
+
+        Assert.Equal("Fail", check.Status);
+        Assert.Null(container);
+        Assert.Contains("contosocare/patient-events now (HTTP 404): it exists only during a session, so ./scripts/start-demo.ps1 (or deploy.ps1) creates it", check.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AStormWhoseContainerIsDeletedMidRunHasNoDocumentLeftToCleanUp()
+    {
+        // A session's end deletes T5's container: a storm still running then fails (its writes get 404 with substatus
+        // 1003), and its cleanup has no storm document left to delete, which is a Pass, not a Warning.
+        var time = new AcceleratedTime(10);
+        var account = new FakeCosmosAccount(time);
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), account);
+        var runner = new CosmosScenarioRunner(client, new CosmosRunStore(StorePath, time), RunnerLog.Null, time);
+        var token = TestContext.Current.CancellationToken;
+
+        var run = runner.RunAsync(Plan("ru-storm", TimeSpan.FromSeconds(300), concurrency: 2, intensity: 5, time, new Dictionary<string, string> { ["stormSeconds"] = "60", ["calmSeconds"] = "0" }), token);
+        await WaitForAsync(() => Task.FromResult(account.Requests.Count(r => r.IsUpsert) >= 5), token);
+        account.ContainerMissing = true;
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(30), token);
+
+        Assert.Equal("Failed", result.Status);
+        Assert.Contains("exists only during a session", result.Outcome, StringComparison.Ordinal);
+        var cleanup = Assert.Single(result.Checks, c => c.CheckId == "auto-cleanup");
+        Assert.Equal("Pass", cleanup.Status);
+        Assert.Equal("T5's container doesn't exist now (it exists only during a session), so no storm document is left.", cleanup.Message);
+        Assert.EndsWith(" Cleanup: " + StormCleanupResult.ContainerMissingMessage, result.Outcome, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ARecoveredStormWhoseContainerIsGoneHasNothingToCleanUp()
+    {
+        var store = new CosmosRunStore(StorePath);
+        var token = TestContext.Current.CancellationToken;
+        var dead = new CosmosRunOwner(Environment.MachineName, 1_000_007, DateTimeOffset.UtcNow.AddHours(-1));
+        await store.BeginRunAsync(new CosmosRunStart("20261118160000-t5-dead02", "ru-storm", 600, 1800, 8, 7, "{}", "profile:showcase", "showcase") { Owner = dead }, token);
+        using var writer = new StringWriter();
+        using var log = new RunnerLog(writer);
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount { ContainerMissing = true });
+        var runner = new CosmosScenarioRunner(client, store, log, TimeProvider.System);
+
+        var recovered = await runner.RecoverOrphanedProfileRunsAsync(Environment.MachineName, DateTimeOffset.UtcNow.AddMinutes(1), token);
+
+        Assert.Equal(["20261118160000-t5-dead02"], recovered);
+        var cleanup = Assert.Single(writer.ToString().Split(Environment.NewLine), l => l.Contains(" run.cleanup ", StringComparison.Ordinal));
+        Assert.Contains("complete=True containerMissing=True", cleanup, StringComparison.Ordinal);
+        Assert.Contains("error=\"\"", cleanup, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -230,14 +355,16 @@ public sealed class CosmosRunnerTests : IDisposable
         Assert.Equal("showcase", run["profile"]!.GetValue<string>());
         Assert.Equal(["scenario", "requestedAt", "requestedBy", "scope", "runId"], json["stopRequests"]![0]!.AsObject().Select(p => p.Key));
         var account = json["account"]!;
-        Assert.Equal(["endpoint", "database", "container", "reachable", "partitionKey", "error", "live"], account.AsObject().Select(p => p.Key));
+        Assert.Equal(["endpoint", "database", "container", "reachable", "containerExists", "partitionKey", "error", "note", "live"], account.AsObject().Select(p => p.Key));
         Assert.Equal(Host, account["endpoint"]!.GetValue<string>());
         Assert.Equal("contosocare", account["database"]!.GetValue<string>());
         Assert.Equal("patient-events", account["container"]!.GetValue<string>());
         Assert.True(account["reachable"]!.GetValue<bool>());
+        Assert.True(account["containerExists"]!.GetValue<bool>());
         Assert.Equal("/patientId", account["partitionKey"]!["paths"]![0]!.GetValue<string>());
         Assert.Equal(2, account["partitionKey"]!["version"]!.GetValue<int>());
         Assert.Null(account["error"]);
+        Assert.Null(account["note"]);
         Assert.Equal(75.5, account["live"]!["requestsPerSecond"]!.GetValue<double>());
         Assert.Equal(401.2, account["live"]!["ruPerSecond"]!.GetValue<double>());
         Assert.Equal(12.25, account["live"]!["throttledPerSecond"]!.GetValue<double>());
@@ -258,12 +385,34 @@ public sealed class CosmosRunnerTests : IDisposable
 
         var account = json["account"]!;
         Assert.False(account["reachable"]!.GetValue<bool>());
+        Assert.Null(account["containerExists"]);
         Assert.Null(account["partitionKey"]);
         Assert.Contains("Cosmos DB Built-in Data Contributor", account["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Null(account["note"]);
         Assert.Equal(0, account["live"]!["requestsPerSecond"]!.GetValue<double>());
         Assert.Null(account["live"]!["updatedAt"]);
         Assert.Equal("host", json.Last().Key);
         Assert.DoesNotContain(tokens.Token, json.ToJsonString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StatusSaysT5sContainerDoesntExistNowWithoutAnError()
+    {
+        // Between sessions T5's container doesn't exist: the account answers, and status says so, which isn't an error.
+        Directory.CreateDirectory(folder);
+        using var client = new CosmosRestClient(CosmosEndpoint.Create(Host, null), new FakeTokens(), new FakeCosmosAccount { ContainerMissing = true });
+
+        var status = await CommandLineDefinition.ReadStatusT5Async(client, new CosmosRunStore(StorePath), new FileProfileStore(Path.Combine(folder, "activity-t5.json")), 10, Path.Combine(folder, "host-lanes.json"), TestContext.Current.CancellationToken);
+        var account = CommandLineDefinition.StatusT5Node(status)["account"]!;
+        using var text = new StringWriter();
+        CommandLineDefinition.WriteStatusT5Text(text, status);
+
+        Assert.True(account["reachable"]!.GetValue<bool>());
+        Assert.False(account["containerExists"]!.GetValue<bool>());
+        Assert.Null(account["partitionKey"]);
+        Assert.Null(account["error"]);
+        Assert.Equal("T5's container doesn't exist now: it exists only during a session (./scripts/start-demo.ps1 or the control notebook's Run all creates it).", account["note"]!.GetValue<string>());
+        Assert.Contains($"Account:  {Host} answers; T5's container doesn't exist now: it exists only during a session", text.ToString(), StringComparison.Ordinal);
     }
 
     [Theory]
@@ -410,6 +559,10 @@ public sealed class CosmosRunnerTests : IDisposable
             new RunRequest { ScenarioId = scenarioId, Target = DemoTarget.T5, Duration = duration, Concurrency = concurrency, Intensity = intensity, Parameters = parameters ?? [], RequestedBy = "tester" },
             time.GetUtcNow());
     }
+
+    /// <summary>When each read of the container's definition arrived.</summary>
+    private static List<DateTimeOffset> ContainerReads(FakeCosmosAccount account) =>
+        [.. account.Requests.Where(r => r.Method == "GET" && r.Path == FakeCosmosAccount.ContainerPath).Select(r => r.At)];
 
     private static async Task WaitForAsync(Func<Task<bool>> condition, CancellationToken cancellationToken)
     {

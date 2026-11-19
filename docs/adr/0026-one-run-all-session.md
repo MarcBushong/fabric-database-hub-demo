@@ -108,6 +108,16 @@ No network join action: the replica's create names T4's delegated subnet and pri
 
 Azure has no narrower action and no name condition for these: attribute-based conditions cover storage data actions only. A delete lock on T4 would block the identity's delete of T4, but `destroy.ps1` as a Contributor couldn't remove it, so there's none.
 
+**Since 2026-11-19** ([ADR 0027](0027-t5-cosmos-db.md), approved for the user by the coordinator, who reviews it with the owner before any merge), three more, at the demo resource group only (A1), because T5's container exists only during a session: its provisioned throughput bills every hour it exists, and an Azure Cosmos DB account has no stop ([Azure Cosmos DB's permissions](https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb)):
+
+| Action | What the session uses it for | What it could also touch, at the demo resource group |
+|---|---|---|
+| `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read` | Reads whether T5's container is there, before T5's activity and after a delete | Any Azure Cosmos DB container's settings there, where T5's account is the only account; never its documents |
+| `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write` | Creates T5's container at a session's start | Could change any container there; the runbook creates `contosocare/patient-events` only |
+| `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete` | Deletes T5's container at a session's stop | Could delete any container there; the runbook deletes `contosocare/patient-events` only, and only while the demo resource group's `DbHubT5Container` tag is `Session` |
+
+Nothing of the account itself, its keys, its network, or its data plane: T1's own data-plane role reads and writes the documents.
+
 **"DbHub Demo Session Writer"** (A4, new), for the same identity at the control vault's two session secrets only, never at the demo resource group, whose optional vault it never reaches:
 
 | Action | What the session uses it for | What it could also touch |

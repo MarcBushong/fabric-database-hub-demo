@@ -5,12 +5,19 @@
 # identity, Automation account, and schedules live in the demo resource group and go with it, and they run the same
 # DbHub-Stop runbook code (automation/runbooks) with its own settings. Internal.
 
-# The custom role, exactly as the owner approved it on 2026-11-05 (ADR 0024): read and stop, nothing else. It can't start,
-# create, change, or delete anything; it has no Run Command, no data action, and no Automation, Key Vault, Fabric, or role
-# permission. Changing this list needs the owner's approval; tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and
-# the ADR differ.
+# The custom role, as the owner approved it on 2026-11-05 (ADR 0024) and as amended on 2026-11-19 (below): read, stop, and
+# delete T5's session-only container, nothing else. It can't start, create, or change anything; it has no Run Command, no
+# data action, and no Automation, Key Vault, Fabric, or role permission. Changing this list needs the owner's approval;
+# tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and the ADR differ.
+# 2026-11-19 (ADR 0024 and ADR 0027, provisionally approved by the coordinator for the owner, who reviews it before any
+# merge): read and delete T5's session-only container, so a session that ended without its stop doesn't leave its
+# provisioned throughput billing all night. It could read or delete any Azure Cosmos DB for NoSQL container in the demo
+# resource group, where T5's account is the only account, and the runbook deletes contosocare/patient-events only, and only
+# while the DbHubT5Container tag is Session (a session creates it again). Nothing of the account, its keys, its network,
+# or its data plane.
+# https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
 $script:SafetyStopRoleName = 'DbHub Demo Safety Stop'
-$script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, and read its Azure SQL database''s status. Assigned only at the demo resource group, to the nightly safety stop''s identity.'
+$script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, read its Azure SQL database''s status, and read and delete its session-only Azure Cosmos DB container. Assigned only at the demo resource group, to the nightly safety stop''s identity.'
 $script:SafetyStopRoleActions = @(
     'Microsoft.Resources/subscriptions/resourceGroups/read'
     'Microsoft.Compute/virtualMachines/read'
@@ -19,6 +26,8 @@ $script:SafetyStopRoleActions = @(
     'Microsoft.Sql/servers/databases/read'
     'Microsoft.DBforPostgreSQL/flexibleServers/read'
     'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
 )
 $script:SafetyStopAutomationApiVersion = '2024-10-23'
 $script:SafetyStopDoc = 'https://learn.microsoft.com/azure/automation/shared-resources/schedules'
@@ -221,11 +230,11 @@ function Get-DemoSafetyStopRoleDefinition {
 function Get-DemoSafetyStopRunbookSetting {
     <#
     .SYNOPSIS
-    The settings baked into the safety stop's DbHub-Stop (ADR 0024): the names it acts on, the demo's shutdown time, its
-    waits, and the pinned API versions. The shared code's checks also want the control's runbook and schedule names, so
-    they're here with the control's values, though the Nightly and T3Check scopes never use them, and its account is this
-    one. Nothing in it is secret: it holds the subscription ID and the identity's client ID, which live in Azure only.
-    Internal.
+    The settings baked into the safety stop's DbHub-Stop (ADR 0024): the names it acts on (since 2026-11-19 T5's account and
+    container too, ADR 0027), the demo's shutdown time, its waits, and the pinned API versions. The shared code's checks
+    also want the control's runbook and schedule names, so they're here with the control's values, though the Nightly and
+    T3Check scopes never use them, and its account is this one. Nothing in it is secret: it holds the subscription ID and
+    the identity's client ID, which live in Azure only. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -242,8 +251,17 @@ function Get-DemoSafetyStopRunbookSetting {
     )
 
     $apiVersions = [ordered]@{}
-    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers') {
+    # Microsoft.DocumentDB/databaseAccounts (2026-11-19, ADR 0027): T5's session-only container, which the nightly stop
+    # deletes when a session's stop didn't.
+    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DocumentDB/databaseAccounts') {
         $apiVersions[$type] = Get-DemoPinnedApiVersion -ResourceType $type
+    }
+    # T5 (2026-11-19, ADR 0027): its account and container's names, and its throughput for the stop's text, when it's on.
+    $t5On = Test-DemoT5Enabled -Config $Config
+    $cosmos = Get-DemoCosmosSetting
+    $t5Container = $null
+    if ($t5On) {
+        $t5Container = [ordered]@{ databaseName = [string]$cosmos['databaseName']; containerName = [string]$cosmos['containerName']; throughput = [int]$cosmos['throughputRUs'] }
     }
     return [ordered]@{
         schemaVersion         = 1
@@ -270,6 +288,10 @@ function Get-DemoSafetyStopRunbookSetting {
         t4ServerPrefix        = 'pgflex01-'
         # T4's read replica (ADR 0025): the safety stop stops one a session left behind, only after T4 is stopped.
         t4ReplicaPrefix       = ('{0}-' -f (Get-DemoT4ReplicaSetting)['serverNamePrefix'])
+        # T5's container (2026-11-19, ADR 0027): the nightly stop deletes one a session's stop didn't, while the demo
+        # resource group's DbHubT5Container tag is Session; empty and $null when T5 is off.
+        t5AccountPrefix       = $(if ($t5On) { '{0}-' -f $cosmos['accountNamePrefix'] } else { '' })
+        t5Container           = $t5Container
         autoShutdownTime      = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone  = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         t4WaitMinutes         = 10

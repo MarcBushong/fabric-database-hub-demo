@@ -131,6 +131,7 @@
         'Test-DemoT4'
         'Test-DemoT5'
         'Test-DemoTeardownResidue'
+        'Update-DemoT5ContainerLifecycle'
         'Wait-DemoBootstrapLoader'
         'Write-DemoDeploymentOutcome'
         'Write-DemoLog'

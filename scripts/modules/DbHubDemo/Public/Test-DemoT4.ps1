@@ -7,7 +7,8 @@ function Test-DemoT4 {
     metrics, max_connections, and with -IncludeMetrics whether Azure Monitor has fresh metrics (METRICS.T4).
 
     .DESCRIPTION
-    Reads only, with the documented REST APIs through 'az rest --method get' (they work while T4 is stopped).
+    Reads only, with the documented REST APIs through 'az rest --method get'. The server's own read (Servers - Get) works
+    while T4 is stopped, so T4.SERVER, T4.CONFIG, T4.ENTRAONLY, and T4.NETWORK are checked then too.
     Results: T4.SERVER, T4.CONFIG, T4.ENTRAONLY, T4.NETWORK, T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS,
     T4.MAXCONNECTIONS, and METRICS.T4. Database Hub's PostgreSQL monitoring reads the same Azure Monitor metrics (it's metrics-only,
     with no query-level diagnostics), so METRICS.T4 passing is what the Hub's PostgreSQL dashboard needs;
@@ -15,9 +16,15 @@ function Test-DemoT4 {
     T4.MAXCONNECTIONS (2026-11-03): the template sets max_connections to config/versions.json's postgresql.maxConnections
     on every size, so connection-surge reaches the limit and Database Hub's Failed connections fill; a static parameter,
     so a new value waits for a restart (isConfigPendingRestart), which deploy.ps1 does before T1 sets T4 up.
+    A stopped T4 (2026-11-18): T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS, and T4.MAXCONNECTIONS read through the running
+    server, and a stopped one answers ServerStoppedError ("Server '<name>' is in 'Stopped' state", live 2026-11-18;
+    "Once the server is stopped, other management operations aren't available", Learn). Such a read, or any of them that
+    fails while T4 isn't Ready (Stopped, Stopping, Starting, Updating, ...), is a Warning that says what wasn't checked and
+    why, and that start-demo.ps1 or the control notebook's Run all starts T4, never a Fail, as a paused T3 is; a read
+    that answers is judged as usual. A running T4's own failures stay what they were: a missing database is a Fail.
     T4 turned off (t4Enabled false) is Not selected.
 
-    Sources (checked 2026-10-23; the server parameter pages 2026-11-03):
+    Sources (checked 2026-10-23; the server parameter pages 2026-11-03; stopping a server 2026-11-18):
     - https://learn.microsoft.com/fabric/database/hub/monitor-postgresql
     - https://learn.microsoft.com/azure/postgresql/network/concepts-networking-private
     - https://learn.microsoft.com/azure/postgresql/security/security-manage-entra-users
@@ -25,6 +32,7 @@ function Test-DemoT4 {
     - https://learn.microsoft.com/rest/api/monitor/metrics/list
     - https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings
     - https://learn.microsoft.com/rest/api/postgresql/configurations/get
+    - https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server
 
     .PARAMETER DeploymentId
     The deployment's six-character suffix. Read from the resource group's deploymentId tag when omitted.
@@ -81,7 +89,7 @@ function Test-DemoT4 {
     $serverEvidence = [ordered]@{ server = $names.ServerName; resourceId = $names.ServerId; state = $state; fqdn = [string](Get-DemoMemberValue -InputObject $properties -Name 'fullyQualifiedDomainName') }
     switch ($state) {
         'Ready' { & $add 'T4.SERVER' 'Pass' ('T4 ({0}) is running (Ready).' -f $names.ServerName) $serverEvidence }
-        'Stopped' { & $add 'T4.SERVER' 'Warning' ('T4 ({0}) is stopped: it sends no metrics and runs no activity. A stopped server starts on its own after {1} days.' -f $names.ServerName, $postgres['autoStartAfterStoppedDays']) $serverEvidence 'start-demo.ps1 starts it with the rest of the demo.' $docs['stopServer'] }
+        'Stopped' { & $add 'T4.SERVER' 'Warning' ('T4 ({0}) is stopped: it sends no metrics and runs no activity. A stopped server starts on its own after {1} days.' -f $names.ServerName, $postgres['autoStartAfterStoppedDays']) $serverEvidence './scripts/start-demo.ps1 or the control notebook''s Run all starts it with the rest of the demo.' $docs['stopServer'] }
         default { & $add 'T4.SERVER' 'Warning' ('T4 ({0}) is {1}.' -f $names.ServerName, $state) $serverEvidence 'Check again in a few minutes.' $docs['stopServer'] }
     }
 
@@ -125,13 +133,46 @@ function Test-DemoT4 {
         & $add 'T4.NETWORK' 'Fail' 'T4 isn''t integrated in snet-pg without public access.' $networkEvidence 'Redeploy with scripts/deploy.ps1 -Resume. Virtual network integration is chosen when the server is created; a server created otherwise must be deleted and created again.' $docs['networkingPrivate']
     }
 
+    # The checks that read through the running server: its administrators, its database, and its parameters. A stopped
+    # server answers them with ServerStoppedError (live, 2026-11-18), so a read that failed while T4 isn't Ready, or with
+    # that error while it read Ready (it stopped in between), says what wasn't checked and why; it's never a Fail.
+    $unreadState = {
+        param([object] $Read)
+        if ([bool](Get-DemoMemberValue -InputObject $Read -Name 'Found')) {
+            return ''
+        }
+        $text = [string](Get-DemoMemberValue -InputObject $Read -Name 'Error')
+        if ($text -match "(?i)\bis in '([A-Za-z]+)' state" -and $Matches[1] -ne 'Ready') {
+            return $Matches[1]
+        }
+        if ($text -match '(?i)\bServerStoppedError\b') {
+            return 'Stopped'
+        }
+        if ($state -ne 'Ready') {
+            return $state
+        }
+        return ''
+    }
+    $comeBack = './scripts/start-demo.ps1 or the control notebook''s Run all starts T4; the check runs then (./scripts/validate.ps1 -Area T4).'
+    $notRead = {
+        param([string] $CheckId, [string] $Unread, [string] $What, [System.Collections.IDictionary] $Evidence, [object] $Read)
+        $Evidence['state'] = $Unread
+        $Evidence['error'] = [string](Get-DemoMemberValue -InputObject $Read -Name 'Error')
+        $why = if ($Unread -eq 'Stopped') { 'Stopped between sessions' } else { $Unread }
+        & $add $CheckId 'Warning' ('T4 ({0}) is {1}, so {2} can''t be read.' -f $names.ServerName, $why, $What) $Evidence $comeBack $docs['stopServer']
+    }
+
     $groupId = [string]$Config['t3AdminGroupObjectId']
     $admins = Get-DemoT4Resource -Config $Config -ServerId $names.ServerId -Child 'administrators'
     $entries = if ($admins.Found) { Get-DemoMemberList -InputObject $admins.Value -Name 'value' } else { @() }
     $admin = $entries | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'objectId') -eq $groupId } | Select-Object -First 1
+    $unread = & $unreadState $admins
     if ($admin) {
         $adminProperties = Get-DemoMemberValue -InputObject $admin -Name 'properties'
         & $add 'T4.ADMIN' 'Pass' ('The P6 group ({0}) is T4''s Microsoft Entra administrator; T1''s identity signs in through it to set T4 up.' -f (Get-DemoMemberValue -InputObject $adminProperties -Name 'principalName')) ([ordered]@{ principalName = [string](Get-DemoMemberValue -InputObject $adminProperties -Name 'principalName'); principalType = [string](Get-DemoMemberValue -InputObject $adminProperties -Name 'principalType') })
+    }
+    elseif ($unread) {
+        & $notRead 'T4.ADMIN' $unread 'its Microsoft Entra administrators' ([ordered]@{}) $admins
     }
     elseif (-not $admins.Found) {
         & $add 'T4.ADMIN' 'Warning' ('T4''s administrators couldn''t be read: {0}' -f $admins.Error) @{} 'Run the check again.' $docs['entraRoles']
@@ -141,8 +182,12 @@ function Test-DemoT4 {
     }
 
     $database = Get-DemoT4Resource -Config $Config -ServerId $names.ServerId -Child ('databases/{0}' -f $names.DatabaseName)
+    $unread = & $unreadState $database
     if ($database.Found) {
         & $add 'T4.DATABASE' 'Pass' ('T4''s database {0} exists.' -f $names.DatabaseName) ([ordered]@{ charset = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $database.Value -Name 'properties') -Name 'charset') })
+    }
+    elseif ($unread) {
+        & $notRead 'T4.DATABASE' $unread ('its database {0}' -f $names.DatabaseName) ([ordered]@{ database = $names.DatabaseName }) $database
     }
     else {
         & $add 'T4.DATABASE' 'Fail' ('T4''s database {0} wasn''t found{1}.' -f $names.DatabaseName, $(if ($database.NotFound) { '' } else { ': ' + $database.Error })) @{} 'Redeploy with scripts/deploy.ps1 -Resume.'
@@ -151,7 +196,15 @@ function Test-DemoT4 {
     $parameterName = [string]$postgres['enhancedMetricsParameter']
     $setting = Get-DemoT4Resource -Config $Config -ServerId $names.ServerId -Child ('configurations/{0}' -f $parameterName)
     $value = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $setting.Value -Name 'properties') -Name 'value')
-    if ($value -ieq 'on') {
+    $unread = & $unreadState $setting
+    if ($unread) {
+        & $notRead 'T4.ENHANCEDMETRICS' $unread ('its enhanced metrics setting ({0})' -f $parameterName) ([ordered]@{ parameter = $parameterName; value = $value }) $setting
+    }
+    elseif (-not $setting.Found) {
+        # Couldn't be read isn't off: whether they're on is unknown.
+        & $add 'T4.ENHANCEDMETRICS' 'Warning' ('Whether the enhanced metrics are on ({0}) couldn''t be read: {1}' -f $parameterName, $setting.Error) ([ordered]@{ parameter = $parameterName; value = $value }) 'Run the check again (./scripts/validate.ps1 -Area T4).' $docs['monitoring']
+    }
+    elseif ($value -ieq 'on') {
         & $add 'T4.ENHANCEDMETRICS' 'Pass' ('Enhanced metrics are on ({0}): sessions by state and by wait event type, the oldest transaction and query, and deadlocks reach Azure Monitor at no extra charge.' -f $parameterName) ([ordered]@{ parameter = $parameterName; value = $value })
     }
     else {
@@ -162,7 +215,11 @@ function Test-DemoT4 {
     $wantedConnections = [string]$postgres['maxConnections']
     $connections = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'max_connections'
     $connectionEvidence = [ordered]@{ parameter = 'max_connections'; value = $connections.Value; wanted = $wantedConnections; pendingRestart = $connections.PendingRestart; source = $connections.Source }
-    if (-not $connections.Found) {
+    $unread = & $unreadState $connections
+    if ($unread) {
+        & $notRead 'T4.MAXCONNECTIONS' $unread 'its max_connections' $connectionEvidence $connections
+    }
+    elseif (-not $connections.Found) {
         & $add 'T4.MAXCONNECTIONS' 'Warning' ('T4''s max_connections couldn''t be read: {0}' -f $connections.Error) $connectionEvidence 'Run the check again.' $docs['serverParameters']
     }
     elseif ($connections.Value -ne $wantedConnections) {

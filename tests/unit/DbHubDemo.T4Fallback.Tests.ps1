@@ -1853,7 +1853,7 @@ Describe 'Get-DemoT4State and its callers: a server Azure is deleting isn''t T4 
         # A stopped server keeps its text and fix.
         $stopped = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); ServerId = $serverId } { Test-DemoT4MetricFlow -Config $Config -ServerId $ServerId -State 'Stopped' }
         $stopped.message | Should -Be 'T4 is Stopped, so it sends no fresh metrics.'
-        $stopped.remediation | Should -Match '^start-demo\.ps1 starts it'
+        $stopped.remediation | Should -Match '^\./scripts/start-demo\.ps1 or the control notebook''s Run all starts it'
 
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; Enabled = $true }; Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = $null; Error = '' } }
         $enable = Enable-DemoT4Workload -Config (New-TestConfig) -DeploymentId 'abc123' -Confirm:$false

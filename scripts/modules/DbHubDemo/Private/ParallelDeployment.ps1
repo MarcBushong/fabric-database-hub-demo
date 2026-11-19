@@ -1156,6 +1156,7 @@ function Invoke-DemoParallelDeployment {
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
                 Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric)
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
             }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
@@ -1192,6 +1193,9 @@ function Invoke-DemoParallelDeployment {
             # before 2026-11-14 is adopted; its runbooks get this code, and its roles what this code needs.
             Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
             & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
+            # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
+            # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
+            & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
         }
 
         # 4. The tracks.

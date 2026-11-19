@@ -383,9 +383,11 @@ function Invoke-DemoValidationT4 {
 function Invoke-DemoValidationT5 {
     <#
     .SYNOPSIS
-    The T5 area (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics, read-only. T5 has no stop, but its requests come from
+    The T5 area (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics -IncludeLifecycle, read-only. T5's requests come from
     the runner on sqlvm01, so METRICS.T5 without requests while sqlvm01 isn't running is a Warning that says so, never a
-    Fail. A demo deployed before T5 (no account yet) gets the upgrade's command. Internal.
+    Fail. Its container exists only during a session once its lifecycle is Session (2026-11-19), so a missing container
+    then is a Pass while the demo is stopped (T5.CONTAINER). A demo deployed before T5 (no account yet) gets the upgrade's
+    command. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -394,7 +396,7 @@ function Invoke-DemoValidationT5 {
         [pscustomobject] $Context
     )
 
-    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true }
+    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true; IncludeLifecycle = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
     }
@@ -409,7 +411,7 @@ function Invoke-DemoValidationT5 {
                 $quiet = Get-DemoValidationQuietReason -Context $Context -Target 'T5'
             }
             if ($quiet) {
-                $item = New-DemoResult -CheckId $item.checkId -Area $item.area -Target 'T5' -Status 'Warning' -Message ('Azure Monitor has no request metrics for T5 from the last 15 minutes, because {0}: its runner sends T5''s requests. T5 itself has no stop, so its throughput bills anyway.' -f $quiet) -Evidence $item.evidence -Remediation 'Start the demo (./scripts/start-demo.ps1), then run validate.ps1 -Area T5 again in a few minutes.' -DocUrl $item.docUrl
+                $item = New-DemoResult -CheckId $item.checkId -Area $item.area -Target 'T5' -Status 'Warning' -Message ('Azure Monitor has no request metrics for T5 from the last 15 minutes, because {0}: its runner sends T5''s requests.' -f $quiet) -Evidence $item.evidence -Remediation 'Start the demo (./scripts/start-demo.ps1), then run validate.ps1 -Area T5 again in a few minutes.' -DocUrl $item.docUrl
             }
         }
         $item
@@ -677,6 +679,8 @@ function Invoke-DemoValidationCost {
         }
         # T5's free tier (ADR 0027): the account's own when it exists.
         $parameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $config -DeploymentId ([string]$Context.DeploymentId)
+        # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions.
+        $parameters['T5ContainerLifecycle'] = Get-DemoT5CostLifecycle -Config $config
         try {
             foreach ($item in @((Get-DemoCostEstimate @parameters).Results)) {
                 $results.Add($item)

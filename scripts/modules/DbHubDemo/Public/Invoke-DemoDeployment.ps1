@@ -589,6 +589,9 @@ function Invoke-DemoDeployment {
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
                 # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
+                # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
+                # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -740,6 +743,8 @@ function Invoke-DemoDeployment {
                 # false still checks it (review, 2026-11-19). A T5 failure doesn't stop the stage; DONE needs HUB.ESTATE.T5 and
                 # METRICS.T5.
                 if (Test-DemoT5Enabled -Config $Config) {
+                    # The container exists only during a session (2026-11-19): a resumed run skips the template, which creates it.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
                     $t5Checks = @(Test-DemoT5 -Config $Config)
                     & $addAll $t5Checks
                     $t5Current = Get-DemoDeploymentState -Config $Config
