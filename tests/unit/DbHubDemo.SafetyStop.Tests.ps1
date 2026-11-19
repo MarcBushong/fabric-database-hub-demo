@@ -503,12 +503,33 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $role.remediation | Should -Match 'grant-safety-stop\.ps1'
         @($role.evidence['missingActions']).Count | Should -Be 2
         @($script:writes | Where-Object { $_ -match 'roleDefinitions' }) | Should -BeNullOrEmpty
+        # DONE says exactly that (the re-review of 0590bbe): assigned, so the stop still stops the VMs and T4, but it can't
+        # delete T5's container; never that it can't stop anything until its role is assigned.
+        $staleNote = 'The nightly safety stop runs, but its role "DbHub Demo Safety Stop" doesn''t have exactly its 9 approved actions (it doesn''t have Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete; another environment''s deploy.ps1 on older code may have written it back for the whole subscription), so it still stops the VMs, stops T4, and reads T3, but it can''t delete T5''s container between sessions. An Owner of the subscription runs, once, ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.'
+        InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoSafetyStopNote -Result $Result } | Should -Be $staleNote
         # As a Role Based Access Control Administrator, who assigns it but can't write it: the same Warning once assigned.
         $script:assignments.Clear()
         $script:canAssign = $true
-        $assigned = (& $script:setup) | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $assignedResults = & $script:setup
+        $assigned = $assignedResults | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
         $assigned.status | Should -Be 'Warning'
         $assigned.message | Should -Match 'is assigned now, but the custom role'
+        InModuleScope DbHubDemo -Parameters @{ Result = $assignedResults } { Get-DemoSafetyStopNote -Result $Result } | Should -Be $staleNote
+    }
+
+    It 'says in DONE what a stale safety-stop role still does and what it can''t, from SAFETYSTOP.ROLE''s evidence (the re-review of 0590bbe)' {
+        $note = {
+            param([string[]] $Missing, [string[]] $Extra = @())
+            $evidence = [ordered]@{ roleDiffers = $true; assigned = $true; missingActions = $Missing; extraActions = $Extra; command = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json' }
+            $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'stale' -Evidence $evidence
+            InModuleScope DbHubDemo -Parameters @{ Result = @($role) } { Get-DemoSafetyStopNote -Result $Result }
+        }
+        & $note @('Microsoft.DBforPostgreSQL/flexibleServers/stop/action') | Should -Match 'so it still stops the VMs, reads T3, and deletes T5''s container between sessions, but it can''t stop T4\. '
+        & $note @() @('Microsoft.Compute/virtualMachines/start/action') | Should -Match '\(it has Microsoft\.Compute/virtualMachines/start/action, which isn''t approved; another environment''s.*\), so it still does all it''s for: it stops the VMs, stops T4, reads T3, and deletes T5''s container between sessions\. '
+        & $note @('Microsoft.Resources/subscriptions/resourceGroups/read') | Should -Match 'so it can''t stop the VMs, stop T4, read T3, and delete T5''s container between sessions\. '
+        # A role that isn't assigned: the sentence for that, as before.
+        $unassigned = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'not assigned' -Evidence ([ordered]@{ roleDiffers = $true; command = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json' })
+        InModuleScope DbHubDemo -Parameters @{ Result = @($unassigned) } { Get-DemoSafetyStopNote -Result $Result } | Should -Match '^The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned'
     }
     It 'as a Role Based Access Control Administrator: assigns the role when it exists, and needs an Owner to create it' {
         $script:canDefine = $false

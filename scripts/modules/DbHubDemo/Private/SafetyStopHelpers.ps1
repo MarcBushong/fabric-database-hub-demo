@@ -848,6 +848,8 @@ function Grant-DemoSafetyStopRole {
         $extra = @(@($role.Actions) | Where-Object { $_ -cnotin $script:SafetyStopRoleActions })
         $evidence['missingActions'] = $missing
         $evidence['extraActions'] = $extra
+        # Assigned, so the nightly stop runs and does what its actions still allow; DONE says which (the re-review of 0590bbe).
+        $evidence['assigned'] = $true
         $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
         $message = 'The role {0} is {1}, but the custom role "{2}" doesn''t have exactly its {3} approved actions: {4} (another environment''s deploy.ps1 on older code may have written it back for the whole subscription), and you can''t write it (it takes Microsoft.Authorization/roleDefinitions/write: an Owner or a User Access Administrator). Until then the nightly safety stop can''t do what it lacks{5}.' -f $label, $State, $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $(if (@($missing | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count) { ', such as deleting T5''s container between sessions' } else { '' })
         New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('An Owner of the subscription runs, once: {0}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $command) -DocUrl $script:SafetyStopRoleDoc
@@ -1254,15 +1256,75 @@ function Get-DemoSafetyStopNote {
     }
     $role = @($problems | Where-Object { [string]$_.checkId -eq 'SAFETYSTOP.ROLE' }) | Select-Object -Last 1
     if ($problems.Count -eq 1 -and $null -ne $role) {
-        $command = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $role -Name 'evidence') -Name 'command')
+        $roleEvidence = Get-DemoMemberValue -InputObject $role -Name 'evidence'
+        $command = [string](Get-DemoMemberValue -InputObject $roleEvidence -Name 'command')
         if (-not $command) {
             $command = Get-DemoSafetyStopCommand
+        }
+        # Assigned, but without exactly its approved actions (the re-review of 0590bbe; R910: another environment's older
+        # deploy.ps1 wrote the shared role back): the stop runs, and does all but what it lacks.
+        if ([bool](Get-DemoMemberValue -InputObject $roleEvidence -Name 'roleDiffers') -and [bool](Get-DemoMemberValue -InputObject $roleEvidence -Name 'assigned')) {
+            return (Get-DemoSafetyStopStaleNote -Evidence $roleEvidence -Command $command)
         }
         return ('The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned: an Owner of the subscription runs, once, {0}. Until then T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.' -f $command)
     }
     $first = $problems[0]
     $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $first -Name 'remediation')
     return ('The nightly safety stop isn''t fully set up ({0}): {1} Until it is, T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.{2}' -f [string]$first.checkId, (ConvertTo-DemoPlainText -Value $first.message).TrimEnd(), $(if ($fix) { ' ' + $fix } else { '' }))
+}
+
+function Get-DemoSafetyStopStaleNote {
+    <#
+    .SYNOPSIS
+    DONE's line when the nightly safety stop's role is assigned but doesn't have exactly its approved actions (the re-review
+    of 0590bbe; R910: another environment's deploy.ps1 on older code wrote the shared custom role back): what the stop still
+    does, what it can't, and the fix, from SAFETYSTOP.ROLE's evidence (missingActions, extraActions). Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Evidence,
+
+        [string] $Command = ''
+    )
+
+    if (-not $Command) {
+        $Command = Get-DemoSafetyStopCommand
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $missingValue = Get-DemoMemberValue -InputObject $Evidence -Name 'missingActions'
+    $missing = @(@($missingValue) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $extraValue = Get-DemoMemberValue -InputObject $Evidence -Name 'extraActions'
+    $extra = @(@($extraValue) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    # What each of its approved actions is for, in the order the nightly stop does it.
+    $duties = @(
+        [pscustomobject]@{ Prefix = 'Microsoft.Compute/'; Does = 'stops the VMs'; Cannot = 'stop the VMs' }
+        [pscustomobject]@{ Prefix = 'Microsoft.DBforPostgreSQL/'; Does = 'stops T4'; Cannot = 'stop T4' }
+        [pscustomobject]@{ Prefix = 'Microsoft.Sql/'; Does = 'reads T3'; Cannot = 'read T3' }
+        [pscustomobject]@{ Prefix = 'Microsoft.DocumentDB/'; Does = 'deletes T5''s container between sessions'; Cannot = 'delete T5''s container between sessions' }
+    )
+    $blind = @($missing | Where-Object { $_ -like 'Microsoft.Resources/*' }).Count -gt 0
+    $lacks = { param([object] $Duty) $blind -or @($missing | Where-Object { $_ -like ($Duty.Prefix + '*') }).Count -gt 0 }
+    $does = @($duties | Where-Object { -not (& $lacks $_) } | ForEach-Object { $_.Does })
+    $cannot = @($duties | Where-Object { & $lacks $_ } | ForEach-Object { $_.Cannot })
+    $list = {
+        param([string[]] $Item)
+        if ($Item.Count -le 1) { return ($Item -join '') }
+        if ($Item.Count -eq 2) { return ('{0} and {1}' -f $Item[0], $Item[1]) }
+        return ('{0}, and {1}' -f (@($Item[0..($Item.Count - 2)]) -join ', '), $Item[-1])
+    }
+    $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
+    $what = if ($cannot.Count -eq 0) {
+        'so it still does all it''s for: it {0}' -f (& $list $does)
+    }
+    elseif ($does.Count -eq 0) {
+        'so it can''t {0}' -f (& $list $cannot)
+    }
+    else {
+        'so it still {0}, but it can''t {1}' -f (& $list $does), (& $list $cannot)
+    }
+    return ('The nightly safety stop runs, but its role "{0}" doesn''t have exactly its {1} approved actions ({2}; another environment''s deploy.ps1 on older code may have written it back for the whole subscription), {3}. An Owner of the subscription runs, once, {4}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $what, $Command)
 }
 
 function New-DemoSafetyStopPlanResult {
