@@ -45,7 +45,7 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         # deletes the container after a session (review of ab91ee5): here the session control's role.
         Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $true; T5Container = 'Session' } }
         Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
-        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDeletes { $false }
+        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDelete { $false }
         # Your permissions (2026-11-19, the final tests), which the script reads, as deploy.ps1's preflight does, only for an
         # environment that doesn't exist yet: here an Owner's.
         Mock -ModuleName DbHubDemo Get-DemoDeployerRolePermission { [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' } }
@@ -169,7 +169,7 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Invoke-TestEstimate
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly }
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month*' }
-        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDeletes { $true }
+        Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDelete { $true }
         Invoke-TestEstimate
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
         # A session-control role without the container's actions: all month for real, with nothing to excuse.

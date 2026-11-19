@@ -4152,7 +4152,7 @@ Describe 'Test-DemoStartCost' {
         # whose Warning DbHubDemo.Cost.Tests.ps1 tests: over the ceiling, and a Fail unless it's told so.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T5Container = 'Session'; Tags = @{ deploymentId = 'abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $false }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $false }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
             $monthly = if ($PesterBoundParameters.ContainsKey('T5ManualDeleteOnly') -and [bool]$PesterBoundParameters['T5ManualDeleteOnly']) { 'Warning' } else { 'Fail' }
             [pscustomobject]@{ SessionCost = 12.5; Results = @((New-TestResult 'PREFLIGHT.COST.SESSION' 'Pass' 'preflight'), (New-TestResult 'PREFLIGHT.COST.MONTHLY' $monthly 'preflight')) }
@@ -4162,7 +4162,7 @@ Describe 'Test-DemoStartCost' {
         ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Warning'
         @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'start-demo.ps1 stops only on a Fail'
         # A nightly safety stop that deletes the container: priced for the running hours, with nothing to excuse.
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $true }
         $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
         # A session-control role without the container's actions: all month for real, so the ceiling still fails.

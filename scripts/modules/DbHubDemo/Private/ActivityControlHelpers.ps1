@@ -722,6 +722,116 @@ function Get-DemoActivityControlUrl {
     return $url
 }
 
+function Get-DemoActivityControlDeployer {
+    <#
+    .SYNOPSIS
+    The environment's deployer, for A3 (2026-11-19): the person whose ./scripts/deploy.ps1 last set up the control vault,
+    as Azure Resource Manager records it on the vault (systemData.lastModifiedBy, when lastModifiedByType is User), with
+    that person's Microsoft Entra object ID from Microsoft Graph, read as Resolve-DemoFabricAppOperator reads users.
+    Returns Status (Found, NotPerson, or Unknown), Name (the name Azure recorded), ObjectId (lowercase; '' unless Found),
+    and Reason (why there's none). Internal.
+
+    .DESCRIPTION
+    Every deploy.ps1 run deploys infra/control/control.bicep, which writes the vault, so its last change is the last
+    deployment's; grant-safety-stop.ps1 only assigns roles and doesn't change it. An application or a managed identity (a
+    GitHub workflow's deployment) is no person to give a secret to (NotPerson). A vault that can't be read, a change with
+    no name, or a name that Microsoft Graph doesn't resolve to exactly one user is Unknown: nobody is guessed, because the
+    webhook URL the vault holds is a bearer secret. A user principal name is read with Get user, and an address that isn't
+    one (a guest's) with List users filtered on mail.
+    Sources: https://learn.microsoft.com/rest/api/keyvault/keyvault/vaults/get (SystemData),
+    https://learn.microsoft.com/graph/api/user-get, https://learn.microsoft.com/graph/api/user-list
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name
+    )
+
+    $answer = {
+        param([string] $Status, [string] $Who, [string] $Id, [string] $Reason)
+        [pscustomobject]@{ Status = $Status; Name = $Who; ObjectId = $Id; Reason = $Reason }
+    }
+    $vault = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $Name.KeyVaultId -ApiVersion '2026-02-01')
+    if (-not $vault.Ok) {
+        return (& $answer 'Unknown' '' '' ('the control vault {0} couldn''t be read ({1})' -f $Name.KeyVault, $vault.Error))
+    }
+    $system = Get-DemoMemberValue -InputObject $vault.Value -Name 'systemData'
+    $who = ([string](Get-DemoMemberValue -InputObject $system -Name 'lastModifiedBy')).Trim()
+    $kind = [string](Get-DemoMemberValue -InputObject $system -Name 'lastModifiedByType')
+    if (-not $who) {
+        return (& $answer 'Unknown' '' '' ('Azure records no change on the control vault {0}' -f $Name.KeyVault))
+    }
+    if ($kind -ne 'User') {
+        return (& $answer 'NotPerson' $who '' ('the control vault {0} was last deployed by {1} {2}, not by a person' -f $Name.KeyVault, $(if ($kind) { $kind } else { 'the identity' }), $who))
+    }
+    if ($who -notmatch '^[^@\s''"/?]+@[^@\s''"/?]+$') {
+        return (& $answer 'Unknown' $who '' ('the control vault''s last change names {0}, which isn''t a user''s sign-in name' -f $who))
+    }
+    $graph = 'https://graph.microsoft.com/v1.0'
+    $users = @()
+    $byName = Invoke-DemoRestRequest -SubscriptionId $Name.SubscriptionId -Method 'GET' -Uri ('{0}/users/{1}?$select=id,userPrincipalName,mail' -f $graph, [uri]::EscapeDataString($who))
+    if ($byName.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$byName.StdOut)) {
+        $users = @([string]$byName.StdOut | ConvertFrom-Json -Depth 8)
+    }
+    else {
+        # A guest signs in with their own address, which isn't their user principal name here.
+        $filter = [uri]::EscapeDataString(("mail eq '{0}'" -f $who.Replace("'", "''")))
+        $byMail = Invoke-DemoRestRequest -SubscriptionId $Name.SubscriptionId -Method 'GET' -Uri ('{0}/users?$filter={1}&$select=id,userPrincipalName,mail' -f $graph, $filter)
+        if ($byMail.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$byMail.StdOut)) {
+            # Assigned first: Get-DemoMemberValue returns the array as one object, which @(...) would nest.
+            $listed = Get-DemoMemberValue -InputObject ([string]$byMail.StdOut | ConvertFrom-Json -Depth 8) -Name 'value'
+            $users = @($listed)
+        }
+    }
+    $ids = @($users | Where-Object { $null -ne $_ } | ForEach-Object { ([string](Get-DemoMemberValue -InputObject $_ -Name 'id')).ToLowerInvariant() } | Where-Object { $_ -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' } | Select-Object -Unique)
+    if ($ids.Count -ne 1) {
+        return (& $answer 'Unknown' $who '' ('Microsoft Graph found {0} user(s) named {1}, the control vault''s last deployer' -f $ids.Count, $who))
+    }
+    return (& $answer 'Found' $who $ids[0] '')
+}
+
+function New-DemoActivityControlDeployerResult {
+    <#
+    .SYNOPSIS
+    CONTROL.ROLE.DEPLOYER (2026-11-19): who the environment's deployer is for A3 (Get-DemoActivityControlDeployer), and
+    what that means for Run all. Pass for a person, you or another; Not selected when the control vault's last change
+    was an application's or a managed identity's; Warning when the deployer can't be told, with the fix. Internal and
+    pure.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Deployer,
+
+        [AllowEmptyString()]
+        [string] $CallerObjectId = '',
+
+        [AllowEmptyString()]
+        [string] $Command = './scripts/grant-safety-stop.ps1'
+    )
+
+    $doc = 'https://learn.microsoft.com/rest/api/keyvault/keyvault/vaults/get'
+    $evidence = [ordered]@{ status = [string]$Deployer.Status; deployer = [string]$Deployer.Name; deployerObjectId = [string]$Deployer.ObjectId; source = 'the control vault''s systemData.lastModifiedBy' }
+    $result = @{ CheckId = 'CONTROL.ROLE.DEPLOYER'; Area = 'workload'; Target = 'subscription'; Evidence = $evidence; DocUrl = $doc }
+    switch ([string]$Deployer.Status) {
+        'Found' {
+            if ($CallerObjectId -and [string]$Deployer.ObjectId -eq $CallerObjectId.ToLowerInvariant()) {
+                return (New-DemoResult @result -Status 'Pass' -Message ('You deployed this environment last ({0}: the control vault''s last change, which Azure records, is yours), so A3 for you is the deployer''s too.' -f $Deployer.Name))
+            }
+            return (New-DemoResult @result -Status 'Pass' -Message ('The environment''s deployer is {0}: the control vault''s last change, which Azure records, is their ./scripts/deploy.ps1, which can''t give them the vault''s secrets unless they''re an Owner. A3 gives them Key Vault Secrets User on its three secrets too, so they can Run all in NB_DatabaseHub_Control.' -f $Deployer.Name))
+        }
+        'NotPerson' {
+            return (New-DemoResult @result -Status 'Not selected' -Message ('No deployer gets A3: {0}. A3 is for you and control.notebookUserObjectIds only.' -f $Deployer.Reason) -Remediation ('To let others Run all, add their Microsoft Entra object IDs to control.notebookUserObjectIds and run {0} again.' -f $Command))
+        }
+        default {
+            return (New-DemoResult @result -Status 'Warning' -Message ('The environment''s deployer couldn''t be told ({0}), so A3 is for you and control.notebookUserObjectIds only, and whoever deployed it can''t Run all yet.' -f $Deployer.Reason) -Remediation ('Run {0} again once that''s fixed; or add the deployer''s Microsoft Entra object ID to control.notebookUserObjectIds in the configuration you run it with, then run it again.' -f $Command))
+        }
+    }
+}
+
 function Get-DemoActivityControlRoleId {
     <#
     .SYNOPSIS
@@ -847,7 +957,9 @@ function Get-DemoActivityControlGrantPlan {
     Secrets User at the one secret dbhub-activity-webhook, for the signed-in owner and control.notebookUserObjectIds.
     2026-11-14 (ADR 0026): A3 also at the session's two secrets, dbhub-session-status and dbhub-session-metrics, which the
     notebook reads; and A4, the custom role "DbHub Demo Session Writer" for the automation identity at those two secrets
-    only, which the runbook writes. Internal and pure.
+    only, which the runbook writes. 2026-11-19: A3 also for the environment's deployer (-DeployerObjectId,
+    Get-DemoActivityControlDeployer), whom deploy.ps1 can't give it when they aren't an Owner; each person once.
+    Internal and pure.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -873,6 +985,12 @@ function Get-DemoActivityControlGrantPlan {
         [AllowEmptyString()]
         [string] $CallerPrincipalType = 'User',
 
+        [AllowEmptyString()]
+        [string] $DeployerObjectId = '',
+
+        [AllowEmptyString()]
+        [string] $DeployerName = '',
+
         [ValidateSet('A1', 'A2', 'A3', 'A4')]
         [string[]] $Assignment = @('A1', 'A2', 'A3', 'A4')
     )
@@ -893,11 +1011,16 @@ function Get-DemoActivityControlGrantPlan {
     }
     if ('A3' -in $Assignment) {
         $users = [System.Collections.Generic.List[object]]::new()
-        if ($CallerObjectId) {
-            $users.Add([pscustomobject]@{ Id = $CallerObjectId.ToLowerInvariant(); Type = $(if ($CallerPrincipalType) { $CallerPrincipalType } else { 'User' }); Label = 'you (the signed-in owner)' })
+        $callerId = $CallerObjectId.ToLowerInvariant()
+        $deployerId = $DeployerObjectId.ToLowerInvariant()
+        if ($callerId) {
+            $users.Add([pscustomobject]@{ Id = $callerId; Type = $(if ($CallerPrincipalType) { $CallerPrincipalType } else { 'User' }); Label = 'you (the signed-in owner)' })
+        }
+        if ($deployerId -and $deployerId -ne $callerId) {
+            $users.Add([pscustomobject]@{ Id = $deployerId; Type = 'User'; Label = ('the deployer {0}' -f $(if ($DeployerName) { $DeployerName } else { $deployerId })) })
         }
         foreach ($id in (Get-DemoActivityControlSetting -Config $Config).NotebookUserObjectIds) {
-            if (-not $CallerObjectId -or $id -ne $CallerObjectId.ToLowerInvariant()) {
+            if ($id -ne $callerId -and $id -ne $deployerId) {
                 $users.Add([pscustomobject]@{ Id = $id; Type = ''; Label = ('notebook user {0}' -f $id) })
             }
         }
@@ -944,7 +1067,11 @@ function Grant-DemoActivityControlRole {
 
         [switch] $IncludeDefinition,
 
-        [string] $ConfigPath = ''
+        [string] $ConfigPath = '',
+
+        # grant-safety-stop.ps1 and setup-activity-control.ps1 -GrantRole (2026-11-19): A3 for the environment's deployer
+        # too, whom deploy.ps1 couldn't give it when they aren't an Owner (Get-DemoActivityControlDeployer).
+        [switch] $IncludeDeployer
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -1033,7 +1160,14 @@ function Grant-DemoActivityControlRole {
 
     $principalId = Get-DemoActivityControlPrincipalId -Name $name
     $caller = Get-DemoCallerIdentity -SubscriptionId $subscriptionId
-    $plan = @(Get-DemoActivityControlGrantPlan -Name $name -Config $Config -RoleId $roleIds.Operator -WriterRoleId $roleIds.Writer -PrincipalId $principalId -CallerObjectId ([string]$caller.ObjectId) -CallerPrincipalType ([string]$caller.PrincipalType) -Assignment $Assignment)
+    $deployer = $null
+    if ($IncludeDeployer -and 'A3' -in $Assignment) {
+        $deployer = Get-DemoActivityControlDeployer -Name $name
+        $results.Add((New-DemoActivityControlDeployerResult -Deployer $deployer -CallerObjectId ([string]$caller.ObjectId) -Command $command))
+    }
+    $deployerId = if ($null -ne $deployer -and $deployer.Status -eq 'Found') { [string]$deployer.ObjectId } else { '' }
+    $deployerName = if ($deployerId) { [string]$deployer.Name } else { '' }
+    $plan = @(Get-DemoActivityControlGrantPlan -Name $name -Config $Config -RoleId $roleIds.Operator -WriterRoleId $roleIds.Writer -PrincipalId $principalId -CallerObjectId ([string]$caller.ObjectId) -CallerPrincipalType ([string]$caller.PrincipalType) -DeployerObjectId $deployerId -DeployerName $deployerName -Assignment $Assignment)
     foreach ($item in $plan) {
         $checkId = 'CONTROL.ROLE.{0}' -f $item.Id
         $evidence = [ordered]@{ assignment = $item.Id; role = $item.Role; scope = $item.ScopeLabel; principal = $item.PrincipalLabel; principalId = $item.PrincipalId }

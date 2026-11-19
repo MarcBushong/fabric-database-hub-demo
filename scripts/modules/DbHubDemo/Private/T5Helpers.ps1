@@ -752,7 +752,7 @@ function Get-DemoT5CostLifecycle {
             }
             # No role at all (review of ab91ee5): only stop-demo.ps1 deletes the container then, unless the nightly safety stop
             # does already; this run can't set that up either, since it can't assign roles.
-            if (-not $willHold -and -not (Test-DemoT5SafetyStopDeletes -Config $Config)) {
+            if (-not $willHold -and -not (Test-DemoT5SafetyStopDelete -Config $Config)) {
                 return (& $reply $script:T5LifecycleAlwaysOn 'NoAutoDelete')
             }
             return (& $reply $script:T5LifecycleSession 'Session')
@@ -771,7 +771,7 @@ function Get-DemoT5CostLifecycle {
             return (& $reply $script:T5LifecycleSession 'Session')
         }
         if ($control.Mode -eq 'NoRole') {
-            if (Test-DemoT5SafetyStopDeletes -Config $Config) {
+            if (Test-DemoT5SafetyStopDelete -Config $Config) {
                 return (& $reply $script:T5LifecycleSession 'Session')
             }
             return (& $reply $script:T5LifecycleAlwaysOn 'NoAutoDelete')
@@ -1065,7 +1065,7 @@ function Remove-DemoT5Container {
     return [pscustomobject]@{ Outcome = 'Failed'; Seconds = [int][System.Math]::Round($watch.Elapsed.TotalSeconds); Error = ('it was still there {0} minutes after its deletion was accepted{1}' -f $WaitMinutes, $(if ($waited.Error) { ' (' + $waited.Error + ')' } else { '' })) }
 }
 
-function Test-DemoT5SafetyStopDeletes {
+function Test-DemoT5SafetyStopDelete {
     <#
     .SYNOPSIS
     Whether the nightly safety stop deletes T5's container between sessions (review of ab91ee5): it's in place
@@ -1185,7 +1185,7 @@ function Resolve-DemoT5ContainerLifecycle {
       can't any more (a shared role that another deployment changed back, for example); nothing becomes Session.
     When the role can't be read, the recorded value stands. -WhatIf reads, and records nothing. Mode says which case.
     AutoDelete says whether something automatic deletes the container after a session (the session control's role, or, with
-    no role, the nightly safety stop: Test-DemoT5SafetyStopDeletes; review of ab91ee5), and Price how the estimate prices it:
+    no role, the nightly safety stop: Test-DemoT5SafetyStopDelete; review of ab91ee5), and Price how the estimate prices it:
     Session only when the lifecycle is Session and AutoDelete is true, AlwaysOn otherwise.
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -1222,7 +1222,7 @@ function Resolve-DemoT5ContainerLifecycle {
     # it, but it's priced all month (Price) and reported as a Warning.
     $autoDelete = switch ($control.Mode) {
         'Control' { $true }
-        'NoRole' { [bool](Test-DemoT5SafetyStopDeletes -Config $Config) }
+        'NoRole' { [bool](Test-DemoT5SafetyStopDelete -Config $Config) }
         default { -not $known }
     }
     $changed = $lifecycle -cne $recorded

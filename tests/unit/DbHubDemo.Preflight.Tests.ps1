@@ -483,7 +483,7 @@ Describe 'Invoke-DemoPreflight' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -MockWith { [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -MockWith { [pscustomobject]@{ Counts = $false; Missing = 'Role'; Reason = 'the nightly safety stop can''t stop T4: its role isn''t assigned'; Fix = 'An Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once.'; Evidence = [ordered]@{ counts = $false; missing = 'Role'; nightly = 'NoRole' } } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $false }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $false }
         $null = @(Invoke-DemoPreflight -Config $fromMain -SkipWhatIf -SkipPolicyInventory)
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly -and [double]$Config['monthlyCeilingUsd'] -eq $Ceiling -and -not $T4RestartCoverage.Counts }
         $fromMain['monthlyCeilingUsd'] | Should -Be $Ceiling -Because 'preflight never changes the configured ceiling'
