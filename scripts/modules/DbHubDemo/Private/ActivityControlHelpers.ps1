@@ -13,7 +13,8 @@
 #   parameter of T4 or the replica.
 # - No network join action: the replica's create names T4's delegated subnet and private DNS zone, and Azure created it
 #   without virtualNetworks/subnets/join/action or privateDnsZones/join/action (live, 2026-11-14), so neither is granted.
-# - Microsoft.Insights/metrics/read: T4's and the replica's Azure Monitor metrics for the history; read-only.
+# - Microsoft.Insights/metrics/read: T4's and the replica's Azure Monitor metrics for the history; read-only. Since
+#   2026-11-18 it reads T5's (ADR 0027) too, at the same demo resource group: no new action.
 # - Microsoft.Resources/tags/write: the busy marker and the session's ID on the demo resource group (the safety stop
 #   honors the marker); it could change any tag in the demo resource group, the deploymentId included.
 $script:ActivityControlRoleName = 'DbHub Demo Activity Operator'
@@ -62,7 +63,7 @@ $script:ActivityControlActionReach = [ordered]@{
     'Microsoft.DBforPostgreSQL/flexibleServers/write'                 = 'creates T4''s read replica; it could also change T4, which the runbook never does'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'                = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'  = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
-    'Microsoft.Insights/metrics/read'                                 = 'reads T4''s and the replica''s Azure Monitor metrics for the history; read-only'
+    'Microsoft.Insights/metrics/read'                                 = 'reads T4''s, the replica''s, and T5''s Azure Monitor metrics for the history; read-only'
     'Microsoft.Resources/tags/write'                                  = 'marks the demo busy for the nightly stop and records the session; it could change any tag in the demo resource group'
     'Microsoft.KeyVault/vaults/secrets/read'                          = 'reads the session secrets'' properties (never their values through Azure Resource Manager); at those two secrets only'
     'Microsoft.KeyVault/vaults/secrets/write'                         = 'writes the session''s status and metrics; it could overwrite those two secrets'' values, at those two secrets only'
@@ -419,8 +420,9 @@ function Get-DemoActivityControlProfile {
     <#
     .SYNOPSIS
     The activity profiles the control runs as a whole (2026-11-04: showcase, Run all's default), from
-    scenarios/activity-profiles.json: each one's maximum and default minutes and the targets it has incidents for. off
-    isn't one: the runbook takes it as its own word, which turns a target's activity off. Internal.
+    scenarios/activity-profiles.json: each one's maximum and default minutes, its cycle, the targets it has incidents for,
+    and T5's slots in a cycle (2026-11-18). off isn't one: the runbook takes it as its own word, which turns a target's
+    activity off. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -431,11 +433,14 @@ function Get-DemoActivityControlProfile {
     foreach ($name in @('showcase')) {
         $definition = $definitions['profiles'][$name]
         # cycleMinutes (2026-11-14): a session cut short by the VMs' auto-shutdown ends after whole cycles, so no beat is cut.
+        # t5Slots (2026-11-18, ADR 0027): T5's slots in a cycle, so the runbook ends T5's showcase at its baseline, with no
+        # ru-storm still running (Set-DbHubT5ShowcaseMinute).
         $profiles[$name] = [ordered]@{
             maxMinutes     = [int]$definition['maxDurationMinutes']
             defaultMinutes = [int]$definition['defaultDurationMinutes']
             cycleMinutes   = [int]$definition['cycleMinutes']
             targets        = @($definition['incidents'] | ForEach-Object { [string]$_['target'] } | Sort-Object -Unique)
+            t5Slots        = @($definition['incidents'] | Where-Object { [string]$_['target'] -eq 'T5' } | ForEach-Object { [ordered]@{ startMinute = [int]$_['startMinute']; durationMinutes = [int]$_['durationMinutes'] } })
         }
     }
     return $profiles
@@ -447,8 +452,9 @@ function Get-DemoActivityControlRunbookSetting {
     The settings baked into the three runbooks: names, the demo's schedule, the bounds, the allow-lists from the scenario
     catalog and the activity profiles the control runs as a whole (showcase), how long the VM-side control waits for
     each target (readySeconds), how T1's monitoring plugin is looked after, the pinned API versions, and the VM-side
-    workload-control template. Nothing in it is secret; it holds the subscription ID and the identity's client ID, which
-    live in Azure only. Internal.
+    workload-control template. T5 (2026-11-18, ADR 0027) is a target when it's on and the catalog has a scenario for it,
+    and t5AccountPrefix names its account while it's on. Nothing in it is secret; it holds the subscription ID and the
+    identity's client ID, which live in Azure only. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -476,6 +482,17 @@ function Get-DemoActivityControlRunbookSetting {
     $targets = [ordered]@{ T1 = [ordered]@{}; T2 = [ordered]@{}; T3 = [ordered]@{} }
     if (@($catalog.Values | Where-Object { $_['targets'] -contains 'T4' }).Count -gt 0) {
         $targets['T4'] = [ordered]@{}
+    }
+    # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): a target when it's on (t5Enabled) and the scenario catalog
+    # has a scenario for it (ru-storm), so a runner that doesn't know T5 is never sent its activity. Its account's name goes
+    # in either way while it's on, for the history's metrics and the stops' text.
+    $t5On = Test-DemoT5Enabled -Config $Config
+    if ($t5On -and @($catalog.Values | Where-Object { $_['targets'] -contains 'T5' }).Count -gt 0) {
+        $targets['T5'] = [ordered]@{}
+    }
+    $readySeconds = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
+    if ($targets.Contains('T5')) {
+        $readySeconds['T5'] = 600
     }
     $guest = Import-PowerShellDataFile -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/dsc/guest.psd1')
     $sqlVm = (Get-DemoArcSetting).SqlVm
@@ -512,6 +529,8 @@ function Get-DemoActivityControlRunbookSetting {
             deleteWaitMinutes          = [int](Get-DemoT4ReplicaSetting)['deleteTimeoutMinutes']
             raceMinutes                = 10
         }
+        # T5's account is <t5AccountPrefix><deploymentId> (2026-11-18, ADR 0027); empty when T5 is off.
+        t5AccountPrefix        = $(if ($t5On) { '{0}-' -f (Get-DemoCosmosSetting)['accountNamePrefix'] } else { '' })
         # The session's status and the history's metrics (2026-11-14): written to these secrets of the control vault through
         # Azure Resource Manager, for the control notebook to read.
         controlVault           = $Name.KeyVault
@@ -535,7 +554,7 @@ function Get-DemoActivityControlRunbookSetting {
         targets                = $targets
         scenarios              = $catalog
         profiles               = Get-DemoActivityControlProfile
-        readySeconds           = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
+        readySeconds           = $readySeconds
         monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 8; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
@@ -1589,7 +1608,7 @@ function Get-DemoActivityControlShowcase {
     The showcase's beats for the control notebook's guide (2026-11-14), from scenarios/activity-profiles.json: its cycle,
     each incident slot as the runner reads it (target, scenario, startMinute, durationMinutes, and cycles, tier, and
     replica when set; and for the Database Agent beat, 2026-11-18, its respondPercent, goodPercent, and agentBeat), and each
-    scenario's title and the first Database Hub signal it fills (scenarios/<id>/scenario.json).
+    scenario's title and the first Database Hub signal it fills for the SQL targets, T4, and T5 (scenarios/<id>/scenario.json).
     Internal and pure.
     #>
     [CmdletBinding()]
@@ -1621,13 +1640,19 @@ function Get-DemoActivityControlShowcase {
         }
         $slots.Add($slot)
         if (-not $scenarios.Contains($slot['scenario'])) {
-            # The first signal for the SQL targets and the first for T4 (its text starts with "T4"), Performance first:
-            # what the guide says each beat fills.
-            $scenario = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath ('scenarios/{0}/scenario.json' -f $slot['scenario'])) -Raw | ConvertFrom-Json -AsHashtable
+            # The first signal for the SQL targets, the first for T4 (its text starts with "T4"), and the first for T5 (with
+            # "T5", 2026-11-18), Performance first: what the guide says each beat fills. A scenario without its file yet
+            # (another change adds it) shows by its ID.
+            $file = Join-Path -Path $script:RepoRoot -ChildPath ('scenarios/{0}/scenario.json' -f $slot['scenario'])
+            if (-not (Test-Path -LiteralPath $file)) {
+                $scenarios[$slot['scenario']] = [ordered]@{ title = [string]$slot['scenario'] }
+                continue
+            }
+            $scenario = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable
             $signals = @($scenario['expectedHubSignals'] | Sort-Object -Stable -Property { if ($_['surface'] -eq 'Performance') { 0 } else { 1 } })
             $entry = [ordered]@{ title = [string]$scenario['title'] }
-            foreach ($kind in 'sql', 't4') {
-                $match = @($signals | Where-Object { ([string]$_['signal']).StartsWith('T4') -eq ($kind -eq 't4') }) | Select-Object -First 1
+            foreach ($kind in 'sql', 't4', 't5') {
+                $match = @($signals | Where-Object { $text = [string]$_['signal']; if ($kind -eq 'sql') { -not ($text.StartsWith('T4') -or $text.StartsWith('T5')) } else { $text.StartsWith($kind.ToUpperInvariant()) } }) | Select-Object -First 1
                 if ($null -ne $match) {
                     $entry[$kind] = [ordered]@{ surface = [string]$match['surface']; signal = [string]$match['signal'] }
                 }

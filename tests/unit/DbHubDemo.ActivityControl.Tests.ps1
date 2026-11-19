@@ -570,15 +570,20 @@ Describe 'The runbooks'' settings' {
     It 'hold the allow-lists from the scenario catalog, the bounds, the pinned API versions, and the template, and no secret' {
         $config = New-ControlConfig
         $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '99999999-9999-9999-9999-999999999999' }
-        @($setting['targets'].Keys) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        # T5 (2026-11-18, ADR 0027) since ru-storm lists it; the example configuration leaves it on.
+        @($setting['targets'].Keys) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         $setting['scenarios'].Contains('healthy-baseline') | Should -BeFalse
         $folders = @(Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scenarios') -Directory | Where-Object Name -NE 'healthy-baseline' | ForEach-Object Name)
         @($setting['scenarios'].Keys | Sort-Object) | Should -Be @($folders | Sort-Object)
+        @($setting['scenarios']['ru-storm']['targets']) | Should -Be @('T5')
         # Run all's showcase (2026-11-04): its bounds from scenarios/activity-profiles.json.
         @($setting['profiles'].Keys) | Should -Be @('showcase')
         $setting['profiles']['showcase']['maxMinutes'] | Should -Be 120
         $setting['profiles']['showcase']['defaultMinutes'] | Should -Be 90
-        @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
+        # T5's ru-storm slots in each cycle, which the runbook cuts T5's showcase back to (user-directed, 2026-11-18).
+        @($setting['profiles']['showcase']['t5Slots'] | ForEach-Object { '{0}+{1}' -f $_['startMinute'], $_['durationMinutes'] }) | Should -Be @('3+10', '18+8')
+        $setting['t5AccountPrefix'] | Should -Be 'cosmos01-'
         $setting['minDurationMinutes'] | Should -Be 5
         $setting['maxDurationMinutes'] | Should -Be 120
         $setting['maxBodyBytes'] | Should -Be 4096
@@ -589,6 +594,7 @@ Describe 'The runbooks'' settings' {
         $setting['readySeconds']['T2'] | Should -Be 1200
         $setting['readySeconds']['T3'] | Should -Be 600
         $setting['readySeconds']['T4'] | Should -Be 600
+        $setting['readySeconds']['T5'] | Should -Be 600
         $setting['monitorRunbook'] | Should -Be 'DbHub-Monitor'
         $setting['monitorSchedulePrefix'] | Should -Be 'dbhub-monitor-'
         $setting['monitorRecheckMinutes'] | Should -Be 30
@@ -606,6 +612,25 @@ Describe 'The runbooks'' settings' {
         $json = ConvertTo-Json -InputObject $setting -Depth 16 -Compress
         $json | Should -Not -Match '(?i)"[^"]*(password|secret|token)[^"]*"\s*:' -Because 'no setting is a credential'
         $json | Should -Not -Match '(?i)token=|vault\.azure\.net'
+    }
+
+    It 'leave T5 out, and its account unnamed, when the configuration turns it off (t5Enabled false, ADR 0027)' {
+        $config = New-ControlConfig
+        $config['t5Enabled'] = $false
+        $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '99999999-9999-9999-9999-999999999999' }
+        @($setting['targets'].Keys) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        $setting['readySeconds'].Contains('T5') | Should -BeFalse
+        $setting['t5AccountPrefix'] | Should -Be ''
+    }
+
+    It 'give the guide each scenario''s Database Hub signal for T5 apart from the SQL targets'' and T4''s (2026-11-18)' {
+        $showcase = InModuleScope -ModuleName DbHubDemo { Get-DemoActivityControlShowcase }
+        @($showcase['incidents'] | Where-Object { $_['target'] -eq 'T5' } | ForEach-Object { '{0}@{1}+{2}' -f $_['scenario'], $_['startMinute'], $_['durationMinutes'] }) | Should -Be @('ru-storm@3+10', 'ru-storm@18+8')
+        $storm = $showcase['scenarios']['ru-storm']
+        $storm['t5']['signal'] | Should -Match '^T5: Normalized RU consumption'
+        $storm['t5']['surface'] | Should -Be 'Performance'
+        $storm.Contains('sql') | Should -BeFalse -Because 'a T5 signal is never the SQL targets'' one'
+        $storm.Contains('t4') | Should -BeFalse
     }
 }
 

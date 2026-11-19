@@ -19,11 +19,11 @@ function New-DemoResult {
         [string] $CheckId,
 
         [Parameter(Mandatory)]
-        [ValidateSet('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')]
+        [ValidateSet('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 't5', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')]
         [string] $Area,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4', 'subscription', 'tenant', 'fabric', 'github', 'repo')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5', 'subscription', 'tenant', 'fabric', 'github', 'repo')]
         [string] $Target,
 
         [Parameter(Mandatory)]

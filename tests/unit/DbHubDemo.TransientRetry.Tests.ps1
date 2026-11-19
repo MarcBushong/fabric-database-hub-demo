@@ -229,6 +229,7 @@ Describe 'deploy.ps1 after a network error that lasted (Phase 28 live finding, 2
         $script:config['subscriptionId'] = $script:subscriptionId
         $script:config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $script:config['t4Enabled'] = $false
+        $script:config['t5Enabled'] = $false
     }
 
     It 'reports a Fabric script a network error stopped with evidence networkError and a rerun of deploy.ps1, not the script''s own output' {

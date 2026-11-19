@@ -182,6 +182,21 @@ def running_status(session_id, accepted, minutes):
             "message": "The session runs until %s UTC." % iso(end)}
 
 
+def with_t5(status, dispatch, minutes=78):
+    """T5 in the session (2026-11-18): its account, its showcase sent with sqlvm01's, and when it ends at its baseline."""
+    status["names"]["t5Account"] = "cosmos01-abc123"
+    status["dispatchUtc"]["T5"] = iso(dispatch)
+    status["t5"] = {"endUtc": iso(dispatch + real_dt.timedelta(minutes=minutes))}
+    return status
+
+
+def cosmos_document(session, start, end):
+    return {"version": 1, "sessionId": session, "capturedBy": "control", "capturedUtc": iso(end), "startUtc": iso(start), "endUtc": iso(end),
+            "windowMinutes": int((end - start).total_seconds() // 60), "intervalMinutes": 1, "accounts": [{"target": "T5", "resourceName": "cosmos01-abc123"}],
+            "series": [{"resourceName": "cosmos01-abc123", "metric": "ThrottledRequests", "aggregation": "Count", "unit": "Count", "statusCode": "429",
+                        "intervalMinutes": 1, "points": [[iso(start + real_dt.timedelta(minutes=10)), 120]]}]}
+
+
 if scenario in ("active", "stopnow"):
     RUNBOOK.update(session="a" * 32, accepted=Clock.now - real_dt.timedelta(minutes=20), minutes=90)
     VAULT["dbhub-session-status"] = json.dumps(running_status("a" * 32, RUNBOOK["accepted"], 90))
@@ -190,6 +205,12 @@ if scenario == "leftover":
     # The runbook writes the metrics compact (ConvertTo-Json -Compress).
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
                                                  "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "leftovercosmos":
+    # T5's metrics alone (2026-11-18): an empty T4 document carries them as its cosmos member.
+    earlier = Clock.now - real_dt.timedelta(days=1)
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedBy": "control", "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
+                                                 "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [],
+                                                 "cosmos": cosmos_document("e" * 32, earlier - real_dt.timedelta(minutes=100), earlier)}, separators=(",", ":"))
 
 
 def runbook(body):
@@ -207,8 +228,11 @@ def runbook(body):
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
         if session:
             accepted = RUNBOOK["accepted"] or Clock.now
-            VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(Clock.now), "startUtc": iso(accepted), "endUtc": iso(Clock.now),
-                                                         "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+            document = {"version": 1, "sessionId": session, "capturedUtc": iso(Clock.now), "startUtc": iso(accepted), "endUtc": iso(Clock.now),
+                        "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}
+            if scenario == "sessioncosmos":
+                document["cosmos"] = cosmos_document(session, accepted, Clock.now)
+            VAULT["dbhub-session-metrics"] = json.dumps(document, separators=(",", ":"))
 
 
 HOST_WARNING = {"step": "Host", "state": "Warning", "message": "T2: archost01 is deallocated, so T2 has no activity now.",
@@ -221,7 +245,10 @@ def vault_read(name):
     if name == "dbhub-session-status" and RUNBOOK["session"]:
         current = json.loads(VAULT[name])
         if current.get("phase") == "starting" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(seconds=60):
-            VAULT[name] = json.dumps(running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"]))
+            status = running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"])
+            if scenario == "sessioncosmos":
+                status = with_t5(status, RUNBOOK["accepted"] + real_dt.timedelta(minutes=4))
+            VAULT[name] = json.dumps(status)
         elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
                 and not any(step.get("step") == "Host" for step in current.get("steps") or []):
             # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
@@ -395,7 +422,7 @@ Describe 'NB_DatabaseHub_Control' {
         foreach ($switchName in 'STOP_NOW', 'RESET_NOW') {
             $source | Should -Match ('(?m)^{0} = False\s*$' -f $switchName)
         }
-        foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+        foreach ($target in 'T1', 'T2', 'T3', 'T4', 'T5') {
             $source | Should -Match ('(?m)^\s+\{{"target": "{0}", "scenario": "showcase"\}},\s*$' -f $target)
         }
         $source | Should -Match '(?m)^WATCH_MINUTES = 30\s'
@@ -946,11 +973,89 @@ print(json.dumps(out))
         @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
     }
 
+    It 'shows T5 in the guide and the live view, ends its ru-storms by its own end, and hands its metrics to the history as COSMOS_METRICS (2026-11-18)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'sessioncosmos' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        $report.printed | Should -Match ([regex]::Escape('The targets: T1 sqlvm01 | T2 arcsql01 | T3 azuresql01-abc123/ContosoCare | T4 pgflex01-abc123 | T4''s read replica pgreplica01-abc123 | T5 cosmos01-abc123'))
+        $report.printed | Should -Match 'Estate: View Microsoft SQL, then View PostgreSQL, then View Azure Cosmos DB \| Performance: the real-time dashboards for Microsoft SQL and PostgreSQL, and Azure Cosmos DB with T5''s account selected \| Optimization: '
+        # The user (2026-11-18): every Run all leaves T5 back at its baseline, with no ru-storm still running, at its end.
+        $report.printed | Should -Match 'T5: its last ru-storm ends, and T5 is back at its baseline with no throttled requests \(429s\), by 15:22, before the session ends at 15:30; every Run all repeats its storms from the first\.'
+        $report.printed | Should -Match 'T5 is Azure Cosmos DB: show it in Estate \(View: Azure Cosmos DB, cosmos01-abc123\) and on Performance: Peak Norm RU % at 100% and Throttled Requests \(429s\) during each ru-storm'
+        $report.printed | Should -Match '(?m)^  14:07-14:17  T5  RU storm \(request rate too from about 14:08  Performance: T5: Normalized RU consumption'
+        $report.printed | Should -Match 'Now: T5 RU storm \(request rate too large\), until 14:17; in Database Hub from about 14:08\.'
+        $report.printed | Should -Match 'The history''s metrics: Azure Monitor metrics for the history\.'
+        # Its beats: two ru-storms in each 30-minute cycle from its dispatch at 14:04, none past its own end at 15:22.
+        $job = $report.refs[0].args
+        $storms = @(($job.SESSION_PLAN | ConvertFrom-Json).beats | Where-Object target -EQ 'T5')
+        @($storms | ForEach-Object { ([datetime]$_.startUtc).ToUniversalTime().ToString('HH:mm') }) | Should -Be @('14:07', '14:22', '14:37', '14:52', '15:07')
+        @($storms | ForEach-Object scenario | Select-Object -Unique) | Should -Be @('ru-storm')
+        ([datetime]$storms[-1].endUtc).ToUniversalTime() | Should -BeLessOrEqual ([datetime]::new(2026, 11, 14, 15, 22, 0, [System.DateTimeKind]::Utc))
+        # T5's metrics go as their own parameter, and T4's without them.
+        $cosmos = $job.COSMOS_METRICS | ConvertFrom-Json
+        $cosmos.sessionId | Should -Be $job.SESSION_ID
+        $cosmos.series[0].statusCode | Should -Be '429'
+        ($job.POSTGRES_METRICS | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'cosmos'
+        ($job.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $job.SESSION_ID
+    }
+
+    It 'leaves T5''s ACTIVITIES entry out when T5 isn''t one of the demo''s targets, and lists T5''s beats only until its own end' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $filled = Get-FilledNotebook -Zone 'UTC'
+        $driver = Join-Path -Path $TestDrive -ChildPath 't5.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import datetime as dt, json, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+exec(cells[0], ns)
+exec(cells[1], ns)
+catalog = ns["load_catalog"](ns["CATALOG_JSON"])
+showcase = ns["load_showcase"](ns["SHOWCASE_JSON"])
+without = dict(catalog, targets=[target for target in catalog["targets"] if target != "T5"])
+out = {"with": [item["target"] for item in ns["known_activities"](ns["ACTIVITIES"], catalog)],
+       "without": [item["target"] for item in ns["known_activities"](ns["ACTIVITIES"], without)],
+       "request": ns["build_request"]("run", ns["known_activities"](ns["ACTIVITIES"], without), 90, catalog=without)["activities"]}
+anchor = dt.datetime(2026, 11, 14, 14, 0, tzinfo=dt.timezone.utc)
+end = anchor + dt.timedelta(minutes=90)
+def storms(target_ends):
+    return ["%s@%d" % (beat["scenario"], (beat["startUtc"] - anchor).total_seconds() // 60)
+            for beat in ns["showcase_beats"](showcase, {"T5": anchor}, end, "", False, target_ends=target_ends)]
+out["full"] = storms(None)
+out["cut"] = storms({"T5": anchor + dt.timedelta(minutes=78)})
+out["signal"] = ns["showcase_beats"](showcase, {"T5": anchor}, end)[0]["signal"]
+status = {"acceptedUtc": "2026-11-14T14:00:00Z", "runEndUtc": "2026-11-14T15:30:00Z", "dispatchUtc": {"T5": "2026-11-14T14:00:00Z"},
+          "t5": {"endUtc": "2026-11-14T15:18:00Z"}}
+out["status"] = ["%s@%s" % (beat["scenario"], beat["startUtc"].strftime("%H:%M")) for beat in ns["status_beats"](status, showcase)]
+out["shows"] = [ns["shows_minutes"](target) for target in ("T1", "T4", "T5")]
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $filled 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $t5 = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        @($t5.with) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
+        @($t5.without) | Should -Be @('T1', 'T2', 'T3', 'T4') -Because 'a demo without T5 (t5Enabled false) runs the default ACTIVITIES as before'
+        @($t5.request | ForEach-Object target) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($t5.full) | Should -Be @('ru-storm@3', 'ru-storm@18', 'ru-storm@33', 'ru-storm@48', 'ru-storm@63', 'ru-storm@78')
+        @($t5.cut) | Should -Be @('ru-storm@3', 'ru-storm@18', 'ru-storm@33', 'ru-storm@48', 'ru-storm@63') -Because 'T5''s showcase ends at minute 78, where its sixth storm would start'
+        $t5.signal | Should -Match '^T5: Normalized RU consumption'
+        @($t5.status) | Should -Be @('ru-storm@14:03', 'ru-storm@14:18', 'ru-storm@14:33', 'ru-storm@14:48', 'ru-storm@15:03') -Because 'the status''s t5.endUtc, 15:18, ends T5''s beats'
+        @($t5.shows) | Should -Be @(3, 1, 1)
+    }
+
     It 'runs Run all in <Case>' -ForEach @(
         @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
         @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
         @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
+        @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
         @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'MODE is "check", so nothing was sent\.' }
         @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Validators = 1; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
@@ -978,6 +1083,14 @@ print(json.dumps(out))
             $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
             $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
             $report.refs[1].args.SESSION_ID | Should -Be $session
+        }
+        if ($Scenario -eq 'leftovercosmos') {
+            # T5's alone: COSMOS_METRICS, and no POSTGRES_METRICS for an empty T4 document.
+            $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
+            $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
+            $cosmos = $report.refs[0].args.COSMOS_METRICS | ConvertFrom-Json
+            $cosmos.sessionId | Should -Be ('e' * 32)
+            @($cosmos.accounts | ForEach-Object resourceName) | Should -Be @('cosmos01-abc123')
         }
         if ($Scenario -in 'unbound', 'refail') {
             $report.jobs[0].SESSION_ID | Should -Be $report.sent[0].sessionId
@@ -1208,13 +1321,14 @@ Describe 'The notebook deploy.ps1 imports' {
         $source | Should -Match '(?m)^MODE = "session"'
         $catalogLine = [regex]::Match($source, '(?m)^CATALOG_JSON = (".*")$').Groups[1].Value
         $catalog = ($catalogLine | ConvertFrom-Json) | ConvertFrom-Json -AsHashtable
-        @($catalog['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($catalog['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         $catalog['scenarios'].Contains('blocking-chain') | Should -BeTrue
         $catalog['scenarios'].Contains('idle-in-transaction') | Should -BeTrue
+        $catalog['scenarios'].Contains('ru-storm') | Should -BeTrue
         $catalog['maxDurationMinutes'] | Should -Be 120
         $catalog['profiles']['showcase']['maxMinutes'] | Should -Be 120
         $catalog['profiles']['showcase']['cycleMinutes'] | Should -Be 30
-        @($catalog['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($catalog['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         # The session's rules, as the runbook applies them, and the auto-shutdown's zone by its IANA name for Python.
         $catalog['session']['minMinutes'] | Should -Be 30
         $catalog['session']['shutdownMarginMinutes'] | Should -Be 2
@@ -1226,6 +1340,7 @@ Describe 'The notebook deploy.ps1 imports' {
         @($showcase['incidents']).Count | Should -Be @($profileFile['profiles']['showcase']['incidents']).Count
         $showcase['scenarios']['replica-lag']['t4']['signal'] | Should -Match 'Read replica lag'
         $showcase['scenarios']['blocking-chain']['sql']['surface'] | Should -Be 'Performance'
+        $showcase['scenarios']['ru-storm']['t5']['signal'] | Should -Match '^T5: Normalized RU consumption'
         $text | Should -Not -Match '(?i)webhooks\?token='
         @($filled['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['outputs']).Count } | Where-Object { $_ -gt 0 }) | Should -BeNullOrEmpty
         # Without the demo's lakehouse, the copy names none, and the history runs as a job (the fallback).

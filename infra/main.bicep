@@ -254,6 +254,12 @@ param t4AvailabilityZone string = ''
 @description('Current storage types of existing disks that differ from the profile, keyed by disk name (for example sqlvm01-osdisk). The subscription\'s automation can switch a deallocated VM\'s disks to Standard HDD, and Azure doesn\'t change an OS disk\'s type through its VM, so deploy.ps1 passes each drifted disk\'s current type and the template keeps it (Phase 24).')
 param diskSkuOverrides object = {}
 
+@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), a private endpoint in snet-pe in both network modes with public network access off, and the patient-events container at 400 RU/s. T1\'s managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027).')
+param t5Enabled bool = true
+
+@description('T5 uses the subscription\'s one free-tier account (the first 1,000 RU/s and 25 GB free), which Azure sets only when the account is created. deploy.ps1 sets it when the subscription has no free-tier account yet and t5UseFreeTier is true, and passes an existing account\'s own value (ADR 0027).')
+param t5FreeTier bool = false
+
 var resourceGroupName = 'rg-${prefix}-${environment}'
 
 var commonTags = {
@@ -326,6 +332,8 @@ module demo 'modules/demo.bicep' = {
     t4AutonomousTuning: t4AutonomousTuning
     t4AvailabilityZone: t4AvailabilityZone
     diskSkuOverrides: diskSkuOverrides
+    t5Enabled: t5Enabled
+    t5FreeTier: t5FreeTier
   }
 }
 
@@ -382,6 +390,15 @@ output t4ServerId string = demo.outputs.t4ServerId
 
 @description('Name of the T4 database, or empty when T4 is off.')
 output t4DatabaseName string = demo.outputs.t4DatabaseName
+
+@description('Name of the T5 account (cosmos01-<deploymentId>), or empty when T5 is off.')
+output t5AccountName string = demo.outputs.t5AccountName
+
+@description('The T5 account\'s document endpoint, or empty when T5 is off.')
+output t5DocumentEndpoint string = demo.outputs.t5DocumentEndpoint
+
+@description('Resource ID of the T5 account, or empty when T5 is off.')
+output t5AccountId string = demo.outputs.t5AccountId
 
 @description('The bootstrap loaders\' settings (nothing secret), for the loaders deploy.ps1 runs itself (ADR 0018).')
 output loaderSettings object = demo.outputs.loaderSettings

@@ -1102,11 +1102,13 @@ Describe 'Plumbing for read-only runs' {
         @(Get-ChildItem -LiteralPath $temp -Filter '*.tmp' -Force) | Should -BeNullOrEmpty -Because 'a caller''s -WhatIf must not skip the cleanup'
     }
 
-    It 'adds the cost and security areas to the result schema, and only those' {
+    It 'adds the cost and security areas to the result schema, and only those (and t5 for T5, 2026-11-18)' {
         $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/schemas/validation-result.schema.json') -Raw | ConvertFrom-Json -AsHashtable
-        $schema.properties.area.enum | Should -Be @('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')
+        $schema.properties.area.enum | Should -Be @('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 't5', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')
         $parameter = (Get-Command -Name New-DemoResult).Parameters['Area']
         ($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues | Should -Be $schema.properties.area.enum
+        $target = (Get-Command -Name New-DemoResult).Parameters['Target']
+        ($target.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues | Should -Be $schema.properties.target.enum
     }
 }
 
@@ -1157,7 +1159,7 @@ Describe 'scripts/validate.ps1 (the contract with validate.yml)' {
         $output.DefaultValue.Extent.Text | Should -Match ([regex]::Escape("'../out/validate.jsonl'"))
         $area = $script:ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Area' }
         $set = $area.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }
-        @($set.PositionalArguments.Value) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
+        @($set.PositionalArguments.Value) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
         $binding = $script:ast.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq 'CmdletBinding' }
         $named = @($binding.NamedArguments | ForEach-Object { $_.ArgumentName })
         $named | Should -Not -Contain 'SupportsShouldProcess' -Because 'validation never asks for -WhatIf; it changes nothing in the demo'
@@ -1181,7 +1183,7 @@ Describe 'scripts/validate.ps1 (the contract with validate.yml)' {
         $output | Should -Match 'Manual action required'
         $output | Should -Match 'INFRA\.VM\.SQLVM01'
         Should -Invoke -CommandName Invoke-DemoValidation -Times 1 -Exactly -ParameterFilter {
-            @($Area).Count -eq 12 -and @($Target).Count -eq 4 -and $WaitMinutes -eq 0 -and $Config['subscriptionId'] -eq $script:HubSubscriptionId
+            @($Area).Count -eq 13 -and @($Target).Count -eq 5 -and $WaitMinutes -eq 0 -and $Config['subscriptionId'] -eq $script:HubSubscriptionId
         }
     }
 

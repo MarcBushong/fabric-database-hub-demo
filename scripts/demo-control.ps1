@@ -6,7 +6,7 @@ live-activity notebook call it; ADR 0010, ADR 0011).
 
 .DESCRIPTION
 Takes the inputs demo-control.yml declares, with the names the live-activity notebook dispatches:
-target (all, T1, T2, T3, or T4), scenario (baseline, business-day, off, or incident:<scenario>), duration
+target (all, T1, T2, T3, T4, or T5), scenario (baseline, business-day, off, or incident:<scenario>), duration
 (1-240 minutes), concurrency (0 or 1-64), intensity (0 or 1-10), reset-before, and auto-cleanup. Each target
 gets 'profile set' through Run Command; everything ends before the next auto-shutdown, and the runner clamps
 it to the scenario's limits. An incident on 'all' runs on the scenario's default target.
@@ -15,7 +15,8 @@ it to the scenario's limits. An incident on 'all' runs on the scenario's default
 Demo configuration (default: config/demo.config.json).
 
 .PARAMETER Target
-all, T1, T2, T3, or T4 (the PostgreSQL flexible server, when t4Enabled; Phase 24, ADR 0019).
+all, T1, T2, T3, T4 (the PostgreSQL flexible server, when t4Enabled; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
+account, when t5Enabled; ADR 0027).
 
 .PARAMETER Scenario
 baseline, business-day, off, or incident:<scenario>.
@@ -48,7 +49,7 @@ Where to write the results as JSON lines.
 param(
     [string] $ConfigPath = (Join-Path -Path $PSScriptRoot -ChildPath '../config/demo.config.json'),
 
-    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4')]
+    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4', 'T5')]
     [string] $Target = 'all',
 
     [Parameter(Mandatory)]

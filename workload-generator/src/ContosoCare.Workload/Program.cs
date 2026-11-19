@@ -6,7 +6,7 @@ namespace ContosoCare.Workload;
 
 /// <summary>
 /// Entry point for the Contoso Care Operations workload runner (ADR 0010): bounded scenarios, activity profiles, stop,
-/// reset, and status for the demo's three SQL targets.
+/// reset, and status for the demo's targets: three SQL targets, PostgreSQL (T4), and Cosmos DB for NoSQL (T5).
 /// </summary>
 internal static class Program
 {

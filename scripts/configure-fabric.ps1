@@ -184,7 +184,8 @@ With -RunLiveActivity: a file that stop-demo.ps1 -SaveHistory kept in out/histor
 couldn't be saved (STOP.T4.HISTORY.PENDING, for example while the Fabric capacity was paused): T4's and its deleted read
 replica's metrics from that session, which the run adds to the history as the notebook's POSTGRES_METRICS (ADR 0025).
 After a run that passed, the file moves to out/history-pending/saved. Without it, the run sends T4's and a running
-replica's metrics from Azure Monitor over the window, as deploy.ps1's history snapshot does.
+replica's metrics from Azure Monitor over the window, as deploy.ps1's history snapshot does. T5's (Azure Cosmos DB,
+2026-11-18) always come from Azure Monitor over the window, as COSMOS_METRICS, when T5 is deployed.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
@@ -663,6 +664,17 @@ if ($RunLiveActivity -or $firstRun) {
                 $notebookParameters['POSTGRES_METRICS'] = [string]$postgresCapture.Json
             }
         }
+        # T5 (2026-11-18, ADR 0027): its Azure Cosmos DB account stays between sessions, so its metrics come from Azure Monitor
+        # over the window, as COSMOS_METRICS, the way deploy.ps1's snapshot and stop-demo.ps1 -SaveHistory send them.
+        if ($RunLiveActivity -and $azGuarded) {
+            $cosmosCapture = & $module { param($Configuration, $Minutes) Get-DemoCosmosHistoryCapture -Config $Configuration -WindowMinutes $Minutes -CheckId 'FABRIC.T5.HISTORY' } $config $LiveActivityWindowMinutes
+            if ($null -ne $cosmosCapture -and $null -ne $cosmosCapture.Result) {
+                $results.Add($cosmosCapture.Result)
+            }
+            if ($null -ne $cosmosCapture -and [string]$cosmosCapture.Json) {
+                $notebookParameters['COSMOS_METRICS'] = [string]$cosmosCapture.Json
+            }
+        }
         # A copy of the notebook from before 2026-11-13 doesn't know POSTGRES_METRICS and would ignore them (2026-11-16): they
         # aren't sent, and a kept file stays where it is. One whose definition can't be read gets them, as before.
         $postgresWithheld = $false
@@ -672,6 +684,14 @@ if ($RunLiveActivity -or $firstRun) {
                 $notebookParameters.Remove('POSTGRES_METRICS')
                 $postgresWithheld = $true
                 $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' })))
+            }
+        }
+        # The same for T5's, with a copy from before 2026-11-18; Azure Monitor keeps them, so a later run adds them.
+        if ($notebookParameters.Contains('COSMOS_METRICS')) {
+            $knowsCosmos = & $module { param($Configuration, $FabricToken) Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $Configuration['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'COSMOS_METRICS' -Token $FabricToken } $config $runToken
+            if ($knowsCosmos.Known -and -not $knowsCosmos.Has) {
+                $notebookParameters.Remove('COSMOS_METRICS')
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T5.HISTORY' -Area 'fabric' -Target 'T5' -Status 'Warning' -Message 'T5''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them. Azure Monitor keeps them.' -Remediation $(if ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again adds them.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again adds them.' })))
             }
         }
         $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))

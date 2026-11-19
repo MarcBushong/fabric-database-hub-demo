@@ -27,6 +27,9 @@ function Stop-DemoEnvironment {
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
       storage and the Defender plans a tenant policy enables are billed while it's stopped.
+      T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off; an account has no stop, so STOP.T5
+      (Not supported) says what bills on between sessions: its provisioned throughput (nothing on the free tier), its
+      storage, and its private endpoint (Get-DemoT5StopResult). destroy.ps1 deletes it.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
       it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP). The busy marker (2026-11-14) is cleared, a
       deferred nightly pass removed, and the VMs' auto-shutdown put back at autoShutdownTime, since everything stops now
@@ -44,7 +47,9 @@ function Stop-DemoEnvironment {
       T4's read replica (ADR 0025) is deleted after each session, and its Azure Monitor metrics with it, so -SaveHistory
       first reads T4's and the replica's metrics (STOP.T4.HISTORY) and sends them with that run; when the run doesn't save
       them (a paused capacity, for example), they're kept in out/history-pending, with the command that adds them once
-      the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending).
+      the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending). T5's Azure Monitor metrics
+      (2026-11-18, ADR 0027) are read right before the run (STOP.T5.HISTORY, Get-DemoCosmosHistoryCapture) and sent as
+      COSMOS_METRICS; its account stays, so a run that doesn't save them leaves them in Azure Monitor for a later one.
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -179,7 +184,14 @@ function Stop-DemoEnvironment {
         $t4Read = Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $t4Missing = [string]$t4Read.State -eq 'NotFound' -or [bool](Get-DemoMemberValue -InputObject $t4Read -Name 'Removing')
     }
-    $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @('T2') }
+    $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2') }
+    # T5 (2026-11-18, ADR 0027): an account that doesn't exist yet (a demo deployed before T5) has no activity, and T1's
+    # runner may not know T5 yet, so it's left alone, as T4 is.
+    $t5Missing = $false
+    if ('T5' -in $profileTargets) {
+        $t5Read = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Missing = [string]$t5Read.State -eq 'NotFound'
+    }
     $offTargets = [System.Collections.Generic.List[string]]::new()
     foreach ($item in $profileTargets) {
         $vm = if ($item -eq 'T2') { $hostVm } else { 'sqlvm01' }
@@ -189,6 +201,9 @@ function Stop-DemoEnvironment {
         }
         elseif ($item -eq 'T4' -and $t4Missing) {
             $skip = 'T4 isn''t deployed, so it has no activity to turn off.'
+        }
+        elseif ($item -eq 'T5' -and $t5Missing) {
+            $skip = 'T5 isn''t deployed, so it has no activity to turn off.'
         }
         elseif ($item -eq 'T2' -and ($hostVm -ne 'archost01' -or 'archost01' -notin $state.RunnerSentTo)) {
             $skip = 'T2 has no workload runner (the evaluation-only mode, or the runner wasn''t sent to archost01).'
@@ -310,6 +325,11 @@ function Stop-DemoEnvironment {
     elseif (-not $ParkT2 -and $t4On) {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))
     }
+    # T5 (2026-11-18, ADR 0027): an Azure Cosmos DB account has no stop or pause. Its activity is off now (above) and the
+    # runner ended with sqlvm01, so it serves no requests, but what it provisions bills on: said here, once per stop.
+    if (-not $ParkT2 -and (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((Get-DemoT5StopResult -State $(if ($t5Missing) { $null } else { $t5Read })))
+    }
 
     if (-not $ParkT2) {
         # Phase 26b (ADR 0023): the session's history first, then the capacity the demo resumed, because a pause would
@@ -318,8 +338,17 @@ function Stop-DemoEnvironment {
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
             $historySaved = $false
+            # T5's Azure Monitor metrics (2026-11-18, ADR 0027), for the notebook's COSMOS_METRICS: its account stays, so
+            # they're read now, right before the run (Get-DemoCosmosHistoryCapture never throws).
+            $cosmosHistory = $null
+            if (Test-DemoT5Enabled -Config $Config) {
+                $cosmosHistory = Get-DemoCosmosHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -DeploymentId ([string]$state.Tags['deploymentId']) -CheckId 'STOP.T5.HISTORY'
+                if ($null -ne $cosmosHistory.Result) {
+                    $results.Add($cosmosHistory.Result)
+                }
+            }
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' })
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
                 # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.

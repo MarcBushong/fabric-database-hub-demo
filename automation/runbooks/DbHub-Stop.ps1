@@ -11,7 +11,9 @@ publishes it to the nightly safety stop's own account in the demo resource group
 
 - Scope All: started by the one-time schedule dbhub-autostop, which DbHub-Control creates at each run's end plus
   10 minutes. It does exactly what Stop now does: removes that schedule and the run's monitoring re-checks,
-  deallocates both VMs, and stops T4, through Azure Resource Manager only.
+  deallocates both VMs, and stops T4, through Azure Resource Manager only. T5, the Azure Cosmos DB account (ADR 0027),
+  has no stop: when its account is there, the result says it's left running and that its throughput keeps billing.
+  Scope Nightly leaves T5 alone and says nothing of it.
 - Scope T4: started by the control's daily schedule dbhub-t4-safety-stop. It stops T4 only when it's running, because
   a stopped flexible server starts itself after 7 days
   (https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server). A cost guardrail, not an

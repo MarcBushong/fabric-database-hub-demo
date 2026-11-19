@@ -11,8 +11,8 @@
     "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", "maxLength": 32, "description": "Kebab-case ID; also the folder name and part of the application name ContosoCare.Demo/<id>/<runId>." },
     "title": { "type": "string", "minLength": 3, "maxLength": 60 },
     "summary": { "type": "string", "minLength": 20, "maxLength": 600 },
-    "orchestration": { "enum": ["workers", "locking", "chain", "pairs", "slow-consumer", "capacity"], "description": "workers: N sessions run the procedure. locking: a holder, contenders, optional normal workers, and an optional deadlock pair. chain: a head blocker, chained links (depth x branches), an optional lock escalator, and optional normal workers. pairs: N pairs of sessions (sides 1 and 2). slow-consumer: N sessions whose client reads the procedure's result set slowly. capacity: N CPU sessions and ioWorkers IO sessions (Phase 25b)." },
-    "procedure": { "type": "string", "pattern": "^demo\\.usp_scenario_[a-z_]+$", "description": "The bounded entry point: the T-SQL procedure in database/common/120-scenario-procedures.sql for T1 to T3, and the PostgreSQL step function of the same name in database/postgresql/120-scenario-functions.sql for T4." },
+    "orchestration": { "enum": ["workers", "locking", "chain", "pairs", "slow-consumer", "capacity"], "description": "workers: N sessions run the procedure (on T5, N writers send the scenario's requests). locking: a holder, contenders, optional normal workers, and an optional deadlock pair. chain: a head blocker, chained links (depth x branches), an optional lock escalator, and optional normal workers. pairs: N pairs of sessions (sides 1 and 2). slow-consumer: N sessions whose client reads the procedure's result set slowly. capacity: N CPU sessions and ioWorkers IO sessions (Phase 25b)." },
+    "procedure": { "type": "string", "pattern": "^demo\\.usp_scenario_[a-z_]+$", "description": "The bounded entry point: the T-SQL procedure in database/common/120-scenario-procedures.sql for T1 to T3, and the PostgreSQL step function of the same name in database/postgresql/120-scenario-functions.sql for T4. T5's scenarios run in the runner's Cosmos DB REST client, so for a T5-only scenario the name is only a label." },
     "duration": {
       "type": "object",
       "additionalProperties": false,
@@ -34,7 +34,7 @@
       "additionalProperties": false,
       "required": ["applicable", "default"],
       "properties": {
-        "applicable": { "$ref": "#/$defs/targetList", "description": "Where the scenario can run. Every SQL Server incident runs on T1, T2, and T3 because the Database Agent's target coverage is undocumented (ADR 0013); T4 (PostgreSQL) runs the scenarios that list it (ADR 0019)." },
+        "applicable": { "$ref": "#/$defs/targetList", "description": "Where the scenario can run. Every SQL Server incident runs on T1, T2, and T3 because the Database Agent's target coverage is undocumented (ADR 0013); T4 (PostgreSQL) runs the scenarios that list it (ADR 0019), and T5 (Cosmos DB for NoSQL) healthy-baseline and ru-storm." },
         "default": { "$ref": "#/$defs/targetList", "description": "Where the architecture places it by default." },
         "notes": {
           "type": "object",
@@ -43,7 +43,8 @@
             "T1": { "type": "string" },
             "T2": { "type": "string" },
             "T3": { "type": "string" },
-            "T4": { "type": "string" }
+            "T4": { "type": "string" },
+            "T5": { "type": "string" }
           }
         }
       }
@@ -97,7 +98,7 @@
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
-      "items": { "enum": ["T1", "T2", "T3", "T4"] }
+      "items": { "enum": ["T1", "T2", "T3", "T4", "T5"] }
     },
     "parameter": {
       "type": "object",
@@ -116,7 +117,8 @@
             "T1": { "type": ["integer", "boolean", "string"] },
             "T2": { "type": ["integer", "boolean", "string"] },
             "T3": { "type": ["integer", "boolean", "string"] },
-            "T4": { "type": ["integer", "boolean", "string"] }
+            "T4": { "type": ["integer", "boolean", "string"] },
+            "T5": { "type": ["integer", "boolean", "string"] }
           }
         },
         "sqlParameter": { "type": ["string", "null"], "pattern": "^@[a-z_]+$" },

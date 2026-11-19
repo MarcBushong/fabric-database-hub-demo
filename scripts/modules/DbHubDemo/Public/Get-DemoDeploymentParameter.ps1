@@ -75,6 +75,11 @@ function Get-DemoDeploymentParameter {
     T4's server exists: its availability zone isn't sent, because a server keeps the zone it was created in.
     t4SkuName (Get-DemoT4SkuName) is always sent (Phase 24, ADR 0019).
 
+    .PARAMETER T5FreeTier
+    Whether T5's Cosmos DB account uses the subscription's free tier (Resolve-DemoT5FreeTier: an existing account's own
+    value, or true for a new one when no other account has it). False by default; ignored when t5Enabled is false
+    (2026-11-18, ADR 0027).
+
     .EXAMPLE
     Get-DemoDeploymentParameter -Config $config -NetworkMode private -T3UseFreeLimit $true | ConvertTo-Json -Depth 10
 
@@ -128,7 +133,9 @@ function Get-DemoDeploymentParameter {
 
         [System.Collections.IDictionary] $DiskSkuOverride = @{},
 
-        [switch] $T4Exists
+        [switch] $T4Exists,
+
+        [bool] $T5FreeTier = $false
     )
 
     if ($T2OsDiskSourceId -and $T2AttachExistingOsDisk) {
@@ -239,6 +246,9 @@ function Get-DemoDeploymentParameter {
         t4AutonomousTuning        = ((Test-DemoT4Enabled -Config $Config) -and (Get-DemoT4Tuning -Config $Config).Enabled)
         # A server keeps the zone it was created in, so the zone goes only to a T4 that doesn't exist yet.
         t4AvailabilityZone        = $(if ($T4Exists) { '' } else { Get-DemoT4AvailabilityZone -Config $Config })
+        # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), with the free tier Resolve-DemoT5FreeTier decided.
+        t5Enabled                 = (Test-DemoT5Enabled -Config $Config)
+        t5FreeTier                = ((Test-DemoT5Enabled -Config $Config) -and $T5FreeTier)
     }
     if ($DiskSkuOverride.Count -gt 0) {
         $overrides = [ordered]@{}

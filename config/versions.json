@@ -76,7 +76,7 @@
     "avm/res/network/network-security-group": "0.5.4"
   },
   "apiVersions": {
-    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference; 2026-11-18: Microsoft.Sql/servers/databases/automaticTuning, which status.ps1 reads and stop-demo.ps1 sets back for T3's FORCE_LAST_GOOD_PLAN, from the Database Automatic Tuning REST reference, and Microsoft.Authorization/permissions, which reads whether the signed-in account can save T3 in Database agent settings, from the Permissions - List For Resource reference, both checked 2026-11-18). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
+    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference; 2026-11-18: Microsoft.Sql/servers/databases/automaticTuning, which status.ps1 reads and stop-demo.ps1 sets back for T3's FORCE_LAST_GOOD_PLAN, from the Database Automatic Tuning REST reference, and Microsoft.Authorization/permissions, which reads whether the signed-in account can save T3 in Database agent settings, from the Permissions - List For Resource reference, both checked 2026-11-18; and Microsoft.DocumentDB/databaseAccounts and its sqlDatabases, containers, and sqlRoleAssignments for T5 in infra/modules/cosmos01.bicep and cosmos01-access.bicep, the newest generally available version Bicep 0.47.16 has types for (2026-01-01 has none), checked 2026-11-18). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
     "Microsoft.Authorization/denyAssignments": "2022-04-01",
     "Microsoft.Authorization/locks": "2020-05-01",
     "Microsoft.Authorization/permissions": "2022-04-01",
@@ -118,7 +118,11 @@
     "Microsoft.Automation/automationAccounts/webhooks": "2024-10-23",
     "Microsoft.Automation/automationAccounts/variables": "2024-10-23",
     "Microsoft.KeyVault/vaults/secrets": "2026-02-01",
-    "Microsoft.Fabric/capacities": "2023-11-01"
+    "Microsoft.Fabric/capacities": "2023-11-01",
+    "Microsoft.DocumentDB/databaseAccounts": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlDatabases": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments": "2025-10-15"
   },
   "arc": {
     "note": "Azure Arc onboarding of the T2 guest and SQL Server enabled by Azure Arc (Phase 7, ADR 0005, ADR 0006). Checked on Microsoft Learn on 2026-10-20; the source of each value is in docUrls.",
@@ -253,6 +257,45 @@
       "verifiedOn": "2026-11-13"
     },
     "verifiedOn": "2026-10-23"
+  },
+  "cosmosdb": {
+    "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. It has no stop: its throughput bills every hour (ADR 0027).",
+    "accountNamePrefix": "cosmos01",
+    "databaseName": "contosocare",
+    "containerName": "patient-events",
+    "partitionKeyPath": "/patientId",
+    "throughputRUs": 400,
+    "freeTierRUs": 1000,
+    "freeTierStorageGB": 25,
+    "estimatedStorageGB": 1,
+    "dataContributorRoleDefinitionId": "00000000-0000-0000-0000-000000000002",
+    "privateDnsZoneName": "privatelink.documents.azure.com",
+    "privateEndpointGroupId": "Sql",
+    "metrics": {
+      "note": "The Azure Monitor metrics Database Hub's Cosmos DB views chart (monitor-cosmos-db, checked 2026-11-18): Normalized RU Consumption (Maximum), Total Request Units (Total), Throttled Requests (TotalRequests filtered to StatusCode 429, Count), Provisioned throughput (Maximum), Avg Latency (ServerSideLatencyDirect, Average: direct mode only, so the runner's gateway requests leave it empty), and Availability (ServiceAvailability, Average, hourly). Read by status.ps1, validate.ps1, and the history snapshot with az monitor metrics list.",
+      "hub": [
+        "NormalizedRUConsumption",
+        "TotalRequestUnits",
+        "TotalRequests",
+        "ProvisionedThroughput",
+        "ServiceAvailability"
+      ],
+      "throttledDimension": "StatusCode",
+      "throttledStatusCode": "429"
+    },
+    "docUrls": {
+      "hubMonitor": "https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db",
+      "dataPlaneRbac": "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
+      "disableLocalAuth": "https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control",
+      "privateEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints",
+      "freeTier": "https://learn.microsoft.com/azure/cosmos-db/free-tier",
+      "normalizedRu": "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
+      "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
+      "metrics": "https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-documentdb-databaseaccounts-metrics",
+      "restAuthorization": "https://learn.microsoft.com/rest/api/cosmos-db/access-control-on-cosmosdb-resources",
+      "pricing": "https://azure.microsoft.com/pricing/details/cosmos-db/autoscale-provisioned/"
+    },
+    "verifiedOn": "2026-11-18"
   },
   "vmImages": {
     "note": "Marketplace images; 'latest' is resolved by Azure at creation. Preflight reads t1 to resolve securityType.t1 = Auto (ADR 0003).",

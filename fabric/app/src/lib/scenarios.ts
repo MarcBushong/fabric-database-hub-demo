@@ -18,7 +18,7 @@ export const SCENARIOS: readonly ScenarioInfo[] = [
     { id: "connection-surge", title: "Connection surge (capacity maxed)", targets: ["T4"], defaultMinutes: 5, maxMinutes: 15 },
     { id: "cpu-pressure", title: "CPU pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "deadlock-storm", title: "Deadlock storm", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
-    { id: "healthy-baseline", title: "Healthy baseline", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 30, maxMinutes: 240 },
+    { id: "healthy-baseline", title: "Healthy baseline", targets: ["T1", "T2", "T3", "T4", "T5"], defaultMinutes: 30, maxMinutes: 240 },
     { id: "idle-in-transaction", title: "Idle in transaction", targets: ["T4"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "inefficient-query", title: "Inefficient query", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "io-pressure", title: "IO pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
@@ -31,6 +31,7 @@ export const SCENARIOS: readonly ScenarioInfo[] = [
     { id: "plan-regression", title: "Plan regression (automatic plan correction)", targets: ["T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "replica-lag", title: "Read replica lag", targets: ["T4"], defaultMinutes: 10, maxMinutes: 15 },
     { id: "resource-governance", title: "Resource governance (CPU cap)", targets: ["T1", "T2", "T3"], defaultMinutes: 5, maxMinutes: 20 },
+    { id: "ru-storm", title: "RU storm (request rate too large)", targets: ["T5"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "slow-consumer", title: "Slow consumer", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "tempdb-contention", title: "tempdb allocation contention", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
 ];

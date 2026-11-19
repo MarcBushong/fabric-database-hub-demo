@@ -61,8 +61,10 @@ function Start-DemoEnvironment {
        (Set-DemoT4ReplicaHold, 2026-11-16) before the warm-up: a new one through its template's tags, one that's running
        already at once, and one that was stopped once it's Ready. So a deploy.ps1 run that ends during the session leaves
        it (a Warning, START.T4.REPLICA.HOLD, when the mark couldn't be written).
+    4c. T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so nothing starts it: START.T5 says whether
+       it's ready (a Warning with deploy.ps1's command for a demo deployed before T5), and its profile is set with T1's.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
-       2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
+       2026-11-03) on T1, T3, T4, T5, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
        activityProfileOnBoot is true, so this is what starts the demo's activity. T2's guest needs a few
        minutes after the host starts, so its profile is retried. Then the on-demand activity control's finished
@@ -274,9 +276,25 @@ function Start-DemoEnvironment {
     }
     $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
     $t4Request = if ($t4On) { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 0 -CheckPrefix START } else { $null }
+    # T5 (2026-11-18, ADR 0027) has no stop, so there's nothing to start: START.T5 says whether it's there, and its activity
+    # profile is set with T1's below.
+    $t5Ready = $false
+    if (Test-DemoT5Enabled -Config $Config) {
+        $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Ready = [bool]$t5.Exists -and [string]$t5.State -eq 'Succeeded'
+        if ($t5Ready) {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5 ({0}) is ready: an Azure Cosmos DB account has no stop, so it was running already{1}.' -f $t5.Names.AccountName, $(if ($t5.FreeTier) { ', on the free tier' } else { ', and its throughput bills every hour' }))))
+        }
+        elseif ($t5.State -eq 'NotFound') {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) doesn''t exist yet: a demo deployed before 2026-11-18 doesn''t have it, so this session has no Azure Cosmos DB.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1: it adds T5, with nothing else to do.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor'])))
+        }
+        else {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) is {1}{2}, so its activity isn''t started.' -f $t5.Names.AccountName, $t5.State, $(if ($t5.Error) { ': ' + $t5.Error } else { '' })) -Remediation 'Run ./scripts/status.ps1 in a few minutes; if it stays, run ./scripts/deploy.ps1.'))
+        }
+    }
     # A VM that was already running may still serve an earlier run's incidents: the targets this start sets get the
     # interim baseline before its own Run Commands reach that VM, and its switch brings the profile back (2026-11-03).
-    $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @('T2')
+    $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @(if ($t5Ready) { 'T5' }) + @('T2')
     $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru | Where-Object { $_.Outcome -eq 'Sent' } | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
     $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in 'sqlvm01', $hostVm) {
@@ -424,7 +442,7 @@ function Start-DemoEnvironment {
     }
 
     $t3Enabled = $t3Ready -and ((Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T3') -or @($results | Where-Object { $_.checkId -like 'WORKLOAD.T3*' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0)
-    $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @('T2')
+    $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2')
     # A target whose interim baseline this start waited for has had that wait's readiness bound already: its VM tried it
     # every 15 seconds for up to 10 minutes. One that never answered then (TimedOut, or Failed after several attempts) gets
     # one more attempt below without another wait, so the two waits don't add up (review of PR 17, 2026-11-04).
@@ -438,8 +456,11 @@ function Start-DemoEnvironment {
         if (-not $state.RunnerSha256) {
             $skip = 'No workload runner was deployed (deploy.ps1 -SkipRunner).'
         }
-        elseif ($target -in 'T1', 'T3', 'T4' -and -not $running['sqlvm01']) {
+        elseif ($target -in 'T1', 'T3', 'T4', 'T5' -and -not $running['sqlvm01']) {
             $skip = 'sqlvm01 isn''t running.'
+        }
+        elseif ($target -eq 'T5' -and -not $t5Ready) {
+            $skip = 'T5 isn''t ready (START.T5 says why), so its activity wasn''t started.'
         }
         elseif ($target -eq 'T4' -and $SkipT4) {
             $skip = 'T4 was left alone (-SkipT4).'

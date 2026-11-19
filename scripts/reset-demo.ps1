@@ -20,7 +20,8 @@ It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't 
 Demo configuration (default: config/demo.config.json).
 
 .PARAMETER Target
-all (default), T1, T2, T3, or T4.
+all (default), T1, T2, T3, T4, or T5 (T5, the Cosmos DB account: its runs stop and its profile goes off; there's no
+data to reseed or remediation to undo there).
 
 .PARAMETER Reseed
 Reseed the business data with the recorded seed and scale.
@@ -50,7 +51,7 @@ Exit with code 2 when a result is Manual action required.
 param(
     [string] $ConfigPath = (Join-Path -Path $PSScriptRoot -ChildPath '../config/demo.config.json'),
 
-    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4')]
+    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4', 'T5')]
     [string] $Target = 'all',
 
     [switch] $Reseed,

@@ -449,4 +449,49 @@ public sealed class ProfileSchedulerTests
         var incident = Assert.Single(activities, a => !a.IsBaseline);
         Assert.Equal(new DateTimeOffset(2026, 10, 20, 16, 5, 0, TimeSpan.Zero), incident.Start);
     }
+
+    [Theory]
+    [InlineData(2, null, 0, null)]
+    [InlineData(4, "ru-storm", 8, null)]
+    [InlineData(12, "ru-storm", 8, null)]
+    [InlineData(15, null, 0, null)]
+    [InlineData(19, "ru-storm", 10, "4")]
+    [InlineData(27, null, 0, null)]
+    [InlineData(34, "ru-storm", 8, null)]
+    [InlineData(49, "ru-storm", 10, "4")]
+    public void TheShowcaseStormsT5TwiceInEachCycleWithCalmBetween(int minute, string? scenario, int writers, string? documentKb)
+    {
+        var state = State("showcase", SetAt.AddMinutes(90));
+
+        var activities = ProfileScheduler.Plan(state, DemoTarget.T5, SetAt.AddMinutes(minute), Definitions, Catalog, null);
+
+        Assert.Contains(activities, a => a.IsBaseline && a.Concurrency == 1 && a.Intensity == 2);
+        var incidents = activities.Where(a => !a.IsBaseline).ToList();
+        if (scenario is null)
+        {
+            Assert.Empty(incidents);
+            return;
+        }
+
+        var storm = Assert.Single(incidents);
+        Assert.Equal(scenario, storm.ScenarioId);
+        Assert.Equal(writers, storm.Concurrency);
+        Assert.Equal(8, storm.Intensity);
+        Assert.Equal(documentKb, storm.Parameters.TryGetValue("documentKb", out var kb) ? kb : null);
+        Assert.True(storm.End - storm.Start <= TimeSpan.FromSeconds(Catalog.Get(scenario).Duration.MaxSeconds));
+    }
+
+    [Fact]
+    public void BusinessDayStormsT5AtTwentyFivePastEachHour()
+    {
+        var activities = ProfileScheduler.Plan(State("business-day"), DemoTarget.T5, new DateTimeOffset(2026, 10, 20, 16, 27, 0, TimeSpan.Zero), Definitions, Catalog, null);
+
+        var storm = Assert.Single(activities, a => !a.IsBaseline);
+        Assert.Equal("ru-storm", storm.ScenarioId);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 16, 25, 0, TimeSpan.Zero), storm.Start);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 16, 33, 0, TimeSpan.Zero), storm.End);
+        Assert.Equal("120", storm.Parameters["stormSeconds"]);
+        Assert.Equal("60", storm.Parameters["calmSeconds"]);
+        Assert.All(ProfileScheduler.Plan(State("business-day"), DemoTarget.T5, new DateTimeOffset(2026, 10, 20, 16, 40, 0, TimeSpan.Zero), Definitions, Catalog, null), a => Assert.True(a.IsBaseline));
+    }
 }

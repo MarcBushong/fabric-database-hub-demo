@@ -102,7 +102,8 @@ function Start-DemoDeploymentRun {
         $pageLine = ''
         if (-not $NoStatusPage -and -not $environment.GitHubActions) {
             # T4's rows are always there (2026-11-09): a run without T4 says on them why, and how to add it (DEPLOY.T4.OFF).
-            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -SkipFabric:$SkipFabric
+            # T5's rows are there too (2026-11-18, ADR 0027): a configuration that turns T5 off shows them Skipped.
+            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -T5Enabled -SkipFabric:$SkipFabric
             $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text }
             try {
                 Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false

@@ -54,7 +54,7 @@ Presenter scripts for the Fabric Database Hub hybrid SQL demo: a 15-minute versi
 
 ## The DBA moments in a Run all session
 
-Since 2026-11-18, **Run all** in `NB_DatabaseHub_Control` carries three moments a DBA audience remembers. They need nothing beyond the session itself, apart from the one-time agent selection below, and the guide the notebook prints gives each one's time in the demo's clock.
+Since 2026-11-18, **Run all** in `NB_DatabaseHub_Control` carries four moments a DBA audience remembers. They need nothing beyond the session itself, apart from the one-time agent selection below, and the guide the notebook prints gives each one's time in the demo's clock.
 
 ### Open at Overview
 
@@ -96,10 +96,22 @@ The agent's issue, Copilot's analysis of it, a manual response, and the issue cl
 - **If it isn't there:** no issue after about 20 minutes means T3 isn't selected or the agent isn't active: check the green message, and `./scripts/validate.ps1 -Area T3` (`T3.AGENT`) names any gap Azure can see. **Explain why** and **Analyze slow query** need the capacity's Copilot. The regression and its CPU still show on **Performance**, and [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md)'s prompts work in Copilot.
 - **Afterward:** `./scripts/status.ps1` shows `FORCE_LAST_GOOD_PLAN` (`STATUS.T3.AUTOTUNING`). Every way a session ends puts it back: the response, the beat's end, reset, a cancel, a newer Run all, Stop now, `stop-demo.ps1`, and, after the nightly safety stop, the next run on T3; `deploy.ps1` does too ([plan regression](../scenarios/plan-regression/README.md)). Once the session's history is saved, the history report and the Insights app have the beat's `database_agent` finding: T3's CPU before and after the response, with **Pass** when it fell.
 
+### T5: Azure Cosmos DB's RU storm
+
+One hot partition uses up T5's 400 RU/s, Database Hub shows normalized RU at 100% with throttled requests (429s), and both recover when the storm ends ([ADR 0027](adr/0027-t5-cosmos-db.md)). Nothing to sign in to or set up: T1's managed identity has T5's data-plane role, and Database Hub reads T5's Azure Monitor metrics with your Reader access.
+
+**In every session** (Run all's guide prints the times): Run all's showcase runs `ru-storm` on T5 at minutes 3 (10 minutes) and 18 (8 minutes) of each 30-minute cycle, and ends T5's activity at its baseline, with no storm running, at least 2 minutes before the session ends.
+
+1. **Show:** in Database Hub, **Estate**, filter to Azure Cosmos DB and select `cosmos01-<deploymentId>`; then **Performance**. **Normalized RU Consumption** at 100% and **Throttled Requests (429s)** climbing, with **Total Request Units** flat at the **Provisioned Throughput** line. Its charts use an hourly grain, so look at the hour the storm falls in.
+2. **Say:** "A bedside-monitor integration is stuck in a retry loop and hammering one patient's records. Cosmos DB rate-limits it to protect everyone else's throughput: a 429 isn't an outage, and **Availability** stays at 100%. The fix is the data model, a partition key that spreads the writes, not a bigger bill."
+3. **The recovery:** between the waves and after the storm, normalized RU falls back to the baseline's few percent and the 429s stop.
+4. **If it isn't there:** `./scripts/status.ps1` (`STATUS.T5`) gives the last 15 minutes' peak normalized RU and 429s from Azure Monitor, and the walkthrough's [RU storm (T5)](#ru-storm-t5) cheat sheet has the rehearsal steps and the command that starts a storm by itself.
+5. **Afterward:** the session's history has T5's peak normalized RU, requests, 429s, and request units, with a `cosmosdb.T5.recovery` finding (**Pass** when T5 was back at its baseline before the capture ended).
+
 ### Reset, stop, and repeat
 
-- **Repeat:** every Run all repeats the three moments. The agent raises a new issue each session (closed ones stay in its history), and the beat unforces the plan at its next start.
-- **Reset:** `RESET_NOW = True` in the notebook, or `./scripts/reset-demo.ps1`, unforces the plan and puts back anything a run left.
+- **Repeat:** every Run all repeats the moments. The agent raises a new issue each session (closed ones stay in its history), and the beat unforces the plan at its next start. T5's storm upserts a fixed set of 100 documents and deletes them when it ends, however it ends, so every session's storm starts from the same data, RU, and no 429s.
+- **Reset:** `RESET_NOW = True` in the notebook, or `./scripts/reset-demo.ps1`, unforces the plan and puts back anything a run left, T5's storm documents included.
 - **Stop:** Run all ends the session itself; `./scripts/stop-demo.ps1` stops everything from a PC.
 
 ## Demo it yourself: the Insights app
@@ -234,6 +246,7 @@ Assert-DemoAzContext -SubscriptionId $config.subscriptionId -TenantId $config.te
 | :15 | T3 | `resource-governance`, 5 min | CPU at the service tier's limit: **Databases limited by service tier** and the high-CPU panels |
 | :20 | T2 | `missing-index`, 8 min | CPU and logical reads above the baseline: the CPU-spike panel |
 | :22 | T4 | `idle-in-transaction`, 8 min | Sessions idle in an open transaction, blocking writers, on the PostgreSQL dashboard |
+| :25 | T5 | `ru-storm`, 8 min | Normalized RU at 100% and throttled (429) requests in waves, then the recovery, on the Cosmos DB view ([RU storm](#ru-storm-t5)) |
 | :35 | T2 | `io-pressure`, 8 min | Storage IO, `Page reads/sec`, and `WRITELOG` waits |
 | :40 | T1 | `locking-blocking` with a deadlock, 6 min | Blocking, and `Number of Deadlocks/sec` above 0 |
 | :42 | T4 | `cpu-pressure`, 6 min | CPU at its ceiling, on the PostgreSQL dashboard |
@@ -859,6 +872,25 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 - **Show in the Hub:** in **Estate**, filter to **View: PostgreSQL**: the replica is a flexible server of its own next to T4 (*verify in rehearsal*). Select `pgreplica01-<deploymentId>`, then **Performance** and the PostgreSQL dashboard: **Read replica lag** (`physical_replication_delay_in_seconds`, replicas only) climbs to about `holdSeconds` during each report and drops back to a few seconds once it ends. Outside the beat, a same-region replica idles at 2 to 6 seconds ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)). On T4 itself, the Azure portal's Metrics show **Max Physical Replication Lag** in bytes growing at the same time.
 - **Afterward:** `./scripts/stop-demo.ps1 -SaveHistory` keeps the session's lag curve in the history, and the Insights app's T4 page (**Estate**, then T4) shows it; it reads the replica's metrics before it deletes the replica, whose Azure Monitor history goes with it.
 - **Reset:** the marks are the only rows it writes; the auto-cleanup and `reset` delete them, and `reset` ends the demo's sessions on the replica.
+
+### RU storm (T5)
+
+The DBA moment for Azure Cosmos DB (since 2026-11-18, [ADR 0027](adr/0027-t5-cosmos-db.md)): one hot partition uses up the container's throughput, Database Hub shows normalized RU at 100% with throttled requests, and then both recover.
+
+- **Runs on:** T5, `cosmos01-<deploymentId>`, the Azure Cosmos DB for NoSQL account that every deployment has (an older demo gets it from `./scripts/deploy.ps1`). Its container `patient-events` has 400 RU/s; T1's runner drives it, so `sqlvm01` must be running. Nothing to sign in to: T1's managed identity has its data-plane role, and Database Hub needs only your Reader access.
+- **The story:** "A bedside-monitor integration got stuck in a retry loop and is hammering one patient's records. Cosmos DB protects everyone else's throughput by rate-limiting it: that's a 429, not an outage. The fix is in the data model, not a bigger bill."
+- **Bounds:** 10 minutes by default, 30 at most; 8 writers in waves of `stormSeconds` (150), each followed by `calmSeconds` (90) with no storm writes. Writes are upserts over a fixed set of 100 documents in its own partition (`p-storm-01`), never new ones, and it deletes them when it ends, however it ends, so every session starts from the same data ([the scenario](../scenarios/ru-storm/README.md)).
+- **Start:** `./scripts/demo-control.ps1 -Target T5 -Scenario incident:ru-storm -Duration 10`. `business-day` runs it at :25 each hour for 8 minutes; Run all's showcase runs it twice in each 30-minute cycle, from minute 3 for 10 minutes and from minute 18 for 8.
+- **Stop:** `profile set --name baseline` (or the notebook's **Stop now**); the writers stop within seconds, and the run deletes its documents.
+- **Rehearse it, then show it in the Hub:**
+  1. Before the audience, check that T5 is ready: `./scripts/validate.ps1 -Area T5` shows `T5.ACCOUNT` to `T5.ACCESS` **Pass** and `METRICS.T5` **Pass** (requests in the last 15 minutes).
+  2. Start the storm (above), or let Run all's showcase start it at minute 3. Within a minute, `./scripts/status.ps1` shows `STATUS.T5` with throttled (429) requests and normalized RU at or near 100% for the last 15 minutes.
+  3. In Database Hub, **Estate**: filter to Azure Cosmos DB and select `cosmos01-<deploymentId>`; then **Performance**. **Normalized RU Consumption** rises to 100% in the storm's waves, and **Throttled Requests** (429) climbs with it; **Total Request Units** flattens at about 400 RU/s, the **Provisioned Throughput** line. Its charts use an hourly grain, so give it a few minutes after the first wave, and look at the hour the storm falls in (*verify in rehearsal*).
+  4. Point out what stays fine: **Availability** stays at 100%, because a 429 isn't an availability error, and between the waves normalized RU falls back and the 429s stop: the recovery, live.
+  5. Open **Security** for T5: Microsoft Entra only and no public network access pass; customer-managed keys stay a suggestion.
+- **What to say about the fix:** a better partition key spreads the writes (a per-device key, or a synthetic key with a suffix); a retry policy that honors `x-ms-retry-after-ms`, which the runner does; and more RU/s or autoscale only when the load is real. The demo changes nothing; the storm ends on its own.
+- **Afterward:** `./scripts/stop-demo.ps1 -SaveHistory` (or Run all's end) saves T5's peak normalized RU, requests, 429s, and request units to the history. T5 has no stop: it bills between sessions too ([cost](cost-management.md#t5-azure-cosmos-db-2026-11-18)).
+- **Reset:** nothing to do: the run deletes its storm documents. After a stopped VM cut a storm off, `./scripts/reset-demo.ps1 -Target T5` deletes any left over.
 
 ## Recovery playbook
 

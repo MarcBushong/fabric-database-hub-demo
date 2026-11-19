@@ -222,6 +222,8 @@ function Get-HubGraphRow {
         [ordered]@{ id = $script:HubT3ServerId; name = 'azuresql01-abc123'; type = 'microsoft.sql/servers'; location = 'westus3'; resourceGroup = 'rg-dbhub-demo' }
         [ordered]@{ id = $script:HubT3Id; name = 'ContosoCare'; type = 'microsoft.sql/servers/databases'; location = 'westus3'; resourceGroup = 'rg-dbhub-demo'; status = 'Online'; createdUtc = '2026-10-20T11:00:00.0000000Z'; skuName = 'GP_S_Gen5' }
         [ordered]@{ id = ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' -f $script:HubGroupId); name = 'pgflex01-abc123'; type = 'microsoft.dbforpostgresql/flexibleservers'; location = 'westus3'; resourceGroup = 'rg-dbhub-demo'; status = 'Ready'; version = '18'; skuName = 'Standard_B1ms' }
+        # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account.
+        [ordered]@{ id = ('{0}/providers/Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123' -f $script:HubGroupId); name = 'cosmos01-abc123'; type = 'microsoft.documentdb/databaseaccounts'; location = 'westus3'; resourceGroup = 'rg-dbhub-demo'; status = 'Succeeded' }
     )
     @($rows | Where-Object { $_.type + '|' + $_.name -notin $Without })
 }

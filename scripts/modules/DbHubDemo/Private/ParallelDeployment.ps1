@@ -502,6 +502,15 @@ function Invoke-DemoParallelDeployment {
             $Resume = [switch]::new($false)
         }
     }
+    # 2026-11-18 (ADR 0027): the same for T5, a demo deployed before T5: a resume would skip the template that creates it.
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $missingT5 = Get-DemoT5MissingResult -Config $Config -State $state
+        if ($null -ne $missingT5) {
+            $results.Add($missingT5)
+            Write-DemoLog -Message $missingT5.message
+            $Resume = [switch]::new($false)
+        }
+    }
     # 2026-11-17: a T2 host that a rebuild deleted and didn't create again, or one deleted by hand, would make the T2 track fail
     # on a VM that doesn't exist. Its records are cleared (its artifacts go again), and a resume starts from preflight instead,
     # so the template creates it.
@@ -589,6 +598,12 @@ function Invoke-DemoParallelDeployment {
     }
     if ($skipT4 -and -not $whatIf) {
         $null = & $showT4Off
+    }
+    # T5 turned off in the configuration (t5Enabled false; ADR 0027): said once, on its rows too.
+    $t5Off = New-DemoT5OffResult -Config $Config
+    if ($null -ne $t5Off -and -not $whatIf) {
+        $results.Add($t5Off)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Not selected' -Message ([string]$t5Off.message)
     }
     # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
     # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
@@ -1235,18 +1250,34 @@ function Invoke-DemoParallelDeployment {
         }
         return ([string](Get-DemoMemberValue -InputObject $state -Name ('Track{0}' -f $Track)) -eq $LastStep)
     }
-    $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
+    $allTracksDone = (& $trackFinished 'T1' ([string]@((Get-DemoTrackStep -Track 'T1').Keys)[-1])) -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
     $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
-    $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric
+    $skipT5 = -not (Test-DemoT5Enabled -Config $Config)
+    $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:$skipT5
     $validationStart = $results.Count
+    # When T5's metrics passed in this run's validation, for the timing's targetReadyUtc (ADR 0027).
+    $t5ReadyUtc = ''
     # Whether DONE's checks ran, which the history report's snapshot at the end needs (2026-11-06).
     $doneChecked = $false
     if ($plan.Validation) {
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -State 'Running' -Message 'Checking Database Hub''s estate, telemetry, and metrics, and the Fabric items.'
-        # T4's estate only when it's deployed: the Burstable fallback can leave it out of this run (Phase 28).
-        $estateTargets = @(@(if ($t1Done) { 'T1', 'T3' }) + @(if ($t2Done) { 'T2' }) + @(if ($t4Done -and -not $skipT4) { 'T4' }))
+        # T4's estate only when it's deployed: the Burstable fallback can leave it out of this run (Phase 28). T5's with T1's
+        # track, which checks it (ADR 0027).
+        $estateTargets = @(@(if ($t1Done) { 'T1', 'T3' }) + @(if ($t2Done) { 'T2' }) + @(if ($t4Done -and -not $skipT4) { 'T4' }) + @(if ($t1Done -and -not $skipT5) { 'T5' }))
         if ($estateTargets.Count -gt 0) {
             & $addAll @(Test-DemoHubEstate -Config $Config -Target $estateTargets)
+        }
+        if ($t1Done -and -not $skipT5) {
+            # T5's Azure Monitor metrics (ADR 0027), which Database Hub's Cosmos DB views chart: T1's activity has sent it
+            # requests since T1's Activity step, so they've had the whole run to arrive. A resumed run whose T1 track
+            # finished earlier reads them in DONE's checks below.
+            Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -State 'Running' -Message 'Reading T5''s normalized RU, requests, and 429s in Azure Monitor.'
+            $t5Metrics = Test-DemoT5MetricFlow -Config $Config -AccountId ([string](Get-DemoT5Name -Config $Config).AccountId) -WaitMinutes $TelemetryWaitMinutes
+            $results.Add($t5Metrics)
+            Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -Status ([string]$t5Metrics.status) -Message ([string]$t5Metrics.message)
+            if ([string]$t5Metrics.status -eq 'Pass') {
+                $t5ReadyUtc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
         }
         if ($t1Done) {
             # T1's AssociatedServices step must have converged: unified inventory lists only the engine. A Fail, not a
@@ -1318,6 +1349,9 @@ function Invoke-DemoParallelDeployment {
                 $ready[[string]$key] = [string]$readyValue[$key]
             }
         }
+    }
+    if ($t5ReadyUtc) {
+        $ready['T5'] = $t5ReadyUtc
     }
     # The clock stops when DONE's requirements pass (ADR 0018, section 1, as amended by Phase 28: T4 included).
     $clockStopped = $allTracksDone -and (Test-DemoDoneEvidence -Result $all -Requirement $requirement).Complete

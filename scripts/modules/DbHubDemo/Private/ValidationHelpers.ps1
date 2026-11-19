@@ -83,7 +83,7 @@ function New-DemoValidationContext {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [string[]] $Target = @('T1', 'T2', 'T3', 'T4'),
+        [string[]] $Target = @('T1', 'T2', 'T3', 'T4', 'T5'),
 
         [AllowEmptyString()]
         [string] $DeploymentId = '',
@@ -378,7 +378,7 @@ function Get-DemoValidationQuietReason {
     <#
     .SYNOPSIS
     Why a target sends no telemetry by design right now, or an empty string: its VM isn't running, or T3 is
-    paused or removed. Internal.
+    paused or removed. T5 has no stop, so its reason is sqlvm01's, whose runner sends its requests (ADR 0027). Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -387,10 +387,17 @@ function Get-DemoValidationQuietReason {
         [pscustomobject] $Context,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target
     )
 
+    if ($Target -eq 'T5') {
+        $state = Get-DemoValidationVmState -Context $Context -VmName 'sqlvm01'
+        if (-not $state.Running) {
+            return ('sqlvm01, whose runner sends T5''s requests, is {0}' -f $state.PowerState)
+        }
+        return ''
+    }
     if ($Target -eq 'T4') {
         $t4 = Get-DemoT4State -Config $Context.Config -DeploymentId ([string]$Context.DeploymentId)
         if (-not $t4.Exists) {
@@ -430,7 +437,7 @@ function Test-DemoValidationWorkloadBound {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [AllowEmptyString()]
@@ -605,14 +612,14 @@ function Test-DemoValidationWorkloadHost {
     its profile, while no host runs, or when the output has no host state; Fail while a profile is active and
     nothing runs it (the host ended without a clean stop, or its heartbeat is stale), or when the lane keeps failing
     (three restarts in an hour); Not selected when the host doesn't serve the target and its profile is off. T4's
-    lane runs in T1's profile host, like T3's (Phase 24).
+    lane runs in T1's profile host, like T3's (Phase 24), and so does T5's (ADR 0027).
     Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [AllowEmptyString()]

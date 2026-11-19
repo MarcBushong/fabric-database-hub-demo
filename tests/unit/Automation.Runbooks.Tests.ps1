@@ -118,6 +118,9 @@ BeforeAll {
         $script:variableMissing = $false
         $script:variableReads = 0
         $script:variableReadHook = $null
+        # T5's Azure Cosmos DB account (2026-11-18, ADR 0027): $null when it isn't there (its metrics answer 404, as between
+        # deployments without T5), or a hashtable when it is.
+        $script:cosmos = $null
     }
 
     # The Automation sandbox's internal cmdlets for an existing variable, as the runbooks call them.
@@ -159,6 +162,33 @@ BeforeAll {
                 if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
                 $script:secrets[$name].Add([pscustomobject]@{ Value = [string]$Body.properties.value; Tags = $Body['tags']; At = $script:clock })
                 return (New-Response 200 '{}')
+            }
+            '/databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics\?' {
+                # T5's metrics (2026-11-18): three 1-minute points of each, normalized RU at 100% in the middle one, which
+                # alone has throttled requests (429s), and one hourly point for the hourly reads.
+                if ($null -eq $script:cosmos) { return (New-Response 404 '{"error":{"code":"ResourceNotFound","message":"The Resource ''Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123'' was not found."}}') }
+                $null = $Path -match 'metricnames=([^&]+)'
+                $name = $Matches[1]
+                $null = $Path -match 'aggregation=(\w+)'
+                $field = $Matches[1].ToLowerInvariant()
+                $hourly = $Path -match 'interval=PT1H'
+                $throttled = $Path -match '\$filter=StatusCode%20eq%20%27429%27'
+                $values = switch ($name) {
+                    'NormalizedRUConsumption' { @(35, 100, 40) }
+                    'TotalRequestUnits' { @(1200, 24000, 1300) }
+                    'TotalRequests' { if ($throttled) { @($null, 120, $null) } else { @(600, 900, 610) } }
+                    'ServerSideLatencyGateway' { @(5.25, 9.5, 5) }
+                    'ProvisionedThroughput' { @(400) }
+                    'ServiceAvailability' { @(100) }
+                }
+                $points = for ($index = 0; $index -lt @($values).Count; $index++) {
+                    $at = if ($hourly) { $script:clock.Date.AddHours(15) } else { $script:clock.Date.AddHours(15).AddMinutes($index) }
+                    $point = @{ timeStamp = $at.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+                    if ($null -ne @($values)[$index]) { $point[$field] = @($values)[$index] }
+                    $point
+                }
+                $unit = @{ NormalizedRUConsumption = 'Percent'; ServiceAvailability = 'Percent'; ServerSideLatencyGateway = 'MilliSeconds' }[$name]
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@{ name = @{ value = $name }; unit = $(if ($unit) { $unit } else { 'Count' }); timeseries = @(@{ data = @($points) }) }) } -Depth 8))
             }
             '/flexibleServers/(pgflex01|pgreplica01)-abc123/providers/Microsoft\.Insights/metrics\?' {
                 # Three 1-minute points of each metric asked for; Read Replica Lag climbs to 180 seconds and drops.
@@ -377,6 +407,8 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a reset of every target'; Body = @{ action = 'reset' } }
         @{ Name = 'the showcase on every target'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'showcase' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 90 } }
         @{ Name = 'the showcase with a target off'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 120 } }
+        @{ Name = 'an ru-storm on T5, at its maximum concurrency'; Body = @{ action = 'run'; activities = @(@{ target = 'T5'; scenario = 'ru-storm'; intensity = 8; concurrency = 16 }); durationMinutes = 30 } }
+        @{ Name = 'a reset of T5'; Body = @{ action = 'reset'; targets = @('T5') } }
     ) {
         $request = Test-DbHubControlRequest -WebhookData (New-Webhook $Body) -Settings $script:settings
         $request.Reason | Should -BeNullOrEmpty
@@ -431,6 +463,9 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a run of off only'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"off"},{"target":"T4","scenario":"off"}],"durationMinutes":20}'; Match = 'at least one activity that isn''t off' }
         @{ Name = 'the showcase in another case'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"Showcase"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
         @{ Name = 'business-day, which the control doesn''t run'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"business-day"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
+        @{ Name = 'ru-storm on a SQL target'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"ru-storm"}],"durationMinutes":20}'; Match = 'T1' }
+        @{ Name = 'an ru-storm over its maximum concurrency'; Raw = '{"action":"run","activities":[{"target":"T5","scenario":"ru-storm","concurrency":17}],"durationMinutes":20}'; Match = 'concurrency' }
+        @{ Name = 'a target past T5'; Raw = '{"action":"run","activities":[{"target":"T6","scenario":"baseline"}],"durationMinutes":20}'; Match = 'target must be' }
     ) {
         $data = if ($null -eq $Raw) { $null } else { New-Webhook $Raw }
         $request = Test-DbHubControlRequest -WebhookData $data -Settings $script:settings
@@ -439,10 +474,12 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
     }
 
     It 'allows the catalog''s targets and scenarios only, from scenarios/*/scenario.json' {
-        # T4 is in the catalog since Phase 24's scenarios (connection-surge, idle-in-transaction) list it.
-        @($script:settings.targets.PSObject.Properties.Name) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        # T4 is in the catalog since Phase 24's scenarios (connection-surge, idle-in-transaction) list it, and T5 since
+        # ru-storm does (2026-11-18, ADR 0027), with T5 on in the configuration.
+        @($script:settings.targets.PSObject.Properties.Name) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         $scenarios = @($script:settings.scenarios.PSObject.Properties.Name)
         $scenarios | Should -Contain 'connection-surge'
+        $scenarios | Should -Contain 'ru-storm'
         $scenarios | Should -Contain 'blocking-chain'
         $scenarios | Should -Contain 'capacity-max'
         $scenarios | Should -Not -Contain 'healthy-baseline'
@@ -451,11 +488,11 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         $script:settings.scenarios.'blocking-chain'.maxConcurrency | Should -Be 4
     }
 
-    It 'allows the showcase profile, from scenarios/activity-profiles.json: 90 minutes by default, 120 at most, on T1 to T4' {
+    It 'allows the showcase profile, from scenarios/activity-profiles.json: 90 minutes by default, 120 at most, on T1 to T5' {
         @($script:settings.profiles.PSObject.Properties.Name) | Should -Be @('showcase')
         $script:settings.profiles.showcase.defaultMinutes | Should -Be 90
         $script:settings.profiles.showcase.maxMinutes | Should -Be 120
-        @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         # A session the auto-shutdown cuts short ends after whole cycles (2026-11-14).
         $script:settings.profiles.showcase.cycleMinutes | Should -Be 30
     }
@@ -1093,7 +1130,8 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'reset' }) -Context (New-TestContext)
         $result.status | Should -Be 'Dispatched'
-        @($result.dispatched) | Should -Be @('T1', 'T3')
+        # T5 (2026-11-18) goes with sqlvm01, as T1 and T3 do: Azure Cosmos DB has no stop.
+        @($result.dispatched) | Should -Be @('T1', 'T3', 'T5')
         $result.message | Should -Match 'T2 \(archost01 isn''t running\)'
         @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
     }
@@ -1177,7 +1215,7 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $session.Action | Should -Be 'session'
         $session.SessionId | Should -Be $script:sessionId
         $session.DurationMinutes | Should -Be 90
-        @($session.Activities | ForEach-Object Target) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($session.Activities | ForEach-Object Target) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         @($session.Activities | ForEach-Object Scenario | Select-Object -Unique) | Should -Be @('showcase')
         (Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; durationMinutes = 120 }) -Settings $script:settings).DurationMinutes | Should -Be 120
         foreach ($body in @(
@@ -1503,6 +1541,167 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
             $module = InModuleScope -ModuleName DbHubDemo -Parameters @{ Points = $points; Case = $case } { ConvertTo-DemoPostgresHistoryPoint -Point $Points -Aggregation $Case.Aggregation -Unit $Case.Unit -IntervalMinutes $Case.Interval }
             (ConvertTo-Json -InputObject $runbook -Compress) | Should -Be (ConvertTo-Json -InputObject $module -Compress) -Because ($case | ConvertTo-Json -Compress)
         }
+    }
+}
+
+Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase in a session, its stop, and its metrics' {
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        $script:sessionId = '0123456789abcdef0123456789abcdef'
+        $script:decodeRequest = { param($Call) @([regex]::Matches($Call.Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) | ConvertFrom-Json }) }
+    }
+
+    It 'ends T5''s showcase after its last whole ru-storm and 2 minutes of its baseline: <Available> minutes left run <Expected>' -ForEach @(
+        @{ Available = 90; Expected = 90 }
+        @{ Available = 88; Expected = 88 }
+        @{ Available = 87; Expected = 78 }
+        @{ Available = 84; Expected = 78 }
+        @{ Available = 78; Expected = 78 }
+        @{ Available = 31; Expected = 31 }
+        @{ Available = 27; Expected = 18 }
+        @{ Available = 15; Expected = 15 }
+        @{ Available = 14; Expected = 3 }
+        @{ Available = 2; Expected = 2 }
+        @{ Available = 0; Expected = 0 }
+    ) {
+        # The showcase's T5 slots: ru-storm from minute 3 for 10 minutes and from minute 18 for 8, in every 30-minute cycle.
+        $slots = @($script:settings.profiles.showcase.t5Slots)
+        @($slots | ForEach-Object { '{0}+{1}' -f $_.startMinute, $_.durationMinutes }) | Should -Be @('3+10', '18+8')
+        Get-DbHubT5ShowcaseMinute -AvailableMinutes $Available -CycleMinutes 30 -Slot $slots | Should -Be $Expected
+    }
+
+    It 'cuts T5''s showcase back at its dispatch, from the run''s end less the runner''s 2 minutes and its Run Command''s 2, and leaves every other activity alone' {
+        $now = [datetime]::new(2026, 10, 27, 15, 4, 0, [System.DateTimeKind]::Utc)
+        $notAfter = [datetime]::new(2026, 10, 27, 16, 32, 0, [System.DateTimeKind]::Utc)
+        $t5 = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
+        $end = Set-DbHubT5ShowcaseMinute -Settings $script:settings -Activity $t5 -NowUtc $now
+        # 16:30 less 15:04 is 86 minutes, less 2 for the Run Command: 84, inside the third cycle's second ru-storm (minutes
+        # 78 to 86, and 2 of baseline), so the showcase ends where that storm would start.
+        $t5.Minutes | Should -Be 78
+        $end | Should -Be $now.AddMinutes(78)
+        foreach ($other in @(
+                [pscustomobject]@{ Target = 'T1'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
+                [pscustomobject]@{ Target = 'T5'; Scenario = 'ru-storm'; Intensity = 0; Concurrency = 0; Minutes = 10; NotAfterUtc = $null }
+                [pscustomobject]@{ Target = 'T5'; Scenario = 'baseline'; Intensity = 0; Concurrency = 0; Minutes = 30; NotAfterUtc = $notAfter })) {
+            $minutes = $other.Minutes
+            Set-DbHubT5ShowcaseMinute -Settings $script:settings -Activity $other -NowUtc $now | Should -BeNullOrEmpty
+            $other.Minutes | Should -Be $minutes
+        }
+    }
+
+    It 'sends T5''s showcase with sqlvm01''s, ending at its baseline before the session ends, and says when on the status (user-directed)' {
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4 = 'Stopped'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        $writes = $script:secrets['dbhub-session-status']
+        $status = $writes[$writes.Count - 1].Value | ConvertFrom-Json
+        $status.names.t5Account | Should -Be 'cosmos01-abc123'
+        $dispatch = ConvertTo-DbHubUtc -Value $status.dispatchUtc.T5
+        $dispatch | Should -Be (ConvertTo-DbHubUtc -Value $status.dispatchUtc.T1) -Because 'T5 goes with sqlvm01''s targets'
+        # T5's request in sqlvm01's Run Command: its showcase, cut back.
+        $sqlvm = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-' }) | Select-Object -First 1
+        $request = @(& $script:decodeRequest $sqlvm) | Where-Object target -EQ 'T5'
+        @($request).Count | Should -Be 1
+        $arguments = @($request.arguments)
+        $arguments[0..3] | Should -Be @('profile', 'set', '--name', 'showcase')
+        $minutes = [int]($arguments[[array]::IndexOf($arguments, '--duration') + 1].TrimEnd('m'))
+        $notAfter = ConvertTo-DbHubUtc -Value $arguments[[array]::IndexOf($arguments, '--not-after') + 1]
+        $runEnd = ConvertTo-DbHubUtc -Value $status.runEndUtc
+        $notAfter | Should -Be $runEnd.AddMinutes(2)
+        $minutes | Should -BeLessThan 90
+        # No ru-storm runs, or recovers, at the end: the end isn't in a slot (3 to 13, 18 to 26) or 2 minutes after it.
+        $position = $minutes % 30
+        ($position -gt 3 -and $position -lt 15) | Should -BeFalse -Because ('{0} minutes end at minute {1} of a cycle' -f $minutes, $position)
+        ($position -gt 18 -and $position -lt 28) | Should -BeFalse -Because ('{0} minutes end at minute {1} of a cycle' -f $minutes, $position)
+        $t5End = ConvertTo-DbHubUtc -Value $status.t5.endUtc
+        ($t5End - $dispatch.AddMinutes($minutes)).Duration().TotalMinutes | Should -BeLessOrEqual 1
+        $t5End.AddMinutes(2) | Should -BeLessOrEqual $notAfter.AddMinutes(-2) -Because 'the profile ends by the runner''s end even when its Run Command takes 2 minutes'
+        $t5End | Should -BeLessThan $runEnd
+        $step = @($status.steps | Where-Object step -EQ 'T5')
+        $step.Count | Should -Be 1
+        $step[0].state | Should -Be 'Pass'
+        $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+        $endText = [System.TimeZoneInfo]::ConvertTimeFromUtc($t5End, $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+        $step[0].message | Should -Match ('^T5 \(cosmos01-abc123\): its showcase ends at {0} \(Eastern Standard Time\), after its last ru-storm and at least 2 minutes of its baseline, so T5 is back at its baseline, with no throttled requests \(429s\), before the session ends at \d\d:\d\d; the next Run all starts its ru-storm cycles again from the first\.$' -f [regex]::Escape($endText))
+        # Nothing is started or stopped for T5: it has no start or stop.
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' -and $_.Method -ne 'GET' }) | Should -BeNullOrEmpty
+    }
+
+    It 'says on Stop now that T5 isn''t stopped and keeps billing only when its account is there, and never stops it' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:cosmos = @{}
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        @($result.done) | Should -Contain 'T5 cosmos01-abc123 not stopped (Cosmos DB has no stop; its throughput keeps billing)'
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' -and $_.Method -ne 'GET' }) | Should -BeNullOrEmpty
+        $script:cosmos = $null
+        $script:calls.Clear()
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        @($result.done | Where-Object { $_ -match '^T5 ' }) | Should -BeNullOrEmpty -Because 'an account that isn''t there bills nothing'
+        # The nightly safety stop says nothing of T5, there or not.
+        $script:cosmos = @{}
+        $nightly = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $nightly.message | Should -Not -Match 'T5|cosmos'
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' -and $_.Method -ne 'GET' }) | Should -BeNullOrEmpty
+    }
+
+    It 'saves T5''s metrics with T4''s in the metrics secret, as its cosmos member, the throttled requests read with StatusCode 429' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:cosmos = @{}
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Captured'
+        $result.cosmos | Should -BeTrue
+        $secret = $script:secrets['dbhub-session-metrics'][0]
+        $secret.Tags['t5'] | Should -Be 'yes'
+        [System.Text.Encoding]::UTF8.GetByteCount($secret.Value) | Should -BeLessOrEqual 24000
+        $secret.Value | Should -Not -Match '(?i)/subscriptions/|resourceGroups|management\.azure\.com'
+        $document = $secret.Value | ConvertFrom-Json
+        @($document.servers | ForEach-Object role) | Should -Be @('primary', 'replica')
+        $cosmos = $document.cosmos
+        $cosmos.version | Should -Be 1
+        $cosmos.sessionId | Should -Be $script:sessionId
+        $cosmos.capturedBy | Should -Be 'control'
+        @($cosmos.accounts | ForEach-Object { '{0}={1}' -f $_.target, $_.resourceName }) | Should -Be @('T5=cosmos01-abc123')
+        @($cosmos.series | ForEach-Object metric) | Should -Be @('NormalizedRUConsumption', 'TotalRequestUnits', 'TotalRequests', 'ThrottledRequests', 'ServerSideLatencyGateway', 'ProvisionedThroughput', 'ServiceAvailability')
+        $throttled = @($cosmos.series) | Where-Object metric -EQ 'ThrottledRequests'
+        $throttled.statusCode | Should -Be '429'
+        $throttled.aggregation | Should -Be 'Count'
+        @($throttled.points | ForEach-Object { $_[1] }) | Should -Be @(120)
+        @(@($cosmos.series) | Where-Object metric -EQ 'NormalizedRUConsumption' | ForEach-Object { $_.points } | ForEach-Object { $_[1] }) | Should -Be @(35, 100, 40)
+        (@($cosmos.series) | Where-Object metric -EQ 'ProvisionedThroughput').intervalMinutes | Should -Be 60
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics\?.*\$filter=StatusCode%20eq%20%27429%27' }).Count | Should -Be 1
+
+        # Without T5's account, the secret is T4's document alone, as before.
+        Reset-TestAzure
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Captured'
+        $result.cosmos | Should -BeFalse
+        $script:secrets['dbhub-session-metrics'][0].Tags['t5'] | Should -Be 'no'
+        ($script:secrets['dbhub-session-metrics'][0].Value | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'cosmos'
+
+        # T5's alone, without T4: an empty T4 document carries it, which the notebook reads as no T4 metrics.
+        Reset-TestAzure
+        $script:cosmos = @{}
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.cosmos | Should -BeTrue
+        $alone = $script:secrets['dbhub-session-metrics'][0].Value | ConvertFrom-Json
+        @($alone.series).Count | Should -Be 0
+        @($alone.servers).Count | Should -Be 0
+        $alone.sessionId | Should -Be $script:sessionId
+        @($alone.cosmos.series).Count | Should -Be 7
     }
 }
 

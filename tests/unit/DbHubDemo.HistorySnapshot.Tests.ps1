@@ -196,6 +196,21 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
         (InModuleScope DbHubDemo -Parameters @{ R = @($record) } { Get-DemoHistorySnapshotItem -Result $R }) | Should -BeNullOrEmpty
     }
 
+    It 'sends T5''s Azure Monitor metrics as COSMOS_METRICS when there are some, and says so in its evidence (2026-11-18, ADR 0027)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { [pscustomobject]@{ Json = '{"version":1,"accounts":[{"target":"T5","resourceName":"cosmos01-abc123"}]}'; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status 'Pass' -Message 'captured') } }
+        $record = & $script:invoke
+        $record.status | Should -Be 'Pass'
+        $record.evidence.parameters.COSMOS_METRICS | Should -Be 'sent'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -Times 1 -Exactly -ParameterFilter { $WindowMinutes -eq 1440 -and $CheckId -eq 'DEPLOY.FABRIC.HISTORY.T5' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['COSMOS_METRICS'] -eq '{"version":1,"accounts":[{"target":"T5","resourceName":"cosmos01-abc123"}]}' }
+        # Nothing to send: no parameter, and no Warning in the log either way.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { [pscustomobject]@{ Json = ''; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status 'Not selected' -Message 'T5 is turned off.') } }
+        $record = & $script:invoke
+        $record.evidence.parameters.COSMOS_METRICS | Should -Be ''
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('COSMOS_METRICS') }
+        @($script:warned).Count | Should -Be 0
+    }
+
     It 'says the earlier measure check came before this snapshot, and what stays blank with the baseline profile' {
         $script:done = @(New-DoneResult) + @(New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots.')
         $record = & $script:invoke @{ ActivityProfile = [pscustomobject]@{ Name = 'baseline'; HasIncidents = $false } }

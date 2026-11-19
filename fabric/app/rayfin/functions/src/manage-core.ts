@@ -136,7 +136,7 @@ export const SCENARIO_RULES: ReadonlyArray<{ id: string; targets: readonly strin
     { id: "connection-surge", targets: ["T4"], defaultMinutes: 5, maxMinutes: 15 },
     { id: "cpu-pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "deadlock-storm", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
-    { id: "healthy-baseline", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 30, maxMinutes: 240 },
+    { id: "healthy-baseline", targets: ["T1", "T2", "T3", "T4", "T5"], defaultMinutes: 30, maxMinutes: 240 },
     { id: "idle-in-transaction", targets: ["T4"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "inefficient-query", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "io-pressure", targets: ["T1", "T2", "T3", "T4"], defaultMinutes: 10, maxMinutes: 30 },
@@ -149,6 +149,7 @@ export const SCENARIO_RULES: ReadonlyArray<{ id: string; targets: readonly strin
     { id: "plan-regression", targets: ["T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "replica-lag", targets: ["T4"], defaultMinutes: 10, maxMinutes: 15 },
     { id: "resource-governance", targets: ["T1", "T2", "T3"], defaultMinutes: 5, maxMinutes: 20 },
+    { id: "ru-storm", targets: ["T5"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "slow-consumer", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
     { id: "tempdb-contention", targets: ["T1", "T2", "T3"], defaultMinutes: 10, maxMinutes: 30 },
 ];
