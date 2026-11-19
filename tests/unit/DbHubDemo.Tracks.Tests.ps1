@@ -2287,6 +2287,20 @@ Describe 'Invoke-DemoParallelDeployment' {
         $script:calls | Should -Contain 'preflight'
     }
 
+    It 'lists HUB.AGENT.T3 on a resume whose T1 track an earlier run finished, so DONE still has it (F10, 2026-11-19)' {
+        # Live on dbhubfn, 2026-11-19: the rerun that resumed T2 after NOT DONE ended DONE without the Database Agent loop's one
+        # manual step, which only the first run, the one that ran T1's track, had listed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'T2'; $state.TrackT4 = 'Telemetry'; $state.TrackFabric = 'Fabric'; $state.Tags = @{ deploymentId = 'abc123' }; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        @($script:calls | Where-Object { $_ -like 'track T1*' }) | Should -BeNullOrEmpty -Because 'an earlier run finished T1'
+        $script:calls | Should -Contain 'track T2: Telemetry'
+        $agent = @($results | Where-Object { $_.checkId -eq 'HUB.AGENT.T3' })
+        $agent.Count | Should -Be 1
+        $agent[0].status | Should -Be 'Manual action required'
+        $agent[0].message | Should -Match 'select azuresql01-abc123/ContosoCare'
+    }
+
     It 'starts from preflight, so the template creates T2''s host again, when the host the state records doesn''t exist, and says so (2026-11-17)' {
         $script:stateReads = 0
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:stateReads++; $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Bootstraps'; $state }

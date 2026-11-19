@@ -1537,6 +1537,218 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
             Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match '^This run finished track T2 at Telemetry \(the state had T2\), but recording it again failed: ' }
         }
     }
+
+    Context 'A resumed run still lists what an earlier run of the deployment found (F10, 2026-11-19)' {
+        # Live on dbhubfn, 2026-11-19: the first run ended NOT DONE at T2's cleanup, and the plain rerun that resumed it ended
+        # DONE without HUB.AGENT.T3 under "Please confirm" and without the Insights app: only the first run's results had them.
+        BeforeAll {
+            # The resource group's state at a run's end: T2 unfinished (run 1), or every track finished.
+            function New-CarryState([string] $DeploymentId = 'abc123', [string] $TrackT2 = 'Telemetry') {
+                $state = New-FinishedState -WithT4
+                $state.TrackT2 = $TrackT2
+                if ($TrackT2 -ne 'Telemetry') {
+                    $state.Stage = 'Monitoring'
+                }
+                $state | Add-Member -NotePropertyName 'Tags' -NotePropertyValue @{ deploymentId = $DeploymentId } -PassThru
+            }
+            function New-AgentResult {
+                InModuleScope DbHubDemo -Parameters @{ C = $script:config } { Get-DemoT3AgentSetupItem -Config $C -ServerName 'azuresql01-abc123' }
+            }
+            # The Insights app's records as the Fabric track reports them (ConvertTo-DemoInsightsAppRecord): deployed and
+            # checked, or not created.
+            function New-AppResult([switch] $Failed) {
+                InModuleScope DbHubDemo -Parameters @{ Failed = [bool]$Failed } {
+                    if ($Failed) {
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1).' -Remediation 'Fix the reported problem and run the script again.')
+                    }
+                    else {
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed APP_DatabaseHub_Insights.')
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.CONNECTOR' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every query the app runs returned its data.')
+                    }
+                }
+            }
+            # One deploy.ps1 run over the same out folder: its status page set by its plan (-PlanState, a resume's state at
+            # its start), and its ending.
+            function Invoke-CarryRun([object[]] $Result, [object] $State, [object] $PlanState = $null, [switch] $SkipFabric, [switch] $WhatIfRun, [switch] $Stopped) {
+                $script:carryRun = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -SkipFabric:$SkipFabric -Confirm:$false
+                if ($null -ne $PlanState) {
+                    InModuleScope DbHubDemo -Parameters @{ Path = $script:carryRun.ProgressPath; State = $PlanState; Skip = [bool]$SkipFabric } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -Resume -State $State -SkipFabric:$Skip) -Resume }
+                }
+                Complete-DemoDeploymentRun -Run $script:carryRun -Config $script:config -Result $Result -State $State -SkipFabric:$SkipFabric -WhatIfRun:$WhatIfRun -Stopped:$Stopped
+            }
+            function Get-CarryFile {
+                $group = InModuleScope DbHubDemo -Parameters @{ C = $script:config } { Get-DemoResourceGroupName -Config $C }
+                Join-Path -Path $script:out -ChildPath ('deploy-carry-{0}.json' -f $group.ToLowerInvariant())
+            }
+            function Get-CarriedId([object] $Outcome) {
+                $record = @($Outcome.Added | Where-Object { $_.checkId -eq 'DEPLOY.CARRIED' })
+                if ($record.Count -eq 0) {
+                    return @()
+                }
+                @($record[0].evidence['items'] | ForEach-Object { [string]$_['checkId'] })
+            }
+            function Get-ModelStep([string] $Path, [string] $Id) {
+                $model = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+                foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq $Id) { return $item } } }
+            }
+        }
+
+        BeforeEach {
+            $script:config = New-TestConfig -WithT4
+        }
+
+        It 'run 1 ends NOT DONE with HUB.AGENT.T3 and the Insights app; the plain rerun that resumes it ends DONE and still lists both, on the console and the status page' {
+            $first = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult)) -State (New-CarryState -TrackT2 'T2')
+            $first.Kind | Should -Be 'NotDone'
+            Test-Path -LiteralPath (Get-CarryFile) | Should -BeTrue
+            @(Get-CarriedId $first) | Should -BeNullOrEmpty -Because 'run 1 showed only its own results'
+
+            # Run 2 resumes T2 only: T1's track and the Fabric track finished in run 1, so neither runs again.
+            $second = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            $second.Kind | Should -Be 'Done'
+            $second.ExitCode | Should -Be 0
+            @($second.Confirm | ForEach-Object { [string]$_['checkId'] }) | Should -Contain 'HUB.AGENT.T3'
+            $second.Reason | Should -Match 'the Insights app' -Because 'run 1 deployed and checked it'
+            @($second.NonBlocking) | Should -BeNullOrEmpty
+            $note = @($second.Notes | Where-Object { $_ -match '^From the earlier run at \d\d:\d\d.*\(.+\), since this run didn''t check them again: Database Agents on T3 and the Insights app\.$' })
+            $note.Count | Should -Be 1
+            $banner = (InModuleScope DbHubDemo -Parameters @{ Outcome = $second } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+            $banner | Should -Match 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment'
+            $banner | Should -Match ([regex]::Escape($note[0]))
+            @(Get-CarriedId $second) | Should -Be @('HUB.AGENT.T3', 'FABRIC.APP.DEPLOY', 'FABRIC.APP.CONNECTOR')
+            @($second.Added | Where-Object { $_.checkId -eq 'DEPLOY.CARRIED' })[0].status | Should -Be 'Pass'
+
+            # The status page: "Please confirm", the reason with the note, and the app's row with its earlier state.
+            $model = Get-Content -LiteralPath $script:carryRun.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            $model['run']['state'] | Should -Be 'Done'
+            @($model['confirm'] | Where-Object { $_ -match '^Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment' }).Count | Should -Be 1
+            $model['run']['reason'] | Should -Match 'the Insights app'
+            $model['run']['reason'] | Should -Match 'From the earlier run at'
+            $row = Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.App'
+            $row['state'] | Should -Be 'Done'
+            $row['message'] | Should -Match '^From the earlier run at .+: Deployed and checked'
+            (Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.Items')['message'] | Should -Be 'Finished in an earlier run.' -Because 'only the app''s and Ask''s rows show an earlier state'
+            $page = Get-Content -LiteralPath $script:carryRun.PagePath -Raw
+            $page | Should -Match 'Please confirm'
+            $page | Should -Match 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment'
+        }
+
+        It 'shows an Insights app that run 1 couldn''t create as what didn''t work, on DONE and its row' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult -Failed)) -State (New-CarryState -TrackT2 'T2')
+            $second = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            $second.Kind | Should -Be 'Done'
+            @($second.NonBlocking).Count | Should -Be 1
+            $second.NonBlocking[0]['name'] | Should -Be 'the Insights app'
+            $second.NonBlocking[0]['state'] | Should -Be 'Failed'
+            $second.NonBlocking[0]['message'] | Should -Match 'rayfin up didn''t deploy'
+            $second.Reason | Should -Not -Match 'the Insights app' -Because 'DONE names the app only when it works'
+            @($second.Notes | Where-Object { $_ -match 'since this run didn''t check them again: Database Agents on T3 and the Insights app\.$' }).Count | Should -Be 1
+            $row = Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.App'
+            $row['state'] | Should -Be 'Failed'
+            $row['message'] | Should -Match '^From the earlier run at .+: It wasn''t created: FABRIC\.APP\.DEPLOY'
+            $model = Get-Content -LiteralPath $script:carryRun.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            @($model['nonBlocking']).Count | Should -Be 1
+        }
+
+        It 'a fresh result always wins: a run that checks a group again shows its own, and the next resume shows that one' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult -Failed)) -State (New-CarryState -TrackT2 'T2')
+            # Run 2 ran the Fabric step again (the app deployed now) and T1's track (HUB.AGENT.T3 again), but ended NOT DONE.
+            $second = Invoke-CarryRun -Result (@(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T2' }) + @(New-TestResult 'TELEMETRY.T2' 'Fail') + @(New-AgentResult) + @(New-AppResult)) -State (New-CarryState -TrackT2 'T2')
+            $second.Kind | Should -Be 'NotDone'
+            @(Get-CarriedId $second) | Should -BeNullOrEmpty
+            @($second.NonBlocking) | Should -BeNullOrEmpty -Because 'this run''s app records replace run 1''s failure'
+            @($second.Confirm | Where-Object { $_['checkId'] -eq 'HUB.AGENT.T3' }).Count | Should -Be 1
+
+            $third = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            $third.Kind | Should -Be 'Done'
+            $third.Reason | Should -Match 'the Insights app'
+            @($third.NonBlocking) | Should -BeNullOrEmpty
+            @(Get-CarriedId $third) | Should -Be @('HUB.AGENT.T3', 'FABRIC.APP.DEPLOY', 'FABRIC.APP.CONNECTOR')
+        }
+
+        It 'lists the Hub tenant setting that run 1''s preflight couldn''t read, until a run reads it' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING')) -State (New-CarryState -TrackT2 'T2')
+            # The resume skips preflight and the Fabric track, so nothing reads the setting again.
+            $second = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            $second.Kind | Should -Be 'Done'
+            @($second.Confirm | ForEach-Object { [string]$_['checkId'] }) | Should -Be @('PREFLIGHT.P4.HUBSETTING')
+            @($second.Notes | Where-Object { $_ -match 'since this run didn''t check them again: the Database Hub tenant setting\.$' }).Count | Should -Be 1
+
+            # A run that reads it (the Fabric track's check, by a Fabric administrator) lists nothing, and so does the next resume.
+            $third = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-HubSettingResult 'Enabled')) -State (New-CarryState)
+            @($third.Confirm) | Should -BeNullOrEmpty
+            $fourth = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            @($fourth.Confirm) | Should -BeNullOrEmpty
+        }
+
+        It 'drops the Insights app''s earlier state once configure-fabric-app.ps1 ran on its own since the last run, never showing it stale' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult -Failed)) -State (New-CarryState -TrackT2 'T2')
+            # configure-fabric-app.ps1 -SignIn, which NOT DONE's line for the app names, writes its results to the out folder;
+            # deploy.ps1's own app step writes them elsewhere.
+            $appRun = Join-Path -Path $script:out -ChildPath 'configure-fabric-app.jsonl'
+            Set-Content -LiteralPath $appRun -Value '{}' -Encoding utf8NoBOM
+            (Get-Item -LiteralPath $appRun).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1)
+            $older = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState -TrackT2 'T2')
+            @($older.NonBlocking | ForEach-Object { $_['name'] }) | Should -Be @('the Insights app') -Because 'that script ran before the last deploy.ps1 run'
+
+            (Get-Item -LiteralPath $appRun).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(5)
+            $second = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -PlanState (New-CarryState -TrackT2 'T2')
+            $second.Kind | Should -Be 'Done'
+            @($second.NonBlocking) | Should -BeNullOrEmpty -Because 'the app may be there now'
+            @(Get-CarriedId $second) | Should -Be @('HUB.AGENT.T3')
+            (Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.App')['message'] | Should -Be 'Finished in an earlier run.'
+            # Not kept either: the next resume doesn't show it.
+            (Get-Item -LiteralPath $appRun).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1)
+            $third = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState)
+            @($third.NonBlocking) | Should -BeNullOrEmpty
+            @(Get-CarriedId $third) | Should -Be @('HUB.AGENT.T3')
+        }
+
+        It 'shows nothing from another deployment of the resource group, or from a file that doesn''t parse, and replaces it' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult)) -State (New-CarryState -TrackT2 'T2')
+            $other = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState -DeploymentId 'zzz999') -PlanState (New-CarryState -DeploymentId 'zzz999' -TrackT2 'T2')
+            $other.Kind | Should -Be 'Done'
+            @($other.Confirm) | Should -BeNullOrEmpty
+            $other.Reason | Should -Not -Match 'the Insights app'
+            @(Get-CarriedId $other) | Should -BeNullOrEmpty
+            (Get-Content -LiteralPath (Get-CarryFile) -Raw | ConvertFrom-Json -AsHashtable)['deploymentId'] | Should -Be 'zzz999'
+
+            Set-Content -LiteralPath (Get-CarryFile) -Value '{ not json' -Encoding utf8NoBOM
+            $broken = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState -DeploymentId 'zzz999')
+            $broken.Kind | Should -Be 'Done'
+            @(Get-CarriedId $broken) | Should -BeNullOrEmpty
+            (Get-Content -LiteralPath (Get-CarryFile) -Raw | ConvertFrom-Json -AsHashtable)['deploymentId'] | Should -Be 'zzz999'
+        }
+
+        It 'with -SkipFabric shows only what isn''t a Fabric item''s, and keeps the Insights app''s for a later run' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult -Failed)) -State (New-CarryState -TrackT2 'T2')
+            $skipped = Invoke-CarryRun -Result @(New-DoneResult -SkipFabric) -State (New-CarryState) -SkipFabric
+            $skipped.Kind | Should -Be 'Done'
+            @($skipped.Confirm | ForEach-Object { [string]$_['checkId'] }) | Should -Contain 'HUB.AGENT.T3'
+            @($skipped.NonBlocking) | Should -BeNullOrEmpty
+            @(Get-CarriedId $skipped) | Should -Be @('HUB.AGENT.T3')
+
+            $later = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState)
+            @($later.NonBlocking | ForEach-Object { $_['name'] }) | Should -Be @('the Insights app')
+        }
+
+        It 'neither reads nor saves for a what-if, a stopped run, a run in GitHub Actions, or a state without the deployment''s ID' {
+            $null = Invoke-CarryRun -Result (@(New-DoneResult) + @(New-AgentResult) + @(New-AppResult)) -State (New-CarryState -TrackT2 'T2')
+            $saved = Get-Content -LiteralPath (Get-CarryFile) -Raw
+            $whatIf = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -WhatIfRun
+            @(Get-CarriedId $whatIf) | Should -BeNullOrEmpty
+            $stopped = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState) -Stopped
+            @(Get-CarriedId $stopped) | Should -BeNullOrEmpty
+            $noId = Invoke-CarryRun -Result @(New-DoneResult) -State (New-FinishedState -WithT4)
+            @(Get-CarriedId $noId) | Should -BeNullOrEmpty
+            @($noId.Confirm) | Should -BeNullOrEmpty
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $true; Ci = $true; Interactive = $false; Codespaces = $false; Windows = $false } }
+            $actions = Invoke-CarryRun -Result @(New-DoneResult) -State (New-CarryState)
+            @(Get-CarriedId $actions) | Should -BeNullOrEmpty
+            @($actions.Confirm) | Should -BeNullOrEmpty
+            Get-Content -LiteralPath (Get-CarryFile) -Raw | Should -Be $saved
+        }
+    }
 }
 
 Describe 'The stop at the end of an update: an update leaves the demo as it found it (2026-11-19)' {

@@ -16,7 +16,8 @@ function Start-DemoDeploymentRun {
     - The banner: Get-DemoDeploymentExpectation and Get-DemoDeploymentNotice, through the redacting console writer.
     - The busy marker (2026-11-14), with -BusyMarker: Start-DemoBusyMarkerRun starts its refresher, which keeps the nightly
       stop waiting while the run goes on; Complete-DemoDeploymentRun ends it. Not with -WhatIf.
-    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, WaitForT2, and Busy, for
+    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, WaitForT2, Busy, and
+    OutputDirectory (the out folder, where the ending also keeps what an earlier run of the deployment found; F10), for
     Invoke-DemoDeployment and Complete-DemoDeploymentRun.
 
     .PARAMETER Config
@@ -92,6 +93,8 @@ function Start-DemoDeploymentRun {
         InstallMode  = $installMode
         WaitForT2    = [bool]$WaitForT2
         Busy         = $null
+        # The out folder: the ending keeps what this run found there for the next run of the deployment (F10, 2026-11-19).
+        OutputDirectory = $paths.Directory
     }
     if (-not $PSCmdlet.ShouldProcess($paths.Model, 'Write the status page and keep this PC awake')) {
         return $run

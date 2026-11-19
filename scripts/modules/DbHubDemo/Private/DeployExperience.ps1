@@ -1597,7 +1597,13 @@ function Get-DemoDeploymentOutcome {
 
         # The size change's notice (2026-11-09; Format-DemoT4SizeChangeText): what was tried and refused, what was deployed,
         # and both monthly estimates, which the caller made, so this stays pure.
-        [string] $T4Notice = ''
+        [string] $T4Notice = '',
+
+        # What an earlier run of this deployment found that this run didn't check again (F10, 2026-11-19;
+        # Get-DemoCarriedRunResult): listed with this run's results under "Please confirm", in what didn't work, and in
+        # DONE's mention of the Insights app, never judged.
+        [AllowEmptyCollection()]
+        [object[]] $CarriedResult = @()
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1606,8 +1612,10 @@ function Get-DemoDeploymentOutcome {
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.
     $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) })
-    $nonBlocking = @(Get-DemoNonBlockingItem -Result $all)
-    $confirm = @(Get-DemoConfirmItem -Result $all)
+    # Shown, not judged (F10): an earlier run's results first, so this run's read of the Hub tenant setting is the latest.
+    $shown = @(@($CarriedResult | Where-Object { $null -ne $_ }) + @($all))
+    $nonBlocking = @(Get-DemoNonBlockingItem -Result $shown)
+    $confirm = @(Get-DemoConfirmItem -Result $shown)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $t4Off = Get-DemoT4OffReason -Config $Config -State $State -Result $all
@@ -1766,8 +1774,9 @@ function Get-DemoDeploymentOutcome {
             $metrics += ', and T5''s (Azure Cosmos DB: normalized RU, requests, and throttled 429s)'
         }
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
-        # The Insights app, part of every deployment, when this run's records show it deployed and working.
-        $app = Get-DemoInsightsAppSummary -Result $all
+        # The Insights app, part of every deployment, when this run's records, or an earlier run's that this one didn't check
+        # again (F10), show it deployed and working.
+        $app = Get-DemoInsightsAppSummary -Result $shown
         $appText = if ($null -ne $app -and [bool]$app.Deployed -and -not [bool]$app.Failed) { ' the history report, and the Insights app' } else { ' and the history report' }
         $fabricText = if ($SkipFabric) { ' Fabric was skipped (-SkipFabric).' } else { ' Fabric has the workspace, the lakehouse, the notebooks, the Real-Time Dashboard,{0}.' -f $appText }
         $outcome.Reason = 'Database Hub shows every target: {0} in Estate, with {1}{2}.{3}{4}' -f $targets, $performance, $metrics, $t2, $fabricText
