@@ -46,6 +46,9 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $true; T5Container = 'Session' } }
         Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'Control'; Why = ''; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @(); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
         Mock -ModuleName DbHubDemo Test-DemoT5SafetyStopDeletes { $false }
+        # Your permissions (2026-11-19, the final tests), which the script reads, as deploy.ps1's preflight does, only for an
+        # environment that doesn't exist yet: here an Owner's.
+        Mock -ModuleName DbHubDemo Get-DemoDeployerRolePermission { [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' } }
         Mock Get-DemoCostEstimate {
             [pscustomobject]@{
                 Results = @(); Components = @(); HourlyRunning = 1.0; BastionHourly = 0.2; SessionCost = 5.0; IdleMonthly = 30.0; LightUseMonthly = 40.0
@@ -75,6 +78,44 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: about a day each, the nightly safety stop is in place*' }
         # T5's free tier prices its throughput at zero (ADR 0027).
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5FreeTier -eq $true }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 0 -Exactly -Because 'an existing environment is priced by what''s in place'
+    }
+
+    Context 'an environment that doesn''t exist yet, priced as deploy.ps1''s preflight will price its first run for you (2026-11-19, the final tests)' {
+        BeforeEach {
+            # No environment, so no safety stop in place and no session-control identity yet; the custom roles don't exist.
+            Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $false; T5Container = '' } }
+            Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $false; Missing = 'SafetyStop'; Reason = 'the nightly safety stop isn''t in place yet (the schedule dbhub-safety-stop doesn''t exist)'; Fix = './scripts/deploy.ps1 sets it up after its template.'; Evidence = [ordered]@{ counts = $false; missing = 'SafetyStop'; nightly = 'NotScheduled' } } }
+            Mock -ModuleName DbHubDemo Get-DemoSafetyStopRoleState { [pscustomobject]@{ Id = ''; Actions = @(); Error = '' } }
+            Mock -ModuleName DbHubDemo Get-DemoT5ControlRoleState { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'); IdentityExists = $false; HoldsRole = $false; HoldsOther = $false } }
+        }
+
+        It 'counts, for an Owner, the nightly safety stop that deploy.ps1''s first run sets up, and T5''s container for the running hours, and says so' {
+            Invoke-TestEstimate
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 1 -Exactly -Because 'your permissions are read once, for T4 and T5'
+            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T4RestartCoverage.Counts -and $T4RestartCoverage.Planned -and $T5ContainerLifecycle -ceq 'Session' }
+            Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'No environment yet, so the estimate prices what deploy.ps1''s first run sets up with your rights, as its preflight does*' }
+            Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: about a day each, counting the nightly safety stop that deploy.ps1 sets up in its first run, since you can assign its role*' }
+            Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: for the running hours only: no environment yet, and deploy.ps1 gives the session control its role with your rights*' }
+            Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+        }
+
+        It 'counts, for a Contributor, T4''s restart for the rest of the month and T5''s container all month, and names the grant' {
+            Mock -ModuleName DbHubDemo Get-DemoDeployerRolePermission { [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' } }
+            Invoke-TestEstimate
+            Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts -and $T5ContainerLifecycle -ceq 'AlwaysOn' }
+            Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: the rest of the month: no environment yet, and you can''t assign the nightly safety stop''s role*Once it''s deployed, an Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath *' }
+            Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container: all month: no environment yet, and you can''t assign roles, so the session control gets none and only ./scripts/stop-demo.ps1 deletes the container after a session*grant-safety-stop.ps1*' }
+            Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+        }
+    }
+
+    It 'keeps pricing an existing environment by what''s in place, without reading your permissions (2026-11-19)' {
+        Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $false; Missing = 'SafetyStop'; Reason = 'the nightly safety stop isn''t in place yet (the schedule dbhub-safety-stop doesn''t exist)'; Fix = './scripts/deploy.ps1 sets it up after its template.'; Evidence = [ordered]@{ counts = $false; missing = 'SafetyStop'; nightly = 'NotScheduled' } } }
+        Invoke-TestEstimate
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 0 -Exactly
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts -and $T5ContainerLifecycle -ceq 'Session' }
+        Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: the rest of the month, because the nightly safety stop isn''t in place yet*' }
     }
 
     It 'says exactly what it couldn''t read, and still reads the rest' {

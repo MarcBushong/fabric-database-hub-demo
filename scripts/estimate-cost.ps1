@@ -13,6 +13,10 @@ T4's 7-day automatic restart: when signed in, the script also reads whether a sa
 (Get-DemoT4RestartCoverage, read-only): the nightly safety stop that every deployment sets up (its schedule, its role, and
 its last run; ADR 0024), or the on-demand control's daily T4 safety stop. Then each restart counts as about a day;
 otherwise, and when not signed in, the worst case counts the rest of the month.
+An environment that doesn't exist yet (2026-11-19) is priced as deploy.ps1's preflight will price its first run for you,
+from the same read-only reads of your permissions and the custom roles: each restart counts as about a day when you can
+assign the nightly safety stop's role, which deploy.ps1 then sets up in that run, and T5's container (below) is priced for
+the running hours only when the session control will hold its role. The script says which it assumed and why.
 T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and stop-demo.ps1 deletes
 it, so its compute (at T4's size), storage, and Defender plans are in the running hours (the Replica session column), and
 no automatic restart applies to it. A Burstable T4 has no replica.
@@ -66,7 +70,8 @@ The effective network mode, public or private.
 When T5's container exists (2026-11-19, ADR 0027): Session, only during a session (start-demo.ps1 and Run all create it,
 the stops delete it), or AlwaysOn, between sessions too, as while the session control's role can't create it. Without it,
 the script reads the environment's own when signed in (the resource group's DbHubT5Container tag; AlwaysOn when it says so,
-or when an existing environment doesn't have it yet), and assumes Session otherwise.
+or when an existing environment doesn't have it yet), prices an environment that doesn't exist yet as deploy.ps1's first
+run will record it for you (AlwaysOn when you can't assign roles), and assumes Session otherwise.
 
 .PARAMETER Detailed
 Show every priced component and its meter.
@@ -179,13 +184,55 @@ else {
         }
         try {
             $t4RestartCoverage = & $module { param($Settings, $Path) if (Test-DemoT4Enabled -Config $Settings) { Get-DemoT4RestartCoverage -Config $Settings -ConfigPath $Path } } $config $ConfigPath
-            if ($null -ne $t4RestartCoverage) {
-                Write-DemoLog -Message ('T4''s automatic restart: {0} (2026-11-04, ADR 0016).' -f $(if ($t4RestartCoverage.Counts) { 'about a day each, ' + $t4RestartCoverage.Reason } else { 'the rest of the month, because ' + $t4RestartCoverage.Reason }))
-            }
         }
         catch {
             $t4RestartCoverage = $null
             Write-DemoLog -Level Warning -Message ('Whether a safety stop covers T4''s 7-day restart couldn''t be read, so the estimate counts it for the rest of the month. {0}' -f $_.Exception.Message)
+        }
+        # An environment that doesn't exist yet (2026-11-19, the final tests) is priced as deploy.ps1's preflight will price
+        # its first run for you: what that run sets up with your rights, from the same functions and read-only probes (your
+        # permissions, Get-DemoDeployerRolePermission; Resolve-DemoT4RestartCoverage; Get-DemoT5CostLifecycle
+        # -ThisRunDeploys), so the worst case here is the one deploy.ps1 then checks. An existing environment is priced by
+        # what's in place, as before. The deployment state is read only when T4's restart doesn't count as capped or T5's
+        # container lifecycle is needed, and your permissions only when there's no environment yet.
+        $t5Needed = -not $t5Lifecycle -and (& $module { param($Settings) Test-DemoT5Enabled -Config $Settings } $config)
+        $environmentState = $null
+        $stateError = ''
+        if (($null -ne $t4RestartCoverage -and -not $t4RestartCoverage.Counts) -or $t5Needed) {
+            try {
+                $environmentState = Get-DemoDeploymentState -Config $config
+            }
+            catch {
+                $stateError = $_.Exception.Message
+            }
+        }
+        $firstRun = $null -ne $environmentState -and -not [bool]$environmentState.Exists
+        $deployer = $null
+        $grant = & $module { param($Path) Get-DemoSafetyStopCommand -ConfigPath $Path } $ConfigPath
+        if ($firstRun) {
+            $deployer = & $module { param($Settings) Get-DemoDeployerRolePermission -Config $Settings } $config
+            Write-DemoLog -Message 'No environment yet, so the estimate prices what deploy.ps1''s first run sets up with your rights, as its preflight does (read-only: your permissions and the custom roles).'
+        }
+        if ($null -ne $t4RestartCoverage) {
+            $plan = $null
+            if ($firstRun) {
+                $resolved = & $module { param($Settings, $Permission, $Coverage) Resolve-DemoT4RestartCoverage -Config $Settings -Permission $Permission -Coverage $Coverage } $config $deployer $t4RestartCoverage
+                $t4RestartCoverage = $resolved.Coverage
+                $plan = $resolved.Plan
+            }
+            $t4Text = if ($null -ne $plan -and $plan.Planned) {
+                'about a day each, counting the nightly safety stop that deploy.ps1 sets up in its first run, since you can assign its role (no environment yet; deploy.ps1''s preflight counts it the same way)'
+            }
+            elseif ($t4RestartCoverage.Counts) {
+                'about a day each, ' + $t4RestartCoverage.Reason
+            }
+            elseif ($null -ne $plan) {
+                'the rest of the month: no environment yet, and {0}. Once it''s deployed, an Owner of the subscription runs, once: {1}; each restart then counts as about a day' -f $plan.Reason, $grant
+            }
+            else {
+                'the rest of the month, because ' + $t4RestartCoverage.Reason
+            }
+            Write-DemoLog -Message ('T4''s automatic restart: {0} (2026-11-04, ADR 0016).' -f $t4Text)
         }
         # T5's free tier (2026-11-18, ADR 0027): the account's own when it exists, otherwise whether the subscription's one
         # free-tier Azure Cosmos DB account is free (Azure Resource Graph, read-only).
@@ -196,16 +243,37 @@ else {
         # T5's container lifecycle (2026-11-19, ADR 0027), unless -T5ContainerLifecycle gives it: the resource group's
         # DbHubT5Container tag (read-only). AlwaysOn when it says so, while the session control's role can't create the
         # container, and when an existing environment doesn't have the tag yet (deployed before then: nothing deletes it).
-        if (-not $t5Lifecycle -and (& $module { param($Settings) Test-DemoT5Enabled -Config $Settings } $config)) {
-            try {
-                $state = Get-DemoDeploymentState -Config $config
-                # The shared rule (review of ab91ee5): Session only where something automatic deletes the container after a session.
-                $t5Lifecycle = & $module { param($Settings, $State) Get-DemoT5CostLifecycle -Config $Settings -State $State } $config $state
-                Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month' } elseif ($state.Exists) { 'it exists only during a session, so its throughput bills only while the demo runs' } else { 'no environment yet, so the estimate assumes it exists only during a session' }))
+        # With no environment yet, what deploy.ps1's first run will record for you (above).
+        if ($t5Needed) {
+            $t5Unread = 'T5''s container lifecycle couldn''t be read, so the estimate assumes the container exists only during a session. {0}'
+            if ($null -eq $environmentState) {
+                Write-DemoLog -Level Warning -Message ($t5Unread -f $stateError)
             }
-            catch {
-                $t5Lifecycle = ''
-                Write-DemoLog -Level Warning -Message ('T5''s container lifecycle couldn''t be read, so the estimate assumes the container exists only during a session. {0}' -f $_.Exception.Message)
+            else {
+                try {
+                    if ($firstRun) {
+                        $t5Lifecycle = & $module { param($Settings, $State, $Permission) Get-DemoT5CostLifecycle -Config $Settings -State $State -ThisRunDeploys -Permission $Permission } $config $environmentState $deployer
+                        $t5Text = if ($t5Lifecycle -ceq 'Session') {
+                            'for the running hours only: no environment yet, and deploy.ps1 gives the session control its role with your rights, which creates the container for each session and deletes it after'
+                        }
+                        elseif (-not [bool]$deployer.CanAssign) {
+                            'all month: no environment yet, and you can''t assign roles, so the session control gets none and only ./scripts/stop-demo.ps1 deletes the container after a session. Once it''s deployed, an Owner of the subscription runs, once: {0}; it''s then priced for the running hours only' -f $grant
+                        }
+                        else {
+                            'all month: no environment yet, and the session control''s role won''t be able to create the container again, or that couldn''t be read (fail safe)'
+                        }
+                        Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $t5Text)
+                    }
+                    else {
+                        # The shared rule (review of ab91ee5): Session only where something automatic deletes the container after a session.
+                        $t5Lifecycle = & $module { param($Settings, $State) Get-DemoT5CostLifecycle -Config $Settings -State $State } $config $environmentState
+                        Write-DemoLog -Message ('T5''s container: {0} (ADR 0027).' -f $(if ($t5Lifecycle -ceq 'AlwaysOn') { 'it stays between sessions in this environment, or only stop-demo.ps1 deletes it, so its throughput is priced all month' } else { 'it exists only during a session, so its throughput bills only while the demo runs' }))
+                    }
+                }
+                catch {
+                    $t5Lifecycle = ''
+                    Write-DemoLog -Level Warning -Message ($t5Unread -f $_.Exception.Message)
+                }
             }
         }
     }

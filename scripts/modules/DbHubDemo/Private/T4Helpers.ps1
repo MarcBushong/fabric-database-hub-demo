@@ -2394,6 +2394,46 @@ function Get-DemoT4RestartWorstCase {
     return [pscustomobject]@{ Hours = [System.Math]::Min($rest, $restarts * 24.0); Restarts = $restarts }
 }
 
+function Resolve-DemoT4RestartCoverage {
+    <#
+    .SYNOPSIS
+    T4's 7-day restart coverage as deploy.ps1's run will have it (2026-11-19, the coordinator's option 2): what's in place
+    (Get-DemoT4RestartCoverage, or -Coverage when it was read already), or, while the nightly safety stop isn't in place or
+    has no role, the one this run sets up when the deployer can (Get-DemoSafetyStopPlan, with -Permission from
+    Get-DemoDeployerRolePermission): each restart then counts as about a day (Counts and Planned, with WithoutReason and
+    WithoutFix for DEPLOY.COST.T4RESTART). Returns Coverage and Plan ($null when no plan was needed). deploy.ps1's preflight
+    uses it, and estimate-cost.ps1 for an environment that doesn't exist yet, so both price a first run alike (the final
+    tests, 2026-11-19). Never throws: its callees don't. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Permission = $null,
+
+        [AllowNull()]
+        [object] $Coverage = $null
+    )
+
+    if ($null -eq $Coverage) {
+        $Coverage = Get-DemoT4RestartCoverage -Config $Config
+    }
+    $plan = $null
+    if (-not $Coverage.Counts -and [string]$Coverage.Missing -in 'SafetyStop', 'Role' -and [string](Get-DemoMemberValue -InputObject $Coverage.Evidence -Name 'nightly') -in 'Missing', 'NotScheduled', 'NoRole') {
+        $plan = Get-DemoSafetyStopPlan -Config $Config -Permission $Permission
+        $Coverage.Evidence['plan'] = $plan.Evidence
+        if ($plan.Planned) {
+            $Coverage.Evidence['counts'] = $true
+            $Coverage.Evidence['missing'] = ''
+            $Coverage = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = $plan.Reason; Fix = ''; Evidence = $Coverage.Evidence; WithoutReason = $Coverage.Reason; WithoutFix = $Coverage.Fix }
+        }
+    }
+    return [pscustomobject]@{ Coverage = $Coverage; Plan = $plan }
+}
+
 function New-DemoT4RestartCoverageResult {
     <#
     <Prefix>.COST.T4RESTART (2026-11-04, ADR 0016): which worst case the monthly ceiling counts for T4's 7-day automatic
