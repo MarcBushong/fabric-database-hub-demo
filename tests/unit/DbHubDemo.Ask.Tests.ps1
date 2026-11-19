@@ -205,7 +205,7 @@ Describe 'Ask''s relay setup (Invoke-DemoAskRelaySetup)' {
         $script:templateError = $field.Replace('{0}', 'GET https:?scope=repository%3Acontoso%2Fdbhub%2Fask-relay%3Apull&service=ghcr.io: DENIED: requested access to the resource is denied')
         $denied = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
         $denied.Results[0].status | Should -Be 'Warning'
-        $denied.Results[0].message | Should -BeLike '*without credentials*package must be public*follows its repository''s visibility*'
+        $denied.Results[0].message | Should -BeLike '*without credentials*package must be public*can start private*'
         $denied.Results[0].remediation | Should -BeLike '*Change visibility*ask.image*'
         $denied.Endpoint | Should -Be ''
         $script:templateError = $field.Replace('{0}', 'GET https:: MANIFEST_UNKNOWN: manifest sha256:' + ('a' * 64) + ' is not found')

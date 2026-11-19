@@ -640,7 +640,7 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:recorded.Add([string]$Value['T5Container']) }
         # Whether the nightly safety stop deletes the container (review of ab91ee5): not by default, as in a Contributor's run.
         $script:safetyDeletes = $false
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $script:safetyDeletes }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $script:safetyDeletes }
         function Resolve-Lifecycle([string] $Purpose, [string] $Recorded) {
             InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Purpose = $Purpose; State = [pscustomobject]@{ T5Container = $Recorded } } { Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose $Purpose -State $State -Confirm:$false }
         }
@@ -706,7 +706,7 @@ Describe 'Resolve-DemoT5ContainerLifecycle: a stop deletes the container only wh
         $control.Mode | Should -Be 'Control'
         $control.AutoDelete | Should -BeTrue
         $control.Price | Should -Be 'Session'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -Times 2 -Exactly -Because 'only a control with no role needs the nightly safety stop'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -Times 2 -Exactly -Because 'only a control with no role needs the nightly safety stop'
     }
 
     It 'says on the status page which mode applies and why, and names grant-safety-stop.ps1 where it helps' {
@@ -779,7 +779,7 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { $script:control }
         # Whether the nightly safety stop deletes the container (review of ab91ee5): not by default.
         $script:safetyDeletes = $false
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDeletes -MockWith { $script:safetyDeletes }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $script:safetyDeletes }
         $script:owner = [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' }
         $script:contributor = [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' }
         function Get-Priced([object] $State, [object] $Permission, [switch] $ThisRunDeploys) {
