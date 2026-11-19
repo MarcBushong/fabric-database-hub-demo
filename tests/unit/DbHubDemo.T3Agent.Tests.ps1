@@ -39,7 +39,7 @@ Describe 'T3''s FORCE_LAST_GOOD_PLAN in status.ps1 and stop-demo.ps1 (Invoke-Dem
         $script:patch = New-RestAnswer -Json @{}
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
-            $script:calls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $Body })
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($PesterBoundParameters.ContainsKey('Body')) { $PesterBoundParameters['Body'] } else { $null }) })
             if ($Method -eq 'PATCH') {
                 if ($script:patch.ExitCode -eq 0) {
                     $script:tuning = New-Tuning -Desired 'Default' -Actual 'On'
