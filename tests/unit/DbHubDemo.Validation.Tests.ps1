@@ -847,6 +847,26 @@ Describe 'Security area' {
         @($output.evidence.pruned)[0] | Should -Match 'fabric-app[\\/]node_modules$'
     }
 
+    It 'warns, naming the folder, when a dependency-named folder outside the Insights app''s build holds what the scan left out (review of ab91ee5)' {
+        # A log in out/venv/ is the demo's own output: left out, the scan must not pass silently.
+        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd('=') }
+        $token = '{0}.{1}.{2}' -f (& $encode '{"alg":"HS256"}'), (& $encode ('{"oid":"' + [guid]::NewGuid().ToString() + '"}')), (& $encode ([guid]::NewGuid().ToString('N')))
+        foreach ($folder in 'venv', 'fabric-app/node_modules/pkg') {
+            New-Item -ItemType Directory -Path (Join-Path -Path $script:scanFolder -ChildPath $folder) -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path -Path $script:scanFolder -ChildPath ('{0}/run.log' -f $folder)) -Value ('token={0}' -f $token) -Encoding utf8NoBOM
+        }
+        $context = New-TestContext
+        $output = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder } { param($X, $P) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' }
+        $output.status | Should -Be 'Warning'
+        $output.message | Should -Match 'but 1 folder\(s\) named like a dependency tree outside the Insights app''s build weren''t read: .*venv\. They could hold this demo''s own output\.'
+        $output.message | Should -Not -Match 'fabric-app[\\/]node_modules\. They could'
+        $output.remediation | Should -Match 'validate\.ps1 -Area Security -ScanPath'
+        @($output.evidence.unexpectedPruned).Count | Should -Be 1
+        @($output.evidence.unexpectedPruned)[0] | Should -Match 'venv$'
+        $output.evidence.directoriesPruned | Should -Be 2
+        ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
+    }
+
     It 'warns on role assignments the demo never creates and on a Key Vault, and fails on a public IP or an open inbound rule' {
         $script:securityResponse['^role assignment list'] = Get-TestAzOk @(@{ roleDefinitionName = 'Owner'; principalType = 'User'; scope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo' }, @{ roleDefinitionName = 'Contributor'; principalType = 'User'; scope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/other' })
         $script:securityResponse['^resource list .*KeyVault'] = Get-TestAzOk @(@{ name = 'kv-left-behind' })
