@@ -274,6 +274,38 @@ Describe 'Guardrail 1: only SkuNotAvailable is a refusal' {
     }
 }
 
+Describe 'The group''s tags, read again right before each attempt (the re-review of the stop at the end of an update, 2026-11-19)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+    }
+
+    It 'sends a tag that another command wrote between attempts, such as start-demo.ps1''s DbHubStartDemoUtc, and keeps the T4 record this run set' {
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
+        # Azure's tags, a new hashtable at each read, as az group show gives them: start-demo.ps1 writes its start once the
+        # first attempt is sent, and the group's T4 record lags behind what this run set.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith {
+            $read = @{}
+            foreach ($key in $script:groupTags.Keys) {
+                $read[$key] = $script:groupTags[$key]
+            }
+            if ($script:deployCalls.Count -ge 1) {
+                $read['DbHubStartDemoUtc'] = '2026-11-19T18:05:00Z'
+                $read['DbHubT4Size'] = 'Standard_D4ds_v5'
+            }
+            $read
+        }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $script:deployCalls[0].parameters.budgetTags.value.Contains('DbHubStartDemoUtc') | Should -BeFalse
+        $sent = $script:deployCalls[1].parameters.budgetTags.value
+        $sent.Contains('DbHubStartDemoUtc') | Should -BeTrue -Because 'a group''s PUT replaces all its tags, so one the template doesn''t send is lost'
+        # The parameters file goes through JSON, which reads an ISO 8601 text as a date.
+        ([datetime]$sent['DbHubStartDemoUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-11-19T18:05:00Z'
+        $sent['DbHubT4Size'] | Should -Be 'Standard_D4ads_v5'
+    }
+}
+
 Describe 'Guardrail 1: only SkuNotAvailable for both 4-vCore sizes moves T4 to its 2-vCore size' {
     BeforeEach {
         Initialize-TemplateHarness

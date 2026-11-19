@@ -68,7 +68,8 @@ function Invoke-DemoTemplateDeployment {
        fallback tries is priced instead, unless the fallback's own check prices it. A record that doesn't
        match the server that exists is cleared, never set to its size, unless it's the size a refused scale kept. A
        record no longer holds once the configuration sets t4SkuName (review finding 5). The VMs that exist are read again
-       before each attempt, so a VM a failed attempt created never gets an osProfile again. While the fallback is
+       before each attempt, so a VM a failed attempt created never gets an osProfile again, and so are the group's tags
+       (2026-11-19), so a tag another command wrote meanwhile isn't lost. While the fallback is
        choosing, T4 is read again after each failed attempt that sent it (review of 64c28b2): its server depends only on
        the network, so an attempt that failed for another resource (the T3 free offer, a budget) can still have created
        it, and a server that exists is treated as existing from then on: it keeps its own size and record, isn't priced
@@ -708,6 +709,20 @@ function Invoke-DemoTemplateDeployment {
             $missing = @($vms.Missing)
             $attachHostDisk = $vms.AttachHostDisk
             $hostSnapshotId = $vms.HostSnapshotId
+        }
+        # The group's tags again, right before each attempt (2026-11-19, the re-review of the stop at the end of an update):
+        # each attempt deploys the group with them, and a group's PUT replaces all its tags, so one that another command wrote
+        # since the last read, such as start-demo.ps1's DbHubStartDemoUtc or the busy marker's refresh, would be lost. What
+        # this function records itself stays as it set it: T4's size and refusals, T5's record, and Phase 28's DbHubT4Sku,
+        # which it drops. A read that fails changes nothing (Get-DemoResourceGroupTag is empty then).
+        if ($groupSeen -or (Test-DemoResourceGroupExist -Config $Config)) {
+            $ownTags = @($t4TagName, $t4RefusedTagName, $t5RefusedTagName) + @(if ($Action -eq 'Create') { 'DbHubT4Sku' })
+            $freshTags = Get-DemoResourceGroupTag -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName
+            foreach ($key in @($freshTags.Keys)) {
+                if ([string]$key -notin $ownTags) {
+                    $tags[[string]$key] = $freshTags[$key]
+                }
+            }
         }
         $parameterArguments = @{
             Config                    = $effective

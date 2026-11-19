@@ -1828,8 +1828,9 @@ function Get-DemoT4ReplicaHold {
       so a replica a session may use is never deleted. So is a replica whose mark couldn't be read (2026-11-19, the review
       of the stop at the end of an update): its read failed, or the resource group has no deploymentId tag to name it.
     - -StartDemoSinceUtc (deploy.ps1's stop at the end of an update, which found the demo stopped when it began): a
-      start-demo.ps1 auto-stop from a session that started before then is left over, because the nightly stop or the VMs'
-      auto-shutdown ended that session without removing it, so it doesn't count (Ignored has its time).
+      start-demo.ps1 auto-stop from a session that started before then, with a nightly stop between, is left over, because
+      the nightly stop or the VMs' auto-shutdown ended that session without removing it, so it doesn't count (Ignored has its
+      time). One with no nightly stop between counts: its session may not have started its VMs yet when the run began.
     https://learn.microsoft.com/rest/api/automation/schedule/get
     #>
     [CmdletBinding()]
@@ -1870,7 +1871,16 @@ function Get-DemoT4ReplicaHold {
                 if ($startDemo -and $found.Success) {
                     $startedUtc = ConvertTo-DemoUtcDateTime -Value $found.Groups[1].Value
                 }
+                # A start-demo.ps1 auto-stop left over (deploy.ps1's stop at the end of an update): its session started before
+                # the run, and a nightly stop came between, which ended it without removing the schedule. With no nightly stop
+                # between, it may be a session whose VMs weren't started yet when the run began, so it counts (the re-review
+                # of 2026-11-19).
+                $leftOver = $false
                 if ($startDemo -and $null -ne $startedUtc -and $null -ne $since -and $startedUtc -lt $since) {
+                    $nightlyUtc = Get-DemoLastNightlyStopUtc -Config $Config -BeforeUtc $since
+                    $leftOver = $null -ne $nightlyUtc -and $nightlyUtc -gt $startedUtc
+                }
+                if ($leftOver) {
                     $ignored = $stopUtc
                 }
                 else {

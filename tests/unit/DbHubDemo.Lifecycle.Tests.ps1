@@ -1898,7 +1898,8 @@ Describe 'Stop-DemoEnvironment' {
         $guard[0].status | Should -Be 'Not selected'
         $guard[0].message | Should -Be 'A start-demo.ps1 session started while this update ran, so the run leaves the demo running for it: ./scripts/stop-demo.ps1 stops it when the session ends, or the nightly stop does. Nothing was stopped.'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoUpdateStopSession -Times 1 -Exactly -ParameterFilter { $SinceUtc -eq $since }
-        @($script:order | Where-Object { $_ -like 'Profile:*' -or $_ -like 'Deallocate:*' -or $_ -in 'Guest', 'AutoStopClear', 'Nightly' }).Count | Should -Be 0
+        $script:order | Should -Be @('Session') -Because 'a held stop changes nothing, Bastion and the host password included (the re-review of 2026-11-19)'
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('PREFLIGHT.GUARD.CONTEXT', 'STOP.SESSION')
 
         # Before T2's guest and the VMs: they keep running, but the activity is off already.
         $script:order.Clear()
@@ -2204,16 +2205,20 @@ Describe 'Start-DemoEnvironment' {
         ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T5' }).message | Should -Match 'START\.T5\.CONTAINER'
     }
 
-    It 'records when it began on the resource group before it starts anything (DbHubStartDemoUtc), so deploy.ps1''s stop at the end of an update leaves its session alone, and a failed write never stops the start (the review of 2026-11-19, finding 1)' {
+    It 'records when it began on the resource group before it starts anything (DbHubStartDemoUtc), and again once it asked for the VMs'' starts, so deploy.ps1''s stop at the end of an update leaves its session alone, and a failed write never stops the start (the review of 2026-11-19, finding 1, and its re-review)' {
         $script:written = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
             if ($Value.Contains('StartDemoUtc')) { $script:written.Add([pscustomobject]@{ Value = [string]$Value['StartDemoUtc']; At = $script:order.Count }) }
         }
         $null = @(Start-DemoEnvironment -Config $config -Confirm:$false)
-        $script:written.Count | Should -Be 1
+        $script:written.Count | Should -Be 2
         $script:written[0].Value | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
         $script:written[0].At | Should -Be $script:order.IndexOf('AutoStop:Start') -Because 'it''s written before the auto-stop and the VMs'' start'
         $script:written[0].At | Should -BeLessThan $script:order.IndexOf('Request:sqlvm01')
+        # A deploy.ps1 that began while this start was on its control calls found the VMs stopped: the later time tells its
+        # stop at the end that this session began during it.
+        $script:written[1].At | Should -Be ($script:order.IndexOf('Request:archost01') + 1) -Because 'it''s written right after both starts are asked for'
+        [string]::CompareOrdinal($script:written[1].Value, $script:written[0].Value) | Should -BeGreaterOrEqual 0
         $script:order.Clear()
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'The tag write was refused.' }
         $null = @(Start-DemoEnvironment -Config $config -Confirm:$false)

@@ -152,6 +152,17 @@ function Stop-DemoEnvironment {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
 
+    # deploy.ps1's stop at the end of an update (2026-11-19): a session that started since the end's last check keeps the
+    # demo. Checked before anything changes (the re-review of 2026-11-19), Bastion and the host password included, which an
+    # interactive session uses, so a held stop changes nothing.
+    $updateEnd = $UpdateEnd -and -not $ParkT2 -and -not $RemoveBastionOnly
+    if ($updateEnd) {
+        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
+        if ([bool]$session.Held) {
+            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage Before))
+            return $results.ToArray()
+        }
+    }
     $bastion = Remove-DemoBastion -Config $Config -IfExpired:$IfExpired -Confirm:$false
     $results.Add($bastion)
     $state = Get-DemoDeploymentState -Config $Config
@@ -183,16 +194,6 @@ function Stop-DemoEnvironment {
     }
     if ($RemoveBastionOnly) {
         return $results.ToArray()
-    }
-    # deploy.ps1's stop at the end of an update (2026-11-19): a session that started since the end's last check keeps the
-    # demo, before anything that a session uses changes.
-    $updateEnd = $UpdateEnd -and -not $ParkT2
-    if ($updateEnd) {
-        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
-        if ([bool]$session.Held) {
-            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage Before))
-            return $results.ToArray()
-        }
     }
     if (-not $ParkT2 -and (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
