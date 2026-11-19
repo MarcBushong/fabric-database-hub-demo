@@ -199,14 +199,16 @@ Describe 'Ask''s relay setup (Invoke-DemoAskRelaySetup)' {
     }
 
     It 'says why when Container Apps can''t pull the image: a package that isn''t public yet, or a digest that isn''t there (2026-11-19)' {
-        $field = 'ERROR: {"code":"InvalidParameterValueInContainerTemplate","message":"The following field(s) are either invalid or missing. Field ''template.containers.ask.image'' is invalid with details: ''Invalid value: \"ghcr.io/contoso/dbhub/ask-relay@sha256:' + ('a' * 64) + '\": {0}'';."}'
-        $script:templateError = $field.Replace('{0}', 'GET https:?scope=repository:contoso/dbhub/ask-relay:pull&service=ghcr.io: UNAUTHORIZED: authentication required')
+        $field = 'ERROR: {"code":"InvalidParameterValueInContainerTemplate","message":"The following field(s) are either invalid or missing. Field ''template.containers.relay.image'' is invalid with details: ''Invalid value: \"ghcr.io/contoso/dbhub/ask-relay@sha256:' + ('a' * 64) + '\": {0}'';."}'
+        # Container Apps' own words, live on 2026-11-19: GHCR's answer for a package that isn't public (or doesn't exist),
+        # and a registry's for a digest it doesn't have.
+        $script:templateError = $field.Replace('{0}', 'GET https:?scope=repository%3Acontoso%2Fdbhub%2Fask-relay%3Apull&service=ghcr.io: DENIED: requested access to the resource is denied')
         $denied = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
         $denied.Results[0].status | Should -Be 'Warning'
         $denied.Results[0].message | Should -BeLike '*without credentials*private until its owner makes it public*'
         $denied.Results[0].remediation | Should -BeLike '*Change visibility*ask.image*'
         $denied.Endpoint | Should -Be ''
-        $script:templateError = $field.Replace('{0}', 'GET https://ghcr.io/v2/contoso/dbhub/ask-relay/manifests/sha256:aaaa: MANIFEST_UNKNOWN: manifest unknown')
+        $script:templateError = $field.Replace('{0}', 'GET https:: MANIFEST_UNKNOWN: manifest sha256:' + ('a' * 64) + ' is not found')
         $missing = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
         $missing.Results[0].message | Should -BeLike '*no image with the pinned digest*'
         $missing.Results[0].remediation | Should -BeLike '*ask-relay-image.yml printed*'
