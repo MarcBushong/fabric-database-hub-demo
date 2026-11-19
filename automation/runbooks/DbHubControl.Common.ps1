@@ -1414,6 +1414,10 @@ function Get-DbHubWorkloadScript {
     status, the end of its message, and whether its runner predates the control (it refused the profile or an option; #21),
     and ends with exit code 1: Azure then shows the Run Command Failed, and the session's host check names the target
     (Get-DbHubSessionHealth). It reads only the line every VM-side control writes, so it works whatever runner a VM has.
+    Each target that got its activity also gets the VM's UTC time right after its set returned, which is when the runner
+    set the profile and so when its showcase counts its cycles from, and the script writes them in one DBHUB-SET line at
+    the end of its output, before DBHUB-DISPATCH (2026-11-19; live: on a VM that had just started, sqlvm01's Run Command,
+    accepted at 13:29:28, set T3's profile 2 minutes 41 seconds later). Get-DbHubSessionHealth moves dispatchUtc to it.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -1434,6 +1438,7 @@ function Get-DbHubWorkloadScript {
         # otherwise the host's later output would go into a capture that's no longer read.
         'Write-Output ''DbHubDemo on-demand dispatch: one result line per target follows.''',
         '$dbhubFailed = New-Object -TypeName ''System.Collections.Generic.List[object]''',
+        '$dbhubSet = [ordered]@{}',
         'function Read-DbHubDispatchResult {',
         '    param([string] $Target, [string] $Text)',
         '    $dbhubConsole.Write($Text)',
@@ -1445,7 +1450,10 @@ function Get-DbHubWorkloadScript {
         '            try { $parsed = $line.Substring(19) | ConvertFrom-Json; $status = [string]$parsed.status; $message = [string]$parsed.message } catch { $status = ''Unreadable'' }',
         '        }',
         '    }',
-        '    if ($status -eq ''Pass'' -or $status -eq ''Warning'') { return }',
+        '    if ($status -eq ''Pass'' -or $status -eq ''Warning'') {',
+        '        $dbhubSet[$Target] = [DateTime]::UtcNow.ToString(''yyyy-MM-ddTHH:mm:ssZ'', [System.Globalization.CultureInfo]::InvariantCulture)',
+        '        return',
+        '    }',
         '    if (-not $status) { $status = ''NoResult'' }',
         '    if ($message.Length -gt 240) { $message = ''...'' + $message.Substring($message.Length - 240) }',
         '    $dbhubFailed.Add([ordered]@{ target = $Target; status = $status; message = $message; oldRunner = [bool]($Text -match ''Unknown activity profile|Unrecognized command or argument'') })',
@@ -1490,6 +1498,10 @@ function Get-DbHubWorkloadScript {
         )
     }
     $parts += @(
+        'if ($dbhubSet.Count -gt 0) {',
+        '    $dbhubConsole.WriteLine(''DBHUB-SET '' + (ConvertTo-Json -InputObject $dbhubSet -Compress))',
+        '    $dbhubConsole.Flush()',
+        '}',
         'if ($dbhubFailed.Count -gt 0) {',
         '    $dbhubConsole.WriteLine(''DBHUB-DISPATCH '' + (ConvertTo-Json -InputObject @{ failed = @($dbhubFailed.ToArray()) } -Depth 4 -Compress))',
         '    $dbhubConsole.Flush()',
@@ -4317,6 +4329,41 @@ function Get-DbHubDispatchFailure {
     }
 }
 
+function Get-DbHubDispatchSetTime {
+    <#
+    .SYNOPSIS
+    When a dispatch Run Command's script set each target's activity on its VM (2026-11-19): its last DBHUB-SET line
+    (Get-DbHubWorkloadScript), with the VM's UTC time right after each target's set returned, within the end of its output
+    that the instance view keeps. Returns Target and SetUtc for each target named T1 to T5 with a time; nothing for output
+    without that line, or one that can't be read.
+    #>
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Output
+    )
+
+    $line = @(([string]$Output) -split '\r?\n' | Where-Object { $_.StartsWith('DBHUB-SET ') }) | Select-Object -Last 1
+    if (-not $line) {
+        return
+    }
+    try {
+        $parsed = $line.Substring(10) | ConvertFrom-Json
+    }
+    catch {
+        return
+    }
+    foreach ($target in @(Get-DbHubPropertyName -InputObject $parsed)) {
+        if ($target -notmatch '^T[1-5]$') {
+            continue
+        }
+        $at = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $parsed -Name $target)
+        if ($null -ne $at) {
+            [pscustomobject]@{ Target = $target; SetUtc = $at }
+        }
+    }
+}
+
 function Get-DbHubSessionHealth {
     <#
     .SYNOPSIS
@@ -4329,7 +4376,8 @@ function Get-DbHubSessionHealth {
     with why (#28, 2026-11-17), and a runner older than the control (#21) gets deploy.ps1 as its fix. Azure Resource Manager reads only: one per VM and one per Run Command. A VM's
     failed provisioning counts only from the session's start on, so an older failure (an extension's, say) isn't blamed
     on it. Returns one finding (Message and Fix) per problem, in words that stay the same while the problem does, so a
-    check that finds it again adds nothing.
+    check that finds it again adds nothing. It also moves each target's dispatchUtc in -Status to when its Run Command's
+    script set the target's activity (its DBHUB-SET line, Get-DbHubDispatchSetTime; 2026-11-19), which the caller writes.
     https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
     #>
@@ -4470,6 +4518,24 @@ function Get-DbHubSessionHealth {
                 continue
             }
             $instance = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'instanceView'
+            # Each target's showcase counts its cycles from when its runner set the profile, which the dispatch script's
+            # DBHUB-SET line gives (2026-11-19; live: on a VM that had just started, 2 minutes 41 seconds after Azure
+            # accepted the Run Command, and every planned time of T3's showcase came that much early). dispatchUtc moves to
+            # it, before the session's start writes "running", so the control notebook's guide, its live view, and the
+            # session's history count from it too. Only later, and by at most an hour (T2's guest may take more than 30
+            # minutes after a cold start: the script's 12-minute heartbeat wait, then up to 20 for its SQL Server); a
+            # target that wasn't set, or a Run Command that hasn't ended, keeps the accepted time.
+            $anchors = Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'
+            if ($anchors -is [System.Collections.IDictionary]) {
+                foreach ($set in @(Get-DbHubDispatchSetTime -Output ([string](Get-DbHubMember -InputObject $instance -Name 'output')) | Where-Object { $command.Targets -contains $_.Target })) {
+                    $accepted = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $anchors -Name $set.Target)
+                    if ($null -eq $accepted -or $set.SetUtc -le $accepted.AddSeconds(5) -or $set.SetUtc -gt $accepted.AddMinutes(60)) {
+                        continue
+                    }
+                    $anchors[$set.Target] = ConvertTo-DbHubTimeText -Value $set.SetUtc
+                    Write-DbHubLog -Context $Context -Message ('{0}: its activity was set on {1} at {2} UTC, {3} s after Azure accepted the Run Command; the session''s times for {0} count from then.' -f $set.Target, $vm, $set.SetUtc.ToString('HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture), [int]($set.SetUtc - $accepted).TotalSeconds)
+                }
+            }
             $state = [string](Get-DbHubMember -InputObject $instance -Name 'executionState')
             $exit = Get-DbHubMember -InputObject $instance -Name 'exitCode'
             # "A nonzero ExitCode indicates an unsuccessful execution" (Learn, managed Run Commands), whatever the state says.
