@@ -4,7 +4,9 @@ name: ask-relay-image
 # by this repository only, tagged with the commit SHA. Users never run it: deploy.ps1 pulls the image anonymously by
 # the digest pinned in config/versions.json (askRelay.image). The first publish from this public repository made the
 # package public (2026-11-19), and a public package can't be made private again, only deleted; a fork's or a private
-# copy's package can start private, GitHub's default for a new package. It runs on a push to
+# copy's package can start private, GitHub's default for a new package
+# (https://docs.github.com/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility; an
+# anonymous pull of the pinned digest worked on 2026-11-19). It runs on a push to
 # main or ignite-updates that changes ask-relay/ or this file, in a public repository or with the repository variable
 # ASK_RELAY_IMAGE_ENABLED set to true (ADR 0022), and by hand on any branch, so a branch's image can be tried before
 # it merges. Never on a pull request, and never in a fork. The image holds no secret (ask-relay/Dockerfile).

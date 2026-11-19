@@ -211,7 +211,7 @@ Describe 'Ask''s relay setup (Invoke-DemoAskRelaySetup)' {
         $script:templateError = $field.Replace('{0}', 'GET https:: MANIFEST_UNKNOWN: manifest sha256:' + ('a' * 64) + ' is not found')
         $missing = Invoke-DemoAskRelaySetup -Config (New-AskConfig -Ask @{ image = $script:image }) -Confirm:$false
         $missing.Results[0].message | Should -BeLike '*no image with the pinned digest*'
-        $missing.Results[0].remediation | Should -BeLike '*ask-relay-image.yml printed*'
+        $missing.Results[0].remediation | Should -BeLike '*up-to-date copy of main, whose pin is current*'
     }
 
     It 'deploys nothing without an image (a Warning) or with ask.enabled false (Not selected)' {
