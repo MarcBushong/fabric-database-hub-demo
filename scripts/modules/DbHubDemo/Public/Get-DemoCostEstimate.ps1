@@ -40,8 +40,15 @@ function Get-DemoCostEstimate {
     So its throughput, its storage (prorated by the hour), and Defender for Azure Cosmos DB are running costs; the
     account's private endpoint and private DNS zone stay, and bill all month.
 
+    Bastion (2026-11-19): a default deployment and a default session have none. Only start-demo.ps1 -Interactive creates
+    it, for interactive access such as T2's missing-index fix, and it goes after bastionMaxHours. So -BastionHours defaults
+    to bastionHoursPerSession in config/profiles.json, 0 (it was 1); start-demo.ps1 -Interactive counts it for up to
+    bastionMaxHours, and estimate-cost.ps1 -BastionHours prices such a session.
+
     Returns hourly running cost, one demo-day session, idle monthly cost, and a light-use month, plus
-    validation results that compare them with the configured ceilings. The monthly ceiling is hard: a
+    validation results that compare them with the configured ceilings. PREFLIGHT.COST.MONTHLY says the month's worst case,
+    the total it compares with monthlyCeilingUsd (the light-use month plus T4's automatic restart), the ceiling, the
+    margin, and what it assumed: T4's restart hours and T5's container lifecycle (2026-11-19). The monthly ceiling is hard: a
     light-use month above monthlyCeilingUsd is Fail, or a Warning when only a T4 size the person didn't choose puts it
     over (2026-11-09; -SkipCeilingReference says when). A session above sessionCeilingUsd is a Warning. A
     missing price is reported as a Warning and left out of the totals, never guessed. Data disk tiers
@@ -696,6 +703,7 @@ function Get-DemoCostEstimate {
     # didn't assume.
     $evidence['lightUseMonthly'] = $lightUseMonthly
     $evidence['monthlyWorstCase'] = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
+    $evidence['bastionHours'] = $BastionHours
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
         $evidence['defenderMonthly'] = $defenderMonthly
@@ -714,7 +722,29 @@ function Get-DemoCostEstimate {
         $monthlyStatus = if ($lightUseMonthly + [double]$t4WorstCase -le $monthlyCeiling) { 'Pass' } else { 'Fail' }
         $sessionDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderSession } else { '' }
         $monthlyDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderMonthly } else { '' }
-        $monthlyMessage = '{0}: idle plus {1} hours of use is estimated at {2:N2} USD a month{3} against the hard ceiling of {4:N2} USD.' -f $ProfileName, $LightUseHoursPerMonth, $lightUseMonthly, $monthlyDefender, $monthlyCeiling
+        # The total the ceiling is checked against, its margin, and what it assumes (2026-11-19, the docs audit): the
+        # light-use month, T4's automatic restart, and T5's container, so the result says why it passed or failed.
+        $worstCulture = [System.Globalization.CultureInfo]::InvariantCulture
+        $worstMonth = [double]$evidence['monthlyWorstCase']
+        $worstMargin = [System.Math]::Round($monthlyCeiling - $worstMonth, 2)
+        $evidence['monthlyCeiling'] = $monthlyCeiling
+        $evidence['monthlyMargin'] = $worstMargin
+        $counted = [System.Collections.Generic.List[string]]::new()
+        $counted.Add([string]::Format($worstCulture, 'idle plus {0} hours of use, {1:N2} USD{2}', $LightUseHoursPerMonth, $lightUseMonthly, $monthlyDefender))
+        if ($t4On) {
+            if ($null -ne $t4Restart -and $null -ne $t4WorstCase) {
+                $counted.Add([string]::Format($worstCulture, 'T4''s automatic restart for {0:N0} hours, {1:N2} USD', [double]$t4Restart.Hours, [double]$t4WorstCase))
+            }
+            else {
+                $counted.Add('no T4 restart (its price couldn''t be read)')
+            }
+        }
+        if ($t5On) {
+            $counted.Add($(if ($t5Session) { 'T5''s container for the running hours only (Session)' } else { 'T5''s container all month (AlwaysOn)' }))
+        }
+        $countedText = if ($counted.Count -gt 1) { (@($counted)[0..($counted.Count - 2)] -join '; ') + '; and ' + $counted[$counted.Count - 1] } else { $counted[0] }
+        $versus = if ($worstMargin -ge 0) { [string]::Format($worstCulture, '{0:N2} USD under', $worstMargin) } else { [string]::Format($worstCulture, '{0:N2} USD over', -$worstMargin) }
+        $monthlyMessage = [string]::Format($worstCulture, '{0}: the month''s worst case is {1:N2} USD, {2} the hard ceiling of {3:N2} USD. It counts {4}.', $ProfileName, $worstMonth, $versus, $monthlyCeiling, $countedText)
         if ($null -ne $arcSqlWorstCase) {
             $monthlyMessage += ' If Defender for SQL also bills the Arc SQL instance while it''s disconnected (not documented), add up to {0:N2} USD.' -f $arcSqlWorstCase
         }
@@ -905,6 +935,10 @@ function Get-DemoCostEstimate {
         SessionCost                    = $sessionCost
         IdleMonthly                    = $idleMonthly
         LightUseMonthly                = $lightUseMonthly
+        MonthlyWorstCase               = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
+        MonthlyCeiling                 = $(if ($CurrencyCode -eq 'USD') { [double]$Config['monthlyCeilingUsd'] } else { $null })
+        MonthlyMargin                  = $(if ($CurrencyCode -eq 'USD') { [System.Math]::Round([double]$Config['monthlyCeilingUsd'] - ($lightUseMonthly + [double]$t4WorstCase), 2) } else { $null })
+        BastionHours                   = $BastionHours
         DefenderIncluded               = $defenderIncluded
         DefenderSession                = $defenderSession
         DefenderMonthly                = $defenderMonthly

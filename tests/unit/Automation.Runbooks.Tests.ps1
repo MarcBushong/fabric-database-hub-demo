@@ -355,7 +355,12 @@ BeforeAll {
             }
             '/runCommands/([A-Za-z0-9-]+)\?\$expand=instanceView$' {
                 if ($script:runCommandViews.ContainsKey($Matches[1])) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ instanceView = $script:runCommandViews[$Matches[1]] } } -Depth 6))
+                    $view = $script:runCommandViews[$Matches[1]]
+                    # A view can be a scriptblock, run when it's read, for output that depends on when the Run Command went out.
+                    if ($view -is [scriptblock]) {
+                        $view = & $view
+                    }
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ instanceView = $view } } -Depth 6))
                 }
                 return (New-Response 202)
             }
@@ -1624,12 +1629,14 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $t5 = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
         # The profile ends at 16:30, the runner's 2 minutes before --not-after: 86 minutes from 15:04, less 2 for its Run Command,
         # 84, so the third cycle's second ru-storm (minutes 78 to 86, and 2 of recovery) doesn't run, and T5 is back at its
-        # baseline at minute 75, after the first one.
-        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $t5 -NowUtc $now | Should -Be $now.AddMinutes(75)
+        # baseline at minute 75 of its profile, after the first one. Its profile starts when the Run Command sets it, at most 2
+        # minutes after the dispatch, so that's by minute 77 from the dispatch (review of ab91ee5).
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $t5 -NowUtc $now | Should -Be $now.AddMinutes(77)
         $t5.Minutes | Should -Be 90 -Because 'nothing is cut: T5''s baseline runs on until the run ends'
-        # A profile whose own minutes end first: 60, less 2, is 58, the end of the second cycle's second storm and its recovery.
+        # A profile whose own minutes end first: 60, less 2, is 58, the end of the second cycle's second storm and its recovery,
+        # by minute 60 from the dispatch.
         $short = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 60; NotAfterUtc = $notAfter }
-        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $short -NowUtc $now | Should -Be $now.AddMinutes(58)
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $short -NowUtc $now | Should -Be $now.AddMinutes(60)
         foreach ($other in @(
                 [pscustomobject]@{ Target = 'T1'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
                 [pscustomobject]@{ Target = 'T5'; Scenario = 'ru-storm'; Intensity = 0; Concurrency = 0; Minutes = 10; NotAfterUtc = $null }
@@ -1672,9 +1679,10 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $arguments[[array]::IndexOf($arguments, '--duration') + 1] | Should -Be '90m'
         @($status.dispatched) | Should -Contain 'T5: showcase for 90 minutes'
         # The session ends at 16:30; from 15:00:30 the profile has 89 minutes, less 2 for its Run Command, 87: the third
-        # cycle's second ru-storm and its recovery (to minute 88) don't fit, so T5 is back at its baseline at minute 75, 16:15:30.
+        # cycle's second ru-storm and its recovery (to minute 88) don't fit, so T5 is back at its baseline at minute 75 of its
+        # profile, which starts at most 2 minutes after the dispatch: by 16:17:30.
         $t5End = ConvertTo-DbHubUtc -Value $status.t5.endUtc
-        $t5End | Should -Be $dispatch.AddMinutes(75)
+        $t5End | Should -Be $dispatch.AddMinutes(77)
         $steps = @($status.steps | Where-Object step -EQ 'T5')
         @($steps | ForEach-Object state) | Should -Be @('Pass', 'Pass')
         $steps[0].message | Should -Be 'T5''s container contosocare/patient-events (cosmos01-abc123) was created for this session, with its 400 RU/s; the stop at its end deletes it, so it bills only while the demo runs.'
@@ -1800,7 +1808,7 @@ Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase i
         $script:t5ContainerForbidden = @('DELETE')
         $refused = Remove-DbHubT5Container -Context (New-TestContext) -Tags $tags
         $refused.Outcome | Should -Be 'NotGranted'
-        Get-DbHubT5ContainerText -Outcome $refused | Should -Be 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        Get-DbHubT5ContainerText -Outcome $refused | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         $script:t5Container | Should -Be 'Present'
         # Without T5 in the settings, or without the group's deploymentId: nothing to say, and nothing sent.
         $script:calls.Clear()
@@ -2031,7 +2039,7 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container already gone.'
     }
 
-    It 'deletes T5''s container a session''s stop didn''t, after the VMs and T4, keeps it unless its lifecycle is Session, and makes a delete it isn''t granted Partial (2026-11-19)' {
+    It 'deletes T5''s container a session''s stop didn''t, after the VMs and T4, keeps it unless its lifecycle is Session, and reports a delete it isn''t granted apart from its status (2026-11-19)' {
         $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
         $script:t4 = 'Ready'
         $script:t5Container = 'Present'
@@ -2049,14 +2057,87 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $kept.status | Should -Be 'Stopped'
         $kept.t5 | Should -Be 'T5''s container kept between sessions (the session control''s role can''t create it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
-        # Without the role's container actions yet: Partial, so the job fails after its result line and its history shows it.
+        # Without the role's container actions: kept, and said in t5Status, apart from the job's status (review of ab91ee5).
         $script:calls.Clear()
         $script:groupTags['DbHubT5Container'] = 'Session'
         $script:t5ContainerForbidden = @('DELETE')
         $refused = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
-        $refused.status | Should -Be 'Partial'
-        @($refused.failed) | Should -Be @('T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once')
+        $refused.status | Should -Be 'Stopped'
+        @($refused.failed) | Should -BeNullOrEmpty
+        $refused.t5Status | Should -Be 'NotGranted'
+        $refused.t5 | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
         $script:t5Container | Should -Be 'Present'
+    }
+
+    It 'keeps T5''s container apart from the status of the nightly stop, the daily T4 stop, and the auto-stop when its role lacks the container''s actions, so T4''s stop still counts (review of ab91ee5, R910)' {
+        # The shared role written back to its 7 actions by older code (R910): a 403 on the container's GET, whether or not
+        # it exists. The VMs and T4 stop as usual, so each job says Stopped (or Skipped), which the cost check of T4's
+        # restart reads (Get-DemoT4RestartCoverage).
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $script:t5Container = ''
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $nightly = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $nightly.status | Should -Be 'Stopped'
+        @($nightly.failed) | Should -BeNullOrEmpty
+        $nightly.t5Status | Should -Be 'NotGranted'
+        $nightly.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        $nightly.message | Should -Not -Match 'keeps billing'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:t4 = 'Ready'
+        $daily = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $daily.status | Should -Be 'Stopped'
+        $daily.t5Status | Should -Be 'NotGranted'
+        $script:t4 = 'Stopped'
+        $stopped = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $stopped.status | Should -Be 'Skipped' -Because 'T4 was stopped already and nothing else was'
+        $stopped.message | Should -Be 'T4 is Stopped. T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $auto = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+        $auto.status | Should -Be 'Stopped'
+        @($auto.failed) | Should -BeNullOrEmpty
+        $auto.t5Status | Should -Be 'NotGranted'
+        @($auto.done) | Should -Contain 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+    }
+
+    It 'leaves T5''s container alone when a session started sqlvm01 again while the nightly stop waited for T4 (review of ab91ee5)' {
+        # The nightly stop read the busy marker once, at its start; a presenter's Run all right after the auto-shutdown
+        # starts sqlvm01 while the nightly stop waits for a starting T4, and its session uses the container.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Starting'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:t5Container = 'Present'
+        $script:sessionAt = $script:clock.AddMinutes(2)
+        Mock Start-Sleep {
+            $script:clock = $script:clock.AddSeconds($Seconds)
+            if ($script:clock -ge $script:sessionAt -and $script:vm['sqlvm01'] -eq 'deallocating') {
+                $script:vm['sqlvm01'] = 'starting'
+            }
+        }
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.t5Status | Should -Be 'InUse'
+        $result.t5 | Should -Be 'T5''s container left alone: sqlvm01 is starting, so a session may use it'
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
+        $script:t5Container | Should -Be 'Present'
+        # Once sqlvm01 is down for good, the next pass deletes it.
+        $script:vm['sqlvm01'] = 'deallocated'
+        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).t5Status | Should -Be 'Deleted'
+        $script:t5Container | Should -Be ''
+        # A container kept between sessions (AlwaysOn) is said as kept, whatever sqlvm01 does: nothing would delete it.
+        $script:groupTags['DbHubT5Container'] = 'AlwaysOn'
+        $script:t5Container = 'Present'
+        $script:vm['sqlvm01'] = 'running'
+        $script:deallocateStatus['sqlvm01'] = 409
+        $kept = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $kept.t5Status | Should -Be 'Kept'
+        $kept.t5 | Should -Match '^T5''s container kept between sessions \('
     }
 
     It 'deletes T5''s container in the control''s daily T4 stop too, only while sqlvm01 doesn''t run (2026-11-19)' {
@@ -2495,6 +2576,60 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         @(Get-HostStep | ForEach-Object message) | Should -Be @('T2: the Run Command DbHubControl-archost01-20261027150000 that set its activity on archost01 ended with exit code 1, so T2 may have no activity this session.')
     }
 
+    It 'moves each target''s dispatchUtc to when its Run Command''s script set it, before the session runs, and keeps the accepted time otherwise (2026-11-19)' {
+        # Live, 2026-11-19: on a VM that had just started, sqlvm01's Run Command set T3's profile 2 minutes 41 seconds after
+        # Azure accepted it, which is when T3's showcase counts its cycles from, so the control notebook's times for T3, its
+        # "Now: T3 Respond" line included, came that much early.
+        $script:runCommandViews['DbHubControl-sqlvm01-20261027150000'] = {
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0]
+            $set = [ordered]@{ T1 = $put.At.AddSeconds(158).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture); T3 = $put.At.AddSeconds(161).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
+        $result.status | Should -Be 'Started'
+        @(Get-HostStep) | Should -BeNullOrEmpty -Because 'a later set is no problem'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0]
+        $text = { param($Value) ConvertTo-DbHubTimeText -Value (ConvertTo-DbHubUtc -Value $Value) }
+        (& $text $status.dispatchUtc.T1) | Should -Be (& $text $put.At.AddSeconds(158))
+        (& $text $status.dispatchUtc.T3) | Should -Be (& $text $put.At.AddSeconds(161))
+        (& $text $status.dispatchUtc.T4) | Should -Be (& $text $status.t4.dispatchUtc) -Because 'T4 isn''t in the line, so it keeps the accepted time'
+        @($context.Log | Where-Object { $_ -match 'T3: its activity was set on sqlvm01 at \d\d:\d\d:\d\d UTC, \d+ s after Azure accepted the Run Command' }).Count | Should -Be 1
+    }
+
+    It 'keeps the accepted time for a set within 5 seconds of it, before it, or more than an hour after it, and moves only the command''s own targets' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:vm['archost01'] = 'running'
+        $status = [ordered]@{
+            sessionId   = $script:sessionId
+            acceptedUtc = '2026-10-27T15:00:00Z'
+            dispatchUtc = [ordered]@{ T1 = '2026-10-27T15:04:00Z'; T2 = '2026-10-27T15:04:00Z'; T3 = '2026-10-27T15:04:00Z'; T4 = '2026-10-27T15:04:00Z'; T5 = '2026-10-27T15:04:00Z' }
+            runCommands = @([ordered]@{ vm = 'sqlvm01'; name = 'DbHubControl-sqlvm01-anchor'; targets = @('T1', 'T3', 'T4', 'T5') })
+        }
+        $script:runCommandViews['DbHubControl-sqlvm01-anchor'] = @{ executionState = 'Succeeded'; exitCode = 0; output = 'DBHUB-SET {"T1":"2026-10-27T15:04:04Z","T3":"2026-10-27T16:04:30Z","T4":"2026-10-27T15:03:00Z","T5":"2026-10-27T15:36:41Z","T2":"2026-10-27T15:06:41Z"}' }
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock.AddMinutes(10)) -Status $status) | Should -BeNullOrEmpty
+        $status['dispatchUtc']['T1'] | Should -Be '2026-10-27T15:04:00Z' -Because '4 seconds is within the 5'
+        $status['dispatchUtc']['T3'] | Should -Be '2026-10-27T15:04:00Z' -Because 'more than an hour later isn''t a set time to trust'
+        $status['dispatchUtc']['T4'] | Should -Be '2026-10-27T15:04:00Z' -Because 'a set never comes before its Run Command'
+        $status['dispatchUtc']['T5'] | Should -Be '2026-10-27T15:36:41Z' -Because 'T2''s guest, say, can take more than 30 minutes after a cold start'
+        $status['dispatchUtc']['T2'] | Should -Be '2026-10-27T15:04:00Z' -Because 'T2 isn''t one of this Run Command''s targets'
+        # Idempotent: the next check finds the time it moved to, and changes nothing.
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock.AddMinutes(40)) -Status $status) | Should -BeNullOrEmpty
+        $status['dispatchUtc']['T5'] | Should -Be '2026-10-27T15:36:41Z'
+    }
+
+    It 'reads the last DBHUB-SET line''s targets and times, and nothing from output without one, or with one it can''t read (2026-11-19)' {
+        $set = @(Get-DbHubDispatchSetTime -Output ("before`nDBHUB-SET {""T1"":""2026-10-27T15:01:00Z""}`nDBHUB-SET {""T1"":""2026-10-27T15:02:41Z"",""T3"":""2026-10-27T15:02:44Z"",""T9"":""2026-10-27T15:02:45Z"",""T4"":""soon""}`nDBHUB-DISPATCH {}"))
+        @($set | ForEach-Object Target) | Should -Be @('T1', 'T3')
+        (ConvertTo-DbHubTimeText -Value $set[0].SetUtc) | Should -Be '2026-10-27T15:02:41Z'
+        (ConvertTo-DbHubTimeText -Value $set[1].SetUtc) | Should -Be '2026-10-27T15:02:44Z'
+        @(Get-DbHubDispatchSetTime -Output 'DBHUB-SET {not json') | Should -BeNullOrEmpty
+        @(Get-DbHubDispatchSetTime -Output 'DBHUB-DISPATCH {"failed":[]}') | Should -BeNullOrEmpty
+        @(Get-DbHubDispatchSetTime -Output '') | Should -BeNullOrEmpty
+    }
+
     It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
         $null = Start-TestSession
         $before = Get-SessionStatus
@@ -2678,12 +2813,32 @@ Describe 'The dispatch Run Command''s script: a target whose activity wasn''t se
         $run.ExitCode | Should -Be 0
         @($run.Lines | Where-Object { $_.StartsWith('DBHUBDEMO-WORKLOAD ') }).Count | Should -Be 2
         @($run.Lines | Where-Object { $_.StartsWith('DBHUB-DISPATCH ') }) | Should -BeNullOrEmpty
+        $run.Lines[-1] | Should -Match '^DBHUB-SET ' -Because 'each target''s set time is the last line then'
+    }
+
+    It 'writes one DBHUB-SET line with each target that got its activity and the VM''s UTC time right after its set, before DBHUB-DISPATCH (2026-11-19)' {
+        # Live, 2026-11-19: on a VM that had just started, sqlvm01's Run Command set T3's profile 2 minutes 41 seconds after
+        # Azure accepted it, which is when T3's showcase counts its cycles from.
+        $before = [DateTime]::UtcNow.AddSeconds(-1)
+        $run = Invoke-DispatchScript -Target 'T1', 'T3', 'T4' -Outcome @{ T1 = @{ status = 'Pass'; message = 'ok' }; T3 = @{ status = 'Fail'; message = 'runner profile set --target T3: Fail. error=547' }; T4 = @{ status = 'Warning'; message = 'set, with a warning' } }
+        $after = [DateTime]::UtcNow.AddSeconds(1)
+        $run.ExitCode | Should -Be 1
+        $run.Lines[-1] | Should -Match '^DBHUB-DISPATCH ' -Because 'DBHUB-DISPATCH stays the last line'
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUB-SET ') }).Count | Should -Be 1
+        $set = @(Get-DbHubDispatchSetTime -Output ($run.Lines -join "`n"))
+        @($set | ForEach-Object Target) | Should -Be @('T1', 'T4') -Because 'T3''s activity wasn''t set'
+        foreach ($item in $set) {
+            $item.SetUtc | Should -BeGreaterOrEqual $before.AddTicks(-($before.Ticks % [TimeSpan]::TicksPerSecond))
+            $item.SetUtc | Should -BeLessOrEqual $after
+        }
+        @($run.Failed | ForEach-Object Target) | Should -Be @('T3')
     }
 
     It 'fails a target that wrote no result line, and with the module''s own template a VM without the control' {
         $run = Invoke-DispatchScript -Target 'T1' -Outcome @{ T1 = @{ status = $null; message = $null } }
         $run.ExitCode | Should -Be 1
         $run.Failed[0].Status | Should -Be 'NoResult'
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUB-SET ') }) | Should -BeNullOrEmpty -Because 'no target got its activity'
         if (Test-Path -LiteralPath 'C:\ProgramData\DbHubDemo\settings.json') {
             Set-ItResult -Skipped -Because 'this machine has the VM-side control'
             return

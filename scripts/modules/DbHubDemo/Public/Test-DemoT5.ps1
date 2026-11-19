@@ -123,7 +123,8 @@ function Test-DemoT5 {
     $ru = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $throughput.Value -Name 'properties') -Name 'resource') -Name 'throughput'
     # The container's lifecycle (2026-11-19): with Session it exists only during a session, so whether it should be there
     # depends on whether the demo runs (sqlvm01, whose runner sends T5's requests, is running).
-    $lifecycle = [string](Get-DemoMemberValue -InputObject (Get-DemoDeploymentState -Config $Config) -Name 'T5Container')
+    $deploymentState = Get-DemoDeploymentState -Config $Config
+    $lifecycle = [string](Get-DemoMemberValue -InputObject $deploymentState -Name 'T5Container')
     $session = $lifecycle -ceq $script:T5LifecycleSession
     $demoRunning = $null
     if ($session) {
@@ -158,9 +159,16 @@ function Test-DemoT5 {
     }
     if ($IncludeLifecycle) {
         # As recorded on the demo resource group (DbHubT5Container); deploy.ps1, grant-safety-stop.ps1, and stop-demo.ps1 set it.
-        $recorded = [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $lifecycle; Changed = $false; Known = $true; Why = ''; RoleName = (Get-DemoActivityControlName -Config $Config).RoleName }
+        # Read as stop-demo.ps1 would decide it (-WhatIf: nothing is written), with the session control's mode and whether
+        # something automatic deletes the container after a session (review of ab91ee5).
+        $recorded = if ($lifecycle -ceq $script:T5LifecycleSession) {
+            Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose Stop -State $deploymentState -WhatIf
+        }
+        else {
+            [pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $lifecycle; Changed = $false; Known = $true; Why = ''; RoleName = (Get-DemoActivityControlName -Config $Config).RoleName }
+        }
         $said = Get-DemoT5LifecycleText -Lifecycle $recorded -FreeTier ([bool]$current.FreeTier)
-        & $add 'T5.LIFECYCLE' $said.Status $said.Text ([ordered]@{ lifecycle = $lifecycle; freeTier = [bool]$current.FreeTier }) $said.Fix $docs['provisionThroughput']
+        & $add 'T5.LIFECYCLE' $said.Status $said.Text ([ordered]@{ lifecycle = $lifecycle; mode = [string](Get-DemoMemberValue -InputObject $recorded -Name 'Mode'); autoDelete = Get-DemoMemberValue -InputObject $recorded -Name 'AutoDelete'; freeTier = [bool]$current.FreeTier }) $said.Fix $docs['provisionThroughput']
     }
 
     $freeEvidence = [ordered]@{ enableFreeTier = [bool]$current.FreeTier; t5UseFreeTier = (Test-DemoT5FreeTierWanted -Config $Config) }
