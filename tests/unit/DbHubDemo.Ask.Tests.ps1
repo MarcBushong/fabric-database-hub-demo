@@ -287,7 +287,7 @@ Describe 'How deploy.ps1 shows Ask' {
 
     It 'keeps it a Warning on the status page''s Needs attention box, not Failed (live, 2026-11-19)' {
         $path = Join-Path -Path $TestDrive -ChildPath 'progress-ask.json'
-        $problems = InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+        $problems = @(InModuleScope DbHubDemo -Parameters @{ Path = $path } {
             $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -InstallMode 'JumpstartImage') -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -NowUnix (Get-DemoUnixTime)
             Initialize-DemoProgress -Path $Path -Model $model -Confirm:$false
             $warning = New-DemoResult -CheckId 'ASK.RELAY.HEALTH' -Area 'fabric' -Target 'subscription' -Status 'Warning' -Message 'Ask''s chat relay answers, but doesn''t allow the Insights app''s origin yet.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 again.'
@@ -296,8 +296,8 @@ Describe 'How deploy.ps1 shows Ask' {
             $saved = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
             @($saved['nonBlocking'])[0]['state'] | Should -Be 'Warning'
             Get-DemoProgressProblem -Model $saved
-        }
-        @($problems).Count | Should -Be 1
+        })
+        $problems.Count | Should -Be 1
         $problems[0] | Should -BeLike 'Warning (doesn''t block DONE): the Copilot chat in the Insights app (Ask).*'
     }
 
@@ -339,7 +339,10 @@ Describe 'Ask''s pins stay in step' {
 
     It 'publishes the image only from this repository''s workflow, with least privilege and pinned actions' {
         $workflow = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath '.github/workflows/ask-relay-image.yml') -Raw
-        $workflow | Should -Match '(?m)^permissions:\s*\n\s+contents: read\s*\n\s+packages: write\s*$'
+        # A read-only token at the top; only the job that publishes may write packages (ADR 0022).
+        $workflow | Should -Match '(?m)^permissions:\s*\n  contents: read\s*\n\s*\n'
+        $workflow | Should -Match '(?m)^    permissions:\s*\n      contents: read\s*\n      packages: write\s*$'
+        $workflow | Should -Match "(?m)^    if: github\.event_name == 'workflow_dispatch' \|\| github\.event\.repository\.visibility == 'public' \|\| vars\.ASK_RELAY_IMAGE_ENABLED == 'true'$"
         foreach ($uses in [regex]::Matches($workflow, 'uses:\s*(\S+)')) {
             $uses.Groups[1].Value | Should -Match '@[0-9a-f]{40}$'
         }

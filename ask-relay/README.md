@@ -43,7 +43,7 @@ A conversation also ends after 15 minutes without a message; the page closes an 
 
 ## The image
 
-`.github/workflows/ask-relay-image.yml` builds it on `main` when `ask-relay/**` changes, or when run by hand: it type-checks and tests the relay, then builds the `Dockerfile` and pushes `ghcr.io/<owner>/<repository>/ask-relay:<commit SHA>`, with the digest in the run's summary. The repository's owner makes the package public once and pins its digest in `config/versions.json` (`askRelay.image`); `deploy.ps1` runs exactly that digest. Deployers never run the workflow.
+`.github/workflows/ask-relay-image.yml` builds it on `main` when `ask-relay/**` changes (in a public repository, or with the repository variable `ASK_RELAY_IMAGE_ENABLED` set to `true`), or when run by hand: it type-checks and tests the relay, then builds the `Dockerfile` and pushes `ghcr.io/<owner>/<repository>/ask-relay:<commit SHA>`, with the digest in the run's summary. Its token can only read the repository; only the job that publishes can write packages. The repository's owner makes the package public once and pins its digest in `config/versions.json` (`askRelay.image`); `deploy.ps1` runs exactly that digest. Deployers never run the workflow.
 
 - **Base images:** Microsoft's Azure Linux Node.js images from `mcr.microsoft.com`, pinned by digest (`askRelay.buildImage` and `askRelay.runtimeImage`): the build stage has npm; the runtime is distroless, with no shell or package manager, and runs as a non-root user.
 - **Dependencies:** `npm ci` from `package-lock.json`, with no install scripts; every version is exact.
