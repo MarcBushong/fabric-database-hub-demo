@@ -237,6 +237,8 @@ Describe 'Lifecycle scripts' {
         Mock -CommandName Write-DemoDeploymentOutcome -MockWith { }
         # Stop-DemoEnvironment's rotation and start-demo.ps1's handover record never reach Azure here.
         Mock -CommandName Set-DemoDeploymentState -MockWith { $capture['state'] = $Value }
+        # start-demo.ps1 wakes Ask's chat relay (ADR 0028); the lookup and the check have their own tests (DbHubDemo.Ask.Tests.ps1).
+        Mock -CommandName Get-DemoAskRelayEndpoint -MockWith { '' }
     }
 
     It 'deploy.ps1 passes its switches and stages through, and drops an empty stage' {

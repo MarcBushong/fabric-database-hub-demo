@@ -1825,13 +1825,31 @@ function Invoke-DemoDeploymentTrack {
                     # publishes it again when the scripts have other content (Get-DemoFabricContentReopen).
                     $fabricContent = Get-DemoFabricContentSha256
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Items' -State 'Running' -Message ''
-                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
+                    # #68: a first deployment's first history run waits up to HistoryRunWaitMinutes while a busy capacity
+                    # keeps it queued, on the status page; one still queued then is followed after the history model's step.
+                    $historyWait = [int](& $option 'HistoryRunWaitMinutes' 45)
+                    $historyFollow = [int](& $option 'HistoryFollowMinutes' 45)
+                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
+                    # A first history run that didn't complete is never a Fail: the history snapshot at the run's end runs it again.
+                    $firstRun = Get-DemoHistoryFirstRun -Result $fabric
+                    Set-DemoHistoryFirstRunWarning -FirstRun $firstRun
                     & $addAll $fabric
                     & $partDone 'Fabric.Items' $fabric
                     # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
                     $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
+                    # Its refresh found no tables while the first history run hadn't completed: a Warning that says what fills
+                    # the model (#68). With the run still queued or running, it's followed now, and the model's step runs again
+                    # once it completes, before the Insights app, whose checks read the model.
+                    $refreshWaiting = Set-DemoHistoryRefreshWaiting -Result $powerBI -FirstRun $firstRun -WaitMinutes $historyWait -FollowMinutes $historyFollow
                     & $addAll $powerBI
+                    if ($null -ne $refreshWaiting -and $firstRun.Pending) {
+                        Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $refreshWaiting.message
+                        $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress)
+                        & $addAll $again
+                        $powerBI = @($powerBI + $again)
+                        & $partDone 'Fabric.Items' $fabric
+                    }
                     & $partDone 'Fabric.Report' $powerBI
                     # The Insights app is part of every deployment, and nothing about it stops the track or keeps the run
                     # from DONE (2026-11-05): its records are non-blocking (ConvertTo-DemoInsightsAppRecord), an exception

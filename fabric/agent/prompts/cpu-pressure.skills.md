@@ -16,7 +16,7 @@ fallback: Without an agent, run Learn telemetry sample queries 3, 4, 5, and 9 in
 actionPolicy: read-only
 adrPrompts: [target-most-pressure, correlate-signals, inefficient-queries, supporting-evidence]
 sources:
-  - https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql-fdh
+  - https://github.com/microsoft/skills-for-fabric/tree/main/skills/databasehub-cli
   - https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql
   - https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
 reviewed: 2026-10-20

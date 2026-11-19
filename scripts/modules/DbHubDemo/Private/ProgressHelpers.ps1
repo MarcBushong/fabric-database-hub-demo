@@ -190,6 +190,8 @@ function Get-DemoProgressCatalog {
                     (& $step 'Fabric.Items' 'Workspace, notebooks, and the Real-Time Dashboard' @('Fabric/Fabric'))
                     (& $step 'Fabric.Report' 'History report' @('Fabric/Fabric'))
                     (& $step 'Fabric.App' 'Insights app' @('Fabric/Fabric') $true)
+                    # Ask (ADR 0028): the app's Copilot chat relay, set up by the app's step (configure-fabric-app.ps1).
+                    (& $step 'Fabric.Ask' 'Copilot chat in the app (Ask: its relay scales to zero; each viewer signs in with GitHub once)' @('Fabric/Fabric') $true)
                 )
             })
     }
@@ -264,7 +266,7 @@ function Get-DemoProgressStepId {
         'T4/Server' { return @('T4.Server') }
         'T4/Replica' { return @('T4.Replica') }
         'T4/Telemetry' { return @('T4.Telemetry') }
-        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App') }
+        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App', 'Fabric.Ask') }
         default { return @() }
     }
 }
@@ -948,7 +950,7 @@ function Set-DemoProgressValue {
         $clean = @(foreach ($entry in @($Value | Where-Object { $null -ne $_ })) {
                 [ordered]@{
                     name    = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'name'))
-                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
+                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed', 'Warning') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
                     message = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'message')) -MaxLength 1200
                     howTo   = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'howTo')) -MaxLength 1200
                 }

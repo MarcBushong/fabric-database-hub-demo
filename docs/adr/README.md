@@ -45,6 +45,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0025](0025-t4-read-replica.md) | T4's read replica, created for each session | User-directed (2026-11-13, "Postgres HA/DR"), with the lifecycle chosen from a live probe and approved within the owner's delegated scope | Accepted; probe live on 2026-11-13; live deployment results in the ADR |
 | [0026](0026-one-run-all-session.md) | One Run all for a whole demo session | User-directed (2026-11-14: one notebook, one thing to run; no GitHub Actions for a demo), with the design and the control identity's grant approved for the user by the coordinator | Accepted; live validation in the ADR |
 | [0027](0027-t5-cosmos-db.md) | T5, an Azure Cosmos DB for NoSQL account | User-directed (2026-11-18: Database Hub GA's Cosmos DB coverage, one click and repeatable), with the coordinator's decisions (a private endpoint in both modes, the free tier when it's free) | Accepted; live validation in the ADR |
+| [0028](0028-ask-copilot-in-the-insights-app.md) | Ask: GitHub Copilot chat in the Insights app, on each viewer's own Copilot | User-directed (2026-11-17 and 18: the in-app chat "is a must and a gamechanger", one click and repeatable), with the coordinator's decisions on sign-in, the image, the live estate, and user steps | Accepted; Phase 0 live evidence in the ADR; the in-browser check waits for the owner's rehearsal |
 
 ## Template
 

@@ -421,21 +421,25 @@ Describe 'Agent install guide' {
         $agentPlugins = $versions.agentPlugins
     }
 
-    It 'pins the marketplace to the commit in config/versions.json for Copilot CLI and VS Code' {
-        $pins = @([regex]::Matches($guide, 'microsoft/microsoft-sql#([0-9a-f]+)') | ForEach-Object { $_.Groups[1].Value })
-        $pins.Count | Should -BeGreaterOrEqual 2
-        foreach ($pin in $pins) {
-            $pin | Should -BeExactly $agentPlugins.marketplace.commit
+    It 'pins each marketplace to its commit in config/versions.json for Copilot CLI and VS Code' {
+        foreach ($name in $agentPlugins.marketplaces.Keys) {
+            $marketplace = $agentPlugins.marketplaces[$name]
+            $pins = @([regex]::Matches($guide, ([regex]::Escape($marketplace.repository) + '#([0-9a-f]+)')) | ForEach-Object { $_.Groups[1].Value })
+            $pins.Count | Should -BeGreaterOrEqual 2 -Because "Copilot CLI and VS Code both pin $name"
+            foreach ($pin in $pins) {
+                $pin | Should -BeExactly $marketplace.commit
+            }
+            $guide | Should -BeLikeExactly ('*copilot plugin marketplace add ' + $marketplace.repository + '#*')
         }
-        $guide | Should -BeLikeExactly ('*copilot plugin marketplace add ' + $agentPlugins.marketplace.repository + '#*')
         $guide | Should -BeLikeExactly '*"chat.plugins.marketplaces"*'
     }
 
-    It 'installs both plugins from the pinned marketplace' {
-        foreach ($plugin in 'microsoft-sql-fdh', 'microsoft-sql') {
-            $guide | Should -BeLikeExactly ('*copilot plugin install {0}@{1}*' -f $plugin, $agentPlugins.marketplace.name)
+    It 'installs the GA Database Hub skill and the SQL diagnostics from their pinned marketplaces, not the retired microsoft-sql-fdh' {
+        foreach ($plugin in 'fabric-skills', 'microsoft-sql') {
+            $guide | Should -BeLikeExactly ('*copilot plugin install {0}@{1}*' -f $plugin, $agentPlugins.plugins[$plugin].marketplace)
             $guide | Should -BeLikeExactly ('*{0}*' -f $agentPlugins.plugins[$plugin].version)
         }
+        $guide | Should -Not -BeLikeExactly '*plugin install microsoft-sql-fdh*'
     }
 
     It 'adds the Learn MCP server endpoint from config/versions.json' {
@@ -463,17 +467,25 @@ Describe 'Agent install guide' {
 }
 
 Describe 'Agent plugin pins in config/versions.json' {
-    It 'pin the marketplace to a full commit SHA and the plugins to semantic versions' {
+    It 'pin each marketplace to a full commit SHA and the plugins to semantic versions on a known marketplace' {
         $agentPlugins = $versions.agentPlugins
-        $agentPlugins.marketplace.commit | Should -Match '^[0-9a-f]{40}$'
-        $agentPlugins.marketplace.url | Should -BeExactly ('https://github.com/' + $agentPlugins.marketplace.repository)
+        $agentPlugins.marketplaces.Keys | Should -Contain 'fabric-collection'
+        $agentPlugins.marketplaces['fabric-collection'].repository | Should -BeExactly 'microsoft/skills-for-fabric'
+        foreach ($marketplace in $agentPlugins.marketplaces.Values) {
+            $marketplace.commit | Should -Match '^[0-9a-f]{40}$'
+            $marketplace.url | Should -BeExactly ('https://github.com/' + $marketplace.repository)
+        }
         $agentPlugins.verifiedOn | Should -Match '^\d{4}-\d{2}-\d{2}$'
-        foreach ($name in 'microsoft-sql-fdh', 'microsoft-sql') {
+        foreach ($name in 'fabric-skills', 'microsoft-sql') {
             $agentPlugins.plugins.Keys | Should -Contain $name
         }
+        $agentPlugins.plugins.Keys | Should -Not -Contain 'microsoft-sql-fdh'
         foreach ($plugin in $agentPlugins.plugins.Values) {
             $plugin.version | Should -Match '^\d+\.\d+\.\d+$'
+            $agentPlugins.marketplaces.Keys | Should -Contain $plugin.marketplace
         }
+        $agentPlugins.plugins['fabric-skills'].skillsUsed | Should -Contain 'databasehub-cli'
+        $agentPlugins.skills['databasehub-cli'].commit | Should -Match '^[0-9a-f]{40}$'
         $agentPlugins.learnMcp.endpoint | Should -BeExactly 'https://learn.microsoft.com/api/mcp'
         $agentPlugins.learnMcp.pluginCommit | Should -Match '^[0-9a-f]{40}$'
     }

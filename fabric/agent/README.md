@@ -1,10 +1,10 @@
 # Database agent prompt pack and install guide
 
-How to show Copilot and Database Agents (previews) in Database Hub, generally available since 2026-11-17, safely, and how to install and use the documented, scriptable fallback: GitHub Copilot CLI (the primary host) or VS Code with the `microsoft-sql-fdh` and `microsoft-sql` plugins, the telemetry agent instructions on Microsoft Learn, and the Microsoft Learn MCP server. The decision is [ADR 0013](../../docs/adr/0013-agent-experience.md). The prompts are in [prompts/](prompts/README.md).
+How to show Copilot and Database Agents (previews) in Database Hub, generally available since 2026-11-17, safely, and how to install and use the documented, scriptable fallback for presenters: GitHub Copilot CLI (the primary host) or VS Code with the GA Database Hub skill (`databasehub-cli`, in the `fabric-skills` plugin from `microsoft/skills-for-fabric`) and the `microsoft-sql` plugin, the telemetry agent instructions on Microsoft Learn, and the Microsoft Learn MCP server. Since 2026-11-18, the first place to ask is the Insights app's own Copilot chat ([ADR 0028](../../docs/adr/0028-ask-copilot-in-the-insights-app.md)), which needs nothing installed; this guide is the fallback when the app isn't at hand. The decision is [ADR 0013](../../docs/adr/0013-agent-experience.md). The prompts are in [prompts/](prompts/README.md).
 
 > **Preview disclosure:** Database Hub is generally available since 2026-11-17, with its CLI skill in skills-for-fabric; Copilot in Database Hub, Database Agents, and the SQL telemetry endpoint are previews ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). Their behavior, coverage, and interfaces can change. This guide uses only documented interfaces, and it never hard-codes what an agent will answer: every prompt lists the signals to look for and how to judge the answer instead.
 
-**Status (2026-10-20):** the prompt pack, the install steps, and the plugin pins are done and checked against the sources below. Running the prompts against the live environment, and recording the targets covered and the latency observed, is pending: see the [live coverage record](#live-coverage-record).
+**Status (2026-11-18):** the prompt pack and the install steps are done and checked against the sources below; on 2026-11-18 the Database Hub skill moved from the `microsoft-sql-fdh` plugin to the GA `databasehub-cli` in `fabric-skills`, and its pins were checked again (re-running the prompt pack with it is part of the next rehearsal). Running the prompts against the live environment, and recording the targets covered and the latency observed, is pending: see the [live coverage record](#live-coverage-record).
 
 ## What's here
 
@@ -13,21 +13,22 @@ How to show Copilot and Database Agents (previews) in Database Hub, generally av
 | [prompts/README.md](prompts/README.md) | The prompt index, the placeholders, and the front matter convention |
 | `prompts/*.md` | 35 prompt files: a session setup, then one file per scenario and surface (16 scenarios since Phase 25b), plus an incident wrap-up per surface |
 | [prompts/prompt.schema.json](prompts/prompt.schema.json) | The JSON Schema for prompt front matter. `tests/unit/Agent.PromptPack.Tests.ps1` enforces it and the rules the schema can't express |
-| `config/versions.json` (`agentPlugins`) | The pinned marketplace commit and the plugin versions this guide was checked with |
+| `config/versions.json` (`agentPlugins`) | The pinned marketplace commits and the plugin versions this guide was checked with |
 
 ## Surfaces at a glance
 
 | Surface | Host | What it reaches | Can it change anything? | Role in the demo |
 |---|---|---|---|---|
 | Database Agent and Copilot in Database Hub | Database Hub in the Fabric portal | What Database Hub shows you: Estate, issues and suggestions, Performance telemetry | Only through an explicit proposal that you approve | The showcase: presenter-driven, UI only, no API |
-| `microsoft-sql-fdh` plugin (skill `databasehub-cli`) | Copilot CLI, VS Code | Database Hub inventory; CPU, storage, and memory health; security posture | No, it's read-only by design | Fallback for estate and health questions |
+| The Insights app's Copilot chat (Ask) | The Insights app (a Fabric App), on the viewer's own GitHub Copilot | The history model through read-only DAX, and the live estate through the app's estate function (the GA skill's read-only routes, the demo's resource group only) | No, every tool is read-only | The in-app chat: questions, charts, and Ask why ([ADR 0028](../../docs/adr/0028-ask-copilot-in-the-insights-app.md)) |
+| `fabric-skills` plugin (GA skill `databasehub-cli`) | Copilot CLI, VS Code | Database Hub inventory; SQL and PostgreSQL CPU, storage, and memory health; Cosmos DB availability and normalized RU; security posture | No, the skill is read-only by design (start sessions with the deny rules in step 5: the bundle also carries MCP servers) | Fallback for estate and health questions |
 | Telemetry agent instructions | Copilot CLI, VS Code | The documented telemetry endpoint for all three targets: CPU, waits, memory, performance counters including blocking, storage IO, and database properties | No, the endpoint is read-only | Fallback for every incident on every target |
 | `microsoft-sql` plugin diagnostics skills | Copilot CLI, VS Code | DMVs, Query Store, and plans over a SQL connection | Only if you approve a changing command, which the prompts forbid | Query-level evidence, documented for Azure SQL Database (T3) |
 | Microsoft Learn MCP server | Copilot CLI, VS Code | Microsoft Learn documentation | No | Grounding and citations |
 
 The Fabric data agent is out of scope: it works over OneLake data, not Database Hub signals (ADR 0013).
 
-**Fallback ladder, for every beat:** the Database Agent in Database Hub, then the same scenario's skills prompts in Copilot CLI, then the Database Hub pages and the Learn sample queries in the [Azure Data Explorer web UI](https://dataexplorer.azure.com) without any agent, then the screenshots recorded in the rehearsal.
+**Fallback ladder, for every beat:** the Database Agent in Database Hub, then the Insights app's Copilot chat, then the same scenario's skills prompts in Copilot CLI, then the Database Hub pages and the Learn sample queries in the [Azure Data Explorer web UI](https://dataexplorer.azure.com) without any agent, then the screenshots recorded in the rehearsal.
 
 ## Part 1: The Database Agent in Database Hub
 
@@ -83,21 +84,27 @@ winget install GitHub.Copilot
 npm install -g @github/copilot
 ```
 
-### 2. Add the marketplace at the pinned commit, then install the plugins
+### 2. Add the marketplaces at their pinned commits, then install the plugins
 
-The marketplace is the `microsoft/microsoft-sql` repository, and its name is `microsoft-sql`. Pin it to the commit this guide was checked with, recorded in `config/versions.json` (`agentPlugins.marketplace.commit`):
+Two marketplaces, each pinned to the commit this guide was checked with, recorded in `config/versions.json` (`agentPlugins.marketplaces`):
+
+- `microsoft/skills-for-fabric` (name `fabric-collection`) carries the GA Database Hub skill, `databasehub-cli`, in its `fabric-skills` bundle. It replaced the earlier `microsoft-sql-fdh` plugin on 2026-11-18.
+- `microsoft/microsoft-sql` (name `microsoft-sql`) carries the SQL diagnostics skills in its `microsoft-sql` plugin.
 
 ```powershell
+copilot plugin marketplace add microsoft/skills-for-fabric#e31422e7d1045ef3a0906df9ff5991f2338af010
+copilot plugin install fabric-skills@fabric-collection
 copilot plugin marketplace add microsoft/microsoft-sql#eeb1c6867c2d128763516a1aad41671c593cc189
-copilot plugin install microsoft-sql-fdh@microsoft-sql
 copilot plugin install microsoft-sql@microsoft-sql
 copilot plugin list --json
 ```
 
-- `copilot plugin list --json` should show version `1.0.0` for both plugins.
-- If the marketplace is already registered without the pin, remove it first with `copilot plugin marketplace remove microsoft-sql --force`, which also uninstalls its plugins, then add it again with the pin.
-- Don't run `copilot plugin update` before a demo. Move the pin on purpose: update `config/versions.json`, re-run the prompt pack in a rehearsal, and record the result.
-- The plugins contain skills only: no hooks and no MCP servers.
+- `copilot plugin list --json` should show version `0.3.22` for `fabric-skills` and `1.0.0` for `microsoft-sql`.
+- **If you installed `microsoft-sql-fdh` before,** uninstall it first, so only one `databasehub-cli` is loaded: `copilot plugin uninstall microsoft-sql-fdh@microsoft-sql`.
+- If a marketplace is already registered without the pin, remove it first with `copilot plugin marketplace remove <name> --force`, which also uninstalls its plugins, then add it again with the pin.
+- Don't run `copilot plugin update` before a demo. Move a pin on purpose: update `config/versions.json`, re-run the prompt pack in a rehearsal, and record the result.
+- `microsoft-sql` contains skills only. **`fabric-skills` is a bundle:** besides its skills, it brings four Fabric agents and three remote MCP servers (`FabricIQ`, `powerbi-modeling-mcp`, which can author semantic models, and `fabric-sqlendpoint`). Step 5 denies all three for a demo session; the prompts don't use them.
+- **To install the Database Hub skill without the bundle's MCP servers,** use [APM](https://github.com/microsoft/apm) instead of the plugin: `apm install microsoft/skills-for-fabric --skill databasehub-cli --target copilot -g --only apm`. `--only apm` skips the MCP servers; APM still adds the Fabric agents, which do nothing unless you pick one ([how it works](https://github.com/microsoft/skills-for-fabric#install-a-single-skill-apm)).
 
 ### 3. Add the Learn MCP server
 
@@ -122,28 +129,29 @@ The Database Hub skill is designed never to query the telemetry endpoint itself,
 New-Item -ItemType Directory -Path "$HOME\dbhub-agent-demo" -Force | Out-Null
 Set-Location -Path "$HOME\dbhub-agent-demo"
 az login --tenant <tenantId>
-copilot --deny-tool=write
+copilot --deny-tool=write --deny-tool=FabricIQ --deny-tool=powerbi-modeling-mcp --deny-tool=fabric-sqlendpoint
 ```
 
 - **Start outside this repo.** Copilot CLI loads custom instructions such as `.github/copilot-instructions.md` and `AGENTS.md` from the repository and working folder, and this repo's instructions are for coding it, not for demos.
-- **`--deny-tool=write`** denies all file writing for the session. Deny rules win over any approval.
+- **`--deny-tool=write`** denies all file writing for the session, and the three other deny rules switch off the `fabric-skills` bundle's MCP servers, which no prompt uses. Deny rules win over any approval.
 - **Approve each command once, after reading it.** Approve only read commands: `az rest` calls to the Database Hub routes the skill names, POST calls to the telemetry query endpoint, and `SELECT` statements against `ContosoCare`. Reject sign-in and context changes such as `az login` or `az account set`; do those yourself. Never choose to approve a tool for the rest of the session, and never start with `--allow-all-tools` or `--allow-all`.
 - **Tokens:** if one appears in the transcript, end the session, clear the terminal, and sign out and in again.
 
 ## Part 3: Skills in VS Code
 
-1. Turn on agent plugins and add the marketplace at the pinned commit in your user settings (`chat.plugins.marketplaces` is experimental):
+1. Turn on agent plugins and add the marketplaces at their pinned commits in your user settings (`chat.plugins.marketplaces` is experimental):
 
    ```json
    {
      "chat.plugins.enabled": true,
      "chat.plugins.marketplaces": [
+       "microsoft/skills-for-fabric#e31422e7d1045ef3a0906df9ff5991f2338af010",
        "microsoft/microsoft-sql#eeb1c6867c2d128763516a1aad41671c593cc189"
      ]
    }
    ```
 
-2. In the Extensions view, search for `@agentPlugins` and install `microsoft-sql-fdh` and `microsoft-sql`. If you use the MSSQL extension, install `microsoft-sql-vscode` instead of `microsoft-sql`, never both: it carries the same diagnostics skills for that extension. Plugins that you installed with Copilot CLI also appear in VS Code automatically.
+2. In the Extensions view, search for `@agentPlugins` and install `fabric-skills` and `microsoft-sql`. If you use the MSSQL extension, install `microsoft-sql-vscode` instead of `microsoft-sql`, never both: it carries the same diagnostics skills for that extension. Plugins that you installed with Copilot CLI also appear in VS Code automatically. In the Chat view's tool picker, turn off the `fabric-skills` MCP servers (`FabricIQ`, `powerbi-modeling-mcp`, and `fabric-sqlendpoint`) for demo chats.
 3. Run **MCP: Add Server** from the Command Palette, choose **HTTP**, enter `https://learn.microsoft.com/api/mcp`, name it `microsoft-learn`, and store it globally.
 4. Keep the chat's permission level at **Manual permissions**, the default. Never switch a demo session to **Allow all** or **Autopilot**.
 5. Start each chat with [session-setup.skills](prompts/session-setup.skills.md), or paste the agent instructions block at the start of the chat.
@@ -170,13 +178,12 @@ The telemetry and Database Hub prompts work from any machine. The `microsoft-sql
 - No API, so it can't be automated or tested; answers vary between runs.
 - A newly created T3 can show findings late, and a paused serverless database sends no telemetry.
 
-### `microsoft-sql-fdh` plugin
+### The `databasehub-cli` skill (GA, in `fabric-skills`)
 
-- Read-only, delegated user only.
-- It calls Database Hub routes that its authors classify as not a public contract, which can change independently of the documented Fabric REST APIs. This repo's code never calls them; only the plugin does, as the signed-in presenter.
-- It doesn't expose Query Store, active sessions, query text, plans, blocking, or DMVs, and its health contract covers CPU, storage, and memory, not IO.
-- Its skill notes say its claims were verified against fixtures on 2026-09-22 and that live execution was still pending. TODO(verify) live.
-- Its description lists Azure SQL and Arc-enabled SQL Server but doesn't mention SQL Server on Azure VMs, so T1 coverage is TODO(verify).
+- Read-only, delegated user only: it runs as the signed-in presenter.
+- It calls Database Hub routes that are not a public contract (its own reference, `private-over-public-api.md`), which can change independently of the documented Fabric REST APIs. Two things call them: this skill, as the presenter, and, since 2026-11-18, the Insights app's estate function, as the app's owner, under the narrow exception in [ADR 0013](../../docs/adr/0013-agent-experience.md) (8 read-only routes, the demo's resource group only). Nothing else in this repo calls them.
+- It doesn't expose Query Store, active sessions, query text, plans, blocking, or DMVs. Its SQL and PostgreSQL health covers CPU, storage, and memory, not IO; Cosmos DB reports availability and normalized RU only.
+- Live check, 2026-11-18: its inventory route lists T1 (`sqlvm01`) as `AzureSqlVM`, with T3 and T4 and its read replica, filtered to the demo's resource group.
 
 ### Telemetry agent instructions
 
@@ -256,7 +263,7 @@ Record the agent's entry point, any action it offered, and any TODO(verify) item
 ## Sources (checked 2026-10-20)
 
 - Database Hub: [overview](https://learn.microsoft.com/fabric/database/hub/overview), [FAQ](https://learn.microsoft.com/fabric/database/hub/faq), [monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql), [enable performance monitoring](https://learn.microsoft.com/fabric/database/hub/add-sql), [query performance monitoring telemetry and its agent instructions block](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry) (all updated 2026-10-17)
-- Agent skills: [the `microsoft/microsoft-sql` marketplace](https://github.com/microsoft/microsoft-sql), [`microsoft-sql-fdh`](https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql-fdh), [`microsoft-sql`](https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql) (commit `eeb1c6867c2d128763516a1aad41671c593cc189`, plugin version 1.0.0)
+- Agent skills: [the `microsoft/skills-for-fabric` marketplace](https://github.com/microsoft/skills-for-fabric) with the GA [`databasehub-cli`](https://github.com/microsoft/skills-for-fabric/tree/e31422e7d1045ef3a0906df9ff5991f2338af010/skills/databasehub-cli) skill in `fabric-skills` (commit `e31422e7d1045ef3a0906df9ff5991f2338af010`, version 0.3.22); [the `microsoft/microsoft-sql` marketplace](https://github.com/microsoft/microsoft-sql) with [`microsoft-sql`](https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql) (commit `eeb1c6867c2d128763516a1aad41671c593cc189`, plugin version 1.0.0)
 - GitHub Copilot CLI: [install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), [find and install plugins](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/plugins-finding-installing), [plugin reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-plugin-reference), [use Copilot CLI and add MCP servers](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview), [allow and deny tools](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools), [custom instructions](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions)
 - VS Code: [agent plugins](https://code.visualstudio.com/docs/agent-customization/agent-plugins), [MCP servers](https://code.visualstudio.com/docs/agent-customization/mcp-servers), [approvals and permissions](https://code.visualstudio.com/docs/agents/run/approvals)
 - Microsoft Learn MCP server: [overview](https://learn.microsoft.com/training/support/mcp), [get started](https://learn.microsoft.com/training/support/mcp-get-started), [`MicrosoftDocs/mcp`](https://github.com/MicrosoftDocs/mcp)

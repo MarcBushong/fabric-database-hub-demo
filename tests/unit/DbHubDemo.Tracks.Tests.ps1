@@ -1158,6 +1158,37 @@ Describe 'Invoke-DemoDeploymentTrack' {
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
     }
 
+    It 'ends a first deployment''s Fabric step without a Fail when a busy capacity kept the first history run queued past its wait: the model refreshes once it completes, before the Insights app (#68)' {
+        # Live (2026-11-19, a shared F4): the run was still queued after 10 minutes, the model refreshed before scenario_runs
+        # existed, FABRIC.SEMANTICMODEL.REFRESH failed, and the run ended NOT DONE.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            $script:calls.Add('fabric stage')
+            New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'NB_DatabaseHub_LiveActivity is still NotStarted after 45 minutes; it keeps running. Check its run in the workspace (Monitor hub).' -Evidence ([ordered]@{ status = 'NotStarted'; jobLocation = 'https://api.fabric.microsoft.com/v1/workspaces/22222222-2222-2222-2222-222222222222/items/44444444-4444-4444-4444-444444444444/jobs/instances/55555555-5555-5555-5555-555555555555' })
+        }
+        $script:powerBIRuns = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
+            $script:calls.Add('powerbi')
+            $script:powerBIRuns++
+            if ($script:powerBIRuns -eq 1) {
+                New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh ended with status Failed: | 0xC14700C7 We cannot access the source Delta table ''<oii>scenario_runs</oii>'' referenced by table ''<oii>Scenario Runs</oii>''.'
+            }
+            else {
+                New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Refreshed the semantic model (Direct Lake framing) in about 5 seconds.'
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { $script:calls.Add('fabric app'); New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -MockWith { $script:calls.Add('job read'); [pscustomobject]@{ StatusCode = 200; Headers = @{}; Body = [pscustomobject]@{ status = 'Completed' } } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -in 'fabric stage', 'powerbi', 'job read', 'fabric app' }) | Should -Be @('fabric stage', 'powerbi', 'job read', 'powerbi', 'fabric app')
+        @($outcome.Results | Where-Object { [string]$_.status -eq 'Fail' }).Count | Should -Be 0
+        @($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.REFRESH' } | ForEach-Object { [string]$_.status }) | Should -Be @('Warning', 'Pass')
+        ($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' }).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { $HistoryRunWaitMinutes -eq 45 }
+    }
+
     It 'records what the Fabric step published with the step once the notebooks, the model, and the Insights app are this version''s, and not while the app isn''t (2026-11-16)' {
         $script:recorded = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }

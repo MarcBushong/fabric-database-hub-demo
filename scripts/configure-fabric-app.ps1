@@ -363,15 +363,33 @@ if (-not $RayfinSignIn) {
 }
 
 #region Step 4-5: stage and prerequisites
+$resourceGroupName = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
 $deployFile = [ordered]@{
     expectedAccount  = $(if ($config) { [string]$config['azureAccount'] } else { '' })
     expectedTenantId = $tenantId
     # Names only, for the app's Database Agent prompts: never an ID or a secret.
-    resourceGroup    = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
+    resourceGroup    = $resourceGroupName
     links            = $links
 }
+# The Copilot dock (Ask, ADR 0028): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
+# gets the relay's address, and the live estate function's scope. -DryRun and -CheckOnly only look for the relay.
+$functionScope = $null
+$ask = $null
+if ($config -and $guarded -and $resourceGroupName) {
+    $functionScope = @{ subscriptionId = [string]$config['subscriptionId']; resourceGroups = @($resourceGroupName) }
+    $askRelay = ''
+    if ($DryRun -or $CheckOnly) {
+        $askRelay = Get-DemoAskRelayEndpoint -SubscriptionId ([string]$config['subscriptionId']) -ResourceGroupName $resourceGroupName
+    }
+    else {
+        $ask = Invoke-DemoAskRelaySetup -Config $config -StagePath $stage -Confirm:$false
+        $results.AddRange([object[]]@($ask.Results))
+        $askRelay = [string]$ask.Endpoint
+    }
+    $deployFile['ask'] = [ordered]@{ relayUrl = $askRelay; estate = $true }
+}
 $envValues = [ordered]@{ DBHUB_FABRIC_WORKSPACE_ID = $targetWorkspaceId; DBHUB_SEMANTIC_MODEL_ID = $modelId }
-$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
+$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -FunctionScope $functionScope -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
 $results.AddRange([object[]]$stageResults)
 if (@($stageResults | Where-Object { $_.status -eq 'Fail' }).Count -gt 0) {
     & $skip 'FABRIC.APP.DEPLOY' 'The deploy stage isn''t ready, so nothing was deployed.'
@@ -466,6 +484,38 @@ else {
     & $skip 'FABRIC.APP.CONNECTOR' 'The app wasn''t deployed in this run, so it wasn''t checked. Run with -CheckOnly to check the deployed app.'
 }
 #endregion Step 7: checks
+
+#region Step 8: Ask's relay and its origin
+# The relay serves the app's hosting origin only; rayfin up names it, so the relay is set again when it differs. Then the
+# relay is woken and checked as the app reaches it, and the tenant setting that would block it is read. Never a Fail.
+# -CheckOnly changes nothing: it checks the relay it found, with the origin of the app's last deployment.
+if ($null -ne $ask -and [string]$ask.Endpoint -and -not $DryRun) {
+    $origin = Get-DemoFabricAppOrigin -HostingUrl $hostingUrl -StagePath $stage
+    if ($origin -and $origin -ne [string]$ask.AllowedOrigins) {
+        $again = Invoke-DemoAskRelaySetup -Config $config -AllowedOrigin $origin -Confirm:$false
+        $kept = @($results | Where-Object { $_.checkId -ne 'ASK.RELAY' })
+        $results.Clear()
+        $results.AddRange([object[]]$kept)
+        $results.AddRange([object[]]@($again.Results))
+        $ask = $again
+    }
+    if ([string]$ask.Endpoint) {
+        $results.AddRange([object[]]@(Test-DemoAskRelay -Endpoint ([string]$ask.Endpoint) -Origin $origin -ClientIdSource ([string]$ask.ClientIdSource)))
+    }
+    $results.Add((Test-DemoAskCspSetting -Config $config -Token $FabricToken))
+}
+elseif ($CheckOnly -and $config -and $guarded -and $resourceGroupName) {
+    if ($askRelay) {
+        $origin = Get-DemoFabricAppOrigin -HostingUrl $hostingUrl -StagePath $stage
+        $ownClientId = $config['ask'] -is [System.Collections.IDictionary] -and ([string]$config['ask']['githubClientId']).Trim()
+        $results.AddRange([object[]]@(Test-DemoAskRelay -Endpoint $askRelay -Origin $origin -ClientIdSource $(if ($ownClientId) { 'config' } else { 'pinned' })))
+    }
+    else {
+        $results.Add((New-DemoResult -CheckId 'ASK.RELAY.HEALTH' -Area 'fabric' -Target 'subscription' -Status 'Not selected' -Message 'Ask''s chat relay isn''t deployed in this environment, so it wasn''t checked; the Copilot dock says Ask isn''t deployed.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 (or ./scripts/deploy.ps1): it deploys the relay, and ASK.RELAY says why when it can''t.' -DocUrl 'https://learn.microsoft.com/azure/container-apps/overview'))
+    }
+    $results.Add((Test-DemoAskCspSetting -Config $config -Token $FabricToken))
+}
+#endregion Step 8: Ask's relay and its origin
 
 # Without -FabricAdmin, tenant settings can't be read, but the check each one gates proves it's on for the operator:
 # creating or updating the item (Fabric Apps), and a DAX query through the connector (Execute Queries).
