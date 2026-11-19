@@ -199,7 +199,8 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/vaults/kv-dbhub-ctl-[0-9a-f]{6}$' {
-                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ publicNetworkAccess = $script:vaultAccess } }))
+                # systemData (2026-11-19): who last changed the vault, as Azure records it, which names the environment's deployer.
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ publicNetworkAccess = $script:vaultAccess }; systemData = $script:vaultSystemData } -Depth 4))
             }
             '/secrets/dbhub-activity-webhook$' {
                 if (-not $script:secretExists) {
@@ -327,6 +328,7 @@ BeforeAll {
         $script:groupExists = $true
         $script:leftInGroup = 0
         $script:vaultAccess = 'Enabled'
+        $script:vaultSystemData = $null
         $script:webhooks = @()
         $script:webhookExpiry = [datetime]::new(2027, 1, 25, 15, 0, 0, [System.DateTimeKind]::Utc)
         $script:webhookUrl = ''
@@ -742,6 +744,80 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         foreach ($id in 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2') {
             ($results | Where-Object checkId -EQ $id).message | Should -Match 'is in place\.$' -Because $id
         }
+    }
+
+    It 'gives the environment''s deployer A3 too, as Azure records them on the control vault, and no one else (2026-11-19)' {
+        # A Contributor deployed, so their deploy.ps1 couldn't give them the vault's secrets. The Owner's grant-safety-stop.ps1
+        # gives them A3, beside the Owner's own and control.notebookUserObjectIds', with no change to the configuration.
+        $deployer = 'cccccccc-0000-0000-0000-000000000003'
+        $notebookUser = 'bbbbbbbb-0000-0000-0000-000000000002'
+        $script:vaultSystemData = @{ createdBy = 'first@contoso.example'; createdByType = 'User'; lastModifiedBy = 'deployer@contoso.example'; lastModifiedByType = 'User' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Method -eq 'GET' -and $Uri -eq 'https://graph.microsoft.com/v1.0/users/deployer%40contoso.example?$select=id,userPrincipalName,mail') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = '{"id":"CCCCCCCC-0000-0000-0000-000000000003","userPrincipalName":"deployer@contoso.example"}'; StdErr = ''; StatusCode = 200 }
+            }
+            return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'HTTP 404: Request_ResourceNotFound'; StatusCode = 404 }
+        }
+        $config = New-ControlConfig
+        $config['control']['notebookUserObjectIds'] = @($notebookUser)
+        $name = Get-ControlName $config
+        $results = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        foreach ($scope in $name.SecretId, $name.StatusSecretId, $name.MetricsSecretId) {
+            @($script:assignments | Where-Object { $_.scope -eq $scope -and $_.roleDefinitionId -match '/4633458b-17de-408a-b874-0445c86b69e6$' } | ForEach-Object principalId | Sort-Object) | Should -Be @($script:callerId, $notebookUser, $deployer) -Because "only you, the notebook user, and the deployer hold Key Vault Secrets User at $scope"
+        }
+        @($script:assignments | Where-Object principalId -EQ $deployer | ForEach-Object principalType | Select-Object -Unique) | Should -Be @('User')
+        $found = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEPLOYER'
+        $found.status | Should -Be 'Pass'
+        $found.message | Should -Match '^The environment''s deployer is deployer@contoso\.example: the control vault''s last change'
+        $found.evidence['deployerObjectId'] | Should -Be $deployer
+        @($results | Where-Object { $_.checkId -eq 'CONTROL.ROLE.A3' -and $_.message -match '^A3: Key Vault Secrets User for the deployer deployer@contoso\.example at ' }).Count | Should -Be 3
+    }
+
+    It 'gives no one else A3 when the vault''s last change isn''t a person''s or doesn''t resolve, and doesn''t repeat you when it''s yours' {
+        $config = New-ControlConfig
+        $readers = { @($script:assignments | Where-Object { $_.roleDefinitionId -match '/4633458b-17de-408a-b874-0445c86b69e6$' } | ForEach-Object principalId | Select-Object -Unique) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'HTTP 404: Request_ResourceNotFound'; StatusCode = 404 } }
+
+        # A GitHub workflow's deployment: an application, no person to give a secret to, and no Microsoft Graph read.
+        $script:vaultSystemData = @{ lastModifiedBy = '99999999-9999-9999-9999-999999999999'; lastModifiedByType = 'Application' }
+        $app = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        $none = $app | Where-Object checkId -EQ 'CONTROL.ROLE.DEPLOYER'
+        $none.status | Should -Be 'Not selected'
+        $none.message | Should -Match 'was last deployed by Application 99999999-9999-9999-9999-999999999999, not by a person'
+        & $readers | Should -Be @($script:callerId)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -Times 0 -Exactly
+
+        # A user Microsoft Graph finds neither by name nor by mail.
+        $script:vaultSystemData = @{ lastModifiedBy = 'gone@contoso.example'; lastModifiedByType = 'User' }
+        $gone = (@(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false) | Where-Object checkId -EQ 'CONTROL.ROLE.DEPLOYER')
+        $gone.status | Should -Be 'Warning'
+        $gone.message | Should -Match 'Microsoft Graph found 0 user\(s\) named gone@contoso\.example'
+        $gone.remediation | Should -Match 'control\.notebookUserObjectIds'
+        & $readers | Should -Be @($script:callerId)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -Times 1 -Exactly -ParameterFilter { $Uri -match '/users\?\$filter=mail%20eq%20%27gone%40contoso\.example%27&' }
+
+        # An address that two users share: ambiguous, so nobody.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Uri -match '/users\?\$filter=') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = '{"value":[{"id":"cccccccc-0000-0000-0000-000000000003"},{"id":"cccccccc-0000-0000-0000-000000000004"}]}'; StdErr = ''; StatusCode = 200 }
+            }
+            return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'HTTP 404: Request_ResourceNotFound'; StatusCode = 404 }
+        }
+        $script:vaultSystemData = @{ lastModifiedBy = 'shared@contoso.example'; lastModifiedByType = 'User' }
+        $shared = (@(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false) | Where-Object checkId -EQ 'CONTROL.ROLE.DEPLOYER')
+        $shared.status | Should -Be 'Warning'
+        $shared.message | Should -Match 'Microsoft Graph found 2 user\(s\) named shared@contoso\.example'
+        & $readers | Should -Be @($script:callerId)
+
+        # You deployed it last: one grant for you, none repeated.
+        $script:assignments.Clear()
+        $caller = $script:callerId
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ('{{"id":"{0}"}}' -f $caller); StdErr = ''; StatusCode = 200 } }
+        $script:vaultSystemData = @{ lastModifiedBy = 'owner@contoso.example'; lastModifiedByType = 'User' }
+        $mine = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        ($mine | Where-Object checkId -EQ 'CONTROL.ROLE.DEPLOYER').message | Should -Match '^You deployed this environment last \(owner@contoso\.example'
+        @($mine | Where-Object checkId -EQ 'CONTROL.ROLE.A3').Count | Should -Be 3
+        & $readers | Should -Be @($script:callerId)
     }
 
     It 'keeps assignments that exist, and writes nothing then' {

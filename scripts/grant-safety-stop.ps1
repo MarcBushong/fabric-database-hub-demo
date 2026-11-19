@@ -26,10 +26,13 @@ Since 2026-11-14 (ADR 0026) it also grants the on-demand control's roles, which 
 account (A2), with the session's actions (create and delete T4's read replica, set its streaming delay, join T4's subnet
 and private DNS zone, read the servers' metrics, tag the demo resource group, and since 2026-11-19 create, read, and
 delete T5's container); "DbHub Demo Session Writer" for the same identity at the control vault's two session secrets
-only (A4); and Key Vault Secrets User on the control vault's three secrets for you and control.notebookUserObjectIds
-(A3). Its results list what each new action could touch. Then it records T5's container lifecycle
-(GRANT.T5.LIFECYCLE, 2026-11-19, ADR 0027): once the control's role can create the container again, the container
-exists only during a session, so its throughput stops billing between sessions.
+only (A4); and Key Vault Secrets User on the control vault's three secrets for you, the environment's deployer, and
+control.notebookUserObjectIds (A3). The deployer (2026-11-19) is the person whose deploy.ps1 last set up the control
+vault, as Azure records it on the vault (CONTROL.ROLE.DEPLOYER), so a Contributor who deployed can Run all in
+NB_DatabaseHub_Control after this one run, without editing the configuration; nobody else gets the secrets, whose
+webhook URL is a bearer secret. Its results list what each new action could touch. Then it records T5's container
+lifecycle (GRANT.T5.LIFECYCLE, 2026-11-19, ADR 0027): once the control's role can create the container again, the
+container exists only during a session, so its throughput stops billing between sessions.
 
 .PARAMETER ConfigPath
 Path to the demo configuration (config/demo.config.json).
