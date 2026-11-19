@@ -264,6 +264,31 @@ Describe 'Get-DemoFabricWorkspaceClaim: the other demo environments, across the 
         @($fd.Claims) | Should -Be @('dddddddd-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000002')
         $claim.Others[1].Tagged | Should -BeFalse -Because 'an earlier version records no workspace'
         $claim.Others[2].Tagged | Should -BeFalse -Because 'a record that isn''t a workspace ID doesn''t count'
+        # 2026-11-19: this environment's own group, which deploy.ps1's DEPLOY.FABRIC.SHARED compares with the others.
+        $claim.Own.Found | Should -BeTrue
+        $claim.Own.FabricWorkspaceId | Should -Be 'dddddddd-0000-0000-0000-000000000001'
+        @($claim.Own.Claims) | Should -Be @('dddddddd-0000-0000-0000-000000000001')
+        $claim.Own.UsedFabric | Should -BeTrue -Because 'its last finished stage, Validation, comes after Fabric'
+    }
+
+    It 'says whether this environment''s own group finished a Fabric step, which one deployed before 2026-11-17 did without recording its workspace' {
+        foreach ($case in @(
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubTrackFabric = 'Fabric' }; Used = $true }
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubDeployStage = 'Fabric' }; Used = $true }
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubDeployStage = 'Infrastructure'; DbHubTrackFabric = '' }; Used = $false }
+            )) {
+            $script:rows = @(
+                [pscustomobject]@{ id = ('/subscriptions/{0}' -f $script:subscription); name = 'Demo subscription'; type = 'microsoft.resources/subscriptions'; subscriptionId = $script:subscription; tags = $null }
+                [pscustomobject]@{ id = ('/subscriptions/{0}/resourceGroups/rg-dbhub-demo' -f $script:subscription); name = 'rg-dbhub-demo'; type = 'microsoft.resources/subscriptions/resourcegroups'; subscriptionId = $script:subscription; tags = [pscustomobject]$case.Tags }
+            )
+            $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }
+            $claim.Own.Found | Should -BeTrue
+            $claim.Own.FabricWorkspaceId | Should -BeNullOrEmpty
+            $claim.Own.UsedFabric | Should -Be $case.Used
+            @($claim.Others).Count | Should -Be 0
+        }
+        $script:rows = @($script:rows | Select-Object -First 1)
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }).Own.Found | Should -BeFalse -Because 'a new environment has no group yet'
     }
 
     It 'can''t tell when Resource Graph fails, cuts its answer short, throws, or doesn''t list the subscription' {

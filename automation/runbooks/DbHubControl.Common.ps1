@@ -6279,9 +6279,16 @@ function Invoke-DbHubCapture {
     return [pscustomobject]@{ action = 'capture'; status = $state; message = $saved.Message; sessionId = [string]$Request.SessionId; bytes = $saved.Bytes; replica = $saved.Replica; cosmos = [bool](Get-DbHubMember -InputObject $saved -Name 'Cosmos') }
 }
 
+$script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5')
+
 function Write-DbHubStopStatus {
     # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
     # what failed, for the control notebook. Only when a session is known (the request's or the group's DbHubSessionId).
+    # It keeps the session's plan from the status it replaces (2026-11-19): its window, when each target's activity went
+    # out, T4's tier, the replica-lag beat, and T5's end, from the copy Read-DbHubSessionStatusCopy reads, when that copy
+    # is the same session's (planKept says whether it was). So the control notebook's Stop now, and its next Run all's
+    # pre-check, can save the session's history with its beats and its "saved" row when the run that was ending it
+    # stopped first.
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -6309,7 +6316,16 @@ function Write-DbHubStopStatus {
     if ($session -notmatch '^[0-9a-f]{32}$') {
         return
     }
-    $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') } }
+    $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') }; planKept = $false }
+    $earlier = Read-DbHubSessionStatusCopy -Context $Context
+    if ($null -ne $earlier -and [string]$earlier['sessionId'] -eq $session) {
+        foreach ($name in $script:DbHubStopStatusPlan) {
+            if ($earlier.Contains($name)) {
+                $status[$name] = $earlier[$name]
+            }
+        }
+        $status['planKept'] = $true
+    }
     $null = Write-DbHubSessionStatus -Context $Context -Status $status
 }
 
