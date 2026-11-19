@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { csvFileName, toCsv } from "./csv";
-import { formatAgo, formatCell, formatDateTimeUtc, formatDuration, formatNumber, toDate } from "./format";
+import { clause, formatAgo, formatCell, formatDateTimeUtc, formatDuration, formatNumber, sentence, toDate } from "./format";
 
 describe("formatNumber", () => {
     it("formats each kind with its unit", () => {
@@ -81,5 +81,16 @@ describe("toCsv", () => {
     it("builds safe, stamped file names", () => {
         expect(csvFileName("Estate: key signals / target", new Date(Date.UTC(2026, 9, 21, 17, 5)))).toBe("dbhub-estate-key-signals-target-202610211705Z.csv");
         expect(csvFileName("***", new Date(Date.UTC(2026, 9, 21, 17, 5)))).toBe("dbhub-data-202610211705Z.csv");
+    });
+});
+
+describe("messages inside the app's sentences", () => {
+    it("ends each sentence with exactly one period, whatever the message brought", () => {
+        expect(sentence("The live estate function isn't deployed in this app.")).toBe("The live estate function isn't deployed in this app.");
+        expect(sentence("this build of the app has no live estate source")).toBe("This build of the app has no live estate source.");
+        expect(sentence("  Database Hub refused the call (HTTP 403)..\n")).toBe("Database Hub refused the call (HTTP 403).");
+        expect(sentence("Still reading\u2026")).toBe("Still reading\u2026");
+        expect(sentence("")).toBe("");
+        expect(`Partial answer: ${["GET /auth/warnings failed.", "GET /cmk/warnings timed out"].map(clause).join("; ")}.`).toBe("Partial answer: GET /auth/warnings failed; GET /cmk/warnings timed out.");
     });
 });

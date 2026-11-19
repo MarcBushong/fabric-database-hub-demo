@@ -136,7 +136,7 @@ function AgentPanel({ build, lead, warning, visualId }: AgentPanelProps) {
                     </ol>
                 ) : (
                     <ol className="agent-howto" aria-label="How to ask">
-                        <li>Install the microsoft-sql-fdh and microsoft-sql plugins</li>
+                        <li>Install the fabric-skills (databasehub-cli) and microsoft-sql plugins</li>
                         <li>Run the session-setup prompt</li>
                         <li>Paste it into Copilot CLI or VS Code chat</li>
                     </ol>
@@ -156,7 +156,7 @@ function AgentPanel({ build, lead, warning, visualId }: AgentPanelProps) {
             <p className="muted">
                 {surface === "hub"
                     ? `Database Hub's Database Agent is a preview with no API, so this app can't send it a prompt: copy one, open Database Hub in a new tab, and paste it into the Database Agent. The agent proposes actions, and each one runs only after you explicitly approve it there; in this demo, read a proposal aloud, then cancel it. The agent sees ${TELEMETRY_RETENTION_DAYS} days of telemetry or less; this app's history goes further back.`
-                    : "The documented fallback (fabric/agent/README.md): GitHub Copilot CLI or VS Code with the microsoft-sql-fdh and microsoft-sql plugins from the pinned marketplace commit, and the telemetry agent instructions from Microsoft Learn. Approve only read commands, one at a time; every prompt forbids changes."}
+                    : "The documented fallback (fabric/agent/README.md): GitHub Copilot CLI or VS Code with the GA Database Hub skill (databasehub-cli, in the fabric-skills plugin) and the microsoft-sql plugin, each from its pinned marketplace commit, and the telemetry agent instructions from Microsoft Learn. Start the session with the guide's deny rules for the bundle's MCP servers. Approve only read commands, one at a time; every prompt forbids changes."}
             </p>
         </div>
     );

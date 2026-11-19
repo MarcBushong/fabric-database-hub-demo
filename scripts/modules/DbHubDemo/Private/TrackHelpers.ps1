@@ -1829,6 +1829,15 @@ function Invoke-DemoDeploymentTrack {
                     if ($null -ne $refreshWaiting -and $firstRun.Pending) {
                         Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $refreshWaiting.message
                         $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress)
+                        # The follow-up's model step checked the model's data again, so the first step's "Not selected" data
+                        # check, from before the model had tables, goes (the review of #68).
+                        if (@($again | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' }).Count -gt 0) {
+                            $staleData = @($powerBI | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' -and [string]$_.status -eq 'Not selected' })
+                            foreach ($item in $staleData) {
+                                $null = $results.Remove($item)
+                            }
+                            $powerBI = @($powerBI | Where-Object { $_ -notin $staleData })
+                        }
                         & $addAll $again
                         $powerBI = @($powerBI + $again)
                         & $partDone 'Fabric.Items' $fabric

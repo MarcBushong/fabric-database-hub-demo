@@ -1,7 +1,7 @@
 // Turns Database Hub's live answers into the app's rows: each security warning, and each check Database Hub flags on a
 // resource (its issues need attention; its enhancements are recommendations), named with the demo's targets.
 
-import type { FlagCategory, InventoryData, LiveResource, SecurityData } from "@/data/live-estate";
+import type { FlagCategory, FlagGroups, InventoryData, LiveResource, SecurityData } from "@/data/live-estate";
 
 /** Database Hub's flag names, as a DBA reads them, and the area each belongs to. */
 const FLAGS: Record<string, { text: string; area: string }> = {
@@ -14,6 +14,8 @@ const FLAGS: Record<string, { text: string; area: string }> = {
     hasCmkIssue: { text: "No customer-managed key", area: "Customer-managed keys" },
     hasLedgerIssue: { text: "Ledger is off", area: "Ledger" },
     hasPaygLicenseIssue: { text: "Pay-as-you-go SQL Server license: a license-model opportunity", area: "Licensing" },
+    hasUsageReportingIssue: { text: "Usage reporting to Azure needs attention", area: "Licensing" },
+    hasMigrationAssessmentIssue: { text: "The migration assessment needs attention", area: "Migration" },
     hasHighComputeUtilizationIssue: { text: "High compute use", area: "Sizing" },
     hasHighMemoryUtilizationIssue: { text: "High memory use", area: "Sizing" },
     hasHighStorageUtilizationIssue: { text: "High storage use", area: "Sizing" },
@@ -75,9 +77,62 @@ const SECURITY_AREAS = [
     ["customerManagedKeys", "Customer-managed keys"],
 ] as const;
 
+const NO_STATUS = /^\s*(unknown)?\s*$/i;
+
+function mergeFlags(a: FlagGroups | undefined, b: FlagGroups | undefined): FlagGroups | undefined {
+    if (!a) return b;
+    if (!b) return a;
+    const out: FlagGroups = {};
+    for (const category of new Set([...Object.keys(a), ...Object.keys(b)]) as Set<FlagCategory>) {
+        const merged: Record<string, boolean> = { ...(a[category] ?? {}) };
+        for (const [flag, on] of Object.entries(b[category] ?? {})) merged[flag] = merged[flag] === true || on === true;
+        out[category] = merged;
+    }
+    return out;
+}
+
+/**
+ * One row per resource. Database Hub's inventory lists a SQL Server on an Azure VM twice, as the SQL virtual machine and
+ * as its SQL Server instance from unified inventory, with the same type and name (live, 2026-11-18): they're one
+ * resource here, with the status that's known and every flag either row raises.
+ */
+export function uniqueResources(resources: readonly LiveResource[]): LiveResource[] {
+    const byKey = new Map<string, LiveResource>();
+    for (const r of resources) {
+        const key = `${r.databaseType}|${(r.resourceGroup ?? "").toLowerCase()}|${r.name.toLowerCase()}`;
+        const seen = byKey.get(key);
+        if (!seen) {
+            byKey.set(key, r);
+            continue;
+        }
+        byKey.set(key, {
+            ...seen,
+            status: seen.status && !NO_STATUS.test(seen.status) ? seen.status : (r.status ?? seen.status),
+            issues: mergeFlags(seen.issues, r.issues),
+            enhancements: mergeFlags(seen.enhancements, r.enhancements),
+            migrationAssessment: seen.migrationAssessment ?? r.migrationAssessment,
+        });
+    }
+    return [...byKey.values()];
+}
+
+/** The inventory with one row per resource, and its counts from those rows. */
+export function uniqueInventory(inventory: InventoryData): InventoryData {
+    const resources = uniqueResources(inventory.resources);
+    if (resources.length === inventory.resources.length) return inventory;
+    const countByType: Record<string, number> = {};
+    for (const r of resources) countByType[r.databaseType] = (countByType[r.databaseType] ?? 0) + 1;
+    return { ...inventory, resources, countByType, totalCount: inventory.totalCount - (inventory.resources.length - resources.length) };
+}
+
+/** A status that says the resource isn't up. "Unknown", or none, says nothing either way. */
+export function isDown(status: string | undefined): boolean {
+    return !!status && !NO_STATUS.test(status) && !/^(online|ready|connected|running|succeeded|available)$/i.test(status);
+}
+
 function flagRows(inventory: InventoryData | null | undefined, category: FlagCategory): LiveCheckRow[] {
     const rows: LiveCheckRow[] = [];
-    for (const resource of inventory?.resources ?? []) {
+    for (const resource of uniqueResources(inventory?.resources ?? [])) {
         for (const [kind, groups] of [["issue", resource.issues], ["enhancement", resource.enhancements]] as const) {
             for (const [flag, on] of Object.entries(groups?.[category] ?? {})) {
                 if (on !== true) continue;
@@ -132,11 +187,97 @@ export function liveOptimizationRows(inventory: InventoryData | null | undefined
 
 const SHORT_TYPE: Record<string, string> = { AzureSql: "Azure SQL", AzureSqlVM: "SQL VM", ArcSql: "Arc SQL", ArcSqlServer: "Arc SQL", SqlServerArc: "Arc SQL", PostgreSql: "PostgreSQL", CosmosDb: "Cosmos DB" };
 
-/** "2 PostgreSQL · 1 Arc SQL · …", largest first; `long` spells each type out. */
+/** "2 PostgreSQL · 1 Arc SQL · …", largest first, one per resource; `long` spells each type out. */
 export function inventoryMix(inventory: InventoryData | null | undefined, long = false): string {
-    return Object.entries(inventory?.countByType ?? {})
+    return Object.entries(inventory ? uniqueInventory(inventory).countByType : {})
         .filter(([, n]) => n > 0)
         .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
         .map(([type, n]) => `${n} ${long ? typeText(type) : (SHORT_TYPE[type] ?? typeText(type))}`)
         .join(long ? ", " : " \u00b7 ");
+}
+
+/** A migration assessment's Azure SQL targets, as Learn names them, in Learn's order (migration-assessment). */
+const MIGRATION_TARGETS: ReadonlyArray<readonly [string, string]> = [
+    ["azureSqlManagedInstance", "Azure SQL Managed Instance"],
+    ["azureSqlVirtualMachine", "SQL Server on Azure Virtual Machines"],
+    ["azureSqlDatabase", "Azure SQL Database"],
+];
+
+/** Learn's readiness words: Ready, Not ready, and Unknown. */
+export function readinessText(value: string): string {
+    const plain = value.replace(/[\s_-]/g, "").toLowerCase();
+    if (plain === "ready") return "Ready";
+    if (plain === "notready") return "Not ready";
+    if (plain === "" || plain === "unknown") return "Unknown";
+    return value.replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+export interface MigrationTargetRow extends Record<string, unknown> {
+    id: string;
+    resource: string;
+    target: string;
+    azureTarget: string;
+    readiness: string;
+}
+
+export interface LiveMigration {
+    resource: string;
+    /** The demo's target: T2 for arcsql01. */
+    target: string;
+    type: string;
+    enabled: boolean;
+    uploadedAt: Date | null;
+    /** "Available", "Stale", or "Unavailable", as Database Hub says it. */
+    dataStatus: string;
+    /** Results to show: an available or stale assessment with a readiness for at least one target. */
+    hasResults: boolean;
+    rows: MigrationTargetRow[];
+    ready: string[];
+    notReady: string[];
+}
+
+function joinAnd(items: readonly string[]): string {
+    if (items.length <= 1) return items.join("");
+    if (items.length === 2) return `${items[0]} and ${items[1]}`;
+    return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+}
+
+/** Every migration assessment in the inventory, T2's first: its readiness per Azure SQL target, in Learn's words. */
+export function liveMigrations(inventory: InventoryData | null | undefined): LiveMigration[] {
+    const out: LiveMigration[] = [];
+    for (const r of uniqueResources(inventory?.resources ?? [])) {
+        const a = r.migrationAssessment;
+        if (!a) continue;
+        const known = new Map(MIGRATION_TARGETS);
+        const keys = [...MIGRATION_TARGETS.map(([key]) => key).filter((key) => key in (a.targets ?? {})), ...Object.keys(a.targets ?? {}).filter((key) => !known.has(key))];
+        const target = targetOfResource(r);
+        const rows = keys.map((key) => ({
+            id: `${r.name}:${key}`,
+            resource: r.name,
+            target,
+            azureTarget: known.get(key) ?? typeText(key.charAt(0).toUpperCase() + key.slice(1)),
+            readiness: readinessText(String(a.targets[key] ?? "")),
+        }));
+        const uploaded = a.uploadedAt ? new Date(a.uploadedAt) : null;
+        const status = a.dataStatus || "Unknown";
+        out.push({
+            resource: r.name,
+            target,
+            type: typeText(r.databaseType),
+            enabled: a.enabled,
+            uploadedAt: uploaded && !Number.isNaN(uploaded.getTime()) ? uploaded : null,
+            dataStatus: status,
+            hasResults: /^(available|stale)$/i.test(status) && rows.some((row) => row.readiness !== "Unknown"),
+            rows,
+            ready: rows.filter((row) => row.readiness === "Ready").map((row) => row.azureTarget),
+            notReady: rows.filter((row) => row.readiness === "Not ready").map((row) => row.azureTarget),
+        });
+    }
+    return out.sort((a, b) => Number(b.target === "T2") - Number(a.target === "T2") || a.resource.localeCompare(b.resource));
+}
+
+/** "Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database." */
+export function migrationSentence(m: Pick<LiveMigration, "ready" | "notReady">): string {
+    const parts = [m.ready.length ? `Ready for ${joinAnd(m.ready)}` : "", m.notReady.length ? `${m.ready.length ? "not" : "Not"} ready for ${joinAnd(m.notReady)}` : ""].filter(Boolean);
+    return parts.length ? `${parts.join("; ")}.` : "No Azure SQL target's readiness is known yet.";
 }

@@ -8,6 +8,7 @@ import { CopilotProvider } from "./copilot/CopilotProvider";
 import { QueryClientContext } from "./data/use-query";
 import { createQueryClient, type Execute } from "./data/query-client";
 import { AuthProvider } from "./hooks/use-auth";
+import { functionsManageApi } from "./lib/manage-client";
 import { createRayfinClient } from "./lib/rayfin-client";
 import { loadAppRuntime } from "./lib/runtime-config";
 import { createAuthService } from "./services/rayfin-auth.service";
@@ -31,7 +32,7 @@ loadAppRuntime()
                         <AuthGate runtime={runtime}>
                             <QueryClientContext.Provider value={queryClient}>
                                 <CopilotProvider>
-                                    <App runtime={runtime} />
+                                    <App runtime={runtime} manageApi={functionsManageApi(client)} />
                                 </CopilotProvider>
                             </QueryClientContext.Provider>
                         </AuthGate>

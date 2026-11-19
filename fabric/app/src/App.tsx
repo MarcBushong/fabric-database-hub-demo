@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type Compone
 import { MessageBar, MessageBarBody, Spinner, Toast, ToastTitle, Toaster, useId, useToastController } from "@fluentui/react-components";
 
 import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess, type NotifyIntent } from "./app-context";
+import { manageAccessOf, type ManageApi } from "./lib/manage-client";
 import type { DataProvenance } from "./copilot/contract";
 import { toMeta } from "./data/model";
 import { metaQuery, type Filters } from "./data/queries";
@@ -44,10 +45,37 @@ function initialView(): ViewState {
 export interface AppProps {
     runtime: AppRuntime;
     provenance?: DataProvenance;
+    /** A fixed Manage mode (the preview and the tests); otherwise the app asks manageApi. */
     manage?: ManageAccess;
+    /** The app's Manage function: when it answers, actions run from the app (A); when it doesn't, they're copied (C). */
+    manageApi?: ManageApi;
 }
 
-export default function App({ runtime, provenance = "history", manage = MANAGE_READ_ONLY }: AppProps) {
+/** Which way Manage sends actions here, from the Manage function's answer about the signed-in viewer. */
+function useManageAccess(fixed: ManageAccess | undefined, api: ManageApi | undefined): ManageAccess {
+    const [detected, setDetected] = useState<ManageAccess | null>(null);
+    useEffect(() => {
+        if (fixed || !api) return;
+        let alive = true;
+        api.access().then(
+            (a) => {
+                if (alive) setDetected(manageAccessOf(a, api, (reason) => setDetected({ ...MANAGE_READ_ONLY, reason })));
+            },
+            () => {
+                if (alive) setDetected(MANAGE_READ_ONLY);
+            },
+        );
+        return () => {
+            alive = false;
+        };
+    }, [fixed, api]);
+    if (fixed) return fixed;
+    if (!api) return MANAGE_READ_ONLY;
+    return detected ?? { ...MANAGE_READ_ONLY, checking: true, reason: "Checking whether this app can send actions…" };
+}
+
+export default function App({ runtime, provenance = "history", manage: fixedManage, manageApi }: AppProps) {
+    const manage = useManageAccess(fixedManage, manageApi);
     const { session, signOut } = useAuth();
     const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
     const [view, setViewState] = useState<ViewState>(initialView);

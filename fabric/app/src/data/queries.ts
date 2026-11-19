@@ -358,6 +358,7 @@ export function readinessChecksQuery(): QuerySpec {
         id: "readiness-checks",
         title: "Validation checks, latest six runs",
         rowLimit: 3000,
+        mayBeEmpty: "until the first session's readiness check: Run all in NB_DatabaseHub_Control runs NB_DatabaseHub_Deployment",
         dax: `EVALUATE
 VAR Runs = TOPN ( 6, VALUES ( 'Validation Results'[Run ID] ), 'Validation Results'[Run ID], DESC )
 RETURN

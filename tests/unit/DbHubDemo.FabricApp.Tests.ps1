@@ -1003,6 +1003,25 @@ Describe 'Resolve-DemoFabricAppItem' {
         $links['databaseHub'] | Should -Match '^https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid='
     }
 
+    It 'links the control notebook in the demo workspace, or in the control workspace by its name (2026-11-18)' {
+        $script:notebookId = '0b0b0b0b-0000-0000-0000-000000000000'
+        $script:controlWorkspaceId = '0c0c0c0c-0000-0000-0000-000000000000'
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith {
+            $id = switch ($Type) { 'SemanticModel' { $script:modelId } 'KQLDashboard' { $script:dashboardId } 'Report' { $script:reportId } 'Notebook' { if ($WorkspaceId -eq $script:controlWorkspaceId) { $script:notebookId } } }
+            [pscustomobject]@{ StatusCode = 200; Items = @(if ($id) { [pscustomobject]@{ id = $id; displayName = $DisplayName; type = $Type } }); Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @([pscustomobject]@{ id = $script:controlWorkspaceId; displayName = 'Lab Control' }) } }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config @{ fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        $result.status | Should -Be 'Pass'
+        $result.evidence['links']['controlNotebook'] | Should -Be "https://app.fabric.microsoft.com/groups/$script:controlWorkspaceId/synapsenotebooks/$($script:notebookId)?ctid=$script:tenantId"
+        $result.evidence['controlNotebookId'] | Should -Be $script:notebookId
+
+        # Without the configuration, only the demo workspace is searched, and no link isn't a problem.
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token
+        $result.status | Should -Be 'Pass'
+        $result.evidence['links'].Keys | Should -Not -Contain 'controlNotebook'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -Times 1 -Exactly
+    }
     It 'needs the model, and only warns about a missing dashboard or report' {
         Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 200; Items = @(); Error = '' } }
         (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token).status | Should -Be 'Manual action required'
@@ -1014,8 +1033,184 @@ Describe 'Resolve-DemoFabricAppItem' {
         $result.status | Should -Be 'Warning'
         $result.evidence['links'].Keys | Should -Not -Contain 'report'
     }
+
+    It 'links T2''s SQL Server instance in the Azure portal from its own resource ID, the default instance first (2026-11-18)' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith {
+            $id = switch ($Type) { 'SemanticModel' { $script:modelId } 'KQLDashboard' { $script:dashboardId } 'Report' { $script:reportId } }
+            [pscustomobject]@{ StatusCode = 200; Items = @(if ($id) { [pscustomobject]@{ id = $id; displayName = $DisplayName; type = $Type } }); Error = '' }
+        }
+        $script:armGroup = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lab-demo'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith {
+            $machine = '{0}/providers/Microsoft.HybridCompute/machines/arcsql01' -f $script:armGroup
+            # As the real one returns it: the whole array as one object.
+            return , @(
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01_NAMED' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = $machine; instanceName = 'NAMED' } }
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/sqlvm01' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = ('{0}/providers/Microsoft.Compute/virtualMachines/sqlvm01' -f $script:armGroup); instanceName = 'MSSQLSERVER' } }
+                [pscustomobject]@{ id = ('{0}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01' -f $script:armGroup); properties = [pscustomobject]@{ containerResourceId = $machine; instanceName = 'MSSQLSERVER' } }
+            )
+        }
+        $config = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; tenantId = $script:tenantId; prefix = 'lab'; environment = 'demo'; fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @() } }
+        $result = Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config
+        $result.evidence['links']['t2MigrationAssessment'] | Should -BeExactly ('https://portal.azure.com/#@{0}/resource{1}/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01' -f $script:tenantId.ToLowerInvariant(), $script:armGroup)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 1 -Exactly -ParameterFilter { $Url -match '^https://management\.azure\.com/subscriptions/0{8}-0{4}-0{4}-0{4}-0{12}/resourceGroups/rg-lab-demo/providers/Microsoft\.AzureArcData/sqlServerInstances\?api-version=' }
+    }
+
+    It 'leaves T2''s portal link out when T2 has no instance yet, when Azure can''t be read, or without a tenant' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 200; Items = @([pscustomobject]@{ id = $script:modelId }); Error = '' } }
+        $config = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; tenantId = $script:tenantId; prefix = 'lab'; environment = 'demo'; fabric = @{ workspaceName = 'Lab' }; control = @{} }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlFabricList -MockWith { [pscustomobject]@{ Items = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith { return , @() }
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith { throw 'Reading the instances failed: (AuthorizationFailed)' }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'names the Azure portal path' }
+        $config.Remove('tenantId')
+        (Resolve-DemoFabricAppItem -WorkspaceId $script:workspaceId -TenantId $script:tenantId -Token $script:token -Config $config).evidence['links'].Keys | Should -Not -Contain 't2MigrationAssessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 2 -Exactly
+    }
 }
 
+Describe 'Resolve-DemoFabricAppOperator' {
+    BeforeAll {
+        $script:operatorConfig = @{ subscriptionId = '00000000-0000-0000-0000-000000000000'; t3AdminGroupObjectId = 'aaaaaaaa-0000-0000-0000-000000000000' }
+        $script:answer = { param([object] $Body) [pscustomobject]@{ ExitCode = 0; StdOut = ($Body | ConvertTo-Json -Depth 8); StdErr = ''; StatusCode = 200 } }
+    }
+
+    It 'resolves the deployer and the admin group''s users, every page, once each, lowercased (2026-11-18)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Uri -match '/me\?') { return (& $script:answer @{ id = 'D0000000-0000-0000-0000-000000000000'; userPrincipalName = 'Deployer@Contoso.example'; mail = $null }) }
+            if ($Uri -like '*skiptoken*') { return (& $script:answer @{ value = @(@{ id = 'd0000000-0000-0000-0000-000000000000'; userPrincipalName = 'deployer@contoso.example' }, @{ id = 'b0000000-0000-0000-0000-000000000000'; userPrincipalName = 'dba2@contoso.example'; mail = 'DBA2@contoso.example' }) }) }
+            & $script:answer @{ value = @(@{ id = 'a0000000-0000-0000-0000-000000000000'; userPrincipalName = 'dba1@contoso.example'; mail = 'dba.one@contoso.example' }); '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/groups/x/members/microsoft.graph.user?$skiptoken=2' }
+        }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'The app''s Manage actions are for you and 2 other members of the demo''s admin group; every deploy refreshes the list.'
+        $operators = @($result.evidence['operators'])
+        @($operators | ForEach-Object { $_['objectId'] }) | Should -Be @('d0000000-0000-0000-0000-000000000000', 'a0000000-0000-0000-0000-000000000000', 'b0000000-0000-0000-0000-000000000000')
+        $operators[0]['names'] | Should -Be @('deployer@contoso.example')
+        $operators[1]['names'] | Should -Be @('dba1@contoso.example', 'dba.one@contoso.example')
+        $operators[2]['source'] | Should -Be 'adminGroup'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -Times 1 -Exactly -ParameterFilter { $Uri -like '*/groups/aaaaaaaa-0000-0000-0000-000000000000/members/microsoft.graph.user?*' }
+    }
+
+    It 'falls back to the deployer only, with a Warning, when the group''s members can''t be read; and fails without the deployer' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            if ($Uri -match '/me\?') { return (& $script:answer @{ id = 'd0000000-0000-0000-0000-000000000000'; userPrincipalName = 'deployer@contoso.example' }) }
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'Forbidden: Insufficient privileges'; StatusCode = 403 }
+        }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The admin group''s members couldn''t be read \(Forbidden: Insufficient privileges\), so the app''s Manage actions are yours only\.$'
+        @($result.evidence['operators']).Count | Should -Be 1
+        $result.remediation | Should -Match 'every deploy refreshes the list'
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'not signed in'; StatusCode = 401 } }
+        $result = Resolve-DemoFabricAppOperator -Config $script:operatorConfig
+        $result.status | Should -Be 'Fail'
+        @($result.evidence['operators']).Count | Should -Be 0
+    }
+}
+
+Describe 'Set-DemoFabricAppManageSetting' {
+    BeforeAll {
+        $script:manageApi = 'https://example.invalid/v1/workspaces/w/appbackends/a/BaaSService/'
+        $script:newManageStage = {
+            param([bool] $Functions = $true, [string] $ApiUrl = $script:manageApi)
+            $stage = Join-Path -Path $TestDrive -ChildPath ('stage-{0}' -f [guid]::NewGuid().ToString('n'))
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $stage -ChildPath 'rayfin/functions/src') -Force
+            $yml = @('id: dbhub-insights', 'services:', '  auth:', '    enabled: true', '  functions:', '    # The app''s functions.', ('    enabled: {0}' -f $(if ($Functions) { 'true' } else { 'false' })), '    buildCommand: npm run build', '    auth:', '      type: application', 'connectors: []', '') -join "`n"
+            Set-Content -LiteralPath (Join-Path -Path $stage -ChildPath 'rayfin/rayfin.yml') -Value $yml -Encoding utf8NoBOM -NoNewline
+            if ($ApiUrl) {
+                # Built at run time, so no scanner takes it for a key.
+                $key = 'pk_' + ('k' * 21)
+                $record = @{ active = 'dbhub'; deployments = @{ dbhub = @{ itemName = 'APP_DatabaseHub_Insights'; fabricItemId = '00000000-0000-0000-0000-000000000000'; fabricWorkspaceId = '00000000-0000-0000-0000-000000000000'; fabricTenantId = '00000000-0000-0000-0000-000000000000'; fabricApiUrl = $ApiUrl; publishableKey = $key; hostingUrl = 'https://example.invalid/'; fabricDeepLink = 'https://app.fabric.microsoft.com/' } } }
+                Set-Content -LiteralPath (Join-Path -Path $stage -ChildPath 'rayfin/.deployments.json') -Value ($record | ConvertTo-Json -Depth 5) -Encoding utf8NoBOM
+            }
+            return $stage
+        }
+        $script:manageFile = { param([string] $Stage) Join-Path -Path $Stage -ChildPath 'rayfin/functions/src/manage.generated.ts' }
+        $script:readManage = {
+            param([string] $Stage)
+            $text = Get-Content -LiteralPath (& $script:manageFile $Stage) -Raw
+            ($text -replace '(?s)^.*export const MANAGE_SETTINGS: ManageSettings = ', '') -replace ';\s*$', '' | ConvertFrom-Json
+        }
+        $script:manageOperators = @(
+            [ordered]@{ objectId = 'D0000000-0000-0000-0000-000000000000'; names = @('Deployer@Contoso.example', 'deployer@contoso.example'); source = 'deployer' },
+            [ordered]@{ objectId = 'not-an-object-id'; names = @('someone@contoso.example'); source = 'adminGroup' }
+        )
+        $script:manageIds = @{ ControlWorkspaceId = 'C0000000-0000-0000-0000-000000000000'; ControlNotebookId = 'E0000000-0000-0000-0000-000000000000' }
+    }
+
+    It 'writes the app''s API and IDs, NB_DatabaseHub_Control''s IDs, the operators, and the control''s catalog for the Manage function, never the publishable key (ADR 0029)' {
+        $stage = & $script:newManageStage
+        $ids = $script:manageIds
+        $result = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'Manage sends its actions from the app for 1 operator: its function checks each caller with the app''s own keys, and runs NB_DatabaseHub_Control through the Fabric job API after the caller confirms.'
+        $result.evidence['apiUrl'] | Should -BeExactly $script:manageApi
+        $settings = & $script:readManage $stage
+        $settings.apiUrl | Should -BeExactly $script:manageApi
+        $settings.controlWorkspaceId | Should -BeExactly 'c0000000-0000-0000-0000-000000000000'
+        $settings.controlNotebookId | Should -BeExactly 'e0000000-0000-0000-0000-000000000000'
+        foreach ($name in 'tenantId', 'workspaceId', 'appId') {
+            $settings.$name | Should -BeExactly '00000000-0000-0000-0000-000000000000' -Because $name
+        }
+        $settings.issuer | Should -BeExactly ''
+        $settings.audience | Should -BeExactly ''
+        @($settings.catalog.targets) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
+        $settings.catalog.scenarios.PSObject.Properties.Name | Should -Not -Contain 'healthy-baseline'
+        @($settings.catalog.scenarios.'ru-storm'.targets) | Should -Be @('T5')
+        $settings.catalog.minDurationMinutes | Should -Be 5
+        $settings.catalog.maxDurationMinutes | Should -Be 120
+        @($settings.operators).Count | Should -Be 1
+        $settings.operators[0].objectId | Should -BeExactly 'd0000000-0000-0000-0000-000000000000'
+        @($settings.operators[0].names) | Should -Be @('deployer@contoso.example')
+        $text = Get-Content -LiteralPath (& $script:manageFile $stage) -Raw
+        $text | Should -Match '^// Written by scripts/configure-fabric-app\.ps1'
+        $text | Should -Match 'import type \{ ManageSettings \} from "\./manage-core\.js";'
+        $text | Should -Not -Match 'pk_'
+    }
+
+    It 'says the app copies each request for Run all, and why, without the app''s API, the control notebook, or operators, or without functions' {
+        $stage = & $script:newManageStage -ApiUrl ''
+        $result = Set-DemoFabricAppManageSetting -StagePath $stage -Operator @() -Confirm:$false
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -BeExactly 'Manage''s function is missing the app''s API and IDs (its first deploy records them), NB_DatabaseHub_Control, the control''s catalog, and operators, so the app copies each request for Run all in NB_DatabaseHub_Control instead of sending it.'
+        $result.remediation | Should -Match 'configure-fabric-app\.ps1 again'
+        (& $script:readManage $stage).apiUrl | Should -BeExactly ''
+
+        $ids = $script:manageIds
+        $stage = & $script:newManageStage -ApiUrl 'http://example.invalid/api/'
+        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false).message | Should -Match '^Manage''s function is missing the app''s API and IDs \(its first deploy records them\), so'
+
+        $stage = & $script:newManageStage -Functions $false
+        (Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -Confirm:$false).status | Should -Be 'Not supported'
+
+        $stage = & $script:newManageStage
+        $null = Set-DemoFabricAppManageSetting -StagePath $stage @ids -Operator $script:manageOperators -Config (Get-HubTestConfig) -WhatIf
+        Test-Path -LiteralPath (& $script:manageFile $stage) | Should -BeFalse
+    }
+
+    It 'gives the function the control''s own catalog: the runbook settings'' targets, incidents, and bounds, with T5 only while it''s on' {
+        foreach ($t5 in $true, $false) {
+            $config = Get-HubTestConfig
+            $config['t5Enabled'] = $t5
+            $catalog, $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } {
+                (Get-DemoFabricAppManageCatalog -Config $Config), (Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '00000000-0000-0000-0000-000000000000')
+            }
+            @($catalog['targets']) | Should -Be @($setting['targets'].Keys) -Because ('t5Enabled {0}' -f $t5)
+            @($catalog['targets']) -contains 'T5' | Should -Be $t5
+            ($catalog['scenarios'] | ConvertTo-Json -Depth 6 -Compress) | Should -BeExactly ($setting['scenarios'] | ConvertTo-Json -Depth 6 -Compress)
+            $catalog['minDurationMinutes'] | Should -Be $setting['minDurationMinutes']
+            $catalog['maxDurationMinutes'] | Should -Be $setting['maxDurationMinutes']
+            $catalog['session']['minMinutes'] | Should -Be $setting['minSessionMinutes']
+            $catalog['session']['maxMinutes'] | Should -Be $setting['profiles']['showcase']['maxMinutes']
+            $catalog['session']['defaultMinutes'] | Should -Be $setting['profiles']['showcase']['defaultMinutes']
+        }
+    }
+}
 Describe 'configure-fabric-app.ps1' {
     BeforeAll {
         $script:passResult = { param([string] $CheckId, [hashtable] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ok' -Evidence $Evidence }
@@ -1141,6 +1336,9 @@ Describe 'configure-fabric-app.ps1' {
             }
             Mock -CommandName Test-DemoFabricApp -MockWith { @((& $pass 'FABRIC.APP.CONNECTOR'), (& $pass 'FABRIC.APP.QUERIES'), (& $pass 'FABRIC.APP.HOSTING')) }
             Mock -CommandName Connect-DemoRayfinCli -MockWith { throw 'No browser sign-in is expected here.' }
+            # Manage's settings (ADR 0029), in a guarded run: the operators, and settings whose app API the stage already has.
+            Mock -CommandName Resolve-DemoFabricAppOperator -MockWith { & $pass 'FABRIC.APP.OPERATORS' @{ operators = @(@{ objectId = 'd0000000-0000-0000-0000-000000000000'; names = @('deployer@contoso.example') }) } }
+            Mock -CommandName Set-DemoFabricAppManageSetting -MockWith { & $pass 'FABRIC.APP.ACTIONS' @{ apiUrl = 'https://example.invalid/api/'; functionsEnabled = $true; written = $true } }
         }
 
         It 'deploys with the Rayfin CLI''s own sign-in when Fabric refuses the Azure CLI''s token, and FABRIC.APP.TOKEN says why' {
@@ -1225,6 +1423,41 @@ Describe 'configure-fabric-app.ps1' {
             $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
             $LASTEXITCODE | Should -Be 0
             Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] -and -not $RayfinSignIn }
+        }
+
+        It 'writes Manage''s settings before rayfin up; a first deploy writes them again with the app''s API and deploys once more (ADR 0029)' {
+            $pass = $script:passResult
+            $testFabricToken = $script:token
+            Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }
+            Mock -CommandName Get-DemoFabricToken -MockWith { $testFabricToken }
+            Mock -CommandName Get-DemoPowerBIToken -MockWith { throw 'No Power BI token here.' }
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith { @((& $pass 'FABRIC.APP.DEPLOY' @{ itemId = $itemId; hostingUrl = $hosting }), (& $pass 'FABRIC.APP.STATUS')) }
+            Mock -CommandName Resolve-DemoFabricAppItem -MockWith { & $pass 'FABRIC.APP.ITEMS' @{ semanticModelId = $modelId; controlWorkspaceId = 'c0000000-0000-0000-0000-000000000000'; controlNotebookId = 'e0000000-0000-0000-0000-000000000000'; links = [ordered]@{} } }
+            # Before the first rayfin up, the stage has no deployment record, so the first write has no app API.
+            $writes = [System.Collections.Generic.List[int]]::new()
+            Mock -CommandName Set-DemoFabricAppManageSetting -MockWith {
+                $writes.Add($writes.Count)
+                & $pass 'FABRIC.APP.ACTIONS' @{ apiUrl = $(if ($writes.Count -eq 1) { '' } else { 'https://example.invalid/api/' }); functionsEnabled = $true; written = $true }
+            }
+            $output = Join-Path -Path $TestDrive -ChildPath 'manage.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Resolve-DemoFabricAppOperator -Times 1 -Exactly
+            Should -Invoke -CommandName Set-DemoFabricAppManageSetting -Times 2 -Exactly -ParameterFilter { $ControlWorkspaceId -eq 'c0000000-0000-0000-0000-000000000000' -and $ControlNotebookId -eq 'e0000000-0000-0000-0000-000000000000' -and @($Operator).Count -eq 1 }
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 2 -Exactly
+            $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+            ($records | Where-Object checkId -EQ 'FABRIC.APP.OPERATORS').status | Should -Be 'Pass'
+            $actions = @($records | Where-Object checkId -EQ 'FABRIC.APP.ACTIONS')
+            $actions.Count | Should -Be 1
+            $actions[0].status | Should -Be 'Pass'
+            $actions[0].evidence.redeployed | Should -BeTrue
+            @($records | Where-Object checkId -EQ 'FABRIC.APP.DEPLOY').Count | Should -Be 1
+
+            # A later deploy finds the app's API in the stage's record: one rayfin up.
+            Mock -CommandName Set-DemoFabricAppManageSetting -MockWith { & $pass 'FABRIC.APP.ACTIONS' @{ apiUrl = 'https://example.invalid/api/'; functionsEnabled = $true; written = $true } }
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 3 -Exactly
         }
 
         It 'adds no FABRIC.APP.TOKEN and opens no browser when only the connector''s direct route refused the token: Execute Queries checked the app and proves its tenant setting (2026-11-09 live finding)' {

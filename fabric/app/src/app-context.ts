@@ -3,22 +3,42 @@ import { createContext, useContext } from "react";
 import type { DataProvenance } from "./copilot/contract";
 import type { Meta } from "./data/model";
 import type { Filters } from "./data/queries";
+import type { ControlRequest } from "./lib/control";
+import type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer } from "./lib/manage-client";
 import type { AppRuntime } from "./lib/runtime-config";
 import type { PageId, ViewState } from "./lib/view-state";
 
 export type NotifyIntent = "success" | "info" | "warning" | "error";
 
-/** Whether this viewer can run the control's actions from the app, and if not, why. */
+/** How the Manage page sends actions here: the app's Manage function (A), or by copying them for Run all (C). */
 export interface ManageAccess {
+    /** "run": the app's Manage function sends confirmed requests; "copy": it isn't deployed, so each action copies its request for Run all. */
+    mode: "run" | "copy";
+    /** Run mode: the verified viewer is an operator (the deployer or a member of the demo's admin group). */
     canRun: boolean;
-    /** One short sentence for viewers who see the actions read-only. */
+    /** One short sentence: why the viewer can't run actions, or how copy mode works. */
     reason: string;
+    /** Run mode: the verified viewer, as the control records them. */
+    who?: string;
+    /** Run mode: the control's run that's queued or in progress; a new session follows it, and Stop now cancels it first. */
+    running?: ManageAccessAnswer["running"];
+    /** Run mode: the control's targets (T5 only while it's on), when the function says. */
+    targets?: string[];
+    /** Run mode: sends a confirmed request. */
+    send?: (request: ControlRequest) => Promise<ManageRequestAnswer>;
+    /** Run mode: reads one of the control's runs, to show its real state. */
+    job?: (jobInstance: string) => Promise<ManageJobAnswer>;
+    /** Run mode: switches to copy mode, with the reason, when the function couldn't send a request that Run all can. */
+    fallBack?: (reason: string) => void;
+    /** Still finding out which mode this deployment has. */
+    checking?: boolean;
 }
 
-/** Until the app's own control path is approved and deployed, its actions are read-only (Run all stays the demo's action). */
+/** Copy mode (C): without the app's Manage function, each action copies its request for Run all in the control notebook. */
 export const MANAGE_READ_ONLY: ManageAccess = {
+    mode: "copy",
     canRun: false,
-    reason: "Actions from the app aren't connected in this deployment. Run all in NB_DatabaseHub_Control runs a whole session.",
+    reason: "This deployment has no Manage function, so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.",
 };
 
 export interface AppContextValue {

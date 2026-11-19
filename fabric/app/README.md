@@ -1,12 +1,27 @@
 # Database Hub Insights: the Fabric App (preview)
 
-`APP_DatabaseHub_Insights` is a read-only [Fabric app](https://learn.microsoft.com/fabric/apps/overview) over the history semantic model `SM_DatabaseHub_History` (Phase 19). It shows the same lakehouse history as the Power BI report, in a different form: custom visuals, motion, themes, and ways to take the data out. Fabric Apps is a **preview**.
+`APP_DatabaseHub_Insights` is the demo's DBA console: a [Fabric app](https://learn.microsoft.com/fabric/apps/overview) where a DBA sees what needs attention across the estate, drills from the estate to a target and an incident, asks Copilot about what's on screen, and acts through the demo's own session control ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md)). Fabric Apps is a **preview**.
 
-It's history, not live. `NB_DatabaseHub_LiveActivity` saves telemetry snapshots, findings, and incident windows to `LH_DatabaseHub`; the model reads them with Direct Lake; the app queries the model with DAX. For live data, use Database Hub and the Real-Time Dashboard ([presentation](../../docs/presentation.md)).
+It reads two sources and says which one every visual shows:
+
+- **History:** the lakehouse history (`LH_DatabaseHub`), which `NB_DatabaseHub_LiveActivity` saves at each session's end, through the semantic model `SM_DatabaseHub_History` and the read-only `history` connector, as you. It keeps what Database Hub's 7 days of telemetry don't.
+- **Live:** Database Hub's own read-only API, through the app's function, scoped to the demo's resource groups and cached for a minute: the estate's resources, their health in the last 24 hours, and security warnings. When the function isn't deployed, each page says why in one line and shows the history.
+
+## Demo it yourself
+
+Anyone who deploys the demo demos it themselves, with nothing to set up in the app:
+
+1. **Deploy:** `./scripts/deploy.ps1` deploys the app with everything else, and updates it in place on every run ([Deploy](#deploy)).
+2. **Open it:** in the Fabric portal, open the demo's workspace and select `APP_DatabaseHub_Insights`. It signs you in with your Fabric account and opens on **Overview**.
+3. **The first time,** before any session, Overview says **No history yet** and names the one action that fills it: **Run all** in `NB_DatabaseHub_Control`. Live now (Database Hub's own view) shows already.
+4. **After a session,** every page shows it: the incidents, T3's Database Agent loop, T4's read replica lag, T5's throttling and recovery, the findings, and **Readiness**, which every Run all fills by running `NB_DatabaseHub_Deployment`'s read-only checks once its session runs. Each session adds to the history; reset (in Manage, or `RESET_NOW` in the control notebook) and the next Run all work the same way every time.
+5. **Copilot:** select **Copilot** in the top bar, or **Ask Copilot** on any visual. The dock signs in to GitHub with your Copilot license the first time; its chip in the top bar shows your GitHub login and Copilot plan, next to your Fabric account.
+
+**Accounts:** your Fabric account opens the app and runs its queries (it needs Read and Build on `SM_DatabaseHub_History`); your GitHub account, with a Copilot license, runs the chat. They're separate, and neither is stored in the app.
 
 ## Open the app
 
-**Open it from its item in the Fabric workspace.** In the Fabric portal, open the demo workspace and select `APP_DatabaseHub_Insights`. The app runs embedded in the item page and signs you in by itself with `initEmbeddedAuth` ([Fabric authentication](https://learn.microsoft.com/fabric/apps/fabric-authentication)). The **Live links** page shows **"✓ Connector check passed"** with the counts of validation checks, telemetry rows, and incident windows. That message proves sign-in, the connector, and your access to the model in one step.
+**Open it from its item in the Fabric workspace.** The app runs embedded in the item page and signs you in by itself with `initEmbeddedAuth` ([Fabric authentication](https://learn.microsoft.com/fabric/apps/fabric-authentication)). **Live views** shows **"✓ Connector check passed"** with the counts of validation checks, telemetry rows, and incident windows. That message proves sign-in, the connector, and your access to the model in one step.
 
 Don't open the hosted URL directly. That's a known preview limitation: see [Known limitation: the hosted URL](#known-limitation-the-hosted-url).
 
@@ -18,54 +33,64 @@ Viewers need:
 
 ## What's in it
 
-Five pages, designed for the portal's item frame (smaller than full screen) and responsive down to a phone width.
+A left navigation (it folds into a rail), a global filter (targets T1 to T5, and the period: latest day, 7 days, 30 days, all history, anchored to the newest telemetry day), and nine pages. All times are UTC.
 
-| Page | Visuals | What it answers |
+| Page | What it answers | What's on it |
 |---|---|---|
-| **Estate** | Estate constellation (targets orbit the estate; satellites are signals sized by value; a halo takes the worst finding's status), activity clock (24 UTC hours, one ring per target), signal ridgelines (per-bin distributions), the findings feed, and a Database Agent prompt library | Which target works hardest, when, and what changed |
-| **Incidents** | Incident ribbon, replay (every signal bin by bin, with a scrubber, steps, speeds, the window, its baseline, and its peak), **Investigate with the Database Agent** (ready-made prompts for each window), before-and-after spotlight (a wait "rose" that morphs from the minutes before the window into the window), and the wait flow (Sankey or sunburst: wait family to category to target) | What an incident looked like, what changed during it, and what to ask next |
-| **PostgreSQL** | T4, the PostgreSQL flexible server, and its read replica, from the latest capture of their Azure Monitor metrics: the replica's **Read replica lag** over time with its peak and the 60-second warning line, CPU on both servers (80 % warning line), active connections and T4's failed connections, the servers and their sizes, and the notebook's findings. Without a capture yet, it says how one gets there | Is T4 healthy, and how far did the replica lag behind |
-| **Readiness** | Readiness dial and area rings (the latest validation run; inner rings are earlier runs), telemetry coverage, a Database Agent prompt library that starts with telemetry coverage, and every check worst first with its next step and documentation | Is the demo ready, and what's the next step |
-| **Live links** | New-tab links to Database Hub, the Real-Time Dashboard, and the Power BI report; how the history gets here; the connection check | Where the live view is |
+| **Overview** | What needs attention now | **Live now** from Database Hub: resources and any not up, high usage in the last 24 hours, security warnings, Cosmos DB's peak normalized RU and lowest availability. Then from the history: targets needing attention, incidents, findings, readiness, the newest snapshot and the last session, each target's health with its CPU sparkline, the newest incidents, and the worst findings |
+| **Estate** | Every engine and target | Health tiles by engine, the inventory (sort, filter, CSV), and each target's page: T1 to T3 (CPU with incident bands and **Ask why** on its peak, waits, sessions, findings; on T2, **Ready to migrate**), T4 and its read replica (Read replica lag, CPU, connections), and T5 (normalized RU with the throttled intervals shaded and the 100 % line, requests and 429s, gateway latency, the recovery) |
+| **Performance** | Where the time goes | A signal per target (CPU, waits, sessions, IO), wait categories, each target's distribution, and a heatmap of the UTC hours |
+| **Incidents** | What happened, why, and what fixed it | The timeline, the replay (every signal bin by bin, with steps and speeds), what changed (waits before and during), **the Database Agent loop** on T3 (detect, evidence, respond, verify, from the session's `database_agent` finding: T3's CPU before and after the response), every incident window, and the Database Agent prompts |
+| **Findings** | What the analyses found, by category | Performance, availability, security, optimization, capacity, and telemetry. **Security** and **Optimization** read Database Hub live (warnings first, then recommendations, each named with the demo's target); the history's findings stay beside them. **Ready to migrate** (2026-11-18): `arcsql01`'s readiness for Azure SQL Managed Instance, SQL Server on Azure Virtual Machines, and Azure SQL Database, with when it was assessed, from Database Hub's inventory, and **Ask Copilot** with "Which of my servers can move to Azure, and to what?". Database Hub doesn't raise a ready assessment as an issue, so its issue lists don't show it; without the live source, the card links `arcsql01` in the Azure portal, whose **Migration**, **Assessments** page has it |
+| **Readiness** | Is the demo ready, and what's next | The latest validation run worst first, with each check's next step and documentation. Every Run all fills it: once its session runs, `NB_DatabaseHub_Control` runs `NB_DatabaseHub_Deployment`'s read-only checks; before the first session, it says so |
+| **Trends** | What changed past 7 days | The history per UTC day and target, week over week |
+| **Manage** | Act on the demo | Start a session, run an incident on a target, stop now, reset: each bounded and confirmed ([Manage](#manage-bounded-confirmed-actions)) |
+| **Live views** | Where the live view is | Database Hub, the real-time dashboards, and the history report, in new tabs; the connector check |
 
-Each page starts with **insight cards**: plain sentences computed by rules over the query results in the browser, such as "T3 Buffer IO (PAGEIOLATCH) waits ran at 6.0 times their baseline". No external AI service is called.
+**T4's and T5's history:** the notebook can't read Azure Monitor, so `./scripts/stop-demo.ps1 -SaveHistory`, `./scripts/deploy.ps1` at its end, and Run all's session end pass their metrics to `NB_DatabaseHub_LiveActivity` (analyses `postgresql` and `cosmosdb`). Their pages read the latest capture, whatever the filters, and say how a capture gets there when there's none. A deployment without Cosmos DB (`t5Enabled` off) shows no T5.
 
-**T4's history (2026-11-13, ADR 0025).** The notebook can't read Azure Monitor, so `./scripts/stop-demo.ps1 -SaveHistory` (before it deletes the read replica, whose metrics go with it) and `./scripts/deploy.ps1` (at its end) capture T4's and its replica's metrics and pass them to `NB_DatabaseHub_LiveActivity`, which saves them with the analysis `postgresql` and the targets `T4` and `T4-replica` ([Fabric assets](../README.md#t4s-postgresql-metrics-in-the-history-2026-11-13)). The **PostgreSQL** page reads the latest capture with two queries, `postgres-series` and `postgres-findings`, whatever the filters; the read replica exists only during a session, so a capture between sessions has no lag, and the page says why. The SQL pages, their filters, and their queries stay on T1, T2, and T3.
+### Ask Copilot, and take the data out
 
-### Take the data out
+Every visual and table has:
 
-Every visual's card has:
+- **Ask Copilot:** opens the Copilot dock with the visual's title, its rows (at most 200), and the DAX behind them, or, for a live visual, its time; an anomaly has **Ask why**, which adds what's unusual about it.
+- **The data as a table**, with sort, filter, **Download CSV**, and **Copy as CSV** (spreadsheet formulas are neutralized).
+- **Show the DAX** and **Copy the DAX**, or for a live visual **Show the Database Hub API calls**.
+- **Focus mode** (the visual alone; Esc closes it) and **Run the query again**.
 
-- **Show DAX**: the exact query the visual ran, highlighted, with **Copy DAX**.
-- **Data table**: the visual's data as an accessible table (its text alternative).
-- **Download CSV** and **Copy CSV** of exactly that data (spreadsheet formulas are neutralized).
-- **Refresh** and **Focus** (the visual alone, full frame; Esc closes it).
+The view (page, filter, drill-down, replay position) is kept in the frame's address and remembered per browser, since the portal's frame has no address bar of its own.
 
-Inside the portal the app has no address bar of its own, so the view (page, filters, incident, replay position, visual options) is kept in the app and remembered per browser. **Copy link** on Live links copies the app item's page in the Fabric portal; it opens the app's home page, not a specific view.
+### Copilot in the app
 
-### Customize
+The Copilot chat sits in a dock on the right: it resizes, goes full screen, and keeps its width. **Copilot** in the top bar opens it, and so does every **Ask Copilot** and **Ask why**. It answers from what's on screen and the tools it has, and draws its charts in the app's own chart language (`ChartView`). [Ask Copilot: the chat in the app](#ask-copilot-the-chat-in-the-app) has what it can do, its sign-in, and its states.
 
-- **Filters:** targets (T1, T2, T3) and the period (latest day, 7 days, 30 days, all history), anchored to the newest telemetry day, not to today. The **PostgreSQL** page has no filters: it shows T4's latest capture.
-- **Themes:** Aurora (the signature dark glass), Daybreak (light), and Contrast (high contrast). Every text color passes WCAG AA on every surface (`src/theme/themes.test.ts`). The app follows the system's light and high-contrast preferences until you pick one.
-- **Motion:** the sparkle button turns animations off; the app also honors `prefers-reduced-motion`.
-- Keyboard: every control and every target in the constellation is reachable with Tab and Enter; status is never shown by color alone (each status has a shape and a word, ADR 0012).
+### Look and feel
+
+- **Fluent 2** (`@fluentui/react-components`), Fabric's design language, in Fabric teal: **light**, **dark**, and **high contrast**. The app follows the system until you pick one in the top bar. Every status, target, and chart color keeps its contrast on each surface (`src/lib/app.test.ts`).
+- Keyboard and screen readers: every control, tile, row, and chart is reachable with Tab and Enter; charts read their values with the arrow keys and announce them; status is never shown by color alone (each status has a shape and a word, ADR 0012).
+- It fits Fabric's frame on a laptop screen: cards stack and tables scroll sideways when the dock takes room, and chart labels rotate or shorten (with the full name as a tooltip).
 
 ### Ask the Database Agent
 
-Database Hub has a built-in Database Agent (preview). It works only in Database Hub's UI and has no API, so the app can't send it anything. Instead, the app writes ready-made prompts from the data on screen: you copy one, select **Open Database Hub**, and paste it into the Database Agent. It never runs anything itself.
+Database Hub's Database Agent (preview) works only in Database Hub's UI and has no API, so the app writes ready-made prompts from the data on screen: copy one, select **Open Database Hub**, and paste it into the agent, or select **Ask Copilot** to ask the in-app Copilot instead. Incidents has each window's prompts (what caused it, what moved with it, against the baseline, the evidence), with the target and its resource name, the UTC window, and the window's own numbers; Estate and Readiness have a prompt library. Every prompt ends with the [prompt pack's](../agent/prompts/README.md) safety sentence ("Don't apply anything; propose only."), the panels say **Preview**, **the agent proposes; you approve each action**, and **investigation only: this app never runs anything**, and the **Copilot CLI · VS Code** switch rewrites the prompts for the documented fallback, GitHub Copilot CLI or VS Code with the GA Database Hub skill (`databasehub-cli`, in the `fabric-skills` plugin) and the `microsoft-sql` plugin ([agent guide](../agent/README.md)). Database Hub keeps 7 days of telemetry or less; for an older window the panel says the agent may not see it any more.
 
-- **Incidents, per window:** each window in the ribbon has an agent button (a robot icon), the replay has **Ask the agent**, and the **Investigate with the Database Agent** card under the replay shows the selected window's prompts. The prompts carry the window's own numbers: the target and its resource name, the UTC window, and the peak, baseline, and ratio of the window's signal from the replay. For example:
+## Manage: bounded, confirmed actions
 
-  > On T2 (Arc-enabled SQL Server arcsql01) between 14:05 and 14:35 UTC on 2026-10-22, Buffer IO (PAGEIOLATCH) waits peaked at 11.5 s per 5-minute bin and averaged about 4 times the baseline (2.9 s per 5-minute bin in the 30 minutes before). What caused it, which sessions and queries were involved, and what should I check or change? Name each signal you used. Don't apply anything; propose only.
+Run all in `NB_DatabaseHub_Control` stays the demo's one action ([ADR 0026](../../docs/adr/0026-one-run-all-session.md)); Manage's actions come in addition to it and do the same things:
 
-  Each window gets four prompts: what caused it, what moved with it, against the baseline (the window against the minutes before it), and the evidence.
-- **Estate and Readiness, a prompt library:** estate health, the top waits per target, blocking chains, and what changed since the baseline (the newest telemetry day against the day before), for the targets and period you selected. Readiness starts with telemetry coverage: which targets the agent has performance data for.
-- **Copy** on each prompt, **Copy and open Database Hub** (copies the prompt and opens Database Hub in a new tab in one click), **Copy all**, and **Open Database Hub**. Database Hub opens in a new tab in the demo's tenant (the deploy-time link, with `ctid`).
-- **Labels on every panel:** **Preview**; **the agent proposes; you approve each action** (the [Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq) says actions are "explicit and always approved by the end user"); and **investigation only: this app never runs anything**. In this demo, read a proposal aloud, then cancel it ([presenter rules](../agent/README.md#use-it-safely-approval-rules-for-presenters)).
-- **The fallback format:** the **Copilot CLI · VS Code** switch rewrites the same questions for the documented fallback, GitHub Copilot CLI or VS Code with the GA Database Hub skill (`databasehub-cli`, in the `fabric-skills` plugin) and the `microsoft-sql` plugin ([agent guide](../agent/README.md)): KQL through the telemetry agent instructions on Microsoft Learn, the Database Hub skill, and the `microsoft-sql` diagnostics skills, connected as you and never with a SQL login. The choice is remembered per browser.
-- Every prompt ends with the [prompt pack's](../agent/prompts/README.md) safety sentence, "Don't change anything." or "Don't apply anything; propose only.", so a copied prompt keeps it.
-- The resource names come from the telemetry snapshots (query `target-names`); the resource group name comes from the deploy-time `dbhub-app.json`, never from Git.
-- Database Hub keeps 7 days of telemetry or less ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)). For an older window the panel warns that the agent may not see it any more; this app's history still does.
+| Action | What it does | The control's parameters |
+|---|---|---|
+| **Start a session** | What Run all does: starts every target, runs the showcase's incidents and T3's Database Agent beat, and stops everything at its end (30 to 120 minutes, 90 by default) | `MODE = "session"`, `DURATION_MINUTES`, `WAIT_FOR_END = True` |
+| **Run an incident** | One scenario from the catalog on one target it applies to, within the scenario's maximum minutes, with the baseline beside it | `MODE = "activities"`, `ACTIVITIES`, `DURATION_MINUTES` |
+| **Stop now** | Ends the session as its end would: saves the history, deletes T4's read replica, and stops what costs money | `STOP_NOW = True` |
+| **Reset** | Returns ContosoCare to its seed state on the running targets, and removes what a cut-off RU storm left on T5 | `RESET_NOW = True`, `RESET_TARGETS` |
+
+Every action says what it does and what bounds it, shows the control request, and asks for confirmation; a value outside the control's allow-lists and caps can't be confirmed. No secret reaches the browser: the control's webhook URL stays in Key Vault, read by the control notebook. Manage works one of two ways, which the app finds out by itself:
+
+- **Sending from the app** (when the app's Manage function, `rayfin/functions/src/manage.ts`, is deployed and set up): the function takes who you are only from your Fabric sign-in, never from what the browser sends, and sends only for operators: the deployer and the members of the demo's admin group, which `deploy.ps1` writes into the app's settings at every deploy (a redeploy refreshes the list; when it can't read the group's members, the deployer only, with a **Warning**). It runs `NB_DatabaseHub_Control` through the Fabric job API with the request's parameters, and the control records who sent it (`REQUESTED_BY`, `app/<you>`). Everyone else sees Manage read-only, with the reason. The control takes one request at a time and follows a session that's running instead of starting another, so while one of its runs is in progress, Manage offers only Stop now, which cancels that run first: on a small capacity (F2 or F4), the stop couldn't start until it ended. After each start, the page follows the run's real state from the Fabric job API, a failure included. Whenever the function can't send (it isn't set up, it can't confirm who you are, or Fabric refuses the run), the request is copied for Run all instead, with the reason. The deploy writes the function's settings (the app's API and IDs, the control notebook's IDs, the operators, and the control's own catalog, never a secret) and says which way Manage works (`FABRIC.APP.ACTIONS`); an app's first deploy deploys once more, about a minute, because only then does it know the app's API.
+- **Copying for Run all** (otherwise): each action copies its request as lines for a new cell under the control notebook's parameters cell and opens the notebook, where Run all sends it with the same checks.
+
+**What the control ran** lists every session plan and activity request the notebooks recorded, newest first.
 
 ### Ask Copilot: the chat in the app
 
@@ -84,27 +109,32 @@ Database Hub has a built-in Database Agent (preview). It works only in Database 
 |---|---|
 | Template | The Fabric Apps data app template, `microsoft/fabric-apps-analytic-templates` at commit `239b2c7` (MIT), recorded in `config/versions.json` (`fabricApp.template`) |
 | Runtime | React 19 and Vite, the Rayfin SDK 1.36.2 (`@microsoft/rayfin-client`, `-auth-provider-fabric`, `-connector-fabric-semanticmodel`) |
-| Visuals | Hand-built SVG with d3 (shape, scale, hierarchy, sankey, interpolate) and Framer Motion; no charting library and no CDN |
-| Fonts | Space Grotesk and JetBrains Mono (OFL), bundled |
-| Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)) |
-| Queries | `src/data/queries.ts`: 16 DAX queries, each with a row bound (`resultSetRowCountLimit`); results are cached for 5 minutes and shared between visuals |
+| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md)) |
+| Charts | One chart component, `ChartView`: hand-built SVG with d3-scale and d3-shape (line, area, bar, stacked bar, scatter, table, and KPI, with incident bands, thresholds, and markers), which the Copilot dock's charts use too; the incident replay, a heatmap, and sparklines. No charting library and no CDN |
+| Fonts | Segoe UI from the system, like Fabric; no web fonts |
+| Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)). Live data from the app's function (`src/copilot/estate.ts`), through `src/data/live-estate.ts` |
+| Queries | `src/data/queries.ts`: 21 DAX queries, each with a row bound (`resultSetRowCountLimit`); results are cached for 5 minutes and shared between visuals. The ones a new environment has no rows for are marked `mayBeEmpty` (the readiness checks, the sessions, the agent loop, and T5), so the deploy-time check says so rather than warns |
 | Hosting | `staticHosting.assetAccess: protected`, set explicitly in `rayfin/rayfin.yml` ([hosting](https://learn.microsoft.com/fabric/apps/hosting)) |
-| Backend services | Auth, and one read-only function, `estateOverview` (`rayfin/functions`), the live estate for Ask and the pages; no database or storage |
+| Backend services | Auth; and the shared functions project (`rayfin/functions/`): `estateOverview`, the live estate for Ask and the pages, read-only (`estate.ts`), and Manage's `manageAccess`, `manageRequest`, and `manageJob` (`manage.ts`). No database or storage |
 
-Every package is pinned to an exact version in `package.json` and `package-lock.json`, resolved from the public npm registry with SHA-512 integrity. `npm run check:licenses` fails on a production dependency that isn't MIT, ISC, Apache-2.0, BSD, 0BSD, OFL-1.1, BlueOak-1.0.0, Unlicense, or CC0-1.0. The build writes `dist/THIRD_PARTY_NOTICES.txt`.
+Every package is pinned to an exact version in `package.json` and `package-lock.json`, resolved from the public npm registry (`registry.npmjs.org`) with SHA-512 integrity: install new packages with `--registry=https://registry.npmjs.org/`, or fix the lock file's URLs after an install through a mirror. `npm run check:licenses` fails on a production dependency that isn't MIT, ISC, Apache-2.0, BSD, 0BSD, OFL-1.1, BlueOak-1.0.0, Unlicense, or CC0-1.0. The build writes `dist/THIRD_PARTY_NOTICES.txt`. The bundle is about 410 KB gzip in all, and pages load lazily.
 
 ```text
 fabric/app/
   rayfin/rayfin.yml            backend config: placeholders only (${DBHUB_FABRIC_WORKSPACE_ID}, ${DBHUB_SEMANTIC_MODEL_ID})
   rayfin/connectors/history/   the connector's generated schema (no IDs)
-  src/data/                    the DAX catalog, the query client (cache, bounds), and typed parsers
-  src/lib/                     DAX builders, formatting, CSV, view state, statistics, the insight rules, and the Database Agent prompts
-  src/visuals/                 the eight custom visuals and their pure layout code (layout.ts)
-  src/pages/                   Estate, Incidents, PostgreSQL, Readiness, and Live links
-  src/copilot/                 Ask: the Copilot dock and provider, its page-run tools, the relay client, and the model guide
-  rayfin/functions/            the estate function (estate.ts, estate-core.ts); function_app.ts registers each feature's functions
-  src/theme/                   the three themes and their contrast tests
-  src/test/                    the test setup, and the tests of the npm overrides with Rayfin's code (its sign-in harness too)
+  src/shell/                   the top bar, the left navigation, the global filter, the account chips, and the dock's region
+  src/pages/                   Overview, Estate, Performance, Incidents, Findings, Readiness, Trends, Manage, and Live views
+  src/components/              the visual card (Ask Copilot, the data, the DAX, focus), the data grid, KPI and health tiles, and badges
+  src/visuals/                 ChartView and its chart kit, the incident replay, the heatmap, and sparklines
+  src/data/                    the DAX catalog, the query client (sources, cache, bounds), typed parsers, and the live estate's loader
+  src/lib/                     DAX builders, formatting, CSV, view state, health, insights, Ask Copilot's context, the control's
+                               requests, the Manage client, the live findings, and the Database Agent prompts
+  src/copilot/                 Ask: the Copilot dock and provider, its page-run tools, the relay client, and the model guide (the chat's code)
+  rayfin/functions/            the functions: the live estate (estate.ts, estate-core.ts) and Manage (manage.ts, manage-core.ts); function_app.ts registers each feature's
+  src/theme/                   the Fluent themes and their tokens
+  src/preview/                 the local preview's sample data (npm run dev:sample); never built into the app
+  src/test/                    the test setup and fixtures, and the tests of the npm overrides with Rayfin's code
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
   scripts/build-model-guide.ts writes src/copilot/model-guide.generated.ts from the model's TMDL (npm run guide:build)
   scripts/check-licenses.mjs   the production license check
@@ -171,6 +201,12 @@ The CLI's `connector invoke --transport deployed` needs an app session the CLI c
 
 The CLI writes its deployment record (`rayfin/.deployments.json`, `rayfin/.env`, `.env.local`) in the stage. Those files hold the item ID, the hosting URL, and the app's publishable key, so they stay under `out/`, Git-ignored. The publishable key is public by design (the browser bundle carries it), but the script redacts it from every result and log anyway.
 
+### Update and delete
+
+- **Update:** run `./scripts/deploy.ps1` again (or `./scripts/configure-fabric-app.ps1` for the app alone). It updates the item `APP_DatabaseHub_Insights` in place, keeps its history and its links, and refreshes Manage's operators list; the new version shows the next time the app opens. Upgrading an older demo is the same command ([deployment](../../docs/deployment.md#update-an-existing-environment)).
+- **Delete:** `./scripts/destroy.ps1` deletes the demo's Fabric workspace, with the app in it, when every item in it is one the demo creates; `-KeepFabric` keeps it. To remove only the app, delete the `APP_DatabaseHub_Insights` item in the workspace; the next deploy creates it again.
+- **What you control:** who can open it (the workspace's roles, or the item shared), who reads the history (Read and Build on `SM_DatabaseHub_History`), and who sends Manage's actions (the demo's admin group).
+
 ## Known limitation: the hosted URL
 
 Opening the hosted app's URL directly in a browser tab fails in this preview: the Fabric Apps host shows its own **Sign in required** page, and its **Sign in** opens a Fabric portal page in a pop-up that stops at **"Page not accessible directly. This page must be opened from an application."** The same happened in an InPrivate window signed in to Fabric as the demo's admin, so the account and tenant weren't the cause.
@@ -188,10 +224,13 @@ What the live check found (2026-10-22, anonymous requests only):
 ```powershell
 cd fabric/app
 npm ci
-npm run verify   # typecheck, lint, Vitest (unit, page, theme-contrast, and override tests), license check, build
+npm run verify       # typecheck, lint, Vitest (unit, page, chart, theme-contrast, and override tests), license check, build
+npm run dev:sample   # the local preview with sample data: no Fabric, no sign-in
 ```
 
 `./tests/Invoke-StaticValidation.ps1 -Check FabricApp` runs the same in the repository's static validation, and the `Fabric App` CI job runs it on Node.js 24. The tests use fixture rows shaped like the connector's results; no test reaches Fabric.
+
+**The preview** (`npm run dev:sample`, then `/preview.html`) runs the whole app on made-up history and live answers, labeled **Sample data**, for design work and screenshots. Its query parameters: `theme=light|dark|contrast`, `copilot=open`, `manage=operator|viewer|running` (without it, Manage's copy mode), `empty=1` (no history: the first run), and `live=off` (no live source). Vite builds only `index.html`, so none of it ships.
 
 To run the app locally against the deployed backend, work in the stage (`out/fabric-app`, after a deploy): `npm run dev` writes `.env.local` from the deployment record and serves on `http://localhost:5173`, which `rayfin.yml` allows as a redirect URI. Local sign-in wasn't verified in this phase.
 
@@ -207,9 +246,12 @@ To run the app locally against the deployed backend, work in the stage (`out/fab
 | `FABRIC.APP.DEPLOY` says not signed in or the token expired | The CLI's session lapsed; sign in again with the same command |
 | `FABRIC.APP.ITEMS` is Manual action required | Deploy the model first: `./scripts/configure-powerbi.ps1` |
 | A visual says Fabric refused the query | The viewer needs Read and Build on `SM_DatabaseHub_History`, and the Execute Queries tenant setting |
-| `FABRIC.APP.QUERIES` warns that some queries returned no rows | Run `NB_DatabaseHub_LiveActivity` (and a scenario) so the lakehouse has history for that window. For `postgres-series` and `postgres-findings`, the history has no T4 capture yet: `./scripts/stop-demo.ps1 -SaveHistory` or `./scripts/deploy.ps1` adds one |
-| The **PostgreSQL** page says there's no PostgreSQL history yet | The same: those scripts capture T4's Azure Monitor metrics and pass them to the notebook. A notebook you run by hand has none to pass |
-| The **PostgreSQL** page has no Read replica lag | The latest capture had no read replica: it exists only during a session, so capture before `stop-demo.ps1` deletes it (its `-SaveHistory` does) |
+| `FABRIC.APP.QUERIES` warns that some queries returned no rows | Run all in `NB_DatabaseHub_Control` so the lakehouse has history for that window. Queries that a new environment has no rows for (the sessions, the agent loop, T4's and T5's captures) are said in the message, not warned about |
+| T4's or T5's page says there's no history yet | A session's end (Run all), `./scripts/stop-demo.ps1 -SaveHistory`, or `./scripts/deploy.ps1` captures their Azure Monitor metrics and passes them to the notebook. A notebook you run by hand has none to pass; a deployment without Cosmos DB has no T5 |
+| T4's page has no Read replica lag | The latest capture had no read replica: it exists only during a session, so capture before `stop-demo.ps1` deletes it (its `-SaveHistory` does) |
+| A page says **Live · unavailable** | The app's live estate function isn't deployed, or Database Hub didn't answer: the line beside it says which. The page shows the history, and Database Hub has the live view |
+| Manage says each action copies its request | The app's Manage function isn't deployed, or it isn't set up, which the message says (`FABRIC.APP.ACTIONS` says why, for example when the session control's notebook wasn't found): paste the copied lines into a new cell under the control notebook's parameters cell, then Run all. With the function set up, operators send from the app |
+| Manage is read-only for you | You aren't one of the demo's operators: the deployer and the members of its admin group. Ask an operator, or one of them redeploys after adding you to the group (`./scripts/deploy.ps1` refreshes the list) |
 | The Copilot dock says Ask isn't deployed | `ASK.RELAY` says why: no image pinned, an image it can't pull, `ask.enabled` false, or the relay's deployment failed; fix it and run `./scripts/configure-fabric-app.ps1` again |
 | The Copilot dock says it can't reach the relay | Wait about 15 seconds (it starts from zero); otherwise `ASK.RELAY.HEALTH` and `ASK.CSP` say why: the relay doesn't allow the app's origin yet, or the strict-CSP tenant setting is on |
 | The Copilot dock says this GitHub account can't use Copilot | Sign in with the GitHub account that has your Copilot license (**Switch GitHub account**); an organization that restricts OAuth apps has an owner approve **Database Hub Insights Ask** |

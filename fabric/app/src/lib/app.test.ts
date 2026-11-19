@@ -4,10 +4,12 @@ import { describe, expect, it } from "vitest";
 
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
 import { estateQuery } from "@/data/queries";
-import { flagText, inventoryMix, liveOptimizationRows, liveSecurityRows, targetOfResource } from "@/lib/live-findings";
+import { liveDataOf, type InventoryData } from "@/data/live-estate";
+import { flagText, inventoryMix, isDown, liveMigrations, liveOptimizationRows, liveSecurityRows, migrationSentence, readinessText, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { buildAskContext } from "@/lib/ask";
 import { describeRequest, notebookParameters, validateRequest } from "@/lib/control";
+import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
 import { DEFAULT_VIEW, mergeView, parseHash, toHash } from "@/lib/view-state";
@@ -102,6 +104,16 @@ describe("the control's requests", () => {
         expect(describeRequest({ action: "session" }).effects[2]).toMatch(/^Includes T3's Database Agent beat/);
     });
 
+    it("copies a request as Python lines for a new cell under the control notebook's parameters cell", () => {
+        expect(parameterCellText({ action: "run", scenario: "cpu-pressure", target: "T3", durationMinutes: 10, intensity: 6 }).split("\n").slice(1)).toEqual([
+            'MODE = "activities"',
+            'ACTIVITIES = [{"target":"T3","scenario":"cpu-pressure","intensity":6}]',
+            "DURATION_MINUTES = 10",
+            "WATCH_MINUTES = 0",
+        ]);
+        expect(parameterCellText({ action: "reset", targets: ["T1", "T3"] })).toMatch(/\nRESET_NOW = True\nRESET_TARGETS = \["T1","T3"\]$/);
+        expect(parameterCellText({ action: "stop" })).toMatch(/^# From the Insights app: stop\. .+\nSTOP_NOW = True$/);
+    });
     it("offers exactly the scenarios in scenarios/*/scenario.json, with their targets and bounds", () => {
         const root = join(process.cwd(), "..", "..", "scenarios");
         const fromRepo = readdirSync(root, { withFileTypes: true })
@@ -136,7 +148,8 @@ describe("live findings", () => {
         expect(targetOfResource({ name: "ContosoCare", databaseType: "AzureSql" }, "azuresql01-x")).toBe("T3");
         expect(targetOfResource({ name: "elsewhere", databaseType: "PostgreSql" })).toBe("");
         expect(flagText("hasSomethingNewIssue")).toBe("Something new");
-        const rows = liveSecurityRows(answers.security.data, answers.inventory.data);
+        const inventory = liveDataOf(answers.inventory);
+        const rows = liveSecurityRows(liveDataOf(answers.security), inventory);
         expect(rows.map((r) => `${r.attention}|${r.target}|${r.area}`)).toEqual([
             "Needs attention|T3|Auditing",
             "Needs attention|T3|Customer-managed keys",
@@ -144,9 +157,43 @@ describe("live findings", () => {
             "Recommended|T4|Customer-managed keys",
             "Recommended|T4-replica|Customer-managed keys",
         ]);
-        expect(liveOptimizationRows(answers.inventory.data)).toMatchObject([{ target: "T1", attention: "Needs attention", area: "Licensing" }]);
-        expect(inventoryMix(answers.inventory.data)).toBe("2 PostgreSQL · 1 Arc SQL · 1 Azure SQL · 1 SQL VM · 1 Cosmos DB");
-        expect(inventoryMix(answers.inventory.data, true)).toMatch(/^2 Azure Database for PostgreSQL, 1 Arc-enabled SQL Server, /);
+        // Live, 2026-11-18: neither T1 nor T2 has a license finding, and a ready assessment isn't an issue.
+        expect(liveOptimizationRows(inventory)).toEqual([]);
+        expect(inventoryMix(inventory)).toBe("2 PostgreSQL · 1 Arc SQL · 1 Azure SQL · 1 SQL VM · 1 Cosmos DB");
+        expect(inventoryMix(inventory, true)).toMatch(/^2 Azure Database for PostgreSQL, 1 Arc-enabled SQL Server, /);
         expect(liveSecurityRows(null, null)).toEqual([]);
+        expect(flagText("hasUsageReportingIssue")).toBe("Usage reporting to Azure needs attention");
+    });
+
+    it("counts a SQL Server on an Azure VM once, though Database Hub lists its VM and its instance (live, 2026-11-18)", () => {
+        const vm = { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-x", location: "westus3" };
+        const inventory: InventoryData = {
+            totalCount: 3,
+            countByType: { AzureSqlVM: 2, AzureSql: 1 },
+            complete: true,
+            resources: [
+                { ...vm, status: "Unknown", issues: { optimization: { hasPaygLicenseIssue: true, hasLowComputeUtilizationIssue: false } } },
+                { ...vm, resourceGroup: "RG-X", status: "Connected", issues: { optimization: { hasLowComputeUtilizationIssue: true } } },
+                { databaseType: "AzureSql", name: "ContosoCare", resourceGroup: "rg-x", location: "westus3", status: "Online" },
+            ],
+        };
+        const unique = uniqueInventory(inventory);
+        expect(unique.totalCount).toBe(2);
+        expect(unique.countByType).toEqual({ AzureSqlVM: 1, AzureSql: 1 });
+        expect(unique.resources[0]).toMatchObject({ status: "Connected", issues: { optimization: { hasPaygLicenseIssue: true, hasLowComputeUtilizationIssue: true } } });
+        expect(liveOptimizationRows(inventory).map((r) => `${r.target}|${r.area}|${r.check}`)).toEqual(["T1|Licensing|Pay-as-you-go SQL Server license: a license-model opportunity", "T1|Sizing|Low compute use: it may be oversized"]);
+        expect([isDown("Unknown"), isDown(undefined), isDown("Connected"), isDown("Stopped")]).toEqual([false, false, false, true]);
+    });
+
+    it("reads T2's migration assessment: readiness per Azure SQL target in Learn's words, ready ones named first", () => {
+        const [t2] = liveMigrations(liveDataOf(sampleLiveAnswers("2026-10-21T21:00:00.000Z").inventory));
+        expect(t2).toMatchObject({ resource: "arcsql01", target: "T2", type: "Arc-enabled SQL Server", enabled: true, dataStatus: "Available", hasResults: true });
+        expect(t2.uploadedAt?.toISOString()).toBe("2026-10-21T18:00:00.000Z");
+        expect(t2.rows.map((r) => `${r.azureTarget}: ${r.readiness}`)).toEqual(["Azure SQL Managed Instance: Ready", "SQL Server on Azure Virtual Machines: Ready", "Azure SQL Database: Not ready"]);
+        expect(migrationSentence(t2)).toBe("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.");
+        expect(migrationSentence({ ready: [], notReady: ["Azure SQL Database"] })).toBe("Not ready for Azure SQL Database.");
+        expect([readinessText("NotReady"), readinessText("Unknown"), readinessText("ReadyWithConditions")]).toEqual(["Not ready", "Unknown", "Ready With Conditions"]);
+        const none = liveMigrations({ totalCount: 1, countByType: {}, complete: true, resources: [{ databaseType: "ArcSqlServer", name: "arcsql01", resourceGroup: "rg-x", location: "westus3", status: "Connected", migrationAssessment: { enabled: true, uploadedAt: null, dataStatus: "Unavailable", targets: { azureSqlDatabase: "Unknown" }, readyTargets: [] } }] });
+        expect(none[0]).toMatchObject({ hasResults: false, ready: [], uploadedAt: null });
     });
 });

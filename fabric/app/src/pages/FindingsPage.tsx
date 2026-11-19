@@ -1,21 +1,23 @@
 import { useMemo } from "react";
-import { Badge, Button, Link, MessageBar, MessageBarBody, Tab, TabList } from "@fluentui/react-components";
+import { Badge, Button, MessageBar, MessageBarBody, Tab, TabList } from "@fluentui/react-components";
 import { Open16Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
 import { EmptyState } from "@/components/EmptyState";
 import { KpiTile } from "@/components/KpiTile";
+import { MigrationCard } from "@/components/MigrationCard";
+import { ProvenanceBadge } from "@/components/ProvenanceBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import { FINDING_CATEGORIES, findingCategory, toFindings, toPostgresFindings, toTargetNames, type FindingCategory, type TargetName } from "@/data/model";
 import { findingsQuery, postgresFindingsQuery, targetNamesQuery } from "@/data/queries";
-import { useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
+import { liveDataOf, useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
-import { formatDateTimeUtc } from "@/lib/format";
+import { clause, formatDateTimeUtc, sentence } from "@/lib/format";
 import { worstStatus } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
 
@@ -71,8 +73,8 @@ const LIVE_TABS: Partial<Record<FindingCategory, { title: string; view: string; 
     optimization: {
         title: "Optimization, live from Database Hub",
         view: "Optimization",
-        reads: "Each resource's optimization checks: license-model opportunities and sizing.",
-        fallback: "Database Hub's optimization insights are live: migration assessments, license-model opportunities, and SQL Server instances that don't report usage.",
+        reads: "The optimization checks Database Hub raises on each resource: license-model opportunities, usage reporting, and sizing.",
+        fallback: "Database Hub's optimization checks are live: license-model opportunities, SQL Server instances that don't report usage, and sizing.",
         ask: "Which of these optimization opportunities save the most, and what does each one take?",
     },
 };
@@ -104,7 +106,10 @@ function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRo
             <section className="panel span-12 live-panel" aria-label={info.title}>
                 <h3>{info.title}</h3>
                 <p className="panel-sub">{info.fallback}</p>
-                <p className="muted">{`Not read live here: ${props.unavailable ?? "no live source"}. The table below is the history's own findings.`}</p>
+                <p className="muted live-off">
+                    <ProvenanceBadge provenance="live" liveState="unavailable" />
+                    {` ${sentence(props.unavailable ?? "this app has no live source")} The table below is the history's own findings.`}
+                </p>
                 <div>{open}</div>
             </section>
         );
@@ -129,7 +134,7 @@ function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRo
         >
             {live && live.errors.length > 0 ? (
                 <MessageBar intent="warning">
-                    <MessageBarBody>{`Partial answer: ${live.errors.join("; ")}. What the other routes read is below.`}</MessageBarBody>
+                    <MessageBarBody>{`Partial answer: ${live.errors.map(clause).join("; ")}. What the other routes read is below.`}</MessageBarBody>
                 </MessageBar>
             ) : null}
             <DataGrid columns={LIVE_COLUMNS} rows={props.rows} caption={`Live ${props.tab} checks`} exportName={`findings-live-${props.tab}`} />
@@ -151,8 +156,8 @@ export default function FindingsPage() {
     // The live reads are cached for a minute and shared with the Copilot dock, so the tiles and tabs read them once.
     const security = useLiveEstate("security");
     const inventory = useLiveEstate("inventory");
-    const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(security.answer?.data, inventory.answer?.data) : null), [security.answer, inventory.answer]);
-    const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(inventory.answer.data) : null), [inventory.answer]);
+    const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), liveDataOf(inventory.answer)) : null), [security.answer, inventory.answer]);
+    const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(liveDataOf(inventory.answer)) : null), [inventory.answer]);
     const hubUrl = hubUrlOf(runtime);
     const rows: FindingRow[] = useMemo(() => {
         const sql = toFindings(findingsState.data?.rows ?? []).filter((f) => !/^T\d/.test(f.target) || view.targets.some((t) => f.target === t || f.target.startsWith(`${t}-`)));
@@ -194,15 +199,8 @@ export default function FindingsPage() {
             {tab === "security" ? <LiveChecks tab="security" rows={liveSecurity ?? []} answers={[security.answer, inventory.answer]} loading={security.loading || inventory.loading} unavailable={security.unavailable ?? inventory.unavailable} onRefresh={() => (security.refresh(), inventory.refresh())} hubUrl={hubUrl} /> : null}
             {tab === "optimization" ? (
                 <>
-                    <section className="panel span-12 live-panel" aria-label="Migration assessment, in Database Hub">
-                        <h3>Migration assessment, in Database Hub</h3>
-                        <p className="panel-sub">{`T2's SQL Server instance ${t2Instance(t2)} shows as "migration assessment ready" in Database Hub's Optimization view, with its readiness for each Azure SQL target. Azure keeps the assessment on the Arc resource, so it isn't in the history or the app's live routes; deploy.ps1's status page reports it as T2.ARC.MIGRATIONASSESSMENT.`}</p>
-                        <div>
-                            <Link href={hubUrl} target="_blank" rel="noopener noreferrer">
-                                Open Database Hub, then Optimization
-                            </Link>
-                        </div>
-                    </section>
+                    <MigrationCard className="span-12" resourceName={t2Instance(t2)} />
+
                     <LiveChecks tab="optimization" rows={liveOptimization ?? []} answers={[inventory.answer]} loading={inventory.loading} unavailable={inventory.unavailable} onRefresh={inventory.refresh} hubUrl={hubUrl} />
                 </>
             ) : null}

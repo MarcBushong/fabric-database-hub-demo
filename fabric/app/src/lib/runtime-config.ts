@@ -8,6 +8,8 @@ export interface AppLinks {
     workspace?: string;
     /** The control notebook NB_DatabaseHub_Control, in its own workspace: Run all runs a whole session. */
     controlNotebook?: string;
+    /** T2's SQL Server instance enabled by Azure Arc in the Azure portal, from its resource ID: its migration assessment. */
+    t2MigrationAssessment?: string;
 }
 
 /** Everything the app needs at run time, from rayfin.config.json, the build's VITE_* values, and dbhub-app.json. */
@@ -72,6 +74,8 @@ export async function loadAppRuntime(fetchImpl: typeof fetch = fetch): Promise<A
         const value = text(deploy?.links?.[key]);
         if (value && /^https:\/\//i.test(value)) links[key] = value;
     }
+    const migration = text(deploy?.links?.t2MigrationAssessment);
+    if (migration && /^https:\/\/portal\.azure\.com\/#@[\w.-]+\/resource\/subscriptions\//i.test(migration)) links.t2MigrationAssessment = migration;
     const resourceGroup = text(deploy?.resourceGroup);
     return {
         apiUrl,
