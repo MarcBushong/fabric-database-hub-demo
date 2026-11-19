@@ -239,13 +239,16 @@ function Start-DemoEnvironment {
     }
     # This start's time, before it starts anything (2026-11-19, DbHubStartDemoUtc): deploy.ps1's stop at the end of an update
     # leaves a session that began during that run alone, also one that gets no auto-stop (Get-DemoUpdateStopSession). Never
-    # in the start's way.
-    try {
-        Set-DemoDeploymentState -Config $Config -Value @{ StartDemoUtc = (ConvertTo-DemoBusyTimeText -Utc ([DateTime]::UtcNow)) } -Confirm:$false
+    # in the start's way. Recorded again once the VMs' starts are asked for (below).
+    $recordStart = {
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ StartDemoUtc = (ConvertTo-DemoBusyTimeText -Utc ([DateTime]::UtcNow)) } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Debug -Message ('This start''s time wasn''t recorded on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
     }
-    catch {
-        Write-DemoLog -Level Debug -Message ('This start''s time wasn''t recorded on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
-    }
+    & $recordStart
     # start-demo.ps1's auto-stop (2026-11-19): the session stops by itself -AutoStopHours after this start, or after the
     # warm-up it waits for, through the same one-time schedule a Run all session uses (dbhub-autostop), which replaces an
     # earlier session's: the newer session's plan wins. A stop job already in flight is waited for first. Without the
@@ -289,6 +292,10 @@ function Start-DemoEnvironment {
     foreach ($vm in 'sqlvm01', $hostVm) {
         $startRequested[$vm] = [bool](Request-DemoVmStart -Config $Config -VmName $vm)
     }
+    # Again now that the VMs' starts are asked for (the re-review of 2026-11-19): a deploy.ps1 that began after the first
+    # record, while this start was still on its control calls (a minute, or 10 when it waits for a stop job), found the VMs
+    # stopped, so this later time is what tells its stop at the end that this session began during that run.
+    & $recordStart
     # With activityProfileOnBoot, a VM this start starts sets the interim baseline itself at boot (2026-11-03), so its
     # targets are switched with the others.
     if ($activity.HasIncidents -and $Config.Contains('activityProfileOnBoot') -and [bool]$Config['activityProfileOnBoot']) {

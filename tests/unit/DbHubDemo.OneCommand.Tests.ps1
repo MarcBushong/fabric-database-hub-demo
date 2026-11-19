@@ -2134,6 +2134,33 @@ Describe 'Whether a session uses the demo, for the stop at the end of an update 
     }
 }
 
+Describe 'The nightly stop, settled at the end of an update only once everything is stopped (Resolve-DemoUpdateStopNightly; the re-review of 2026-11-19)' {
+    BeforeEach {
+        $script:config = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoBusyNightlyStop -MockWith { New-DemoResult -CheckId 'STOP.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'The deferred nightly pass dbhub-safety-deferred is removed.' }
+    }
+
+    It 'settles it when T5''s container <Case>' -ForEach @(
+        @{ Case = 'was deleted'; Status = 'Pass'; Outcome = 'Deleted'; Settled = $true }
+        @{ Case = 'was gone already'; Status = 'Pass'; Outcome = 'Missing'; Settled = $true }
+        @{ Case = 'stays between sessions on purpose (Kept, a Warning)'; Status = 'Warning'; Outcome = 'Kept'; Settled = $true }
+        @{ Case = 'wasn''t deleted (Failed, a Warning): tonight''s stop deletes it'; Status = 'Warning'; Outcome = 'Failed'; Settled = $false }
+    ) {
+        $stop = @(
+            New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'deallocated'
+            New-DemoResult -CheckId 'STOP.VM_SQLVM01' -Area 'infra' -Target 'T1' -Status 'Pass' -Message 'deallocated'
+            New-DemoResult -CheckId 'STOP.T4.STOP' -Area 't4' -Target 'T4' -Status 'Pass' -Message 'stopped'
+            New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status $Status -Message ('T5 {0}' -f $Outcome) -Evidence ([ordered]@{ outcome = $Outcome })
+        )
+        # Not $settled: PowerShell's variable names don't tell case apart, so that would replace the test's data.
+        $answer = @(InModuleScope DbHubDemo -Parameters @{ Config = $script:config; Stop = $stop } { Resolve-DemoUpdateStopNightly -Config $Config -Result $Stop })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoBusyNightlyStop -Times $(if ($Settled) { 1 } else { 0 }) -Exactly
+        @($answer | Where-Object { $_.checkId -eq 'STOP.NIGHTLYSTOP' }).Count | Should -Be $(if ($Settled) { 1 } else { 0 })
+    }
+}
+
 Describe 'The host credential an earlier guided stop handed over, rotated and cleaned up (ADR 0009)' {
     BeforeEach {
         $config = New-TestConfig
