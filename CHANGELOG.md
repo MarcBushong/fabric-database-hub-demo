@@ -221,7 +221,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
   - **GitHub sign-in:** the device flow through the shared OAuth App **Database Hub Insights Ask** (client ID in `config/versions.json`, `askRelay.githubClientId`; `ask.githubClientId` overrides it), once per browser, renewed for up to six months, with no client secret anywhere.
   - **The live estate:** the app's function `estateOverview` reads 8 allowlisted read-only Database Hub routes as the app's owner, scoped to the demo's subscription and resource group, cached for 60 seconds: a narrow exception to "documented interfaces only" ([ADR 0013's amendment](docs/adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)). `useLiveEstate(view)` gives the app's pages the same source.
   - **The image:** `.github/workflows/ask-relay-image.yml` builds and publishes it to GitHub Container Registry; `config/versions.json` pins it by digest (`askRelay.image`), and `ask.image` can name your own.
-  - **Cost:** at most about $0.11 an hour, only while someone asks (2026-11-19 list prices); the default 5-hour session estimate goes from $12.42 to $12.96, and no ceiling's result changes ([cost management](docs/cost-management.md#dated-example-asks-chat-relay-2026-11-18)).
+  - **Cost:** at most about $0.11 an hour, only while someone asks (2026-11-19 list prices); the default 5-hour session estimate goes from $15.03 to $15.57, and no ceiling's result changes ([cost management](docs/cost-management.md#dated-example-asks-chat-relay-2026-11-18)).
   - Tests: `tests/unit/DbHubDemo.Ask.Tests.ps1`, the cost tests, `fabric/app/src/copilot/*.test.ts(x)`, `fabric/app/rayfin/functions/src/estate-core.test.ts`, and `ask-relay`'s own tests.
 
 ### Changed
