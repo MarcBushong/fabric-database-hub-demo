@@ -113,7 +113,7 @@ Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deplo
   | `demo-day`, a 5-hour session | $14.75 | $16.56 | $15, a Warning |
   | The owner's kind of configuration (Defender plans, private network), a month with T4's restart | | $357.18; $363.58 with a golden snapshot's estimate | $375, Pass |
 
-- **The session ceiling stays $15** (the owner's decision, 2026-11-13). `demo-day`'s session is then over it by the replica's share: `PREFLIGHT.COST.SESSION` is a **Warning** that names the share and `-SkipT4Replica`, as the session ceiling always was. **T4's one-time move to `Standard_D4ds_v5`** ([ADR 0019](0019-t4-postgresql-flexible-server.md)) is still decided on the session and month without the replica's share, so the replica never defers it for a configuration that had it before.
+- **The session ceiling stays $15** (the owner's decision, 2026-11-13; on 2026-11-18 the owner raised it to $20 with T3's second vCore, [ADR 0016](0016-cost-profiles.md)). `demo-day`'s session is then over it by the replica's share: `PREFLIGHT.COST.SESSION` is a **Warning** that names the share and `-SkipT4Replica`, as the session ceiling always was. **T4's one-time move to `Standard_D4ds_v5`** ([ADR 0019](0019-t4-postgresql-flexible-server.md)) is still decided on the session and month without the replica's share, so the replica never defers it for a configuration that had it before.
 - **When a session isn't stopped,** the safety stop stops the replica that night; `status.ps1` then counts it like T4: storage and Defender while it's there, and its restart, until `stop-demo.ps1` deletes it.
 
 ## Consequences

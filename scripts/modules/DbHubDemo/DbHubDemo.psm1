@@ -49,6 +49,10 @@ $script:DemoRunCancelWatch = $false
 # activity profile at its end, or when it's stopped or fails (Register-DemoActivitySwitch, Invoke-DemoActivitySwitch).
 $script:DemoActivitySwitchVm = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+# Issue #65 (2026-11-18): this run's key for the T2 host's guest restart that clears a broken PowerShell Direct channel, at
+# most once per key (Set-DemoRunRecoveryKey, Get-DemoRunRecoveryKey); empty outside a deploy.ps1 run.
+$script:DemoRunRecoveryKey = ''
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

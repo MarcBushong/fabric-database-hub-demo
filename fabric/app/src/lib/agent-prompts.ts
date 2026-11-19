@@ -375,3 +375,8 @@ export function databaseHubUrl(configured: string | undefined, tenantId: string 
     const base = `${portalUrl.replace(/\/+$/, "")}/workloads/fdh/databaseHub`;
     return tenantId ? `${base}?ctid=${encodeURIComponent(tenantId)}` : base;
 }
+
+/** This deployment's Database Hub link, always set: the deploy-time link, or one built from the portal and the tenant. */
+export function hubUrlOf(runtime: { links: { databaseHub?: string }; expectedTenantId?: string; tenantId?: string; portalUrl?: string }): string {
+    return databaseHubUrl(runtime.links.databaseHub, runtime.expectedTenantId ?? runtime.tenantId, runtime.portalUrl);
+}

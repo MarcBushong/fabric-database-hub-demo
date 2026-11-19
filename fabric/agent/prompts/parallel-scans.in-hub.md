@@ -55,7 +55,7 @@ Which queries on {target} are most likely running with parallel plans? If Databa
 |---|---|---|
 | T1 | Parallelism waits (`CXPACKET`, `CXCONSUMER`, `CXSYNC_PORT`); SQL Server process CPU (`SQLProcessCPUPercent`) high; CPU waits (`SOS_SCHEDULER_YIELD`) when sessions outnumber schedulers | 2 vCPUs, so plans run at DOP 2 |
 | T2 (default) | The same as T1 | The guest has 2 vCPUs; nested-guest Performance support is validated live |
-| T3 | CPU waits and CPU at the tier limit, without Parallelism waits | At 1 vCore or less there's no second scheduler, so the plans run serially |
+| T3 | Parallelism waits at DOP 2, or CPU waits and CPU at the tier limit | At its 2-vCore maximum (since 2026-11-18) the plans can run at DOP 2 (*verify in rehearsal*); at 1 vCore there was no second scheduler, so they ran serially |
 
 - Parallelism waits show that parallel plans ran and some threads finished early; they're a symptom, not a cause by themselves.
 - Plans and degree of parallelism live in Query Store and the plan cache, not in the telemetry.

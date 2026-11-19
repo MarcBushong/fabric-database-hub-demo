@@ -313,6 +313,24 @@ Describe 'The activity profiles'' Run Command (DbHubDemo-Profile)' {
         Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -Because 'only the booting guest was tried again'
     }
 
+    It 'keeps a recovery from a broken PowerShell Direct channel in T2''s short line, with its action and time, so deploy.ps1 reports it once (second review of #65)' {
+        Mock -CommandName Start-Sleep -MockWith { }
+        $script = InModuleScope DbHubDemo { Get-DemoProfileRunCommandScript -Target 'T2' -ProfileName 'baseline' -RequestedBy 'deploy' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(10)) -RetrySeconds 15 -RunnerTimeoutSeconds 120 }
+        $healed = New-RelayLine 'Warning' 'PowerShell Direct into arcsql01 broke for a moment (The Hyper-V socket target process has ended.), so the command ran once arcsql01 answered again. runner profile set --target T2: Pass.' 'Released'
+        $healed['evidence']['guestRecovery'] = [ordered]@{ action = 'Healed'; restarted = $false; recovered = $true; seconds = 0; atUtc = '2026-11-18T18:49:26.0000000Z'; restartUtc = ''; stoppedBy = ''; by = 'the T2 relay'; key = 'deploy-aaaaaaaaaaaa'; reason = ('The Hyper-V socket target process has ended. ' * 5); message = 'arcsql01 answers over PowerShell Direct again.'; guest = 'arcsql01' }
+        $lines = Invoke-RetryScript -Script $script -Bundle (New-GuestBundle -Line @($healed)) -Target 'T2'
+        $lines['T2']['status'] | Should -Be 'Warning'
+        $lines['T2']['evidence']['guestRecovery']['action'] | Should -Be 'Healed'
+        $lines['T2']['evidence']['guestRecovery']['atUtc'] | Should -Not -BeNullOrEmpty
+        ([string]$lines['T2']['evidence']['guestRecovery']['reason']).Length | Should -BeLessOrEqual 120
+        # A relay from before this fix has no action or time, and nothing breaks.
+        $older = New-RelayLine 'Warning' 'restarted' 'Released'
+        $older['evidence']['guestRecovery'] = [ordered]@{ restarted = $true; recovered = $true; seconds = 95; restartUtc = '2026-11-18T18:52:10.0000000Z'; stoppedBy = 'Shutdown'; by = 'the T2 relay'; reason = 'x' }
+        $lines = Invoke-RetryScript -Script $script -Bundle (New-GuestBundle -Line @($older)) -Target 'T2'
+        $lines['T2']['evidence']['guestRecovery']['restarted'] | Should -BeTrue
+        $lines['T2']['evidence']['guestRecovery']['restartUtc'] | Should -Not -BeNullOrEmpty
+    }
+
     It 'matches the result lines to their targets by the target they name, else in order from the end' {
         $named = @((ConvertTo-ProfileLine 'T3' 'Pass' 'T3 set'), 'noise', (ConvertTo-ProfileLine 'T1' 'Fail' 'T1 failed')) -join "`n"
         $lines = InModuleScope DbHubDemo -Parameters @{ Output = $named } { ConvertFrom-DemoProfileRunCommandOutput -Output $Output -Target 'T1', 'T3', 'T4' }

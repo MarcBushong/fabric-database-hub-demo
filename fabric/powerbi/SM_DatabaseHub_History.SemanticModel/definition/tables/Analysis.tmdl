@@ -21,7 +21,7 @@ table Analysis
         isNameInferred
         sourceColumn: [Analysis Group]
 
-    /// What one row means: per bin, per analysis window, latest sample, per incident, or per run.
+    /// What one row means: per bin, per analysis window, latest sample, per incident, per agent beat, or per run.
     column Grain
         dataType: string
         isNameInferred
@@ -57,6 +57,7 @@ table Analysis
                         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
                         { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
                         { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
-                        { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 18 }
+                        { "database_agent", "Database Agent loop", "Incidents", "Per agent beat", 18 },
+                        { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 19 }
                     }
                 )

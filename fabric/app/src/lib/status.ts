@@ -62,3 +62,18 @@ export function statusClass(meta: StatusMeta): string {
 export function statusColor(meta: StatusMeta): string {
     return `var(${STATUS_CLASS[meta.token] ? meta.token : "--status-muted"})`;
 }
+
+const TONE: Record<StatusName, string> = {
+    Fail: "fail",
+    "Manual action required": "manual",
+    Warning: "warning",
+    Pass: "pass",
+    "Not supported": "muted",
+    "Not selected": "muted",
+};
+
+/** The status's tone (fail, manual, warning, pass, muted), or none for an empty status: the class that colors tiles and rails. */
+export function statusTone(status: unknown): string {
+    if (typeof status !== "string" || !status.trim()) return "none";
+    return TONE[statusMeta(status).name];
+}

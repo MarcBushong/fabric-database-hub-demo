@@ -20,6 +20,7 @@ function Get-DemoArcSetting {
         Agent                 = $arc['agent']
         SqlExtension          = $arc['sqlExtension']
         MonitoringApiVersion  = [string]$arc['monitoringApiVersion']
+        MigrationAssessment   = $arc['migrationAssessment']
         MinimumCoresPerOse    = [int]$arc['billing']['minimumCoresPerOse']
         DocUrls               = $arc['docUrls']
         SqlVm                 = $versions['sqlVm']

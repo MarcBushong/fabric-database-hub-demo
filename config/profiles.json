@@ -12,7 +12,7 @@
       "t1": { "size": "Standard_D2s_v5", "vcpus": 2, "family": "standardDSv5Family", "osDisk": "E10", "dataDisk": "None" },
       "t2Host": { "size": "Standard_E2s_v5", "vcpus": 2, "family": "standardESv5Family", "osDisk": "E10", "dataDisk": "None" },
       "t2Guest": { "vcpus": 2, "memoryGiB": 8, "vhdxGB": 64 },
-      "t3": { "minVcores": 0.5, "maxVcores": 1, "maxSizeGB": 32, "autoPauseMinutes": 15 },
+      "t3": { "minVcores": 0.5, "maxVcores": 2, "maxSizeGB": 32, "autoPauseMinutes": 15 },
       "t4": { "skuName": "Standard_D4ds_v5", "tier": "GeneralPurpose", "vcores": 4, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
       "database": { "seedScale": 1 }
     },

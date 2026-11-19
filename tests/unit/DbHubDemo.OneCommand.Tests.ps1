@@ -1168,6 +1168,19 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-Host -ParameterFilter { [string]$Object -match 'stays awake' }
     }
 
+    It 'says once, at the start and on the status page, that a sessionCeilingUsd of 15 counts as 20 (2026-11-18)' {
+        $config = New-TestConfig
+        $config['sessionCeilingUsd'] = 20
+        $config['sessionCeilingUsdSource'] = 'legacy'
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['expect']['text'] | Should -Match 'sessionCeilingUsd 15 in your configuration \(the default before 2026-11-18\) counts as 20'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-Host -Times 1 -Exactly -ParameterFilter { [string]$Object -match 'sessionCeilingUsd 15 in your configuration' }
+
+        $plain = Start-DemoDeploymentRun -Config (New-TestConfig) -WaitForT2 -OutputDirectory ($script:out + '-plain') -Confirm:$false
+        (Get-Content -LiteralPath $plain.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20)['expect']['text'] | Should -Not -Match 'sessionCeilingUsd'
+    }
+
     It 'writes no page in GitHub Actions, and records DONE or NOT DONE in the model at the end' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $true; Ci = $true; Interactive = $false; Codespaces = $false; Windows = $false } }
         $ci = Start-DemoDeploymentRun -Config (New-TestConfig) -OutputDirectory $script:out -Confirm:$false

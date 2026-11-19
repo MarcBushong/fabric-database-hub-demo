@@ -20,7 +20,7 @@ Actions:
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
 - Runner (sqlvm01 for T1, T3, T4, and T5; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn }: runs one runner command. The token
+  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey }: runs one runner command. The token
   {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, T4
   commands the flexible server's FQDN, the runner's role, and T4's read replica when it's known (--replica-server, from
   the request's optional replicaServerFqdn or else workload-install.json; ADR 0025), and T5 commands the Cosmos DB
@@ -32,7 +32,12 @@ Actions:
   cold start doesn't fail the command.
   On archost01 the guest is made ready first (Invoke-DemoControlGuestReady): a golden snapshot's source that the
   capture left air-gapped is released, a restored copy whose Arc identity wasn't reset is never started, and a
-  guest that's off starts.
+  guest that's off starts. A broken PowerShell Direct channel into a guest that runs with a healthy heartbeat (issue #65,
+  2026-11-18) is cleared by restarting the guest once for the caller's run (the request's optional recoveryKey; one an
+  hour without it; Invoke-DemoGuestRecovery): before a command that starts activity when a probe finds it broken, or
+  after any command failed with it, which then runs again once. A command that ran after such a restart is a Warning
+  that says what broke and that the restart cleared it; one that still fails says that the run's restart didn't help,
+  or why there was none.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
 
@@ -1063,9 +1068,10 @@ function Invoke-DemoControlGuestReady {
         $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
     }
 
-    # PowerShell Direct, with the stored credential or a pending one that a rotation left.
+    # PowerShell Direct, with the stored credential or a pending one that a rotation left. A channel that stays broken for
+    # 30 seconds while the guest runs ends the wait with its error, which the relay clears with a restart (issue #65).
     try {
-        $wait = Wait-GoldenGuest -UserName $AdministratorName -TimeoutSeconds (& $left)
+        $wait = Wait-GoldenGuest -UserName $AdministratorName -TimeoutSeconds (& $left) -BrokenChannelSeconds 30
     }
     catch {
         return (& $fail ([string]$_.Exception.Message))
@@ -1188,45 +1194,63 @@ function Invoke-DemoControlRunner {
         if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
             $guestName = [string]$Settings['guest']['name']
         }
-        if ($activity) {
-            # Live, 2026-11-03: the control's start found the guest off and air-gapped since a golden capture.
-            $prepared = Invoke-DemoControlGuestReady -StateRoot $StateRoot -GuestName $guestName -AdministratorName ([string]$guest.AdministratorName) -ToolsFolder ([string]$guest.ToolsFolder) -TimeoutSeconds ([System.Math]::Max(60, $readySeconds))
-            foreach ($key in $prepared.Evidence.Keys) {
-                $readyNote[$key] = $prepared.Evidence[$key]
-            }
-            if ($prepared.Evidence.Contains('seconds')) {
-                $readyNote['readySeconds'] = [int]$prepared.Evidence['seconds']
-            }
-            if ($prepared.Status -ne 'Pass') {
-                $evidence = [ordered]@{ target = $target }
-                foreach ($key in $readyNote.Keys) {
-                    $evidence[$key] = $readyNote[$key]
-                }
-                Write-DemoControlResult -ActionName 'Runner' -Status $prepared.Status -Message ('{0}: {1}' -f $label, $prepared.Message) -Evidence $evidence
-                return
-            }
-            $credential = $prepared.Credential
-        }
-        else {
-            . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
-            $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $guest.AdministratorName
-        }
+        # The guest restart that clears a broken PowerShell Direct channel, once for the caller's run (issue #65).
+        . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+        $requestKey = if ($Request.Contains('recoveryKey')) { [string]$Request['recoveryKey'] } else { '' }
+        $recoveryKey = Get-DemoGuestRecoveryKey -Key $requestKey -Prefix 'control'
         $full = @($arguments) + @('--target', 'T2')
-        $run = Invoke-DemoControlGuestCommand -GuestName $guestName -Credential $credential -ArgumentList @($guest.ToolsFolder, $full, $timeout) -ScriptBlock {
-            param($Folder, $Arguments, $TimeoutSeconds)
-            $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
-            if (-not (Test-Path -LiteralPath $modulePath)) {
-                # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
-                # Not selected, not a Warning.
-                throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
-            }
-            Import-Module -Name $modulePath -Force
-            $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
-            if ($null -eq $install) {
-                throw 'The workload runner is not installed in the guest yet.'
-            }
-            Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
+        $t2 = @{ StateRoot = $StateRoot; GuestName = $guestName; Guest = $guest; Arguments = $full; TimeoutSeconds = $timeout; Activity = $activity; ReadySeconds = $readySeconds }
+        # Only activity probes first; a read, a stop, or a reset just runs, and a broken channel it meets is cleared after it.
+        $recovery = $null
+        if ($activity) {
+            $recovery = Invoke-DemoControlT2Recovery -StateRoot $StateRoot -GuestName $guestName -AdministratorName ([string]$guest.AdministratorName) -Key $recoveryKey -BeforeCommand
         }
+        if ($null -ne $recovery -and -not $recovery.Recovered) {
+            Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message ('{0}: PowerShell Direct into {1} is broken ({2}). {3}' -f $label, $guestName, (Get-DemoControlTail -Text ([string]$recovery.Reason) -Length 300), (ConvertTo-DemoControlRecoveryText -Recovery $recovery -GuestName $guestName)) -Evidence ([ordered]@{ target = $target; guestRecovery = (ConvertTo-DemoControlRecoveryEvidence -Recovery $recovery) })
+            return
+        }
+        $attempt = $null
+        $failure = $null
+        try {
+            $attempt = Invoke-DemoControlT2Attempt @t2
+        }
+        catch {
+            $failure = $_
+        }
+        $failureText = if ($null -ne $failure) { [string]$failure.Exception.Message } elseif ($null -ne $attempt.Failure) { [string]$attempt.Failure.Message } else { '' }
+        if ($null -eq $recovery -and (Test-DemoGuestChannelBroken -Text $failureText)) {
+            $recovery = Invoke-DemoControlT2Recovery -StateRoot $StateRoot -GuestName $guestName -AdministratorName ([string]$guest.AdministratorName) -Key $recoveryKey -Reason $failureText
+            if ($null -ne $recovery -and $recovery.Recovered) {
+                $attempt = $null
+                $failure = $null
+                try {
+                    $attempt = Invoke-DemoControlT2Attempt @t2
+                }
+                catch {
+                    $failure = $_
+                }
+            }
+        }
+        $recoveryText = if ($null -ne $recovery) { ' ' + (ConvertTo-DemoControlRecoveryText -Recovery $recovery -GuestName $guestName) } else { '' }
+        if ($null -ne $failure) {
+            throw ('{0}{1}' -f [string]$failure.Exception.Message, $recoveryText)
+        }
+        foreach ($key in $attempt.ReadyNote.Keys) {
+            $readyNote[$key] = $attempt.ReadyNote[$key]
+        }
+        if ($null -ne $recovery) {
+            $readyNote['guestRecovery'] = ConvertTo-DemoControlRecoveryEvidence -Recovery $recovery
+            $readyNote['guestRecovery']['guest'] = $guestName
+        }
+        if ($null -ne $attempt.Failure) {
+            $evidence = [ordered]@{ target = $target }
+            foreach ($key in $readyNote.Keys) {
+                $evidence[$key] = $readyNote[$key]
+            }
+            Write-DemoControlResult -ActionName 'Runner' -Status $attempt.Failure.Status -Message ('{0}: {1}{2}' -f $label, $attempt.Failure.Message, $recoveryText) -Evidence $evidence
+            return
+        }
+        $run = $attempt.Run
     }
     else {
         Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message ('Target {0} is not driven from this VM (role {1}): T1, T3, T4, and T5 run on sqlvm01, T2 through archost01.' -f $target, $role)
@@ -1252,7 +1276,194 @@ function Invoke-DemoControlRunner {
     if ($readyNote.Contains('readySeconds') -and [int]$readyNote['readySeconds'] -gt 0) {
         $message = '{0} ({1} accepted connections after {2} seconds.)' -f $message, $target, [int]$readyNote['readySeconds']
     }
-    Write-DemoControlResult -ActionName 'Runner' -Status $outcome.Status -Message $message -Evidence $evidence
+    $status = $outcome.Status
+    # A break this relay recovered from (a wait until the guest answered, or its restart) is a Warning, with what broke and
+    # how it was cleared.
+    if ($readyNote.Contains('guestRecovery') -and ([bool]$readyNote['guestRecovery']['restarted'] -or [string]$readyNote['guestRecovery']['action'] -eq 'Healed')) {
+        $message = '{0} {1}' -f (ConvertTo-DemoControlRecoveryText -Recovery $readyNote['guestRecovery'] -GuestName ([string]$readyNote['guestRecovery']['guest']) -Done), $message
+        if ($status -eq 'Pass') {
+            $status = 'Warning'
+        }
+    }
+    Write-DemoControlResult -ActionName 'Runner' -Status $status -Message $message -Evidence $evidence
+}
+
+function Invoke-DemoControlT2Attempt {
+    <#
+    .SYNOPSIS
+    One attempt of T2's relay: for an activity, the guest is made ready first (Invoke-DemoControlGuestReady); then the
+    runner command runs in the guest over PowerShell Direct. Returns Run (the runner's ExitCode, StdOut, and StdErr),
+    ReadyNote (the readiness evidence), and Failure (Status, Message: the readiness result to write instead of running
+    the command). Throws what PowerShell Direct throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Guest,
+
+        [Parameter(Mandatory = $true)]
+        [string[]] $Arguments,
+
+        [int] $TimeoutSeconds = 1800,
+
+        [bool] $Activity,
+
+        [int] $ReadySeconds = 0
+    )
+
+    $readyNote = [ordered]@{}
+    if ($Activity) {
+        # Live, 2026-11-03: the control's start found the guest off and air-gapped since a golden capture.
+        $prepared = Invoke-DemoControlGuestReady -StateRoot $StateRoot -GuestName $GuestName -AdministratorName ([string]$Guest.AdministratorName) -ToolsFolder ([string]$Guest.ToolsFolder) -TimeoutSeconds ([System.Math]::Max(60, $ReadySeconds))
+        foreach ($key in $prepared.Evidence.Keys) {
+            $readyNote[$key] = $prepared.Evidence[$key]
+        }
+        if ($prepared.Evidence.Contains('seconds')) {
+            $readyNote['readySeconds'] = [int]$prepared.Evidence['seconds']
+        }
+        if ($prepared.Status -ne 'Pass') {
+            return [pscustomobject]@{ Run = $null; ReadyNote = $readyNote; Failure = [pscustomobject]@{ Status = $prepared.Status; Message = [string]$prepared.Message } }
+        }
+        $credential = $prepared.Credential
+    }
+    else {
+        $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $Guest.AdministratorName
+    }
+    $run = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ArgumentList @($Guest.ToolsFolder, $Arguments, $TimeoutSeconds) -ScriptBlock {
+        param($Folder, $Arguments, $TimeoutSeconds)
+        $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+        if (-not (Test-Path -LiteralPath $modulePath)) {
+            # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
+            # Not selected, not a Warning.
+            throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+        }
+        Import-Module -Name $modulePath -Force
+        $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
+        if ($null -eq $install) {
+            throw 'The workload runner is not installed in the guest yet.'
+        }
+        Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
+    }
+    return [pscustomobject]@{ Run = $run; ReadyNote = $readyNote; Failure = $null }
+}
+
+function Invoke-DemoControlT2Recovery {
+    <#
+    .SYNOPSIS
+    T2's relay clears a broken PowerShell Direct channel (issue #65): with -BeforeCommand, only when the guest has run
+    with a healthy heartbeat for at least 5 minutes and a probe finds the channel broken, so a command doesn't wait out
+    its readiness bound against it (live, 2026-11-18: a Run all dispatch waited 1,200 seconds); otherwise after a command
+    failed with a broken channel. Invoke-DemoGuestRecovery restarts the guest at most once for the caller's run (Key).
+    Returns its result, or $null when nothing needed it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $AdministratorName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Key,
+
+        [AllowEmptyString()]
+        [string] $Reason = '',
+
+        [switch] $BeforeCommand
+    )
+
+    $secretPath = [System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')
+    if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
+        return $null
+    }
+    $credential = Get-DemoGuestCredential -SecretPath $secretPath -UserName $AdministratorName
+    if ($BeforeCommand) {
+        $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+        if (-not $vm -or [string]$vm.State -ne 'Running' -or [string]$vm.Heartbeat -notlike 'Ok*' -or (Get-DemoGuestUptime -Vm $vm) -lt 5) {
+            return $null
+        }
+        $probe = Test-DemoGuestChannel -Name $GuestName -Credential $credential
+        if (-not $probe.Broken) {
+            return $null
+        }
+        $Reason = [string]$probe.Error
+    }
+    return (Invoke-DemoGuestRecovery -Name $GuestName -Credential $credential -Key $Key -By 'the T2 relay' -Reason $Reason -StateRoot $StateRoot -Confirm:$false)
+}
+
+function ConvertTo-DemoControlRecoveryEvidence {
+    # The result line's guestRecovery, compact, so it fits the 4 KB the instance view keeps: Invoke-DemoGuestRecovery's
+    # result, or a map this made already. Pure.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Recovery
+    )
+
+    if ($Recovery -is [System.Collections.IDictionary]) {
+        return $Recovery
+    }
+    $at = $Recovery.PSObject.Properties['AtUtc']
+    return [ordered]@{
+        action     = [string]$Recovery.Action
+        restarted  = [bool]$Recovery.Restarted
+        recovered  = [bool]$Recovery.Recovered
+        seconds    = [int]$Recovery.Seconds
+        atUtc      = $(if ($null -ne $at) { [string]$at.Value } else { '' })
+        restartUtc = [string]$Recovery.RestartUtc
+        stoppedBy  = [string]$Recovery.StoppedBy
+        by         = [string]$Recovery.By
+        key        = [string]$Recovery.Key
+        reason     = Get-DemoControlTail -Text ([string]$Recovery.Reason) -Length 200
+        message    = Get-DemoControlTail -Text ([string]$Recovery.Message) -Length 300
+    }
+}
+
+function ConvertTo-DemoControlRecoveryText {
+    <#
+    .SYNOPSIS
+    One sentence on a recovery for the result line. Pure.
+
+    .DESCRIPTION
+    -Done: the command ran after the restart; what broke, and that the restart cleared it. Otherwise the command still
+    failed: that the run's one restart didn't keep the channel working, or why the guest wasn't restarted.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Recovery,
+
+        [string] $GuestName = 'the guest',
+
+        [switch] $Done
+    )
+
+    $evidence = ConvertTo-DemoControlRecoveryEvidence -Recovery $Recovery
+    if ($Done) {
+        if (-not [bool]$evidence['restarted']) {
+            return ('PowerShell Direct into {0} broke for a moment ({1}), so the command ran once {0} answered again.' -f $GuestName, $evidence['reason'])
+        }
+        return ('PowerShell Direct into {0} was broken ({1}), so archost01 restarted {0} once ({2} s), and the command then ran.' -f $GuestName, $evidence['reason'], [int]$evidence['seconds'])
+    }
+    if ([bool]$evidence['restarted']) {
+        return ('archost01 restarted {0} once for this run ({1} s), {2}.' -f $GuestName, [int]$evidence['seconds'], $(if ([bool]$evidence['recovered']) { 'and its channel broke again' } else { 'and it still didn''t answer over PowerShell Direct' }))
+    }
+    if ([string]$evidence['action'] -eq 'Healed') {
+        return ('It ran again once {0} answered, and broke again.' -f $GuestName)
+    }
+    return [string]$evidence['message']
 }
 
 function Invoke-DemoControlStopGuest {
@@ -1262,7 +1473,9 @@ function Invoke-DemoControlStopGuest {
         [System.Collections.IDictionary] $Request,
 
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Settings
+        [System.Collections.IDictionary] $Settings,
+
+        [string] $StateRoot = 'C:\ProgramData\DbHubDemo'
     )
 
     $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
@@ -1270,6 +1483,9 @@ function Invoke-DemoControlStopGuest {
     if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
         $guestName = [string]$Settings['guest']['name']
     }
+    # A restart that its process didn't finish (#65) ends here, so nothing starts the guest that this stop turns off.
+    . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+    Close-DemoGuestRecoveryUnfinished -StateRoot $StateRoot -Confirm:$false
     $minutes = 10
     if ($Request.Contains('timeoutMinutes') -and [int]$Request['timeoutMinutes'] -ge 1) {
         $minutes = [System.Math]::Min(30, [int]$Request['timeoutMinutes'])
@@ -1343,7 +1559,7 @@ function Invoke-DemoWorkloadControl {
                 Write-DemoControlResult -ActionName $ActionName -Status 'Fail' -Message 'StopGuest runs on the T2 host (archost01).'
                 return
             }
-            Invoke-DemoControlStopGuest -Request $body -Settings $settings
+            Invoke-DemoControlStopGuest -Request $body -Settings $settings -StateRoot $StateRoot
         }
         default {
             Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, or StopGuest.'

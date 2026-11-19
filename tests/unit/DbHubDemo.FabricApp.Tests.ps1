@@ -621,6 +621,8 @@ Describe 'Test-DemoFabricApp' {
         $script:rowLimits = @{ 'connector-check' = 1; 'history-meta' = 1; 'estate-targets' = 50; 'replay-T3' = 500; 'postgres-series' = 500 }
         # The queries the stage's index lists; a test can change them.
         $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'replay-T3')
+        # What the catalog says about the queries that may be empty until a session (mayBeEmpty); a test can set some.
+        $script:mayBeEmpty = @{}
         # npm run queries:export writes the payloads ({ query, resultSetRowCountLimit }) and their index into the stage.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith {
             $folder = Join-Path -Path $WorkingDirectory -ChildPath $ArgumentList[3]
@@ -630,7 +632,7 @@ Describe 'Test-DemoFabricApp' {
             foreach ($id in $ids) {
                 @{ query = ('EVALUATE /* {0} */ ROW("x", 1)' -f $id); resultSetRowCountLimit = $script:rowLimits[$id] } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath ($id + '.json')) -Encoding utf8NoBOM
             }
-            $index = @{ latestDay = '2026-10-21'; queries = @($ids | ForEach-Object { @{ id = $_; file = ($_ + '.json'); rowLimit = $script:rowLimits[$_] } }) }
+            $index = @{ latestDay = '2026-10-21'; queries = @($ids | ForEach-Object { @{ id = $_; file = ($_ + '.json'); rowLimit = $script:rowLimits[$_]; mayBeEmpty = $script:mayBeEmpty[$_] } }) }
             $index | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'index.json') -Encoding utf8NoBOM
             [pscustomobject]@{ ExitCode = 0; StdOut = 'Wrote 4 queries'; StdErr = '' }
         }
@@ -732,6 +734,30 @@ Describe 'Test-DemoFabricApp' {
         $browser.remediation | Should -Match 'Page not accessible directly'
     }
 
+    It 'says the queries the catalog marks mayBeEmpty have no rows yet, as expected, and still warns about the others (2026-11-18)' {
+        $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'scenario-runs', 'agent-loop', 'replay-T3')
+        $script:rowLimits['scenario-runs'] = 200
+        $script:rowLimits['agent-loop'] = 100
+        $script:mayBeEmpty = @{ 'scenario-runs' = 'until the first session: Run all in NB_DatabaseHub_Control records one'; 'agent-loop' = 'until a session''s Database Agent beat on T3' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith {
+            $file = $ArgumentList[[array]::IndexOf($ArgumentList, '--file') + 1]
+            $table = if ($file -match 'connector-check') { @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @(12, 2293, 4)) } }
+            elseif ($file -match 'history-meta') { @{ columns = @(@{ name = '[LatestDay]' }); rows = @(, @('2026-10-21T00:00:00')) } }
+            elseif ($file -match 'scenario-runs|agent-loop|replay') { @{ columns = @(@{ name = '[RequestId]' }); rows = @() } }
+            else { @{ columns = @(@{ name = 'Target[Target Key]' }); rows = @(, @('T3')) } }
+            New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = $table } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
+        $queries = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token) | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+        $queries.status | Should -Be 'Warning' -Because 'replay-T3 isn''t marked, so its being empty is still worth a Warning'
+        $queries.message | Should -Match '1 returned no rows for the newest telemetry day 2026-10-21: replay-T3\.'
+        $queries.message | Should -Match ([regex]::Escape('No rows yet, as expected: scenario-runs (until the first session: Run all in NB_DatabaseHub_Control records one); agent-loop (until a session''s Database Agent beat on T3).'))
+
+        $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'scenario-runs', 'agent-loop')
+        $queries = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token) | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+        $queries.status | Should -Be 'Pass' -Because 'a new environment has no session yet, and that''s no reason for a Warning'
+        $queries.message | Should -Match 'No rows yet, as expected: scenario-runs'
+    }
     It 'gives the connector''s queries the Azure CLI''s Power BI token (2026-11-09)' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @(12, 2293, 4)) } } } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }

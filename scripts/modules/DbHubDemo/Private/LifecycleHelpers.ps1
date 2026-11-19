@@ -824,6 +824,11 @@ function Set-DemoTargetProfile {
     if ($SwitchTo) {
         $evidence['switchTo'] = $SwitchTo
     }
+    # A restart of T2's guest that cleared a broken PowerShell Direct channel (issue #65); DEPLOY.T2.GUESTRESTART reports it.
+    $recovery = if ($null -ne $run) { Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run.Result -Name 'evidence') -Name 'guestRecovery' } else { $null }
+    if ($null -ne $recovery) {
+        $evidence['guestRecovery'] = $recovery
+    }
     if ($null -ne $run -and $run.Status -in 'Pass', 'Warning') {
         $message = if ($ProfileName -eq 'off') {
             '{0}: the activity profile is off. Nothing sets it again at boot unless activityProfileOnBoot is true.' -f $Target

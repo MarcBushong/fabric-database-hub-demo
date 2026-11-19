@@ -411,7 +411,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $within.T4MonthlyWorstCaseUsd | Should -Be (20.0 + 0.5 * 730)
         $within.SessionUsd | Should -Be 8.0
         $within.MonthlyCeilingUsd | Should -Be 250
-        $within.SessionCeilingUsd | Should -Be 15
+        $within.SessionCeilingUsd | Should -Be 20 -Because 'the default since 2026-11-18'
 
         $month = & $verdict (New-TestEstimate -LightUse 200) (New-TestConfig)
         $month.Allowed | Should -BeFalse
@@ -421,7 +421,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $raised['monthlyCeilingUsd'] = 400
         (& $verdict (New-TestEstimate -LightUse 200) $raised).Allowed | Should -BeTrue -Because 'a ceiling raised on purpose allows it'
 
-        (& $verdict (New-TestEstimate -Session 16.2) (New-TestConfig)).SkipReason | Should -Be 'SessionCeiling'
+        (& $verdict (New-TestEstimate -Session 21.2) (New-TestConfig)).SkipReason | Should -Be 'SessionCeiling'
         (& $verdict (New-TestEstimate -NoCompute) (New-TestConfig)).SkipReason | Should -Be 'Price'
         (& $verdict $null (New-TestConfig)).SkipReason | Should -Be 'Price'
     }

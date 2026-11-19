@@ -4,7 +4,7 @@ const integer = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const oneDecimal = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 
-export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "compact";
+export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "ms" | "compact";
 
 export function isNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -23,6 +23,8 @@ export function formatNumber(value: unknown, kind: NumberKind = "decimal"): stri
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} min`;
         case "mb":
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} MB`;
+        case "ms":
+            return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} ms`;
         case "compact":
             return compact.format(value);
         default:
@@ -85,6 +87,16 @@ export function formatAgo(date: Date | null, now: Date = new Date()): string {
     const minutes = (now.getTime() - date.getTime()) / 60000;
     if (minutes < 1) return "just now";
     return `${formatDuration(minutes)} ago`;
+}
+
+/** "26 h ago", "3 d ago": the age in its largest whole unit, for tiles. */
+export function formatAgoShort(date: Date | null, now: Date = new Date()): string {
+    if (!date) return "never";
+    const minutes = (now.getTime() - date.getTime()) / 60000;
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${Math.floor(minutes)} min ago`;
+    if (minutes < 48 * 60) return `${Math.floor(minutes / 60)} h ago`;
+    return `${Math.floor(minutes / 1440)} d ago`;
 }
 
 /** A table cell as the visual's data table shows it, by the column's kind. */

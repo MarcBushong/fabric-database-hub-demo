@@ -895,6 +895,32 @@ function Invoke-DemoDeploymentTrack {
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
     # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
     $progress = [string](& $option 'ProgressPath' '')
+    # Issue #65: the run's key for the T2 host's guest restart (once per run), from deploy.ps1's own process.
+    $runRecoveryKey = [string](& $option 'RecoveryKey' '')
+    if ($runRecoveryKey) {
+        Set-DemoRunRecoveryKey -Key $runRecoveryKey
+    }
+    $runStartUtc = $startedUtc
+    $runStartText = [string](& $option 'RunStartUtc' '')
+    if ($runStartText) {
+        $parsedStart = [datetime]::MinValue
+        if ([datetime]::TryParse($runStartText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsedStart)) {
+            $runStartUtc = $parsedStart
+        }
+    }
+    # A recovery from a broken PowerShell Direct channel this run made shows once, as DEPLOY.T2.GUESTRESTART or
+    # DEPLOY.T2.GUESTRETRY, and on the status page's T2.GuestRestart row.
+    $reportGuestRestart = {
+        param([object] $Health)
+        $restarts = @(Get-DemoGuestRecoveryRunResult -Result $results.ToArray() -Health $Health -SinceUtc $runStartUtc -CheckPrefix 'DEPLOY')
+        foreach ($item in $restarts) {
+            $results.Add($item)
+            Write-DemoLog -Level Warning -Message ('{0}: {1}' -f [string]$item.checkId, [string]$item.message)
+        }
+        if ($restarts.Count -gt 0) {
+            Set-DemoGuestRecoveryProgress -ProgressPath $progress -Result $results.ToArray()
+        }
+    }
     # Phase 28's settle waits and watchdog (brief item 14); tests shorten them through the context.
     $settleMinutes = [int](& $option 'SettleMinutes' 20)
     $settleAfterMinutes = [int](& $option 'SettleAfterRestartMinutes' 10)
@@ -1604,7 +1630,7 @@ function Invoke-DemoDeploymentTrack {
                     else {
                         $arcArguments['WaitForHostMinutes'] = 0
                     }
-                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, and monitoring.'
+                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, monitoring, and migration assessment.'
                     $plainKey = [string]$env:DBHUB_SQL_PRODUCT_KEY
                     $secureKey = $null
                     if ($plainKey) {
@@ -1630,6 +1656,8 @@ function Invoke-DemoDeploymentTrack {
                     # Its Run Commands that ran under a fresh name (2026-11-13 live finding) show on the onboarding's row.
                     $arcStuck = @(Get-DemoRunCommandStuckResult -Clear)
                     & $addAll $arcStuck
+                    # A guest restart that cleared a broken PowerShell Direct channel during onboarding (issue #65).
+                    & $reportGuestRestart $null
                     $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
                     if ($onboarding.Count -gt 0) {
                         & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
@@ -1651,7 +1679,7 @@ function Invoke-DemoDeploymentTrack {
                         }
                         break
                     }
-                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION' })
+                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION', 'T2.ARC.MIGRATIONASSESSMENT' })
                     # The guest is built, set up, onboarded, and monitored: its bootstrap generation's record goes (review follow-up).
                     & $recordT2Build ''
                     if (-not $golden) {
@@ -1667,6 +1695,8 @@ function Invoke-DemoDeploymentTrack {
                         $wait = Wait-DemoVmHealthState -Config $Config -VmName 'archost01' -State @('Ready', 'Failed', 'ManualActionRequired') -MaxPolls ([System.Math]::Max(1, $minutes)) -PollSeconds 60
                         $state = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'state')
                         $message = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'message')
+                        # A restart the host's own bootstrap made, or one from earlier in this run (issue #65).
+                        & $reportGuestRestart $wait.Health
                         if ($state -eq 'Ready') {
                             & $note 'DEPLOY.T2.READY' 'T2' 'Pass' ('T2''s host is Ready: {0}' -f $message)
                         }
@@ -1681,6 +1711,8 @@ function Invoke-DemoDeploymentTrack {
                         }
                     }
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
+                    # A restart T2's relay made to set the profile (issue #65).
+                    & $reportGuestRestart $null
                 }
                 'T2/Telemetry' {
                     if (-not (& $telemetry @('T2') 'T2.Telemetry')) {

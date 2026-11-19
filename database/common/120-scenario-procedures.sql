@@ -1595,11 +1595,23 @@ GO
 -- worker 1 unforces a plan an earlier run left forced, so the regression can happen again. Only
 -- demo.usp_visit_summary_lookup's own queries are touched, and only by reading. Azure SQL Database only: SQL Server
 -- 2022 Standard (T1, T2) has no automatic tuning, and the runner there can't recompile or unforce.
+--
+-- The Database Agent beat (2026-11-18, the showcase's second cycle on T3): @hold_auto_correction = 1 turns
+-- FORCE_LAST_GOOD_PLAN off for the run, after demo.auto_tuning_hold records how it was, so the regression lasts until
+-- Database Agents raises its issue (about 15 minutes after a condition starts, Learn). @respond_percent > 0 is the manual
+-- response the issue's guidance asks for, at that share of the run: worker 1 forces the last good plan through Query Store
+-- (sys.sp_query_store_force_plan): the plan sys.dm_db_tuning_recommendations recommends for the lookup, or else the
+-- lookup's plan with the lowest average CPU; then it puts FORCE_LAST_GOOD_PLAN back. Worker 1 also puts it back when the
+-- run ends, and demo.usp_release_auto_tuning_hold does when it ends any other way. The forced plan stays, so it can be
+-- shown; the next run, or reset, unforces it.
 CREATE OR ALTER PROCEDURE demo.usp_scenario_plan_regression
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 6,
-    @good_percent int = 35
+    @good_percent int = 35,
+    @respond_percent int = 0,
+    @hold_auto_correction bit = 0,
+    @pause_ms int = 0
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -1612,19 +1624,28 @@ BEGIN
         THROW 50168, N'plan-regression runs on Azure SQL Database (T3) only: SQL Server 2022 Standard has no automatic tuning.', 1;
     IF @good_percent IS NULL OR @good_percent NOT BETWEEN 10 AND 80
         THROW 50169, N'@good_percent must be between 10 and 80.', 1;
+    IF @respond_percent IS NULL OR (@respond_percent <> 0 AND (@respond_percent <= @good_percent OR @respond_percent > 95))
+        THROW 50170, N'@respond_percent must be 0 (no response) or above @good_percent and at most 95.', 1;
+    IF @pause_ms IS NULL OR @pause_ms NOT BETWEEN 0 AND 1000
+        THROW 50171, N'@pause_ms must be between 0 (from the intensity) and 1000.', 1;
 
-    DECLARE @started datetime2(3), @switch_at datetime2(3), @quiet_until datetime2(3);
+    DECLARE @started datetime2(3), @switch_at datetime2(3), @quiet_until datetime2(3), @respond_at datetime2(3) = NULL;
     DECLARE @patients int, @first int, @last int, @visits int, @minutes int, @r bigint;
-    DECLARE @good bigint = 0, @regressed bigint = 0, @switched bit = 0, @unforced int = 0;
-    DECLARE @pause datetime = demo.fn_pause(@intensity, 400, 0);
+    DECLARE @good bigint = 0, @regressed bigint = 0, @after_response bigint = 0, @switched bit = 0, @unforced int = 0;
+    DECLARE @pause datetime = CASE WHEN @pause_ms > 0 THEN DATEADD(millisecond, @pause_ms, CAST(0 AS datetime)) ELSE demo.fn_pause(@intensity, 400, 0) END;
     DECLARE @stopped bit = 0, @next_check datetime2(3) = SYSUTCDATETIME();
     DECLARE @lookup int = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P');
     DECLARE @forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
     DECLARE @remaining int = 0, @query_id bigint, @plan_id bigint;
+    DECLARE @held bit = 0, @was_held bit = 0, @released bit = 0, @restored nvarchar(60), @prior nvarchar(60);
+    DECLARE @responded bit = 0, @responded_after_seconds int = 0, @already_forced bit = 0;
+    DECLARE @response_query_id bigint = NULL, @forced_plan_id bigint = NULL, @regressed_plan_id bigint = NULL, @response_detail nvarchar(400);
 
     SELECT @started = started_at FROM demo.scenario_runs WHERE run_id = @run_id;
     SET @switch_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @good_percent / 100 AS int), @started);
     SET @quiet_until = DATEADD(second, 5, @switch_at);
+    IF @respond_percent > 0
+        SET @respond_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @respond_percent / 100 AS int), @started);
 
     SELECT @patients = MAX(patient_id) FROM care.patients;
     IF @patients IS NULL
@@ -1647,6 +1668,24 @@ BEGIN
             SET @remaining -= 1;
         END;
         EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+
+        IF @hold_auto_correction = 1
+        BEGIN
+            -- A hold an earlier run left goes back first, so the state recorded here is the database's own.
+            EXEC demo.usp_release_auto_tuning_hold @by = N'the next Database Agent beat''s start (the run that held it had ended)';
+            IF NOT EXISTS (SELECT 1 FROM demo.auto_tuning_hold WHERE option_name = N'FORCE_LAST_GOOD_PLAN')
+            BEGIN
+                SELECT @prior = desired_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN';
+                -- Recorded first, so a run that stops right after the ALTER still leaves a hold that's put back.
+                INSERT INTO demo.auto_tuning_hold (option_name, prior_state, run_id, held_at)
+                VALUES (N'FORCE_LAST_GOOD_PLAN', ISNULL(@prior, N'DEFAULT'), @run_id, SYSUTCDATETIME());
+                ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = OFF);
+                SET @held = 1;
+                SET @was_held = 1;
+                EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'auto-tuning-held', @session_id = @@SPID,
+                    @detail = N'FORCE_LAST_GOOD_PLAN is off for the Database Agent beat, so automatic tuning doesn''t correct the regression first; it comes back at the response or the run''s end.';
+            END;
+        END;
     END;
 
     WHILE @stopped = 0 AND SYSUTCDATETIME() < @deadline
@@ -1662,6 +1701,49 @@ BEGIN
             END;
         END;
 
+        IF @worker = 1 AND @respond_at IS NOT NULL AND @responded = 0 AND @switched = 1 AND SYSUTCDATETIME() >= @respond_at
+        BEGIN
+            -- The manual response (Database Agents applies none itself): force the last good plan through Query Store, the
+            -- plan the engine's own recommendation names (Learn: automatic tuning, sys.dm_db_tuning_recommendations).
+            SET @responded = 1;
+            SET @responded_after_seconds = DATEDIFF(second, @started, SYSUTCDATETIME());
+            SELECT TOP (1) @response_query_id = d.query_id, @forced_plan_id = d.recommended_plan_id, @regressed_plan_id = d.regressed_plan_id
+            FROM sys.dm_db_tuning_recommendations AS t
+            CROSS APPLY OPENJSON(t.details, '$.planForceDetails')
+                WITH (query_id bigint '$.queryId', regressed_plan_id bigint '$.regressedPlanId', recommended_plan_id bigint '$.recommendedPlanId') AS d
+            WHERE t.type = 'FORCE_LAST_GOOD_PLAN'
+              AND d.query_id IN (SELECT q.query_id FROM sys.query_store_query AS q WHERE q.object_id = @lookup)
+            ORDER BY t.last_refresh DESC;
+            IF @forced_plan_id IS NULL
+                SELECT TOP (1) @response_query_id = p.query_id, @forced_plan_id = p.plan_id
+                FROM sys.query_store_plan AS p
+                INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+                INNER JOIN sys.query_store_runtime_stats AS s ON s.plan_id = p.plan_id
+                WHERE q.object_id = @lookup
+                GROUP BY p.query_id, p.plan_id
+                HAVING SUM(s.count_executions) > 0
+                ORDER BY SUM(s.avg_cpu_time * s.count_executions) / SUM(s.count_executions), p.plan_id;
+            IF @forced_plan_id IS NOT NULL
+            BEGIN
+                IF EXISTS (SELECT 1 FROM sys.query_store_plan WHERE plan_id = @forced_plan_id AND is_forced_plan = 1)
+                    SET @already_forced = 1;
+                ELSE
+                    EXEC sys.sp_query_store_force_plan @query_id = @response_query_id, @plan_id = @forced_plan_id;
+                EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+            END;
+            SET @response_detail = CASE WHEN @forced_plan_id IS NULL
+                THEN N'The response found no plan of the lookup in Query Store to force.'
+                ELSE LEFT(CONCAT(N'The manual response: Query Store forces plan ', @forced_plan_id, N' of query ', @response_query_id,
+                    CASE WHEN @regressed_plan_id IS NOT NULL THEN CONCAT(N' (automatic tuning''s recommendation; regressed plan ', @regressed_plan_id, N')') ELSE N' (the lookup''s plan with the lowest average CPU)' END,
+                    CASE WHEN @already_forced = 1 THEN N', already forced' ELSE N'' END, N'.'), 400) END;
+            EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'agent-response', @session_id = @@SPID, @detail = @response_detail;
+            IF @held = 1
+            BEGIN
+                EXEC demo.usp_release_auto_tuning_hold @run_id = @run_id, @by = N'the run''s response', @released = @released OUTPUT, @restored_state = @restored OUTPUT;
+                SET @held = 0;
+            END;
+        END;
+
         -- The other workers stay out of the switch's few seconds, so the lookup compiles for every patient.
         IF @worker > 1 AND SYSUTCDATETIME() >= @switch_at AND SYSUTCDATETIME() < @quiet_until
             WAITFOR DELAY '00:00:01';
@@ -1671,7 +1753,9 @@ BEGIN
             SET @first = 1 + CAST(@r % @patients AS int);
             SET @last = @first + CAST(@r % 3 AS int);
             EXEC demo.usp_visit_summary_lookup @first_patient = @first, @last_patient = @last, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
-            IF @switched = 1
+            IF @respond_at IS NOT NULL AND SYSUTCDATETIME() >= @respond_at
+                SET @after_response += 1;
+            ELSE IF @switched = 1
                 SET @regressed += 1;
             ELSE
                 SET @good += 1;
@@ -1686,7 +1770,15 @@ BEGIN
             WAITFOR DELAY @pause;
     END;
 
-    SELECT worker = @worker, good_lookups = @good, regressed_lookups = @regressed, unforced_plans = @unforced,
+    -- The run's end, or a stop request: FORCE_LAST_GOOD_PLAN goes back as it was.
+    IF @held = 1
+        EXEC demo.usp_release_auto_tuning_hold @run_id = @run_id, @by = N'the run''s end', @released = @released OUTPUT, @restored_state = @restored OUTPUT;
+
+    SELECT worker = @worker, good_lookups = @good, regressed_lookups = @regressed, lookups_after_response = @after_response,
+        unforced_plans = @unforced, held_auto_correction = CAST(@was_held AS int), responded = CAST(@responded AS int),
+        responded_after_seconds = @responded_after_seconds, forced_plan_id = ISNULL(@forced_plan_id, 0),
+        regressed_plan_id = ISNULL(@regressed_plan_id, 0), already_forced = CAST(@already_forced AS int),
+        restored_auto_correction = CAST(@released AS int),
         forced_now = CAST(CASE WHEN EXISTS (
             SELECT 1 FROM sys.query_store_plan AS p INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
             WHERE q.object_id = @lookup AND p.is_forced_plan = 1) THEN 1 ELSE 0 END AS bit),

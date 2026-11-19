@@ -272,7 +272,7 @@ throw $failure
             Should -Be 'The history report step failed: configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.'
         # The guided stop's step is gone with the guided stop (retired, 2026-11-09).
         InModuleScope DbHubDemo { (Get-DemoProgressStepLabel -Id 'T1.Monitoring'), (Get-DemoProgressStepLabel -Id 'T3.Setup'), (Get-DemoProgressStepLabel -Id 'T2.Monitoring') } |
-            Should -Be @('monitoring', 'T3 setup from T1', 'PAYG and monitoring')
+            Should -Be @('monitoring', 'T3 setup from T1', 'PAYG, monitoring, and migration assessment')
     }
 }
 

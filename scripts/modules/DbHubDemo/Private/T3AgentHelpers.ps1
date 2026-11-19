@@ -1,0 +1,353 @@
+# The Database Agent loop on T3 (2026-11-18): FORCE_LAST_GOOD_PLAN, which plan-regression's Database Agent beat turns off
+# from the regression to its response (demo.auto_tuning_hold), and what Database Agents needs from T3, read where an API
+# documents it. Database Agents itself has no API: its one-time selection is made in Database Hub, and only a person can
+# confirm it (HUB.AGENT.T3).
+# - Database Agents: https://learn.microsoft.com/fabric/database/hub/database-agents
+# - Enable and activate Database Agents: https://learn.microsoft.com/fabric/database/hub/enable-database-agents
+# - Database Automatic Tuning (REST): https://learn.microsoft.com/rest/api/sql/database-automatic-tuning
+# - Permissions - List For Resource: https://learn.microsoft.com/rest/api/authorization/permissions/list-for-resource
+
+$script:DemoAgentDocUrl = 'https://learn.microsoft.com/fabric/database/hub/enable-database-agents'
+$script:DemoAutoTuningDocUrl = 'https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview'
+# The Agent policy options the beat's issues need (Learn's UI labels): the regression, its long-running lookup, and T3's CPU.
+$script:DemoAgentPolicy = @('Flag long-running queries', 'Force last known good plans', 'Flag high CPU')
+
+function Get-DemoT3AgentUri {
+    <#
+    .SYNOPSIS
+    T3's database's Azure Resource Manager URL, with -Path after it and -ApiType's API version from config/versions.json.
+    Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^azuresql01-[a-z0-9]{6}$')]
+        [string] $ServerName,
+
+        [ValidateSet('automaticTuning/current', 'providers/Microsoft.Authorization/permissions')]
+        [string] $Path = 'automaticTuning/current'
+    )
+
+    $apiType = if ($Path -like 'providers/*') { 'Microsoft.Authorization/permissions' } else { 'Microsoft.Sql/servers/databases/automaticTuning' }
+    $versions = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
+    $apiVersion = [string]$versions['apiVersions'][$apiType]
+    if (-not $apiVersion) {
+        throw ('config/versions.json has no API version for {0}.' -f $apiType)
+    }
+    return ('https://management.azure.com/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.Sql/servers/{2}/databases/ContosoCare/{3}?api-version={4}' -f [string]$Config['subscriptionId'], (Get-DemoResourceGroupName -Config $Config), $ServerName, $Path, $apiVersion)
+}
+
+function Get-DemoT3AutoTuning {
+    <#
+    .SYNOPSIS
+    T3's FORCE_LAST_GOOD_PLAN, read with Database Automatic Tuning - Get: Read, Desired (Default, On, or Off), Actual (On
+    or Off), Reason (reasonDesc), and Error. Call it only while T3 is Online: a paused serverless database can resume to
+    answer it. A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^azuresql01-[a-z0-9]{6}$')]
+        [string] $ServerName
+    )
+
+    $response = Invoke-DemoRestRequest -SubscriptionId ([string]$Config['subscriptionId']) -Method GET -Uri (Get-DemoT3AgentUri -Config $Config -ServerName $ServerName)
+    if ($response.ExitCode -ne 0) {
+        return [pscustomobject]@{ Read = $false; Desired = ''; Actual = ''; Reason = ''; Error = (Protect-DemoText -Text $(if ($response.StdErr) { [string]$response.StdErr } else { 'HTTP {0}' -f $response.StatusCode })) }
+    }
+    $option = $null
+    try {
+        $body = [string]$response.StdOut | ConvertFrom-Json -AsHashtable
+        $option = $body['properties']['options']['forceLastGoodPlan']
+    }
+    catch {
+        $option = $null
+    }
+    if ($option -isnot [System.Collections.IDictionary]) {
+        return [pscustomobject]@{ Read = $false; Desired = ''; Actual = ''; Reason = ''; Error = 'the answer has no forceLastGoodPlan option' }
+    }
+    return [pscustomobject]@{ Read = $true; Desired = [string]$option['desiredState']; Actual = [string]$option['actualState']; Reason = [string]$option['reasonDesc']; Error = '' }
+}
+
+function Invoke-DemoT3AutoTuningCheck {
+    <#
+    .SYNOPSIS
+    T3's FORCE_LAST_GOOD_PLAN for status.ps1 (-CheckId STATUS.T3.AUTOTUNING) and, with -Restore, stop-demo.ps1 (-CheckId
+    STOP.T3.AUTOTUNING), 2026-11-18. Returns $null when T3 doesn't exist.
+
+    .DESCRIPTION
+    Read only while T3 is Online (Get-DemoT3State's Status), because reading a paused serverless database's tuning
+    options can wake it: otherwise Not selected, saying that the next run on T3, reset, or deploy.ps1 puts it back. Pass
+    when it's on. Off with a desired state of Off is what the Database Agent beat leaves while it holds it, from the
+    regression to its response; after a session it means the run that held it stopped with the VMs, before any of its
+    own ways back. Then status.ps1 reports a Warning with the fix, and stop-demo.ps1 (-Restore, the user's own rights,
+    ADR 0024's rule that the safety stop changes nothing stays) sets its desired state back to Default with Database
+    Automatic Tuning - Update. Inside T3, the next run's start, reset, and setup put back what the hold recorded, logged
+    as auto-tuning-restored (demo.usp_release_auto_tuning_hold). A desired state of Default or On that isn't in effect
+    (Query Store read-only, for example) is a Warning with its reason. A read that fails is a Warning. Never a Fail.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [object] $T3,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('STATUS.T3.AUTOTUNING', 'STOP.T3.AUTOTUNING')]
+        [string] $CheckId,
+
+        [switch] $Restore
+    )
+
+    if (-not [bool](Get-DemoMemberValue -InputObject $T3 -Name 'Exists')) {
+        return $null
+    }
+    $server = [string](Get-DemoMemberValue -InputObject $T3 -Name 'ServerName')
+    $status = [string](Get-DemoMemberValue -InputObject $T3 -Name 'Status')
+    $area = if ($CheckId -like 'STOP.*') { 'infra' } else { 't3' }
+    $result = {
+        param([string] $State, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '')
+        New-DemoResult -CheckId $CheckId -Area $area -Target 'T3' -Status $State -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $script:DemoAutoTuningDocUrl
+    }
+    $putBack = 'The next run on T3 puts it back when it starts, and so do reset, ./scripts/stop-demo.ps1 while T3 is awake, and ./scripts/deploy.ps1.'
+    if ($status -ne 'Online') {
+        return (& $result 'Not selected' ('T3 is {0}, so FORCE_LAST_GOOD_PLAN wasn''t read: reading it could wake T3. If a session''s Database Agent beat left it off, {1}' -f $(if ($status) { $status } else { 'unknown' }), ($putBack.Substring(0, 1).ToLowerInvariant() + $putBack.Substring(1))) ([ordered]@{ t3Status = $status }))
+    }
+    $read = Get-DemoT3AutoTuning -Config $Config -ServerName $server
+    $evidence = [ordered]@{ t3Status = $status; desiredState = $read.Desired; actualState = $read.Actual; reason = $read.Reason }
+    if (-not $read.Read) {
+        return (& $result 'Warning' ('T3''s FORCE_LAST_GOOD_PLAN couldn''t be read: {0}.' -f $read.Error.TrimEnd('.')) $evidence ('Run the script again. {0}' -f $putBack))
+    }
+    if ($read.Desired -eq 'Off') {
+        if (-not $Restore) {
+            return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is off on T3 (actual {0}). A session''s Database Agent beat holds it off from the regression to its response, so during that beat this is expected; after a session, the run that held it stopped before putting it back, and automatic tuning doesn''t correct plan regressions until it''s back.' -f $read.Actual) $evidence $putBack)
+        }
+        if (-not $PSCmdlet.ShouldProcess($server, 'Set FORCE_LAST_GOOD_PLAN back to Default')) {
+            return (& $result 'Not selected' 'What if: FORCE_LAST_GOOD_PLAN would be set back to Default on T3.' $evidence)
+        }
+        $body = '{"properties":{"options":{"forceLastGoodPlan":{"desiredState":"Default"}}}}'
+        $update = Invoke-DemoRestRequest -SubscriptionId ([string]$Config['subscriptionId']) -Method PATCH -Uri (Get-DemoT3AgentUri -Config $Config -ServerName $server) -Body $body
+        if ($update.ExitCode -ne 0) {
+            $why = Protect-DemoText -Text $(if ($update.StdErr) { [string]$update.StdErr } else { 'HTTP {0}' -f $update.StatusCode })
+            return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is off on T3, and it couldn''t be set back to Default: {0}' -f $why) $evidence $putBack)
+        }
+        $after = Get-DemoT3AutoTuning -Config $Config -ServerName $server
+        $evidence['desiredStateAfter'] = $after.Desired
+        $evidence['actualStateAfter'] = $after.Actual
+        Write-DemoLog -Message ('T3''s FORCE_LAST_GOOD_PLAN was off, held by a Database Agent beat that stopped with the session; stop-demo.ps1 set it back to Default (now {0}).' -f $(if ($after.Actual) { $after.Actual } else { 'not read' }))
+        return (& $result 'Pass' ('FORCE_LAST_GOOD_PLAN was off on T3, held by a Database Agent beat that stopped with the session; it''s back to Default ({0}), so automatic tuning corrects plan regressions again.' -f $(if ($after.Actual) { 'now ' + $after.Actual } else { 'not read again' })) $evidence)
+    }
+    if ($read.Actual -eq 'On') {
+        return (& $result 'Pass' ('T3''s FORCE_LAST_GOOD_PLAN is on (desired {0}): automatic tuning corrects plan regressions, as the showcase''s third cycle shows.' -f $read.Desired) $evidence)
+    }
+    return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN''s desired state on T3 is {0}, but it''s {1} ({2}), so automatic tuning doesn''t correct plan regressions.' -f $read.Desired, $(if ($read.Actual) { $read.Actual } else { 'not reported' }), $(if ($read.Reason) { $read.Reason } else { 'no reason given' })) $evidence 'Query Store must be READ_WRITE on ContosoCare: ./scripts/validate.ps1 -Area T3 shows its state.')
+}
+
+function ConvertTo-DemoT3AutoTuningResult {
+    <#
+    .SYNOPSIS
+    T3.AUTOTUNING (2026-11-18) from the row of database/azuresql/900-status.sql that Test-DemoT3 reads through T1:
+    FORCE_LAST_GOOD_PLAN's desired and actual state, and the Database Agent beat's hold (demo.auto_tuning_hold) with its
+    run's status. Pure. Internal.
+
+    .DESCRIPTION
+    - Pass: on; or off while the beat's run that holds it is still Running, which is the beat working as designed.
+    - Warning: held by a run that isn't Running any more (it stopped before any of its own ways back; the next run's
+      start, reset, or deploy.ps1's setup puts it back); off with no hold, which something outside the demo did; on by
+      its desired state but not in effect (Query Store read-only, for example); or not in the row.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Row
+    )
+
+    $desired = [string](Get-DemoMemberValue -InputObject $Row -Name 'force_last_good_plan_desired')
+    $actual = [string](Get-DemoMemberValue -InputObject $Row -Name 'force_last_good_plan_actual')
+    $holder = [string](Get-DemoMemberValue -InputObject $Row -Name 'auto_tuning_hold_run')
+    $holderStatus = [string](Get-DemoMemberValue -InputObject $Row -Name 'auto_tuning_hold_status')
+    $queryStore = [string](Get-DemoMemberValue -InputObject $Row -Name 'query_store_state')
+    $evidence = [ordered]@{ desiredState = $desired; actualState = $actual; holdRun = $holder; holdRunStatus = $holderStatus; queryStore = $queryStore }
+    $result = {
+        param([string] $Status, [string] $Message, [string] $Remediation = '')
+        New-DemoResult -CheckId 'T3.AUTOTUNING' -Area 't3' -Target 'T3' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $script:DemoAutoTuningDocUrl
+    }
+    $putBack = 'The next run on T3 puts it back when it starts, and so do reset (./scripts/reset-demo.ps1 -Target T3), ./scripts/stop-demo.ps1 while T3 is awake, and ./scripts/deploy.ps1.'
+    if (-not $desired -and -not $actual) {
+        return (& $result 'Warning' 'T3''s FORCE_LAST_GOOD_PLAN wasn''t in its status, so it wasn''t checked.' 'Run ./scripts/validate.ps1 -Area T3 again.')
+    }
+    if ($holder -and $holderStatus -eq 'Running') {
+        return (& $result 'Pass' ('FORCE_LAST_GOOD_PLAN is held off on T3 by the Database Agent beat''s run {0}, which is running: automatic tuning waits until its response, and the run puts it back then, or at its end.' -f $holder))
+    }
+    if ($holder) {
+        return (& $result 'Warning' ('FORCE_LAST_GOOD_PLAN is still held off on T3 (desired {0}): the Database Agent beat''s run {1} ({2}) stopped before putting it back, so automatic tuning doesn''t correct plan regressions until it''s back.' -f $desired, $holder, $(if ($holderStatus) { $holderStatus } else { 'no longer recorded' })) $putBack)
+    }
+    if ($actual -eq 'ON') {
+        return (& $result 'Pass' ('T3''s FORCE_LAST_GOOD_PLAN is on (desired {0}): automatic tuning corrects plan regressions, as the showcase''s third cycle shows.' -f $desired))
+    }
+    if ($desired -eq 'OFF') {
+        return (& $result 'Warning' 'T3''s FORCE_LAST_GOOD_PLAN is off, and no Database Agent beat holds it, so something outside the demo turned it off; automatic tuning doesn''t correct the showcase''s third-cycle regression.' 'In the Azure portal, open the database''s Automatic tuning page and set Force plan to Inherit, or run ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = DEFAULT) on ContosoCare.')
+    }
+    return (& $result 'Warning' ('T3''s FORCE_LAST_GOOD_PLAN is {0} but not in effect (actual {1}; Query Store {2}), so automatic tuning doesn''t correct plan regressions.' -f $desired, $(if ($actual) { $actual } else { 'not reported' }), $(if ($queryStore) { $queryStore } else { 'not reported' })) 'Automatic tuning needs Query Store READ_WRITE on ContosoCare: check sys.database_query_store_options, or the database''s Query Store settings in SSMS.')
+}
+
+function Test-DemoT3AgentPermission {
+    <#
+    .SYNOPSIS
+    Whether the signed-in Azure account can save T3 in Database agent settings: saving needs Azure RBAC write on each
+    selected database (Learn), read with Permissions - List For Resource. Returns Read, Allowed, and Error. A read.
+    Internal.
+
+    .DESCRIPTION
+    Test-DemoPermission decides: one role's actions match Microsoft.Sql/servers/databases/write (wildcards included) and
+    that role's notActions don't. Deny assignments aren't listed by that API, so an Allowed account can still be refused.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^azuresql01-[a-z0-9]{6}$')]
+        [string] $ServerName
+    )
+
+    $action = 'Microsoft.Sql/servers/databases/write'
+    $response = Invoke-DemoRestRequest -SubscriptionId ([string]$Config['subscriptionId']) -Method GET -Uri (Get-DemoT3AgentUri -Config $Config -ServerName $ServerName -Path 'providers/Microsoft.Authorization/permissions')
+    if ($response.ExitCode -ne 0) {
+        return [pscustomobject]@{ Read = $false; Allowed = $false; Error = (Protect-DemoText -Text $(if ($response.StdErr) { [string]$response.StdErr } else { 'HTTP {0}' -f $response.StatusCode })) }
+    }
+    try {
+        $permissions = @((([string]$response.StdOut | ConvertFrom-Json).value) | Where-Object { $null -ne $_ })
+    }
+    catch {
+        return [pscustomobject]@{ Read = $false; Allowed = $false; Error = 'the answer isn''t JSON' }
+    }
+    return [pscustomobject]@{ Read = $true; Allowed = (Test-DemoPermission -Permission $permissions -Action $action); Error = '' }
+}
+
+function Test-DemoT3AgentReadiness {
+    <#
+    .SYNOPSIS
+    T3.AGENT (2026-11-18): what Database Agents needs from T3 that deploy.ps1 and validate.ps1 can read. Pass, or a
+    Warning that names each gap with its fix; never a Fail, because the rest of the demo doesn't need the agent.
+
+    .DESCRIPTION
+    - T3 isn't a one-vCore serverless database, which Database Agents doesn't support: the lowest-cost profile's maximum
+      went from 1 to 2 vCores for it (ADR 0016), and deploy.ps1 scales an existing T3 online.
+    - T3 isn't in an elastic pool.
+    - The signed-in account can save T3 in Database agent settings: Azure RBAC write on the database
+      (Test-DemoT3AgentPermission). It's the account the presenter signs in to Fabric with, in the demo's one-click path.
+    - Performance monitoring is on: -PerformanceMonitoring, T3.PROPERTY's value ('true'), when it was read.
+    What deploy can't read, the Fabric home region and whether the agent is on, is HUB.AGENT.T3's to confirm.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^azuresql01-[a-z0-9]{6}$')]
+        [string] $ServerName,
+
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [object] $Database,
+
+        [AllowEmptyString()]
+        [string] $PerformanceMonitoring = ''
+    )
+
+    $gaps = [System.Collections.Generic.List[string]]::new()
+    $fixes = [System.Collections.Generic.List[string]]::new()
+    $notes = [System.Collections.Generic.List[string]]::new()
+    $sku = Get-DemoMemberValue -InputObject $Database -Name 'currentSku'
+    if ($null -eq $sku) {
+        $sku = Get-DemoMemberValue -InputObject $Database -Name 'sku'
+    }
+    $skuName = [string](Get-DemoMemberValue -InputObject $sku -Name 'name')
+    $capacity = Get-DemoMemberValue -InputObject $sku -Name 'capacity'
+    $pool = [string](Get-DemoMemberValue -InputObject $Database -Name 'elasticPoolId')
+    $evidence = [ordered]@{ database = ('{0}/ContosoCare' -f $ServerName); sku = $skuName; maxVcores = $capacity; elasticPool = $pool; performanceMonitoring = $PerformanceMonitoring }
+    if ($skuName -like 'GP_S_*' -and $null -ne $capacity -and [double]$capacity -le 1) {
+        $gaps.Add('T3 is a one-vCore serverless database, which Database Agents doesn''t support')
+        $fixes.Add('run ./scripts/deploy.ps1, which scales T3 to the profile''s 2 vCores online (ADR 0016)')
+    }
+    if ($pool) {
+        $gaps.Add('T3 is in an elastic pool, which Database Agents doesn''t support')
+        $fixes.Add('move T3 out of the pool')
+    }
+    $permission = Test-DemoT3AgentPermission -Config $Config -ServerName $ServerName
+    $evidence['canSaveAgent'] = if ($permission.Read) { $permission.Allowed } else { $null }
+    if ($permission.Read -and -not $permission.Allowed) {
+        $gaps.Add('the signed-in Azure account can''t save T3 in Database agent settings, which needs Azure write access on the database (Microsoft.Sql/servers/databases/write)')
+        $fixes.Add('sign in to Fabric with an account that has Contributor or SQL DB Contributor on T3, such as the account that deployed the demo, or have an Owner grant one')
+    }
+    elseif (-not $permission.Read) {
+        $notes.Add(('your write access on T3 couldn''t be read ({0}); saving T3 in Database agent settings needs it' -f $permission.Error.TrimEnd('.')))
+    }
+    if ($PerformanceMonitoring -and $PerformanceMonitoring -ne 'true') {
+        $gaps.Add('T3''s performance monitoring is off (T3.PROPERTY), so Database Hub can''t list T3 for the agent')
+        $fixes.Add('run ./scripts/deploy.ps1, which turns it on')
+    }
+    if ($gaps.Count -gt 0) {
+        return (New-DemoResult -CheckId 'T3.AGENT' -Area 't3' -Target 'T3' -Status 'Warning' -Message ('Database Agents can''t monitor T3 yet: {0}. The rest of the demo doesn''t need it.' -f ($gaps -join '; ')) -Evidence $evidence -Remediation (($fixes -join '; ') + '.') -DocUrl $script:DemoAgentDocUrl)
+    }
+    $text = 'Database Agents can monitor T3: it''s a {0}-vCore serverless database outside any pool{1}{2}.' -f $capacity, $(if ($permission.Read) { ', and your account can save it in Database agent settings' } else { '' }), $(if ($PerformanceMonitoring -eq 'true') { ', with performance monitoring on' } else { '' })
+    if ($notes.Count -gt 0) {
+        return (New-DemoResult -CheckId 'T3.AGENT' -Area 't3' -Target 'T3' -Status 'Warning' -Message ('{0}. But {1}.' -f $text.TrimEnd('.'), ($notes -join '; ')) -Evidence $evidence -Remediation 'Run ./scripts/validate.ps1 -Area T3 again to read it.' -DocUrl $script:DemoAgentDocUrl)
+    }
+    return (New-DemoResult -CheckId 'T3.AGENT' -Area 't3' -Target 'T3' -Status 'Pass' -Message $text -Evidence $evidence -DocUrl $script:DemoAgentDocUrl)
+}
+
+function Get-DemoT3AgentSetupItem {
+    <#
+    .SYNOPSIS
+    HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one manual step, which no API offers, as a Manual action required
+    that only a person confirms (Test-DemoConfirmOnlyResult): deploy.ps1's ending and the status page list it under
+    "Please confirm", with Database Hub's link, the exact database to select, and the Agent policy options. It's once
+    per deployment: the selection stays across sessions and upgrades, unless T3 is recreated (stop-demo.ps1 -RemoveT3).
+    Database Agents also needs T3 in the supported region associated with the Fabric tenant's home region, which no API
+    reads, so it's named here too. Returns $null when T3 doesn't exist. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $ServerName,
+
+        [AllowEmptyString()]
+        [string] $Region = ''
+    )
+
+    if ($ServerName -notmatch '^azuresql01-[a-z0-9]{6}$') {
+        return $null
+    }
+    $tenant = ([string]$Config['tenantId']).ToLowerInvariant()
+    # The portal's address comes from config/versions.json (fabricApp.portalUrl), as the Insights app's links do: Database
+    # Hub has no API, and this is the page a person opens.
+    $portal = ([string](Get-DemoFabricAppSetting)['portalUrl']).TrimEnd('/')
+    $link = '{0}/workloads/fdh/databaseHub{1}' -f $portal, $(if ($tenant) { '?ctid=' + $tenant } else { '' })
+    $database = '{0}/ContosoCare' -f $ServerName
+    $where = if ($Region) { $Region } else { [string]$Config['location'] }
+    $message = 'Database Agents on T3, once per deployment (the Database Agent loop; it stays across sessions and upgrades, unless T3 is recreated): open {0}, select Manage agents, then Database agent settings; turn Enabled on, select {1}, and under Agent policy turn on {2}; select Apply, then Save (about 30 seconds). T3 must be awake: right after deploy.ps1, or during a session. Database Agents needs T3''s region ({3}) to be the one associated with your Fabric tenant''s home region (Fabric: ? > About Fabric).' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $where
+    return (New-DemoResult -CheckId 'HUB.AGENT.T3' -Area 'hub' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database; policy = @($script:DemoAgentPolicy); region = $where; oncePerDeployment = $true }) -Remediation ('In Database Hub, Manage agents > Database agent settings: Enabled, {0}, Apply, Save; the walkthrough''s Database Agent loop shows the rest.' -f $database) -DocUrl $script:DemoAgentDocUrl)
+}

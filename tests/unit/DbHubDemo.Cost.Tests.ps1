@@ -426,14 +426,15 @@ Describe 'Get-DemoCostEstimate' {
     It 'prices the lowest-cost profile from retail prices' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         # Running: T1 0.20 + SQL 0.40 + host 0.30 + Arc 0.10 x 4 cores (the per-OSE minimum for the 2-vCPU guest)
-        # + T3 0.50 x 1 vCore = 1.80 per hour.
-        $estimate.HourlyRunning | Should -Be 1.8
+        # + T3 0.50 x 2 vCores (since 2026-11-18: Database Agents doesn't support one-vCore serverless databases) = 2.30 per hour.
+        $estimate.HourlyRunning | Should -Be 2.3
+        ($estimate.Components | Where-Object Name -EQ 'T3 compute (serverless)').Quantity | Should -Be 2
         $estimate.BastionHourly | Should -Be 0.2
         # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, and the session
         # control's vault operations, 0.03 (every deployment since 2026-11-14). There's no artifact cache.
         $estimate.IdleMonthly | Should -Be 23.23
-        $estimate.SessionCost | Should -Be 9.2
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.SessionCost | Should -Be 11.7
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
@@ -489,7 +490,7 @@ Describe 'Get-DemoCostEstimate' {
         $quiet = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ activityProfile = 'baseline' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $default.ActivityProfile | Should -Be 'business-day'
         $quiet.ActivityProfile | Should -Be 'baseline'
-        # T3 at its maximum, 1 vCore x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
+        # T3 at its maximum, 2 vCores x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
         $default.T3BusinessDaySession | Should -Be 0
         $default.T3BusinessDayMonthly | Should -Be 0
         $default.SessionCost | Should -Be $quiet.SessionCost
@@ -514,16 +515,16 @@ Describe 'Get-DemoCostEstimate' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoProfile -MockWith { $script:halfShare }
         $businessDay = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $baseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -ActivityProfile 'baseline'
-        # 1 vCore x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0417 an hour.
+        # 2 vCores x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0833 an hour.
         $increment = $businessDay.Components | Where-Object Name -EQ 'T3 compute, business-day incidents (10 of every 60 minutes at the maximum vCores)'
         $increment.UnitPrice | Should -Be 0.5
-        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.0833
-        $businessDay.T3BusinessDaySession | Should -Be 0.21 -Because '0.0833 x 5 hours x 0.50'
-        $businessDay.T3BusinessDayMonthly | Should -Be 0.42 -Because '0.0833 x 10 hours x 0.50'
-        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.21
-        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.42
+        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.1667
+        $businessDay.T3BusinessDaySession | Should -Be 0.42 -Because '0.1667 x 5 hours x 0.50'
+        $businessDay.T3BusinessDayMonthly | Should -Be 0.83 -Because '0.1667 x 10 hours x 0.50'
+        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.42
+        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.83
         @($baseline.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
-        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.21 USD to a session and 0\.42 USD to the light-use month before the free allowance'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.42 USD to a session and 0\.83 USD to the light-use month before the free allowance'
         ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Pass'
         ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match 'Serverless - Compute Gen5' }
@@ -578,10 +579,11 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
         # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00.
         $estimate.IdleMonthly | Should -Be 20.03
-        # The session stays at list price: 1.80 x 5 + 0.20 = 9.20.
-        $estimate.SessionCost | Should -Be 9.2
-        # Allowance: 10 vCore-hours x 0.50 = 5.00. Month: 20 + 1.80 x 10 + 0.20 - 5.00 = 33.20.
-        $estimate.T3FreeOfferCreditMonthly | Should -Be 5
+        # The session stays at list price: 2.30 x 5 + 0.20 = 11.70.
+        $estimate.SessionCost | Should -Be 11.7
+        # Allowance: 10 hours x 2 vCores = 20 vCore-hours (72,000 vCore-seconds, within the 100,000) x 0.50 = 10.00.
+        # Month: 20 + 2.30 x 10 + 0.20 - 10.00 = 33.20, as at 1 vCore: the allowance covers T3 at light use either way.
+        $estimate.T3FreeOfferCreditMonthly | Should -Be 10
         $estimate.LightUseMonthly | Should -Be 33.23
         $estimate.T3FreeOffer | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer'
@@ -595,7 +597,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless when the free offer is unavailable' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $false
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.T3FreeOffer | Should -BeFalse
         $estimate.T3FreeOfferUnchecked | Should -BeFalse
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'free offer'
@@ -603,7 +605,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless and says so when the free offer was not checked' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.T3FreeOfferUnchecked | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer wasn''t checked'
     }
@@ -715,12 +717,12 @@ Describe 'Get-DemoCostEstimate' {
         @($estimate.Components | Where-Object Name -like 'Defender CSPM *').Basis | Should -Be @('running', 'running', 'idle')
         $estimate.Components.Name | Should -Not -Match 'Defender for Storage|Resource Manager|Key Vault'
 
-        # Running: 1.80 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 1.939 per hour.
-        $estimate.HourlyRunning | Should -Be 1.94
+        # Running: 2.30 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 2.439 per hour.
+        $estimate.HourlyRunning | Should -Be 2.44
         # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month.
         $estimate.IdleMonthly | Should -Be 46.59
-        $estimate.SessionCost | Should -Be 7.96
-        $estimate.LightUseMonthly | Should -Be 66.18
+        $estimate.SessionCost | Should -Be 9.96
+        $estimate.LightUseMonthly | Should -Be 71.18
         $estimate.DefenderSession | Should -Be 0.56
         $estimate.DefenderMonthly | Should -Be 24.75
     }
@@ -763,7 +765,7 @@ Describe 'Get-DemoCostEstimate' {
     }
 
     It 'checks the hard monthly ceiling against totals that include Defender' {
-        # Without Defender the light-use month is 41.40; with it, 66.15.
+        # Without Defender the light-use month is 46.43; with it, 71.18.
         $config = New-TestConfig -Override @{ monthlyCeilingUsd = 50 }
         $without = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -NetworkMode public -DefenderPlans @()
         ($without.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
@@ -781,10 +783,29 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Match 'raise monthlyCeilingUsd'
     }
 
-    It 'uses a 375 USD monthly ceiling and a 15 USD session ceiling by default (375 since 2026-11-04)' {
+    It 'uses a 375 USD monthly ceiling and a 20 USD session ceiling by default (375 since 2026-11-04, 20 since 2026-11-18)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DefenderPlans $defenderPlans
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 375\.00 USD'
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 15\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 20\.00 USD'
+    }
+
+    It 'checks a session against 20 USD for a configuration that still says 15, the default before 2026-11-18, and against any other value as set' {
+        $legacyPath = Join-Path -Path $TestDrive -ChildPath 'legacy-session-ceiling.json'
+        $file = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable
+        $file['sessionCeilingUsd'] = 15
+        $file | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyPath -Encoding utf8NoBOM
+        $legacy = Get-DemoConfig -Path $legacyPath
+        $legacy['t4Enabled'] = $false
+        # The fixture's lowest-cost session, 11.70 USD, is between the two ceilings: a Pass against 20, not a Warning against 15.
+        $session = (Get-DemoCostEstimate -Config $legacy -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Pass'
+        $session.message | Should -Match 'is estimated at 11\.70 USD \(of which Defender for Cloud: 0\.00 USD\) against a ceiling of 20\.00 USD'
+        $set = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ sessionCeilingUsd = 11 }) -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()
+        ($set.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Warning' -Because 'a value someone set stays'
+        # T4's cost checks (ConvertTo-DemoT4FallbackCost) read the same configuration.
+        $verdict = InModuleScope DbHubDemo -Parameters @{ Config = $legacy } { ConvertTo-DemoT4FallbackCost -Estimate ([pscustomobject]@{ LightUseMonthly = 50.0; T4AutoRestartWorstCaseMonthly = 100.0; SessionCost = 18.0; T4FixedMonthly = 5.0; DefenderIncluded = $true; MissingPrices = @(); Components = @([pscustomobject]@{ Name = 'T4 compute (Standard_D4ds_v5)'; UnitPrice = 0.09; Quantity = 4 }) }) -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $verdict.SessionCeilingUsd | Should -Be 20
+        $verdict.SkipReason | Should -Be ''
     }
 
     It 'passes when estimates are within the ceilings' {
@@ -861,8 +882,8 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ dataDiskSku = 'E10' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         ($estimate.Components | Where-Object Name -eq 'T1 data disk (E10)').Cost | Should -Be 10
         ($estimate.Components | Where-Object Name -eq 'T2 host data disk (E10)').Cost | Should -Be 10
-        # The two data disks add 2 x 10.00 to the default 41.40.
-        $estimate.LightUseMonthly | Should -Be 61.43
+        # The two data disks add 2 x 10.00 to the default 46.43.
+        $estimate.LightUseMonthly | Should -Be 66.43
     }
 
     It 'removes the demo-day data disks when dataDiskSku is None' {

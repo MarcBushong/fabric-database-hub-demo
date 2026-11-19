@@ -456,7 +456,13 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('$dbhubWriter = New-Object -TypeName System.IO.StringWriter')
         $lines.Add('[Console]::SetOut($dbhubWriter)')
         $lines.Add('try {')
-        $lines.Add((Get-DemoWorkloadControlScript -Action 'Runner' -Request @{ target = $item; arguments = $arguments; timeoutSeconds = $RunnerTimeoutSeconds; readySeconds = 0 }))
+        $controlRequest = @{ target = $item; arguments = $arguments; timeoutSeconds = $RunnerTimeoutSeconds; readySeconds = 0 }
+        # Issue #65: T2's relay restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
+        $recoveryKey = Get-DemoRunRecoveryKey
+        if ($item -eq 'T2' -and $recoveryKey) {
+            $controlRequest['recoveryKey'] = $recoveryKey
+        }
+        $lines.Add((Get-DemoWorkloadControlScript -Action 'Runner' -Request $controlRequest))
         $lines.Add('}')
         $lines.Add('finally {')
         $lines.Add('    [Console]::SetOut($dbhubOut)')
@@ -492,12 +498,21 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('    if ($dbhubMessage.Length -gt 300) { $dbhubMessage = ''...'' + $dbhubMessage.Substring($dbhubMessage.Length - 300) }')
         $lines.Add('    $dbhubExit = $null')
         $lines.Add('    $dbhubGolden = $null')
+        $lines.Add('    $dbhubRecovery = $null')
         # Read through PSObject.Properties: a relay's refusal has no exitCode, and an older relay no golden reason.
         $lines.Add('    if ($null -ne $dbhubResult.PSObject.Properties[''evidence''] -and $null -ne $dbhubResult.evidence) {')
         $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''exitCode'']) { $dbhubExit = $dbhubResult.evidence.exitCode }')
         $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''golden'']) { $dbhubGolden = $dbhubResult.evidence.golden }')
+        # A recovery from a broken PowerShell Direct channel (issue #65), kept short for the 4 KB, with what deploy.ps1 needs to
+        # report it once: its action and time, read through PSObject.Properties for any relay's version.
+        $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''guestRecovery''] -and $null -ne $dbhubResult.evidence.guestRecovery) {')
+        $lines.Add('            $dbhubGr = $dbhubResult.evidence.guestRecovery')
+        $lines.Add('            $dbhubPick = @{}')
+        $lines.Add('            foreach ($dbhubName in ''action'', ''restarted'', ''recovered'', ''seconds'', ''atUtc'', ''restartUtc'', ''stoppedBy'', ''by'', ''reason'') { $dbhubProperty = $dbhubGr.PSObject.Properties[$dbhubName]; $dbhubPick[$dbhubName] = $(if ($null -ne $dbhubProperty) { $dbhubProperty.Value } else { $null }) }')
+        $lines.Add('            if ([bool]$dbhubPick[''restarted''] -or [string]$dbhubPick[''action''] -eq ''Healed'') { $dbhubWhy = [string]$dbhubPick[''reason'']; if ($dbhubWhy.Length -gt 120) { $dbhubWhy = $dbhubWhy.Substring(0, 120) }; $dbhubRecovery = @{ action = [string]$dbhubPick[''action'']; restarted = [bool]$dbhubPick[''restarted'']; recovered = [bool]$dbhubPick[''recovered'']; seconds = [int]$dbhubPick[''seconds'']; atUtc = [string]$dbhubPick[''atUtc'']; restartUtc = [string]$dbhubPick[''restartUtc'']; stoppedBy = [string]$dbhubPick[''stoppedBy'']; by = [string]$dbhubPick[''by'']; reason = $dbhubWhy } }')
+        $lines.Add('        }')
         $lines.Add('    }')
-        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts; golden = $dbhubGolden }} }}' -f $item))
+        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts; golden = $dbhubGolden; guestRecovery = $dbhubRecovery }} }}' -f $item))
         $lines.Add('}')
         $lines.Add('[Console]::Out.WriteLine(''DBHUBDEMO-WORKLOAD '' + (ConvertTo-Json -InputObject $dbhubShort -Depth 4 -Compress))')
     }
@@ -664,7 +679,9 @@ function Send-DemoProfileRunCommand {
                     source                          = [ordered]@{ script = $script }
                     asyncExecution                  = $true
                     treatFailureAsDeploymentFailure = $false
-                    timeoutInSeconds                = 900
+                    # 30 minutes: a T2 relay that finds PowerShell Direct broken restarts the guest and waits for it
+                    # (issue #65), and Run Command ends a script at its timeout.
+                    timeoutInSeconds                = 1800
                 }
             }
             $bodyPath = Write-DemoPrivateFile -Directory $directory -Name ('{0}.json' -f $vm) -Content ($body | ConvertTo-Json -Depth 6 -Compress)
@@ -909,6 +926,11 @@ function Invoke-DemoActivitySwitch {
         $item = [string]$record.Target
         $checkId = '{0}.INCIDENTS_{1}' -f $CheckPrefix, $item
         $evidence = [ordered]@{ profile = $name; interim = 'baseline'; vm = $record.VmName; outcome = $record.Outcome; seconds = $record.Seconds; runCommand = 'DbHubDemo-Profile' }
+        # A restart of T2's guest that cleared a broken PowerShell Direct channel (issue #65); DEPLOY.T2.GUESTRESTART reports it.
+        $recovery = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $record.Data -Name 'evidence') -Name 'guestRecovery'
+        if ($null -ne $recovery) {
+            $evidence['guestRecovery'] = $recovery
+        }
         $fix = './scripts/demo-control.ps1 -Target {0} -Scenario {1} -Duration 240 sets it (or ./scripts/start-demo.ps1 -ActivityProfile {1}); until then the baseline runs, until the next auto-shutdown.' -f $item, $name
         switch ($record.Outcome) {
             'Set' {
@@ -1151,6 +1173,11 @@ function Wait-DemoActivityInterim {
         $checkId = '{0}.INTERIM_{1}' -f $CheckPrefix, $item
         $attempts = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $entry.Data -Name 'evidence') -Name 'attempts'
         $evidence = [ordered]@{ profile = $interim; switchTo = $name; vm = $vm; outcome = [string]$entry.Outcome; seconds = $entry.Seconds; attempts = $attempts; runCommand = 'DbHubDemo-Profile' }
+        # A restart of T2's guest that cleared a broken PowerShell Direct channel (issue #65); DEPLOY.T2.GUESTRESTART reports it.
+        $recovery = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $entry.Data -Name 'evidence') -Name 'guestRecovery'
+        if ($null -ne $recovery) {
+            $evidence['guestRecovery'] = $recovery
+        }
         $fix = './scripts/validate.ps1 -Area Workload -Target {0} says whether {0}''s runner answers now. If this run''s switch to {1} ({2}.INCIDENTS_{0}) didn''t pass, set it once it does: ./scripts/demo-control.ps1 -Target {0} -Scenario {1} -Duration 240.' -f $item, $name, $CheckPrefix
         $risk = 'This run''s own Run Commands there went on, so the profile stored there could run its incidents beside them.'
         switch ([string]$entry.Outcome) {

@@ -7,7 +7,7 @@ Latch contention in tempdb for T2 (and any target): many sessions creating and d
 - **Why the index:** SQL Server caches and reuses temporary tables created in a procedure; changing a table's definition after `CREATE TABLE` stops that, so every iteration allocates pages and system catalog rows in tempdb, the source of the `PAGELATCH` waits.
 - **Scope:** the `#tables` belong to the scenario's own sessions and are dropped every iteration (at most about 800 KB per session at a time). tempdb is the only place outside `ContosoCare` the scenario touches, as any `#table` does.
 - **Expected signals:** Buffer Latch waits (`PAGELATCH_EX`, `PAGELATCH_SH`, `PAGELATCH_UP`) on tempdb pages; `Temp Tables Creation Rate`, `Active Temp Tables`, and `Free Space in tempdb (KB)`; `SQL Re-Compilations/sec` and CPU rising with the DDL churn.
-- **By target:** T1's tempdb is on the VM's local temporary disk; T2's is in the guest. Azure SQL Database (T3) manages tempdb, and at 1 vCore or less fewer sessions run at once, so expect fewer latch waits and more CPU waits there.
+- **By target:** T1's tempdb is on the VM's local temporary disk; T2's is in the guest. Azure SQL Database (T3) manages tempdb, so expect fewer latch waits and more CPU waits there (seen at 1 vCore; T3's maximum is 2 vCores since 2026-11-18).
 - **Reset:** nothing persists; SQL Server drops any `#table` that remains when its session closes, and `reset` kills leftover `ContosoCare.Demo/` sessions.
 
 ```powershell

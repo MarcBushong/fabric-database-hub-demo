@@ -13,8 +13,9 @@ capacity fabric.capacityName, the lakehouse with lakehouse schemas), and every l
 (FABRIC.RESOLVE.*). fabric.workspaceId and fabric.lakehouseId, when set, are overrides used as they are. It runs
 after the subscription guard, and -WhatIf creates nothing.
 
-Step 1, the Database Hub checklist (Invoke-DemoHubReadiness; -SkipHubChecks skips it). Database Hub (preview)
-has no public API or ARM resource, so the checklist uses documented interfaces only and never calls a Hub route
+Step 1, the Database Hub checklist (Invoke-DemoHubReadiness; -SkipHubChecks skips it). Database Hub (generally
+available since 2026-11-17) has no public API or ARM resource, so the checklist uses documented interfaces only and
+never calls a Hub route
 (docs/architecture.md, "Database Hub integration"):
 - The subscription guard first: it stops the checklist with Fail unless the Azure CLI context matches the
   configured subscription and tenant and a token is available without interaction. It never signs in.
@@ -52,6 +53,9 @@ validates fabric/realtime/RealTimeDashboard.json and fills in the demo resource 
 creates the KQLDashboard item or overrides its definition, then reads the definition back with Get Item Definition
 (FABRIC.IMPORT.* and FABRIC.READBACK.*). The dashboard's data source is the documented SQL ADX proxy, queried with
 each viewer's own identity; the definition holds no credential and no ID. -WhatIf validates it and shows the plan.
+After a passing import and read-back, the presenters in presenterObjectIds get the Viewer role on the demo workspace
+when they have no role there yet, which shares the dashboard with them (Grant-DemoPresenterWorkspaceAccess,
+FABRIC.PRESENTER.VIEWER, 2026-11-18): Fabric's REST API has no operation to share one item.
 
 Step 4, the dashboard's data (Phase 18; after a passing import and read-back, or alone with -CheckDashboardData).
 Test-DemoRealTimeDashboardData runs each tile's KQL, read-only, against the telemetry endpoint for the last 24
@@ -525,6 +529,11 @@ if ($ImportDashboard) {
             $imported = @(Import-DemoFabricItem -WorkspaceId $importWorkspaceId -Item $dashboard -Token $dashboardToken -TimeoutSeconds $TimeoutSeconds -ReadBack -Confirm:$false)
             $results.AddRange([object[]]$imported)
             $dashboardImported = $imported.Count -eq 2 -and @($imported | Where-Object { $_.status -ne 'Pass' }).Count -eq 0
+            if ($dashboardImported) {
+                # 2026-11-18: the dashboard shared with the presenters in presenterObjectIds, as Viewers of the demo workspace,
+                # because Fabric's REST API has no operation to share one item (FABRIC.PRESENTER.VIEWER).
+                $results.Add((Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $importWorkspaceId -Token $dashboardToken -Confirm:$false))
+            }
         }
         else {
             $results.Add((New-DemoResult -CheckId ('FABRIC.IMPORT.' + ($dashboard.DisplayName.ToUpperInvariant() -replace '[^A-Z0-9_]', '_')) `

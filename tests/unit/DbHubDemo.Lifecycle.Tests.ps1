@@ -1318,7 +1318,11 @@ Describe 'Invoke-DemoDeployment' {
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
             'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'App', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
-        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+        # The Database Agent loop's one-time selection (2026-11-18) is the one item a person confirms: it never keeps DONE.
+        $summary = $results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }
+        $summary.status | Should -Be 'Manual action required'
+        $summary.message | Should -Match 'Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Database Agents on T3, once per deployment'
+        ($results | Where-Object { $_.checkId -eq 'HUB.AGENT.T3' }).message | Should -Match 'select azuresql01-[a-z0-9]{6}/ContosoCare'
         $script:state.Stage | Should -Be 'Validation'
         @($script:state.BundleSentTo | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
         @($script:state.RunnerSentTo | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
@@ -1805,6 +1809,23 @@ Describe 'Stop-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT3 -MockWith { $script:order.Add('RemoveT3'); New-TestResult 'T3.REMOVE' 'Pass' 't3' 'T3' }
         Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { @() }
+        # T3's FORCE_LAST_GOOD_PLAN (2026-11-18) has its own tests (DbHubDemo.T3Agent.Tests.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT3State -MockWith { [pscustomobject]@{ Exists = $true; Status = 'Online'; ServerName = 'azuresql01-abc123'; DeploymentId = 'abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $null }
+    }
+
+    It 'puts T3''s FORCE_LAST_GOOD_PLAN back after the deallocation only when T3''s profile went off during a session (2026-11-18)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $script:order.Add('AutoTuning'); New-TestResult 'STOP.T3.AUTOTUNING' 'Pass' 'infra' 'T3' }
+        $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'AutoTuning')
+        @($results | Where-Object { $_.checkId -eq 'STOP.T3.AUTOTUNING' }).Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly -ParameterFilter { $Restore -and $CheckId -eq 'STOP.T3.AUTOTUNING' -and $T3.ServerName -eq 'azuresql01-abc123' }
+        # sqlvm01 deallocated already: no session ran, so T3 isn't read (it would wake a paused T3); -ParkT2 leaves T3 alone.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        Stop-DemoEnvironment -Config $config -ParkT2 -Confirm:$false | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly
     }
 
     It 'sends the deletes of a running VM''s chunk Run Commands right before its deallocate, which completes them (R871)' {

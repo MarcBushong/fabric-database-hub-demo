@@ -366,7 +366,9 @@ function Invoke-DemoParallelDeployment {
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
     builds, and a VM track whose VM doesn't goes back to its Artifacts step, with the steps after it, and says why
-    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); -ProgressPath is the status
+    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); a resume starts from preflight
+    instead when T4's server doesn't exist (DEPLOY.T4.MISSING) or T3's database doesn't have the profile's maximum vCores
+    (DEPLOY.T3.SCALE, 2026-11-18), so the template creates or scales it; -ProgressPath is the status
     page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
@@ -523,6 +525,16 @@ function Invoke-DemoParallelDeployment {
             $state = Get-DemoDeploymentState -Config $Config
         }
     }
+    # 2026-11-18 (the owner's decision): T3's database at other maximum vCores than the profile sets, as an existing
+    # lowest-cost T3 at 1 vCore: a resume would skip the template that scales it, so this run starts from preflight too.
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $scaleT3 = Get-DemoT3ScaleResult -Config $Config -State $state
+        if ($null -ne $scaleT3) {
+            $results.Add($scaleT3)
+            Write-DemoLog -Message $scaleT3.message
+            $Resume = [switch]::new($false)
+        }
+    }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
     # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
@@ -622,6 +634,11 @@ function Invoke-DemoParallelDeployment {
     if ($WaitForT2) {
         $TrackTimeoutMinutes = [System.Math]::Min(600, [System.Math]::Max($TrackTimeoutMinutes, $T2WaitMinutes + 65 + 30 + $ArcWaitMinutes + 30 + $TelemetryWaitMinutes + 15))
     }
+    # Issue #65: this run's key for the T2 host's guest restart that clears a broken PowerShell Direct channel, so the host
+    # restarts the guest at most once for this run, and a rerun gets its own. The track processes get it in their context.
+    $recoveryModel = Read-DemoProgress -Path $ProgressPath
+    $recoveryKey = New-DemoRunRecoveryKey -RunId $(if ($null -ne $recoveryModel) { [string]$recoveryModel['runId'] } else { '' })
+    Set-DemoRunRecoveryKey -Key $recoveryKey
     $context = @{
         NetworkMode           = $state.NetworkMode
         T3UseFreeLimit        = $state.T3UseFreeLimit
@@ -644,6 +661,9 @@ function Invoke-DemoParallelDeployment {
         PagePath              = $PagePath
         # Why a resumed track sends its VM's artifacts again, by track; its Artifacts step says it (2026-11-06).
         ResendNote            = $resend.Notes
+        RecoveryKey           = $recoveryKey
+        # Since when a guest restart counts as this run's (DEPLOY.T2.GUESTRESTART), the interim baseline's included.
+        RunStartUtc           = $startUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
     }
     $ensureContext = {
         if (-not $context.NetworkMode) {
@@ -1269,6 +1289,14 @@ function Invoke-DemoParallelDeployment {
             $status = Invoke-DemoWorkloadCommand -Config $Config -Target 'T1' -ArgumentList 'status', '--json' -TimeoutSeconds 300 -Confirm:$false
             $results.Add($status.Result)
         }
+        if ($t1Done) {
+            # The Database Agent loop's one manual step, once per deployment (2026-11-18): under "Please confirm" on the
+            # status page and in the run's summary, with Database Hub's link and T3's exact database (HUB.AGENT.T3).
+            $agentItem = Get-DemoT3AgentSetupItem -Config $Config -ServerName ('azuresql01-{0}' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Tags') -Name 'deploymentId'))
+            if ($null -ne $agentItem) {
+                $results.Add($agentItem)
+            }
+        }
         if ($fabricDone) {
             # The T3 gate's extended property: T1's track read it (T3.PROPERTY); a resumed run reads it from T1 now.
             $property = @($results) | Where-Object { [string]$_.checkId -eq 'T3.PROPERTY' -and [string]$_.status -in 'Pass', 'Fail' } | Select-Object -Last 1
@@ -1368,6 +1396,17 @@ function Invoke-DemoParallelDeployment {
     }
     # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
     & $addAll @(Get-DemoRunCommandStuckResult -Clear)
+    # Issue #65: each recovery from a broken PowerShell Direct channel into T2's guest during this run, once
+    # (DEPLOY.T2.GUESTRESTART or DEPLOY.T2.GUESTRETRY), the interim baseline's and the switch's included, which the T2
+    # track doesn't see.
+    $guestRestarts = @(Get-DemoGuestRecoveryRunResult -Result $results.ToArray() -SinceUtc $startUtc -CheckPrefix 'DEPLOY')
+    if ($guestRestarts.Count -gt 0) {
+        & $addAll $guestRestarts
+        foreach ($item in $guestRestarts) {
+            Write-DemoLog -Level Warning -Message ('{0}: {1}' -f [string]$item.checkId, [string]$item.message)
+        }
+    }
+    Set-DemoGuestRecoveryProgress -ProgressPath $ProgressPath -Result $results.ToArray()
 
     $all = $results.ToArray()
     # 2026-11-09: T4 out of this deployment is never silent (DEPLOY.T4.OFF): a Fail, because DONE needs T4, with the reason
