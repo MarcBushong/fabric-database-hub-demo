@@ -561,7 +561,8 @@ function Get-DemoFabricAppDeploymentRecord {
     <#
     .SYNOPSIS
     Reads the active deployment that 'rayfin up' recorded in the stage (rayfin/.deployments.json): item name and ID,
-    workspace, hosting URL, and the portal deep link. Never returns the publishable key. Null when there is none.
+    workspace, hosting URL, the app's API (fabricApiUrl, which the Manage function checks callers' keys at), and the
+    portal deep link. Never returns the publishable key. Null when there is none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -592,6 +593,7 @@ function Get-DemoFabricAppDeploymentRecord {
         WorkspaceId = [string]$record['fabricWorkspaceId']
         TenantId    = [string]$record['fabricTenantId']
         HostingUrl  = [string]$record['hostingUrl']
+        ApiUrl      = [string]$record['fabricApiUrl']
         ItemUrl     = [string]$record['fabricDeepLink']
     }
 }
@@ -850,4 +852,82 @@ function Test-DemoFabricAppTenantSetting {
         $parts.Add(('not found among the {0} settings the admin API returned (the preview may have renamed it): {1}' -f $items.Count, ($notFound -join ', ')))
     }
     return (& $result 'Warning' ('The Fabric tenant settings the Insights app needs aren''t all on for the organization ({0}). The app isn''t created, or its queries fail, while one is off; that doesn''t keep the run from DONE.' -f ($parts -join '; ')) $evidence $steps)
+}
+
+function Get-DemoT2MigrationPortalLink {
+    <#
+    .SYNOPSIS
+    The Azure portal page of T2's SQL Server instance enabled by Azure Arc, built from the instance resource's own ID, for
+    the Insights app's migration card when Database Hub isn't read live (2026-11-18). Internal.
+
+    .DESCRIPTION
+    Learn's path to an instance's migration assessment is its SQL Server resource, then Migration, Assessments
+    (https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment). The portal documents no link to that
+    menu item, so the link opens the resource, and the app names the rest of the path. Read-only: one list of the
+    resource group's Microsoft.AzureArcData/sqlServerInstances through Invoke-DemoAz, pinned to the configured
+    subscription; the instance hosted on T2's Arc machine is taken, the default instance (MSSQLSERVER) first. Returns ''
+    when T2 has no instance resource yet, or when Azure can't be read: the app then names the whole path.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $tenantId = [string]$Config['tenantId']
+    if ($tenantId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return ''
+    }
+    try {
+        $target = Get-DemoArcTarget -Config $Config
+        # Both return their array as one object (return , $array), as Get-DemoArcState reads them: no @() around them.
+        $instances = Get-DemoArmCollection -SubscriptionId $target.SubscriptionId -Url $target.SqlInstancesUrl
+        $hosted = Select-DemoArcSqlInstance -Instance $instances -MachineId $target.MachineId
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('T2''s SQL Server instance couldn''t be read, so the Insights app names the Azure portal path to its migration assessment instead of linking it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return ''
+    }
+    $defaultFirst = @($hosted | Sort-Object -Property @{ Expression = { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'instanceName') -ne 'MSSQLSERVER' } })
+    foreach ($instance in $defaultFirst) {
+        $id = [string](Get-DemoMemberValue -InputObject $instance -Name 'id')
+        if ($id -match '^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[\w.()-]{1,90}/providers/Microsoft\.AzureArcData/sqlServerInstances/[A-Za-z0-9._-]{1,128}$') {
+            return ('https://portal.azure.com/#@{0}/resource{1}' -f $tenantId.ToLowerInvariant(), $id)
+        }
+    }
+    return ''
+}
+
+function Get-DemoFabricAppManageCatalog {
+    <#
+    .SYNOPSIS
+    The session control's own rules for the Insights app's Manage function (ADR 0029), from the same runbook settings the
+    control's runbooks and NB_DatabaseHub_Control's CATALOG_JSON come from: its targets (T5 only while it's on), its
+    incidents, a run's minutes, and a session's (the showcase's). So the function sends only what the control accepts.
+    Names and numbers only. Null when the settings can't be built. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    try {
+        # The identity's client ID only goes into the runbooks' own copy, so the placeholder changes nothing here.
+        $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '00000000-0000-0000-0000-000000000000'
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The control''s catalog for the Insights app''s Manage function couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $null
+    }
+    $showcase = $setting['profiles']['showcase']
+    return [ordered]@{
+        targets            = @($setting['targets'].Keys | ForEach-Object { [string]$_ })
+        scenarios          = $setting['scenarios']
+        minDurationMinutes = [int]$setting['minDurationMinutes']
+        maxDurationMinutes = [int]$setting['maxDurationMinutes']
+        session            = [ordered]@{ minMinutes = [int]$setting['minSessionMinutes']; maxMinutes = [int]$showcase['maxMinutes']; defaultMinutes = [int]$showcase['defaultMinutes'] }
+    }
 }

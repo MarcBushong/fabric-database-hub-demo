@@ -4,6 +4,8 @@
 import type { EstateAnswer, EstateReader, EstateView } from "../data/live-estate";
 
 const SCOPE = { subscriptionId: "00000000-0000-0000-0000-000000000000", resourceGroups: ["rg-dbhub-sample"] };
+const USAGE_WINDOW = { startTime: "2026-11-17T21:00:00Z", endTime: "2026-11-18T21:00:00Z", granularity: "PT1H" };
+const NO_SUMMARIES = { performanceIssueSummary: null, performanceEnhancementSummary: null, coverage: null, errors: [] };
 
 export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer<V> } {
     return {
@@ -14,13 +16,32 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
             errors: [],
             at,
             data: {
-                totalCount: 6,
-                countByType: { AzureSql: 1, AzureSqlVM: 1, ArcSql: 1, PostgreSql: 2, CosmosDb: 1 },
+                // As the function counts them: sqlvm01 twice, its SQL virtual machine and its SQL Server instance from
+                // unified inventory (live, 2026-11-18). The app shows one row per resource.
+                totalCount: 7,
+                countByType: { AzureSql: 1, AzureSqlVM: 2, ArcSqlServer: 1, PostgreSql: 2, CosmosDb: 1 },
                 complete: true,
                 resources: [
                     { databaseType: "AzureSql", name: "ContosoCare", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online", issues: { security: { hasPublicNetworkAccessIssue: false, hasTdeIssue: false }, optimization: {} }, enhancements: { security: { hasLedgerIssue: true, hasCmkIssue: true }, optimization: {} } },
-                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online", issues: { optimization: { hasPaygLicenseIssue: true } } },
-                    { databaseType: "ArcSql", name: "arcsql01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Connected", issues: { security: {}, optimization: {} } },
+                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Unknown", issues: { security: {}, optimization: { hasPaygLicenseIssue: false } } },
+                    { databaseType: "AzureSqlVM", name: "sqlvm01", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Connected", issues: { security: {}, optimization: {} } },
+                    {
+                        databaseType: "ArcSqlServer",
+                        name: "arcsql01",
+                        resourceGroup: "rg-dbhub-sample",
+                        location: "westus3",
+                        status: "Connected",
+                        issues: { security: {}, optimization: { hasMigrationAssessmentIssue: false, hasPaygLicenseIssue: false, hasUsageReportingIssue: false } },
+                        // Ready to migrate: Database Hub carries it in the row, not as an issue (live on dbhubal, 2026-11-18).
+                        migrationAssessment: {
+                            enabled: true,
+                            uploadedAt: new Date(Date.parse(at) - 3 * 3600000).toISOString(),
+                            dataStatus: "Available",
+                            targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+                            readyTargets: ["azureSqlManagedInstance", "azureSqlVirtualMachine"],
+                            hasIssue: false,
+                        },
+                    },
                     { databaseType: "PostgreSql", name: "pgflex01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Ready", issues: { security: { hasEntraAuthenticationIssue: false } }, enhancements: { security: { hasCmkIssue: true } } },
                     { databaseType: "PostgreSql", name: "pgreplica01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Ready", enhancements: { security: { hasCmkIssue: true } } },
                     { databaseType: "CosmosDb", name: "cosmos01-sample", resourceGroup: "rg-dbhub-sample", location: "westus3", status: "Online" },
@@ -35,9 +56,10 @@ export function sampleLiveAnswers(at: string): { [V in EstateView]: EstateAnswer
             at,
             data: {
                 window: { startTime: "2026-11-17T21:00:00Z", endTime: "2026-11-18T21:00:00Z", granularity: "PT1H", aggregation: "maximum" },
-                microsoftSql: { totalDatabases: 3, highUsage: { cpu: 1, storage: 0, memory: 0 } },
-                postgreSql: { totalDatabases: 2, highUsage: { cpu: 0, storage: 0, memory: 0 } },
-                cosmosDb: { totalAccounts: 1, minimumServiceAvailability: 100, maximumNormalizedRu: 100, note: "Cosmos DB reports availability and normalized RU only." },
+                // As the function passes them: every metric's count, zeros included, and the databases behind a high one.
+                microsoftSql: { ...USAGE_WINDOW, totalDatabases: 3, highUsage: { cpu: 1, storage: 0, memory: 0 }, highUsageResources: { cpu: [{ name: "ContosoCare" }] }, ...NO_SUMMARIES },
+                postgreSql: { ...USAGE_WINDOW, totalDatabases: 2, highUsage: { cpu: 0, storage: 0, memory: 0 }, ...NO_SUMMARIES },
+                cosmosDb: { totalAccounts: 1, processedAccounts: 1, resourcesWithData: 1, minimumServiceAvailability: 100, maximumNormalizedRu: 100, pages: 1, complete: true, note: "Cosmos DB reports availability and normalized RU only." },
             },
         },
         security: {

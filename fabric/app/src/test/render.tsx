@@ -10,7 +10,7 @@ import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess } from "@/app-context";
 import type { CopilotApi } from "@/copilot/contract";
 import { CopilotContext } from "@/copilot/use-copilot";
-import { setLiveEstateReader } from "@/data/live-estate";
+import { setLiveEstateReader, type EstateReader } from "@/data/live-estate";
 import { toMeta } from "@/data/model";
 import type { QuerySpec } from "@/data/queries";
 import type { QueryClient, QueryResult, Row } from "@/data/query-client";
@@ -29,7 +29,11 @@ export const RUNTIME: AppRuntime = {
     itemId: ZERO,
     portalUrl: "https://app.fabric.microsoft.com",
     resourceGroup: "rg-dbhub-test",
-    links: { report: "https://app.fabric.microsoft.com/groups/x/reports/y" },
+    links: {
+        report: "https://app.fabric.microsoft.com/groups/x/reports/y",
+        controlNotebook: "https://app.fabric.microsoft.com/groups/c/synapsenotebooks/n",
+        t2MigrationAssessment: "https://portal.azure.com/#@00000000-0000-0000-0000-000000000000/resource/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhub-test/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01",
+    },
 };
 
 const bins = (target: "T1" | "T2" | "T3" | null, hours: number, base: number): Row[] =>
@@ -225,12 +229,16 @@ export interface RenderOptions {
     manage?: ManageAccess;
     /** No history yet: the first run. */
     metaEmpty?: boolean;
-    /** Database Hub's live answers: the sample's, or none (the app's function isn't deployed), the default. */
-    live?: "sample" | "off";
+    /** Database Hub's live answers: the sample's, none (the app's function isn't deployed; the default), or a reader's. */
+    live?: "sample" | "off" | EstateReader;
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
-    setLiveEstateReader(sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "the live estate function isn't deployed in this app" }));
+    setLiveEstateReader(
+        typeof options.live === "function"
+            ? options.live
+            : sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "The live estate function isn't deployed in this app." }),
+    );
     const setView = vi.fn();
     const navigate = vi.fn();
     const notify = vi.fn();

@@ -293,6 +293,8 @@ export interface Bin {
     ioMb: number | null;
     batch: number | null;
     sessions: number | null;
+    /** The bin's wait seconds per category, when the incident's waits query read them (withCategoryWaits). */
+    waits?: Readonly<Record<string, number>>;
 }
 
 export function toBins(rows: readonly Row[], target?: TargetKey): Bin[] {
@@ -344,6 +346,22 @@ export function toWaitBins(rows: readonly Row[]): WaitBin[] {
         if (at && seconds !== null && text(r.Metric)) out.push({ at, category: text(r.Metric), seconds });
     }
     return out;
+}
+
+/** The bins with their waits per category from the same window's waits query, so a wait family's own series (Tran Log
+ *  IO, Buffer Latch, Network IO...) can be read bin by bin. A bin that query has no row for keeps none. */
+export function withCategoryWaits(bins: readonly Bin[], waits: readonly WaitBin[]): Bin[] {
+    const byAt = new Map<number, Record<string, number>>();
+    for (const w of waits) {
+        const categories = byAt.get(w.at.getTime()) ?? {};
+        categories[w.category] = (categories[w.category] ?? 0) + w.seconds;
+        byAt.set(w.at.getTime(), categories);
+    }
+    if (byAt.size === 0) return [...bins];
+    return bins.map((b) => {
+        const categories = byAt.get(b.at.getTime());
+        return categories ? { ...b, waits: categories } : b;
+    });
 }
 
 export interface Incident {
@@ -740,6 +758,22 @@ export function toCosmosCapture(rows: readonly Row[]): CosmosCapture | null {
 /** One metric of the capture, oldest first. */
 export function cosmosSeries(capture: CosmosCapture | null, metric: string): CosmosPoint[] {
     return capture ? capture.points.filter((p) => p.metric === metric) : [];
+}
+
+/** The runs of intervals that throttled: a 429 in the interval, or normalized RU at 100 %. */
+export function throttledRuns(capture: CosmosCapture | null): Array<{ from: Date; to: Date }> {
+    if (!capture) return [];
+    const step = (capture.intervalMinutes ?? 1) * 60000;
+    const hot = new Set<number>();
+    for (const p of cosmosSeries(capture, COSMOS_METRICS.throttled)) if (p.value > 0) hot.add(p.at.getTime());
+    for (const p of cosmosSeries(capture, COSMOS_METRICS.normalizedRu)) if (p.value >= 100) hot.add(p.at.getTime());
+    const runs: Array<{ from: Date; to: Date }> = [];
+    for (const at of [...hot].sort((a, b) => a - b)) {
+        const last = runs[runs.length - 1];
+        if (last && at <= last.to.getTime()) last.to = new Date(at + step);
+        else runs.push({ from: new Date(at), to: new Date(at + step) });
+    }
+    return runs;
 }
 
 export interface ThrottleEpisode {

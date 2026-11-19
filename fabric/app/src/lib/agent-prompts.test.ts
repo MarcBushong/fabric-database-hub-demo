@@ -70,9 +70,11 @@ describe("incident prompts for the Database Agent", () => {
         expect(signalClause(incident(), { ...COMPARISON, ratio: 1.1 }, 5)).toBe("Buffer IO (PAGEIOLATCH) waits peaked at 11.5 s per 5-minute bin");
         expect(signalClause(incident(), null)).toBe("Buffer IO (PAGEIOLATCH) waits peaked at 11.5 s");
         expect(signalClause(incident({ family: "cpu", peakValue: null }), null)).toBe("the history recorded a cpu pressure window");
-        expect(signalClause(incident({ family: "cpu" }), { ...COMPARISON, kind: "percent", peak: 97.5, ratio: 2.4, baseline: 30 })).toBe(
+        expect(signalClause(incident({ family: "cpu" }), { ...COMPARISON, signal: "CPU", kind: "percent", peak: 97.5, ratio: 2.4, baseline: 30 })).toBe(
             "CPU peaked at 97.5 % and averaged about 2.4 times the baseline (30.0 % in the 30 minutes before)",
         );
+        // The words come from the comparison, so they always match its numbers, also when it fell back to all waits.
+        expect(signalClause(incident({ family: "tran_log" }), { ...COMPARISON, signal: "wait time", ratio: 0.8 })).toBe("wait time peaked at 11.5 s per bin");
     });
 
     it("gives four hub prompts that never ask the agent to act", () => {
@@ -155,6 +157,7 @@ describe("prompt helpers", () => {
         expect(isoMinute(at(9, 5))).toBe("2026-10-22T09:05Z");
         expect(timesPhrase(3.93)).toBe("about 4 times");
         expect(timesPhrase(1.84)).toBe("about 1.8 times");
+        expect(timesPhrase(1610)).toBe("more than 100 times");
         expect(binMinutes([{ at: at(10, 0) }, { at: at(10, 5) }, { at: at(10, 15) }])).toBe(5);
         expect(binMinutes([{ at: at(10, 0) }])).toBeNull();
         expect(describeTarget("T2", NAMES)).toBe("T2 (Arc-enabled SQL Server arcsql01)");

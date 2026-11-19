@@ -52,7 +52,7 @@ export interface VisualCardProps {
     askPrompt?: string;
     /** Hide the provenance chip (a page that says it once already). */
     quiet?: boolean;
-    /** Live data from Database Hub instead of the history: when it was read, the routes that answered, and the ones that failed. */
+    /** Live data from Database Hub instead of the history: when it was read, the API calls that answered, and the ones that failed. */
     live?: LiveSource | null;
     children: ReactNode;
 }
@@ -130,7 +130,7 @@ export function VisualCard(props: VisualCardProps) {
                     <MenuList>
                         {props.live ? (
                             <MenuItem icon={<Code16Regular />} onClick={() => setShowDax((v) => !v)}>
-                                {showDax ? "Hide the Database Hub routes" : "Show the Database Hub routes"}
+                                {showDax ? "Hide the Database Hub API calls" : "Show the Database Hub API calls"}
                             </MenuItem>
                         ) : (
                             <>
@@ -182,9 +182,9 @@ export function VisualCard(props: VisualCardProps) {
             {showDax && props.live ? (
                 <div className="vcard-dax">
                     <p className="vcard-meta">
-                        <strong>Database Hub routes</strong> · read-only, through the app's function, scoped to the demo's resource groups
+                        <strong>Database Hub API</strong> · read-only calls through the app's function, scoped to the demo's resource groups
                     </p>
-                    <pre className="vcard-routes" aria-label="Database Hub routes">
+                    <pre className="vcard-routes" aria-label="Database Hub API">
                         {[...props.live.source, ...props.live.errors.map((e) => `failed: ${e}`)].join("\n")}
                     </pre>
                 </div>
@@ -222,7 +222,7 @@ export function VisualCard(props: VisualCardProps) {
             {props.live ? (
                 <footer className="vcard-foot">
                     <ProvenanceBadge provenance="live" asOf={new Date(props.live.at)} />
-                    {props.live.errors.length > 0 ? <span className="vcard-partial">{`Partial: ${props.live.errors.length} of ${props.live.source.length + props.live.errors.length} routes failed`}</span> : null}
+                    {props.live.errors.length > 0 ? <span className="vcard-partial">{`Partial: ${props.live.errors.length} of ${props.live.source.length + props.live.errors.length} API calls failed`}</span> : null}
                 </footer>
             ) : !props.quiet && (props.fetchedAt || provenance !== "history") ? (
                 <footer className="vcard-foot">

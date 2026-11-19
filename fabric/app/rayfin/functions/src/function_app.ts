@@ -4,7 +4,9 @@
 import { UserDataFunctions } from "@microsoft/fabric-user-data-functions";
 
 import { registerEstate } from "./estate.js";
+import { registerManage } from "./manage.js";
 
 const udf = new UserDataFunctions();
 
 registerEstate(udf);
+registerManage(udf);

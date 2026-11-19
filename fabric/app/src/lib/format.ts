@@ -99,6 +99,19 @@ export function formatAgoShort(date: Date | null, now: Date = new Date()): strin
     return `${Math.floor(minutes / 1440)} d ago`;
 }
 
+/** A message as a clause inside a sentence: one line, trimmed, without its closing periods. */
+export function clause(text: string): string {
+    return text.replace(/\s+/g, " ").trim().replace(/\.+$/, "");
+}
+
+/** A message as one sentence: capitalized, ending with exactly one period (or its own ? ! …). */
+export function sentence(text: string): string {
+    const body = clause(text);
+    if (!body) return "";
+    const capitalized = body.charAt(0).toUpperCase() + body.slice(1);
+    return /[!?\u2026]$/.test(capitalized) ? capitalized : `${capitalized}.`;
+}
+
 /** A table cell as the visual's data table shows it, by the column's kind. */
 export function formatCell(column: { kind: string }, value: unknown): string {
     if (value === null || value === undefined || value === "") return "–";

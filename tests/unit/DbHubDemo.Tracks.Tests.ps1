@@ -1171,9 +1171,11 @@ Describe 'Invoke-DemoDeploymentTrack' {
             $script:powerBIRuns++
             if ($script:powerBIRuns -eq 1) {
                 New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh ended with status Failed: | 0xC14700C7 We cannot access the source Delta table ''<oii>scenario_runs</oii>'' referenced by table ''<oii>Scenario Runs</oii>''.'
+                New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DATA' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The import or the refresh of the semantic model didn''t pass, so its measures weren''t evaluated.'
             }
             else {
                 New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Refreshed the semantic model (Direct Lake framing) in about 5 seconds.'
+                New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DATA' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every measure of the history model returned a value.'
             }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { $script:calls.Add('fabric app'); New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
@@ -1185,6 +1187,8 @@ Describe 'Invoke-DemoDeploymentTrack' {
         @($script:calls | Where-Object { $_ -in 'fabric stage', 'powerbi', 'job read', 'fabric app' }) | Should -Be @('fabric stage', 'powerbi', 'job read', 'powerbi', 'fabric app')
         @($outcome.Results | Where-Object { [string]$_.status -eq 'Fail' }).Count | Should -Be 0
         @($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.REFRESH' } | ForEach-Object { [string]$_.status }) | Should -Be @('Warning', 'Pass')
+        # The first model step's "Not selected" data check goes once the follow-up's step checked the data (the review of #68).
+        @($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' } | ForEach-Object { [string]$_.status }) | Should -Be @('Pass')
         ($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' }).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { $HistoryRunWaitMinutes -eq 45 }
     }

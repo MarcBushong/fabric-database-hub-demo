@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import EstatePage from "@/pages/EstatePage";
@@ -10,6 +10,8 @@ import OverviewPage from "@/pages/OverviewPage";
 import PerformancePage from "@/pages/PerformancePage";
 import ReadinessPage from "@/pages/ReadinessPage";
 import TrendsPage from "@/pages/TrendsPage";
+import { liveDataOf, type EstateAnswer, type EstateReader } from "@/data/live-estate";
+import { sampleLiveAnswers } from "@/preview/sample-live";
 import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
 
 /** A storage the test owns: newer Node versions put their own, empty localStorage in front of jsdom's. */
@@ -76,10 +78,39 @@ describe("Overview", () => {
         expect(navigate).toHaveBeenCalledWith("findings", { category: "security" });
     });
 
-    it("says in one line when nothing is read live", async () => {
+    it("says in one line when nothing is read live, with a neutral badge and one period per sentence", async () => {
         renderWithApp(<OverviewPage />);
-        expect(await screen.findByText(/Not read live here: the live estate function isn't deployed in this app\. Every page shows the history/)).toBeInTheDocument();
+        const line = await screen.findByText(/^The live estate function isn't deployed in this app\. Every page shows the history; Database Hub has the live view\.$/);
+        expect(line.textContent).not.toMatch(/\.\./);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(screen.queryByText(/^Live$/)).not.toBeInTheDocument();
     });
+
+    it("says why when the function answers with no data, instead of tiles that keep reading", async () => {
+        const reason = "The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1.";
+        const noScope: EstateReader = (view) => Promise.resolve({ view, source: [], scope: { subscriptionId: "", resourceGroups: [] }, data: {}, errors: [reason], at: "2026-10-21T21:00:00.000Z" });
+        renderWithApp(<OverviewPage />, { live: noScope });
+        const line = await screen.findByText(/^The estate function has no scope: deploy the app with scripts\/configure-fabric-app\.ps1\. Every page shows the history/);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+    });
+
+    it("reads health as the function passes it: a count it leaves out is zero, and Cosmos DB shows without an account count", async () => {
+        const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        const health = liveDataOf(sample.health);
+        if (!health?.microsoftSql || !health.postgreSql) throw new Error("The sample has SQL and PostgreSQL health.");
+        const partial: EstateAnswer<"health"> = {
+            ...sample.health,
+            data: { ...health, microsoftSql: { ...health.microsoftSql, highUsage: { cpu: 2 } }, postgreSql: { ...health.postgreSql, highUsage: {} }, cosmosDb: { ...health.cosmosDb, totalAccounts: null } },
+        };
+        const reader: EstateReader = (view) => Promise.resolve((view === "health" ? partial : sample[view]) as never);
+        renderWithApp(<OverviewPage />, { live: reader });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        const high = await within(live).findByRole("button", { name: /^High usage, last 24 hours: 2\./ });
+        expect(within(high).getByText("SQL: CPU 2")).toBeInTheDocument();
+        expect(within(live).getByRole("button", { name: /^Cosmos DB, last 24 hours: 100(\.0)? ?%\./ })).toBeInTheDocument();
+    });
+
     it("on the first run, says the one action that fills it: Run all in NB_DatabaseHub_Control", async () => {
         renderWithApp(<OverviewPage />, { client: fakeQueryClient({ "history-meta": [] }), metaEmpty: true });
         expect(await screen.findByText("No history yet")).toBeInTheDocument();
@@ -110,6 +141,16 @@ describe("Estate", () => {
         const ctx = vi.mocked(copilot.ask).mock.calls[0][0];
         expect(ctx.prompt).toMatch(/^Why did T3's CPU reach 120\.0 % at 21 Oct 10:00 UTC when its median/);
         expect(ctx.anomaly).toMatchObject({ metric: "CPU", target: "T3", unit: "%" });
+    });
+
+    it("shows on T2's page whether it's ready to migrate, live; other targets have no migration card", async () => {
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T2" }, live: "sample" });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(within(card).getByText(/^Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database\.$/)).toBeInTheDocument();
+        cleanup();
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T1" }, live: "sample" });
+        expect(await screen.findByRole("heading", { level: 1, name: /^T1 · / })).toBeInTheDocument();
+        expect(screen.queryByRole("region", { name: /migrat/i })).not.toBeInTheDocument();
     });
 
     it("shows T4 and its read replica from the latest PostgreSQL capture", async () => {
@@ -260,7 +301,7 @@ describe("Findings", () => {
 
     it("says why security isn't read live, links to Database Hub, and keeps the history's findings", async () => {
         renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" } });
-        expect(await screen.findByText(/^Not read live here: the live estate function isn't deployed in this app\./)).toBeInTheDocument();
+        expect(await screen.findByText(/^The live estate function isn't deployed in this app\. The table below is the history's own findings\.$/)).toBeInTheDocument();
         const panel = screen.getByRole("region", { name: "Security posture, live from Database Hub" });
         expect(within(panel).getByRole("link", { name: "Open Database Hub, then Security" })).toHaveAttribute("target", "_blank");
         await waitFor(() => expect(within(screen.getByRole("table", { name: "Findings" })).getAllByRole("row")).toHaveLength(2));
@@ -283,13 +324,29 @@ describe("Findings", () => {
         expect(ctx.dax).toBeUndefined();
     });
 
-    it("names T2's SQL Server instance for its migration assessment, and reads the optimization checks live", async () => {
-        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: "sample" });
-        const panel = screen.getByRole("region", { name: "Migration assessment, in Database Hub" });
-        expect(await within(panel).findByText(/T2's SQL Server instance arcsql01 shows as "migration assessment ready"/)).toBeInTheDocument();
-        expect(within(panel).getByRole("link", { name: "Open Database Hub, then Optimization" })).toHaveAttribute("rel", "noopener noreferrer");
-        const grid = await screen.findByRole("table", { name: "Live optimization checks" });
-        await waitFor(() => expect(within(grid).getByText("Pay-as-you-go SQL Server license: a license-model opportunity")).toBeInTheDocument());
+    it("shows T2 ready to migrate, live, with its readiness per Azure SQL target, and never as a Database Hub issue (2026-11-18)", async () => {
+        const { copilot } = renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: "sample" });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(within(card).getByText("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.")).toBeInTheDocument();
+        expect(within(card).getByRole("list", { name: "Readiness per Azure SQL target" }).textContent).toBe("ReadyAzure SQL Managed InstanceReadySQL Server on Azure Virtual MachinesNot readyAzure SQL DatabaseAsk why");
+        expect(within(card).getByText(/assessed by Azure Arc every week; this assessment was uploaded 21 Oct 18:00 UTC/)).toBeInTheDocument();
+        expect(within(card).getByText(/^A ready assessment isn't an issue, so Database Hub's issue lists don't show it\./)).toBeInTheDocument();
+        expect(within(card).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("href", expect.stringMatching(/^https:\/\/portal\.azure\.com\/#@0{8}-0{4}-0{4}-0{4}-0{12}\/resource\/subscriptions\/.+\/sqlServerInstances\/arcsql01$/));
+        fireEvent.click(within(card).getByRole("button", { name: "Ask Copilot" }));
+        expect(vi.mocked(copilot.ask).mock.calls[0][0]).toMatchObject({ prompt: "Which of my servers can move to Azure, and to what?", source: "live", visualId: "migration.readiness", totalRows: 3 });
+        fireEvent.click(within(card).getByRole("button", { name: "Ask why" }));
+        expect(vi.mocked(copilot.ask).mock.calls[1][0].prompt).toMatch(/^Why isn't arcsql01 ready for Azure SQL Database, and what would make it ready\?/);
+        // The optimization checks Database Hub raises: none on this estate, as live.
+        expect(await screen.findByText("Database Hub flags nothing here")).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/Optimization (view|issues?) (shows|lists) (T2|arcsql01)|migration assessment ready/i);
+    });
+
+    it("links T2's migration assessment in the Azure portal when Database Hub isn't read live, and names the path", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" } });
+        const panel = await screen.findByRole("region", { name: "T2's migration assessment" });
+        expect(within(panel).getByText(/In the Azure portal, open arcsql01, then, under Migration, select Assessments\.$/)).toBeInTheDocument();
+        expect(within(panel).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(within(panel).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("rel", "noopener noreferrer");
         expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
     });
 });
@@ -302,7 +359,24 @@ describe("Readiness", () => {
         fireEvent.click(screen.getByRole("tab", { name: /^All/ }));
         expect(within(screen.getByRole("table", { name: "Validation checks" })).getByText("t3-telemetry")).toBeInTheDocument();
     });
+
+    it("says what fills readiness before any validation run: Run all in NB_DatabaseHub_Control, or the validator by hand", async () => {
+        renderWithApp(<ReadinessPage />, { client: fakeQueryClient(NO_VALIDATION_RUN) });
+        expect(await screen.findByText("No validation run in the history yet")).toBeInTheDocument();
+        expect(screen.getByText(/fills this: once its session runs/)).toHaveTextContent("Run all in NB_DatabaseHub_Control fills this: once its session runs, it runs NB_DatabaseHub_Deployment's read-only checks, which save here.");
+        expect(screen.getByText("Or run NB_DatabaseHub_Deployment yourself, in the demo workspace.")).toBeInTheDocument();
+    });
+
+    it("keeps Overview's readiness tile blank, with what fills it, while the summary is a row of zeros", async () => {
+        renderWithApp(<OverviewPage />, { client: fakeQueryClient(NO_VALIDATION_RUN) });
+        expect(await screen.findByRole("button", { name: "Demo readiness: –. Open readiness" })).toBeInTheDocument();
+        expect(screen.getByText("Run all in NB_DatabaseHub_Control fills this")).toBeInTheDocument();
+        expect(screen.queryByText(/0 failed · 0 manual · 0 warnings/)).not.toBeInTheDocument();
+    });
 });
+
+// What a new environment's model answers before any validation run (dbhubc5, 2026-11-18): no checks, and a summary row of zeros.
+const NO_VALIDATION_RUN = { "readiness-checks": [], "readiness-summary": [{ Checks: 0, Failed: 0, Manual: 0, Warnings: 0, Passed: 0, NotSupported: 0, NotSelected: 0, Readiness: null, RunLabel: null }] };
 
 describe("Trends", () => {
     it("compares the newest week with the week before, per target", async () => {
@@ -314,22 +388,124 @@ describe("Trends", () => {
 });
 
 describe("Manage", () => {
-    it("is read-only with the reason, and still says exactly what an action would do", async () => {
-        renderWithApp(<ManagePage />);
-        expect(await screen.findByText("Read-only for you.")).toBeInTheDocument();
-        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
-        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
-        expect(within(dialog).getByText(/Ends after 90 minutes: saves T4's metrics, deletes the read replica/)).toBeInTheDocument();
-        expect(within(dialog).getByText(/MODE = "session"/)).toBeInTheDocument();
-        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+    const writeText = vi.fn(async (text: string) => {
+        void text;
     });
 
-    it("lets an operator confirm a bounded action", async () => {
-        const { notify } = renderWithApp(<ManagePage />, { manage: { canRun: true, reason: "" } });
+    beforeEach(() => {
+        writeText.mockClear();
+        vi.stubGlobal("isSecureContext", true);
+        Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    });
+
+    afterEach(() => {
+        Reflect.deleteProperty(navigator, "clipboard");
+    });
+
+    it("without the Manage function, copies each request for Run all in the control notebook and opens it", async () => {
+        const open = vi.spyOn(window, "open").mockImplementation(() => null);
+        const { notify } = renderWithApp(<ManagePage />);
+        expect(await screen.findByText("Each action copies its request for the control notebook.")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
+        expect(within(dialog).getByText(/Ends after 90 minutes: saves T4's metrics, and T5's when it's deployed, deletes the read replica/)).toBeInTheDocument();
+        fireEvent.click(within(dialog).getByRole("button", { name: "Copy and open the notebook" }));
+        await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringMatching(/\nMODE = "session"\nDURATION_MINUTES = 90\nWAIT_FOR_END = True$/)));
+        expect(open).toHaveBeenCalledWith(expect.stringMatching(/^https:\/\//), "_blank", "noopener,noreferrer");
+        expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Copied: paste it into a new cell under the parameters cell/), "success");
+        open.mockRestore();
+    });
+
+    it("is read-only with the reason for a viewer who isn't an operator", async () => {
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: false, reason: "Only the demo's operators send actions from the app.", running: null } });
+        expect(await screen.findByText("Read-only for you.")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Stop now…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Stop now" });
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        expect(within(dialog).getByText("Only the demo's operators send actions from the app.")).toBeInTheDocument();
+    });
+
+    it("lets an operator send a bounded action, then follows its run to how it ended", async () => {
+        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [] }));
+        const job = vi.fn(async () => ({ status: "Failed", startedAt: "2026-10-21T20:00:00Z", endedAt: "2026-10-21T20:01:00Z", failureReason: "NotebookFailed: The webhook refused it." }));
+        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: null, send, job } });
+        expect(await screen.findByText("You can run these actions, as ops@contoso.example.")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(send).toHaveBeenCalledWith({ action: "session", durationMinutes: 90 }));
+        expect(notify).toHaveBeenCalledWith("Start a 90-minute session: NB_DatabaseHub_Control started as app/ops@contoso.example (run 00000000)", "success");
+        expect(await screen.findByText(/^Start a 90-minute session: run 00000000 failed at .+: NotebookFailed: The webhook refused it\. Its output is in the notebook's run history\.$/)).toBeInTheDocument();
+        expect(job).toHaveBeenCalledWith("00000000-0000-0000-0000-000000000000");
+    });
+
+    const running = { id: "00000000-0000-0000-0000-000000000000", status: "InProgress", startedAt: "2026-10-21T20:00:00Z" };
+    const inProgress = async () => ({ status: "InProgress", startedAt: "2026-10-21T20:00:00Z", endedAt: null, failureReason: null });
+
+    it("takes one request at a time while the control runs one, and shows that run", async () => {
+        const send = vi.fn();
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send, job: vi.fn(inProgress) } });
+        expect(await screen.findByText(/^The control's run: run 00000000 is in progress, since /)).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Start a session…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Start a 90-minute session" });
+        expect(within(dialog).getByText(/^A run of NB_DatabaseHub_Control is in progress, since .+, and the control takes one request at a time: wait for it to end\. Stop now ends whatever it runs, as a session's end would, its history saved\.$/)).toBeInTheDocument();
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    it("reads the control's run in progress again when an action opens, waits for that read, and reads it again after a start", async () => {
+        const send = vi.fn(async () => ({ started: true, jobInstance: "00000000-0000-0000-0000-000000000000", reason: "", requestedBy: "app/ops@contoso.example", copy: false, cancelled: [] }));
+        const refresh = vi.fn(async () => undefined);
+        const manage = { mode: "run" as const, canRun: true, reason: "", who: "ops@contoso.example", running: null, send, job: vi.fn(inProgress), refresh, refreshing: true };
+        const { unmount } = renderWithApp(<ManagePage />, { manage });
+        fireEvent.click(await screen.findByRole("button", { name: "Run an incident…" }));
+        expect(refresh).toHaveBeenCalledTimes(1);
+        const reading = await screen.findByRole("dialog", { name: /^Run / });
+        expect(within(reading).getByText("Checking NB_DatabaseHub_Control's runs…")).toBeInTheDocument();
+        expect(within(reading).getByRole("button", { name: "Confirm" })).toHaveAttribute("aria-disabled", "true");
+        unmount();
+        renderWithApp(<ManagePage />, { manage: { ...manage, refreshing: false } });
+        fireEvent.click(await screen.findByRole("button", { name: "Run an incident…" }));
+        const dialog = await screen.findByRole("dialog", { name: /^Run / });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
+    });
+
+    it("says Stop now cancels the control's run in progress first", async () => {
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send: vi.fn(), job: vi.fn(inProgress) } });
+        fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Stop now" });
+        expect(within(dialog).getByText("Stop now cancels the control's run first.")).toBeInTheDocument();
+        expect(within(dialog).getByText(/If that run was ending a session, Stop now saves the session's history itself/)).toBeInTheDocument();
+        expect(within(dialog).getByRole("button", { name: "Confirm" })).not.toHaveAttribute("aria-disabled", "true");
+    });
+
+    it("says when Stop now cancelled the control's run but the stop didn't start, and copies the request", async () => {
+        const reason = "Stop now cancelled NB_DatabaseHub_Control's run 55555555, but Fabric didn't start the stop (HTTP 430, TooManyRequestsForCapacity). Nothing is stopping the session now: Run all in the notebook sends the same request, or ./scripts/stop-demo.ps1 -SaveHistory stops it from a PC. Its auto-stop still stops everything at its end, and the next Run all saves its history.";
+        const send = vi.fn(async () => ({ started: false, jobInstance: "", reason, requestedBy: "app/ops@contoso.example", copy: true, cancelled: ["55555555-5555-5555-5555-555555555555"] }));
+        const fallBack = vi.fn();
+        renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running, send, job: vi.fn(inProgress), fallBack } });
         fireEvent.click(await screen.findByRole("button", { name: "Stop now…" }));
         const dialog = await screen.findByRole("dialog", { name: "Stop now" });
         fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
-        expect(notify).toHaveBeenCalledWith("Stop now: sent to the session control", "success");
+        await waitFor(() => expect(fallBack).toHaveBeenCalledWith(reason));
+        expect(await within(dialog).findByText("Stop now cancelled the control's run, but the stop didn't start.")).toBeInTheDocument();
+        expect(within(dialog).getByText(`${reason} Copy it below instead.`)).toBeInTheDocument();
+    });
+
+    it("hands a request the function couldn't send over to copy mode, with the reason", async () => {
+        const reason = "Fabric didn't start NB_DatabaseHub_Control (HTTP 403, InsufficientPrivileges). Run all in the notebook sends the same request.";
+        const send = vi.fn(async () => ({ started: false, jobInstance: "", reason, requestedBy: "app/ops@contoso.example", copy: true, cancelled: [] }));
+        const fallBack = vi.fn();
+        const { notify } = renderWithApp(<ManagePage />, { manage: { mode: "run", canRun: true, reason: "", who: "ops@contoso.example", running: null, send, fallBack } });
+        fireEvent.click(await screen.findByRole("button", { name: "Reset…" }));
+        const dialog = await screen.findByRole("dialog", { name: "Reset every running target" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Confirm" }));
+        await waitFor(() => expect(fallBack).toHaveBeenCalledWith(reason));
+        expect(await within(dialog).findByText("The app couldn't send it.")).toBeInTheDocument();
+        expect(within(dialog).getByText(`${reason} Copy it below instead.`)).toBeInTheDocument();
+        expect(notify).not.toHaveBeenCalledWith(expect.stringMatching(/wasn't sent/), "error");
     });
 
     it("lists what the control ran", async () => {
@@ -337,7 +513,6 @@ describe("Manage", () => {
         expect(await screen.findByText(/^Session abcd1234's Database Agent beat: the plan regresses at 10:03 UTC/)).toBeInTheDocument();
     });
 });
-
 describe("Live views", () => {
     it("passes the connector check and opens every link in a new tab", async () => {
         renderWithApp(<LinksPage />);

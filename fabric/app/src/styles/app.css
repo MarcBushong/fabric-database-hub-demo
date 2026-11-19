@@ -530,6 +530,11 @@ body {
     color: var(--status-manual);
 }
 
+/* Live, but no live answer (reading, or unavailable): neutral, never the live green. */
+.provenance-off {
+    border-style: dashed;
+}
+
 .section-title {
     display: flex;
     align-items: center;
@@ -1807,4 +1812,42 @@ button.kpi-main:hover {
     align-items: center;
     gap: 6px;
     margin: 0;
+}
+
+/* T2's migration assessment (MigrationCard): the headline, then each Azure SQL target with its readiness. */
+.migration {
+    display: grid;
+    gap: 10px;
+}
+
+.migration-headline {
+    margin: 0;
+    font-weight: var(--fontWeightSemibold);
+    font-size: var(--fontSizeBase400);
+}
+
+.migration-targets {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+}
+
+.migration-targets li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 28px;
+}
+
+.migration-targets .fui-Badge {
+    min-width: 76px;
+    justify-content: center;
+}
+
+.migration-empty {
+    display: grid;
+    gap: 6px;
+    text-align: left;
 }
