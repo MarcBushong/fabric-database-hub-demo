@@ -65,8 +65,22 @@ const postgresPoints = (target: "T4" | "T4-replica", metric: string, values: num
         CapturedAt: "2026-11-13T18:06:00",
     }));
 
-export const FIXTURES: Record<string, Row[]> = {
-    "history-meta": [
+/** T5's capture: six minutes of an ru-storm wave, throttled at 100 % normalized RU, then back. */
+function cosmosPoints(): Row[] {
+    const series: Array<[string, string, number[]]> = [
+        ["NormalizedRUConsumption", "percent", [10, 60, 100, 100, 30, 12]],
+        ["TotalRequests", "requests", [300, 1500, 2400, 2300, 900, 310]],
+        ["ThrottledRequests", "requests", [0, 0, 800, 760, 0, 0]],
+        ["ServerSideLatencyGateway", "ms", [5, 7, 12, 11, 6, 5]],
+    ];
+    const rows: Row[] = [];
+    const base = { ResourceName: "cosmos01-test01", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" };
+    for (const [metric, unit, values] of series) values.forEach((value, i) => rows.push({ ...base, Bucket: `2026-11-13T17:0${i}:00`, Metric: metric, Value: value, Unit: unit }));
+    rows.push({ ...base, Bucket: "2026-11-13T17:00:00", Metric: "ProvisionedThroughput", Value: 400, Unit: "RU/s" }, { ...base, Bucket: "2026-11-13T17:00:00", Metric: "ServiceAvailability", Value: 100, Unit: "percent" });
+    return rows;
+}
+
+export const FIXTURES: Record<string, Row[]> = {    "history-meta": [
         { LatestCapture: "2026-10-21T20:30:00", LatestDay: "2026-10-21T00:00:00", EarliestDay: "2026-10-20T00:00:00", HoursSince: 2, Freshness: "Pass", NotebookRuns: 3, ScenarioRequests: 0, Incidents: 2, HasBins: 1 },
     ],
     "estate-targets": [
@@ -149,7 +163,13 @@ export const FIXTURES: Record<string, Row[]> = {
         { Date: "2026-10-21T00:00:00", "Target Key": "T1", CpuAvg: 12, CpuPeak: 30, WaitS: 120, BufferIoS: 6, LockWaitS: 2, Batch: 1100, SessionsPeak: 6, Incidents: 1 },
         { Date: "2026-10-21T00:00:00", "Target Key": "T3", CpuAvg: 40, CpuPeak: 97.5, WaitS: 4000, BufferIoS: 900, LockWaitS: 3, Batch: 90000, SessionsPeak: 22, Incidents: 2 },
     ],
-    "postgres-findings": [
+    "cosmos-series": cosmosPoints(),
+    "cosmos-findings": [
+        { FindingId: "cosmosdb.T5.throttling", TargetKey: "T5", Status: "Warning", StatusSort: 3, Finding: "T5 throttled 1,560 of 7,710 requests (20.2 %).", Evidence: "{}", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.throttle.20261113T1702", TargetKey: "T5", Status: "Warning", StatusSort: 3, Finding: "Throttling episode from 17:02 to 17:04 UTC.", Evidence: "{}", WindowStart: "2026-11-13T17:02:00", WindowEnd: "2026-11-13T17:04:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.recovery", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "T5 recovered: normalized RU was back at baseline by 17:05 UTC.", Evidence: "{}", WindowStart: "2026-11-13T17:04:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.capture", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "Azure Monitor metrics of T5 cosmos01-test01.", Evidence: "{}", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+    ],    "postgres-findings": [
         {
             FindingId: "postgresql.T4.capture",
             TargetKey: "T4",

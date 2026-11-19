@@ -61,7 +61,7 @@ describe("Overview", () => {
         expect(copilot.ask).toHaveBeenCalledTimes(1);
         const ctx = vi.mocked(copilot.ask).mock.calls[0][0];
         expect(ctx).toMatchObject({ prompt: "Which databases need attention this week, and why?", page: "overview", visualId: "overview.attention", source: "history" });
-        expect(ctx.rows?.map((r) => r.target)).toEqual(["T1", "T2", "T3", "T4"]);
+        expect(ctx.rows?.map((r) => r.target)).toEqual(["T1", "T2", "T3", "T4", "T5"]);
         expect(ctx.dax).toMatch(/^\/\/ Estate: key signals per target\nEVALUATE/);
         expect(ctx.asOf).toBe("2026-10-21T20:30:00.000Z");
     });
@@ -123,6 +123,31 @@ describe("Estate", () => {
         expect(within(found).getAllByRole("listitem")).toHaveLength(3);
     });
 
+    it("shows T5's normalized RU with its throttling episode, its 429s, and its recovery, and asks why it hit 100 %", async () => {
+        const { copilot, client } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" } });
+        expect(await screen.findByRole("heading", { level: 1, name: "T5 · Azure Cosmos DB" })).toBeInTheDocument();
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("cosmos01-test01")).toBeInTheDocument());
+        expect(within(glance).getByText("1,560")).toBeInTheDocument();
+        expect(within(glance).getByText(/^20\.2 % of 7,710 requests$/)).toBeInTheDocument();
+        expect(within(glance).getByText("Recovered")).toBeInTheDocument();
+        expect(within(glance).getByText(/400 RU\/s provisioned/)).toBeInTheDocument();
+        const chart = screen.getByRole("region", { name: "Normalized RU, and when it throttled" });
+        await waitFor(() => expect(chart.querySelectorAll(".chart-band rect")).toHaveLength(1));
+        fireEvent.click(within(glance).getByRole("button", { name: "Ask why" }));
+        expect(vi.mocked(copilot.ask).mock.calls[0][0].anomaly).toMatchObject({ metric: "Normalized RU consumption", target: "T5", value: 100, unit: "%" });
+        expect(client.ran).toEqual(expect.arrayContaining(["cosmos-series", "cosmos-findings"]));
+    });
+
+    it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
+        const empty = { "cosmos-series": [], "cosmos-findings": [] };
+        const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient(empty) });
+        expect(await screen.findByText("No Cosmos DB history yet")).toBeInTheDocument();
+        unmount();
+        renderWithApp(<EstatePage />, { client: fakeQueryClient(empty) });
+        expect(await screen.findByText("No T5 history yet")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /^T5 · Azure Cosmos DB/ })).not.toBeInTheDocument();
+    });
     it("explains a PostgreSQL page without a capture yet", async () => {
         renderWithApp(<EstatePage />, { view: { page: "estate", target: "T4" }, client: fakeQueryClient({ "postgres-series": [], "postgres-findings": [] }) });
         expect(await screen.findByText("No PostgreSQL history yet")).toBeInTheDocument();

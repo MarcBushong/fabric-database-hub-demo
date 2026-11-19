@@ -352,7 +352,55 @@ function staticRows(): Record<string, () => Row[]> {
             }
             return out;
         },
-        "postgres-findings": () => {
+        "cosmos-series": () => {
+            // ru-storm's waves in each 30-minute cycle of the session: minutes 3 to 13 and 18 to 26 at 100 % normalized RU.
+            const rand = mulberry32(11);
+            const start = day(6, 13, 30);
+            const out: Row[] = [];
+            const base = { Bucket: "", ResourceName: "cosmos01-sample", Metric: "", Value: 0, Unit: "", WindowStart: iso(start), WindowEnd: iso(start + 90 * MIN), CapturedAt: iso(start + 96 * MIN) };
+            for (let m = 0; m < 90; m++) {
+                const inCycle = m % 30;
+                const storm = (inCycle >= 3 && inCycle < 13) || (inCycle >= 18 && inCycle < 26);
+                const ramp = storm && (inCycle === 3 || inCycle === 18) ? 0.7 : 1;
+                const ru = storm ? Math.min(100, 100 * ramp) : 9 + rand() * 6;
+                const requests = Math.round(storm ? 2300 + rand() * 300 : 280 + rand() * 60);
+                const throttled = storm && ru >= 100 ? Math.round(requests * (0.3 + rand() * 0.1)) : 0;
+                const at = iso(start + m * MIN);
+                out.push(
+                    { ...base, Bucket: at, Metric: "NormalizedRUConsumption", Value: round(ru), Unit: "percent" },
+                    { ...base, Bucket: at, Metric: "TotalRequests", Value: requests, Unit: "requests" },
+                    { ...base, Bucket: at, Metric: "ThrottledRequests", Value: throttled, Unit: "requests" },
+                    { ...base, Bucket: at, Metric: "TotalRequestUnits", Value: Math.round((ru / 100) * 400 * 60), Unit: "RU" },
+                    { ...base, Bucket: at, Metric: "ServerSideLatencyGateway", Value: round(storm ? 9 + rand() * 5 : 4 + rand() * 3), Unit: "ms" },
+                );
+            }
+            for (const hour of [13, 14]) {
+                out.push({ ...base, Bucket: iso(day(6, hour, 0)), Metric: "ProvisionedThroughput", Value: 400, Unit: "RU/s" }, { ...base, Bucket: iso(day(6, hour, 0)), Metric: "ServiceAvailability", Value: 100, Unit: "percent" });
+            }
+            return out;
+        },
+        "cosmos-findings": () => {
+            const at = iso(day(6, 15, 6));
+            const episode = (h: number, m: number) => ({
+                FindingId: `cosmosdb.T5.throttle.${iso(day(6, h, m)).replace(/[-:]/g, "").slice(0, 13)}`,
+                TargetKey: "T5",
+                Status: "Warning",
+                StatusSort: 3,
+                Finding: `Throttling episode from ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} to ${String(h).padStart(2, "0")}:${String(m + 23).padStart(2, "0")} UTC: normalized RU at 100 % and requests answered 429 in both of ru-storm's waves.`,
+                Evidence: '{"wave": "ru-storm"}',
+                WindowStart: iso(day(6, h, m)),
+                WindowEnd: iso(day(6, h, m + 23)),
+                CapturedAt: at,
+            });
+            return [
+                { FindingId: "cosmosdb.T5.throttling", TargetKey: "T5", Status: "Warning", StatusSort: 3, Finding: "T5 throttled 15,640 of 92,410 requests (16.9 %): normalized RU reached 100 % in 3 episodes, with provisioned throughput at 400 RU/s.", Evidence: '{"throttled": 15640, "requests": 92410}', WindowStart: iso(day(6, 13, 30)), WindowEnd: iso(day(6, 15, 0)), CapturedAt: at },
+                episode(13, 33),
+                episode(14, 3),
+                episode(14, 33),
+                { FindingId: "cosmosdb.T5.recovery", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "T5 recovered: normalized RU was back at its 12 % baseline by 14:58 UTC, 2 minutes after the last 429, and availability stayed at 100 %.", Evidence: '{"baselinePercent": 12}', WindowStart: iso(day(6, 14, 56)), WindowEnd: iso(day(6, 15, 0)), CapturedAt: at },
+                { FindingId: "cosmosdb.T5.capture", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "Azure Monitor metrics of T5 cosmos01-sample (400 RU/s) from 13:30 to 15:00 UTC, every minute: 7 metrics, 454 points.", Evidence: '{"intervalMinutes": 1}', WindowStart: iso(day(6, 13, 30)), WindowEnd: iso(day(6, 15, 0)), CapturedAt: at },
+            ];
+        },        "postgres-findings": () => {
             const at = iso(day(6, 18, 6));
             return [
                 {

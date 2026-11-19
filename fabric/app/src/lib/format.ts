@@ -4,7 +4,7 @@ const integer = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const oneDecimal = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 
-export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "compact";
+export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "ms" | "compact";
 
 export function isNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -23,6 +23,8 @@ export function formatNumber(value: unknown, kind: NumberKind = "decimal"): stri
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} min`;
         case "mb":
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} MB`;
+        case "ms":
+            return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} ms`;
         case "compact":
             return compact.format(value);
         default:

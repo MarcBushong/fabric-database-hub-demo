@@ -604,7 +604,7 @@ export interface PostgresPeak {
 }
 
 /** The highest point of a series (the earliest of equal ones), or null for an empty one. */
-export function postgresPeak(points: readonly PostgresPoint[]): PostgresPeak | null {
+export function postgresPeak(points: ReadonlyArray<{ at: Date; value: number }>): PostgresPeak | null {
     let peak: PostgresPeak | null = null;
     for (const p of points) {
         if (!peak || p.value > peak.value) peak = { value: p.value, at: p.at };
@@ -659,7 +659,7 @@ function evidenceOf(value: unknown): Record<string, unknown> | null {
     }
 }
 
-/** The latest capture's findings, worst first. */
+/** A capture's findings (T4's or T5's), worst first. */
 export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
     return rows
         .map((r) => ({
@@ -674,6 +674,91 @@ export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
         .filter((f) => f.id !== "")
         .sort((a, b) => a.statusSort - b.statusSort || a.id.localeCompare(b.id));
 }
+
+/** T5's Azure Monitor metrics (analysis cosmosdb), by what they show. */
+export const COSMOS_METRICS = {
+    /** Normalized RU consumption, the highest in each interval: 100 % is throttling. */
+    normalizedRu: "NormalizedRUConsumption",
+    /** Request units consumed in each interval. */
+    ru: "TotalRequestUnits",
+    /** Requests in each interval, the 429s included. */
+    requests: "TotalRequests",
+    /** Requests answered 429 in each interval: 0 at every interval with requests and none throttled. */
+    throttled: "ThrottledRequests",
+    /** Server-side latency through the gateway, the average in each interval (ms). */
+    latency: "ServerSideLatencyGateway",
+    /** Provisioned throughput, hourly (RU/s). */
+    provisioned: "ProvisionedThroughput",
+    /** Service availability, hourly (%): 429s aren't availability errors. */
+    availability: "ServiceAvailability",
+} as const;
+
+export interface CosmosPoint {
+    at: Date;
+    metric: string;
+    value: number;
+}
+
+/** The latest Cosmos DB capture: its account, its window, and its points, oldest first. */
+export interface CosmosCapture {
+    account: string;
+    capturedAt: Date | null;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    /** Minutes between consecutive points of one per-interval series, or null with single points only. */
+    intervalMinutes: number | null;
+    points: CosmosPoint[];
+}
+
+const COSMOS_METRIC = /^[A-Za-z0-9_]{1,64}$/;
+
+/** The cosmos-series rows as one capture, or null without a valid row (no capture yet, or T5 is off). */
+export function toCosmosCapture(rows: readonly Row[]): CosmosCapture | null {
+    const points: CosmosPoint[] = [];
+    let account = "";
+    let capturedAt: Date | null = null;
+    let windowStart: Date | null = null;
+    let windowEnd: Date | null = null;
+    for (const r of rows) {
+        const at = toDate(r.Bucket);
+        const value = num(r.Value);
+        const metric = text(r.Metric);
+        if (!at || value === null || !COSMOS_METRIC.test(metric)) continue;
+        points.push({ at, metric, value });
+        account ||= safeName(r.ResourceName) ?? "";
+        capturedAt ??= toDate(r.CapturedAt);
+        windowStart ??= toDate(r.WindowStart);
+        windowEnd ??= toDate(r.WindowEnd);
+    }
+    if (points.length === 0) return null;
+    points.sort((a, b) => a.at.getTime() - b.at.getTime());
+    const series = points.filter((p) => p.metric === COSMOS_METRICS.normalizedRu);
+    const gaps = series.slice(1).map((p, i) => (p.at.getTime() - series[i].at.getTime()) / 60000).filter((g) => g > 0);
+    return { account, capturedAt, windowStart, windowEnd, intervalMinutes: gaps.length > 0 ? Math.min(...gaps) : null, points };
+}
+
+/** One metric of the capture, oldest first. */
+export function cosmosSeries(capture: CosmosCapture | null, metric: string): CosmosPoint[] {
+    return capture ? capture.points.filter((p) => p.metric === metric) : [];
+}
+
+export interface ThrottleEpisode {
+    id: string;
+    start: Date | null;
+    end: Date | null;
+    status: string;
+    text: string;
+}
+
+/** The capture's throttling episodes (cosmosdb.T5.throttle.<yyyymmddThhmm>), oldest first. */
+export function throttleEpisodes(rows: readonly Row[]): ThrottleEpisode[] {
+    return rows
+        .filter((r) => text(r.FindingId).startsWith("cosmosdb.T5.throttle."))
+        .map((r) => ({ id: text(r.FindingId), start: toDate(r.WindowStart), end: toDate(r.WindowEnd), status: text(r.Status), text: text(r.Finding) }))
+        .sort((a, b) => (a.start?.getTime() ?? 0) - (b.start?.getTime() ?? 0));
+}
+/** T5's capture findings have the same shape as T4's. */
+export const toCaptureFindings = toPostgresFindings;
 
 const SKU = /^[A-Za-z0-9_]{1,64}$/;
 

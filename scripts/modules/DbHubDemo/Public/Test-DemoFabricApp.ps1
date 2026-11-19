@@ -53,7 +53,7 @@ function Test-DemoFabricApp {
     The app item's page in the Fabric portal, for the browser steps.
 
     .PARAMETER Queries
-    All runs the whole catalog (19 queries since 2026-11-18, with T4's PostgreSQL page's two, which may be empty until a
+    All runs the whole catalog (21 queries since 2026-11-18, with T4's PostgreSQL page's two, which may be empty until a
     capture of T4's metrics exists, and the ones the catalog marks mayBeEmpty, such as the sessions, which may be empty
     until the first session; all of them are said, not warned about); Probe runs only the connector check.
 

@@ -13,8 +13,10 @@ import { LiveNow } from "@/components/LiveNow";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { FAMILY_LABEL, toBins, toChecks, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
+import { FAMILY_LABEL, toBins, toCaptureFindings, toChecks, toCosmosCapture, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
 import {
+    cosmosFindingsQuery,
+    cosmosSeriesQuery,
     estateQuery,
     findingsQuery,
     incidentsQuery,
@@ -29,7 +31,7 @@ import {
 import { useQuery } from "@/data/use-query";
 import { buildAskContext } from "@/lib/ask";
 import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
-import { postgresHealth, sqlHealth } from "@/lib/health";
+import { cosmosHealth, postgresHealth, sqlHealth } from "@/lib/health";
 import { coverageInsight, dominantWaitInsight, familySignal, freshnessInsight, lagInsight } from "@/lib/insights";
 import { worstStatus } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
@@ -73,6 +75,8 @@ export default function OverviewPage() {
     const sessionsSpec = useMemo(() => sessionsQuery(filters), [filters]);
     const pgSeriesSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery() : null), [view.targets]);
     const pgFindingsSpec = useMemo(() => (view.targets.includes("T4") ? postgresFindingsQuery() : null), [view.targets]);
+    const cosmosSeriesSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery() : null), [view.targets]);
+    const cosmosFindingsSpec = useMemo(() => (view.targets.includes("T5") ? cosmosFindingsQuery() : null), [view.targets]);
 
     const estate = useQuery(estateSpec);
     const series = useQuery(seriesSpec);
@@ -84,6 +88,8 @@ export default function OverviewPage() {
     const sessionsState = useQuery(sessionsSpec);
     const pgSeries = useQuery(pgSeriesSpec);
     const pgFindings = useQuery(pgFindingsSpec);
+    const cosmosSeriesState = useQuery(cosmosSeriesSpec);
+    const cosmosFindingsState = useQuery(cosmosFindingsSpec);
 
     const targets = useMemo(() => toTargets(estate.data?.rows ?? []), [estate.data]);
     const bins = useMemo(() => toBins(series.data?.rows ?? []), [series.data]);
@@ -98,12 +104,15 @@ export default function OverviewPage() {
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
     const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
+    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
 
     const health = useMemo(() => {
         const out = sqlHealth(targets, findings, bins, view.targets);
         if (view.targets.includes("T4")) out.push(postgresHealth(capture, pgFindingRows));
+        if (view.targets.includes("T5") && (cosmos || cosmosFindingRows.length > 0)) out.push(cosmosHealth(cosmos, cosmosFindingRows));
         return out;
-    }, [targets, findings, bins, view.targets, capture, pgFindingRows]);
+    }, [targets, findings, bins, view.targets, capture, pgFindingRows, cosmos, cosmosFindingRows]);
 
     const attention = findings.filter((f) => f.statusSort <= 3);
     const worstFinding = worstStatus(attention.map((f) => f.status));

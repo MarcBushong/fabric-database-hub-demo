@@ -2,11 +2,14 @@
 // Overview's and the Estate's tiles agree, and tests can check them.
 
 import {
+    COSMOS_METRICS,
+    cosmosSeries,
     POSTGRES_METRICS,
     postgresPeak,
     postgresSeries,
     replicaCatchUp,
     type Bin,
+    type CosmosCapture,
     type Finding,
     type PostgresCapture,
     type PostgresFinding,
@@ -98,6 +101,33 @@ export function postgresHealth(capture: PostgresCapture | null, findings: readon
         ],
         note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}`,
         spark: cpu.map((p) => p.value),
+        incidents: 0,
+        attention: attention.length,
+    };
+}
+
+/** T5's health from the latest Cosmos DB capture: its normalized RU peak, its 429s, and whether it recovered. */
+export function cosmosHealth(capture: CosmosCapture | null, findings: readonly PostgresFinding[]): TargetHealth {
+    const attention = findings.filter((f) => f.statusSort <= 3);
+    const worst = worstStatus(findings.map((f) => f.status));
+    if (!capture) {
+        return { key: "T5", status: null, reporting: false, metrics: [], note: "No capture yet: a session's end saves T5's metrics", spark: [], incidents: 0, attention: attention.length };
+    }
+    const ru = cosmosSeries(capture, COSMOS_METRICS.normalizedRu);
+    const throttled = cosmosSeries(capture, COSMOS_METRICS.throttled).reduce((a, p) => a + p.value, 0);
+    const availability = cosmosSeries(capture, COSMOS_METRICS.availability).map((p) => p.value);
+    const recovered = findings.find((f) => f.id === "cosmosdb.T5.recovery")?.status === "Pass";
+    return {
+        key: "T5",
+        status: worst?.name ?? "Pass",
+        reporting: true,
+        metrics: [
+            { label: "Norm. RU peak", value: formatNumber(postgresPeak(ru)?.value ?? null, "percent") },
+            { label: "429s", value: formatNumber(throttled, "int") },
+            { label: "Availability", value: availability.length > 0 ? formatNumber(Math.min(...availability), "percent") : "\u2013" },
+        ],
+        note: `Captured ${formatAgo(capture.capturedAt)}${throttled > 0 ? (recovered ? "; throttled, then recovered" : "; throttled") : ""}`,
+        spark: ru.map((p) => p.value),
         incidents: 0,
         attention: attention.length,
     };

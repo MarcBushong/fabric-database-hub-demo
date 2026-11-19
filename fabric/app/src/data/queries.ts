@@ -598,6 +598,105 @@ ORDER BY [StatusSort] ASC, [FindingId] ASC`,
     };
 }
 
+/**
+ * The latest Cosmos DB capture's run (analysis `cosmosdb`, target T5): the notebook run with the newest `cosmosdb`
+ * finding. Every capture writes `cosmosdb.T5.capture`, so its points, when it has any, belong to the same run.
+ */
+const COSMOS_LATEST_RUN = `VAR LatestCapture =
+    CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb" )
+VAR LatestRun =
+    CALCULATETABLE (
+        VALUES ( 'Analysis Findings'[Run ID] ),
+        REMOVEFILTERS (),
+        'Analysis Findings'[Analysis Key] = "cosmosdb",
+        'Analysis Findings'[Captured At UTC] = LatestCapture
+    )`;
+
+const COSMOS_EMPTY = "until a capture of T5's metrics: a session's end saves one (Run all), and so do stop-demo.ps1 -SaveHistory and deploy.ps1; none while T5 is off";
+
+/**
+ * T5's Azure Monitor metrics from the latest capture (analysis `cosmosdb`), one row per metric and interval: normalized
+ * RU, request units, requests and 429s, gateway latency, and the hourly provisioned throughput and availability. The
+ * notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS). Not filtered by target or period.
+ */
+export function cosmosSeriesQuery(): QuerySpec {
+    return {
+        id: "cosmos-series",
+        title: "T5 Azure Cosmos DB: Azure Monitor metrics, latest capture",
+        rowLimit: 5000,
+        mayBeEmpty: COSMOS_EMPTY,
+        dax: `EVALUATE
+${COSMOS_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            REMOVEFILTERS (),
+            'Telemetry Snapshots'[Analysis Key] = "cosmosdb",
+            'Telemetry Snapshots'[Target Key] = "T5",
+            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+        ),
+        "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "ResourceName", 'Telemetry Snapshots'[Resource Name],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", 'Telemetry Snapshots'[Value],
+        "Unit", 'Telemetry Snapshots'[Unit],
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+ORDER BY [Bucket] ASC, [Metric] ASC`,
+        columns: [
+            { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
+            { key: "ResourceName", label: "Account", kind: "text" },
+            { key: "Metric", label: "Azure Monitor metric", kind: "text" },
+            { key: "Value", label: "Value", kind: "decimal" },
+            { key: "Unit", label: "Unit", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+        ],
+    };
+}
+
+/** The latest Cosmos DB capture's findings: what was captured, throttling, each throttling episode, and the recovery. */
+export function cosmosFindingsQuery(): QuerySpec {
+    return {
+        id: "cosmos-findings",
+        title: "T5 Azure Cosmos DB: findings of the latest capture",
+        rowLimit: 50,
+        mayBeEmpty: COSMOS_EMPTY,
+        dax: `EVALUATE
+${COSMOS_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Analysis Findings',
+            REMOVEFILTERS (),
+            'Analysis Findings'[Analysis Key] = "cosmosdb",
+            TREATAS ( LatestRun, 'Analysis Findings'[Run ID] )
+        ),
+        "FindingId", 'Analysis Findings'[Finding ID],
+        "TargetKey", 'Analysis Findings'[Target Key],
+        "Status", 'Analysis Findings'[Status Key],
+        "StatusSort", RELATED ( 'Status'[Status Sort] ),
+        "Finding", 'Analysis Findings'[Finding],
+        "Evidence", 'Analysis Findings'[Evidence],
+        "WindowStart", 'Analysis Findings'[Window Start UTC],
+        "WindowEnd", 'Analysis Findings'[Window End UTC],
+        "CapturedAt", 'Analysis Findings'[Captured At UTC]
+    )
+ORDER BY [StatusSort] ASC, [FindingId] ASC`,
+        columns: [
+            { key: "Status", label: "Status", kind: "status" },
+            { key: "Finding", label: "Finding", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+            { key: "FindingId", label: "Finding ID", kind: "text" },
+        ],
+    };
+}
 /** The activity requests the notebooks recorded in the period, newest first: each session's plan and each incident request. */
 export function sessionsQuery(f: Filters): QuerySpec {
     const filter = dateFilter(f.window);
@@ -791,5 +890,7 @@ export function catalogForCheck(latestDay: Date, anchors: CheckAnchors = {}): Qu
         sessionsQuery(all),
         dailyTrendQuery(week),
         agentLoopQuery(all),
+        cosmosSeriesQuery(),
+        cosmosFindingsQuery(),
     ];
 }

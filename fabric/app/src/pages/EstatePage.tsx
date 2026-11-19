@@ -14,6 +14,8 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import {
     FAMILY_LABEL,
+    COSMOS_METRICS,
+    cosmosSeries,
     POSTGRES_METRICS,
     postgresPeak,
     postgresSeries,
@@ -22,22 +24,26 @@ import {
     toBins,
     toFindings,
     toIncidents,
+    throttleEpisodes,
+    toCaptureFindings,
+    toCosmosCapture,
     toPostgresCapture,
     toPostgresFindings,
     toTargetNames,
     toTargets,
     toWaitFlows,
+    type CosmosCapture,
     type PostgresCapture,
     type PostgresTarget,
 } from "@/data/model";
-import { estateQuery, findingsQuery, incidentsQuery, postgresFindingsQuery, postgresSeriesQuery, seriesQuery, targetNamesQuery, waitsQuery, type ColumnSpec } from "@/data/queries";
+import { cosmosFindingsQuery, cosmosSeriesQuery, estateQuery, findingsQuery, incidentsQuery, postgresFindingsQuery, postgresSeriesQuery, seriesQuery, targetNamesQuery, waitsQuery, type ColumnSpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf, libraryPrompts, type AgentSurface } from "@/lib/agent-prompts";
 import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
 import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
-import { postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
+import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
 import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
 import { PageHeader } from "@/shell/PageHeader";
@@ -95,13 +101,42 @@ function useEstateData() {
     const namesState = useQuery(namesSpec);
     const pgSeries = useQuery(pgSeriesSpec);
     const pgFindings = useQuery(pgFindingsSpec);
+    const cosmosSeriesSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery() : null), [view.targets]);
+    const cosmosFindingsSpec = useMemo(() => (view.targets.includes("T5") ? cosmosFindingsQuery() : null), [view.targets]);
+    const cosmosSeriesState = useQuery(cosmosSeriesSpec);
+    const cosmosFindingsState = useQuery(cosmosFindingsSpec);
     const targets = useMemo(() => toTargets(estate.data?.rows ?? []), [estate.data]);
     const bins = useMemo(() => toBins(series.data?.rows ?? []), [series.data]);
     const findings = useMemo(() => toFindings(findingsState.data?.rows ?? []), [findingsState.data]);
     const names = useMemo(() => toTargetNames(namesState.data?.rows ?? []), [namesState.data]);
     const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
-    return { estateSpec, seriesSpec, findingsSpec, pgSeriesSpec, pgFindingsSpec, estate, series, findingsState, pgSeries, pgFindings, targets, bins, findings, names, capture, pgFindingRows };
+    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
+    return {
+        estateSpec,
+        seriesSpec,
+        findingsSpec,
+        pgSeriesSpec,
+        pgFindingsSpec,
+        cosmosSeriesSpec,
+        cosmosFindingsSpec,
+        estate,
+        series,
+        findingsState,
+        pgSeries,
+        pgFindings,
+        cosmosSeriesState,
+        cosmosFindingsState,
+        targets,
+        bins,
+        findings,
+        names,
+        capture,
+        pgFindingRows,
+        cosmos,
+        cosmosFindingRows,
+    };
 }
 
 function Inventory() {
@@ -110,8 +145,10 @@ function Inventory() {
     const health = useMemo(() => {
         const out: TargetHealth[] = sqlHealth(d.targets, d.findings, d.bins, view.targets);
         if (view.targets.includes("T4")) out.push(postgresHealth(d.capture, d.pgFindingRows));
+        // T5 shows once it has history: a deployment without Cosmos DB (t5Enabled false) has none.
+        if (view.targets.includes("T5") && (d.cosmos || d.cosmosFindingRows.length > 0)) out.push(cosmosHealth(d.cosmos, d.cosmosFindingRows));
         return out;
-    }, [d.targets, d.findings, d.bins, view.targets, d.capture, d.pgFindingRows]);
+    }, [d.targets, d.findings, d.bins, view.targets, d.capture, d.pgFindingRows, d.cosmos, d.cosmosFindingRows]);
 
     const rows: InventoryRow[] = useMemo(() => {
         const out: InventoryRow[] = [];
@@ -124,7 +161,7 @@ function Inventory() {
                 engine: engineOf(h.key).label,
                 platform: info.platform,
                 hosting: info.hosting,
-                resource: h.key === "T4" ? (d.capture?.servers.T4 ?? "–") : (names?.resource ?? "–"),
+                resource: h.key === "T4" ? (d.capture?.servers.T4 ?? "–") : h.key === "T5" ? d.cosmos?.account || "–" : (names?.resource ?? "–"),
                 status: h.status ?? "",
                 cpuAvg: t?.cpuAvg ?? null,
                 cpuPeak: t?.cpuPeak ?? (h.key === "T4" ? postgresPeak(postgresSeries(d.capture, "T4", POSTGRES_METRICS.cpu))?.value ?? null : null),
@@ -154,7 +191,7 @@ function Inventory() {
             }
         }
         return out;
-    }, [health, d.targets, d.names, d.capture, d.pgFindingRows]);
+    }, [health, d.targets, d.names, d.capture, d.pgFindingRows, d.cosmos]);
 
     const loading = d.estate.loading || d.pgSeries.loading;
 
@@ -164,12 +201,12 @@ function Inventory() {
 
             {ENGINES.map((engine) => {
                 const tiles = health.filter((h) => engine.targets.includes(h.key));
-                if (engine.id === "cosmosdb") {
-                    return view.targets.includes("T5") ? (
+                if (engine.id === "cosmosdb" && tiles.length === 0) {
+                    return view.targets.includes("T5") && !d.cosmosSeriesState.loading ? (
                         <section key={engine.id} className="span-12" aria-label={engine.label}>
                             <h2 className="section-title">{engine.label}</h2>
-                            <EmptyState compact title="T5 isn't in this estate's history yet">
-                                <p>When the demo deploys Azure Cosmos DB as T5, its normalized RU consumption, throttled requests (429), and availability show here, saved like T4's metrics.</p>
+                            <EmptyState compact title="No T5 history yet">
+                                <p>A session's end saves T5's Azure Monitor metrics: normalized RU, throttled requests (429), and availability. A deployment without Cosmos DB (t5Enabled off) has none.</p>
                             </EmptyState>
                         </section>
                     ) : null;
@@ -212,16 +249,7 @@ function TargetDetail({ target }: { target: EstateTarget }) {
     const engine = engineOf(target);
     const crumbs = [{ label: "Estate", onClick: () => navigate("estate") }, { label: engine.label, onClick: () => navigate("estate") }, { label: `${info.short} · ${info.name}` }];
     if (target === "T4" || target === "T4-replica") return <PostgresDetail crumbs={crumbs} focus={target} />;
-    if (target === "T5") {
-        return (
-            <div className="page">
-                <PageHeader title={`${info.short} · ${info.name}`} description={info.platform} crumbs={crumbs} filter={false} />
-                <EmptyState title="No Cosmos DB history yet">
-                    <p>When the demo deploys Azure Cosmos DB as T5, its normalized RU consumption, throttled requests (429), and availability show here.</p>
-                </EmptyState>
-            </div>
-        );
-    }
+    if (target === "T5") return <CosmosDetail crumbs={crumbs} />;
     return <SqlTargetDetail target={target} crumbs={crumbs} />;
 }
 
@@ -582,6 +610,184 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                                 <li key={f.id}>
                                     <StatusBadge status={f.status} short />
                                     <TargetChip target={f.target} />
+                                    <span className="feed-text">{f.text}</span>
+                                    <time>{formatDateTimeUtc(f.capturedAt)}</time>
+                                </li>
+                            ))}
+                        </ol>
+                    </VisualCard>
+                </>
+            )}
+        </div>
+    );
+}
+
+function cosmosRows(capture: CosmosCapture | null, series: Array<[string, string]>): Row[] {
+    const out: Row[] = [];
+    for (const [metric, label] of series) {
+        for (const p of cosmosSeries(capture, metric)) out.push({ at: iso(p.at), series: label, value: p.value });
+    }
+    return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+}
+
+/** T5, Azure Cosmos DB: the latest capture's normalized RU, its 429s, its throttling episodes, and its recovery. */
+function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () => void }> }) {
+    const { runtime } = useApp();
+    const d = useEstateData();
+    const capture = d.cosmos;
+    const ru = cosmosSeries(capture, COSMOS_METRICS.normalizedRu);
+    const ruPeak = postgresPeak(ru);
+    const total = (metric: string) => cosmosSeries(capture, metric).reduce((a, p) => a + p.value, 0);
+    const requests = total(COSMOS_METRICS.requests);
+    const throttled = total(COSMOS_METRICS.throttled);
+    const provisioned = postgresPeak(cosmosSeries(capture, COSMOS_METRICS.provisioned))?.value ?? null;
+    const availability = cosmosSeries(capture, COSMOS_METRICS.availability).map((p) => p.value);
+    const lowest = availability.length > 0 ? Math.min(...availability) : null;
+    const latency = cosmosSeries(capture, COSMOS_METRICS.latency);
+    const latencyAvg = latency.length > 0 ? latency.reduce((a, p) => a + p.value, 0) / latency.length : null;
+    const latencyPeak = postgresPeak(latency);
+    const episodes = throttleEpisodes(d.cosmosFindingsState.data?.rows ?? []);
+    const recovery = d.cosmosFindingRows.find((f) => f.id === "cosmosdb.T5.recovery") ?? null;
+    // The story in order: throttling, each episode, the recovery, then what was captured.
+    const storyRank = (id: string) => (id === "cosmosdb.T5.throttling" ? 0 : id.startsWith("cosmosdb.T5.throttle.") ? 1 : id === "cosmosdb.T5.recovery" ? 2 : id === "cosmosdb.T5.capture" ? 4 : 3);
+    const story = [...d.cosmosFindingRows].sort((a, b) => storyRank(a.id) - storyRank(b.id) || a.id.localeCompare(b.id));
+    const ruRows = ru.map((p) => ({ at: iso(p.at), "Normalized RU": p.value }));
+    const requestRows = cosmosRows(capture, [
+        [COSMOS_METRICS.requests, "Requests"],
+        [COSMOS_METRICS.throttled, "429s"],
+    ]);
+    const latencyRows = latency.map((p) => ({ at: iso(p.at), "Gateway latency": p.value }));
+    const loading = d.cosmosSeriesState.loading || d.cosmosFindingsState.loading;
+    const none = !loading && !d.cosmosSeriesState.error && !capture && d.cosmosFindingRows.length === 0;
+    const interval = capture?.intervalMinutes ? `${formatNumber(capture.intervalMinutes, "int")}-minute intervals` : "intervals";
+
+    return (
+        <div className="page">
+            <PageHeader
+                title="T5 · Azure Cosmos DB"
+                description={capture ? `${capture.account || "The account"}: the latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, captured ${formatAgo(capture.capturedAt)}.` : "T5, an Azure Cosmos DB for NoSQL account, from Azure Monitor metrics the demo captures at a session's end."}
+                crumbs={crumbs}
+                filter={false}
+                actions={
+                    <Button as="a" href={hubUrlOf(runtime)} target="_blank" rel="noopener noreferrer" icon={<Open16Regular />} iconPosition="after">
+                        Database Hub, live
+                    </Button>
+                }
+            />
+
+            {none ? (
+                <EmptyState title="No Cosmos DB history yet">
+                    <p>A session's end saves T5's Azure Monitor metrics to the history: Run all in NB_DatabaseHub_Control does it, and so do ./scripts/stop-demo.ps1 -SaveHistory and ./scripts/deploy.ps1 at its end.</p>
+                    <p className="muted">A deployment without Cosmos DB (t5Enabled off) has none. For T5 live, open Database Hub's Cosmos DB view.</p>
+                </EmptyState>
+            ) : (
+                <>
+                    <section className="kpis" aria-label="T5 at a glance">
+                        <KpiTile label="Account" value={capture?.account || "\u2013"} sub={provisioned !== null ? `Azure Cosmos DB for NoSQL \u00b7 ${formatNumber(provisioned, "int")} RU/s provisioned` : "Azure Cosmos DB for NoSQL"} />
+                        <KpiTile
+                            label="Normalized RU, peak"
+                            value={formatNumber(ruPeak?.value ?? null, "percent")}
+                            status={ruPeak ? (ruPeak.value >= 100 ? "Warning" : "Pass") : null}
+                            sub={ruPeak ? `at ${formatDateTimeUtc(ruPeak.at)} \u00b7 100 % throttles` : ""}
+                            actions={
+                                ruPeak && ruPeak.value >= 100 ? (
+                                    <AskWhy
+                                        title="T5 normalized RU"
+                                        visualId="estate.t5.ru"
+                                        prompt={`Why did T5's normalized RU consumption reach ${formatNumber(ruPeak.value, "percent")} at ${formatDateTimeUtc(ruPeak.at)}, with ${formatNumber(throttled, "int")} requests throttled (429)? Should I raise the provisioned RU/s, switch to autoscale, or spread a hot partition key?`}
+                                        anomaly={{ metric: "Normalized RU consumption", target: "T5", at: ruPeak.at.toISOString(), value: ruPeak.value, unit: "%" }}
+                                        specs={[d.cosmosSeriesSpec]}
+                                        rows={ruRows}
+                                    />
+                                ) : undefined
+                            }
+                        />
+                        <KpiTile
+                            label="Throttled requests (429)"
+                            value={formatNumber(throttled, "int")}
+                            status={capture ? (throttled > 0 ? "Warning" : "Pass") : null}
+                            sub={requests > 0 ? `${formatNumber((100 * throttled) / requests, "percent")} of ${formatNumber(requests, "int")} requests` : "No requests in the capture"}
+                        />
+                        <KpiTile label="Recovery" value={recovery ? (recovery.status === "Pass" ? "Recovered" : "Not yet") : throttled > 0 ? "\u2013" : "No throttling"} status={recovery?.status ?? (throttled > 0 ? null : "Pass")} sub={recovery ? recovery.text : "Back at baseline before the capture ended"} />
+                        <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatNumber(lowest, "percent")} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
+                        <KpiTile label="Gateway latency" value={latencyAvg === null ? "\u2013" : formatNumber(latencyAvg, "ms")} sub={latencyPeak ? `average \u00b7 peak ${formatNumber(latencyPeak.value, "ms")}` : "average"} />
+                    </section>
+
+                    <VisualCard
+                        id="estate.t5.ru"
+                        className="span-12"
+                        title="Normalized RU, and when it throttled"
+                        subtitle={`The highest normalized RU consumption in each interval: at 100 % the account throttles requests (429).${provisioned !== null ? ` Provisioned throughput stays at ${formatNumber(provisioned, "int")} RU/s.` : ""} Shaded: each throttling episode.`}
+                        specs={[d.cosmosSeriesSpec, d.cosmosFindingsSpec]}
+                        loading={d.cosmosSeriesState.loading}
+                        error={d.cosmosSeriesState.error}
+                        empty={!d.cosmosSeriesState.loading && ruRows.length === 0}
+                        emptyText="No normalized RU in this capture."
+                        table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "Normalized RU", label: "Normalized RU (%)", kind: "percent" }], rows: ruRows, caption: "Normalized RU per interval" }}
+                        summary={ruPeak ? `Normalized RU peaked at ${formatNumber(ruPeak.value, "percent")}; ${episodes.length} throttling episodes.` : "No normalized RU."}
+                        askPrompt="Explain T5's normalized RU in this capture: when did it throttle, why, and did it recover?"
+                    >
+                        <ChartView
+                            hideHeader
+                            spec={{ kind: "area", title: "Normalized RU", rows: ruRows, x: "at", y: "Normalized RU", unit: "%" }}
+                            colors={{ "Normalized RU": TARGETS.T5.color }}
+                            annotations={{
+                                bands: episodes.filter((e) => e.start && e.end).map((e) => ({ from: e.start as Date, to: e.end as Date, tone: "incident" as const })),
+                                thresholds: [{ value: 100, label: "100 %: throttling", tone: "warning" }],
+                                markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatNumber(ruPeak.value, "percent")}` }] : [],
+                            }}
+                        />
+                    </VisualCard>
+
+                    <VisualCard
+                        id="estate.t5.requests"
+                        className="span-6"
+                        title="Requests and 429s"
+                        subtitle="Requests in each interval, and the ones Cosmos DB throttled (429)."
+                        specs={[d.cosmosSeriesSpec]}
+                        loading={d.cosmosSeriesState.loading}
+                        error={d.cosmosSeriesState.error}
+                        empty={!d.cosmosSeriesState.loading && requestRows.length === 0}
+                        table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "series", label: "Series", kind: "text" }, { key: "value", label: "Requests", kind: "int" }], rows: requestRows, caption: "Requests and 429s per interval" }}
+                        summary={`${formatNumber(throttled, "int")} of ${formatNumber(requests, "int")} requests throttled.`}
+                    >
+                        <ChartView hideHeader height={200} spec={{ kind: "line", title: "Requests", rows: requestRows, x: "at", y: "value", series: "series", unit: "count" }} colors={{ Requests: TARGETS.T5.color, "429s": "var(--status-fail)" }} />
+                    </VisualCard>
+
+                    <VisualCard
+                        id="estate.t5.latency"
+                        className="span-6"
+                        title="Gateway latency"
+                        subtitle="Server-side latency through the gateway, the average in each interval."
+                        specs={[d.cosmosSeriesSpec]}
+                        loading={d.cosmosSeriesState.loading}
+                        error={d.cosmosSeriesState.error}
+                        empty={!d.cosmosSeriesState.loading && latencyRows.length === 0}
+                        emptyText="No gateway latency in this capture."
+                        table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "Gateway latency", label: "Gateway latency (ms)", kind: "decimal" }], rows: latencyRows, caption: "Gateway latency per interval" }}
+                        summary={latencyAvg === null ? "No latency." : `Gateway latency averaged ${formatNumber(latencyAvg, "ms")}.`}
+                    >
+                        <ChartView hideHeader height={200} spec={{ kind: "line", title: "Gateway latency", rows: latencyRows, x: "at", y: "Gateway latency", unit: "ms" }} colors={{ "Gateway latency": TARGETS.T5.color }} />
+                    </VisualCard>
+
+                    <VisualCard
+                        id="estate.t5.findings"
+                        className="span-12"
+                        title="What the notebook found"
+                        subtitle="The findings of the latest Cosmos DB capture: the throttling, each episode, and the recovery."
+                        specs={[d.cosmosFindingsSpec]}
+                        loading={d.cosmosFindingsState.loading}
+                        error={d.cosmosFindingsState.error}
+                        empty={!d.cosmosFindingsState.loading && d.cosmosFindingRows.length === 0}
+                        table={d.cosmosFindingsState.data && d.cosmosFindingsSpec ? { columns: d.cosmosFindingsSpec.columns, rows: d.cosmosFindingsState.data.rows, caption: "Findings of the latest Cosmos DB capture" } : null}
+                        summary={`${d.cosmosFindingRows.length} findings.`}
+                        quiet
+                    >
+                        <ol className="feed">
+                            {story.map((f) => (
+                                <li key={f.id}>
+                                    <StatusBadge status={f.status} short />
+                                    <TargetChip target={f.target || "T5"} />
                                     <span className="feed-text">{f.text}</span>
                                     <time>{formatDateTimeUtc(f.capturedAt)}</time>
                                 </li>
