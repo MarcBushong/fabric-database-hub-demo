@@ -19,8 +19,11 @@ function usage(u: UsageCounts | null | undefined): number {
     return u ? u.cpu + u.memory + u.storage : 0;
 }
 
+/** "SQL: CPU 1", naming only the nonzero counts; null when there are none. */
 function usageText(name: string, u: UsageCounts | null | undefined): string | null {
-    return u ? `${name}: CPU ${u.cpu}, memory ${u.memory}, storage ${u.storage}` : null;
+    if (!u) return null;
+    const parts = ([["CPU", u.cpu], ["memory", u.memory], ["storage", u.storage]] as const).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`);
+    return parts.length > 0 ? `${name}: ${parts.join(", ")}` : null;
 }
 
 export function LiveNow() {
@@ -57,7 +60,7 @@ export function LiveNow() {
         ...down.map((r) => ({ signal: "Not up", value: r.status ?? "", detail: `${r.name} (${targetOfResource(r) || r.databaseType})` })),
         { signal: "High-usage signals, last 24 hours", value: high, detail: [usageText("Microsoft SQL", h?.microsoftSql?.highUsage), usageText("PostgreSQL", h?.postgreSql?.highUsage)].filter(Boolean).join("; ") },
         { signal: "Security warnings", value: warnings?.length ?? null, detail: (warnings ?? []).map((w) => `${w.resource}: ${w.check}`).join("; ") },
-        ...(cosmos ? [{ signal: "Cosmos DB", value: cosmos.maximumNormalizedRu, detail: `peak normalized RU %, lowest availability ${cosmos.minimumServiceAvailability ?? "n/a"} %` }] : []),
+        ...(cosmos ? [{ signal: "Cosmos DB, peak normalized RU (%)", value: cosmos.maximumNormalizedRu, detail: `lowest availability ${cosmos.minimumServiceAvailability ?? "n/a"} %` }] : []),
     ];
 
     const ask = () =>
@@ -111,7 +114,7 @@ export function LiveNow() {
                 <KpiTile
                     label="High usage, last 24 hours"
                     value={high === null ? "\u2013" : String(high)}
-                    sub={h ? [usageText("SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join(" \u00b7 ") || "No usage data" : "Reading\u2026"}
+                    sub={h ? [usageText("SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join(" \u00b7 ") || "None on SQL or PostgreSQL" : "Reading\u2026"}
                     status={high === null ? null : high > 0 ? "Warning" : "Pass"}
                     onOpen={() => navigate("performance")}
                     openLabel="Open performance"
@@ -128,7 +131,7 @@ export function LiveNow() {
                     <KpiTile
                         label="Cosmos DB, last 24 hours"
                         value={cosmos.maximumNormalizedRu === null ? "\u2013" : formatNumber(cosmos.maximumNormalizedRu, "percent")}
-                        sub={`peak normalized RU \u00b7 availability at least ${cosmos.minimumServiceAvailability === null ? "n/a" : formatNumber(cosmos.minimumServiceAvailability, "percent")}`}
+                        sub={`peak normalized RU \u00b7 lowest availability ${cosmos.minimumServiceAvailability === null ? "n/a" : formatNumber(cosmos.minimumServiceAvailability, "percent")}`}
                         status={(cosmos.maximumNormalizedRu ?? 0) >= 100 ? "Warning" : "Pass"}
                         onOpen={() => navigate("estate", { target: "T5" })}
                         openLabel="Open T5"

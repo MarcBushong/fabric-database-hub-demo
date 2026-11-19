@@ -742,6 +742,22 @@ export function cosmosSeries(capture: CosmosCapture | null, metric: string): Cos
     return capture ? capture.points.filter((p) => p.metric === metric) : [];
 }
 
+/** The runs of intervals that throttled: a 429 in the interval, or normalized RU at 100 %. */
+export function throttledRuns(capture: CosmosCapture | null): Array<{ from: Date; to: Date }> {
+    if (!capture) return [];
+    const step = (capture.intervalMinutes ?? 1) * 60000;
+    const hot = new Set<number>();
+    for (const p of cosmosSeries(capture, COSMOS_METRICS.throttled)) if (p.value > 0) hot.add(p.at.getTime());
+    for (const p of cosmosSeries(capture, COSMOS_METRICS.normalizedRu)) if (p.value >= 100) hot.add(p.at.getTime());
+    const runs: Array<{ from: Date; to: Date }> = [];
+    for (const at of [...hot].sort((a, b) => a - b)) {
+        const last = runs[runs.length - 1];
+        if (last && at <= last.to.getTime()) last.to = new Date(at + step);
+        else runs.push({ from: new Date(at), to: new Date(at + step) });
+    }
+    return runs;
+}
+
 export interface ThrottleEpisode {
     id: string;
     start: Date | null;

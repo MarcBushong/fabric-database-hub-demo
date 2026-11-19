@@ -24,6 +24,7 @@ import {
     toBins,
     toFindings,
     toIncidents,
+    throttledRuns,
     throttleEpisodes,
     toCaptureFindings,
     toCosmosCapture,
@@ -717,14 +718,14 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         id="estate.t5.ru"
                         className="span-12"
                         title="Normalized RU, and when it throttled"
-                        subtitle={`The highest normalized RU consumption in each interval: at 100 % the account throttles requests (429).${provisioned !== null ? ` Provisioned throughput stays at ${formatNumber(provisioned, "int")} RU/s.` : ""} Shaded: each throttling episode.`}
+                        subtitle={`The highest normalized RU consumption in each interval: at 100 % the account throttles requests (429).${provisioned !== null ? ` Provisioned throughput stays at ${formatNumber(provisioned, "int")} RU/s.` : ""} Shaded: the intervals that throttled.`}
                         specs={[d.cosmosSeriesSpec, d.cosmosFindingsSpec]}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && ruRows.length === 0}
                         emptyText="No normalized RU in this capture."
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "Normalized RU", label: "Normalized RU (%)", kind: "percent" }], rows: ruRows, caption: "Normalized RU per interval" }}
-                        summary={ruPeak ? `Normalized RU peaked at ${formatNumber(ruPeak.value, "percent")}; ${episodes.length} throttling episodes.` : "No normalized RU."}
+                        summary={ruPeak ? `Normalized RU peaked at ${formatNumber(ruPeak.value, "percent")}; ${throttledRuns(capture).length} throttled stretches in ${episodes.length} episodes.` : "No normalized RU."}
                         askPrompt="Explain T5's normalized RU in this capture: when did it throttle, why, and did it recover?"
                     >
                         <ChartView
@@ -732,7 +733,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             spec={{ kind: "area", title: "Normalized RU", rows: ruRows, x: "at", y: "Normalized RU", unit: "%" }}
                             colors={{ "Normalized RU": TARGETS.T5.color }}
                             annotations={{
-                                bands: episodes.filter((e) => e.start && e.end).map((e) => ({ from: e.start as Date, to: e.end as Date, tone: "incident" as const })),
+                                bands: throttledRuns(capture).map((r) => ({ from: r.from, to: r.to, tone: "incident" as const })),
                                 thresholds: [{ value: 100, label: "100 %: throttling", tone: "warning" }],
                                 markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatNumber(ruPeak.value, "percent")}` }] : [],
                             }}

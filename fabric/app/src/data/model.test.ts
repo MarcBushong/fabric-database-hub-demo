@@ -6,6 +6,7 @@ import {
     beatFor,
     COSMOS_METRICS,
     cosmosSeries,
+    throttledRuns,
     throttleEpisodes,
     toCosmosCapture,
     postgresPeak,
@@ -154,6 +155,9 @@ describe("model parsers", () => {
         expect(cosmosSeries(capture, COSMOS_METRICS.provisioned)).toHaveLength(1);
         expect(toCosmosCapture([{ Bucket: "2026-11-13T17:00:00", Metric: "bad metric!", Value: 1 }])).toBeNull();
         expect(throttleEpisodes(FIXTURES["cosmos-findings"]).map((e) => [e.id, e.start?.toISOString()])).toEqual([["cosmosdb.T5.throttle.20261113T1702", "2026-11-13T17:02:00.000Z"]]);
+        // Only the intervals that throttled are shaded, not the calm minutes of an episode.
+        expect(throttledRuns(capture).map((r) => [r.from.toISOString(), r.to.toISOString()])).toEqual([["2026-11-13T17:02:00.000Z", "2026-11-13T17:04:00.000Z"]]);
+        expect(throttledRuns(null)).toEqual([]);
     });
     it("reads each Database Agent beat's regression, response, and CPU from its evidence, and matches it to the incident it overlaps", () => {
         const beats = toAgentBeats([
