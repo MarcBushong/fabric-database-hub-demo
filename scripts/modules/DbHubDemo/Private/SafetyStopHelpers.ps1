@@ -9,12 +9,11 @@
 # delete T5's session-only container, nothing else. It can't start, create, or change anything; it has no Run Command, no
 # data action, and no Automation, Key Vault, Fabric, or role permission. Changing this list needs the owner's approval;
 # tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and the ADR differ.
-# 2026-11-19 (ADR 0024 and ADR 0027, provisionally approved by the coordinator for the owner, who reviews it before any
-# merge): read and delete T5's session-only container, so a session that ended without its stop doesn't leave its
-# provisioned throughput billing all night. It could read or delete any Azure Cosmos DB for NoSQL container in the demo
-# resource group, where T5's account is the only account, and the runbook deletes contosocare/patient-events only, and only
-# while the DbHubT5Container tag is Session (a session creates it again). Nothing of the account, its keys, its network,
-# or its data plane.
+# 2026-11-19 (ADR 0024 and ADR 0027, approved by the owner on 2026-11-19): read and delete T5's session-only container,
+# so a session that ended without its stop doesn't leave its provisioned throughput billing all night. It could read or
+# delete any Azure Cosmos DB for NoSQL container in the demo resource group, where T5's account is the only account, and
+# the runbook deletes contosocare/patient-events only, and only while the DbHubT5Container tag is Session (a session
+# creates it again). Nothing of the account, its keys, its network, or its data plane.
 # https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
 $script:SafetyStopRoleName = 'DbHub Demo Safety Stop'
 $script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, read its Azure SQL database''s status, and read and delete its session-only Azure Cosmos DB container. Assigned only at the demo resource group, to the nightly safety stop''s identity.'

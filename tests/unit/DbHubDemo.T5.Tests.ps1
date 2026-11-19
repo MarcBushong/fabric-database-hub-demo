@@ -877,7 +877,7 @@ Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when th
         function New-Priced([string] $Lifecycle, [double] $Worst) {
             New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t5ContainerLifecycle = $Lifecycle; t5AlwaysOnExtraMonthly = 22.32; monthlyWorstCase = $Worst })
         }
-        function Update-Lifecycle([object[]] $Prior, [double] $Ceiling = 390) {
+        function Update-Lifecycle([object[]] $Prior, [double] $Ceiling = 415) {
             $config = New-TestConfig
             $config['monthlyCeilingUsd'] = $Ceiling
             @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Prior = $Prior } { Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath './config/demo.config.json' -PriorResult $Prior -Confirm:$false })[0]
@@ -885,35 +885,35 @@ Describe 'Update-DemoT5ContainerLifecycle: the month''s worst case again when th
     }
 
     It 'adds the worst case, over the ceiling, with the ceiling to raise' {
-        $over = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $over = Update-Lifecycle -Prior @(New-Priced 'Session' 400.00)
         $over.status | Should -Be 'Warning'
-        $over.message | Should -Match 'Preflight priced its throughput for a session''s hours only, so the month''s worst case is about 22\.32 USD more than its estimate: 392\.92 USD, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $over.message | Should -Match 'Preflight priced its throughput for a session''s hours only, so the month''s worst case is about 22\.32 USD more than its estimate: 422\.32 USD, over monthlyCeilingUsd \(415\.00 USD\)\.$'
         $over.remediation | Should -Match 'grant-safety-stop\.ps1'
-        $over.remediation | Should -Match 'Or raise monthlyCeilingUsd to at least 393 in your configuration\.$'
+        $over.remediation | Should -Match 'Or raise monthlyCeilingUsd to at least 423 in your configuration\.$'
         $over.evidence['overCeiling'] | Should -BeTrue
-        $over.evidence['monthlyWorstCase'] | Should -Be 392.92
+        $over.evidence['monthlyWorstCase'] | Should -Be 422.32
     }
 
     It 'prices it again when the run ends with no session-control role and nothing automatic to delete the container, though the tag stays Session (review of ab91ee5)' {
         Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $false; Price = 'AlwaysOn' } }
-        $manual = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $manual = Update-Lifecycle -Prior @(New-Priced 'Session' 400.00)
         $manual.status | Should -Be 'Warning'
         $manual.evidence['lifecycle'] | Should -Be 'Session' -Because 'stop-demo.ps1 still deletes it'
         $manual.evidence['price'] | Should -Be 'AlwaysOn'
         $manual.message | Should -Match '^T5''s container is deleted only when you run \./scripts/stop-demo\.ps1'
-        $manual.message | Should -Match 'the month''s worst case is about 22\.32 USD more than its estimate: 392\.92 USD, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $manual.message | Should -Match 'the month''s worst case is about 22\.32 USD more than its estimate: 422\.32 USD, over monthlyCeilingUsd \(415\.00 USD\)\.$'
         $manual.remediation | Should -Match 'stop-demo\.ps1 after each session'
-        $manual.remediation | Should -Match 'raise monthlyCeilingUsd to at least 393'
+        $manual.remediation | Should -Match 'raise monthlyCeilingUsd to at least 423'
         # With the nightly safety stop deleting it, nothing changes.
         Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = ''; Changed = $true; Known = $true; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = 'NoRole'; AutoDelete = $true; Price = 'Session' } }
-        $nightly = Update-Lifecycle -Prior @(New-Priced 'Session' 370.60)
+        $nightly = Update-Lifecycle -Prior @(New-Priced 'Session' 400.00)
         $nightly.status | Should -Be 'Pass'
         $nightly.message | Should -Not -Match 'Preflight priced'
     }
 
     It 'says it''s within the ceiling, and adds nothing when preflight priced AlwaysOn already or didn''t run' {
         $within = Update-Lifecycle -Prior @(New-Priced 'Session' 200.00)
-        $within.message | Should -Match 'worst case is about 22\.32 USD more than its estimate: 222\.32 USD, within monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $within.message | Should -Match 'worst case is about 22\.32 USD more than its estimate: 222\.32 USD, within monthlyCeilingUsd \(415\.00 USD\)\.$'
         $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
         (Update-Lifecycle -Prior @(New-Priced 'AlwaysOn' 380.00)).message | Should -Not -Match 'Preflight priced'
         (Update-Lifecycle -Prior @()).message | Should -Not -Match 'Preflight priced'

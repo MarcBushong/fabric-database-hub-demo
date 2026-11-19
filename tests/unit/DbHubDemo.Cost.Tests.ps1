@@ -887,9 +887,9 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Match 'raise monthlyCeilingUsd'
     }
 
-    It 'uses a 390 USD monthly ceiling and a 20 USD session ceiling by default (390 since 2026-11-19, 375 before; 20 since 2026-11-18)' {
+    It 'uses a 415 USD monthly ceiling and a 20 USD session ceiling by default (415 since 2026-11-19, 375 before; 20 since 2026-11-18)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DefenderPlans $defenderPlans
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 390\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 415\.00 USD'
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 20\.00 USD'
     }
 

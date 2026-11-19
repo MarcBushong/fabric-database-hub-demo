@@ -21,7 +21,7 @@ BeforeAll {
         'Microsoft.Sql/servers/databases/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
-        # T5's session-only container (2026-11-19, ADR 0024's amendment, provisionally approved by the coordinator for the owner).
+        # T5's session-only container (2026-11-19, ADR 0024's amendment, approved by the owner).
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
     )
@@ -942,22 +942,22 @@ Describe 'A nightly safety stop that this run sets up (2026-11-19, the coordinat
     }
 
     It 'says so again on the status page when its setup in this run doesn''t put it in place: the worst case without it, the ceiling, and the fix' {
-        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 395.12 })
+        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 423.10 })
         $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role assignment failed: Conflict.'
         $setup = @((New-TestResult 'SAFETYSTOP.RESOURCES'), (New-TestResult 'SAFETYSTOP.RUNBOOK'), (New-TestResult 'SAFETYSTOP.SCHEDULE'), $role)
         $config = New-SafetyConfig
-        $config['monthlyCeilingUsd'] | Should -Be 390 -Because 'the example''s default for a new configuration since 2026-11-19'
+        $config['monthlyCeilingUsd'] | Should -Be 415 -Because 'the example''s default for a new configuration since 2026-11-19'
         $over = & $script:planResult @($monthly) $setup $config
         $over.checkId | Should -Be 'DEPLOY.COST.T4RESTART'
         $over.status | Should -Be 'Warning'
         $over.message | Should -Match '^Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place \(SAFETYSTOP\.ROLE: The role assignment failed: Conflict\.\)'
-        $over.message | Should -Match 'the worst case is 395\.12 USD a month, over monthlyCeilingUsd \(390\.00 USD\)\.$'
+        $over.message | Should -Match 'the worst case is 423\.10 USD a month, over monthlyCeilingUsd \(415\.00 USD\)\.$'
         $over.remediation | Should -Match 'grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json'
-        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 396 in your configuration\.$'
+        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 424 in your configuration\.$'
         $over.evidence['overCeiling'] | Should -BeTrue
-        $config['monthlyCeilingUsd'] = 400
+        $config['monthlyCeilingUsd'] = 430
         $within = & $script:planResult @($monthly) $setup $config
-        $within.message | Should -Match 'within monthlyCeilingUsd \(400\.00 USD\)\.$'
+        $within.message | Should -Match 'within monthlyCeilingUsd \(430\.00 USD\)\.$'
         $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
         # Nothing when the setup put it in place, or when preflight didn't count it.
         $passed = @($setup | ForEach-Object { New-TestResult ([string]$_.checkId) })
