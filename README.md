@@ -34,7 +34,7 @@ Once; [prerequisites](docs/prerequisites.md) has every item and who provides it.
 
 - **Contributor** on an Azure subscription. Recommended, once per environment: an **Owner** for the nightly safety stop's and the session control's roles. Without one, the run still ends **DONE** and prints the one command an Owner runs.
 - An **F or Trial Fabric capacity** you can assign, **running** while you deploy.
-- Fabric tenant settings, which a Fabric administrator turns on: **Users can access the Database hub (preview)**, and **Create workspaces** unless you already have a workspace; for the Insights app, **Fabric Apps (preview)** and **Dataset Execute Queries REST API**.
+- Fabric tenant settings, which a Fabric administrator turns on: **Users can access the Database hub (preview)**, and **Create workspaces** unless you already have a workspace; for the Insights app, **Fabric Apps (preview)** and **Dataset Execute Queries REST API**; for Copilot in Database Hub, Copilot's own tenant settings ([P17](docs/prerequisites.md#optional)), the tenant's decision.
 - Quota for about **8 vCPUs** of VM sizes with nested virtualization in the region; preflight checks it.
 - PowerShell 7.4, the Azure CLI with Bicep, Node.js 24, and Git. The repository's [dev container](.devcontainer/devcontainer.json) has them all, locally or in GitHub Codespaces. On Windows, `deploy.ps1` installs the .NET SDK for you.
 - For the Copilot chat in the Insights app: each viewer's own GitHub account with a GitHub Copilot plan.
