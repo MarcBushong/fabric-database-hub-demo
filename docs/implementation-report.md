@@ -3224,4 +3224,10 @@ The work:
 - **After the fixes,** `configure-fabric-app.ps1` (5.7 minutes): `FABRIC.APP.DEPLOY`, `FABRIC.APP.HOSTING`, `ASK.RELAY`, `ASK.RELAY.HEALTH` (1.7 s), `ASK.SIGNIN`, and `ASK.CSP` all **Pass**. `stop-demo.ps1` then stopped the environment.
 - **Not yet:** a viewer's whole path in the Fabric-hosted app (the GitHub sign-in, a question, its tools, and the estate function in the browser), which waits for the owner's approval of a sign-in; and the image published from GitHub Container Registry, which waits for the workflow's first run.
 
+**Validation, static** (2026-11-19, on the branch merged with `ignite-updates` at 41a3a1b, `./tests/Invoke-StaticValidation.ps1 -CI` with `Pester` in its own process, because this PC's OneDrive copy of Pester isn't hydrated):
+
+- PSScriptAnalyzer: 0 findings in 377 files. Bicep: builds and lints, `infra/ask` included, and `azuredeploy.json` in sync. markdownlint: 0 issues in 142 files.
+- The Fabric App: typecheck, lint, 176 tests, the license check, and the build pass. `ask-relay`: typecheck, 20 tests, and the build pass.
+- Pester (64.8 minutes): 4,660 tests; 4,617 passed, 1 failed, and 42 skipped; no unit test reached the Azure CLI. The failure is the teardown test's child `pwsh`, which loads this PC's OneDrive Pester, not this change's (the GA updates' entry has the same).
+- The first full run, before the fixes, found this change's own: a test whose configuration turned Ask on; the relay check's missing read limit (R862); `versions.json`'s skill pin under a key gitleaks' allowlist doesn't know; the image workflow's top-level `packages: write` and its push without ADR 0022's opt-in; and the lifecycle tests reaching the Azure CLI through `start-demo.ps1`'s relay lookup. All are fixed.
 **Risks.** R893 to R897 new; R2 updated.
