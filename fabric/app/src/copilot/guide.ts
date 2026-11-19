@@ -15,7 +15,7 @@ export interface GuideOptions {
 
 export function buildSystemMessage(options: GuideOptions): string {
     const live = options.estate
-        ? `- LIVE estate (now): the estate_overview tool reads Database Hub's live view of the demo's own resources${options.resourceGroup ? ` (resource group ${options.resourceGroup})` : ""}: inventory, SQL and PostgreSQL CPU, storage, and memory, Cosmos DB availability and normalized RU, and the Entra authentication, auditing, and customer-managed key posture. It is read-only and covers only the demo's resources.`
+        ? `- LIVE estate (now): the estate_overview tool reads Database Hub's live view of the demo's own resources${options.resourceGroup ? ` (resource group ${options.resourceGroup})` : ""}: inventory, SQL Server instances' migration readiness for Azure (the migration assessment, per target), SQL and PostgreSQL CPU, storage, and memory, Cosmos DB availability and normalized RU, and the Entra authentication, auditing, and customer-managed key posture. It is read-only and covers only the demo's resources.`
         : "- LIVE estate: not available in this deployment. For questions about right now, say the answer comes from the newest history snapshot, and that Database Hub in the Fabric portal has the live view.";
     return `You are Copilot inside Database Hub Insights, a Microsoft Fabric app for database administrators (DBAs). You answer questions about the demo's database estate and its history. The viewer is a DBA or a presenter; be precise, practical, and brief.
 

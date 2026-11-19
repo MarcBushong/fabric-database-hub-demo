@@ -22,6 +22,29 @@ export interface InventoryResource {
     /** Database Hub's findings by area (security, performance, optimization): flags that are true need attention. */
     issues?: Record<string, Record<string, boolean>>;
     enhancements?: Record<string, Record<string, boolean>>;
+    /** A SQL Server instance's migration assessment (Arc-enabled SQL Server), when Database Hub's row carries one. */
+    migrationAssessment?: MigrationAssessment;
+}
+
+/**
+ * Database Hub's migration assessment of a SQL Server instance, from its inventory row (properties.migrationAssessment
+ * of POST /savedView/resources/list, the same route, read-only). Database Hub doesn't raise a ready assessment as an
+ * issue, so this is where "which servers can move to Azure, and to what" is answered.
+ */
+export interface MigrationAssessment {
+    enabled: boolean;
+    /** When the instance last uploaded its assessment (as Database Hub reports it), or null. */
+    uploadedAt: string | null;
+    /** Database Hub's dataStatus: "Available" when the assessment has results, "Unavailable" when not. */
+    dataStatus: string;
+    /** Readiness per Azure target, with Database Hub's names and values, for example azureSqlManagedInstance: "Ready". */
+    targets: Record<string, string>;
+    /** The targets whose readiness is Ready. */
+    readyTargets: string[];
+    /** Any recommendation the row carries besides the fields above (a recommended target or size), as it came. */
+    recommendation?: Record<string, string | number | boolean>;
+    /** Database Hub's own flag (issues.optimization.hasMigrationAssessmentIssue), when the row has it. */
+    hasIssue?: boolean;
 }
 
 export interface InventoryData {
@@ -208,6 +231,47 @@ function usage(summary: Record<string, unknown> | null): UsageSummary | null {
 
 const text = (value: unknown): string | undefined => (value === undefined || value === null ? undefined : String(value));
 
+const ASSESSMENT_FIELDS = new Set(["enabled", "assessmentUploadTimeUtc", "dataStatus", "targets"]);
+const isScalar = (value: unknown): value is string | number | boolean => typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+
+/** A row's migration assessment (properties.migrationAssessment), or undefined when it has none. */
+export function toMigrationAssessment(row: Record<string, unknown>): MigrationAssessment | undefined {
+    const props = row.properties;
+    const raw = props && typeof props === "object" ? (props as Record<string, unknown>).migrationAssessment : undefined;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const source = raw as Record<string, unknown>;
+    const targets: Record<string, string> = {};
+    if (source.targets && typeof source.targets === "object" && !Array.isArray(source.targets)) {
+        for (const [target, readiness] of Object.entries(source.targets as Record<string, unknown>)) {
+            if (isScalar(readiness)) targets[target] = String(readiness);
+        }
+    }
+    // A recommended target or size, if a later version of the row carries one: its scalar fields, one level deep, bounded.
+    const recommendation: Record<string, string | number | boolean> = {};
+    for (const [key, value] of Object.entries(source)) {
+        if (ASSESSMENT_FIELDS.has(key) || Object.keys(recommendation).length >= 20) continue;
+        if (isScalar(value)) recommendation[key] = value;
+        else if (value && typeof value === "object" && !Array.isArray(value)) {
+            for (const [inner, innerValue] of Object.entries(value as Record<string, unknown>)) {
+                if (isScalar(innerValue) && Object.keys(recommendation).length < 20) recommendation[`${key}.${inner}`] = innerValue;
+            }
+        }
+    }
+    const optimization = (row.issues as Record<string, Record<string, unknown>> | undefined)?.optimization;
+    const flag = optimization && typeof optimization === "object" ? optimization.hasMigrationAssessmentIssue : undefined;
+    return {
+        enabled: source.enabled === true,
+        uploadedAt: text(source.assessmentUploadTimeUtc) ?? null,
+        dataStatus: text(source.dataStatus) ?? "Unknown",
+        targets,
+        readyTargets: Object.entries(targets)
+            .filter(([, readiness]) => readiness.toLowerCase() === "ready")
+            .map(([target]) => target),
+        ...(Object.keys(recommendation).length > 0 ? { recommendation } : {}),
+        ...(typeof flag === "boolean" ? { hasIssue: flag } : {}),
+    };
+}
+
 async function inventory(r: Reader, scope: EstateScope): Promise<InventoryData> {
     const resources: InventoryResource[] = [];
     let token: unknown = undefined;
@@ -226,6 +290,7 @@ async function inventory(r: Reader, scope: EstateScope): Promise<InventoryData> 
                 status: text(row.status) ?? "Unknown",
                 issues: (row.issues as InventoryResource["issues"]) ?? undefined,
                 enhancements: (row.enhancements as InventoryResource["enhancements"]) ?? undefined,
+                migrationAssessment: toMigrationAssessment(row),
             });
         }
         token = res.continuationToken;

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { ALLOWED_ROUTES, BUDGET_MS, DBHUB_BASE, inScope, readEstate, USER_AGENT, type EstateScope } from "../../rayfin/functions/src/estate-core";
+import { ALLOWED_ROUTES, BUDGET_MS, DBHUB_BASE, inScope, readEstate, toMigrationAssessment, USER_AGENT, type EstateScope, type InventoryData } from "../../rayfin/functions/src/estate-core";
 
 const scope: EstateScope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-dbhub-demo"] };
 const mine = "/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Sql/servers/s/databases/d";
@@ -42,6 +42,52 @@ describe("the estate function", () => {
         expect(fetchImpl.mock.calls[0][0].startsWith(DBHUB_BASE)).toBe(true);
     });
 
+    it("carries a SQL Server instance's migration assessment from its inventory row (the row Database Hub returned, 2026-11-18)", async () => {
+        const { calls, fetchImpl } = fakeDbHub({
+            "POST /savedView/resources/list": () => ({
+                resources: [
+                    {
+                        databaseType: "ArcSqlServer",
+                        name: "arcsql01",
+                        resourceGroupName: "rg-dbhub-demo",
+                        issues: { optimization: { hasMigrationAssessmentIssue: false, hasPaygLicenseIssue: false, hasUsageReportingIssue: false }, performance: {}, security: {} },
+                        properties: {
+                            migrationAssessment: {
+                                assessmentUploadTimeUtc: "2026-11-18T21:33:29.514-05:00",
+                                dataStatus: "Available",
+                                enabled: true,
+                                targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+                            },
+                        },
+                    },
+                    { databaseType: "AzureSql", name: "ContosoCare", resourceGroupName: "rg-dbhub-demo" },
+                ],
+            }),
+        });
+        const answer = await readEstate("inventory", scope, token, fetchImpl, new Date("2026-11-19T03:00:00Z"));
+        const [arc, database] = (answer.data as InventoryData).resources;
+        expect(arc.migrationAssessment).toEqual({
+            enabled: true,
+            uploadedAt: "2026-11-18T21:33:29.514-05:00",
+            dataStatus: "Available",
+            targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+            readyTargets: ["azureSqlManagedInstance", "azureSqlVirtualMachine"],
+            hasIssue: false,
+        });
+        expect(database.migrationAssessment).toBeUndefined();
+        expect(JSON.parse(JSON.stringify(database))).not.toHaveProperty("migrationAssessment");
+        expect(calls.map((c) => `${c.method} ${c.route}`)).toEqual(["POST /savedView/resources/list"]);
+        expect(answer.source).toEqual(["POST /savedView/resources/list"]);
+    });
+
+    it("keeps a recommended target or size that a later row may carry, bounded, and reads an unavailable assessment as it is", () => {
+        const later = { properties: { migrationAssessment: { enabled: true, dataStatus: "Available", targets: { azureSqlManagedInstance: "Ready" }, recommendedTarget: "azureSqlManagedInstance", skuRecommendation: { tier: "GeneralPurpose", vCores: 4, sizes: ["x"] } } } };
+        expect(toMigrationAssessment(later)?.recommendation).toEqual({ recommendedTarget: "azureSqlManagedInstance", "skuRecommendation.tier": "GeneralPurpose", "skuRecommendation.vCores": 4 });
+        const unavailable = toMigrationAssessment({ properties: { migrationAssessment: { enabled: true, dataStatus: "Unavailable" } } });
+        expect(unavailable).toEqual({ enabled: true, uploadedAt: null, dataStatus: "Unavailable", targets: {}, readyTargets: [] });
+        expect(toMigrationAssessment({ properties: {} })).toBeUndefined();
+        expect(toMigrationAssessment({})).toBeUndefined();
+    });
     it("stops calling routes when the answer's time budget runs out, and says so", async () => {
         const { fetchImpl } = fakeDbHub({ "POST /savedView/resources/list": () => ({ resources: [] }) });
         let ticks = 0;

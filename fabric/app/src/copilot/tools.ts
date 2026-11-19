@@ -115,7 +115,7 @@ export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
             name: "estate_overview",
             description:
                 "Reads the LIVE Database Hub view of the demo's own resources (its resource group only), read-only. " +
-                "view 'inventory': the databases by engine and type. 'health': SQL and PostgreSQL CPU, storage, and memory high-usage counts, and Cosmos DB availability and normalized RU, for the last 24 hours. " +
+                "view 'inventory': the databases by engine and type, Database Hub's findings for each, and each SQL Server instance's migration assessment (readiness for Azure SQL Database, SQL Managed Instance, and SQL Server on Azure VMs; use it for which servers can move to Azure, and to what). 'health': SQL and PostgreSQL CPU, storage, and memory high-usage counts, and Cosmos DB availability and normalized RU, for the last 24 hours. " +
                 "'security': Microsoft Entra authentication, auditing, and customer-managed key posture, and the security findings. Use it for questions about now; use run_dax for history and trends.",
             parameters: {
                 type: "object",

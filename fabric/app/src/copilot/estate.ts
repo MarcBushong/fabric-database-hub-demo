@@ -16,6 +16,7 @@ export type {
     HealthData,
     InventoryData,
     InventoryResource,
+    MigrationAssessment,
     SecurityArea,
     SecurityData,
     SecurityFinding,
