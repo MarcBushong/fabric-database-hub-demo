@@ -16,6 +16,7 @@ The deploying identity needs **Contributor on the subscription** to deploy. The 
 - Reading the Azure Policy assignments that apply to the subscription and the Defender for Cloud plans (preflight, read-only). Policy definitions stored at a management group may need read access there; preflight reports a Warning, not a Fail, when it can't read them.
 - Everything `validate.ps1` reads: role assignments, deployment history and operations, Run Command instance views, Resource Graph, budgets, and auto-shutdown schedules.
 - The nightly safety stop's identity, Automation account, runbook, and schedules (`Microsoft.Automation` is registered when needed), and reading its jobs for `status.ps1`.
+- Reading your own permissions in the subscription and on the demo resource group (preflight, read-only, since 2026-11-19: [Permissions - List For Resource Group](https://learn.microsoft.com/rest/api/authorization/permissions/list-for-resource-group)), so a first deployment's cost check counts the nightly safety stop that the run sets up when you can assign its role, and prices T5's container as the run will record it ([ADR 0016](adr/0016-cost-profiles.md#2026-11-19-a-first-deployments-worst-case-and-a-390-default-for-a-new-configuration)). It grants nothing.
 
 ## What Contributor can't do (and the demo doesn't need)
 
@@ -130,7 +131,7 @@ The session control behind the control notebook's **Run all**, part of every dep
   | `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write` | Creates T5's container at a session's start | Could change any container there; the runbook creates `contosocare/patient-events` only |
   | `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete` | Deletes T5's container at a session's stop | Could delete any container there; the runbook deletes `contosocare/patient-events` only, and only while the demo resource group's `DbHubT5Container` tag is `Session` |
 
-  Nothing of the account itself, its keys, its network, or its data plane. Until the role has them (an Owner's `deploy.ps1`, or `./scripts/grant-safety-stop.ps1`), T5's container stays between sessions and its throughput bills, and `CONTROL.ROLE.DEFINITION` says so.
+  Nothing of the account itself, its keys, its network, or its data plane. While the identity holds the role without them (an update by someone who isn't an Owner, until an Owner's `deploy.ps1` or `./scripts/grant-safety-stop.ps1`), T5's container stays between sessions and its throughput bills, and `CONTROL.ROLE.DEFINITION` and `DEPLOY.T5.LIFECYCLE` say so. While it holds no role at all (a Contributor's deployment), Run all can't start a session, so the container still exists only during a session: `start-demo.ps1` creates it with your own rights (since 2026-11-19, [ADR 0027](adr/0027-t5-cosmos-db.md#2026-11-19-session-when-the-session-control-has-no-role-and-what-preflight-prices)).
 
 - **DbHub Demo Session Writer, 2 actions,** at the two session secrets only, never at the demo resource group, whose optional vault it never reaches:
 
