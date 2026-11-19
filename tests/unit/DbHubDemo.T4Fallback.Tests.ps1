@@ -100,6 +100,8 @@ BeforeAll {
         $script:cost = New-TestCost
         $script:freeOfferFails = $false
         $script:t5FreeRefused = $false
+        # Azure's error when it refuses T5's free tier: the internal subscription's (live 2026-11-18) unless set.
+        $script:t5RefusalText = ''
         $script:createsServer = ''
         $script:elsewhere = @{}
         $script:refusesExisting = $false
@@ -183,11 +185,21 @@ BeforeAll {
                 if ($script:createsServer -and $script:currentSize -ceq $script:createsServer -and $null -eq $script:server) {
                     $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = $script:currentSize } }
                 }
-                if ($script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']) {
+                # Azure's error names every resource that failed in the attempt: T3's free offer refused (Microsoft Q&A's
+                # real text), T5's free tier refused, or both in one error.
+                $t3Refused = $script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']
+                $t5Refused = $script:t5FreeRefused -and $script:deployCalls[-1]['parameters'].Contains('t5FreeTier') -and $script:deployCalls[-1]['parameters']['t5FreeTier']['value']
+                if ($t3Refused -and $t5Refused) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]},{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]}]}}')
+                }
+                if ($t3Refused) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ProvisioningDisabled) Cannot update paid database to free database.')
                 }
                 # T5's free tier refused, in the live error's shape (2026-11-18, an internal subscription).
-                if ($script:t5FreeRefused -and $script:deployCalls[-1]['parameters'].Contains('t5FreeTier') -and $script:deployCalls[-1]['parameters']['t5FreeTier']['value']) {
+                if ($t5Refused) {
+                    if ($script:t5RefusalText) {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:t5RefusalText)
+                    }
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}]}}')
                 }
                 # Azure refuses a size only when it creates the server; an existing one isn't created again.
@@ -1887,5 +1899,130 @@ Describe 'T5''s free tier, refused by Azure: deployed again without it, once, wi
         $deployment = Invoke-TestTemplate -Config $config
         $deployment.Succeeded | Should -BeFalse
         $script:deployCalls.Count | Should -Be 2
+    }
+}
+
+Describe 'Azure refusing T5''s free tier never moves T3 off its free offer (review, 2026-11-19)' {
+    # The independent review of T5 (2026-11-19): Resolve-DemoT3FreeOfferError's "free tier" matched Cosmos DB's refusals,
+    # and T3's check ran first, so a refused T5 moved T3 off its free offer. Every live test subscription is internal (its
+    # quotaId keeps T5 off the free tier) and no test T3 has the free offer, so these tests, with Azure's own texts and the
+    # real Resolve-DemoT5FreeTier, are what validates the path.
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:t5FreeRefused = $true
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:t5Exists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $script:t5Exists; State = $(if ($script:t5Exists) { 'Succeeded' } else { 'NotFound' }); FreeTier = $false; Account = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { $script:quotaId }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5FreeTierHolder -MockWith { [pscustomobject]@{ Succeeded = $true; Accounts = @(); Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        function Invoke-FreeOfferTemplate([System.Collections.IDictionary] $Config) {
+            Invoke-DemoTemplateDeployment -Config $Config -NetworkMode private -T3UseFreeLimit $true
+        }
+        $script:alreadyApplied = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]}]}}'
+    }
+
+    It 'an update keeps an existing free T3 on its offer when Azure refuses the free tier of the T5 it adds ("Free tier has already been applied")' {
+        # The harness's environment exists (its resource group, tags, and VMs): an update from main that adds T5.
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5RefusalText = $script:alreadyApplied
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue -Because 'useFreeLimit false would move the existing free T3 to paid for good'
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'already been applied to another Azure Cosmos DB account'
+    }
+
+    It 'a new deployment creates T3 on its offer when Azure refuses T5''s free tier' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $false }
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5RefusalText = $script:alreadyApplied
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER'))[0].status | Should -Be 'Warning'
+    }
+
+    It 'an unreadable quotaId asks for T5''s free tier, and T3 keeps its offer when Azure refuses it ("Free tier is not supported for Internal subscriptions")' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:quotaId = ''
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue -Because 'an unreadable quotaId still asks for it; the refusal is the backstop'
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue -Because 'Cosmos DB''s "Free tier is not supported" isn''t T3''s'
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'Free tier is not supported for Internal subscriptions'
+    }
+
+    It 'still moves T3 off its offer on Azure SQL''s own refusal, and keeps T5''s free tier then' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5FreeRefused = $false
+        $script:freeOfferFails = $true
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[1]['parameters']['t3UseFreeLimit']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $deployment.T3UseFreeLimit | Should -BeFalse
+        (@($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER'))[0].message | Should -Match 'Cannot update paid database to free database'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER'))[0].status | Should -Be 'Pass'
+    }
+
+    It 'handles T5''s refusal and then T3''s own, each once, when Azure refuses both' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:freeOfferFails = $true
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 3
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
+        $script:deployCalls[2]['parameters']['t3UseFreeLimit']['value'] | Should -BeFalse
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER').Count | Should -Be 1
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER').Count | Should -Be 1
+    }
+
+    It 'never asks for T5''s free tier in an internal subscription, so T3 is never at risk there' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:quotaId = 'Internal_2014-09-01'
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 1
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $script:deployCalls[0]['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
     }
 }

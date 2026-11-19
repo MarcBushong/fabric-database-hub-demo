@@ -846,6 +846,24 @@ function Invoke-DemoTemplateDeployment {
                 Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read after the failed attempt, so the fallback goes on as if it doesn''t exist: {0}' -f (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $t4Now -Name 'Error'))))
             }
         }
+        # T5's free tier refused (ADR 0027): the subscription's offer doesn't include it ("Free tier is not supported for
+        # Internal subscriptions", live 2026-11-18), another account took it after Resolve-DemoT5FreeTier read the
+        # subscription, or Resource Graph didn't list that account. Learn lists no error code, so the match needs an error that
+        # names the free tier (Test-DemoT5FreeTierRefusal); the template is deployed again once, without it, and the warning
+        # replaces the Pass that Resolve-DemoT5FreeTier gave. Before T3's free offer (review, 2026-11-19): Cosmos DB's refusal
+        # must never read as T3's, which would move T3 off its free offer.
+        if (-not $t5FreeTried -and $t5FreeTier -and (Test-DemoT5FreeTierRefusal -Text ([string]$run.StdErr))) {
+            $t5FreeTried = $true
+            $t5FreeTier = $false
+            if ($null -ne $t5FreeResult) {
+                [void]$results.Remove($t5FreeResult)
+                $t5FreeResult = $null
+            }
+            $reason = Get-DemoT5FreeTierRefusalReason -Text ([string]$run.StdErr)
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Azure refused T5''s free tier ({0}), so the template was deployed again without it: T5''s throughput is billed every hour (estimate-cost.ps1 prices it).' -f $reason) -Evidence ([ordered]@{ useFreeTier = $false; refused = $true; reason = $reason }) -Remediation 'Nothing to do. Azure sets the free tier only when an account is created, so T5 keeps list price.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
+            Write-DemoLog -Level Warning -Message ('Azure refused T5''s free tier ({0}); deploying again without it.' -f $reason)
+            continue
+        }
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText ([string]$run.StdErr)
         if (-not $freeOfferTried -and $useFreeLimit -and $verdict.IsFreeOfferError) {
             Write-DemoLog -Level Warning -Message 'Azure rejected the T3 free offer; deploying again with regular General Purpose serverless.'
@@ -887,23 +905,6 @@ function Invoke-DemoTemplateDeployment {
                     $createResult = $null
                 }
             }
-            continue
-        }
-        # T5's free tier refused (ADR 0027): the subscription's offer doesn't include it ("Free tier is not supported for
-        # Internal subscriptions", live 2026-11-18), another account took it after Resolve-DemoT5FreeTier read the
-        # subscription, or Resource Graph didn't list that account. Learn lists no error code, so the match needs an error that
-        # names the free tier (Test-DemoT5FreeTierRefusal); the template is deployed again once, without it, and the warning
-        # replaces the Pass that Resolve-DemoT5FreeTier gave.
-        if (-not $t5FreeTried -and $t5FreeTier -and (Test-DemoT5FreeTierRefusal -Text ([string]$run.StdErr))) {
-            $t5FreeTried = $true
-            $t5FreeTier = $false
-            if ($null -ne $t5FreeResult) {
-                [void]$results.Remove($t5FreeResult)
-                $t5FreeResult = $null
-            }
-            $reason = Get-DemoT5FreeTierRefusalReason -Text ([string]$run.StdErr)
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Azure refused T5''s free tier ({0}), so the template was deployed again without it: T5''s throughput is billed every hour (estimate-cost.ps1 prices it).' -f $reason) -Evidence ([ordered]@{ useFreeTier = $false; refused = $true; reason = $reason }) -Remediation 'Nothing to do. Azure sets the free tier only when an account is created, so T5 keeps list price.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
-            Write-DemoLog -Level Warning -Message ('Azure refused T5''s free tier ({0}); deploying again without it.' -f $reason)
             continue
         }
         if (-not $t4FailureRead -and (Test-DemoT4Enabled -Config $effective) -and ($Action -eq 'Create') -and (-not $t4Exists -or $t4Scaling)) {

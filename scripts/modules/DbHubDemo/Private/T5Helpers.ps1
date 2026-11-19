@@ -305,12 +305,16 @@ function Test-DemoT5FreeTierRefusal {
     <#
     .SYNOPSIS
     True when a failed deployment's error says Azure refused T5's free tier: the subscription's offer doesn't include it
-    ("Free tier is not supported for Internal subscriptions", live 2026-11-18), or another account took it meanwhile.
-    Internal.
+    ("Free tier is not supported for Internal subscriptions", live 2026-11-18), or another account took it meanwhile
+    ("Free tier has already been applied to another Azure Cosmos DB account in this subscription"). Internal.
 
     .DESCRIPTION
-    Microsoft Learn lists no error code for it, so the match needs an error that names the free tier, as
-    Resolve-DemoT3FreeOfferError does for T3's free offer.
+    Microsoft Learn lists no error code for it, so the match needs an error detail that names the free tier and is Azure
+    Cosmos DB's (review, 2026-11-19): the text around "free tier", from the error target that precedes it to the next
+    one, names Cosmos DB, its resource provider (Microsoft.DocumentDB, Microsoft.Azure.Documents), or T5's nested
+    deployment (cosmos01). Invoke-DemoTemplateDeployment checks T5's refusal before T3's free offer, so an Azure SQL error
+    that says "free tier" never costs T5 the free tier, which Azure sets only when an account is created. Validated by
+    unit tests with Azure's own texts: every subscription the live tests use is internal, where T5 never asks for it.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -319,7 +323,29 @@ function Test-DemoT5FreeTierRefusal {
         [string] $Text = ''
     )
 
-    return ($Text -match '(?i)free[ -]?tier')
+    $cosmosPattern = '(?i)cosmos|documentdb|Microsoft\.Azure\.Documents|documents\.azure\.com'
+    $targetPattern = '(?i)"target"\s*:|\bTarget:\s'
+    $flat = ($Text -replace '\\r\\n|\\n|\\r|\\"', ' ') -replace '\s+', ' '
+    foreach ($phrase in [regex]::Matches($flat, '(?i)free[ -]?tier')) {
+        # The phrase's error detail: from the error target before it (at most 600 characters back) to the next one (at
+        # most 300 characters on). JSON details name their target first, the Azure CLI's "Target:" lines before their
+        # inner details.
+        $from = [Math]::Max(0, $phrase.Index - 600)
+        $before = $flat.Substring($from, $phrase.Index - $from)
+        $targets = [regex]::Matches($before, $targetPattern)
+        if ($targets.Count -gt 0) {
+            $before = $before.Substring($targets[$targets.Count - 1].Index)
+        }
+        $after = $flat.Substring($phrase.Index, [Math]::Min(300, $flat.Length - $phrase.Index))
+        $next = [regex]::Match($after, $targetPattern)
+        if ($next.Success) {
+            $after = $after.Substring(0, $next.Index)
+        }
+        if (($before + $after) -match $cosmosPattern) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-DemoT5FreeTierRefusalReason {
@@ -336,6 +362,9 @@ function Get-DemoT5FreeTierRefusalReason {
     $match = [regex]::Match($flat, '(?i)free[ -]?tier is not supported for ([A-Za-z]+) subscriptions')
     if ($match.Success) {
         return ('"Free tier is not supported for {0} subscriptions": the subscription''s offer doesn''t include it' -f $match.Groups[1].Value)
+    }
+    if ($flat -match '(?i)free[ -]?tier has already been applied to another (?:Azure )?Cosmos DB account') {
+        return '"Free tier has already been applied to another Azure Cosmos DB account in this subscription": the subscription''s one free-tier account is taken'
     }
     return 'the subscription''s one free-tier account is taken, or its offer doesn''t include the free tier'
 }
