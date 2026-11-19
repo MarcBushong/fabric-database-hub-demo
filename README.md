@@ -58,15 +58,16 @@ On its first run, `deploy.ps1` writes `config/demo.config.json` from your sign-i
 | What | Without Defender for Cloud | With an internal subscription's Defender plans |
 |---|---|---|
 | Everything running | $3.11 an hour | $3.25 an hour |
-| A Run all session (90 minutes, about 2 billed hours; `estimate-cost.ps1 -DemoHours 2`) | $6.41 | $6.70 |
-| A 5-hour session from a PC | $15.73 | $16.46 |
+| A Run all session (90 minutes, about 2 billed hours; `estimate-cost.ps1 -DemoHours 2`) | $6.21 | $6.51 |
+| A `start-demo.ps1` session left until its auto-stop (4 hours by default) | $12.43 | $13.01 |
+| A 5-hour session, the one preflight checks against `sessionCeilingUsd` | $15.53 | $16.27 |
 | A month with everything stopped | $42.69 | $82.63 |
-| A light-use month (10 running hours) | $73.95 | $115.36 |
+| A light-use month (10 running hours) | $73.76 | $115.16 |
 
 - **Between sessions:** both VMs' disks, T3's and T4's storage, T3's private endpoint in private mode, T5's private endpoint, the private DNS zones, and any Defender for Cloud plans your tenant turns on. The VMs and T4 bill no compute, T4's read replica is deleted, T3 pauses by itself, and T5's container, which holds its 400 RU/s, is deleted: an Azure Cosmos DB account has no stop. A golden snapshot, when you keep one, bills every month, after `destroy.ps1` too.
 - **During a session:** the VMs' compute and their pay-as-you-go SQL Server licenses (T1 by the hour, T2 per core-hour through Azure Arc), T3's compute while it's active, T4 and its read replica, and T5's container. Ask's chat relay bills only while someone uses the chat, and nothing while idle. Bastion, only when you start one.
 - **Close to nothing:** the two Automation accounts (their jobs fit in the 500 free job minutes a month), the Key Vault's operations, the identities, the role definitions, and the budget.
-- **The worst case preflight checks** adds T4's 7-day automatic restart to the light-use month: about a day per restart with the nightly safety stop in place, the rest of the month without it. With an internal subscription's Defender plans, that's $149.54 a month for an Owner's new deployment, which sets the safety stop up, and $398.42 for a Contributor's, until an Owner runs `./scripts/grant-safety-stop.ps1`, which sets up the safety stop and makes T5's container exist only during a session.
+- **The worst case preflight checks** adds T4's 7-day automatic restart to the light-use month: about a day per restart with the nightly safety stop in place, the rest of the month without it. With an internal subscription's Defender plans, that's $149.34 a month for an Owner's new deployment, which sets the safety stop up, and $398.23 for a Contributor's, until an Owner runs `./scripts/grant-safety-stop.ps1`, which sets up the safety stop and makes T5's container exist only during a session.
 - **Not included:** the Fabric capacity, which bills while it runs (you or its administrator pause it); Fabric and Power BI licenses; each viewer's GitHub Copilot plan; taxes and negotiated prices. **Your tenant's Defender for Cloud plans** are outside the demo's control: in an internal subscription they add $39.94 a month whether the demo runs or not, and $0.15 a running hour.
 - **The ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling that preflight fails above; a configuration keeps its own value). The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
 
