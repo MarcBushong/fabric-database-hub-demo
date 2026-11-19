@@ -14,7 +14,10 @@ const RELAY = "https://relay.example";
 
 class FakeSocket {
     static last: FakeSocket | null = null;
+    /** When set, the relay refuses the start with this fatal error. */
+    static startError: { code: string; message: string } | null = null;
     readyState = 0;
+    closed = false;
     sent: Array<Record<string, unknown>> = [];
     onopen: ((ev: Event) => unknown) | null = null;
     onmessage: ((ev: MessageEvent) => unknown) | null = null;
@@ -30,7 +33,10 @@ class FakeSocket {
     send(data: string) {
         const message = JSON.parse(data) as Record<string, unknown>;
         this.sent.push(message);
-        if (message.type === "start") this.emit({ type: "ready", sessionId: "ask-1", model: null, login: "octo", plan: "enterprise" });
+        if (message.type === "start") {
+            if (FakeSocket.startError) this.emit({ type: "error", ...FakeSocket.startError, fatal: true });
+            else this.emit({ type: "ready", sessionId: "ask-1", model: null, login: "octo", plan: "enterprise" });
+        }
         if (message.type === "user") this.emit({ type: "tool_call", callId: "c1", name: "run_dax", arguments: { query: "EVALUATE ROW(\"CpuPct\", 88.2)", purpose: "Peak CPU" } });
         if (message.type === "tool_result") {
             this.emit({ type: "delta", messageId: "m1", text: "T1 peaked " });
@@ -43,6 +49,7 @@ class FakeSocket {
     }
     close() {
         this.readyState = 3;
+        this.closed = true;
     }
 }
 
@@ -62,14 +69,24 @@ function Harness() {
     );
 }
 
-function fetchStub(routes: Record<string, unknown>) {
-    return vi.fn(async (input: RequestInfo | URL) => {
+type Route = unknown | ((init?: RequestInit) => Response);
+
+function fetchStub(routes: Record<string, Route>) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         const key = Object.keys(routes).find((path) => url === `${RELAY}${path}`);
         if (!key) return new Response("{}", { status: 404 });
-        return new Response(JSON.stringify(routes[key]), { status: 200, headers: { "Content-Type": "application/json" } });
+        const route = routes[key];
+        if (typeof route === "function") return (route as (init?: RequestInit) => Response)(init);
+        return new Response(JSON.stringify(route), { status: 200, headers: { "Content-Type": "application/json" } });
     });
 }
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+const SESSION = "dbhub-insights.github.v1";
+const HOUR = 60 * 60 * 1000;
+/** A sign-in from 9 hours ago: its 8-hour token has expired, and its 6-month refresh token still works. */
+const signedInNineHoursAgo = () => ({ accessToken: fakeToken(), expiresAt: Date.now() - HOUR, refreshToken: ["ghr", "R".repeat(36)].join("_"), refreshExpiresAt: Date.now() + 170 * 24 * HOUR, login: "octo" });
 
 /** What the history model's T5 probe answers: 1 once the lakehouse holds T5's (Azure Cosmos DB) metrics. */
 let hasCosmos = 0;
@@ -91,6 +108,7 @@ function renderDock(initialOpen = true) {
 
 beforeEach(() => {
     hasCosmos = 0;
+    FakeSocket.startError = null;
     vi.mocked(queryClient.run).mockClear();
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -179,6 +197,98 @@ describe("the Copilot dock", () => {
         renderDock();
         expect(await screen.findByRole("button", { name: "Was Cosmos DB throttled?" })).toBeInTheDocument();
         expect(run.mock.calls.filter(([spec]) => spec.dax === COSMOS_PROBE_DAX)).toHaveLength(1);
+    });
+
+    it("keeps the viewer signed in 9 hours after sign-in: it renews before asking GitHub who the token is (security review, 2026-11-19)", async () => {
+        const renewed = ["gho", "E".repeat(36)].join("_");
+        window.localStorage.setItem(SESSION, JSON.stringify(signedInNineHoursAgo()));
+        const asked: string[] = [];
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/refresh": () => json({ status: "ok", accessToken: renewed, expiresIn: 28800, refreshToken: ["ghr", "S".repeat(36)].join("_"), refreshTokenExpiresIn: 15552000 }),
+                "/auth/user": (init?: RequestInit) => {
+                    const sent = String(new Headers(init?.headers).get("Authorization")).replace(/^Bearer /, "");
+                    asked.push(sent);
+                    return sent === renewed ? json({ login: "octo", name: null, avatarUrl: null }) : json({ error: "github", message: "GitHub didn't accept the sign-in any more. Sign in to GitHub again." }, 401);
+                },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        renderDock();
+        await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo Copilot Enterprise"));
+        expect(asked).toEqual([renewed]);
+        expect(JSON.parse(window.localStorage.getItem(SESSION) ?? "{}")).toMatchObject({ accessToken: renewed, login: "octo" });
+    });
+
+    it("keeps the sign-in when renewing it fails on the way (security review, 2026-11-19)", async () => {
+        const session = signedInNineHoursAgo();
+        window.localStorage.setItem(SESSION, JSON.stringify(session));
+        const stub = fetchStub({
+            "/healthz": { ok: true, version: "t", signIn: "device" },
+            "/auth/refresh": () => json({ error: "relay_error", message: "The relay couldn't reach GitHub. Try again." }, 502),
+        });
+        vi.stubGlobal("fetch", stub);
+        renderDock();
+        await waitFor(() => expect(stub.mock.calls.some(([url]) => String(url).endsWith("/auth/refresh"))).toBe(true));
+        await act(async () => undefined);
+        expect(JSON.parse(window.localStorage.getItem(SESSION) ?? "null")).toEqual(session);
+        expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo");
+    });
+
+    it("follows another tab: its sign-out signs this tab out too (security review, 2026-11-19)", async () => {
+        window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        renderDock();
+        await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo"));
+        window.localStorage.removeItem(SESSION);
+        await act(async () => {
+            window.dispatchEvent(new StorageEvent("storage", { key: SESSION }));
+        });
+        expect(screen.getByTestId("account")).toHaveTextContent("signed-out");
+    });
+
+    it("closes the socket of a start the relay refused, without pinging it (security review, 2026-11-19)", async () => {
+        FakeSocket.startError = { code: "session_failed", message: "Copilot couldn't start: the runtime is busy." };
+        window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        renderDock();
+        fireEvent.click(await screen.findByRole("button", { name: "Which target worked hardest this week?" }));
+        expect(await screen.findByText(/the runtime is busy/)).toBeInTheDocument();
+        const socket = FakeSocket.last!;
+        expect(socket.closed).toBe(true);
+        expect(socket.sent.map((m) => m.type)).toEqual(["start"]);
+    });
+
+    it("doesn't send for an account that can't use Copilot here (security review, 2026-11-19)", async () => {
+        window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: false, login: "octo", plan: null, message: "This GitHub account can't use GitHub Copilot here." },
+            }),
+        );
+        renderDock();
+        expect(await screen.findByText("This GitHub account can't use Copilot here")).toBeInTheDocument();
+        expect(screen.getByRole("textbox", { name: "Message Copilot" })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Which target worked hardest this week?" })).toBeDisabled();
     });
 
     it("keeps a visual's context attached until the viewer asks", async () => {

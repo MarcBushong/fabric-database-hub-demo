@@ -1019,6 +1019,11 @@ Describe 'Resolve-DemoFabricAppItem' {
 Describe 'configure-fabric-app.ps1' {
     BeforeAll {
         $script:passResult = { param([string] $CheckId, [hashtable] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ok' -Evidence $Evidence }
+        # Ask's relay has its own tests (DbHubDemo.Ask.Tests.ps1). Here its setup answers as it does without a pinned image,
+        # so these tests reach no Azure CLI whatever config/versions.json pins (2026-11-19).
+        Mock -CommandName Invoke-DemoAskRelaySetup -MockWith {
+            [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'ASK.RELAY' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'Ask''s chat relay wasn''t deployed: no relay image is pinned yet (a test stub).'); Endpoint = ''; AllowedOrigins = ''; ClientIdSource = 'pinned' }
+        }
     }
 
     It 'validates the source and plans every step under -WhatIf without a token, a CLI call, or a request' {

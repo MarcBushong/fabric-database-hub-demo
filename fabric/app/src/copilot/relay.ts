@@ -69,6 +69,12 @@ export class RelayError extends Error {
     }
 }
 
+/** A failure worth trying again: the relay starting from zero or busy, a network blip, or a timeout; not a refusal. */
+export function isTransient(err: unknown): boolean {
+    if (!(err instanceof RelayError)) return true;
+    return err.status === 0 || err.status === 408 || err.status === 425 || err.status === 429 || err.status >= 500;
+}
+
 const HTTPS = /^https:\/\/[a-z0-9.-]+(:\d{1,5})?$/i;
 const LOCAL = /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/i;
 
@@ -172,7 +178,6 @@ export class ChatConnection {
             this.socket = socket;
             socket.onopen = () => {
                 socket.send(JSON.stringify({ type: "start", ...start }));
-                this.ping = setInterval(() => this.send({ type: "ping" }), 20000);
             };
             socket.onmessage = (ev) => {
                 let event: RelayEvent;
@@ -183,10 +188,16 @@ export class ChatConnection {
                 }
                 if (!settled && event.type === "ready") {
                     settled = true;
+                    // Pings only for a conversation that started: one that didn't holds nothing open on the relay.
+                    this.ping = setInterval(() => this.send({ type: "ping" }), 20000);
                     resolve({ sessionId: event.sessionId, model: event.model, login: event.login, plan: event.plan });
                 } else if (!settled && event.type === "error" && event.fatal) {
                     settled = true;
+                    // A start that failed leaves nothing to keep: close the socket, so it holds none of the relay's places.
+                    // The caller gets the error from open() and decides what the viewer sees.
+                    this.close();
                     reject(new RelayError(event.message, 0, event.code));
+                    return;
                 }
                 if (event.type !== "pong") this.onEvent(event);
             };

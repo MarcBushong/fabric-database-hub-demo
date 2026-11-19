@@ -318,7 +318,7 @@ function Conversation({ chat }: { chat: ChatController }) {
                 <p>What needs attention now, what happened, and why. Every answer shows the query, or the Database Hub source, behind it. Every visual has Ask Copilot, and every anomaly has Ask why.</p>
                 <div className="copilot-starters" role="group" aria-label="Start with a question">
                     {startersFor(Boolean(state.settings?.estate), state.cosmosHistory).map((s) => (
-                        <Button key={s.label} appearance="outline" size="small" shape="circular" onClick={() => chat.send(s.prompt)} disabled={state.busy}>
+                        <Button key={s.label} appearance="outline" size="small" shape="circular" onClick={() => chat.send(s.prompt)} disabled={state.busy || state.plan.ok === false}>
                             {s.label}
                         </Button>
                     ))}
@@ -390,7 +390,7 @@ function Answer({ turn, chat, isLast }: { turn: AssistantTurn; chat: ChatControl
             {isLast && !turn.streaming && turn.followups.length > 0 ? (
                 <div className="copilot-starters copilot-followups" role="group" aria-label="Follow-up questions">
                     {turn.followups.map((q) => (
-                        <Button key={q} appearance="outline" size="small" shape="circular" onClick={() => chat.send(q)} disabled={chat.state.busy}>
+                        <Button key={q} appearance="outline" size="small" shape="circular" onClick={() => chat.send(q)} disabled={chat.state.busy || chat.state.plan.ok === false}>
                             {q}
                         </Button>
                     ))}
@@ -467,11 +467,13 @@ function Composer({ chat }: { chat: ChatController }) {
     const { state } = chat;
     const [text, setText] = useState("");
     const box = useRef<HTMLTextAreaElement>(null);
+    // An account that can't use Copilot here can't send: each try would only start a session that fails.
+    const blocked = state.plan.ok === false;
     useEffect(() => {
         box.current?.focus();
     }, [state.pending]);
     const submit = () => {
-        if (state.busy || (!text.trim() && !state.pending)) return;
+        if (blocked || state.busy || (!text.trim() && !state.pending)) return;
         chat.send(text.trim(), state.pending);
         setText("");
     };
@@ -493,6 +495,7 @@ function Composer({ chat }: { chat: ChatController }) {
                     value={text}
                     resize="vertical"
                     aria-label="Message Copilot"
+                    disabled={blocked}
                     placeholder={state.pending ? "Ask about it, or press Enter to have Copilot explain it" : "Ask about the estate, an incident, or a trend"}
                     onChange={(_, d) => setText(d.value.slice(0, 4000))}
                     onKeyDown={(e) => {
@@ -508,7 +511,7 @@ function Composer({ chat }: { chat: ChatController }) {
                     </Tooltip>
                 ) : (
                     <Tooltip content="Send (Enter)" relationship="label">
-                        <Button appearance="primary" icon={<Send20Filled />} onClick={submit} disabled={!text.trim() && !state.pending} />
+                        <Button appearance="primary" icon={<Send20Filled />} onClick={submit} disabled={blocked || (!text.trim() && !state.pending)} />
                     </Tooltip>
                 )}
             </div>

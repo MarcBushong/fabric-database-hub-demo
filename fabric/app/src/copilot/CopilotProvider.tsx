@@ -9,10 +9,10 @@ import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } 
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
 import { clearConversation, contextPrompt, loadAskSettings, loadConversation, recap, reduceConversation, saveConversation, toMarkdown, type AskSettings } from "./conversation";
 import { readEstate, type EstateView } from "./estate";
-import { clearSession, fromPoll, loadSession, saveSession, sessionState, type GitHubSession } from "./github-session";
+import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
 import { buildSystemMessage } from "./guide";
 import { describeAskError, planLabel } from "./messages";
-import { ChatConnection, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
+import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { createToolRunner, toolSpecs, type ToolRunner } from "./tools";
 import { CopilotContext, type AttachedContext, type CopilotContextValue } from "./use-copilot";
@@ -61,10 +61,20 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const relayUrl = settings?.relayUrl ?? null;
     const relay = useMemo(() => (relayUrl ? new RelayClient(relayUrl) : null), [relayUrl]);
     const connection = useRef<ChatConnection | null>(null);
+    /** The token the open conversation started with: a renewed token starts a new conversation at the next question. */
+    const connectionToken = useRef<string | null>(null);
     const runner = useRef<ToolRunner | null>(null);
     const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const signInRun = useRef<{ cancelled: boolean } | null>(null);
     const turnsRef = useRef(turns);
+    /** The sign-in callbacks act on, current even between a renewal and the render that follows it. */
+    const sessionRef = useRef(session);
+    /** A token that came from renewing one GitHub refused: if GitHub refuses it too, the sign-in is over. */
+    const renewedAfterRefusal = useRef<string | null>(null);
+    const applySession = useCallback((next: GitHubSession | null) => {
+        sessionRef.current = next;
+        setSession(next);
+    }, []);
 
     useEffect(() => {
         turnsRef.current = turns;
@@ -119,30 +129,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         );
     }, [isOpen, queryClient, relay]);
 
-    // Who the stored sign-in belongs to, and whether that account can use GitHub Copilot here.
+    // Who the stored sign-in belongs to, and whether that account can use GitHub Copilot here (checked below freshToken).
     const token = session?.accessToken ?? null;
-    useEffect(() => {
-        if (!relay || health.state !== "ok" || !token) return;
-        let cancelled = false;
-        Promise.all([relay.user(token).catch((err: unknown) => err), relay.copilot(token).catch(() => null)]).then(([user, check]) => {
-            if (cancelled) return;
-            if (user instanceof RelayError && user.status === 401) {
-                clearSession(local());
-                setSession(null);
-                setAuthError("Your GitHub sign-in expired or was revoked. Sign in with GitHub again.");
-                return;
-            }
-            const plan: CopilotPlan = check
-                ? check.ok
-                    ? { label: planLabel(check.plan), ok: true }
-                    : { label: null, ok: false, detail: check.message ?? "This GitHub account can't use GitHub Copilot here." }
-                : { label: null, ok: null };
-            setIdentity({ token, user: user && typeof user === "object" && "login" in user ? (user as GitHubUser) : null, plan });
-        });
-        return () => {
-            cancelled = true;
-        };
-    }, [health.state, relay, token]);
 
     const user = identity && identity.token === token ? identity.user : null;
     const plan: CopilotPlan = identity && identity.token === token ? identity.plan : NO_PLAN;
@@ -152,6 +140,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         idleTimer.current = null;
         connection.current?.close();
         connection.current = null;
+        connectionToken.current = null;
     }, []);
 
     useEffect(() => () => disconnect(), [disconnect]);
@@ -162,25 +151,91 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         idleTimer.current = setTimeout(() => disconnect(), IDLE_CLOSE_MS);
     }, [disconnect]);
 
-    /** A usable token: renewed through the relay when it's close to expiry, or null when the viewer must sign in. */
-    const freshToken = useCallback(async (): Promise<string | null> => {
-        if (!session) return null;
-        const state = sessionState(session, Date.now());
-        if (state === "valid") return session.accessToken;
-        if (state === "refresh" && relay && session.refreshToken) {
-            const renewed = await relay.refresh(session.refreshToken).catch(() => null);
-            if (renewed && renewed.status === "ok") {
-                const next = fromPoll(renewed, Date.now(), session.login);
-                saveSession(local(), next);
-                setSession(next);
-                return next.accessToken;
+    /**
+     * A usable token: renewed through the relay when it's close to expiry (or, with force, because GitHub just refused
+     * it), or null when the viewer must sign in again. Only GitHub refusing the refresh token ends the sign-in; a renewal
+     * that fails on the way (the relay waking, a network blip) keeps it, and throws unless the token in hand still works.
+     */
+    const freshToken = useCallback(
+        async (force = false): Promise<string | null> => {
+            const current = sessionRef.current;
+            if (!current) return null;
+            if (!force && sessionState(current, Date.now()) === "valid") return current.accessToken;
+            if (!relay) return current.accessToken;
+            const renewal = await renewSession({ storage: local(), current, refresh: (refreshToken) => relay.refresh(refreshToken), now: () => Date.now(), force });
+            if (renewal.kind === "ok") {
+                if (renewal.session.accessToken !== current.accessToken) applySession(renewal.session);
+                return renewal.session.accessToken;
             }
-        }
-        clearSession(local());
-        setSession(null);
-        setAuthError("Your GitHub sign-in expired. Sign in with GitHub again.");
-        return null;
-    }, [relay, session]);
+            if (renewal.kind === "signed-out") {
+                applySession(null);
+                return null;
+            }
+            if (renewal.kind === "expired") {
+                clearSession(local());
+                applySession(null);
+                setAuthError("Your GitHub sign-in expired. Sign in with GitHub again.");
+                return null;
+            }
+            if (!force && current.expiresAt !== null && current.expiresAt > Date.now()) return current.accessToken;
+            throw new RelayError(`Your GitHub sign-in couldn't be renewed just now (${renewal.message}). Try again in a moment.`, 0, "renew_unavailable");
+        },
+        [applySession, relay],
+    );
+
+    // Who the sign-in belongs to, and whether that account can use GitHub Copilot here. A token past its 8 hours is
+    // renewed first: GitHub refuses it, and the 6-month refresh token keeps the viewer signed in.
+    useEffect(() => {
+        if (!relay || health.state !== "ok" || !token) return;
+        let cancelled = false;
+        void (async () => {
+            let usable: string | null;
+            try {
+                usable = await freshToken();
+            } catch {
+                return; // Not renewed just now: the sign-in stays, and the next question or visit renews it.
+            }
+            // A renewal changed the token: this check runs again for the new one.
+            if (cancelled || usable !== token) return;
+            const [found, check] = await Promise.all([relay.user(token).catch((err: unknown) => err), relay.copilot(token).catch(() => null)]);
+            if (cancelled) return;
+            if (found instanceof RelayError && found.status === 401) {
+                if (renewedAfterRefusal.current === token) {
+                    // GitHub refuses even the token renewed a moment ago: the app's authorization is gone.
+                    clearSession(local());
+                    applySession(null);
+                    setAuthError("GitHub didn't accept your sign-in. Sign in with GitHub again.");
+                    return;
+                }
+                const renewed = await freshToken(true).catch(() => null);
+                if (renewed) renewedAfterRefusal.current = renewed;
+                return;
+            }
+            const plan: CopilotPlan = check
+                ? check.ok
+                    ? { label: planLabel(check.plan), ok: true }
+                    : { label: null, ok: false, detail: check.message ?? "This GitHub account can't use GitHub Copilot here." }
+                : { label: null, ok: null };
+            setIdentity({ token, user: found && typeof found === "object" && "login" in found ? (found as GitHubUser) : null, plan });
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [applySession, freshToken, health.state, relay, token]);
+
+    // Another tab renewed the sign-in, signed out, or signed in: follow it, so this tab never holds a token that's gone.
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+        const onStorage = (event: StorageEvent) => {
+            if (event.key !== null && event.key !== SESSION_KEY) return;
+            const next = loadSession(local());
+            if (next?.accessToken === sessionRef.current?.accessToken) return;
+            applySession(next);
+            if (!next) disconnect();
+        };
+        window.addEventListener("storage", onStorage);
+        return () => window.removeEventListener("storage", onStorage);
+    }, [applySession, disconnect]);
 
     const handleEvent = useCallback(
         (event: RelayEvent) => {
@@ -227,7 +282,9 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
 
     const ensureConnection = useCallback(
         async (accessToken: string): Promise<ChatConnection> => {
-            if (connection.current) return connection.current;
+            if (connection.current && connectionToken.current === accessToken) return connection.current;
+            // A renewed token (here or in another tab) starts a new conversation on it; Copilot gets a recap.
+            if (connection.current) disconnect();
             if (!relay || !settings) throw new RelayError("Ask isn't deployed in this environment.", 0, "off");
             setConnecting(true);
             try {
@@ -253,20 +310,27 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup }) +
                     (earlier ? `\n\n# Earlier in this conversation (the previous session ended; continue from it)\n${earlier}` : "");
                 const conn = new ChatConnection(relay.chatUrl(), handleEvent);
-                await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate }) });
+                try {
+                    await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate }) });
+                } catch (err) {
+                    // Nothing of a failed start stays open: no socket and no pings.
+                    conn.close();
+                    throw err;
+                }
                 connection.current = conn;
+                connectionToken.current = accessToken;
                 return conn;
             } finally {
                 setConnecting(false);
             }
         },
-        [handleEvent, queryClient, relay, settings],
+        [disconnect, handleEvent, queryClient, relay, settings],
     );
 
     const send = useCallback(
         (text: string, ctx?: AskContext | null) => {
             const prompt = ctx ? contextPrompt({ ...ctx, prompt: text || ctx.prompt }) : text.trim();
-            if (!prompt || busy) return;
+            if (!prompt || busy || plan.ok === false) return;
             setAttached(null);
             const shown = (text || ctx?.prompt || (ctx?.title ? `Explain "${ctx.title}"` : prompt)).trim();
             dispatch({ type: "user", id: newId("u"), text: shown, from: ctx ? { title: ctx.title, page: ctx.page } : undefined, at: Date.now() });
@@ -275,24 +339,28 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             if (idleTimer.current) clearTimeout(idleTimer.current);
             void (async () => {
                 try {
-                    const accessToken = await freshToken();
+                    let accessToken = await freshToken();
                     if (!accessToken) throw new RelayError("Sign in with GitHub first.", 401, "signin");
-                    const conn = await ensureConnection(accessToken);
+                    let conn: ChatConnection;
+                    try {
+                        conn = await ensureConnection(accessToken);
+                    } catch (err) {
+                        // Copilot refused the token (revoked, or expired early): renew it once and start again. Only GitHub
+                        // refusing the refresh token ends the sign-in (freshToken).
+                        if (!(err instanceof RelayError) || !/sign in to github again/i.test(err.message)) throw err;
+                        accessToken = await freshToken(true);
+                        if (!accessToken) throw new RelayError("Your GitHub sign-in expired. Sign in with GitHub again.", 401, "signin");
+                        conn = await ensureConnection(accessToken);
+                    }
                     if (!conn.ask(prompt)) throw new RelayError("The conversation's connection isn't open. Ask again.", 0, "closed");
                 } catch (err) {
-                    const message = describeAskError(err);
-                    if (err instanceof RelayError && /sign in to github again/i.test(message)) {
-                        clearSession(local());
-                        setSession(null);
-                        setAuthError(message);
-                    }
-                    dispatch({ type: "error", message });
+                    dispatch({ type: "error", message: describeAskError(err) });
                     setBusy(false);
                     disconnect();
                 }
             })();
         },
-        [busy, disconnect, ensureConnection, freshToken],
+        [busy, disconnect, ensureConnection, freshToken, plan.ok],
     );
 
     const stop = useCallback(() => {
@@ -347,53 +415,46 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 }
             }
             setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened });
-            let interval = Math.max(5, start.interval);
-            const deadline = Date.now() + start.expiresIn * 1000;
-            while (!run.cancelled && Date.now() < deadline) {
-                await new Promise((r) => setTimeout(r, interval * 1000));
-                if (run.cancelled) return;
-                const poll = await relay.pollDeviceFlow(start.deviceCode).catch((err: unknown) => ({ status: "error" as const, message: describeAskError(err) }));
-                if (poll.status === "pending") continue;
-                if (poll.status === "slow_down") {
-                    interval = Math.max(interval + 5, poll.interval);
-                    continue;
-                }
-                if (run.cancelled) return;
-                setDevice(null);
-                signInRun.current = null;
-                if (poll.status === "ok") {
-                    const next = fromPoll(poll, Date.now());
-                    const who = await relay.user(next.accessToken).catch(() => null);
-                    const withLogin = { ...next, login: who?.login ?? null };
-                    saveSession(local(), withLogin);
-                    setSession(withLogin);
-                    return;
-                }
-                setAuthError(
-                    poll.status === "denied"
-                        ? "GitHub sign-in was cancelled on github.com. Select Sign in with GitHub to try again."
-                        : poll.status === "expired"
-                          ? "The sign-in code expired before it was entered. Select Sign in with GitHub for a new one."
-                          : `GitHub sign-in didn't finish: ${poll.message}`,
-                );
+            const code = start.deviceCode;
+            const outcome = await waitForDeviceToken({
+                poll: () => relay.pollDeviceFlow(code),
+                sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+                now: () => Date.now(),
+                expiresAt: Date.now() + start.expiresIn * 1000,
+                interval: start.interval,
+                cancelled: () => run.cancelled,
+                isTransient,
+            });
+            if (outcome.status === "cancelled" || run.cancelled) return;
+            setDevice(null);
+            signInRun.current = null;
+            if (outcome.status === "ok") {
+                const next = fromPoll(outcome, Date.now());
+                const who = await relay.user(next.accessToken).catch(() => null);
+                const withLogin = { ...next, login: who?.login ?? null };
+                saveSession(local(), withLogin);
+                renewedAfterRefusal.current = null;
+                applySession(withLogin);
                 return;
             }
-            if (!run.cancelled) {
-                setDevice(null);
-                signInRun.current = null;
-                setAuthError("The sign-in code expired before it was entered. Select Sign in with GitHub for a new one.");
-            }
+            setAuthError(
+                outcome.status === "denied"
+                    ? "GitHub sign-in was cancelled on github.com. Select Sign in with GitHub to try again."
+                    : outcome.status === "expired"
+                      ? "The sign-in code expired before it was entered. Select Sign in with GitHub for a new one."
+                      : `GitHub sign-in didn't finish: ${outcome.message}`,
+            );
         })();
-    }, [relay]);
+    }, [applySession, relay]);
 
     const signOut = useCallback(() => {
         cancelSignIn();
         disconnect();
         clearSession(local());
-        setSession(null);
+        applySession(null);
         setIdentity(null);
         setBusy(false);
-    }, [cancelSignIn, disconnect]);
+    }, [applySession, cancelSignIn, disconnect]);
 
     const open = useCallback(
         (ctx?: AskContext) => {
