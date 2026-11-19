@@ -19,7 +19,7 @@ sources:
   - https://learn.microsoft.com/training/support/mcp
   - https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools
   - https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions
-reviewed: 2026-10-20
+reviewed: 2026-11-19
 ---
 
 # Start a read-only investigation session
@@ -30,7 +30,7 @@ Run this first in every GitHub Copilot CLI or VS Code session that uses the skil
 
 - Install the plugins and the Learn MCP server: see [the install guide](../README.md#part-2-skills-in-github-copilot-cli).
 - Sign in yourself with `az login --tenant <tenantId>` in the same terminal. The agent never signs in for you, and you never give it a password or a key.
-- Start Copilot CLI from a demo working folder outside this repo, with file writes denied: `copilot --deny-tool=write`.
+- Start Copilot CLI from a demo working folder outside this repo, with file writes and the `fabric-skills` bundle's three MCP servers denied: `copilot --deny-tool=write --deny-tool=FabricIQ --deny-tool=powerbi-modeling-mcp --deny-tool=fabric-sqlendpoint`. No prompt uses those servers, and one of them can author semantic models.
 
 ## Prompts
 
