@@ -1588,7 +1588,8 @@ function Get-DemoActivityControlShowcase {
     .SYNOPSIS
     The showcase's beats for the control notebook's guide (2026-11-14), from scenarios/activity-profiles.json: its cycle,
     each incident slot as the runner reads it (target, scenario, startMinute, durationMinutes, and cycles, tier, and
-    replica when set), and each scenario's title and the first Database Hub signal it fills (scenarios/<id>/scenario.json).
+    replica when set; and for the Database Agent beat, 2026-11-18, its respondPercent, goodPercent, and agentBeat), and each
+    scenario's title and the first Database Hub signal it fills (scenarios/<id>/scenario.json).
     Internal and pure.
     #>
     [CmdletBinding()]
@@ -1607,6 +1608,16 @@ function Get-DemoActivityControlShowcase {
         }
         if ($incident.ContainsKey('replica')) {
             $slot['replica'] = [bool]$incident['replica']
+        }
+        # The Database Agent beat (2026-11-18): the run's own response, at respondPercent of the run, and the switch to the
+        # regressed plan at goodPercent, so the guide can give their times.
+        $parameters = $incident['parameters']
+        if ($parameters -is [System.Collections.IDictionary] -and $parameters.Contains('respondPercent') -and [int]$parameters['respondPercent'] -gt 0) {
+            $slot['respondPercent'] = [int]$parameters['respondPercent']
+            if ($parameters.Contains('goodPercent')) {
+                $slot['goodPercent'] = [int]$parameters['goodPercent']
+            }
+            $slot['agentBeat'] = [string]$parameters['holdAutoCorrection'] -eq 'true'
         }
         $slots.Add($slot)
         if (-not $scenarios.Contains($slot['scenario'])) {

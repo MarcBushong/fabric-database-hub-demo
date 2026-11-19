@@ -1,32 +1,53 @@
-// The app's view state: page, filters, the incident and replay position, and visual options.
-// Inside the Fabric portal the app runs in a frame without its own address bar, so the state lives in the app
-// (and in the frame's hash for reloads), and the last view is remembered per browser.
+// The app's view state: the page, the drill-down (a target, an incident, the replay position), and the global filter.
+// Inside the Fabric portal the app runs in a frame without its own address bar, so the state lives in the app (and in
+// the frame's hash for reloads), and the last view is remembered per browser.
 
-import { isTargetKey, SQL_TARGETS, type DateWindow, type TargetKey } from "./dax";
+import type { DateWindow } from "./dax";
 
-export type PageId = "estate" | "incidents" | "postgres" | "readiness" | "links";
+export type PageId = "overview" | "estate" | "performance" | "incidents" | "findings" | "readiness" | "trends" | "manage" | "links";
 export type WindowId = "day" | "7d" | "30d" | "all";
-export type SignalId = "waits" | "cpu" | "sessions" | "batch" | "bufferIo";
-export type ClockMetric = "batch" | "waits" | "sessions";
-export type WaitsView = "sankey" | "sunburst";
+
+/** The global filter's targets: the SQL targets, T4 (with its read replica), and T5 when the estate has one. */
+export type FilterTarget = "T1" | "T2" | "T3" | "T4" | "T5";
+export const FILTER_TARGETS: readonly FilterTarget[] = ["T1", "T2", "T3", "T4", "T5"];
+
+/** What a drill-down can open: a filter target or T4's read replica. */
+export type EstateTarget = FilterTarget | "T4-replica";
+export const ESTATE_TARGETS: readonly EstateTarget[] = ["T1", "T2", "T3", "T4", "T4-replica", "T5"];
+
+/** The Findings page's categories, which Overview's tiles open directly (`#/findings/security`). */
+export const FINDINGS_TABS = ["performance", "availability", "security", "optimization", "capacity", "readiness"] as const;
+export type FindingsTab = (typeof FINDINGS_TABS)[number];
 
 export interface ViewState {
     page: PageId;
-    targets: TargetKey[];
+    targets: FilterTarget[];
     window: WindowId;
+    /** The target the Estate page drills into, or null for the inventory. */
+    target: EstateTarget | null;
     incident: string | null;
     replay: number | null;
-    ridgeSignal: SignalId;
-    clockMetric: ClockMetric;
-    waitsView: WaitsView;
+    /** The Findings page's category, or null for all of them. */
+    category: FindingsTab | null;
 }
 
-export const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
-    { id: "estate", label: "Estate" },
-    { id: "incidents", label: "Incidents" },
-    { id: "postgres", label: "PostgreSQL" },
-    { id: "readiness", label: "Readiness" },
-    { id: "links", label: "Live links" },
+export interface PageInfo {
+    id: PageId;
+    label: string;
+    /** What the page answers, for its header and the navigation's tooltip. */
+    description: string;
+}
+
+export const PAGES: readonly PageInfo[] = [
+    { id: "overview", label: "Overview", description: "What needs attention now" },
+    { id: "estate", label: "Estate", description: "Every engine and target" },
+    { id: "performance", label: "Performance", description: "CPU, waits, and throughput per target" },
+    { id: "incidents", label: "Incidents", description: "Timeline, replay, and cause" },
+    { id: "findings", label: "Findings", description: "Health, security, and optimization" },
+    { id: "readiness", label: "Readiness", description: "Is the demo ready" },
+    { id: "trends", label: "Trends", description: "History past the telemetry's 7 days" },
+    { id: "manage", label: "Manage", description: "Sessions, incidents, and fixes" },
+    { id: "links", label: "Live views", description: "Database Hub and the real-time dashboards" },
 ];
 
 export const WINDOWS: ReadonlyArray<{ id: WindowId; label: string; days: number | null }> = [
@@ -37,70 +58,86 @@ export const WINDOWS: ReadonlyArray<{ id: WindowId; label: string; days: number 
 ];
 
 export const DEFAULT_VIEW: ViewState = {
-    page: "estate",
-    targets: [...SQL_TARGETS],
+    page: "overview",
+    targets: [...FILTER_TARGETS],
     window: "7d",
+    target: null,
     incident: null,
     replay: null,
-    ridgeSignal: "waits",
-    clockMetric: "waits",
-    waitsView: "sankey",
+    category: null,
 };
 
-const PAGE_IDS = new Set<PageId>(["estate", "incidents", "postgres", "readiness", "links"]);
+const PAGE_IDS = new Set<PageId>(PAGES.map((p) => p.id));
 const WINDOW_IDS = new Set<WindowId>(["day", "7d", "30d", "all"]);
-const SIGNALS = new Set<SignalId>(["waits", "cpu", "sessions", "batch", "bufferIo"]);
-const CLOCK = new Set<ClockMetric>(["batch", "waits", "sessions"]);
-const WAITS = new Set<WaitsView>(["sankey", "sunburst"]);
 const INCIDENT_KEY = /^[A-Za-z0-9:._-]{1,120}$/;
+/** Hashes from the app before 2026-11-18: their pages and their drill-downs. */
+const LEGACY_PAGES: Record<string, Partial<ViewState>> = { postgres: { page: "estate", target: "T4" } };
+
+export function isFilterTarget(value: unknown): value is FilterTarget {
+    return typeof value === "string" && (FILTER_TARGETS as readonly string[]).includes(value);
+}
+
+export function isEstateTarget(value: unknown): value is EstateTarget {
+    return typeof value === "string" && (ESTATE_TARGETS as readonly string[]).includes(value);
+}
 
 function pick<T extends string>(value: string | null, allowed: Set<T>): T | undefined {
     return value !== null && allowed.has(value as T) ? (value as T) : undefined;
 }
 
-/** Reads `#/incidents?t=T1,T3&w=30d&i=<key>&r=4&s=cpu&c=batch&v=sunburst`. Unknown or invalid values are dropped. */
+function decode(text: string): string {
+    try {
+        return decodeURIComponent(text);
+    } catch {
+        return "";
+    }
+}
+
+/** Reads `#/estate/T3?t=T1,T3&w=30d` or `#/incidents/<key>?r=4`. Unknown or invalid values are dropped. */
 export function parseHash(hash: string): Partial<ViewState> {
     const text = hash.replace(/^#\/?/, "");
     const [path, query = ""] = text.split("?");
+    const [head, ...rest] = path.split("/");
+    const sub = rest.length > 0 ? decode(rest.join("/")) : "";
     const params = new URLSearchParams(query);
     const out: Partial<ViewState> = {};
-    const page = pick(path || null, PAGE_IDS);
+    const legacy = LEGACY_PAGES[head];
+    if (legacy) Object.assign(out, legacy);
+    const page = pick(head || null, PAGE_IDS);
     if (page) out.page = page;
-    const targets = (params.get("t") ?? "").split(",").filter(isTargetKey);
-    if (targets.length > 0) out.targets = SQL_TARGETS.filter((t) => targets.includes(t));
+    if (page === "estate" && isEstateTarget(sub)) out.target = sub;
+    if (page === "incidents" && INCIDENT_KEY.test(sub)) out.incident = sub;
+    if (page === "findings" && (FINDINGS_TABS as readonly string[]).includes(sub)) out.category = sub as FindingsTab;
+    const targets = (params.get("t") ?? "").split(",").filter(isFilterTarget);
+    if (targets.length > 0) out.targets = FILTER_TARGETS.filter((t) => targets.includes(t));
     const window = pick(params.get("w"), WINDOW_IDS);
     if (window) out.window = window;
     const incident = params.get("i");
     if (incident && INCIDENT_KEY.test(incident)) out.incident = incident;
     const replay = Number(params.get("r"));
     if (params.has("r") && Number.isInteger(replay) && replay >= 0 && replay < 10000) out.replay = replay;
-    const signal = pick(params.get("s"), SIGNALS);
-    if (signal) out.ridgeSignal = signal;
-    const clock = pick(params.get("c"), CLOCK);
-    if (clock) out.clockMetric = clock;
-    const waits = pick(params.get("v"), WAITS);
-    if (waits) out.waitsView = waits;
     return out;
 }
 
 export function toHash(state: ViewState): string {
     const params = new URLSearchParams();
-    if (state.targets.length !== SQL_TARGETS.length) params.set("t", state.targets.join(","));
+    if (state.targets.length !== FILTER_TARGETS.length) params.set("t", state.targets.join(","));
     if (state.window !== DEFAULT_VIEW.window) params.set("w", state.window);
-    if (state.incident) params.set("i", state.incident);
+    let path: string = state.page;
+    if (state.page === "estate" && state.target) path += `/${encodeURIComponent(state.target)}`;
+    else if (state.page === "incidents" && state.incident) path += `/${encodeURIComponent(state.incident)}`;
+    else if (state.page === "findings" && state.category) path += `/${state.category}`;
+    else if (state.incident) params.set("i", state.incident);
     if (state.replay !== null) params.set("r", String(state.replay));
-    if (state.ridgeSignal !== DEFAULT_VIEW.ridgeSignal) params.set("s", state.ridgeSignal);
-    if (state.clockMetric !== DEFAULT_VIEW.clockMetric) params.set("c", state.clockMetric);
-    if (state.waitsView !== DEFAULT_VIEW.waitsView) params.set("v", state.waitsView);
     const query = params.toString();
-    return `#/${state.page}${query ? `?${query}` : ""}`;
+    return `#/${path}${query ? `?${query}` : ""}`;
 }
 
 export function mergeView(...parts: Array<Partial<ViewState>>): ViewState {
     return Object.assign({}, DEFAULT_VIEW, ...parts) as ViewState;
 }
 
-const STORAGE_KEY = "dbhub-insights.view.v1";
+const STORAGE_KEY = "dbhub-insights.view.v2";
 
 export function loadSavedView(storage: Pick<Storage, "getItem"> | undefined): Partial<ViewState> {
     try {

@@ -37,8 +37,8 @@ BeforeAll {
     }
 
     function New-TestInstance {
-        param([string] $Edition = 'Standard', [string] $LicenseType = 'PAYG', [bool] $Monitoring = $true, [string] $Container = $script:machineId, [string] $Name = 'arcsql01', [int] $Cores = 2)
-        [pscustomobject]@{
+        param([string] $Edition = 'Standard', [string] $LicenseType = 'PAYG', [bool] $Monitoring = $true, [string] $Container = $script:machineId, [string] $Name = 'arcsql01', [int] $Cores = 2, [AllowNull()] [object] $Assessment = $null)
+        $instance = [pscustomobject]@{
             name       = $Name
             properties = [pscustomobject]@{
                 instanceName        = 'MSSQLSERVER'
@@ -51,6 +51,10 @@ BeforeAll {
                 monitoring          = [pscustomobject]@{ enabled = $Monitoring }
             }
         }
+        if ($null -ne $Assessment) {
+            $instance.properties | Add-Member -NotePropertyName 'migration' -NotePropertyValue ([pscustomobject]@{ assessment = $Assessment })
+        }
+        return $instance
     }
 
     function New-TestExtension {
@@ -1012,6 +1016,7 @@ Describe 'T2 Arc checks' {
                     'Extension' { Test-DemoArcSqlExtension -State $S }
                     'Instance' { Test-DemoArcSqlInstance -State $S }
                     'Monitoring' { Test-DemoArcMonitoring -State $S }
+                    'MigrationAssessment' { Test-DemoArcMigrationAssessment -State $S }
                     'Duplicates' { Test-DemoArcNoDuplicate -State $S }
                     'Connected' { Test-DemoArcConnected -State $S -Now $T }
                     'Disconnected' { Test-DemoArcDisconnection -State $S -Now $T }
@@ -1068,6 +1073,37 @@ Describe 'T2 Arc checks' {
         $developer = New-TestConfig -Override @{ t2SqlInstallMode = 'Developer' }
         $result = Invoke-Check 'Monitoring' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -Monitoring $false))
         $result.status | Should -Be 'Not supported'
+    }
+
+    It 'checks migration assessment: uploaded is Pass with each target type''s readiness, off is Fail, none uploaded yet is a Warning (2026-11-18)' {
+        $ready = [pscustomobject]@{
+            enabled                  = $true
+            assessmentUploadTime     = '2026-11-18T22:10:00Z'
+            skuRecommendationResults = [pscustomobject]@{
+                azureSqlDatabase        = [pscustomobject]@{ recommendationStatus = 'Ready'; targetSku = [pscustomobject]@{ computeSize = 2; category = [pscustomobject]@{ sqlServiceTier = 'General Purpose' } } }
+                azureSqlManagedInstance = [pscustomobject]@{ recommendationStatus = 'Ready' }
+                azureSqlVirtualMachine  = [pscustomobject]@{ recommendationStatus = 'NotReady' }
+            }
+        }
+        $pass = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $ready) -Extension (New-TestExtension -Version '1.1.2600.1'))
+        $pass.checkId | Should -Be 'T2.ARC.MIGRATIONASSESSMENT'
+        $pass.status | Should -Be 'Pass'
+        $pass.message | Should -Match 'Azure SQL Database: Ready \(General Purpose, 2 vCores\); Azure SQL Managed Instance: Ready; SQL Server on Azure Virtual Machines: NotReady'
+        $pass.docUrl | Should -Be 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment'
+
+        $off = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance) -Extension (New-TestExtension -Version '1.1.2600.1'))
+        $off.status | Should -Be 'Fail'
+        $off.remediation | Should -Match 'configure-arc\.ps1'
+
+        $pending = [pscustomobject]@{ enabled = $true }
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $pending) -Extension (New-TestExtension -Version '1.1.2600.1'))).status | Should -Be 'Warning'
+        $old = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $pending) -Extension (New-TestExtension -Version '1.1.2504.99'))
+        $old.status | Should -Be 'Warning'
+        $old.message | Should -Match '1\.1\.2594\.118'
+        # Free for every edition: Developer mode is checked too.
+        $developer = New-TestConfig -Override @{ t2SqlInstallMode = 'Developer' }
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -Assessment $ready) -Extension (New-TestExtension -Version '1.1.2600.1'))).status | Should -Be 'Pass'
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Fail'
     }
 
     It 'checks monitoring and its documented prerequisites' {
@@ -1151,6 +1187,53 @@ Describe 'T2 Arc checks' {
             $update.properties.settings.LicenseType | Should -Be 'PAYG'
             @($update.properties.settings.ExcludedSqlInstances) | Should -Be @('X')
         }
+    }
+}
+
+Describe 'Set-DemoArcSqlConfiguration turns on migration assessment and starts its first run (2026-11-18)' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:assessment = $null
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { New-TestState -Config $script:config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $script:assessment) -Extension (New-TestExtension -Version '1.1.2600.1') }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoArcSqlInstance -MockWith { , @(New-TestInstance -Assessment $script:assessment) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMonitoringUpdate -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { 'InProgress' }
+    }
+
+    It 'turns it on and starts a run, which is Pass on its own row' {
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 1 -Exactly
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').message | Should -Match 'Turned on migration assessment for arcsql01\. Started a migration assessment of arcsql01 \(job InProgress\)\.'
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Pass'
+        $row.message | Should -Match 'first run started \(InProgress\)'
+    }
+
+    It 'leaves one that has uploaded an assessment alone' {
+        $script:assessment = [pscustomobject]@{ enabled = $true; assessmentUploadTime = '2026-11-18T22:10:00Z' }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+        ($results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Pass'
+    }
+
+    It 'says on its own row when Azure refuses it, and the rest of the configuration still counts' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { throw 'Turning on migration assessment for arcsql01 failed: (AuthorizationFailed)' }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Fail'
+        $row.message | Should -Match 'AuthorizationFailed'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { throw 'Starting a migration assessment of arcsql01 failed: (Conflict)' }
+        $script:assessment = $null
+        $again = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        ($again | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Warning'
     }
 }
 

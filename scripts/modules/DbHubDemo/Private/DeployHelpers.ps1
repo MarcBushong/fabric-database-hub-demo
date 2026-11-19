@@ -625,7 +625,8 @@ function Get-DemoT1PrincipalId {
 function Get-DemoT3State {
     <#
     .SYNOPSIS
-    Whether T3's database exists and its status (Online, Paused, ...), read with az sql db show. Internal.
+    Whether T3's database exists, its status (Online, Paused, ...), and its maximum vCores (MaxVcores, its SKU's capacity;
+    $null when not read), read with az sql db show. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -643,12 +644,57 @@ function Get-DemoT3State {
     $server = 'azuresql01-{0}' -f $id
     $database = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('sql', 'db', 'show', '--resource-group', (Get-DemoResourceGroupName -Config $Config), '--server', $server, '--name', 'ContosoCare') -AsJson -AllowFailure
     $status = [string](Get-DemoMemberValue -InputObject $database -Name 'status')
+    $sku = Get-DemoMemberValue -InputObject $database -Name 'currentSku'
+    if ($null -eq $sku) {
+        $sku = Get-DemoMemberValue -InputObject $database -Name 'sku'
+    }
     return [pscustomobject]@{
         Exists       = ($null -ne $database)
         Status       = $status
+        MaxVcores    = (Get-DemoMemberValue -InputObject $sku -Name 'capacity')
         ServerName   = $server
         DeploymentId = $id
     }
+}
+
+function Get-DemoT3ScaleResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T3.SCALE (2026-11-18): a resumed run starts from preflight instead when T3's database has other maximum vCores
+    than the configuration's profile sets, as an existing lowest-cost T3 has after its maximum went from 1 to 2 vCores
+    (the owner's decision: Database Agents doesn't support one-vCore serverless databases). A resume past the template
+    would skip the deployment that scales it, online. Returns that Pass, or $null when the resume can go on: no
+    deploymentId to name the server by, a database that has the profile's maximum or doesn't exist, or one that couldn't
+    be read (fail safe). A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+    $deploymentId = ''
+    if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) {
+        $deploymentId = [string]$tags['deploymentId']
+    }
+    $sizing = (Get-DemoProfile).profiles[[string]$Config['profile']]
+    if (-not $deploymentId -or $null -eq $sizing) {
+        return $null
+    }
+    $wanted = [double]$sizing['t3']['maxVcores']
+    $current = Get-DemoT3State -Config $Config -DeploymentId $deploymentId
+    $deployed = Get-DemoMemberValue -InputObject $current -Name 'MaxVcores'
+    if (-not [bool](Get-DemoMemberValue -InputObject $current -Name 'Exists') -or $null -eq $deployed -or [double]$deployed -eq $wanted) {
+        return $null
+    }
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $message = [string]::Format($culture, 'T3''s database ContosoCare on {0} has {1} maximum vCores, and the profile {2} sets {3} (lowest-cost went from 1 to 2 on 2026-11-18, because Database Agents doesn''t support one-vCore serverless databases). Resuming would skip the template that scales it, so this run starts from preflight instead: the template scales T3 online, with a brief reconnect, and what earlier runs finished is checked again and kept.', [string]$current.ServerName, [double]$deployed, [string]$Config['profile'], $wanted)
+    return (New-DemoResult -CheckId 'DEPLOY.T3.SCALE' -Area 't3' -Target 'T3' -Status 'Pass' -Message $message -Evidence ([ordered]@{ serverName = [string]$current.ServerName; maxVcores = [double]$deployed; profile = [string]$Config['profile']; profileMaxVcores = $wanted; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage') }) -DocUrl 'https://learn.microsoft.com/azure/azure-sql/database/single-database-scale')
 }
 
 function Get-DemoNextShutdownUtc {

@@ -2,6 +2,7 @@
 
 import { isTargetKey, SQL_TARGETS, type TargetKey } from "../lib/dax";
 import { isNumber, toDate } from "../lib/format";
+import type { FindingsTab } from "../lib/view-state";
 import type { Row } from "./query-client";
 
 export const TARGET_INFO: Record<TargetKey, { name: string; short: string; platform: string; resource: string }> = {
@@ -105,7 +106,10 @@ export function toTargets(rows: readonly Row[]): TargetSummary[] {
 
 export interface Finding {
     id: string;
+    analysisKey: string;
     analysis: string;
+    /** The model's Analysis Group: Estate, CPU, Locks and blocking, Waits, IO, Memory, Storage, Readiness, Incidents, PostgreSQL. */
+    group: string;
     target: string;
     status: string;
     statusSort: number;
@@ -116,13 +120,165 @@ export interface Finding {
 export function toFindings(rows: readonly Row[]): Finding[] {
     return rows.map((r) => ({
         id: text(r.FindingId),
+        analysisKey: text(r.AnalysisKey),
         analysis: text(r.Analysis) || text(r.AnalysisKey).replace(/_/g, " "),
+        group: text(r.AnalysisGroup),
         target: text(r.TargetKey),
         status: text(r.Status),
         statusSort: num(r.StatusSort) ?? 6,
         text: text(r.Finding),
         capturedAt: toDate(r.CapturedAt),
     }));
+}
+
+/** What a finding is about, for the Findings page's tabs. */
+/** The categories a finding files under: the Findings page's tabs. */
+export type FindingCategory = FindingsTab;
+
+export const FINDING_CATEGORIES: ReadonlyArray<{ id: FindingCategory; label: string; description: string }> = [
+    { id: "performance", label: "Performance", description: "CPU, waits, blocking, IO, and memory" },
+    { id: "availability", label: "Availability", description: "Replicas, connections, and throttling" },
+    { id: "security", label: "Security", description: "Authentication, auditing, and encryption posture" },
+    { id: "optimization", label: "Optimization", description: "Migration readiness, licensing, and sizing" },
+    { id: "capacity", label: "Capacity", description: "Storage growth and capacity use" },
+    { id: "readiness", label: "Telemetry and readiness", description: "What Database Hub can see" },
+];
+
+const GROUP_CATEGORY: Record<string, FindingCategory> = {
+    CPU: "performance",
+    "Locks and blocking": "performance",
+    Throughput: "performance",
+    Waits: "performance",
+    IO: "performance",
+    Memory: "performance",
+    "CPU and waits": "capacity",
+    Storage: "capacity",
+    Readiness: "readiness",
+    Estate: "readiness",
+    Incidents: "performance",
+};
+
+/** The category of a finding from its analysis: security, optimization, and migration analyses by key. */
+export function findingCategory(f: Pick<Finding, "analysisKey" | "group" | "id">): FindingCategory {
+    const key = `${f.analysisKey} ${f.id}`.toLowerCase();
+    if (/security|auth|audit|encrypt|cmk|tde|firewall|defender|vulnerab/.test(key)) return "security";
+    if (/optimi|migration|assessment|license|licensing|rightsiz|sizing|payg/.test(key)) return "optimization";
+    if (/lag|replica|connection|throttl|429|availability|failover/.test(key)) return "availability";
+    if (f.group === "PostgreSQL" || f.analysisKey === "postgresql") return "performance";
+    return GROUP_CATEGORY[f.group] ?? "performance";
+}
+
+/** One activity request the notebooks recorded: a session's plan or one incident request. */
+export interface SessionRun {
+    requestId: string;
+    requestedAt: Date | null;
+    target: string;
+    profile: string;
+    durationMin: number | null;
+    status: string;
+    message: string;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    dispatch: string;
+}
+
+export function toSessions(rows: readonly Row[]): SessionRun[] {
+    return rows
+        .map((r) => ({
+            requestId: text(r.RequestId),
+            requestedAt: toDate(r.RequestedAt),
+            target: text(r.TargetKey),
+            profile: text(r.Profile),
+            durationMin: num(r.DurationMin),
+            status: text(r.Status),
+            message: text(r.Message),
+            windowStart: toDate(r.WindowStart),
+            windowEnd: toDate(r.WindowEnd),
+            dispatch: text(r.Dispatch),
+        }))
+        .sort((a, b) => (b.requestedAt?.getTime() ?? 0) - (a.requestedAt?.getTime() ?? 0));
+}
+
+/** T3's Database Agent beat: the regression, the documented response the run applied, and whether CPU recovered. */
+export interface AgentBeat {
+    id: string;
+    target: string;
+    status: string;
+    text: string;
+    requestId: string;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    regressAt: Date | null;
+    respondAt: Date | null;
+    cpuBefore: number | null;
+    cpuAfter: number | null;
+}
+
+export function toAgentBeats(rows: readonly Row[]): AgentBeat[] {
+    return rows
+        .map((r) => {
+            const evidence = evidenceOf(r.Evidence) ?? {};
+            return {
+                id: text(r.FindingId),
+                target: text(r.TargetKey),
+                status: text(r.Status),
+                text: text(r.Finding),
+                requestId: text(r.RequestId),
+                windowStart: toDate(r.WindowStart),
+                windowEnd: toDate(r.WindowEnd),
+                regressAt: toDate(evidence.regressUtc),
+                respondAt: toDate(evidence.respondUtc),
+                cpuBefore: num(evidence.cpuBeforePercent),
+                cpuAfter: num(evidence.cpuAfterPercent),
+            };
+        })
+        .filter((b) => b.id !== "")
+        .sort((a, b) => (b.windowStart?.getTime() ?? 0) - (a.windowStart?.getTime() ?? 0));
+}
+
+/** The beat whose window overlaps the incident's, on the same target. */
+export function beatFor(incident: Pick<Incident, "target" | "start" | "end">, beats: readonly AgentBeat[]): AgentBeat | null {
+    return (
+        beats.find(
+            (b) => b.target === incident.target && b.windowStart !== null && b.windowEnd !== null && b.windowStart.getTime() < incident.end.getTime() && b.windowEnd.getTime() > incident.start.getTime(),
+        ) ?? null
+    );
+}
+
+/** One UTC day of one SQL target. */
+export interface DayRow {
+    day: Date;
+    target: TargetKey;
+    cpuAvg: number | null;
+    cpuPeak: number | null;
+    waitS: number | null;
+    bufferIoS: number | null;
+    lockWaitS: number | null;
+    batch: number | null;
+    sessionsPeak: number | null;
+    incidents: number;
+}
+
+export function toDays(rows: readonly Row[]): DayRow[] {
+    const out: DayRow[] = [];
+    for (const r of rows) {
+        const day = toDate(r.Date);
+        const target = r["Target Key"];
+        if (!day || !isTargetKey(target)) continue;
+        out.push({
+            day,
+            target,
+            cpuAvg: num(r.CpuAvg),
+            cpuPeak: num(r.CpuPeak),
+            waitS: num(r.WaitS),
+            bufferIoS: num(r.BufferIoS),
+            lockWaitS: num(r.LockWaitS),
+            batch: num(r.Batch),
+            sessionsPeak: num(r.SessionsPeak),
+            incidents: num(r.Incidents) ?? 0,
+        });
+    }
+    return out.sort((a, b) => a.day.getTime() - b.day.getTime() || a.target.localeCompare(b.target));
 }
 
 export interface Bin {
@@ -448,7 +604,7 @@ export interface PostgresPeak {
 }
 
 /** The highest point of a series (the earliest of equal ones), or null for an empty one. */
-export function postgresPeak(points: readonly PostgresPoint[]): PostgresPeak | null {
+export function postgresPeak(points: ReadonlyArray<{ at: Date; value: number }>): PostgresPeak | null {
     let peak: PostgresPeak | null = null;
     for (const p of points) {
         if (!peak || p.value > peak.value) peak = { value: p.value, at: p.at };
@@ -503,7 +659,7 @@ function evidenceOf(value: unknown): Record<string, unknown> | null {
     }
 }
 
-/** The latest capture's findings, worst first. */
+/** A capture's findings (T4's or T5's), worst first. */
 export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
     return rows
         .map((r) => ({
@@ -518,6 +674,91 @@ export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
         .filter((f) => f.id !== "")
         .sort((a, b) => a.statusSort - b.statusSort || a.id.localeCompare(b.id));
 }
+
+/** T5's Azure Monitor metrics (analysis cosmosdb), by what they show. */
+export const COSMOS_METRICS = {
+    /** Normalized RU consumption, the highest in each interval: 100 % is throttling. */
+    normalizedRu: "NormalizedRUConsumption",
+    /** Request units consumed in each interval. */
+    ru: "TotalRequestUnits",
+    /** Requests in each interval, the 429s included. */
+    requests: "TotalRequests",
+    /** Requests answered 429 in each interval: 0 at every interval with requests and none throttled. */
+    throttled: "ThrottledRequests",
+    /** Server-side latency through the gateway, the average in each interval (ms). */
+    latency: "ServerSideLatencyGateway",
+    /** Provisioned throughput, hourly (RU/s). */
+    provisioned: "ProvisionedThroughput",
+    /** Service availability, hourly (%): 429s aren't availability errors. */
+    availability: "ServiceAvailability",
+} as const;
+
+export interface CosmosPoint {
+    at: Date;
+    metric: string;
+    value: number;
+}
+
+/** The latest Cosmos DB capture: its account, its window, and its points, oldest first. */
+export interface CosmosCapture {
+    account: string;
+    capturedAt: Date | null;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    /** Minutes between consecutive points of one per-interval series, or null with single points only. */
+    intervalMinutes: number | null;
+    points: CosmosPoint[];
+}
+
+const COSMOS_METRIC = /^[A-Za-z0-9_]{1,64}$/;
+
+/** The cosmos-series rows as one capture, or null without a valid row (no capture yet, or T5 is off). */
+export function toCosmosCapture(rows: readonly Row[]): CosmosCapture | null {
+    const points: CosmosPoint[] = [];
+    let account = "";
+    let capturedAt: Date | null = null;
+    let windowStart: Date | null = null;
+    let windowEnd: Date | null = null;
+    for (const r of rows) {
+        const at = toDate(r.Bucket);
+        const value = num(r.Value);
+        const metric = text(r.Metric);
+        if (!at || value === null || !COSMOS_METRIC.test(metric)) continue;
+        points.push({ at, metric, value });
+        account ||= safeName(r.ResourceName) ?? "";
+        capturedAt ??= toDate(r.CapturedAt);
+        windowStart ??= toDate(r.WindowStart);
+        windowEnd ??= toDate(r.WindowEnd);
+    }
+    if (points.length === 0) return null;
+    points.sort((a, b) => a.at.getTime() - b.at.getTime());
+    const series = points.filter((p) => p.metric === COSMOS_METRICS.normalizedRu);
+    const gaps = series.slice(1).map((p, i) => (p.at.getTime() - series[i].at.getTime()) / 60000).filter((g) => g > 0);
+    return { account, capturedAt, windowStart, windowEnd, intervalMinutes: gaps.length > 0 ? Math.min(...gaps) : null, points };
+}
+
+/** One metric of the capture, oldest first. */
+export function cosmosSeries(capture: CosmosCapture | null, metric: string): CosmosPoint[] {
+    return capture ? capture.points.filter((p) => p.metric === metric) : [];
+}
+
+export interface ThrottleEpisode {
+    id: string;
+    start: Date | null;
+    end: Date | null;
+    status: string;
+    text: string;
+}
+
+/** The capture's throttling episodes (cosmosdb.T5.throttle.<yyyymmddThhmm>), oldest first. */
+export function throttleEpisodes(rows: readonly Row[]): ThrottleEpisode[] {
+    return rows
+        .filter((r) => text(r.FindingId).startsWith("cosmosdb.T5.throttle."))
+        .map((r) => ({ id: text(r.FindingId), start: toDate(r.WindowStart), end: toDate(r.WindowEnd), status: text(r.Status), text: text(r.Finding) }))
+        .sort((a, b) => (a.start?.getTime() ?? 0) - (b.start?.getTime() ?? 0));
+}
+/** T5's capture findings have the same shape as T4's. */
+export const toCaptureFindings = toPostgresFindings;
 
 const SKU = /^[A-Za-z0-9_]{1,64}$/;
 

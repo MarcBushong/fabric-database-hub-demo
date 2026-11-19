@@ -3069,6 +3069,71 @@ The work:
 
 **Risks.** R890 updated.
 
+### The Database Hub GA updates: the Database Agent loop, T2's migration assessment, and the GA wording (2026-11-18)
+
+**Why.** Microsoft Ignite made Database Hub generally available on 2026-11-17, with real-time dashboards for SQL, PostgreSQL, and Cosmos DB, Optimization insights, and Database Agents (preview) for Azure SQL Database. The coordinator reviewed the three announcements and recommended six changes, and the user said "Create a new branch and do them all". This entry covers items 3 to 6, on `ignite-updates`. On 2026-11-18 the owner, answering the coordinator, set T3's lowest-cost maximum to 2 vCores and the session ceiling to $20, because Database Agents doesn't support one-vCore serverless databases. The user then directed, the same day: "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible".
+
+**Decisions.**
+
+- **The response runs inside Run all** (one notebook, one action). At 85% of its window, T3's agent beat makes Database Agents' documented manual response itself, so the presenter needs no second action ([ADR 0013](adr/0013-agent-experience.md#amendment-general-availability-and-the-database-agent-loop-on-t3-2026-11-18)).
+- **`FORCE_LAST_GOOD_PLAN` is held off for the beat** (the owner, 2026-11-18), so automatic tuning doesn't fix the regression before the agent raises its issue. Every way a session ends turns it back on:
+  - The nightly safety stop can't change anything ([ADR 0024](adr/0024-nightly-safety-stop.md)), so after it the next run on T3 restores the setting. That needs no role change (the coordinator's option A).
+  - `stop-demo.ps1` restores it through Azure Resource Manager, and `deploy.ps1`'s setup does too.
+- **The showcase:** the cycle-2 timing, at most two T3 incidents at once, and the cycle-3 recurrence beat, which stays (the coordinator, 2026-11-18; [ADR 0010](adr/0010-workload-generator-technology.md#amendment-the-database-agent-beat-2026-11-18)).
+- **The engine dashboards are linked, not rebuilt** (the coordinator's option a): no Log Analytics workspace.
+- **T2's assessment stays out of the history:** the notebooks have no Azure Resource Manager token, so it shows on the status page and in Database Hub.
+
+**Work summary.**
+
+- **SQL** (`database/common/110-demo-control.sql`, `120-scenario-procedures.sql`, `database/azuresql/900-status.sql`):
+  - The hold, `demo.auto_tuning_hold`.
+  - `demo.usp_release_auto_tuning_hold @by`, idempotent, which logs `auto-tuning-restored` with who restored the setting.
+  - `usp_scenario_plan_regression`'s agent mode (`goodPercent`, `respondPercent`, `holdAutoCorrection`), which logs `auto-tuning-held` and `agent-response`.
+  - The status row's `force_last_good_plan_desired` and `_actual`, and the hold's run and status.
+- **The showcase** (`scenarios/activity-profiles.json`, `scenarios/plan-regression/scenario.json`):
+  - The agent beat in cycle 2: minutes 0 to 30, concurrency 6, intensity 6, the regression at 10%, and the response at 85%.
+  - T3's other slots moved, so at most two incidents overlap.
+- **The module** (`Private/T3AgentHelpers.ps1`, new):
+  - `T3.AGENT`: **Pass** or a **Warning**. It checks write access (Permissions - List For Resource), a one-vCore serverless T3, an elastic pool, and monitoring.
+  - `T3.AUTOTUNING` and `STATUS.T3.AUTOTUNING` (Database Automatic Tuning - Get).
+  - `STOP.T3.AUTOTUNING`: the PATCH back to Default, only while T3 is online.
+  - `HUB.AGENT.T3`: **Manual action required**, confirm-only, so it never keeps **DONE**. It gives the link, the database, the policy, and "once per deployment".
+  - They're called from `Test-DemoT3`, `Get-DemoEnvironmentStatus`, `Stop-DemoEnvironment`, both deploy paths' validation, and the confirm list.
+- **The control notebook:**
+  - The guide's agent lines: the one-time selection, the database, and the times.
+  - The guide's GA lines: Overview and Optimization, and the three GA Copilot prompts.
+  - The live view's `agent_view`: "Now: T3 Respond", then T3's CPU before and after the response.
+  - The summary's line, and `SESSION_PLAN`'s agent fields.
+- **The history:**
+  - `NB_DatabaseHub_LiveActivity` writes the agent beat's `scenario_runs` message and one `database_agent` finding per agent beat. The semantic model's Analysis table has the key.
+  - Each `correlation` finding's key is now the whole request ID. It was the ID's first 12 characters, which every beat of a session shares, so a session's beats overwrote each other.
+- **T2's migration assessment** (item 4): `versions.json`'s `arc.migrationAssessment`, `Invoke-DemoArcMigrationAssessmentUpdate`, `Start-DemoArcMigrationAssessment`, and `T2.ARC.MIGRATIONASSESSMENT`.
+- **Item 5:**
+  - The Real-Time Dashboard spec's note tile, and the regenerated `RealTimeDashboard.json`.
+  - `Grant-DemoPresenterWorkspaceAccess` (`FABRIC.PRESENTER.VIEWER`), called from `configure-fabric.ps1`.
+- **T3 at 2 vCores and the $20 ceiling:**
+  - `config/profiles.json`, and `azuredeploy.json` rebuilt with Bicep 0.47.16.
+  - The schema, and `Get-DemoConfig`'s rule that exactly 15 becomes 20.
+  - `DEPLOY.T3.SCALE`, and the resume rule.
+  - [ADR 0016's amendment](adr/0016-cost-profiles.md#amendment-2026-11-18-the-owners-decision-t3-at-2-vcores-in-lowest-cost-and-a-20-session-ceiling), and the dated example in cost management.
+- **Docs:**
+  - The README: GA wording, "Demo it yourself", and upgrading.
+  - Limitations, the walkthrough (the DBA moments), presentation, architecture, references, permissions, Database Hub's visuals, deployment (upgrading), and cost management (the free assessment).
+  - The prompt pack, the scenarios, and ADRs 0010, 0013, 0016, and 0025.
+
+**Validation.**
+
+- **Full static validation** (2026-11-18, after merging `origin/ignite-updates` at 935eeed):
+  - PSScriptAnalyzer: 0 findings in 368 files.
+  - markdownlint: 0 issues in 140 files, after fixing six findings in this change's lines. Two `$` amounts in one sentence read as inline math and broke the bold around them, and two files lacked their final newline.
+  - .NET: 579 tests; 561 passed and 18 skipped, after updating the setup call's expected text in `SqlScriptTests`.
+  - Pester (`tests/unit` with the Program Files Pester, because this PC's OneDrive copy isn't hydrated): 4,600 tests; 4,592 passed, 4 failed, and 4 skipped; no unit test reached the Azure CLI.
+    - Two of the failures were this change's, and both are fixed: the presenter grant's test compared a hashtable's key order, which changes from one process to the next, and the Database Hub link was a literal URL, which the documented-hosts test forbids in module code. It now comes from `versions.json`, as the Insights app's links do. Their files then passed: 823 passed, and the only failures were the two below.
+    - Not this change's: the Fabric App's lockfile test (`DbHubDemo.FabricApp.Tests.ps1`) fails on `fabric/app/package-lock.json` from 935eeed, and the teardown test's child `pwsh` loads this PC's OneDrive Pester.
+- **Live:** the live test follows, in a test environment of its own: deploy `main`, upgrade it with this branch, then Run all, `validate.ps1`, the agent loop, and T2's assessment. Until then, [limitations](limitations.md#not-proven-live-yet) lists what isn't proven live.
+
+**Risks.** None new: the agent loop's preview dependencies are in [limitations](limitations.md#preview-disclosures).
+
 ### Ask: the GitHub Copilot chat in the Insights app (2026-11-18)
 
 **Why.** The user, on the Ignite 2026 announcements (the Database Hub GA and its CLI skill): "Since there is GitHub Copilot support that we can then use to put into the Fabric app as well as a chat interface in the Rayfin app vs going to the GHCP locally", and "The goal would be to get insights from the data and trends and perform conversational analytics directly in the rayfin app"; every demo user has a GitHub Copilot license. Then: "The GitHub Copilot chat interface right in the App is a must and a gamechanger", and "Make sure to account for users signing in and demoing this themselves and repeatable. Simple and one click as possible."

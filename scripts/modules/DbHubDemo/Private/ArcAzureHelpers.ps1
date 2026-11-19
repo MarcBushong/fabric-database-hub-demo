@@ -482,6 +482,92 @@ function Invoke-DemoArcMonitoringUpdate {
     Write-DemoLog -Message ('Turned on monitoring for the SQL Server instance {0}.' -f $InstanceName)
 }
 
+function Invoke-DemoArcMigrationAssessmentUpdate {
+    <#
+    .SYNOPSIS
+    Turns on migration assessment for one SQL Server instance with the documented REST API (Sql Server Instances - Update):
+    PATCH properties.migration.assessment.enabled = true, at the sqlServerInstances API version in config/versions.json
+    (2026-11-18). Internal.
+
+    .DESCRIPTION
+    The assessment is free for every edition and runs weekly once it's on (migration-assessment). The body goes through a
+    private temporary file, because cmd.exe can't pass JSON to az.cmd; a 409 Conflict is retried. Throws a redacted error
+    on failure.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Target,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._-]{1,128}$')]
+        [string] $InstanceName
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($InstanceName, 'Set properties.migration.assessment.enabled = true')) {
+        return
+    }
+    $url = Get-DemoArcSqlInstanceUrl -Target $Target -Name $InstanceName
+    $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-arm'
+    try {
+        $bodyPath = Write-DemoPrivateFile -Directory $directory -Name 'body.json' -Content '{"properties":{"migration":{"assessment":{"enabled":true}}}}'
+        $patch = Invoke-DemoAzWithConflictRetry -SubscriptionId $Target.SubscriptionId -ArgumentList @('rest', '--method', 'patch', '--url', $url, '--body', "@$bodyPath") -Label ('Turning on migration assessment for {0}' -f $InstanceName)
+    }
+    finally {
+        Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
+    }
+    if ($patch.ExitCode -ne 0) {
+        throw ('Turning on migration assessment for {0} failed: {1}' -f $InstanceName, (Protect-DemoText -Text ([string]$patch.StdErr).Trim()))
+    }
+    Write-DemoLog -Message ('Turned on migration assessment for the SQL Server instance {0}.' -f $InstanceName)
+}
+
+function Start-DemoArcMigrationAssessment {
+    <#
+    .SYNOPSIS
+    Starts a migration assessment of one SQL Server instance now, as the portal's Run assessment does, with the documented
+    REST API (Sql Server Instances - Run Migration Assessment: POST .../runMigrationAssessment), and returns the job's
+    status (NotStarted, InProgress, Succeeded, or Failed; "accepted" when the response has none). Internal.
+
+    .DESCRIPTION
+    A new assessment replaces the last successful one, so a run is started only until the first one is uploaded
+    (Set-DemoArcSqlConfiguration). Throws a redacted error when Azure refuses it.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Target,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._-]{1,128}$')]
+        [string] $InstanceName
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($InstanceName, 'Run a migration assessment now')) {
+        return ''
+    }
+    $url = '{0}{1}/runMigrationAssessment?api-version={2}' -f $Target.SqlInstanceUrlStart, $InstanceName, $Target.Setting.SqlInstanceApiVersion
+    $post = Invoke-DemoAzWithConflictRetry -SubscriptionId $Target.SubscriptionId -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('Starting a migration assessment of {0}' -f $InstanceName)
+    if ($post.ExitCode -ne 0) {
+        throw ('Starting a migration assessment of {0} failed: {1}' -f $InstanceName, (Protect-DemoText -Text ([string]$post.StdErr).Trim()))
+    }
+    $status = ''
+    if (-not [string]::IsNullOrWhiteSpace($post.StdOut)) {
+        try {
+            $status = [string](Get-DemoMemberValue -InputObject ($post.StdOut | ConvertFrom-Json -Depth 32) -Name 'jobStatus')
+        }
+        catch {
+            Write-Debug -Message 'The run''s response wasn''t JSON.'
+        }
+    }
+    if ($status -notmatch '^[A-Za-z]{1,32}$') {
+        $status = 'accepted'
+    }
+    Write-DemoLog -Message ('Started a migration assessment of the SQL Server instance {0} (job {1}).' -f $InstanceName, $status)
+    return $status
+}
+
 function Wait-DemoVmHealthState {
     <#
     .SYNOPSIS

@@ -10,8 +10,9 @@ function Get-DemoConfig {
     say so once, and a configuration written back from this one still inherits the default. t2SqlInstallMode's default
     (JumpstartImage) is merged, and a file that doesn't name it is marked t2SqlInstallModeSource default; PaygWizard, retired
     from the one-click deployment, becomes JumpstartImage, marked legacy. t4Enabled is always true: T4 is part of every
-    deployment, and a file's false is marked t4EnabledIgnored (2026-11-09, ADR 0006 and ADR 0019).
-    ConvertTo-DemoConfigFileText leaves the marks out.
+    deployment, and a file's false is marked t4EnabledIgnored (2026-11-09, ADR 0006 and ADR 0019). sessionCeilingUsd at
+    exactly 15, the default before 2026-11-18, becomes 20, today's default, marked sessionCeilingUsdSource legacy (the
+    owner's decision, ADR 0016); any other value stays. ConvertTo-DemoConfigFileText leaves the marks out.
 
     .EXAMPLE
     $config = Get-DemoConfig -Path ./config/demo.config.json
@@ -64,6 +65,13 @@ function Get-DemoConfig {
         $config['t4EnabledIgnored'] = $true
     }
     $config['t4Enabled'] = $true
+    # The session ceiling (2026-11-18, the owner's decision): lowest-cost's T3 went from 1 to 2 maximum vCores, because
+    # Database Agents doesn't support one-vCore serverless databases, so the default went from 15 to 20. Exactly 15, the
+    # default init.ps1 wrote before, gets 20 with no edit and one line that says so; any other value someone set stays.
+    if ($values.Contains('sessionCeilingUsd') -and [double]$values['sessionCeilingUsd'] -eq 15) {
+        $config['sessionCeilingUsd'] = $defaults['sessionCeilingUsd']
+        $config['sessionCeilingUsdSource'] = 'legacy'
+    }
     # In GitHub Actions only: mask the configuration's IDs and accounts in the job log (ADR 0022).
     Register-DemoLogMask -Config $config
     return $config

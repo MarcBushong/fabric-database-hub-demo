@@ -1,9 +1,11 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { area, curveMonotoneX, line } from "d3-shape";
 import { scaleLinear, scaleUtc } from "d3-scale";
-import { Pause, Play, SkipBack, SkipForward, Target as TargetIcon } from "lucide-react";
+import { Button, ToggleButton } from "@fluentui/react-components";
+import { Next16Regular, Pause16Regular, Play16Regular, Previous16Regular, Target16Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
+import { TARGETS } from "@/lib/estate";
 import { FAMILY_LABEL, type Bin, type Incident } from "@/data/model";
 import { formatDateTimeUtc, formatNumber, formatTimeUtc, type NumberKind } from "@/lib/format";
 import { useElementSize } from "@/lib/hooks";
@@ -18,11 +20,11 @@ interface Lane {
 }
 
 const LANES: Lane[] = [
-    { field: "waitS", label: "Wait time", kind: "seconds", color: "var(--accent)" },
-    { field: "sessions", label: "Active sessions", kind: "int", color: "var(--status-manual)" },
-    { field: "batch", label: "Batch requests", kind: "int", color: "var(--status-pass)" },
-    { field: "ioMb", label: "Data and log IO", kind: "mb", color: "var(--accent-2)" },
-    { field: "cpu", label: "CPU", kind: "percent", color: "var(--accent-3)" },
+    { field: "waitS", label: "Wait time", kind: "seconds", color: "var(--chart-1)" },
+    { field: "sessions", label: "Active sessions", kind: "int", color: "var(--chart-2)" },
+    { field: "batch", label: "Batch requests", kind: "int", color: "var(--chart-5)" },
+    { field: "ioMb", label: "Data and log IO", kind: "mb", color: "var(--chart-8)" },
+    { field: "cpu", label: "CPU", kind: "percent", color: "var(--chart-4)" },
 ];
 
 /** Plays an incident back bin by bin: the incident's own signal with its window, baseline, and peak, and every
@@ -34,6 +36,7 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
     const [speed, setSpeed] = useState(1);
     const clipId = useId().replace(/:/g, "");
     const focus = familySignal(incident.family);
+    const accent = TARGETS[incident.target].color;
     const comparison = useMemo(() => compareIncident(incident, bins), [incident, bins]);
     const step = binMinutes(bins);
     const firstInWindow = Math.max(0, bins.findIndex((b) => b.at >= incident.start));
@@ -80,7 +83,7 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
     const peakBin = comparison.peakAt ? bins.find((b) => b.at.getTime() === comparison.peakAt?.getTime()) : undefined;
 
     if (bins.length === 0) {
-        return <div className="empty">No telemetry bins on {incident.target} around this window.</div>;
+        return <div className="vcard-empty">No telemetry bins on {incident.target} around this window.</div>;
     }
 
     return (
@@ -91,13 +94,13 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
                         <rect x={0} y={0} width={headX} height={h} />
                     </clipPath>
                     <linearGradient id={`focus-fill-${clipId}`} x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="var(--accent-3)" stopOpacity="0.55" />
-                        <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.04" />
+                        <stop offset="0%" stopColor={accent} stopOpacity="0.45" />
+                        <stop offset="100%" stopColor={accent} stopOpacity="0.04" />
                     </linearGradient>
                 </defs>
 
-                <rect x={x(incident.start)} y={8} width={Math.max(2, x(incident.end) - x(incident.start))} height={h - 30} rx={10} fill="var(--accent)" fillOpacity="0.12" stroke="var(--accent)" strokeOpacity="0.45" strokeDasharray="4 6" />
-                <text x={x(incident.start) + 8} y={24} className="label-strong" style={{ fill: "var(--accent)" }}>
+                <rect x={x(incident.start)} y={8} width={Math.max(2, x(incident.end) - x(incident.start))} height={h - 30} rx={6} fill="var(--chart-band)" stroke="var(--chart-band-ink)" strokeOpacity="0.5" strokeDasharray="4 6" />
+                <text x={x(incident.start) + 8} y={24} className="label-strong" style={{ fill: "var(--chart-band-ink)" }}>
                     {FAMILY_LABEL[incident.family] ?? "Incident"} window
                 </text>
 
@@ -114,22 +117,22 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
                     {focus.label}
                 </text>
                 <path d={focusArea(defined) ?? ""} fill={`url(#focus-fill-${clipId})`} opacity="0.35" />
-                <path d={focusLine(defined) ?? ""} fill="none" stroke="var(--ink-faint)" strokeWidth="1.5" strokeDasharray="3 4" />
+                <path d={focusLine(defined) ?? ""} fill="none" stroke="var(--colorNeutralStroke1)" strokeWidth="1.5" strokeDasharray="3 4" />
                 <g clipPath={`url(#reveal-${clipId})`}>
                     <path d={focusArea(defined) ?? ""} fill={`url(#focus-fill-${clipId})`} />
-                    <path d={focusLine(defined) ?? ""} fill="none" stroke="var(--accent-3)" strokeWidth="3" />
+                    <path d={focusLine(defined) ?? ""} fill="none" stroke={accent} strokeWidth="2.5" />
                 </g>
                 {comparison.baseline !== null ? (
                     <g>
-                        <line x1={left} x2={w - right} y1={y(comparison.baseline)} y2={y(comparison.baseline)} stroke="var(--accent-2)" strokeDasharray="6 5" strokeWidth="1.5" />
-                        <text x={w - right} y={y(comparison.baseline) - 6} textAnchor="end" style={{ fill: "var(--accent-2)" }}>
+                        <line x1={left} x2={w - right} y1={y(comparison.baseline)} y2={y(comparison.baseline)} stroke="var(--colorNeutralForeground3)" strokeDasharray="6 5" strokeWidth="1.5" />
+                        <text x={w - right} y={y(comparison.baseline) - 6} textAnchor="end">
                             {`baseline ${formatNumber(comparison.baseline, focus.kind)}`}
                         </text>
                     </g>
                 ) : null}
                 {peakBin && comparison.peak !== null ? (
                     <g>
-                        <circle cx={mid(peakBin)} cy={y(comparison.peak)} r="6" fill="var(--bg)" stroke="var(--accent-3)" strokeWidth="3" />
+                        <circle cx={mid(peakBin)} cy={y(comparison.peak)} r="5" fill="var(--colorNeutralBackground1)" stroke={accent} strokeWidth="2.5" />
                         <text x={mid(peakBin)} y={y(comparison.peak) - 12} textAnchor="middle" className="label-strong">
                             {`peak ${formatNumber(comparison.peak, focus.kind)}`}
                         </text>
@@ -162,29 +165,25 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
                     );
                 })}
 
-                <line x1={headX} x2={headX} y1={8} y2={h - 26} stroke="var(--ink)" strokeWidth="2" style={reducedMotion ? undefined : { transition: "all 0.35s cubic-bezier(0.16, 1, 0.3, 1)" }} />
-                {value !== null && current ? <circle cx={headX} cy={y(value)} r="7" fill="var(--accent-3)" stroke="var(--ink)" strokeWidth="2" /> : null}
+                <line x1={headX} x2={headX} y1={8} y2={h - 26} stroke="var(--colorNeutralForeground1)" strokeWidth="1.5" style={reducedMotion ? undefined : { transition: "all 0.35s cubic-bezier(0.16, 1, 0.3, 1)" }} />
+                {value !== null && current ? <circle cx={headX} cy={y(value)} r="6" fill={accent} stroke="var(--colorNeutralBackground1)" strokeWidth="2" /> : null}
             </svg>
 
             <div className="replay-controls">
-                <button type="button" className="icon-btn" onClick={() => onIndex(Math.max(position - 1, 0))} aria-label="Previous bin" title="Previous bin">
-                    <SkipBack aria-hidden="true" />
-                </button>
-                <button
-                    type="button"
-                    className="icon-btn replay-play"
+                <Button size="small" appearance="subtle" icon={<Previous16Regular />} onClick={() => onIndex(Math.max(position - 1, 0))} aria-label="Previous bin" title="Previous bin" />
+                <Button
+                    size="small"
+                    appearance="primary"
+                    icon={playing ? <Pause16Regular /> : <Play16Regular />}
                     aria-pressed={playing}
                     onClick={() => {
                         if (!playing && position >= bins.length - 1) onIndex(0);
                         setPlaying((p) => !p);
                     }}
                 >
-                    {playing ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                     {playing ? "Pause" : "Play"}
-                </button>
-                <button type="button" className="icon-btn" onClick={() => onIndex(Math.min(position + 1, bins.length - 1))} aria-label="Next bin" title="Next bin">
-                    <SkipForward aria-hidden="true" />
-                </button>
+                </Button>
+                <Button size="small" appearance="subtle" icon={<Next16Regular />} onClick={() => onIndex(Math.min(position + 1, bins.length - 1))} aria-label="Next bin" title="Next bin" />
                 <input
                     className="scrubber"
                     type="range"
@@ -198,17 +197,17 @@ export function IncidentReplay({ incident, bins, index, onIndex }: { incident: I
                     aria-label="Replay position"
                     aria-valuetext={current ? `${formatDateTimeUtc(current.at)}, ${phase} the incident window` : ""}
                 />
-                <div className="segmented" role="group" aria-label="Replay speed">
+                <div className="period" role="group" aria-label="Replay speed">
                     {[1, 2, 4].map((s) => (
-                        <button key={s} type="button" aria-pressed={speed === s} onClick={() => setSpeed(s)}>
-                            {s}×
-                        </button>
+                        <ToggleButton key={s} size="small" appearance="subtle" checked={speed === s} onClick={() => setSpeed(s)}>
+                            {`${s}×`}
+                        </ToggleButton>
                     ))}
                 </div>
                 {peakBin ? (
-                    <button type="button" className="icon-btn" onClick={() => onIndex(bins.indexOf(peakBin))}>
-                        <TargetIcon aria-hidden="true" /> Peak
-                    </button>
+                    <Button size="small" appearance="subtle" icon={<Target16Regular />} onClick={() => onIndex(bins.indexOf(peakBin))}>
+                        Peak
+                    </Button>
                 ) : null}
             </div>
             <p className="replay-readout" aria-live="polite">

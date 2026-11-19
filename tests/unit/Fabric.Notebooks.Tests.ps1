@@ -563,7 +563,7 @@ import datetime as dt, json, re, sys, types
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
 part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
 session_cell = next(cell for cell in cells if cell.startswith("# This session"))
-functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests)\(.*?(?=^\S|\Z)", part3))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests|session_beats)\(.*?(?=^\S|\Z)", part3))
 
 def run(session_id, plan, saved=False):
     exits = []
@@ -617,6 +617,84 @@ print(json.dumps(report))
         # A plan it can't read keeps the session's own row out too (no window), and never stops the run.
         @($report.bad.rows) | Should -BeNullOrEmpty
         @($report.bad.exits) | Should -BeNullOrEmpty
+    }
+
+    It 'records the Database Agent beat''s times and its database_agent finding: CPU before and after the run''s response (2026-11-18)' {
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'agent.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import datetime as dt, json, re, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests|session_beats|agent_beat_finding)\(.*?(?=^\S|\Z)", part3))
+utc = dt.timezone.utc
+ns = {"json": json, "re": re, "dt": dt, "RUN_ID": "run-1", "NOTEBOOK_NAME": "NB_DatabaseHub_LiveActivity", "SELECTED_TARGETS": ["T1", "T2", "T3"],
+      "_parse_utc": lambda text: dt.datetime.fromisoformat(text.replace("Z", "+00:00")),
+      "utc_now": lambda: dt.datetime(2026, 11, 18, 16, 0, tzinfo=utc)}
+exec(functions, ns)
+sid = "fedcba9876543210fedcba9876543210"
+plan = json.dumps({"version": 1, "sessionId": sid, "startUtc": "2026-11-18T14:00:00Z", "endUtc": "2026-11-18T15:30:00Z", "beats": [
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-18T14:30:00Z", "endUtc": "2026-11-18T15:00:00Z",
+     "agent": True, "regressUtc": "2026-11-18T14:33:00Z", "respondUtc": "2026-11-18T14:55:30Z"},
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-18T15:15:00Z", "endUtc": "2026-11-18T15:25:00Z",
+     "agent": True, "regressUtc": "2026-11-18T15:20:00Z", "respondUtc": "2026-11-18T15:40:00Z"},
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-18T14:04:00Z", "endUtc": "2026-11-18T14:14:00Z"}]})
+session = ns["parse_session_plan"](sid, plan)
+beats = ns["session_beats"](session)
+agent = next(beat for _, beat in beats if beat.get("agent"))
+respond = dt.datetime(2026, 11, 18, 14, 55, 30, tzinfo=utc)
+
+def points(before, after):
+    bins = [respond.replace(second=0) + dt.timedelta(minutes=minute) for minute in range(-12, 10)]
+    return [(moment, before if moment < respond else after) for moment in bins]
+
+late = dt.datetime(2026, 11, 18, 15, 35, tzinfo=utc)
+report = {"agent": [bool(beat.get("agent")) for _, beat in beats], "ids": [request_id for request_id, _ in beats],
+          "messages": [row["message"] for row in ns["session_requests"](session)],
+          "pass": ns["agent_beat_finding"](sid, agent, points(84.0, 22.0), late),
+          "flat": ns["agent_beat_finding"](sid, agent, points(50.0, 46.0), late),
+          "early": ns["agent_beat_finding"](sid, agent, points(84.0, 22.0), dt.datetime(2026, 11, 18, 14, 58, tzinfo=utc)),
+          "none": ns["agent_beat_finding"](sid, agent, [], None),
+          "nan": ns["agent_beat_finding"](sid, agent, points(float("nan"), float("nan")), None)}
+print(json.dumps(report))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        # Only a beat whose times fall in its window, in order, is the agent beat; each beat keeps its request ID.
+        @($report.agent) | Should -Be @($false, $true, $false)
+        @($report.ids) | Should -Be @(0, 1, 2 | ForEach-Object { 'session:fedcba9876543210fedcba9876543210:{0:d2}' -f $_ })
+        $report.messages[2] | Should -BeExactly 'Session fedcba98''s Database Agent beat: the plan regresses at 14:33 UTC; the run''s response forces the last good plan at 14:55 UTC.'
+        $report.messages[3] | Should -BeExactly 'Session fedcba98''s showcase beat.'
+        # Pass: CPU fell by a quarter or 10 points, with the times and both averages as evidence.
+        $report.pass[0] | Should -Be 'Pass'
+        $report.pass[1] | Should -BeExactly 'Database Agent loop on T3: the plan regressed at 14:33 UTC and the run''s response forced the last good plan at 14:55 UTC; T3''s CPU fell from 84% to 22%.'
+        $report.pass[2].cpuBeforePercent | Should -Be 84
+        $report.pass[2].cpuAfterPercent | Should -Be 22
+        $report.pass[2].sessionId | Should -Be 'fedcba9876543210fedcba9876543210'
+        foreach ($name in 'regressUtc', 'respondUtc', 'beforeStartUtc', 'beforeEndUtc', 'afterStartUtc', 'afterEndUtc') {
+            $report.pass[2].$name | Should -Not -BeNullOrEmpty -Because $name
+        }
+        # A Warning when CPU didn't fall, when the run read its telemetry too early, or when it has none (or only NaN).
+        $report.flat[0] | Should -Be 'Warning'
+        $report.flat[1] | Should -Match 'didn''t fall \(50% before, 46% after\)'
+        foreach ($case in 'early', 'none', 'nan') {
+            $report.$case[0] | Should -Be 'Warning' -Because $case
+            $report.$case[1] | Should -Match 'isn''t in the telemetry this run read' -Because $case
+        }
+    }
+
+    It 'calls the agent finding in section 8, and keys each correlation finding by its whole request ID (2026-11-18)' {
+        $correlation = @($nb.Code | Where-Object { $_.Source -match '^# Correlation:' })[0].Source
+        # Every beat of a session starts "session:<id>", so a shortened key made one finding of a session's beats per target.
+        $correlation | Should -Match 'window\["request_id"\], evidence=evidence'
+        $correlation | Should -Not -Match 'request_id"\]\[:12\]'
+        $correlation | Should -Match 'add_finding\("database_agent", beat\["target"\]'
+        $correlation | Should -Match 'agent_beat_finding\(SESSION\["id"\], beat, points, WINDOW_END\)'
     }
 
     It 'saves telemetry_snapshots, analysis_findings, and the report tables, then a session''s rows in scenario_runs, last' {

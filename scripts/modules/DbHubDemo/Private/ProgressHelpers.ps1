@@ -119,7 +119,7 @@ function Get-DemoProgressCatalog {
     T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
     non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
     which in JumpstartImage mode is the Jumpstart image's download and first boot, then the sign-in cleanup, Arc
-    onboarding, PAYG and monitoring, and telemetry;
+    onboarding, PAYG, monitoring, and migration assessment, and telemetry;
     Set-DemoProgressPlan skips what the T2 source doesn't use); Validation, with the history report's snapshot after it
     (Fabric.History, 2026-11-06; marked non-blocking, not with -SkipFabric). Each step has an id, a label, the track steps
     (Get-DemoTrackStep) it belongs to, and nonBlocking.
@@ -194,7 +194,7 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.HostBuild' $hostBuild @('T2/T2')))
     $t2.Add((& $step 'T2.SignInCleanup' 'Sign-in data cleanup' @('T2/T2')))
     $t2.Add((& $step 'T2.ArcOnboarding' 'Arc onboarding' @('T2/T2')))
-    $t2.Add((& $step 'T2.Monitoring' 'PAYG and monitoring' @('T2/T2')))
+    $t2.Add((& $step 'T2.Monitoring' 'PAYG, monitoring, and migration assessment' @('T2/T2')))
     $t2.Add((& $step 'T2.Telemetry' 'Telemetry in Database Hub' @('T2/Telemetry')))
     $tracks.Add([ordered]@{ name = 'T2'; label = 'T2: Arc-enabled SQL Server (arcsql01 on archost01)'; steps = $t2.ToArray() })
     $validation = [System.Collections.Generic.List[object]]::new()

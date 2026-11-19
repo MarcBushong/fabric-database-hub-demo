@@ -132,6 +132,23 @@ describe("ChartView", () => {
         expect(container.querySelectorAll("rect.chart-bar")).toHaveLength(4);
     });
 
+    it("keeps short category labels flat, and rotates long ones, truncated, with the full name as their tooltip", () => {
+        const waits = ["PAGEIOLATCH_SH", "SOS_SCHEDULER_YIELD", "RESOURCE_SEMAPHORE_QUERY_COMPILE", "CXPACKET", "LCK_M_X", "WRITELOG", "ASYNC_NETWORK_IO", "THREADPOOL", "PAGELATCH_EX", "HADR_SYNC_COMMIT"];
+        const spec: ChartSpec = { kind: "bar", title: "Top waits", x: "wait", y: "seconds", unit: "s", rows: waits.map((wait, i) => ({ wait, seconds: 10 + i })) };
+        const { container, rerender } = render(<ChartView spec={spec} />);
+        const ticks = [...container.querySelectorAll("text.chart-xtick")];
+        expect(ticks).toHaveLength(10);
+        expect(ticks.every((t) => /^rotate\(-35 /.test(t.getAttribute("transform") ?? ""))).toBe(true);
+        const long = ticks.find((t) => t.querySelector("title")?.textContent === "RESOURCE_SEMAPHORE_QUERY_COMPILE");
+        expect(long?.textContent).toBe("RESOURCE_SEMAPHORE_QUERY_COMPILERESOURCE_SEMAPH\u2026");
+        expect(Number(container.querySelector("svg.chart-svg")?.getAttribute("height"))).toBeGreaterThan(220);
+
+        rerender(<ChartView spec={{ ...spec, rows: [{ wait: "CPU", seconds: 3 }, { wait: "Lock", seconds: 2 }] }} />);
+        const flat = [...container.querySelectorAll("text.chart-xtick")];
+        expect(flat.map((t) => t.textContent)).toEqual(["CPU", "Lock"]);
+        expect(flat.some((t) => t.hasAttribute("transform"))).toBe(false);
+    });
+
     it("shows KPI tiles and a sortable table", () => {
         const { rerender } = render(<ChartView spec={{ kind: "kpi", title: "Now", unit: "%", y: ["CPU", "Memory"], rows: [{ CPU: 42, Memory: 63.5 }] }} />);
         expect(screen.getByText("42 %")).toBeInTheDocument();

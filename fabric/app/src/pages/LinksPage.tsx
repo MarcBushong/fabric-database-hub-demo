@@ -1,20 +1,24 @@
 import { useMemo } from "react";
-import { BookOpen, Copy, ExternalLink, Gauge, LayoutDashboard, Radio } from "lucide-react";
+import { Button, Tooltip } from "@fluentui/react-components";
+import { Board20Regular, Copy16Regular, Database20Regular, DocumentTable20Regular, Gauge20Regular, Open16Regular, PlayCircle20Regular } from "@fluentui/react-icons";
+import type { ReactNode } from "react";
 
 import { useApp } from "@/app-context";
 import { VisualCard } from "@/components/VisualCard";
 import { probeQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
+import { hubUrlOf } from "@/lib/agent-prompts";
 import { copyText } from "@/lib/clipboard";
 import { formatDateTimeUtc, formatNumber } from "@/lib/format";
 import { appItemUrl } from "@/lib/runtime-config";
+import { PageHeader } from "@/shell/PageHeader";
 
 interface LinkCard {
     key: string;
     title: string;
     what: string;
     href?: string;
-    icon: typeof Radio;
+    icon: ReactNode;
     missing: string;
 }
 
@@ -24,78 +28,89 @@ export default function LinksPage() {
     const probe = useQuery(probeSpec);
     const row = probe.data?.rows[0];
     const itemUrl = appItemUrl(runtime.portalUrl, runtime.workspaceId, runtime.itemId, runtime.tenantId);
+    const hub = hubUrlOf(runtime);
     const cards: LinkCard[] = [
         {
             key: "hub",
             title: "Database Hub",
-            what: "The live estate: inventory, performance, and the Database Agent, straight from the telemetry endpoint. Free, no capacity.",
-            href: runtime.links.databaseHub,
-            icon: Radio,
+            what: "The live estate: Overview's what needs attention, Estate, Performance, Security, and Optimization, plus the Database Agent. Its views need no capacity.",
+            href: hub,
+            icon: <Database20Regular />,
             missing: "Open Database Hub from the Fabric portal's Workloads.",
         },
         {
             key: "rtd",
             title: "Real-Time Dashboard",
-            what: "RTD_DatabaseHub_LiveView: the same live telemetry as code, refreshed every minute, for a second screen during an incident.",
+            what: "RTD_DatabaseHub_LiveView: the live telemetry as code, refreshed every minute, for a second screen during an incident.",
             href: runtime.links.realTimeDashboard,
-            icon: Gauge,
-            missing: "Not found at deploy time: run ./scripts/configure-fabric.ps1 -ImportDashboard, then redeploy this app.",
+            icon: <Gauge20Regular />,
+            missing: "Not found at deploy time: ./scripts/deploy.ps1 imports it, then redeploys this app.",
         },
         {
             key: "report",
             title: "Power BI report",
-            what: "RPT_DatabaseHub_History: the same history model as four governed report pages, for sharing and printing.",
+            what: "RPT_DatabaseHub_History: the same history model as governed report pages, for sharing and printing.",
             href: runtime.links.report,
-            icon: LayoutDashboard,
-            missing: "Not found at deploy time: run ./scripts/configure-powerbi.ps1, then redeploy this app.",
+            icon: <DocumentTable20Regular />,
+            missing: "Not found at deploy time: ./scripts/deploy.ps1 deploys it, then redeploys this app.",
+        },
+        {
+            key: "control",
+            title: "The control notebook",
+            what: "NB_DatabaseHub_Control: Run all runs a whole session, from the start to the stop, and saves its history here.",
+            href: runtime.links.controlNotebook,
+            icon: <PlayCircle20Regular />,
+            missing: "Open the control workspace in Fabric and select NB_DatabaseHub_Control.",
+        },
+        {
+            key: "workspace",
+            title: "The demo's workspace",
+            what: "Every Fabric item of the demo: the lakehouse, the notebooks, the model, the report, the dashboard, and this app.",
+            href: runtime.links.workspace,
+            icon: <Board20Regular />,
+            missing: "Open the demo's workspace from the Fabric portal.",
         },
     ];
 
     return (
         <div className="page">
-            <header className="page-head">
-                <div>
-                    <h2>
-                        Live is <span className="gradient-text">elsewhere</span>
-                    </h2>
-                    <p>
-                        This app is history: it reads the lakehouse snapshots that NB_DatabaseHub_LiveActivity writes, through the semantic model SM_DatabaseHub_History. The live view is Database Hub plus
-                        the Real-Time Dashboard. Each link opens in a new browser tab.
-                    </p>
-                </div>
-            </header>
+            <PageHeader title="Live views" description="This app is the estate's history; the live view is Database Hub and the real-time dashboards. Each link opens in a new tab." filter={false} />
 
-            <div className="links span-12">
+            <section className="link-cards span-12" aria-label="Live views">
                 {cards.map((c) => (
-                    <article key={c.key} className="link-card glass">
-                        <c.icon aria-hidden="true" className="link-icon" />
-                        <h3>{c.title}</h3>
+                    <article key={c.key} className="link-card">
+                        <h3>
+                            <span aria-hidden="true">{c.icon}</span>
+                            {c.title}
+                        </h3>
                         <p>{c.what}</p>
                         {c.href ? (
-                            <a className="btn-primary" href={c.href} target="_blank" rel="noopener noreferrer">
-                                Open in a new tab <ExternalLink aria-hidden="true" width={16} height={16} />
-                            </a>
+                            <div className="link-go">
+                                <Button as="a" href={c.href} target="_blank" rel="noopener noreferrer" icon={<Open16Regular />} iconPosition="after" aria-label={`${c.title}: open in a new tab`}>
+                                    Open in a new tab
+                                </Button>
+                            </div>
                         ) : (
-                            <p className="gate-muted">{c.missing}</p>
+                            <p className="muted link-go">{c.missing}</p>
                         )}
                     </article>
                 ))}
-            </div>
+            </section>
 
-            <section className="card glass span-7" aria-labelledby="path-title">
+            <section className="panel span-7" aria-labelledby="path-title">
                 <h3 id="path-title">How the history gets here</h3>
                 <ol className="data-path">
                     <li>
-                        <strong>Telemetry endpoint</strong>
-                        <span>T1, T2, and T3 report performance telemetry (kept 7 days).</span>
+                        <strong>Database Hub's telemetry</strong>
+                        <span>T1, T2, and T3 report performance telemetry, kept 7 days.</span>
                     </li>
                     <li>
                         <strong>Azure Monitor</strong>
-                        <span>T4's and its read replica's metrics, which stop-demo.ps1 -SaveHistory and deploy.ps1 capture and pass to the notebook.</span>
+                        <span>T4's and its read replica's metrics, which a session's end captures and passes to the notebook.</span>
                     </li>
                     <li>
                         <strong>NB_DatabaseHub_LiveActivity</strong>
-                        <span>The notebook analyzes a window and writes snapshots, findings, and incident windows.</span>
+                        <span>Analyzes a window and writes snapshots, findings, and incident windows.</span>
                     </li>
                     <li>
                         <strong>LH_DatabaseHub</strong>
@@ -107,15 +122,14 @@ export default function LinksPage() {
                     </li>
                     <li>
                         <strong>This app</strong>
-                        <span>Read-only DAX through the semantic model connector, as you (delegated), never writing anything.</span>
+                        <span>Read-only DAX through the semantic model connector, as you (delegated).</span>
                     </li>
                 </ol>
-                <p className="dax-meta">
-                    {meta?.latestCapture ? `Newest snapshot ${formatDateTimeUtc(meta.latestCapture)} · ${formatNumber(meta.notebookRuns, "int")} notebook runs captured` : "No snapshot yet."}
-                </p>
+                <p className="muted">{meta?.latestCapture ? `Newest snapshot ${formatDateTimeUtc(meta.latestCapture)} · ${formatNumber(meta.notebookRuns, "int")} notebook runs saved` : "No snapshot yet."}</p>
             </section>
 
             <VisualCard
+                id="links.connection"
                 className="span-5"
                 title="Connection check"
                 subtitle="One DAX query through the connector proves sign-in, the connector, and your access to the model."
@@ -126,50 +140,37 @@ export default function LinksPage() {
                 summary={row ? `Connector check passed: ${String(row.ValidationRows)} validation checks, ${String(row.SnapshotRows)} telemetry rows, ${String(row.Incidents)} incident windows.` : "Connector check."}
                 fetchedAt={probe.data?.fetchedAt}
                 onRefresh={probe.refetch}
+                quiet
             >
                 {row ? (
-                    <p className="gate-ok" data-testid="probe-ok">
-                        ✓ Connector check passed: {formatNumber(row.ValidationRows, "int")} validation checks, {formatNumber(row.SnapshotRows, "int")} telemetry rows, and{" "}
-                        {formatNumber(row.Incidents, "int")} incident windows in SM_DatabaseHub_History.
+                    <p className="ok-line" data-testid="probe-ok">
+                        ✓ Connector check passed: {formatNumber(row.ValidationRows, "int")} validation checks, {formatNumber(row.SnapshotRows, "int")} telemetry rows, and {formatNumber(row.Incidents, "int")} incident windows in
+                        SM_DatabaseHub_History.
                     </p>
                 ) : null}
                 <dl className="kv">
                     <dt>Opened</dt>
-                    <dd>{embedded ? "Inside the Fabric portal (signed in through the portal)" : "Directly in a browser tab"}</dd>
-                    {runtime.links.workspace ? (
-                        <>
-                            <dt>The demo workspace</dt>
-                            <dd>
-                                <a href={runtime.links.workspace} target="_blank" rel="noopener noreferrer">
-                                    Open in a new tab
-                                </a>
-                            </dd>
-                        </>
-                    ) : null}
+                    <dd>{embedded ? "Inside the Fabric portal" : "Directly in a browser tab"}</dd>
                     <dt>This app's item page</dt>
                     <dd>
                         <a href={itemUrl} target="_blank" rel="noopener noreferrer">
                             Open in Fabric
                         </a>{" "}
-                        <button type="button" className="icon-btn" aria-label="Copy the link to this app's item page" onClick={async () => notify((await copyText(itemUrl)) ? "Link copied" : "Copy is blocked here")}>
-                            <Copy aria-hidden="true" />
-                        </button>
+                        <Tooltip content="Copy the link to this app's item page" relationship="label">
+                            <Button size="small" appearance="subtle" icon={<Copy16Regular />} onClick={async () => notify((await copyText(itemUrl)) ? "Link copied" : "Copy is blocked here", "info")} />
+                        </Tooltip>
                     </dd>
                 </dl>
-                <p className="gate-muted">
-                    Inside the portal the app has no address bar of its own, so a link opens the app's home page; the app remembers your last view in this browser.
-                </p>
+                <p className="muted">Inside the portal the app has no address bar of its own, so a link opens the app's home page; the app remembers your last view in this browser.</p>
             </VisualCard>
 
-            <section className="card glass span-12" aria-labelledby="about-title">
-                <h3 id="about-title">
-                    <BookOpen aria-hidden="true" width={18} height={18} /> About this app
-                </h3>
-                <ul className="about">
-                    <li>Fabric Apps is a preview. This app is read-only toward the demo: no controls, no writes to the targets, Azure, the lakehouse, or the model.</li>
-                    <li>Open it from its item in the Fabric workspace. Opening the hosted address directly is a known preview limitation (its sign-in pop-up can lose its link back).</li>
+            <section className="panel span-12" aria-labelledby="about-title">
+                <h3 id="about-title">About this app</h3>
+                <ul className="confirm-list">
+                    <li>Fabric Apps is a preview. The app reads the history as you, through the read-only semantic model connector.</li>
+                    <li>Open it from its item in the Fabric workspace. Opening the hosted address directly is a known preview limitation.</li>
                     <li>It runs on the workspace's Fabric capacity and uses its capacity units, outside the demo's Azure budget.</li>
-                    <li>Every visual can show its DAX, copy it, show its data as a table, and download it as CSV. Insights are rules over the query results; no external AI service.</li>
+                    <li>Every visual can show its DAX, its data as a table, and download it as CSV, and every visual has Ask Copilot.</li>
                 </ul>
             </section>
         </div>

@@ -153,7 +153,7 @@ The live-activity notebook's bin is automatic: 1 minute for windows up to 2 hour
 | `database_growth` | `StartUsedMB`, `EndUsedMB`, `GrowthMB`, `LogUsedMB`, `VersionStoreMB` | Latest sample time |
 | `telemetry_coverage` (deployment notebook) | `<Table>.rows`, `<Table>.instances` | Latest sample time per telemetry table |
 
-`analysis_findings` holds the analyses `telemetry_access`, `estate_pulse`, `blocking` (one finding per blocking incident with its window, plus a `deadlocks` summary), `consumption` (CPU and log-rate findings per target), `correlation` (one per recorded scenario window), and `real_time_dashboard`. Re-running a notebook cell replaces that run's rows, but two runs with overlapping windows store the same bins twice.
+`analysis_findings` holds the analyses `telemetry_access`, `estate_pulse`, `blocking` (one finding per blocking incident with its window, plus a `deadlocks` summary), `consumption` (CPU and log-rate findings per target), `correlation` (one per recorded scenario window), `real_time_dashboard`, and, from 2026-11-18, `database_agent` (one per demo session's Database Agent beat: T3's CPU before and after the run's response). Re-running a notebook cell replaces that run's rows, but two runs with overlapping windows store the same bins twice.
 
 ### Storage mode, framing, and refresh
 
@@ -256,7 +256,8 @@ DATATABLE (
         { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
         { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
-        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 }
+        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
+        { "database_agent", "Database Agent loop", "Incidents", "Per agent beat", 18 }
     }
 )
 

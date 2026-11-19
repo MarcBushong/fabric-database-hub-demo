@@ -4,7 +4,7 @@ import { SQL_TARGETS, type TargetKey } from "./dax";
 import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, type NumberKind } from "./format";
 import { mean } from "./stats";
 import type { StatusName } from "./status";
-import type { PageId } from "./view-state";
+import type { EstateTarget, PageId } from "./view-state";
 import {
     FAMILY_LABEL,
     POSTGRES_METRICS,
@@ -31,6 +31,8 @@ export interface Insight {
     title: string;
     detail: string;
     page?: PageId;
+    /** The target the page drills into. */
+    target?: EstateTarget;
     incident?: string;
 }
 
@@ -310,7 +312,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
                 metric: "catch-up",
                 title: "The latest capture's Read replica lag is only the replica's catch-up after its restart.",
                 detail: `Up to ${formatNumber(caughtPeak.value, "seconds")} from ${formatTimeUtc(caught[0].at)} UTC on ${formatDayUtc(caught[0].at)}: the time since its last replay until T4 wrote again, not replication lag.`,
-                page: "postgres",
+                page: "estate",
+                target: "T4",
             };
         }
         return {
@@ -319,7 +322,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
             metric: "none",
             title: "The latest capture has no Read replica lag.",
             detail: "T4's read replica exists only during a session: start-demo.ps1 creates it, and stop-demo.ps1 captures its metrics before it deletes it.",
-            page: "postgres",
+            page: "estate",
+            target: "T4",
         };
     }
     const replica = capture.servers["T4-replica"];
@@ -329,7 +333,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
         metric: formatNumber(peak.value, "seconds"),
         title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.${left}`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }
 
@@ -345,7 +350,8 @@ export function postgresCpuInsight(capture: PostgresCapture | null): Insight | n
         metric: formatNumber(peak.value, "percent"),
         title: `T4's CPU peaked at ${formatNumber(peak.value, "percent")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(cpu.map((p) => p.value)), "percent")} on average${connections ? `; active connections peaked at ${formatNumber(connections.value, "int")} at ${formatTimeUtc(connections.at)} UTC` : ""}. ${POSTGRES_CPU_WARNING_PERCENT} % or more is a warning.`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }
 
@@ -362,7 +368,8 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
             metric: "0",
             title: "No failed connections on T4 in the latest capture.",
             detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}.`,
-            page: "postgres",
+            page: "estate",
+            target: "T4",
         };
     }
     const interval = capture?.intervalMinutes;
@@ -372,6 +379,7 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
         metric: formatNumber(total, "int"),
         title: `${formatNumber(total, "int")} failed connection${total === 1 ? "" : "s"} on T4 in the latest capture.`,
         detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }

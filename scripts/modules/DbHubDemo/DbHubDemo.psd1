@@ -52,6 +52,7 @@
         'Get-DemoT3FreeOfferStatus'
         'Get-DemoTeardownManifest'
         'Get-DemoVmHealth'
+        'Grant-DemoPresenterWorkspaceAccess'
         'Import-DemoFabricItem'
         'Import-DemoFabricNotebook'
         'Invoke-DemoAskRelaySetup'

@@ -82,7 +82,8 @@ function ConvertTo-DemoConfigFileText {
     .SYNOPSIS
     The configuration as the JSON a script's -ConfigPath reads back with Get-DemoConfig: without the marks that only a
     run's own configuration carries and the schema doesn't allow in the file (additionalProperties false):
-    t2SqlInstallModeSource and t4EnabledIgnored (Get-DemoConfig; 2026-11-09), and t4SkuSource (ADR 0019). Pure. Internal.
+    t2SqlInstallModeSource and t4EnabledIgnored (Get-DemoConfig; 2026-11-09), t4SkuSource (ADR 0019), and
+    sessionCeilingUsdSource (Get-DemoConfig; 2026-11-18). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -93,9 +94,26 @@ function ConvertTo-DemoConfigFileText {
 
     $copy = [ordered]@{}
     foreach ($key in $Config.Keys) {
-        if ([string]$key -notin 't2SqlInstallModeSource', 't4EnabledIgnored', 't4SkuSource') {
+        if ([string]$key -notin 't2SqlInstallModeSource', 't4EnabledIgnored', 't4SkuSource', 'sessionCeilingUsdSource') {
             $copy[$key] = $Config[$key]
         }
     }
     return ($copy | ConvertTo-Json -Depth 20)
+}
+
+function Get-DemoSessionCeilingLegacyText {
+    # The one line a run prints, and its status page shows, when the configuration's sessionCeilingUsd is exactly 15, the
+    # default before 2026-11-18, which counts as 20, today's default (sessionCeilingUsdSource legacy, Get-DemoConfig;
+    # ADR 0016). '' otherwise. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    if (-not ($Config.Contains('sessionCeilingUsdSource') -and [string]$Config['sessionCeilingUsdSource'] -eq 'legacy')) {
+        return ''
+    }
+    return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'sessionCeilingUsd 15 in your configuration (the default before 2026-11-18) counts as {0}, the default since then: lowest-cost''s T3 went from 1 to 2 vCores, because Database Agents doesn''t support one-vCore serverless databases, which raises a session''s estimate; a session over the ceiling is still only a Warning. To drop this note, set sessionCeilingUsd to {0}, or to any value but 15, which is kept as it is.', $Config['sessionCeilingUsd'])
 }

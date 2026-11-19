@@ -1,180 +1,184 @@
 import { useMemo, useState } from "react";
+import { Tab, TabList } from "@fluentui/react-components";
 
 import { useApp } from "@/app-context";
 import { AgentCard } from "@/components/AgentPrompts";
-import { InsightCards } from "@/components/InsightCards";
+import { DataGrid, type GridColumn } from "@/components/DataGrid";
+import { EmptyState } from "@/components/EmptyState";
+import { Insights } from "@/components/Insights";
+import { KpiTile } from "@/components/KpiTile";
 import { StatusBadge } from "@/components/StatusBadge";
+import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { toChecks, toCoverage, toReadinessSummary, toTargetNames, toTargets } from "@/data/model";
+import { toChecks, toCoverage, toReadinessSummary, toTargetNames, toTargets, type Check } from "@/data/model";
 import { coverageQuery, estateQuery, readinessChecksQuery, readinessSummaryQuery, targetNamesQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { coveragePrompt, libraryPrompts, type AgentSurface, type LibraryContext } from "@/lib/agent-prompts";
 import { formatDateTimeUtc, formatNumber } from "@/lib/format";
 import { lagInsight, readinessInsight } from "@/lib/insights";
-import { STATUSES, statusMeta, type StatusName } from "@/lib/status";
+import { statusMeta, STATUSES } from "@/lib/status";
+import { PageHeader } from "@/shell/PageHeader";
+import { ChartView } from "@/visuals/ChartView";
 import { areaRings } from "@/visuals/layout";
-import { ReadinessRings } from "@/visuals/ReadinessRings";
+
+type CheckRow = Check & Record<string, unknown>;
+
+const COLUMNS: GridColumn<CheckRow>[] = [
+    { key: "status", label: "Status", render: (r) => <StatusBadge status={r.status} short />, sortValue: (r) => r.statusSort, width: "120px" },
+    { key: "checkId", label: "Check", render: (r) => <code>{r.checkId}</code>, width: "200px" },
+    { key: "area", label: "Area", width: "110px" },
+    { key: "target", label: "Target", render: (r) => <TargetChip target={r.target} />, width: "100px" },
+    { key: "message", label: "What it found" },
+    { key: "remediation", label: "Next step", render: (r) => (r.remediation ? r.remediation : <span className="muted">–</span>) },
+    { key: "docUrl", label: "Docs", kind: "url", width: "70px" },
+];
+
+const STATUS_COLORS: Record<string, string> = {
+    Fail: "var(--status-fail)",
+    "Manual action required": "var(--status-manual)",
+    Warning: "var(--status-warning)",
+    Pass: "var(--status-pass)",
+    "Not supported": "var(--colorNeutralStroke1)",
+    "Not selected": "var(--colorNeutralStroke2)",
+};
 
 export default function ReadinessPage() {
     const { filters, meta, runtime } = useApp();
-    const [area, setArea] = useState<string | null>(null);
-    const [status, setStatus] = useState<StatusName | null>(null);
+    const [status, setStatus] = useState<string>("open");
     const checksSpec = useMemo(() => readinessChecksQuery(), []);
     const summarySpec = useMemo(() => readinessSummaryQuery(), []);
     const coverageSpec = useMemo(() => coverageQuery(), []);
-    const estateSpec = useMemo(() => estateQuery(filters), [filters]);
+    const estateSpec = useMemo(() => (filters.targets.length ? estateQuery(filters) : null), [filters]);
     const namesSpec = useMemo(() => targetNamesQuery(), []);
-    const checksQuery = useQuery(checksSpec);
-    const summaryQuery = useQuery(summarySpec);
-    const coverageQueryState = useQuery(coverageSpec);
+    const checksState = useQuery(checksSpec);
+    const summaryState = useQuery(summarySpec);
+    const coverageState = useQuery(coverageSpec);
     const estate = useQuery(estateSpec);
-    const namesQuery = useQuery(namesSpec);
+    const namesState = useQuery(namesSpec);
 
-    const checks = useMemo(() => toChecks(checksQuery.data?.rows ?? []), [checksQuery.data]);
-    const summary = useMemo(() => toReadinessSummary(summaryQuery.data?.rows ?? []), [summaryQuery.data]);
-    const coverage = useMemo(() => toCoverage(coverageQueryState.data?.rows ?? []), [coverageQueryState.data]);
+    const checks = useMemo(() => toChecks(checksState.data?.rows ?? []), [checksState.data]);
+    const summary = useMemo(() => toReadinessSummary(summaryState.data?.rows ?? []), [summaryState.data]);
+    const coverage = useMemo(() => toCoverage(coverageState.data?.rows ?? []), [coverageState.data]);
     const targets = useMemo(() => toTargets(estate.data?.rows ?? []), [estate.data]);
-    const names = useMemo(() => toTargetNames(namesQuery.data?.rows ?? []), [namesQuery.data]);
+    const names = useMemo(() => toTargetNames(namesState.data?.rows ?? []), [namesState.data]);
     const latestRun = useMemo(() => areaRings(checks).latestRun, [checks]);
     const latest = useMemo(() => checks.filter((c) => c.runId === latestRun).sort((a, b) => a.statusSort - b.statusSort || a.checkId.localeCompare(b.checkId)), [checks, latestRun]);
-    const shown = latest.filter((c) => (!area || c.area === area) && (!status || statusMeta(c.status).name === status));
+    const shown = latest.filter((c) => status === "all" || (status === "open" ? c.statusSort <= 3 : statusMeta(c.status).name === status)) as CheckRow[];
+    const byArea = useMemo(() => {
+        const rows: Array<{ area: string; status: string; checks: number }> = [];
+        for (const c of latest) {
+            const name = statusMeta(c.status).name;
+            const row = rows.find((r) => r.area === c.area && r.status === name);
+            if (row) row.checks += 1;
+            else rows.push({ area: c.area, status: name, checks: 1 });
+        }
+        return rows.sort((a, b) => STATUSES.findIndex((s) => s.name === a.status) - STATUSES.findIndex((s) => s.name === b.status));
+    }, [latest]);
     const insights = useMemo(() => [readinessInsight(summary, latest), lagInsight(targets)].filter((x): x is NonNullable<typeof x> => x !== null), [summary, latest, targets]);
-    const maxTables = Math.max(1, ...coverage.map((c) => c.tables ?? 0));
+    const applicable = summary ? summary.checks - summary.notSupported - summary.notSelected : 0;
 
     return (
         <div className="page">
-            <header className="page-head">
-                <div>
-                    <h2>
-                        Ready to <span className="gradient-text">demo</span>?
-                    </h2>
-                    <p>
-                        {summary && summary.checks > 0
-                            ? `${summary.runLabel}: the Fabric-side checks from NB_DatabaseHub_Deployment, worst first. The Azure-side catalog stays in ./scripts/validate.ps1.`
-                            : "No validation run in the lakehouse yet: run NB_DatabaseHub_Deployment."}
-                    </p>
-                </div>
-            </header>
-
-            <InsightCards insights={insights} label="Readiness insights" />
-
-            <VisualCard
-                className="span-7"
-                title="Readiness rings"
-                subtitle="The dial is the pass share of the checks that apply. Each area's ring holds one segment per check; select an area to filter the list."
-                specs={[summarySpec, checksSpec]}
-                loading={checksQuery.loading || summaryQuery.loading}
-                error={checksQuery.error ?? summaryQuery.error}
-                empty={!checksQuery.loading && checks.length === 0}
-                emptyText="No validation run in the lakehouse yet: run NB_DatabaseHub_Deployment."
-                table={summaryQuery.data ? { columns: summarySpec.columns, rows: summaryQuery.data.rows, caption: "Readiness of the latest validation run (model measures)" } : null}
-                summary={summary ? `${summary.passed} of ${summary.checks - summary.notSupported - summary.notSelected} applicable checks pass; ${summary.failed} failed, ${summary.manual} manual, ${summary.warnings} warnings.` : "Readiness rings."}
-                fetchedAt={summaryQuery.data?.fetchedAt}
-                onRefresh={() => {
-                    checksQuery.refetch();
-                    summaryQuery.refetch();
-                }}
-            >
-                <ReadinessRings checks={checks} summary={summary} area={area} onArea={setArea} />
-            </VisualCard>
-
-            <VisualCard
-                className="span-5"
-                title="Telemetry coverage"
-                subtitle="Telemetry tables each target sent in the latest validation run, and how old its newest sample was (fresh means 15 minutes or less)."
-                specs={[coverageSpec]}
-                loading={coverageQueryState.loading}
-                error={coverageQueryState.error}
-                empty={!coverageQueryState.loading && coverage.length === 0}
-                table={coverageQueryState.data ? { columns: coverageSpec.columns, rows: coverageQueryState.data.rows, caption: "Telemetry coverage per target" } : null}
-                summary={coverage.map((c) => `${c.target}: ${c.tables ?? 0} tables, ${c.attention}`).join("; ")}
-                fetchedAt={coverageQueryState.data?.fetchedAt}
-            >
-                <ul className="coverage">
-                    {coverage.map((c) => (
-                        <li key={c.target}>
-                            <span className="coverage-target" style={{ color: `var(--${c.target.toLowerCase()})` }}>
-                                {c.target}
-                            </span>
-                            <span className="coverage-bar" aria-hidden="true">
-                                <span style={{ width: `${((c.tables ?? 0) / maxTables) * 100}%`, background: `var(--${c.target.toLowerCase()})` }} />
-                            </span>
-                            <span>{`${formatNumber(c.tables, "int")} tables`}</span>
-                            <span className="gate-muted">{c.ageMin !== null ? `newest ${formatNumber(c.ageMin, "minutes")}` : "not captured"}</span>
-                            <span className={c.attention.startsWith("✓") ? "status status-pass" : c.attention.startsWith("▲") ? "status status-warning" : "status status-muted"}>{c.attention}</span>
-                        </li>
-                    ))}
-                </ul>
-            </VisualCard>
-
-            <AgentCard
-                className="span-12"
-                title="Ask the Database Agent"
-                subtitle="Before the demo, check what the agent can see: telemetry coverage, then the estate prompt library."
-                lead={`For ${filters.targets.join(", ")}, with the names the telemetry reported.`}
-                build={(surface: AgentSurface) => {
-                    const context: LibraryContext = { names, resourceGroup: runtime.resourceGroup, targets: filters.targets, period: filters.window, latestDay: meta?.latestDay ?? null };
-                    return [coveragePrompt(context, surface), ...libraryPrompts(context, surface)];
-                }}
+            <PageHeader
+                title="Readiness"
+                description={summary && summary.checks > 0 ? `${summary.runLabel}: the Fabric-side checks from NB_DatabaseHub_Deployment, worst first. The Azure-side catalog stays in ./scripts/validate.ps1.` : "Is the demo ready to present? The latest validation run's checks, worst first."}
+                filter={false}
             />
 
-            <VisualCard
-                className="span-12"
-                title="Every check, worst first"
-                subtitle="Each check with its exact remediation and documentation. Filter by status or by area (the rings)."
-                specs={[checksSpec]}
-                loading={checksQuery.loading}
-                error={checksQuery.error}
-                empty={!checksQuery.loading && shown.length === 0}
-                emptyText="No check matches these filters."
-                table={checksQuery.data ? { columns: checksSpec.columns, rows: checksQuery.data.rows, caption: "Validation checks of the latest six runs" } : null}
-                summary={`${shown.length} checks shown.`}
-                fetchedAt={checksQuery.data?.fetchedAt}
-                toolbar={
-                    <div className="segmented" role="group" aria-label="Filter by status">
-                        <button type="button" aria-pressed={status === null} onClick={() => setStatus(null)}>
-                            All
-                        </button>
+            {!checksState.loading && checks.length === 0 ? (
+                <EmptyState title="No validation run in the history yet">
+                    <p>./scripts/deploy.ps1 runs NB_DatabaseHub_Deployment, which saves its checks here.</p>
+                </EmptyState>
+            ) : (
+                <>
+                    <section className="kpis" aria-label="Readiness at a glance">
+                        <KpiTile label="Ready" value={summary?.readiness !== null && summary?.readiness !== undefined ? `${Math.round(summary.readiness * 100)} %` : "–"} sub={summary ? `${summary.passed} of ${applicable} applicable pass` : ""} status={summary ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null} />
+                        <KpiTile label="Failed" value={String(summary?.failed ?? 0)} status={summary?.failed ? "Fail" : null} onOpen={() => setStatus("Fail")} openLabel="Show the failed checks" />
+                        <KpiTile label="Manual steps" value={String(summary?.manual ?? 0)} status={summary?.manual ? "Manual action required" : null} onOpen={() => setStatus("Manual action required")} openLabel="Show the manual steps" />
+                        <KpiTile label="Warnings" value={String(summary?.warnings ?? 0)} status={summary?.warnings ? "Warning" : null} onOpen={() => setStatus("Warning")} openLabel="Show the warnings" />
+                        <KpiTile label="Passed" value={String(summary?.passed ?? 0)} status={summary?.passed ? "Pass" : null} onOpen={() => setStatus("Pass")} openLabel="Show the passed checks" />
+                    </section>
+
+                    <VisualCard
+                        id="readiness.areas"
+                        className="span-7"
+                        title="Checks by area"
+                        subtitle="The latest run's checks per area, by status."
+                        specs={[checksSpec]}
+                        loading={checksState.loading}
+                        error={checksState.error}
+                        empty={!checksState.loading && byArea.length === 0}
+                        table={{ columns: [{ key: "area", label: "Area", kind: "text" }, { key: "status", label: "Status", kind: "status" }, { key: "checks", label: "Checks", kind: "int" }], rows: byArea, caption: "Checks per area and status" }}
+                        summary={`${latest.length} checks in ${new Set(latest.map((c) => c.area)).size} areas.`}
+                        askPrompt="Is the demo ready to present? What should I fix first, and how?"
+                    >
+                        <ChartView hideHeader height={220} spec={{ kind: "stackedBar", title: "Checks by area", rows: byArea, x: "area", y: "checks", series: "status", unit: "count" }} colors={STATUS_COLORS} />
+                    </VisualCard>
+
+                    <VisualCard
+                        id="readiness.coverage"
+                        className="span-5"
+                        title="Telemetry coverage"
+                        subtitle="Telemetry tables each SQL target sent in the latest validation run, and how old its newest sample was."
+                        specs={[coverageSpec]}
+                        loading={coverageState.loading}
+                        error={coverageState.error}
+                        empty={!coverageState.loading && coverage.length === 0}
+                        table={coverageState.data ? { columns: coverageSpec.columns, rows: coverageState.data.rows, caption: "Telemetry coverage per target" } : null}
+                        summary={coverage.map((c) => `${c.target}: ${c.tables ?? 0} tables, ${c.attention}`).join("; ")}
+                    >
+                        <ul className="coverage">
+                            {coverage.map((c) => (
+                                <li key={c.target}>
+                                    <TargetChip target={c.target} />
+                                    <span>{`${formatNumber(c.tables, "int")} tables`}</span>
+                                    <span className="muted">{c.ageMin !== null ? `newest ${formatNumber(c.ageMin, "minutes")}` : "not captured"}</span>
+                                    <StatusBadge status={c.attention.startsWith("✓") ? "Pass" : c.attention.startsWith("▲") ? "Warning" : "Not selected"} short />
+                                </li>
+                            ))}
+                        </ul>
+                    </VisualCard>
+
+                    <TabList selectedValue={status} onTabSelect={(_, d) => setStatus(String(d.value))} aria-label="Filter the checks" size="small">
+                        <Tab value="open">{`Open (${latest.filter((c) => c.statusSort <= 3).length})`}</Tab>
+                        <Tab value="all">{`All (${latest.length})`}</Tab>
                         {STATUSES.filter((s) => latest.some((c) => statusMeta(c.status).name === s.name)).map((s) => (
-                            <button key={s.name} type="button" aria-pressed={status === s.name} onClick={() => setStatus(status === s.name ? null : s.name)}>
-                                {`${s.glyph} ${s.short}`}
-                            </button>
+                            <Tab key={s.name} value={s.name}>{`${s.short} (${latest.filter((c) => statusMeta(c.status).name === s.name).length})`}</Tab>
                         ))}
-                    </div>
-                }
-            >
-                {area ? (
-                    <p className="dax-meta">
-                        Area: <strong>{area}</strong>{" "}
-                        <button type="button" className="btn-link" onClick={() => setArea(null)}>
-                            Show every area
-                        </button>
-                    </p>
-                ) : null}
-                <ol className="checks">
-                    {shown.map((c) => (
-                        <li key={`${c.runId}-${c.checkId}`}>
-                            <div className="check-head">
-                                <StatusBadge status={c.status} />
-                                <code>{c.checkId}</code>
-                                <span className="gate-muted">{`${c.area} · ${c.target}`}</span>
-                                <time className="gate-muted">{formatDateTimeUtc(c.checkedAt)}</time>
-                            </div>
-                            <p>{c.message}</p>
-                            {c.remediation ? (
-                                <p className="remediation">
-                                    <strong>Next step:</strong> {c.remediation}
-                                </p>
-                            ) : null}
-                            {c.docUrl ? (
-                                <a href={c.docUrl} target="_blank" rel="noopener noreferrer">
-                                    Documentation
-                                </a>
-                            ) : null}
-                        </li>
-                    ))}
-                </ol>
-            </VisualCard>
+                    </TabList>
+
+                    <VisualCard
+                        id="readiness.checks"
+                        title="Checks, worst first"
+                        subtitle={`Each check with its next step and documentation${latest[0]?.checkedAt ? `, checked ${formatDateTimeUtc(latest[0].checkedAt)}` : ""}.`}
+                        specs={[checksSpec]}
+                        loading={checksState.loading}
+                        error={checksState.error}
+                        empty={!checksState.loading && shown.length === 0}
+                        emptyText="No check matches this filter."
+                        table={checksState.data ? { columns: checksSpec.columns, rows: checksState.data.rows.filter((r) => r.RunId === latestRun), caption: "Checks of the latest validation run" } : null}
+                        summary={`${shown.length} checks shown.`}
+                        askPrompt="Explain these checks and what each next step does."
+                        quiet
+                    >
+                        <DataGrid columns={COLUMNS} rows={shown} caption="Validation checks" exportName="readiness-checks" />
+                    </VisualCard>
+
+                    <AgentCard
+                        className="span-12"
+                        title="Ask the Database Agent"
+                        subtitle="Before the demo, check what the agent can see: telemetry coverage, then the estate prompt library."
+                        lead={`For ${filters.targets.join(", ") || "the SQL targets"}, with the names the telemetry reported.`}
+                        visualId="readiness.agent"
+                        build={(surface: AgentSurface) => {
+                            const context: LibraryContext = { names, resourceGroup: runtime.resourceGroup, targets: filters.targets, period: filters.window, latestDay: meta?.latestDay ?? null };
+                            return [coveragePrompt(context, surface), ...libraryPrompts(context, surface)];
+                        }}
+                    />
+
+                    <Insights insights={insights} label="What the data says" page="readiness" />
+                </>
+            )}
         </div>
     );
 }

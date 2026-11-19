@@ -330,6 +330,21 @@ Describe 'T3 in the compiled template (azuredeploy.json)' {
         $database.Properties['requestedBackupStorageRedundancy'] | Should -Be 'Local'
     }
 
+    It 'sizes T3 from config/profiles.json as compiled, with at least 2 maximum vCores in every profile (2026-11-18)' {
+        # Database Agents doesn't support one-vCore serverless databases (the owner's decision: lowest-cost went from 1 to 2).
+        # deploy.ps1 deploys azuredeploy.json, so a profile change reaches T3 only once the template is rebuilt.
+        $catalog = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/profiles.json') -Raw | ConvertFrom-Json -AsHashtable).profiles
+        # The demo module's variables: catalogProfile, and the profiles it indexes, which loadJsonContent compiled in.
+        $variables = @(Get-TemplateNode -Root $template | Where-Object { $_['type'] -eq 'Microsoft.Resources/deployments' -and $_['properties'] -is [System.Collections.IDictionary] -and $_['properties']['template'] -is [System.Collections.IDictionary] -and $_['properties']['template']['variables'] -is [System.Collections.IDictionary] -and $_['properties']['template']['variables'].Contains('catalogProfile') }) | Select-Object -First 1 | ForEach-Object { $_['properties']['template']['variables'] }
+        $compiled = @($variables.Values | Where-Object { $_ -is [System.Collections.IDictionary] -and $_.Contains('lowest-cost') }) | Select-Object -First 1
+        $compiled | Should -Not -BeNullOrEmpty
+        foreach ($name in $catalog.Keys) {
+            [double]$catalog[$name]['t3']['maxVcores'] | Should -BeGreaterOrEqual 2 -Because $name
+            [double]$compiled[$name]['t3']['maxVcores'] | Should -Be ([double]$catalog[$name]['t3']['maxVcores']) -Because ('azuredeploy.json has {0}''s T3 as config/profiles.json does' -f $name)
+        }
+        $t3Deployment['properties']['parameters']['sizing']['value'] | Should -Be "[variables('catalogProfile').t3]"
+    }
+
     It 'uses the stable names and wires snet-sqlvm and snet-pe from the network module' {
         $parameters = $t3Deployment['properties']['parameters']
         $parameters['serverName']['value'] | Should -Be "[format('azuresql01-{0}', parameters('deploymentId'))]"

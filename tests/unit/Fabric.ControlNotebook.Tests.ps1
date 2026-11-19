@@ -684,6 +684,124 @@ print(json.dumps(out))
         $beats.short | Should -Be 4
     }
 
+    It 'plans the Database Agent beat in T3''s second cycle, and the guide gives the one-time agent selection and its times (2026-11-18)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $filled = Get-FilledNotebook -Zone 'UTC'
+        $driver = Join-Path -Path $TestDrive -ChildPath 'agent-beat.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import datetime as dt, json, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+exec(cells[0], ns)
+exec(cells[1], ns)
+showcase, catalog = ns["load_showcase"](ns["SHOWCASE_JSON"]), ns["load_catalog"](ns["CATALOG_JSON"])
+anchor = dt.datetime(2026, 11, 14, 14, 0, tzinfo=dt.timezone.utc)
+status = {"sessionId": "a" * 32, "acceptedUtc": "2026-11-14T13:56:00Z", "runEndUtc": "2026-11-14T15:30:00Z",
+          "names": {"t3Server": "azuresql01-abc123", "t3Database": "ContosoCare", "t2Guest": "arcsql01"}}
+out = {}
+for label, minutes in (("whole", 90), ("cut", 45)):
+    beats = ns["showcase_beats"](showcase, {"T3": anchor}, anchor + dt.timedelta(minutes=minutes))
+    agent = [beat for beat in beats if beat.get("agent")]
+    out[label] = {"agents": len(agent), "lines": ns["guide_lines"](status, showcase, catalog, {"databaseHub": "https://app.fabric.microsoft.com/workloads/fdh/databaseHub"}, beats)}
+    if agent:
+        out[label].update({"scenario": agent[0]["scenario"], "cycle": agent[0]["cycle"],
+                           "regress": (agent[0]["regressUtc"] - anchor).total_seconds() / 60, "respond": (agent[0]["respondUtc"] - anchor).total_seconds() / 60})
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $filled 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $out = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        # One beat a session: plan-regression in cycle 2 (minutes 30-60), regressing at 10% and responding at 85% of it.
+        $out.whole.agents | Should -Be 1
+        $out.whole.scenario | Should -Be 'plan-regression'
+        $out.whole.cycle | Should -Be 2
+        $out.whole.regress | Should -Be 33
+        $out.whole.respond | Should -Be 55.5
+        $text = $out.whole.lines -join "`n"
+        $text | Should -Match 'Once per deployment, if it isn''t done yet: Database Hub > Manage agents > Database agent settings: Enabled on, select azuresql01-abc123/ContosoCare, Agent policy: Flag long-running queries, Force last known good plans, and Flag high CPU'
+        $text | Should -Match '14:33  T3''s lookup regresses to a scanning plan'
+        $text | Should -Match '14:48  From about now, the agent''s issue on azuresql01-abc123/ContosoCare, a new one each session'
+        $text | Should -Match 'Explain why, then Analyze slow query'
+        $text | Should -Match '14:55  Respond: this Run all forces the last good plan through Query Store'
+        $text | Should -Match 'Optimization: arcsql01, ready to migrate'
+        $text | Should -Match '\[What changed\] What changed in my databases\?'
+        $text | Should -Not -Match 'cuts the beat short'
+        # A 45-minute session cuts the beat to 15 minutes, so the response can come before the agent's issue.
+        $out.cut.agents | Should -Be 1
+        ($out.cut.lines -join "`n") | Should -Match 'This session''s end cuts the beat short'
+    }
+
+    It 'says when T3''s response runs, and checks T3''s CPU before and after it once its telemetry arrives (2026-11-18)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $filled = Get-FilledNotebook -Zone 'UTC'
+        $driver = Join-Path -Path $TestDrive -ChildPath 'agent-view.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import contextlib, datetime as dt, io, json, sys, types
+fake_requests = types.ModuleType("requests")
+fake_requests.RequestException = Exception
+sys.modules["requests"], sys.modules["pandas"] = fake_requests, types.ModuleType("pandas")
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+for index in range(3):
+    exec(cells[index], ns)
+ns["CATALOG"] = ns["load_catalog"](ns["CATALOG_JSON"])
+respond = dt.datetime(2026, 11, 14, 14, 55, 30, tzinfo=dt.timezone.utc)
+beat = {"agent": True, "regressUtc": respond - dt.timedelta(minutes=22.5), "respondUtc": respond}
+
+def run(cpu, minutes, telemetry=True):
+    calls = []
+    def fake(start, end):
+        calls.append([(start - respond).total_seconds() / 60, (end - respond).total_seconds() / 60])
+        return cpu(start)
+    ns["t3_cpu"] = fake
+    state, buffer = {}, io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        for minute in minutes:
+            ns["agent_view"](beat, respond + dt.timedelta(minutes=minute), state, telemetry)
+    return {"printed": buffer.getvalue(), "result": list(state.get("result") or []), "calls": calls,
+            "summary": ns["agent_summary"](beat, state, respond + dt.timedelta(minutes=40))}
+
+out = {"early": run(lambda start: (50.0, ""), [-1]),
+       "drop": run(lambda start: (80.0, "") if start < respond else (12.0, ""), [0, 5, 9, 10]),
+       "flat": run(lambda start: (30.0, ""), [9]),
+       "late": run(lambda start: (80.0, "") if start < respond else (None, ""), [9, 15, 21]),
+       "refused": run(lambda start: (None, "HTTP 401."), [9]),
+       "noTelemetry": run(lambda start: (50.0, ""), [1], telemetry=False),
+       "before": ns["agent_summary"](beat, {}, respond - dt.timedelta(minutes=1)),
+       "none": ns["agent_summary"](None, {}, respond)}
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $filled 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $out = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $out.early.printed | Should -BeNullOrEmpty
+        @($out.early.calls).Count | Should -Be 0
+        # At the response, a line; the CPU only once the minutes after it can be in the telemetry, and only once.
+        $out.drop.printed | Should -Match 'Now: T3 Respond, the Database Agent loop''s manual response: T3''s run forces the last good plan through Query Store'
+        $out.drop.result | Should -Be @('Pass', 'T3''s CPU fell from 80% before the response to 12% after it: the last good plan is back.')
+        ($out.drop.calls | ForEach-Object { $_ -join '..' }) | Should -Be @('1..6', '-8..-1')
+        $out.drop.summary[0] | Should -Match '^The Database Agent loop: T3''s response ran at 14:55 \(the last good plan forced through Query Store, FORCE_LAST_GOOD_PLAN back on\)\. Pass: T3''s CPU fell'
+        $out.flat.result[0] | Should -Be 'Warning'
+        $out.flat.result[1] | Should -Match 'didn''t fall after the response \(30% before, 30% after\)'
+        # Telemetry arrives 3 to 15 minutes late: it waits up to 20 minutes after the response, then says so.
+        @($out.late.calls).Count | Should -Be 3
+        $out.late.result[0] | Should -Be 'Warning'
+        $out.late.result[1] | Should -Match 'isn''t in the telemetry yet'
+        $out.refused.result[1] | Should -Match 'isn''t in the telemetry: HTTP 401\.'
+        $out.noTelemetry.result[0] | Should -Be 'Note'
+        @($out.noTelemetry.calls).Count | Should -Be 0
+        $out.before[0] | Should -Match 'the session ended before T3''s response at 14:55'
+        @($out.none).Count | Should -Be 0
+    }
+
     It 'runs a whole session on Run all: the start, the guide, the end, the stop, and its history, with one session ID' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
@@ -712,6 +830,13 @@ print(json.dumps(out))
         $job.LAKEHOUSE_ID | Should -Be 'cccccccc-0000-0000-0000-000000000003'
         $job.SESSION_ID | Should -Be $report.sent[0].sessionId
         ($job.SESSION_PLAN | ConvertFrom-Json).beats.Count | Should -BeGreaterThan 20
+        # The Database Agent beat carries when its run regresses and responds, for the history's database_agent finding.
+        $agentBeats = @(($job.SESSION_PLAN | ConvertFrom-Json).beats | Where-Object { $_.agent })
+        $agentBeats.Count | Should -Be 1
+        $agentBeats[0].target | Should -Be 'T3'
+        $agentBeats[0].scenario | Should -Be 'plan-regression'
+        ([datetime]$agentBeats[0].respondUtc).ToUniversalTime().ToString('HH:mm') | Should -Be '14:59'
+        ([datetime]$agentBeats[0].regressUtc) | Should -BeLessThan ([datetime]$agentBeats[0].respondUtc)
         ($job.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $job.SESSION_ID
         ([datetime]$job.WINDOW_START_UTC).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 14, 13, 55, 0, [System.DateTimeKind]::Utc))
         $job.RESOURCE_GROUP | Should -Be 'rg-dbhub-demo'
@@ -727,6 +852,10 @@ print(json.dumps(out))
         $report.printed | Should -Match 'T4''s read replica pgreplica01-abc123'
         $report.printed | Should -Match '\[Investigate\] Investigate what happened on sqlvm01 between 14:04 and 14:14 UTC\.'
         $report.printed | Should -Match 'Now: T4 Read replica lag'
+        # The Database Agent loop (2026-11-18): the one-time selection in the guide, the response, and the summary's line.
+        $report.printed | Should -Match 'Database Hub > Manage agents > Database agent settings: Enabled on, select azuresql01-abc123/ContosoCare'
+        $report.printed | Should -Match 'Now: T3 Respond, the Database Agent loop''s manual response'
+        $report.printed | Should -Match 'The Database Agent loop: T3''s response ran at 14:59 '
         $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped'
         $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive'
         $report.printed | Should -Match 'NB_DatabaseHub_LiveActivity runs in this notebook''s Spark session to save session [0-9a-f]{8}''s history\.'

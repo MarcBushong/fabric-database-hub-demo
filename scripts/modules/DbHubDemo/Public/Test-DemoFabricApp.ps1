@@ -53,8 +53,9 @@ function Test-DemoFabricApp {
     The app item's page in the Fabric portal, for the browser steps.
 
     .PARAMETER Queries
-    All runs the whole catalog (16 queries since 2026-11-13, with T4's PostgreSQL page's two, which may be empty until a
-    capture of T4's metrics exists, and are said, not warned about); Probe runs only the connector check.
+    All runs the whole catalog (21 queries since 2026-11-18, with T4's PostgreSQL page's two, which may be empty until a
+    capture of T4's metrics exists, and the ones the catalog marks mayBeEmpty, such as the sessions, which may be empty
+    until the first session; all of them are said, not warned about); Probe runs only the connector check.
 
     .PARAMETER TimeoutSeconds
     How long each connector call may run.
@@ -378,7 +379,7 @@ function Test-DemoFabricApp {
                 $outcomes = foreach ($entry in @($index['queries'])) {
                     $id = [string]$entry['id']
                     $outcome = if ($id -eq 'connector-check') { $probe } elseif ($id -eq 'history-meta') { $meta } else { & $invoke ([string]$entry['file']) }
-                    [pscustomobject]@{ Id = $id; Ok = $outcome.Ok; Rows = $outcome.Rows.Count; Error = $outcome.Error; Route = $outcome.Route }
+                    [pscustomobject]@{ Id = $id; Ok = $outcome.Ok; Rows = $outcome.Rows.Count; Error = $outcome.Error; Route = $outcome.Route; MayBeEmpty = [string]$entry['mayBeEmpty'] }
                 }
                 $failed = @($outcomes | Where-Object { -not $_.Ok })
                 $empty = @($outcomes | Where-Object { $_.Ok -and $_.Rows -eq 0 })
@@ -386,8 +387,13 @@ function Test-DemoFabricApp {
                 # deploy.ps1's history snapshot takes at its end, after this check, and stop-demo.ps1 -SaveHistory at a
                 # session's end; so its queries' being empty is said, not warned about.
                 $notYet = @($empty | Where-Object { $_.Id -like 'postgres-*' })
-                $empty = @($empty | Where-Object { $_.Id -notlike 'postgres-*' })
+                # The app's catalog marks the other queries that are empty until a session (mayBeEmpty, 2026-11-18): said too.
+                $untilSession = @($empty | Where-Object { $_.Id -notlike 'postgres-*' -and $_.MayBeEmpty })
+                $empty = @($empty | Where-Object { $_.Id -notlike 'postgres-*' -and -not $_.MayBeEmpty })
                 $notYetText = if ($notYet.Count -gt 0) { ' T4''s PostgreSQL page has no capture yet ({0}): deploy.ps1''s history snapshot at its end, and stop-demo.ps1 -SaveHistory, add one.' -f (($notYet | ForEach-Object { $_.Id }) -join ', ') } else { '' }
+                if ($untilSession.Count -gt 0) {
+                    $notYetText += ' No rows yet, as expected: {0}.' -f (($untilSession | ForEach-Object { '{0} ({1})' -f $_.Id, $_.MayBeEmpty }) -join '; ')
+                }
                 $routes = @($outcomes | ForEach-Object { [string]$_.Route } | Select-Object -Unique)
                 $through = if ($routes.Count -gt 1) {
                     'through the {0} connector''s direct route, then Power BI''s Execute Queries with the same Azure CLI token once that route refused it' -f $connector
