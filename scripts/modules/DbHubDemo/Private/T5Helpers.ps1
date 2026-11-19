@@ -714,7 +714,10 @@ function Get-DemoT5CostLifecycle {
             if ($control.Mode -eq 'Unknown') {
                 return $script:T5LifecycleAlwaysOn
             }
-            $willHaveActions = @($control.Lacking).Count -eq 0 -or [bool]$Permission.CanDefine
+            # The run writes the control's role to exactly its approved actions ($script:ActivityControlRoleActions), so a
+            # deployer who can write it adds the container's actions only while they're approved there.
+            $approved = @($script:T5ContainerControlActions | Where-Object { $_ -notin $script:ActivityControlRoleActions }).Count -eq 0
+            $willHaveActions = @($control.Lacking).Count -eq 0 -or ([bool]$Permission.CanDefine -and $approved)
             $willHold = [bool]$control.HoldsRole -or [bool]$Permission.CanAssign
             if ($willHold -and -not $willHaveActions) {
                 return $script:T5LifecycleAlwaysOn

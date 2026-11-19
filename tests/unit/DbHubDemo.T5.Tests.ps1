@@ -779,6 +779,21 @@ Describe 'Get-DemoT5CostLifecycle: how the cost estimate prices T5''s throughput
         Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session' -Because 'an Owner''s run assigns the control its own role'
     }
 
+    It 'prices an Owner''s update AlwaysOn when the control''s approved role no longer has the container''s actions, since the run writes only the approved ones' {
+        $script:control = $script:older
+        $saved = InModuleScope DbHubDemo { $script:ActivityControlRoleActions }
+        try {
+            InModuleScope DbHubDemo { $script:ActivityControlRoleActions = @($script:ActivityControlRoleActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' }) }
+            Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'AlwaysOn'
+            $script:control = [pscustomobject]@{ Mode = 'NoRole'; Why = 'the session control''s identity doesn''t exist yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $false; Lacking = $script:actions; IdentityExists = $false; HoldsRole = $false; HoldsOther = $false }
+            Get-Priced -State $script:new -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session' -Because 'with no role at all, the person''s own scripts create the container'
+            $script:control = $script:older
+        }
+        finally {
+            InModuleScope DbHubDemo -Parameters @{ Saved = $saved } { $script:ActivityControlRoleActions = $Saved }
+        }
+        Get-Priced -State $script:fromMain -Permission $script:owner -ThisRunDeploys | Should -Be 'Session'
+    }
     It 'keeps a recorded Session without reading the control, prices what it can''t read AlwaysOn (fail safe), and follows the tag outside deploy.ps1' {
         Get-Priced -State ([pscustomobject]@{ Exists = $true; T5Container = 'Session' }) -Permission $script:contributor -ThisRunDeploys | Should -Be 'Session'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -Times 0 -Exactly
