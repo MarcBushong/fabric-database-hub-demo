@@ -24,7 +24,9 @@ function Find-DemoSecretLeak {
     listing its files (2026-11-18: after the Insights app's build, out/fabric-app/node_modules alone held
     114,315 files, 658 MB, and walking it kept validate.ps1's Security area busy for more than 37 minutes).
     Junctions and symbolic links to folders aren't followed. A folder or file named in -Path is scanned even
-    when it's inside such a tree. Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
+    when it's inside such a tree. A tree outside every -DependencyRoot is left out too, but listed apart
+    (UnexpectedPruned), so the caller can say it wasn't read (review of ab91ee5: a log in out/venv/ or
+    out/.npm/_logs/ is the demo's own output, and the scan shouldn't pass silently without it). Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
     byte order mark says so, or as UTF-16 without one when NUL bytes fall on every other byte (Windows
     PowerShell 5.1's Out-File and redirection write UTF-16). Other files with a NUL byte in the first 8,000
     bytes are binary; they, files larger than -MaxFileBytes, and files and folders that can't be read are
@@ -34,7 +36,8 @@ function Find-DemoSecretLeak {
     Findings (each with Source, Line, Rule, and an Excerpt in which every match is replaced by
     [REDACTED:<rule>] and the rest is redacted again), Scanned (the sources read), Skipped (with the
     reason), Pruned (the dependency-tree folders left out, full paths, sorted, the first 50), and PrunedCount
-    (how many were left out).
+    (how many were left out), and UnexpectedPruned and UnexpectedPrunedCount (those of them outside every
+    -DependencyRoot; all of them when -DependencyRoot isn't given).
 
     Sources (checked 2026-10-20): what ADR 0009 requires scanned, and gitleaks for the repository itself
     (https://github.com/gitleaks/gitleaks); GitHub Actions log masking
@@ -54,6 +57,11 @@ function Find-DemoSecretLeak {
 
     .PARAMETER MaxFileBytes
     Larger files are skipped.
+
+    .PARAMETER DependencyRoot
+    Folders whose dependency trees are expected, such as the Insights app's build stage, out/fabric-app, which npm fills
+    from the repository's lockfiles. A tree left out under one of them is only listed in Pruned; any other one is in
+    UnexpectedPruned too.
 
     .EXAMPLE
     (Find-DemoSecretLeak -Path ./out).Findings | Format-Table Source, Line, Rule, Excerpt
@@ -79,7 +87,10 @@ function Find-DemoSecretLeak {
         [securestring[]] $KnownValue = @(),
 
         [ValidateRange(1024, 1073741824)]
-        [long] $MaxFileBytes = 52428800
+        [long] $MaxFileBytes = 52428800,
+
+        [Parameter(ParameterSetName = 'Path')]
+        [string[]] $DependencyRoot = @()
     )
 
     $values = [System.Collections.Generic.List[object]]::new()
@@ -100,6 +111,8 @@ function Find-DemoSecretLeak {
     $scanned = [System.Collections.Generic.List[string]]::new()
     $skipped = [System.Collections.Generic.List[object]]::new()
     $pruned = [System.Collections.Generic.List[string]]::new()
+    $unexpected = [System.Collections.Generic.List[string]]::new()
+    $expectedRoots = @($DependencyRoot | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar })
 
     if ($PSCmdlet.ParameterSetName -eq 'Text') {
         foreach ($finding in @(Find-DemoSecretInText -Text $Text -Source $Source -Value $values.ToArray())) {
@@ -145,6 +158,10 @@ function Find-DemoSecretLeak {
                         }
                         elseif ($prunedNames.Contains($entry.Name)) {
                             $pruned.Add($entry.FullName)
+                            $underRoot = @($expectedRoots | Where-Object { $entry.FullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+                            if (-not $underRoot) {
+                                $unexpected.Add($entry.FullName)
+                            }
                         }
                         elseif ($entry.Name -ne '.git' -and -not $entry.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
                             $pending.Push($entry)
@@ -193,11 +210,13 @@ function Find-DemoSecretLeak {
     }
 
     [pscustomobject]@{
-        PSTypeName  = 'DbHubDemo.SecretScan'
-        Findings    = $findings.ToArray()
-        Scanned     = $scanned.ToArray()
-        Skipped     = $skipped.ToArray()
-        Pruned      = @($pruned | Sort-Object | Select-Object -First 50)
-        PrunedCount = $pruned.Count
+        PSTypeName            = 'DbHubDemo.SecretScan'
+        Findings              = $findings.ToArray()
+        Scanned               = $scanned.ToArray()
+        Skipped               = $skipped.ToArray()
+        Pruned                = @($pruned | Sort-Object | Select-Object -First 50)
+        PrunedCount           = $pruned.Count
+        UnexpectedPruned      = @($unexpected | Sort-Object | Select-Object -First 50)
+        UnexpectedPrunedCount = $unexpected.Count
     }
 }

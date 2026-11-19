@@ -2121,7 +2121,7 @@ Describe 'Start-DemoEnvironment' {
         }
         ($results | Where-Object { $_.checkId -eq 'START.INCIDENTS_T2' }).message | Should -Match ':05 \(cpu-pressure, 8 minutes\), :20 \(missing-index, 8 minutes\), :35 \(io-pressure, 8 minutes\), and :50 \(inefficient-query, 6 minutes\) past each UTC hour'
         ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T1' }).message | Should -Match 'business-day'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' -and $BastionHours -eq -1 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: business-day:*set activityProfile to baseline for a quiet demo*' } -Times 1 -Exactly
     }
 
@@ -2451,6 +2451,8 @@ Describe 'Start-DemoEnvironment' {
     It 'deploys Bastion with -Interactive and leaves the password to start-demo.ps1' {
         $script:state.HostPasswordUtc = '2026-10-19T15:00:00Z'
         Start-DemoEnvironment -Config $config -Interactive -SkipT3 -Confirm:$false | Out-Null
+        # Its cost guardrail counts the Bastion it deploys, for at most bastionMaxHours (2026-11-19); a default start, none.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $BastionHours -eq [System.Math]::Min([double]$config['bastionMaxHours'], 5) }
         $script:order | Should -Not -Contain 'Rotate'
         $script:order | Should -Not -Contain 'WarmT3'
         $script:order[-1] | Should -Be 'Bastion'
@@ -4153,6 +4155,13 @@ Describe 'Test-DemoStartCost' {
         $script:actual = $null
         $results = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
         ($results | Where-Object { $_.checkId -eq 'START.COST.ACTUAL' }).status | Should -Be 'Warning'
+    }
+
+    It 'counts Bastion''s hours only when it''s given them, as start-demo.ps1 -Interactive does (2026-11-19)' {
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null -BastionHours 4 } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $BastionHours -eq 4 }
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('BastionHours') }
     }
 }
 
