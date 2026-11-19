@@ -1,13 +1,15 @@
-// The app's themes: Fluent 2 (Fabric's own design system) with a Fabric-teal brand ramp, in light, dark, and high
-// contrast. The app's own tokens (status, targets, charts) live beside them, so the contrast tests read the same values
-// the app applies.
+// The app's themes: Fluent 2 (Fabric's own design system) with the app's own brand ramp (ContosoCare's navy and cyan,
+// src/theme/identity.ts, ADR 0030), in light, dark, and high contrast. The app's own tokens (status, targets, charts)
+// live beside them, so the contrast tests read the same values the app applies.
 
 import { createDarkTheme, createLightTheme, teamsHighContrastTheme, type BrandVariants, type Theme } from "@fluentui/react-components";
+
+import { APP_BRAND } from "./identity";
 
 export type ThemeId = "light" | "dark" | "contrast";
 export type ThemeChoice = ThemeId | "system";
 
-/** Fabric's teal, #117865 at 80, the shade Fluent's light theme uses for primary buttons and links. */
+/** Fabric's teal, #117865 at 80: the app's brand until ADR 0030, kept for a one-line swap back (APP_BRAND). */
 export const FABRIC_BRAND: BrandVariants = {
     10: "#030F0C",
     20: "#0A1D19",
@@ -27,17 +29,17 @@ export const FABRIC_BRAND: BrandVariants = {
     160: "#D5EFEA",
 };
 
-const light: Theme = { ...createLightTheme(FABRIC_BRAND) };
+const light: Theme = { ...createLightTheme(APP_BRAND) };
 const dark: Theme = {
-    ...createDarkTheme(FABRIC_BRAND),
-    colorBrandForeground1: FABRIC_BRAND[110],
-    colorBrandForeground2: FABRIC_BRAND[120],
-    colorBrandForegroundLink: FABRIC_BRAND[120],
-    colorBrandForegroundLinkHover: FABRIC_BRAND[130],
-    colorCompoundBrandForeground1: FABRIC_BRAND[110],
-    colorCompoundBrandStroke: FABRIC_BRAND[110],
-    colorNeutralForeground2BrandHover: FABRIC_BRAND[110],
-    colorNeutralForeground2BrandSelected: FABRIC_BRAND[110],
+    ...createDarkTheme(APP_BRAND),
+    colorBrandForeground1: APP_BRAND[110],
+    colorBrandForeground2: APP_BRAND[120],
+    colorBrandForegroundLink: APP_BRAND[120],
+    colorBrandForegroundLinkHover: APP_BRAND[130],
+    colorCompoundBrandForeground1: APP_BRAND[110],
+    colorCompoundBrandStroke: APP_BRAND[110],
+    colorNeutralForeground2BrandHover: APP_BRAND[110],
+    colorNeutralForeground2BrandSelected: APP_BRAND[110],
     colorSubtleBackgroundSelected: "#383838",
 };
 

@@ -14,26 +14,34 @@ import type { AppRuntime } from "./lib/runtime-config";
 import { isEmbedded, loadSavedView, mergeView, parseHash, saveView, toHash, windowRange, type PageId, type ViewState } from "./lib/view-state";
 import { AppShell } from "./shell/AppShell";
 
+const MissionControlPage = lazy(() => import("./pages/MissionControlPage"));
 const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const EstatePage = lazy(() => import("./pages/EstatePage"));
 const PerformancePage = lazy(() => import("./pages/PerformancePage"));
 const IncidentsPage = lazy(() => import("./pages/IncidentsPage"));
+const ScoreboardPage = lazy(() => import("./pages/ScoreboardPage"));
+const ReplayPage = lazy(() => import("./pages/ReplayPage"));
 const FindingsPage = lazy(() => import("./pages/FindingsPage"));
 const ReadinessPage = lazy(() => import("./pages/ReadinessPage"));
 const TrendsPage = lazy(() => import("./pages/TrendsPage"));
 const ManagePage = lazy(() => import("./pages/ManagePage"));
 const LinksPage = lazy(() => import("./pages/LinksPage"));
+const KioskPage = lazy(() => import("./pages/KioskPage"));
 
 const PAGE_COMPONENTS: Record<PageId, ComponentType> = {
+    mission: MissionControlPage,
     overview: OverviewPage,
     estate: EstatePage,
     performance: PerformancePage,
     incidents: IncidentsPage,
+    scoreboard: ScoreboardPage,
+    replay: ReplayPage,
     findings: FindingsPage,
     readiness: ReadinessPage,
     trends: TrendsPage,
     manage: ManagePage,
     links: LinksPage,
+    kiosk: KioskPage,
 };
 
 function initialView(): ViewState {
@@ -168,16 +176,28 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
         </MessageBar>
     ) : null;
 
+    const loading = (
+        <div className="page-loading">
+            <Spinner size="small" label="Loading the page" />
+        </div>
+    );
+
+    // The kiosk runs without the app's frame: no top bar, no navigation, no dock.
+    if (view.page === "kiosk") {
+        return (
+            <AppContext.Provider value={context}>
+                <Suspense fallback={loading}>
+                    <Page />
+                </Suspense>
+                <Toaster toasterId={toasterId} position="bottom-end" />
+            </AppContext.Provider>
+        );
+    }
+
     return (
         <AppContext.Provider value={context}>
             <AppShell email={email} onSignOut={signOut} banner={banner}>
-                <Suspense
-                    fallback={
-                        <div className="page-loading">
-                            <Spinner size="small" label="Loading the page" />
-                        </div>
-                    }
-                >
+                <Suspense fallback={loading}>
                     <Page />
                 </Suspense>
             </AppShell>
