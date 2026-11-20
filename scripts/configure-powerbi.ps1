@@ -278,6 +278,17 @@ if ($targetWorkspaceId -notmatch $guidPattern -or $targetLakehouseId -notmatch $
     & $finish
 }
 $model = Get-DemoFabricSemanticModelDefinition -WorkspaceId $lakehouseWorkspaceId -LakehouseId $targetLakehouseId -DisplayName $modelName
+# The Incident RCA's tables (ADR 0031) only once the lakehouse has them: Direct Lake can't frame a missing table, and an
+# environment that updates to this release gets them when this release's NB_DatabaseHub_LiveActivity runs. Until then the
+# model leaves them out, and FABRIC.SEMANTICMODEL.RCA says what adds them (Get-DemoRcaModelTablePlan; OneLake Path - List
+# with a Storage token, read-only, under the caller's workspace role).
+if (-not ($CheckModelData -or $SkipModel)) {
+    $rcaPlan = Get-DemoRcaModelTablePlan -Config $config -WorkspaceId $lakehouseWorkspaceId -LakehouseId $targetLakehouseId
+    $results.Add($rcaPlan.Result)
+    if (@($rcaPlan.Excluded).Count -gt 0) {
+        $model = Get-DemoFabricSemanticModelDefinition -WorkspaceId $lakehouseWorkspaceId -LakehouseId $targetLakehouseId -DisplayName $modelName -ExcludeTable @($rcaPlan.Excluded)
+    }
+}
 
 #region Step 1-3: semantic model, refresh, and data
 $modelId = ''

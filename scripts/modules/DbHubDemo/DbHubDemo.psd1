@@ -46,6 +46,7 @@
         'Get-DemoPolicyConstraint'
         'Get-DemoPowerBIToken'
         'Get-DemoProfile'
+        'Get-DemoRcaModelTablePlan'
         'Get-DemoRetailPrice'
         'Get-DemoRunEnvironment'
         'Get-DemoT2GoldenSnapshot'
