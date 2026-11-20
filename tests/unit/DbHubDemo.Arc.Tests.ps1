@@ -963,6 +963,78 @@ Describe 'Invoke-DemoArcOnboarding' {
         $outcome.Next | Should -Not -Match 'check-sign-in-data|configure-arc|Then run'
     }
 
+    It 'fails, and configuration waits, when the guest still doesn''t answer after the host''s pass and the probe''s tries; NOT DONE leads with it, and its one next step is ./scripts/deploy.ps1 (2026-11-19, dbhubfx)' {
+        $script:probe.guestReachable = $false
+        $script:probe.guestError = 'An error has occurred which Windows PowerShell cannot handle. A remote session might have ended.'
+        $script:probe.probeTries = 4
+        $script:probe.lockSeconds = 12
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Fail'
+        $result.evidence.decision | Should -Be 'GuestUnreachable'
+        $result.message | Should -Be 'arcsql01 didn''t answer over PowerShell Direct on archost01 after 4 tries: An error has occurred which Windows PowerShell cannot handle. A remote session might have ended. It isn''t onboarded to Azure Arc, so its configuration waits for it.'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it probes arcsql01 again'
+        ('{0} {1}' -f $result.message, $result.remediation) | Should -Not -Match 'configure-arc'
+        $result.evidence.guestError | Should -Match 'remote session might have ended'
+        $result.evidence.probeTries | Should -Be 4
+        $result.evidence.lockSeconds | Should -Be 12
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
+        # The probe waits for the host's pass (its lock, at most 30 minutes) and tries again, so its Run Command has room for both.
+        $script:runs[0].Parameter['LockMinutes'] | Should -Be '30'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ArcProbe' -and $TimeoutSeconds -gt (1500 + 30 * 60) }
+
+        # Live, a Warning let configuration go on, and NOT DONE led with its consequence, T2.ARC.SQLEXTENSION, and said to run
+        # configure-arc.ps1, then deploy.ps1 (F12, F13). A Fail skips configuration (Invoke-DemoArcConfiguration), so it leads.
+        $results = @(
+            $result
+            New-DemoResult -CheckId 'T2.ARC.CONFIGURATION' -Area 't2' -Target 'T2' -Status 'Not selected' -Message 'Configuring SQL Server enabled by Azure Arc was skipped because onboarding failed.'
+            New-DemoResult -CheckId 'DEPLOY.TRACK.T2' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'Track T2: Fail; finished steps: Restore, Artifacts, Bootstraps.' -Remediation 'Run ./scripts/deploy.ps1 again: it continues the unfinished track(s).'
+            New-DemoResult -CheckId 'HUB.ESTATE.T2' -Area 'hub' -Target 'T2' -Status 'Fail' -Message 'The Arc machine arcsql01 isn''t in Azure Resource Graph in rg-dbhub-demo, so T2 isn''t onboarded to Azure Arc.' -Remediation 'Onboard the guest with scripts/configure-arc.ps1 once the host reports WaitingForArcOnboarding.'
+        )
+        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ R = $results; S = $state; C = (New-TestConfig) } { param($R, $S, $C) Get-DemoDeploymentOutcome -Result $R -State $S -Config $C -Command './scripts/deploy.ps1' }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.Reason | Should -Match '^T2\.ARC\.ONBOARDING: arcsql01 didn''t answer over PowerShell Direct'
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Match '^Run \./scripts/deploy\.ps1 again: '
+        $outcome.Next | Should -Not -Match 'configure-arc|Then run'
+
+        # With an Azure machine that's already Connected (an update), configuration, which goes through Azure, goes on.
+        $script:machine = New-TestMachine
+        $connected = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Warning'
+        $connected.message | Should -Match 'Its Azure Arc machine is Connected, so its configuration goes on\.$'
+        $connected.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+    }
+
+    It 'gives the onboarding Run Command room for the host''s pass and the tries, and a fix that''s a plain rerun when the host''s pass held its lock (2026-11-19, dbhubfx)' {
+        $script:machine = $null
+        $null = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $onboard = @($script:runs | Where-Object Name -EQ 'DbHubDemo-ArcOnboard')
+        $onboard.Count | Should -Be 1
+        $onboard[0].Parameter['LockMinutes'] | Should -Be '30'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ArcOnboard' -and $TimeoutSeconds -gt (1800 + 30 * 60) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $RunCommandName = $PesterBoundParameters['RunCommandName']
+            if ($RunCommandName -eq 'DbHubDemo-ArcProbe') {
+                return [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = ($script:probe | ConvertTo-Json -Compress); Error = '' }
+            }
+            [pscustomobject]@{ Succeeded = $false; ExecutionState = 'Failed'; ExitCode = 1; Output = ''; Error = 'DbHubDemo Arc Onboard failed: The host''s own bootstrap pass held its lock (bootstrap.lock) for 1800 seconds, so Arc Onboard didn''t run beside it; nothing was changed (fail closed).' }
+        }
+        $failed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'bootstrap\.lock'
+        $failed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it onboards arcsql01 after archost01''s own bootstrap pass'
+        # The probe that the lock stopped: it says the probe failed, and why, with the same one fix.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            [pscustomobject]@{ Succeeded = $false; ExecutionState = 'Failed'; ExitCode = 1; Output = ''; Error = 'DbHubDemo Arc Probe failed: The host''s own bootstrap pass held its lock (bootstrap.lock) for 1800 seconds, so Arc Probe didn''t run beside it; nothing was changed (fail closed).' }
+        }
+        $probeFailed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $probeFailed.status | Should -Be 'Fail'
+        $probeFailed.message | Should -Match '^The probe of arcsql01 on archost01 failed: DbHubDemo Arc Probe failed: The host''s own bootstrap pass held its lock \(bootstrap\.lock\)'
+        $probeFailed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+    }
+
     It 'sweeps again by itself on a later run while the record says it''s owed, whatever the host''s state, and clears it once it passes (2026-11-19, dbhubfn)' {
         $script:sweepOwed = '2026-11-19T19:37:17Z'
         # A Ready host, where onboarding ran nothing before.

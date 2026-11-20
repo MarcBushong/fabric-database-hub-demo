@@ -263,7 +263,9 @@ function Invoke-DemoValidationT2 {
     $probeError = ''
     try {
         $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
-        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode } -TimeoutSeconds 300 -PollIntervalSeconds 15 -Confirm:$false
+        # The probe waits for the host's own bootstrap pass (its lock, at most 5 minutes here) and runs again while the guest
+        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both.
+        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -Confirm:$false
         if ($run.Succeeded) {
             $probe = ConvertFrom-DemoRunCommandOutput -Text $run.Output
         }
