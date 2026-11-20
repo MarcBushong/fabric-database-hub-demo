@@ -266,6 +266,23 @@ body {
     color: var(--colorNeutralForeground2BrandSelected);
 }
 
+/* Windows forced colors replace the theme's colors with the system's, so the current page would look like every other:
+   mark it as Windows marks a selected item, with the system's selection colors (F22). */
+@media (forced-colors: active) {
+    .nav-item[aria-current="page"] {
+        background: Highlight;
+        color: HighlightText;
+    }
+
+    .nav-item[aria-current="page"] .nav-icon {
+        color: HighlightText;
+    }
+
+    .nav-item[aria-current="page"]::before {
+        background: HighlightText;
+    }
+}
+
 .nav-foot {
     margin: auto 6px 4px;
     padding-top: 16px;

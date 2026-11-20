@@ -61,6 +61,18 @@ describe("themes", () => {
         }
     });
 
+    it("marks the current page with the system's selection colors under Windows forced colors, where the theme's colors give way (F22)", () => {
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8");
+        const forced = css.match(/@media \(forced-colors: active\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+        const rule = (selector: string) => forced.match(new RegExp(`^\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m"))?.[1] ?? "";
+        const value = (body: string, property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`))?.[1]?.trim() ?? "missing";
+        const selected = rule('.nav-item[aria-current="page"]');
+        // Every other item takes the system's text on its canvas; the current one, its selection colors, like Windows's own lists.
+        expect([value(selected, "background"), value(selected, "color")]).toEqual(["Highlight", "HighlightText"]);
+        expect(value(rule('.nav-item[aria-current="page"] .nav-icon'), "color")).toBe("HighlightText");
+        expect(value(rule('.nav-item[aria-current="page"]::before'), "background")).toBe("HighlightText");
+    });
+
     it("uses Fluent 2's Microsoft blue as the brand, not Fabric's teal, from one set of tokens (ADR 0030, the owner's choice)", () => {
         expect(APP_BRAND).toBe(MICROSOFT_BRAND);
         // The same ramp Fluent's own web themes are made from: their brand tokens come out the same.
