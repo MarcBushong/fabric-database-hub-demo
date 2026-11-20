@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Local, containerized runs of the workload runner (ADR 0010), for example against the SQL Server 2022 container in
-# compose.yaml. Build from the repository root, because the runner embeds scenarios/ and database/common/:
+# compose.yaml. Build from the repository root, because the runner embeds scenarios/, database/common/, and the
+# Incident RCA's capture catalog (rca/capture, rca/history-tables.json):
 #   docker build --file workload-generator/Dockerfile --tag contosocare-workload .
 # Base images are updated by Dependabot.
 
@@ -12,6 +13,8 @@ WORKDIR /src/workload-generator
 RUN dotnet restore src/ContosoCare.Workload/ContosoCare.Workload.csproj --locked-mode
 COPY scenarios/ /src/scenarios/
 COPY database/common/ /src/database/common/
+COPY rca/capture/ /src/rca/capture/
+COPY rca/history-tables.json /src/rca/history-tables.json
 COPY workload-generator/src/ src/
 RUN dotnet publish src/ContosoCare.Workload/ContosoCare.Workload.csproj --configuration Release --no-restore --output /app
 

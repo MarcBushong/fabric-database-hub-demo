@@ -196,6 +196,20 @@ Describe 'Publish-DemoWorkloadRunner' {
         $before | Should -Match '^[0-9a-f]{64}$'
     }
 
+    It 'hashes the Incident RCA capture catalog and history tables the runner embeds, so changing them builds a new runner' {
+        $fake = New-FakeRunnerRepository
+        New-Item -ItemType Directory -Path (Join-Path -Path $fake -ChildPath 'rca/capture') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/capture/sqlserver.sql') -Value '-- name: RCA-SQL-09'
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/history-tables.json') -Value '{ "version": 1 }'
+        $before = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/capture/sqlserver.sql') -Value '-- name: RCA-SQL-01'
+        $catalog = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/history-tables.json') -Value '{ "version": 2 }'
+        $tables = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        $catalog | Should -Not -Be $before
+        $tables | Should -Not -Be $catalog
+    }
+
     It 'hashes the publish properties too, so changing them builds a new runner' {
         $fake = New-FakeRunnerRepository
         $without = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' -BuildProperty '-p:RestoreLockedMode=true' } $fake
