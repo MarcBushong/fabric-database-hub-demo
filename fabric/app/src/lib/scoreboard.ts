@@ -1,5 +1,5 @@
 // "Did we catch it?" (ADR 0030): every fault the demo injected (Scenario Runs), when its signal first showed in the
-// telemetry, when it was answered (the response step, where one exists), and when it recovered; and the times to detect
+// telemetry, when it was answered (the response step, where one exists), and when it recovered; and the times to signal
 // and recover per engine and fault type, across sessions. Only the app can say this: it knows what was injected.
 //
 // "Signal visible in telemetry" is measured here from the history's bins, by their sample time, with the analysis
@@ -21,6 +21,8 @@ import { isEstateTarget, type EstateTarget } from "./view-state";
 
 /** The notebook's: telemetry arrives 3 to 15 minutes after the activity, so a fault's signal is looked for this long after its window. */
 export const TELEMETRY_LAG_MINUTES = 15;
+/** What "Did we catch it?" means: the scoreboard verifies the injected faults, it doesn't detect blind (the owner's rule). */
+export const SCOREBOARD_SUBTITLE = "Verified against the injected faults: each one's expected signal, in its own window";
 /** How long after a fault's window its recovery is looked for. */
 export const RECOVERY_SLACK_MINUTES = 30;
 /** Why a visible signal has no recovery, in a sentence and in a table's few words. */
@@ -935,7 +937,7 @@ export interface Aggregate {
     ttrN: number;
 }
 
-/** Times to detect and recover per engine (SQL Server, Azure SQL Database, ...) or per fault type, with how many faults each median rests on. */
+/** Times to signal and recover per engine (SQL Server, Azure SQL Database, ...) or per fault type, with how many faults each median rests on. */
 export function aggregate(scores: readonly FaultScore[], by: "engine" | "type"): Aggregate[] {
     const groups = new Map<string, { label: string; items: FaultScore[] }>();
     for (const s of scores) {

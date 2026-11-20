@@ -8,7 +8,7 @@ import { ArrowExit16Regular, FullScreenMaximize16Regular, Pause16Filled, Play16F
 import { useApp } from "@/app-context";
 import { serviceOf } from "@/lib/business";
 import { formatDayUtc, formatTimeUtc } from "@/lib/format";
-import { minutesText, summarize } from "@/lib/scoreboard";
+import { minutesText, SCOREBOARD_SUBTITLE, summarize } from "@/lib/scoreboard";
 import { CinematicReplay, type CinematicReplayProps } from "@/mission/CinematicReplay";
 import { enterFullscreen, exitFullscreen, fullscreenAllowed, KIOSK_SCENES, KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_LABEL, SCENE_SECONDS } from "@/mission/kiosk";
 import { mapNodes } from "@/mission/nodes";
@@ -122,7 +122,7 @@ export default function KioskPage() {
                                 sub={data.scoreError ? "The telemetry didn't load, so nothing is measured" : undefined}
                                 tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined}
                             />
-                            <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} />
+                            <BigStat label="Median time to signal" value={minutesText(summary.ttdMedian)} />
                             <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} />
                         </div>
                     </div>
@@ -130,6 +130,7 @@ export default function KioskPage() {
                 {scene === "scoreboard" && plan ? (
                     <div className="kiosk-score">
                         <h2>{summary.faults ? `Did we catch it? ${summary.visible} of ${summary.faults}` : "Did we catch it?"}</h2>
+                        <p className="kiosk-subtitle">{SCOREBOARD_SUBTITLE}</p>
                         {data.scoreError ? <p className="kiosk-empty">{`The telemetry didn't load, so none of the ${plan.faults.length} faults is measured yet: the kiosk tries again every ${RETRY_SECONDS} s.`}</p> : null}
                         <SessionRibbon plan={plan} scores={scores} episodes={episodes} />
                         <ul className="kiosk-impacts">

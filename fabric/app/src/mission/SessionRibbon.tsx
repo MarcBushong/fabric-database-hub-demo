@@ -41,7 +41,7 @@ function itemsOf(scores: readonly FaultScore[], episodes: readonly MeasuredEpiso
             injected: s.injectedAt.getTime(),
             answered: t(s.answeredAt),
             recovered: t(s.recoveredAt),
-            label: `${s.target} ${s.title}: injected ${at(s.injectedAt)}, signal visible ${at(s.visibleAt)}, answered ${at(s.answeredAt)}, recovered ${at(s.recoveredAt)} UTC. ${s.status === "Pass" ? "Caught." : s.note}`,
+            label: `${s.target} ${s.title}: injected ${at(s.injectedAt)}, signal visible ${at(s.visibleAt)}, answered ${at(s.answeredAt)}, recovered ${at(s.recoveredAt)} UTC. ${s.status === "Pass" ? "Signal seen." : s.note}`,
         })),
         ...episodes.map((e) => ({
             ref: e.key,

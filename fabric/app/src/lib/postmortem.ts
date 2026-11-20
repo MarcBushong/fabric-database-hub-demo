@@ -131,7 +131,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         lines.push(
             `- ${scores.length} fault${scores.length === 1 ? "" : "s"} injected by the demo's session control on ${targets} (Scenario Runs); ${summary.visible} had their signal visible in the telemetry${summary.notVisible ? `, ${summary.notVisible} didn't` : ""}${summary.unmeasured ? `, and ${summary.unmeasured} had no signal the history measures` : ""}.`,
         );
-        lines.push(`- Median time to detect: ${minutesText(summary.ttdMedian)}. Median time to recover: ${minutesText(summary.ttrMedian)}.`);
+        lines.push(`- Median time to signal: ${minutesText(summary.ttdMedian)}. Median time to recover: ${minutesText(summary.ttrMedian)}.`);
     }
     if (unscored.length > 0) {
         const targets = [...new Set(unscored.map((r) => r.target))].sort().join(", ");
@@ -185,19 +185,19 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     else if (scores.length === 0) lines.push("- No response step in this window.");
     lines.push("");
 
-    lines.push("## Times to detect and recover", "");
+    lines.push("## Times to signal and recover", "");
     if (unscored.length > 0) lines.push(NOT_MEASURED, "");
     if (scores.length > 0) {
         lines.push(
             ...table(
-                ["Fault", "Target", "Injected", "Signal visible", "Time to detect", "Answered", "Recovered", "Time to recover", "Status"],
+                ["Fault", "Target", "Injected", "Signal visible", "Time to signal", "Answered", "Recovered", "Time to recover", "Status"],
                 scores.map((s) => [s.title, s.target, time(s.injectedAt), time(s.visibleAt), minutesText(s.ttdMin, s.binMinutes), time(s.answeredAt), s.recoveredAt ? time(s.recoveredAt) : s.recoveryWord || "–", minutesText(s.ttrMin), s.status]),
             ),
             "",
         );
     }
     lines.push(
-        `Time to detect runs from the injection to the signal visible in the telemetry, by its sample time; time to recover, from the injection to the signal back under its bound for ${RECOVERED_BINS} bins in a row. Database Hub shows the telemetry 3 to 15 minutes after its sample time; what Database Hub itself detected isn't in the history, so this postmortem doesn't say.`,
+        `Time to signal runs from the injection to the signal visible in the telemetry, by its sample time; time to recover, from the injection to the signal back under its bound for ${RECOVERED_BINS} bins in a row. Database Hub shows the telemetry 3 to 15 minutes after its sample time; what Database Hub itself detected isn't in the history, so this postmortem doesn't say.`,
         "",
     );
 
@@ -220,7 +220,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## How this was measured", "");
     lines.push(
         "- **What was injected:** Scenario Runs, which the analysis notebook writes at the session's end from the control's plan.",
-        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to detect is 0, written as at most one bin, and the timeline tells the injection first.`,
+        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to signal is 0, written as at most one bin, and the timeline tells the injection first.`,
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
         "",
@@ -244,7 +244,7 @@ export const POSTMORTEM_COLUMNS: ColumnSpec[] = [
     { key: "fault", label: "Fault or episode", kind: "text" },
     { key: "injected", label: "Injected (UTC)", kind: "datetime" },
     { key: "visible", label: "Signal visible in telemetry (UTC)", kind: "datetime" },
-    { key: "ttdMin", label: "Time to detect (min)", kind: "minutes" },
+    { key: "ttdMin", label: "Time to signal (min)", kind: "minutes" },
     { key: "answered", label: "Answered (UTC)", kind: "datetime" },
     { key: "answer", label: "Response", kind: "text" },
     { key: "recovered", label: "Recovered (UTC)", kind: "datetime" },
@@ -292,7 +292,7 @@ export function postmortemRows(scores: readonly FaultScore[], episodes: readonly
 /** The template Copilot follows: the sections, and the rules that keep it to the measured rows. */
 export function postmortemPrompt(plan: Plan): string {
     return [
-        `Write the postmortem of ${planTitle(plan)} (${windowText(plan)}) in Markdown, with exactly these sections: Summary, Timeline (UTC), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups.`,
+        `Write the postmortem of ${planTitle(plan)} (${windowText(plan)}) in Markdown, with exactly these sections: Summary, Timeline (UTC), Impact on ContosoCare, Cause, Response, Times to signal and recover, Follow-ups.`,
         "Use only the attached rows: each is a fault the demo injected on purpose (or an episode in T4's or T5's metrics), when its signal showed in the telemetry, when it was answered, and when it recovered, measured from the history.",
         "Every figure must come from the rows; write 'not measured' where a row has none, and never estimate user latency or cost.",
         "Say 'signal visible in telemetry', never that Database Hub detected something: the history doesn't record what Database Hub saw.",

@@ -451,9 +451,9 @@ describe("the postmortem", () => {
         expect(title).toBe("Postmortem: ContosoCare session 7f3a9c21");
         expect(fileName).toBe("contosocare-postmortem-7f3a9c21-20261118T0905Z.md");
         const sections = markdown.split("\n").filter((l) => l.startsWith("## "));
-        expect(sections).toEqual(["## Summary", "## Timeline (UTC)", "## Impact on ContosoCare", "## Cause", "## Response", "## Times to detect and recover", "## Follow-ups", "## How this was measured", "## Queries"]);
+        expect(sections).toEqual(["## Summary", "## Timeline (UTC)", "## Impact on ContosoCare", "## Cause", "## Response", "## Times to signal and recover", "## Follow-ups", "## How this was measured", "## Queries"]);
         expect(markdown).toContain("- 4 faults injected by the demo's session control on T1, T2, T3 (Scenario Runs); 3 had their signal visible in the telemetry, 1 didn't.");
-        expect(markdown).toContain("- Median time to detect: 1 min. Median time to recover: 10 min.");
+        expect(markdown).toContain("- Median time to signal: 1 min. Median time to recover: 10 min.");
         expect(markdown).toContain("- The Database Agent loop on T3: the plan regressed at 14:03 UTC, and the run forced the last good plan at 14:26 UTC; T3's CPU fell from 84.0 % to 22.0 %.");
         expect(markdown).toContain("| Scheduling | T3 | under heavy load for 23 min | CPU peak 85.0 %, 4.3 times its baseline |");
         expect(markdown).toContain("| 14:26 | T3 | Answered | The run forced the last good plan (Query Store), the documented response |");
@@ -497,7 +497,7 @@ describe("the postmortem", () => {
     it("hands Copilot the template, the measured rows, and the queries through the ask contract", () => {
         const ctx = postmortemAsk(input);
         expect(ctx).toMatchObject({ title: "Postmortem: ContosoCare session 7f3a9c21", page: "scoreboard", visualId: "postmortem.plan", source: "history", totalRows: 4 });
-        expect(ctx.prompt).toMatch(/^Write the postmortem of ContosoCare session 7f3a9c21 .+ with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups\./);
+        expect(ctx.prompt).toMatch(/^Write the postmortem of ContosoCare session 7f3a9c21 .+ with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to signal and recover, Follow-ups\./);
         expect(ctx.prompt).toMatch(/never that Database Hub detected something/);
         expect(ctx.rows?.[2]).toMatchObject({ target: "T3", service: "Scheduling", injected: "2026-11-17T14:03:00.000Z", ttdMin: 1, ttrMin: 24, status: "Pass" });
         expect(ctx.dax).toMatch(/^\/\/ Sessions and activity requests\nEVALUATE/);
@@ -542,7 +542,7 @@ describe("the postmortem", () => {
         const sessionPlan = toPlans(runs)[0];
         const [score] = scorePlan(sessionPlan, { bins: bins("T1", (m) => (m < 10 ? { blocked: 5 } : {})), beats: [], runs });
         expect(score.visibleAt).toEqual(at(0));
-        // Never a negative time to detect: 0, written as at most one bin.
+        // Never a negative time to signal: 0, written as at most one bin.
         expect(score.ttdMin).toBe(0);
         expect(planEvents([score]).map((e) => e.kind)).toEqual(["injected", "visible", "recovered"]);
         const { markdown } = buildPostmortem({ ...input, plan: sessionPlan, scores: [score], episodes: [], beat: null });

@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { QuerySpec } from "@/data/queries";
 import { createSourceClient, type QueryResult } from "@/data/query-client";
 import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/mission/kiosk";
+import { SCOREBOARD_SUBTITLE } from "@/lib/scoreboard";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
 import { sampleRows } from "@/preview/sample-data";
 import { SESSION_KEY } from "@/preview/sample-session";
@@ -43,6 +44,7 @@ describe("Mission Control", () => {
             const numbers = await screen.findByRole("complementary", { name: "The session in numbers" });
             await waitFor(() => expect(within(numbers).getByText("34 of 35")).toBeInTheDocument());
             expect(within(numbers).getByText("35")).toBeInTheDocument();
+            expect(within(numbers).getByText("Median time to signal")).toBeInTheDocument();
             expect(within(numbers).getByText("84 % → 22 %")).toBeInTheDocument();
             expect(within(numbers).getByText(/% throttled$/)).toBeInTheDocument();
             const scheduling = screen.getByRole("button", { name: /^Scheduling, T3 Azure SQL Database: / });
@@ -81,13 +83,13 @@ describe("Mission Control", () => {
             const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
             // jsdom keeps no focus in the dialog, so Fluent's modal may mark it hidden after it opens; a browser keeps focus in it.
             // Its own Markdown, rendered: the sections in order, each a heading.
-            expect([...dialog.querySelectorAll(".pm-view h4")].map((h) => h.textContent)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "Response", "Times to detect and recover", "Follow-ups", "How this was measured", "Queries"]);
+            expect([...dialog.querySelectorAll(".pm-view h4")].map((h) => h.textContent)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
             expect(within(dialog).getByText(/^The Database Agent loop on T3: the plan regressed at 14:03 UTC, and the run forced the last good plan at 14:26 UTC/)).toBeInTheDocument();
             fireEvent.click(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true }));
             expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Downloaded contosocare-postmortem-7f3a9c21-\d{8}T\d{4}Z\.md$/), "success");
             fireEvent.click(within(dialog).getByRole("button", { name: "Draft with Copilot", hidden: true }));
             expect(copilot.ask).toHaveBeenCalledWith(expect.objectContaining({ page: "scoreboard", visualId: "postmortem.plan", totalRows: expect.any(Number) }));
-            expect(vi.mocked(copilot.ask).mock.calls[0][0].prompt).toMatch(/with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups\./);
+            expect(vi.mocked(copilot.ask).mock.calls[0][0].prompt).toMatch(/with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to signal and recover, Follow-ups\./);
         },
         SLOW,
     );
@@ -178,7 +180,15 @@ describe("Scoreboard", () => {
         async () => {
             const { navigate } = renderWithApp(<ScoreboardPage />, { client: sampleClient() });
             expect(await screen.findByRole("heading", { level: 1, name: "Did we catch it? 34 of 35" }, { timeout: 15000 })).toBeInTheDocument();
+            // It says what it verifies, never that it caught anything blind: each injected fault's expected signal, in its window.
+            expect(screen.getByText(SCOREBOARD_SUBTITLE)).toBeInTheDocument();
+            const stats = screen.getByLabelText("The session in numbers");
+            expect(within(stats).getByText("Signal seen")).toBeInTheDocument();
+            expect(within(stats).getByText("Median time to signal")).toBeInTheDocument();
+            expect(within(stats).queryByText(/Caught|detect/)).toBeNull();
             const table = screen.getByRole("table", { name: "Every injected fault" });
+            expect(within(table).getByRole("columnheader", { name: /^Signal seen\?/ })).toBeInTheDocument();
+            expect(within(table).getByRole("columnheader", { name: /^Time to signal/ })).toBeInTheDocument();
             const rows = within(table).getAllByRole("row").slice(1);
             expect(rows).toHaveLength(35);
             const missed = rows.filter((r) => /Warning/.test(r.textContent ?? ""));
@@ -188,6 +198,13 @@ describe("Scoreboard", () => {
             expect(agent?.textContent).toMatch(/14:03.*14:03.*14:26.*14:27.*24 min/);
             expect(screen.getByRole("heading", { name: "Times per engine" })).toBeInTheDocument();
             expect(screen.getByRole("heading", { name: "Times per fault type" })).toBeInTheDocument();
+            for (const name of ["Times per engine", "Times per fault type"]) {
+                // The card's own body, described by its summary (the chart inside has the same name and its own description).
+                const card = screen.getAllByRole("group", { name }).find((g) => g.classList.contains("vcard-body"));
+                expect(card).toBeDefined();
+                expect(card).toHaveAccessibleDescription(/: time to signal .+, time to recover /);
+                expect(card).not.toHaveAccessibleDescription(/detect/);
+            }
             expect(screen.getByRole("heading", { name: "T4 and T5: what their metrics show" })).toBeInTheDocument();
             fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
             expect(within(screen.getByRole("table", { name: "Every injected fault" })).getByRole("columnheader", { name: /Business impact \(measured\)/ })).toBeInTheDocument();
@@ -321,6 +338,7 @@ describe("Kiosk", () => {
             expect(within(screen.getByText("Faults injected").parentElement as HTMLElement).getByText("35")).toBeInTheDocument();
             fireEvent.keyDown(window, { key: "ArrowRight" });
             expect(screen.getByRole("heading", { level: 2, name: "Did we catch it?" })).toBeInTheDocument();
+            expect(screen.getByText(SCOREBOARD_SUBTITLE)).toBeInTheDocument();
             expect(screen.getByText(`The telemetry didn't load, so none of the 35 faults is measured yet: the kiosk tries again every ${RETRY_SECONDS} s.`)).toBeInTheDocument();
             expect(screen.queryByText(/\b0 of 0\b/)).toBeNull();
         },

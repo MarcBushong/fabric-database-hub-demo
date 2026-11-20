@@ -150,7 +150,7 @@ export default function MissionControlPage() {
                             sub={data.scoreError ? "The telemetry didn't load, so nothing is measured" : summary.notVisible ? `${summary.notVisible} not visible: see the scoreboard` : "by the telemetry's sample time"}
                             tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined}
                         />
-                        <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
+                        <BigStat label="Median time to signal" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
                         <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} sub="injected → back under its bound" />
                         {beat?.cpuBefore !== null && beat?.cpuBefore !== undefined && beat.cpuAfter !== null ? (
                             <BigStat label="Database Agent loop, T3" value={`${Math.round(beat.cpuBefore)} % → ${Math.round(beat.cpuAfter)} %`} sub={`CPU before and after the last good plan, forced at ${formatTimeUtc(beat.respondAt)} UTC`} tone="good" />
