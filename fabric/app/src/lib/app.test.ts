@@ -1,11 +1,13 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { DBHUB_BASE, LIVE_NO_SCOPE, LIVE_REFUSED, readEstate } from "../../rayfin/functions/src/estate-core";
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
 import { estateQuery } from "@/data/queries";
-import { liveDataOf, type InventoryData } from "@/data/live-estate";
-import { flagText, inventoryMix, isDown, liveMigrations, liveOptimizationRows, liveSecurityRows, migrationSentence, readinessText, targetOfResource, uniqueInventory } from "@/lib/live-findings";
+import { liveDataOf, liveRouteLines, liveRoutes, type InventoryData } from "@/data/live-estate";
+import { flagText, inventoryMix, isDown, liveMigrations, liveOptimizationRows, liveSecurityRows, migrationSentence, readinessText, savedMigration, targetOfResource, uniqueInventory } from "@/lib/live-findings";
+import { parseDeployedMigration } from "@/lib/runtime-config";
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { buildAskContext } from "@/lib/ask";
 import { describeRequest, notebookParameters, validateRequest } from "@/lib/control";
@@ -260,5 +262,87 @@ describe("live findings", () => {
         expect([readinessText("NotReady"), readinessText("Unknown"), readinessText("ReadyWithConditions")]).toEqual(["Not ready", "Unknown", "Ready With Conditions"]);
         const none = liveMigrations({ totalCount: 1, countByType: {}, complete: true, resources: [{ databaseType: "ArcSqlServer", name: "arcsql01", resourceGroup: "rg-x", location: "westus3", status: "Connected", migrationAssessment: { enabled: true, uploadedAt: null, dataStatus: "Unavailable", targets: { azureSqlDatabase: "Unknown" }, readyTargets: [] } }] });
         expect(none[0]).toMatchObject({ hasResults: false, ready: [], uploadedAt: null });
+    });
+
+    it("reads T2's assessment saved at deploy: Azure's words, checked field by field, with the recommended tier and size (R924)", () => {
+        const deployed = parseDeployedMigration({
+            resource: "arcsql01",
+            readAt: "2026-11-19T22:10:00Z",
+            enabled: true,
+            uploadedAt: "2026-11-17T23:05:00Z",
+            targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready", "bad key": "Ready", other: "<b>Ready</b>" },
+            recommended: { azureSqlManagedInstance: "General Purpose, 4 vCores", azureSqlDatabase: "x".repeat(80) },
+            extra: "left out",
+        });
+        expect(deployed).toEqual({
+            resource: "arcsql01",
+            readAt: "2026-11-19T22:10:00Z",
+            enabled: true,
+            uploadedAt: "2026-11-17T23:05:00Z",
+            targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+            recommended: { azureSqlManagedInstance: "General Purpose, 4 vCores" },
+        });
+        if (!deployed) throw new Error("The deploy's shape parses.");
+        const t2 = savedMigration(deployed);
+        expect(t2).toMatchObject({ resource: "arcsql01", target: "T2", type: "Arc-enabled SQL Server", enabled: true, hasResults: true });
+        expect(t2.uploadedAt?.toISOString()).toBe("2026-11-17T23:05:00.000Z");
+        expect(t2.rows.map((r) => `${r.azureTarget}: ${r.readiness}${r.recommended ? ` (${r.recommended})` : ""}`)).toEqual([
+            "Azure SQL Managed Instance: Ready (General Purpose, 4 vCores)",
+            "SQL Server on Azure Virtual Machines: Ready",
+            "Azure SQL Database: Not ready",
+        ]);
+        expect(migrationSentence(t2)).toBe("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.");
+        expect(savedMigration({ ...deployed, targets: { azureSqlDatabase: "Unknown" } }).hasResults).toBe(false);
+        expect([null, "arcsql01", { resource: "arcsql01" }, { resource: "../arcsql01", readAt: "2026-11-19T22:10:00Z" }, { resource: "arcsql01", readAt: "yesterday" }].map(parseDeployedMigration)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    });
+});
+
+describe("the live estate when Database Hub refuses the app (R924)", () => {
+    const scope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-dbhub-demo"] };
+    // Built at run time so secret scanners never see a token-shaped literal.
+    const token = ["eyJ", "x".repeat(24)].join("");
+    /** Database Hub answering each route with a status: its body for a refusal is the one it gave the app on 2026-11-19. */
+    function dbHub(statusOf: (route: string) => number) {
+        const routes: string[] = [];
+        const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+            const route = `${init.method ?? "GET"} ${new URL(url).pathname.replace(new URL(DBHUB_BASE).pathname, "")}`;
+            routes.push(route);
+            const status = statusOf(route);
+            if (status === 200) return new Response(JSON.stringify({ items: [], hasMore: false, resources: [] }), { status });
+            return new Response(JSON.stringify({ code: "Unauthorized", subCode: 1, message: "Authentication failed for all authenticators", httpStatusCode: status }), { status });
+        });
+        return { routes, fetchImpl };
+    }
+
+    it("says in one plain sentence that Database Hub refused the app, keeps each route's reason for the log, and still calls every route", async () => {
+        const { routes, fetchImpl } = dbHub((route) => (route === "GET /auditing/warnings" ? 403 : 401));
+        const answers = await Promise.all((["inventory", "health", "security"] as const).map((view) => readEstate(view, scope, token, fetchImpl)));
+        for (const answer of answers) {
+            expect(answer.unavailable).toBe(LIVE_REFUSED);
+            expect(answer.data).toEqual({});
+            expect(liveDataOf(answer)).toBeNull();
+            expect(answer.errors).toHaveLength(answer.source.length);
+            expect(answer.errors.join(" ")).not.toContain(token);
+        }
+        expect(new Set(routes)).toEqual(new Set(["POST /savedView/resources/list", "POST /health/v2/filtered-summary", "POST /postgreSql/health/v2/summary", "POST /cosmosDb/health/summary", "GET /auth/warnings", "GET /auditing/warnings", "GET /cmk/warnings"]));
+        expect(answers[0].errors[0]).toMatch(/^POST \/savedView\/resources\/list: HTTP 401 .*Authentication failed for all authenticators/);
+        expect(answers[2].errors).toContainEqual(expect.stringMatching(/^GET \/auditing\/warnings: HTTP 403 /));
+        expect(LIVE_REFUSED).not.toMatch(/40[13]|HTTP|token|authenticat/i);
+    });
+
+    it("leaves the sentence out when Database Hub didn't answer for another reason, and keeps a partial answer's data with its failed routes by name only", async () => {
+        const down = await readEstate("health", scope, token, dbHub(() => 503).fetchImpl);
+        expect(down.data).toEqual({});
+        expect(down.unavailable).toBeUndefined();
+        expect(down.errors[0]).toMatch(/^POST \/[\w/.-]+: HTTP 503 /);
+        expect(await readEstate("security", scope, token, dbHub((route) => (route === "GET /auth/warnings" ? 401 : 500)).fetchImpl)).not.toHaveProperty("unavailable");
+        expect((await readEstate("inventory", { subscriptionId: "", resourceGroups: [] }, token, dbHub(() => 200).fetchImpl)).unavailable).toBe(LIVE_NO_SCOPE);
+
+        const partial = await readEstate("security", scope, token, dbHub((route) => (route === "GET /auth/warnings" ? 200 : 401)).fetchImpl);
+        expect(partial.unavailable).toBeUndefined();
+        expect(liveDataOf(partial)?.authentication).toMatchObject({ warningCount: 0, complete: true });
+        expect(partial.errors).toHaveLength(2);
+        expect(liveRoutes(partial.source, partial.errors)).toEqual({ called: ["GET /auth/warnings", "GET /auditing/warnings", "GET /cmk/warnings"], failed: ["GET /auditing/warnings", "GET /cmk/warnings"] });
+        expect(liveRouteLines(partial.source, partial.errors)).toBe("GET /auth/warnings\nGET /auditing/warnings  (didn't answer)\nGET /cmk/warnings  (didn't answer)");
     });
 });

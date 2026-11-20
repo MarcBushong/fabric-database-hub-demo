@@ -23,7 +23,8 @@ export function registerEstate(udf: UserDataFunctions): void {
             const done = await answer;
             // A partial answer isn't shared: the next call reads again.
             if (done.errors.length > 0) cache.delete(v);
-            console.log(`estateOverview ${v}: ${done.source.length} routes, ${done.errors.length} errors`);
+            // Each route's failure stays in the log (R924): the pages and the dock show only the answer's plain sentence.
+            console.log(`estateOverview ${v}: ${done.source.length} routes, ${done.errors.length} errors${done.unavailable ? `; ${done.unavailable} First: ${done.errors[0] ?? ""}` : ""}`);
             return done;
         },
         [],

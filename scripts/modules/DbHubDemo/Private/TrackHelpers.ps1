@@ -891,6 +891,8 @@ function Invoke-DemoDeploymentTrack {
     $recordState = -not [bool](& $option 'NoState' $false)
     # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
     $fabricPublished = ''
+    # What the Insights app's Manage has, recorded with the Fabric step when it deployed the app (2026-11-19); @{} otherwise.
+    $appManageRecord = @{}
     $handoff = [string](& $option 'HandoffPath' '')
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
     # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
@@ -1879,6 +1881,9 @@ function Invoke-DemoDeploymentTrack {
                     # when it wasn't created, and the console says so at once.
                     $appRecords = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
                     & $addAll $appRecords
+                    # Whether its Manage has NB_DatabaseHub_Control, which deploy.ps1 puts in Fabric after the tracks: a resume
+                    # deploys the app once more when it hasn't (Get-DemoInsightsAppManageGap, 2026-11-19).
+                    $appManageRecord = Get-DemoInsightsAppManageRecord -Result $appRecords
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }
@@ -2007,6 +2012,10 @@ function Invoke-DemoDeploymentTrack {
                     $record['FabricSha256'] = $fabricPublished
                     $fabricPublished = ''
                 }
+                foreach ($key in @($appManageRecord.Keys)) {
+                    $record[$key] = $appManageRecord[$key]
+                }
+                $appManageRecord = @{}
                 Set-DemoDeploymentStateLocked -Config $Config -Value $record -Confirm:$false
             }
             catch {

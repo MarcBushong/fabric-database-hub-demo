@@ -6,7 +6,7 @@ import { ArrowClockwise16Regular, Code16Regular, Sparkle16Filled } from "@fluent
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
-import { liveDataOf, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
+import { liveDataOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
 import { formatNumber, sentence } from "@/lib/format";
 import { inventoryMix, isDown, liveSecurityRows, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
@@ -54,8 +54,10 @@ export function LiveNow() {
     // Database Hub may leave out the account count while it still reports RU; either one means T5 is there.
     const cosmos = h?.cosmosDb && ((h.cosmosDb.totalAccounts ?? 0) > 0 || h.cosmosDb.maximumNormalizedRu !== null) ? h.cosmosDb : null;
     const at = answers.map((a) => a.at).sort()[0];
-    const routes = answers.flatMap((a) => a.source);
-    const failed = answers.flatMap((a) => a.errors);
+    const { called: routes, failed } = liveRoutes(
+        answers.flatMap((a) => a.source),
+        answers.flatMap((a) => a.errors),
+    );
 
     const rows = [
         { signal: "Resources", value: inv?.totalCount ?? null, detail: inventoryMix(inv, true) },
@@ -84,7 +86,7 @@ export function LiveNow() {
                 </h2>
                 {at ? <ProvenanceBadge provenance="live" asOf={new Date(at)} /> : <ProvenanceBadge provenance="live" liveState="reading" />}
                 {loading ? <Spinner size="extra-tiny" label="Reading Database Hub: a first read takes 5 to 12 seconds" labelPosition="after" /> : null}
-                {failed.length > 0 ? <span className="vcard-partial">{`Partial: ${failed.length} API calls failed`}</span> : null}
+                {failed.length > 0 ? <span className="vcard-partial">{`Partial: ${failed.length} of ${routes.length} Database Hub calls didn't answer`}</span> : null}
                 <span className="live-now-tools">
                     <Button size="small" appearance="subtle" className="ask-copilot" icon={<Sparkle16Filled />} onClick={ask} disabled={answers.length === 0}>
                         Ask Copilot
@@ -96,7 +98,7 @@ export function LiveNow() {
                             </Tooltip>
                         </PopoverTrigger>
                         <PopoverSurface aria-label="Database Hub API">
-                            <pre className="vcard-routes">{[...routes, ...failed.map((e) => `failed: ${e}`)].join("\n")}</pre>
+                            <pre className="vcard-routes">{routes.map((route) => (failed.includes(route) ? `${route}  (didn't answer)` : route)).join("\n")}</pre>
                         </PopoverSurface>
                     </Popover>
                     <Tooltip content="Read again" relationship="label">

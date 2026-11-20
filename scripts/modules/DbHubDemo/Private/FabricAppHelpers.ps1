@@ -941,30 +941,100 @@ function Test-DemoFabricAppTenantSetting {
     return (& $result 'Warning' ('The Fabric tenant settings the Insights app needs aren''t all on for the organization ({0}). The app isn''t created, or its queries fail, while one is off; that doesn''t keep the run from DONE.' -f ($parts -join '; ')) $evidence $steps)
 }
 
-function Get-DemoT2MigrationPortalLink {
+function ConvertTo-DemoT2MigrationVerdict {
     <#
     .SYNOPSIS
-    The Azure portal page of T2's SQL Server instance enabled by Azure Arc, built from the instance resource's own ID, for
-    the Insights app's migration card when Database Hub isn't read live (2026-11-18). Internal.
+    The verdict of one Microsoft.AzureArcData/sqlServerInstances resource's migration assessment, for the Insights app's
+    dbhub-app.json (t2Migration, R924): its readiness per Azure SQL target type, with Azure's own names and values, and the
+    recommended service tier and size when the result names them. $null when the assessment has no readiness yet. Internal
+    and pure.
+
+    .DESCRIPTION
+    From properties.migration.assessment (Sql Server Instances - Get, api-version 2026-01-01), the same fields
+    Get-DemoArcMigrationReadiness reads for T2.ARC.MIGRATIONASSESSMENT: enabled, assessmentUploadTime, and
+    skuRecommendationResults.<azureSqlDatabase|azureSqlManagedInstance|azureSqlVirtualMachine>: recommendationStatus and
+    targetSku (category.sqlServiceTier, computeSize). Words and numbers only, each checked against a pattern, so the app
+    never shows anything else. The Insights app's migration card shows it, with its time, when Database Hub's live view
+    isn't available to the app.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [AllowNull()]
+        [object] $Instance,
+
+        [Parameter(Mandatory)]
+        [datetime] $ReadAt
+    )
+
+    $name = [string](Get-DemoMemberValue -InputObject $Instance -Name 'name')
+    if ($name -notmatch '^[A-Za-z0-9._-]{1,128}$') {
+        return $null
+    }
+    $assessment = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Instance -Name 'properties') -Name 'migration') -Name 'assessment'
+    $results = Get-DemoMemberValue -InputObject $assessment -Name 'skuRecommendationResults'
+    $targets = [ordered]@{}
+    $recommended = [ordered]@{}
+    foreach ($key in 'azureSqlManagedInstance', 'azureSqlVirtualMachine', 'azureSqlDatabase') {
+        $result = Get-DemoMemberValue -InputObject $results -Name $key
+        $status = [string](Get-DemoMemberValue -InputObject $result -Name 'recommendationStatus')
+        if ($status -cnotmatch '^[A-Za-z][A-Za-z ]{0,31}$') {
+            continue
+        }
+        $targets[$key] = $status
+        $sku = Get-DemoMemberValue -InputObject $result -Name 'targetSku'
+        $tier = ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $sku -Name 'category') -Name 'sqlServiceTier')) -creplace '([a-z])([A-Z])', '$1 $2'
+        $size = [string](Get-DemoMemberValue -InputObject $sku -Name 'computeSize')
+        $parts = @(@($tier, $(if ($size -match '^\d{1,4}$') { '{0} vCores' -f $size } else { '' })) | Where-Object { $_ })
+        $text = $parts -join ', '
+        if ($text -match '^\w[\w ,.()-]{0,63}$') {
+            $recommended[$key] = $text
+        }
+    }
+    if ($targets.Count -eq 0) {
+        return $null
+    }
+    $enabled = Get-DemoMemberValue -InputObject $assessment -Name 'enabled'
+    $uploaded = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $assessment -Name 'assessmentUploadTime')
+    $iso = { param([datetime] $Value) $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+    return [ordered]@{
+        resource    = $name
+        readAt      = & $iso $ReadAt
+        enabled     = ($enabled -eq $true -or [string]$enabled -eq 'true')
+        uploadedAt  = $(if ($uploaded -is [datetime]) { & $iso $uploaded } else { '' })
+        targets     = $targets
+        recommended = $recommended
+    }
+}
+
+function Get-DemoT2Migration {
+    <#
+    .SYNOPSIS
+    T2's SQL Server instance enabled by Azure Arc, for the Insights app: its Azure portal page (Link, 2026-11-18), and its
+    migration assessment's verdict as Azure has it now (Verdict, R924), from one read. Internal.
 
     .DESCRIPTION
     Learn's path to an instance's migration assessment is its SQL Server resource, then Migration, Assessments
     (https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment). The portal documents no link to that
-    menu item, so the link opens the resource, and the app names the rest of the path. Read-only: one list of the
-    resource group's Microsoft.AzureArcData/sqlServerInstances through Invoke-DemoAz, pinned to the configured
-    subscription; the instance hosted on T2's Arc machine is taken, the default instance (MSSQLSERVER) first. Returns ''
-    when T2 has no instance resource yet, or when Azure can't be read: the app then names the whole path.
+    menu item, so the link opens the resource, and the app names the rest of the path. The verdict
+    (ConvertTo-DemoT2MigrationVerdict) is what the app's migration card shows, with its time, when Database Hub's live
+    view isn't available to the app (R924: Database Hub refuses the token Fabric gives the app's functions).
+    Read-only: one list of the resource group's Microsoft.AzureArcData/sqlServerInstances through Invoke-DemoAz, pinned to
+    the configured subscription; the instance hosted on T2's Arc machine is taken, the default instance (MSSQLSERVER)
+    first. Link is '' and Verdict $null when T2 has no instance resource yet, when Azure can't be read, or without a
+    tenant: the app then names the whole path.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config
     )
 
+    $none = [pscustomobject]@{ Link = ''; Verdict = $null }
     $tenantId = [string]$Config['tenantId']
     if ($tenantId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
-        return ''
+        return $none
     }
     try {
         $target = Get-DemoArcTarget -Config $Config
@@ -974,16 +1044,20 @@ function Get-DemoT2MigrationPortalLink {
     }
     catch {
         Write-DemoLog -Level Warning -Message ('T2''s SQL Server instance couldn''t be read, so the Insights app names the Azure portal path to its migration assessment instead of linking it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
-        return ''
+        return $none
     }
+    $readAt = [datetime]::UtcNow
     $defaultFirst = @($hosted | Sort-Object -Property @{ Expression = { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'instanceName') -ne 'MSSQLSERVER' } })
     foreach ($instance in $defaultFirst) {
         $id = [string](Get-DemoMemberValue -InputObject $instance -Name 'id')
         if ($id -match '^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[\w.()-]{1,90}/providers/Microsoft\.AzureArcData/sqlServerInstances/[A-Za-z0-9._-]{1,128}$') {
-            return ('https://portal.azure.com/#@{0}/resource{1}' -f $tenantId.ToLowerInvariant(), $id)
+            return [pscustomobject]@{
+                Link    = 'https://portal.azure.com/#@{0}/resource{1}' -f $tenantId.ToLowerInvariant(), $id
+                Verdict = ConvertTo-DemoT2MigrationVerdict -Instance $instance -ReadAt $readAt
+            }
         }
     }
-    return ''
+    return $none
 }
 
 function Get-DemoFabricAppManageCatalog {
