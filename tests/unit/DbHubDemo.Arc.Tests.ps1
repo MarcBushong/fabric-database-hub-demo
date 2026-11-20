@@ -976,7 +976,7 @@ Describe 'Invoke-DemoArcOnboarding' {
         ('{0} {1}' -f $result.message, $result.remediation) | Should -Not -Match 'configure-arc'
         $result.evidence.guestError | Should -Match 'remote session might have ended'
         $result.evidence.probeTries | Should -Be 4
-        $result.evidence.lockSeconds | Should -Be 12
+        $result.evidence.probeLockSeconds | Should -Be 12
         @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe')
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
         # The probe waits for the host's pass (its lock, at most 30 minutes) and tries again, so its Run Command has room for both.
@@ -1005,6 +1005,25 @@ Describe 'Invoke-DemoArcOnboarding' {
         $connected.status | Should -Be 'Warning'
         $connected.message | Should -Match 'Its Azure Arc machine is Connected, so its configuration goes on\.$'
         $connected.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+    }
+
+    It 'keeps the probe''s wait for the host''s bootstrap pass apart from the onboarding''s and the sweep''s (live, 2026-11-19, dbhubfy)' {
+        # Live, the row's lockSeconds was 0: the onboarding's own wait, which replaced the probe's in the evidence.
+        $script:probe.lockSeconds = 37
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $output = switch ([string]$PesterBoundParameters['RunCommandName']) {
+                'DbHubDemo-ArcProbe' { $script:probe | ConvertTo-Json -Compress }
+                'DbHubDemo-SignInData' { [ordered]@{ action = 'Clean'; succeeded = $true; pass = $true; local = $script:sweepPart; guest = $script:sweepPart; lock = [ordered]@{ minutes = 30; seconds = 441; timedOut = $false } } | ConvertTo-Json -Compress -Depth 6 }
+                default { [ordered]@{ succeeded = $true; outcome = 'Onboarded'; resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.HybridCompute/machines/arcsql01'; lockSeconds = 0 } | ConvertTo-Json -Compress }
+            }
+            [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
+        }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.evidence.decision | Should -Be 'Onboard'
+        $result.evidence.probeLockSeconds | Should -Be 37
+        $result.evidence.lockSeconds | Should -Be 0
+        $result.evidence.signInData.lockSeconds | Should -Be 441
     }
 
     It 'gives the onboarding Run Command room for the host''s pass and the tries, and a fix that''s a plain rerun when the host''s pass held its lock (2026-11-19, dbhubfx)' {
