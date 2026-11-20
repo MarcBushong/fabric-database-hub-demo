@@ -1730,6 +1730,70 @@ Describe 'configure-fabric-app.ps1' {
             ($records | Where-Object checkId -EQ 'FABRIC.APP.DEPLOY').status | Should -Be 'Pass'
         }
 
+        It 'records a second expiry as a refusal, so the next deploy.ps1 starts the Rayfin CLI''s own sign-in, as FABRIC.APP.TOKEN says (F16 review)' {
+            $pass = $script:passResult
+            Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }
+            $taken = [System.Collections.Generic.List[object]]::new()
+            Mock -CommandName Get-DemoFabricToken -MockWith { $new = ConvertTo-HubSecureString ('fab' + ('z' * 40) + $taken.Count); $taken.Add($new); $new }
+            Mock -CommandName Get-DemoPowerBIToken -MockWith { throw 'No Power BI token here.' }
+            # The module's own deploy, whose rayfin up says the token expired every time, on a PC with no Rayfin sign-in. Pester
+            # mocks the module-qualified name too, so the mock runs the module's own function from its script block.
+            $real = (Get-Module -Name DbHubDemo).ExportedFunctions['Invoke-DemoFabricAppDeployment'].ScriptBlock
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith { & $real @PesterBoundParameters }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'error'; error = 'Request failed with status code 401: Access token has expired, resubmit with a new access token' } -ExitCode 1 }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -MockWith { }
+            $ownSignIn = 'Manual action required'
+            $output = Join-Path -Path $TestDrive -ChildPath 'expired-twice-record.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 2 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -Times 1 -Exactly -ParameterFilter { $Outcome -eq 'Refused' -and $Reason -match 'Access token has expired' }
+            $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+            ($records | Where-Object checkId -EQ 'FABRIC.APP.TOKEN').remediation | Should -Match 'The next \./scripts/deploy\.ps1 starts that sign-in at its start too'
+            ($records | Where-Object checkId -EQ 'FABRIC.APP.DEPLOY').status | Should -Be 'Not selected'
+        }
+
+        It 'says the token expired and no new one was available when rayfin up didn''t run again, for a token the caller passed (F16 review)' {
+            $pass = $script:passResult
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith {
+                if ($null -ne $PesterBoundParameters['Token']) {
+                    return @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The Azure CLI''s token expired during rayfin up: 401 Access token has expired' -Evidence ([ordered]@{ tokenRefused = $true; tokenExpired = $true; refusal = '401 Access token has expired' }))
+                }
+                @((& $pass 'FABRIC.APP.DEPLOY' @{ itemId = $itemId; hostingUrl = $hosting }), (& $pass 'FABRIC.APP.STATUS'))
+            }
+            $output = Join-Path -Path $TestDrive -ChildPath 'expired-passed-token.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] }
+            $message = (@(Get-Content -LiteralPath $output | ConvertFrom-Json) | Where-Object checkId -EQ 'FABRIC.APP.TOKEN').message
+            $message | Should -Match '^The Azure CLI''s token expired during rayfin up, and no new one was available, so the Rayfin CLI''s own sign-in deploys the app: 401 Access token has expired$'
+            $message | Should -Not -Match 'again|twice'
+        }
+
+        It 'says no new one was available, and doesn''t run rayfin up again, when the Azure CLI gives no new token after an expiry (F16 review)' {
+            $pass = $script:passResult
+            Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }
+            # The guard's token and the one before rayfin up; then the Azure CLI gives none.
+            $taken = [System.Collections.Generic.List[object]]::new()
+            Mock -CommandName Get-DemoFabricToken -MockWith { if ($taken.Count -ge 2) { throw 'az account get-access-token failed.' }; $new = ConvertTo-HubSecureString ('fab' + ('z' * 40) + $taken.Count); $taken.Add($new); $new }
+            Mock -CommandName Get-DemoPowerBIToken -MockWith { throw 'No Power BI token here.' }
+            Mock -CommandName Write-DemoLog -MockWith { }
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith {
+                if ($null -ne $PesterBoundParameters['Token']) {
+                    return @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The Azure CLI''s token expired during rayfin up: 401 Access token has expired' -Evidence ([ordered]@{ tokenRefused = $true; tokenExpired = $true; refusal = '401 Access token has expired' }))
+                }
+                @((& $pass 'FABRIC.APP.DEPLOY' @{ itemId = $itemId; hostingUrl = $hosting }), (& $pass 'FABRIC.APP.STATUS'))
+            }
+            $output = Join-Path -Path $TestDrive -ChildPath 'expired-no-new-token.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] }
+            $message = (@(Get-Content -LiteralPath $output | ConvertFrom-Json) | Where-Object checkId -EQ 'FABRIC.APP.TOKEN').message
+            $message | Should -Match '^The Azure CLI''s token expired during rayfin up, and no new one was available, so '
+            $message | Should -Not -Match 'again|twice'
+            Should -Invoke -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'gave no new Fabric token, so rayfin up keeps the one it has, or, after that one expired, doesn''t run again' }
+        }
+
         It 'adds no FABRIC.APP.TOKEN and opens no browser when only the connector''s direct route refused the token: Execute Queries checked the app and proves its tenant setting (2026-11-09 live finding)' {
             $pass = $script:passResult
             $testFabricToken = $script:token

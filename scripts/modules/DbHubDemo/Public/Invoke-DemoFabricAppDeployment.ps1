@@ -71,7 +71,11 @@ function Invoke-DemoFabricAppDeployment {
         [ValidateRange(60, 7200)]
         [int] $TimeoutSeconds = 1200,
 
-        [securestring] $Token
+        [securestring] $Token,
+
+        # The run once more after the token expired (F16): an expiry now is recorded as a refusal, so the next deploy.ps1
+        # starts the Rayfin CLI's own sign-in at its start, as FABRIC.APP.TOKEN's fix says.
+        [switch] $RecordExpiry
     )
 
     $cliReference = 'https://learn.microsoft.com/fabric/apps/cli-reference'
@@ -108,7 +112,7 @@ function Invoke-DemoFabricAppDeployment {
         # rayfin up once more (tokenExpired), and nothing records a refusal. tokenRefused stays, so a caller that doesn't
         # take a new token handles it as before.
         $expired = Test-DemoRayfinTokenExpiry -Reason $refusal
-        if (-not $DryRun -and -not $expired) {
+        if (-not $DryRun -and (-not $expired -or $RecordExpiry)) {
             Set-DemoRayfinAuthRecord -Outcome 'Refused' -Reason $refusal -TenantId $TenantId
         }
         $refused = [ordered]@{ tokenRefused = $true; tokenExpired = $expired; refusal = $refusal; exitCode = $up.ExitCode; seconds = $seconds; dryRun = [bool]$DryRun }

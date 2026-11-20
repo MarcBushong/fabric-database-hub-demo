@@ -378,7 +378,7 @@ $newFabricToken = {
         return $true
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The Azure CLI gave no new Fabric token, so rayfin up uses the one it has: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Warning -Message ('The Azure CLI gave no new Fabric token, so rayfin up keeps the one it has, or, after that one expired, doesn''t run again: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
         return $false
     }
 }
@@ -391,7 +391,8 @@ $upWithToken = {
     $expired = @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] -and $_.evidence['tokenExpired'] }).Count -gt 0
     if ($expired -and (& $newFabricToken)) {
         Write-DemoLog -Level Warning -Message 'The Azure CLI''s token expired during rayfin up, so rayfin up runs once more with a new one.'
-        $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+        # A second expiry is recorded as a refusal, so the next deploy.ps1 starts the Rayfin CLI's own sign-in at its start.
+        $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -RecordExpiry -Confirm:$false)
         foreach ($record in @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] })) {
             $record.evidence['retriedAfterExpiry'] = $true
         }
@@ -501,10 +502,20 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
     if ($refused) {
         # Fabric refused the Azure CLI's token: the Rayfin CLI's own sign-in deploys instead (2026-11-09). Without one,
         # -SignIn opens its browser sign-in here; deploy.ps1 starts it at the start of its next run (out/fabric-app-auth.json).
-        # A token that expired again, with a new one, comes here too (F16).
+        # A token that expired, and expired again with a new one, comes here too (F16); one that expired with no new one to
+        # take (a -FabricToken the caller passed, or the Azure CLI gave none) didn't run again, and says so.
         $refusal = [string]$refused.evidence['refusal']
-        $lead = if ($refused.evidence['tokenExpired']) { 'The Azure CLI''s token expired during rayfin up, and again with a new one' } else { 'Fabric refused the Azure CLI''s token for rayfin up' }
-        $short = if ($refused.evidence['tokenExpired']) { 'The Azure CLI''s token expired twice' } else { 'Fabric refused the Azure CLI''s token' }
+        $expiredKind = if (-not $refused.evidence['tokenExpired']) { '' } elseif ($refused.evidence['retriedAfterExpiry']) { 'again' } else { 'once' }
+        $lead = switch ($expiredKind) {
+            'again' { 'The Azure CLI''s token expired during rayfin up, and again with a new one' }
+            'once' { 'The Azure CLI''s token expired during rayfin up, and no new one was available' }
+            default { 'Fabric refused the Azure CLI''s token for rayfin up' }
+        }
+        $short = switch ($expiredKind) {
+            'again' { 'The Azure CLI''s token expired twice' }
+            'once' { 'The Azure CLI''s token expired' }
+            default { 'Fabric refused the Azure CLI''s token' }
+        }
         $rayfinToken.Fabric = $null
         $own = @(Test-DemoFabricAppPrerequisite -Config $config -StagePath $stage -Token $FabricToken | Where-Object { $_.checkId -eq 'FABRIC.APP.SIGNIN' }) | Select-Object -First 1
         if ($SignIn -and $config -and ($null -eq $own -or $own.status -ne 'Pass')) {
