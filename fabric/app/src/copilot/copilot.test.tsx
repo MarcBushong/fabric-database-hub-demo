@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, configure, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
@@ -7,6 +7,10 @@ import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
+
+// These tests play conversations through several scripted hops, which take longer than the defaults on a busy machine.
+configure({ asyncUtilTimeout: 4000 });
+vi.setConfig({ testTimeout: 15_000 });
 
 // Built at run time so secret scanners never see a token-shaped literal.
 const fakeToken = () => ["gho", "D".repeat(36)].join("_");
@@ -437,8 +441,8 @@ describe("the end of a turn (R925)", () => {
         const sentence = "Database Hub's live view isn't available to the app";
         estateMock.readEstate.mockResolvedValue({
             view: "health",
-            source: [],
-            scope: { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroup: "rg-test" },
+            source: ["POST /health/v2/filtered-summary"],
+            scope: { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-test"] },
             data: {},
             errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized"],
             unavailable: sentence,
@@ -490,5 +494,48 @@ describe("the end of a turn (R925)", () => {
         await ask("How is my estate doing now?");
         await waitFor(() => expect(FakeSocket.all).toHaveLength(3));
         expect((FakeSocket.all[2].sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
+    });
+
+    // The review of 754fc4c: New chat while the last conversation's live call still runs (a cold start), then a new question.
+    it("keeps the live view on in a new chat when the last conversation's live call ends after it, and keeps that call's row out", async () => {
+        const sentence = "Database Hub's live view isn't available to the app";
+        const scope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-test"] };
+        let release: (answer: unknown) => void = () => undefined;
+        estateMock.readEstate
+            .mockImplementationOnce(() => new Promise((resolve) => (release = resolve)))
+            .mockResolvedValue({ view: "inventory", source: ["POST /savedView/resources/list"], scope, data: { totalCount: 4, countByType: { AzureSql: 1 }, resources: [], complete: true }, errors: [], at: "2026-11-19T21:50:00Z" });
+        FakeSocket.script = (s, m) => {
+            if (s === FakeSocket.all[0]) {
+                if (m.type === "user") s.emit({ type: "tool_call", callId: "e1", name: "estate_overview", arguments: { view: "health" } });
+            } else if (m.type === "tool_result" && m.callId === "e2") {
+                s.emit({ type: "message", messageId: "n2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await ask();
+        await waitFor(() => expect(estateMock.readEstate).toHaveBeenCalledTimes(1));
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        await ask("How is my estate doing now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
+        const second = FakeSocket.all[1];
+        await waitFor(() => expect(second.sent.some((m) => m.type === "user")).toBe(true));
+        expect((second.sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
+
+        // The first conversation's call ends now, with the live view unavailable to it.
+        await act(async () => {
+            release({ view: "health", source: ["POST /health/v2/filtered-summary"], scope, data: {}, errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized"], unavailable: sentence, at: "2026-11-19T21:49:30Z" });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        // The new conversation's own live call still reaches the function, and nothing of the first one shows in it.
+        await act(async () => second.emit({ type: "tool_call", callId: "e2", name: "estate_overview", arguments: { view: "inventory" } }));
+        await screen.findByText(ANSWER);
+        expect(estateMock.readEstate).toHaveBeenCalledTimes(2);
+        expect(resultOf(second, "e2")).toMatchObject({ ok: true });
+        expect(screen.getByRole("button", { name: /Live estate from Database Hub: inventory/ })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /Live estate from Database Hub: health/ })).not.toBeInTheDocument();
     });
 });

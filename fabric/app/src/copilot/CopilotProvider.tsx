@@ -7,7 +7,7 @@ import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useSta
 import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
-import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings } from "./conversation";
+import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings, type ConversationAction } from "./conversation";
 import type { EstateAnswer, EstateView } from "./estate";
 import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
 import { describeAskError, planLabel } from "./messages";
@@ -72,6 +72,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const runner = useRef<ToolRunner | null>(null);
     /** Set once the estate function said the live view isn't available: the rest of the conversation answers from history. */
     const liveUnavailable = useRef<string | null>(null);
+    /** Counts conversations (New chat starts the next): a tool call an earlier one still runs changes nothing in this one. */
+    const conversationNo = useRef(0);
     /** Copilot's text since its last query, by message: what suggest_followups checks before it ends a turn (R925). */
     const answerText = useRef(new Map<string, number>());
     const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -305,6 +307,11 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
                 // A conversation that learned the live view isn't available doesn't offer it again, even on a new session.
                 const live = liveUnavailable.current;
+                // The conversation this runner serves: once New chat starts another, what its calls return is dropped.
+                const servedNo = conversationNo.current;
+                const dispatchHere = (action: ConversationAction) => {
+                    if (conversationNo.current === servedNo) dispatch(action);
+                };
                 runner.current = createToolRunner({
                     runDax: async (query, rowLimit) => {
                         if (!queryClient) throw new Error("The history connector isn't ready yet.");
@@ -321,13 +328,13 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                         : undefined,
                     liveOff: () => liveUnavailable.current,
                     onLiveUnavailable: (reason) => {
-                        liveUnavailable.current = reason;
+                        if (conversationNo.current === servedNo) liveUnavailable.current = reason;
                     },
                     answered: () => [...answerText.current.values()].some((chars) => chars > 0),
-                    onDax: (run) => dispatch({ type: "dax", run }),
-                    onChart: (chart, run) => dispatch({ type: "chart", chart, runId: run.id }),
-                    onFollowups: (questions) => dispatch({ type: "followups", questions }),
-                    onEstate: (call) => dispatch({ type: "estate", call }),
+                    onDax: (run) => dispatchHere({ type: "dax", run }),
+                    onChart: (chart, run) => dispatchHere({ type: "chart", chart, runId: run.id }),
+                    onFollowups: (questions) => dispatchHere({ type: "followups", questions }),
+                    onEstate: (call) => dispatchHere({ type: "estate", call }),
                 });
                 const earlier = recap(turnsRef.current.slice(0, -2));
                 const systemMessage =
@@ -412,6 +419,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     }, []);
 
     const newChat = useCallback(() => {
+        conversationNo.current += 1;
         disconnect();
         setBusy(false);
         dispatch({ type: "reset" });
