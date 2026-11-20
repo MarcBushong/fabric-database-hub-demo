@@ -449,7 +449,7 @@ function Get-DemoRayfinTokenRefusal {
         $said = @($said['code'], $said['message']) -join ' '
     }
     $text = (@([string]$said, [string](Get-DemoMemberValue -InputObject $Run -Name 'StdErr'), [string](Get-DemoMemberValue -InputObject $Run -Name 'StdOut')) | Where-Object { $_ }) -join ' '
-    if ($text -notmatch '(?i)\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]?(auth(entication)?[_ ]?)?token|token (has )?expired|expired token|wrong audience|audience|AADSTS\d+|insufficient (privileges|permissions?)|not authori[sz]ed|access (is )?denied|permission') {
+    if ($text -notmatch '(?i)\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]?(auth(entication)?[_ ]?)?token|token ?(has |is )?expired|expired token|wrong audience|audience|AADSTS\d+|insufficient (privileges|permissions?)|not authori[sz]ed|access (is )?denied|permission') {
         return ''
     }
     $line = (($text -replace '\s+', ' ').Trim())
@@ -457,6 +457,29 @@ function Get-DemoRayfinTokenRefusal {
         $line = $line.Substring(0, 300) + '...'
     }
     return $line
+}
+
+function Test-DemoRayfinTokenExpiry {
+    <#
+    .SYNOPSIS
+    True when a refusal (Get-DemoRayfinTokenRefusal's reason) says the token expired, rather than that Fabric refuses that
+    kind of token. Pure. Internal.
+
+    .DESCRIPTION
+    F16 (live, 2026-11-20): the Azure CLI hands out a cached token until about 5 minutes before it expires, and one taken
+    with minutes left ran out during rayfin up ("401 ... Access token has expired"). That isn't a refusal: the caller takes
+    a new token and runs the command once more, and nothing records a refusal, which would start a browser sign-in at the
+    next deploy.ps1's start.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Reason
+    )
+
+    return [bool]($Reason -match '(?i)\btoken\b[^.;]{0,40}\bexpired\b|\bexpired\b[^.;]{0,20}\btoken\b|TokenExpired|ExpiredAuthenticationToken|lifetime validation failed')
 }
 
 function Get-DemoRayfinAuthRecord {
