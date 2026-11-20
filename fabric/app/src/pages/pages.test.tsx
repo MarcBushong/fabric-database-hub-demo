@@ -11,8 +11,10 @@ import PerformancePage from "@/pages/PerformancePage";
 import ReadinessPage from "@/pages/ReadinessPage";
 import TrendsPage from "@/pages/TrendsPage";
 import { liveDataOf, type EstateAnswer, type EstateReader } from "@/data/live-estate";
+import type { DeployedMigration } from "@/lib/runtime-config";
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
+import { readEstate as readEstateCore } from "../../rayfin/functions/src/estate-core";
 
 /** A storage the test owns: newer Node versions put their own, empty localStorage in front of jsdom's. */
 function memoryStorage(): Storage {
@@ -36,6 +38,27 @@ beforeEach(() => {
 afterEach(() => {
     vi.unstubAllGlobals();
 });
+
+/**
+ * The app's own estate function (estate-core's readEstate) against a Database Hub that answers every route with one
+ * status: 401 refuses the app's sign-in, with the answer it gave on 2026-11-19 (R924).
+ */
+function refusingDbHub(status = 401): EstateReader {
+    const scope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-dbhub-demo"] };
+    // Built at run time so secret scanners never see a token-shaped literal.
+    const token = ["eyJ", "x".repeat(24)].join("");
+    const refuse = () => Promise.resolve(new Response(JSON.stringify({ code: "Unauthorized", subCode: 1, message: "Authentication failed for all authenticators", httpStatusCode: status }), { status }));
+    return (view) => readEstateCore(view, scope, token, refuse);
+}
+
+const T2_SAVED: DeployedMigration = {
+    resource: "arcsql01",
+    readAt: "2026-11-19T22:10:00Z",
+    enabled: true,
+    uploadedAt: "2026-11-17T23:05:00Z",
+    targets: { azureSqlDatabase: "NotReady", azureSqlManagedInstance: "Ready", azureSqlVirtualMachine: "Ready" },
+    recommended: { azureSqlManagedInstance: "General Purpose, 4 vCores" },
+};
 
 describe("Overview", () => {
     it("says what needs attention: the tiles, each target's health, the incidents, and the findings", async () => {
@@ -88,11 +111,25 @@ describe("Overview", () => {
 
     it("says why when the function answers with no data, instead of tiles that keep reading", async () => {
         const reason = "The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1.";
-        const noScope: EstateReader = (view) => Promise.resolve({ view, source: [], scope: { subscriptionId: "", resourceGroups: [] }, data: {}, errors: [reason], at: "2026-10-21T21:00:00.000Z" });
+        const noScope: EstateReader = (view) => Promise.resolve({ view, source: [], scope: { subscriptionId: "", resourceGroups: [] }, data: {}, errors: ["a route's own reason, for the log"], at: "2026-10-21T21:00:00.000Z", unavailable: reason });
         renderWithApp(<OverviewPage />, { live: noScope });
         const line = await screen.findByText(/^The estate function has no scope: deploy the app with scripts\/configure-fabric-app\.ps1\. Every page shows the history/);
         expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
         expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+        expect(document.body.textContent).not.toContain("for the log");
+    });
+
+    it("says in plain words when Database Hub refuses the app, and never shows a route's error (R924)", async () => {
+        renderWithApp(<OverviewPage />, { live: refusingDbHub() });
+        const line = await screen.findByText(/^Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in\. Every page shows the history; Database Hub has the live view\.$/);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
+        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP/);
+        cleanup();
+        // Database Hub didn't answer, for a reason a later read may not meet: plain words too, never the 503.
+        renderWithApp(<OverviewPage />, { live: refusingDbHub(503) });
+        expect(await screen.findByText(/^Database Hub's live view didn't answer the app just now\. Every page shows the history; Database Hub has the live view\.$/)).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/503|Unauthorized|HTTP/);
     });
 
     it("reads health as the function passes it: a count it leaves out is zero, and Cosmos DB shows without an account count", async () => {
@@ -348,6 +385,31 @@ describe("Findings", () => {
         expect(within(panel).getByText("Live · unavailable")).toHaveClass("provenance-off");
         expect(within(panel).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("rel", "noopener noreferrer");
         expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
+    });
+
+    it("shows T2 ready to migrate from the assessment saved at deploy when Database Hub refuses the app, with its time and the portal (R924)", async () => {
+        const { copilot } = renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: refusingDbHub(), runtime: { t2Migration: T2_SAVED } });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(within(card).getByText("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.")).toBeInTheDocument();
+        expect(within(card).getByText(/^Arc-enabled SQL Server \(T2\), assessed by Azure Arc every week; this assessment was uploaded 17 Nov 23:05 UTC\. Read from Azure when the app was deployed, as of 19 Nov 22:10 UTC\.$/)).toBeInTheDocument();
+        expect(within(card).getByText(/^Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in\. This is the assessment as Azure had it when the app was deployed/)).toBeInTheDocument();
+        expect(within(card).getByRole("list", { name: "Readiness per Azure SQL target" }).textContent).toBe("ReadyAzure SQL Managed InstanceGeneral Purpose, 4 vCoresReadySQL Server on Azure Virtual MachinesNot readyAzure SQL DatabaseAsk why");
+        expect(within(card).getByText(/^Saved at deploy/)).toBeInTheDocument();
+        expect(within(card).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("target", "_blank");
+        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP/);
+        fireEvent.click(within(card).getByRole("button", { name: "Ask Copilot" }));
+        expect(vi.mocked(copilot.ask).mock.calls[0][0]).toMatchObject({ source: "history", asOf: "2026-11-19T22:10:00Z", visualId: "migration.readiness", totalRows: 3 });
+        fireEvent.click(within(card).getByRole("button", { name: "Ask why" }));
+        expect(vi.mocked(copilot.ask).mock.calls[1][0]).toMatchObject({ source: "history", asOf: "2026-11-19T22:10:00Z" });
+    });
+
+    it("names a partial live answer's routes that didn't answer, never their errors (R924)", async () => {
+        const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        const partial: EstateAnswer<"security"> = { ...sample.security, errors: ['GET /cmk/warnings: HTTP 401 {"code":"Unauthorized","message":"Authentication failed for all authenticators"}'] };
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: (view) => Promise.resolve((view === "security" ? partial : sample[view]) as never) });
+        expect(await screen.findByText("Partial answer: GET /cmk/warnings didn't answer. What the other routes read is below.")).toBeInTheDocument();
+        expect(screen.getByText(/^Partial: 1 of \d Database Hub calls didn't answer$/)).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators/);
     });
 });
 describe("Readiness", () => {

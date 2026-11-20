@@ -15,7 +15,7 @@ The relay connects the Insights app's Copilot dock (Ask, the Copilot chat in the
 
 ### How it works
 
-The relay holds no Azure, Fabric, or GitHub credential and runs no tool. The page sends the viewer's GitHub token at the start of a conversation, and the relay keeps it in memory for that conversation only. Copilot's tools are declared by the page, and each call goes back to the page to run there, with the viewer's own access: read-only DAX through the app's connector, the app's own charts, and the live estate through the app's function.
+The relay holds no Azure, Fabric, or GitHub credential and runs no tool. The page sends the viewer's GitHub token at the start of a conversation, and the relay keeps it in memory for that conversation only. Copilot's tools are declared by the page, and each call goes back to the page to run there, with the viewer's own access: read-only DAX through the app's connector, the app's own charts, and the live estate through the app's function, which Database Hub refuses today (R924).
 
 ### How a question flows
 

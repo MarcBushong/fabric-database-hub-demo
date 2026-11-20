@@ -13,11 +13,11 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import { FINDING_CATEGORIES, findingCategory, toFindings, toPostgresFindings, toTargetNames, type FindingCategory, type TargetName } from "@/data/model";
 import { findingsQuery, postgresFindingsQuery, targetNamesQuery } from "@/data/queries";
-import { liveDataOf, useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
+import { liveDataOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
-import { clause, formatDateTimeUtc, sentence } from "@/lib/format";
+import { formatDateTimeUtc, sentence } from "@/lib/format";
 import { worstStatus } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
 
@@ -134,7 +134,7 @@ function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRo
         >
             {live && live.errors.length > 0 ? (
                 <MessageBar intent="warning">
-                    <MessageBarBody>{`Partial answer: ${live.errors.map(clause).join("; ")}. What the other routes read is below.`}</MessageBarBody>
+                    <MessageBarBody>{`Partial answer: ${liveRoutes(live.source, live.errors).failed.join(", ") || "a Database Hub call"} didn't answer. What the other routes read is below.`}</MessageBarBody>
                 </MessageBar>
             ) : null}
             <DataGrid columns={LIVE_COLUMNS} rows={props.rows} caption={`Live ${props.tab} checks`} exportName={`findings-live-${props.tab}`} />

@@ -434,7 +434,7 @@ The scripts never create or scale the Fabric capacity, and resume or pause it on
 | `FABRIC.APP.BROWSER` **Not selected**: "Not needed: the app is deployed ..." | Nothing |
 | `FABRIC.APP.HOSTING` **Fail**: the assets answered anonymously | `staticHosting.assetAccess: protected` in `fabric/app/rayfin/rayfin.yml`, then deploy again |
 | `FABRIC.APP.OPERATORS` **Warning**: "The admin group's members couldn't be read" (Manage is the deployer's only) | Make the deployer a group owner (P6), then `./scripts/deploy.ps1` |
-| `FABRIC.APP.ACTIONS` **Warning**: "Manage's function is missing ..." (requests are copied for Run all; [Manage](../fabric/app/README.md#manage-bounded-confirmed-actions)) | `./scripts/deploy.ps1` again |
+| `FABRIC.APP.ACTIONS` **Warning**: "Manage's function is missing ..." (requests are copied for Run all; [Manage](../fabric/app/README.md#manage-bounded-confirmed-actions)) | `./scripts/deploy.ps1` again: since 2026-11-19 it deploys the app once more after it puts the control notebook in Fabric, a resume included, and `-Sequential` puts the notebook in Fabric first (before, a new environment's first run always left "missing NB_DatabaseHub_Control"; R926). `DEPLOY.CONTROL` says what a notebook that isn't in Fabric still needs |
 
 ### Ask, the Copilot chat in the Insights app (2026-11-18)
 

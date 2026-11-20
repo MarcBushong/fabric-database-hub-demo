@@ -1460,7 +1460,12 @@ function Invoke-DemoParallelDeployment {
     # in DONE's way. Without the Fabric track finished (a paused capacity, for example), the next deploy.ps1 does it.
     if (-not $whatIf -and -not $SkipFabric) {
         if (& $trackFinished 'Fabric' 'Fabric') {
-            & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+            $controlFabric = @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+            & $addAll $controlFabric
+            # The Insights app's Manage runs that notebook (ADR 0029), and the Fabric track deployed the app before the
+            # notebook was in Fabric on a first deployment, or an earlier run did: the app's step once more, with its IDs
+            # (2026-11-19, the final tests' net-new run). Non-blocking, as the app's step always is.
+            $null = Complete-DemoInsightsAppManage -Config $Config -ConfigPath $ConfigPath -Results $results -ControlResult $controlFabric -State $state -ProgressPath $ProgressPath
         }
         else {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'

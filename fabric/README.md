@@ -9,7 +9,7 @@ Everything that lives in the Fabric workspace that holds the notebooks (prerequi
 | `agent/` | Prompt pack for the in-Hub Database Agent and the documented skills fallback |
 | `connections/` | Notes on Fabric connections (none needed) |
 | `powerbi/` | The Power BI history report `RPT_DatabaseHub_History`, its Direct Lake semantic model `SM_DatabaseHub_History`, and the report's generator ([its guide](powerbi/README.md)). The Insights app (Fabric Apps, preview; Rayfin) is a separate item |
-| `app/` | The Insights app `APP_DatabaseHub_Insights` (Fabric Apps, preview): the demo's DBA console over the history and the live estate, with Manage, where an operator starts and stops sessions, and Ask, the Copilot chat in the Insights app; `deploy.ps1` deploys it ([its guide](app/README.md), [ADR 0029](../docs/adr/0029-insights-app-dba-console.md)) |
+| `app/` | The Insights app `APP_DatabaseHub_Insights` (Fabric Apps, preview): the demo's DBA console over the history, with Manage, where an operator starts and stops sessions, and Ask, the Copilot chat in the Insights app; `deploy.ps1` deploys it ([its guide](app/README.md), [ADR 0029](../docs/adr/0029-insights-app-dba-console.md)) |
 | `control/` | `NB_DatabaseHub_Control.ipynb`, the session control's notebook: one **Run all** runs a whole demo session through the control's Azure Automation webhook and runbook, and shows it live. `deploy.ps1` imports it into the folder "DBHub Control" of this workspace, or into its own workspace, "&lt;workspace&gt; Control" by default, where the tenant makes vaults private ([its guide](control/README.md), [ADR 0026](../docs/adr/0026-one-run-all-session.md)) |
 
 ## The notebooks

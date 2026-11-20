@@ -945,6 +945,10 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return (& $finishEarly)
                 }
+                # The session control's notebook (ADR 0026), now that the workspace exists, and before the Insights app, whose
+                # Manage runs it (ADR 0029): the app's step reads its IDs, so a first deployment's Manage has them
+                # (2026-11-19, the final tests' net-new run). Never a Fail.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
                 & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
                 $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
                 & $addAll $app
@@ -953,10 +957,13 @@ function Invoke-DemoDeployment {
                 $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
-                # The session control's notebook (ADR 0026), now that the workspace exists; never a Fail.
-                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
-                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen).
-                & $recordStage 'Fabric' $(if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') { @{ FabricSha256 = $fabricContent } } else { @{} })
+                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen), and
+                # what the app's Manage has (2026-11-19).
+                $published = Get-DemoInsightsAppManageRecord -Result $app
+                if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
+                    $published['FabricSha256'] = $fabricContent
+                }
+                & $recordStage 'Fabric' $published
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
             'Validation' {
