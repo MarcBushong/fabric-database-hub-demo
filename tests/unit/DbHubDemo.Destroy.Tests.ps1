@@ -176,6 +176,34 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         }
     }
 
+    It 'says an environment being deployed hasn''t recorded its workspaces yet, never that an earlier version deployed it, and keeps both with the same fix (the final tests'' F15)' {
+        # Live, 2026-11-19: destroy.ps1 of dbhubfx ran while dbhubfy was being deployed, before its Control step recorded its
+        # workspaces, and said rg-dbhubfy-demo "was deployed by an earlier version of the demo".
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhubfy-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfy-demo'; Tagged = $false; Deployment = 'Running'; Claims = @() }) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        foreach ($workspace in $plan.Demo, $plan.Control) {
+            $workspace.Delete | Should -BeFalse -Because 'a workspace it might use is still kept'
+            $workspace.Guard | Should -Be 'Untagged'
+            $workspace.Reason | Should -Be 'rg-dbhubfy-demo is being deployed and hasn''t recorded its workspaces yet, so it might use it'
+            $workspace.Remediation | Should -Be 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhubfy-demo, which records the workspaces it uses, or after its destroy; or delete it in Fabric once nothing uses it (Workspace settings > Remove this workspace).'
+        }
+
+        # Each one says its own, and the fix still names them all.
+        $others = foreach ($case in @(
+                @{ Name = 'rg-dbhuba-demo'; Deployment = 'Running' }
+                @{ Name = 'rg-dbhubb-demo'; Deployment = 'Running' }
+                @{ Name = 'rg-dbhubc-demo'; Deployment = 'Unfinished' }
+                @{ Name = 'rg-dbhubd-demo'; Deployment = '' }
+            )) {
+            [pscustomobject]@{ Name = $case.Name; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = $case.Name; Tagged = $false; Deployment = $case.Deployment; Claims = @() }
+        }
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @($others) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        $plan.Demo.Delete | Should -BeFalse
+        $plan.Demo.Reason | Should -Be 'rg-dbhuba-demo and rg-dbhubb-demo are being deployed and haven''t recorded their workspaces yet, so they might use it; rg-dbhubc-demo hasn''t finished deploying and hasn''t recorded its workspaces yet, so it might use it; rg-dbhubd-demo was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it'
+        $plan.Demo.Remediation | Should -Be 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhuba-demo, rg-dbhubb-demo, rg-dbhubc-demo, and rg-dbhubd-demo, which records the workspaces each uses, or after their destroy; or delete it in Fabric once nothing uses it (Workspace settings > Remove this workspace).'
+    }
+
     It 'keeps both when Resource Graph can''t be read, and says so' {
         $script:claim = [pscustomobject]@{ Ok = $false; Error = 'AuthorizationFailed: no access.'; Others = @() }
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
@@ -289,6 +317,31 @@ Describe 'Get-DemoFabricWorkspaceClaim: the other demo environments, across the 
         }
         $script:rows = @($script:rows | Select-Object -First 1)
         (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }).Own.Found | Should -BeFalse -Because 'a new environment has no group yet'
+    }
+
+    It 'tells another environment that''s being deployed, or whose deployment hasn''t finished, from one an earlier version deployed (the final tests'' F15)' {
+        $now = [datetime]::new(2026, 11, 19, 23, 0, 0, [System.DateTimeKind]::Utc)
+        $ahead = '2026-11-19T23:40:00Z'
+        $past = '2026-11-19T22:00:00Z'
+        $script:rows = @(
+            $script:rows[0]
+            # dbhubfy, live: a first deployment before its Control step, with its busy marker ahead.
+            & $group 'rg-dbhubfy-demo' @{ deploymentId = 'f1'; DbHubDeployStage = 'Infrastructure'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $ahead }
+            # An update of a finished environment while it runs: its stage is still the last run's.
+            & $group 'rg-dbhubup-demo' @{ deploymentId = 'f2'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $ahead }
+            # A run that stopped before the end (NOT DONE), and one whose window closed, so its marker is past.
+            & $group 'rg-dbhubnd-demo' @{ deploymentId = 'f3'; DbHubDeployStage = 'T2' }
+            & $group 'rg-dbhubcr-demo' @{ deploymentId = 'f4'; DbHubDeployStage = 'Monitoring'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $past }
+            # Finished: a session that's going, a run the nightly stop waited for, an expired run's marker, and only the template's tag.
+            & $group 'rg-dbhubss-demo' @{ deploymentId = 'f5'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'session'; DbHubBusyUntilUtc = $ahead }
+            & $group 'rg-dbhubgr-demo' @{ deploymentId = 'f6'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy-grace'; DbHubBusyUntilUtc = $ahead }
+            & $group 'rg-dbhubex-demo' @{ deploymentId = 'f7'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $past }
+            & $group 'rg-dbhubol-demo' @{ deploymentId = 'f8' }
+        )
+        $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config; Now = $now } { Get-DemoFabricWorkspaceClaim -Config $Config -NowUtc $Now }
+        $claim.Ok | Should -BeTrue
+        @($claim.Others | ForEach-Object { '{0}={1}' -f $_.Name, $_.Deployment }) | Should -Be @('rg-dbhubfy-demo=Running', 'rg-dbhubup-demo=Running', 'rg-dbhubnd-demo=Unfinished', 'rg-dbhubcr-demo=Unfinished', 'rg-dbhubss-demo=', 'rg-dbhubgr-demo=', 'rg-dbhubex-demo=', 'rg-dbhubol-demo=')
+        @($claim.Others | Where-Object { $_.Tagged }) | Should -BeNullOrEmpty
     }
 
     It 'can''t tell when Resource Graph fails, cuts its answer short, throws, or doesn''t list the subscription' {
