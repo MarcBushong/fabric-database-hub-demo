@@ -86,7 +86,7 @@ describe("the owner's four questions, at the live session's times (EST)", () => 
         expect(r.window).toMatchObject({ fromUtc: "2026-11-20T16:51:00Z", toUtc: "2026-11-20T17:01:00Z", asked: "11:56 EST (16:56 UTC)" });
         const h = r.details!.hypotheses as Array<{ target: string; family: string; nextTool: string }>;
         expect(h.map((x) => `${x.target} ${x.family} ${x.nextTool}`)).toEqual(["T1 blocking explain_locking", "T5 throttling explain_errors", "T1 errors explain_errors"]);
-        expect(h[1]).toMatchObject({ summary: expect.stringMatching(/^T5: throttled requests \(429\) over 0 requests from 16:56:00 to 17:06:00 UTC, .* Normalized RU consumption was at 100 % in the same minutes\.$/) });
+        expect(h[1]).toMatchObject({ summary: expect.stringMatching(/^T5: throttled requests \(429\) above zero from 16:56:00 to 17:06:00 UTC, .* Normalized RU consumption was at 100 % in the same minutes\.$/) });
         expect(r.details!.quiet).toEqual(["T2", "T3", "T4", "T4-replica"]);
         expect(r.details!.nothingAbnormal).toBe(false);
     });
@@ -128,7 +128,7 @@ describe("incidents, blind", () => {
         expect(keys).toEqual(expect.arrayContaining(["T1-blocking-20261120T165230Z", "T4-blocking-20261120T170230Z", "T4-replica-replica_lag-20261120T171200Z", "T5-throttling-20261120T165600Z"]));
         const r = await ask("explain_incident", { episodeKey: "T1-blocking-20261120T165230Z" });
         expect(r.rootCause?.ruleIds).toEqual(["BLK-IDLE-HEAD"]);
-        expect((r.details!.episodes as Array<{ text: string }>)[0].text).toMatch(/^T1: blocked processes over 0 processes from 16:52:30 to 17:01:40 UTC, peak 7 processes/);
+        expect((r.details!.episodes as Array<{ text: string }>)[0].text).toMatch(/^T1: blocked processes above zero from 16:52:30 to 17:01:40 UTC, peak 7 processes/);
     });
 
     it("explains a target's minutes from a link that passes only a target and a window", async () => {
