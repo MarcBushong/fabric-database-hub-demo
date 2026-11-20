@@ -58,6 +58,10 @@ export function LiveNow() {
     const down = (inv?.resources ?? []).filter((r) => isDown(r.status));
     // Only with the security view's own answer: without it, the resources' flags alone would read as nothing to fix.
     const warnings = security.answer ? liveSecurityRows(liveDataOf(security.answer), inv).filter((r) => r.attention === "Needs attention") : null;
+    // The count takes the resources' own security issues too, from the inventory: until it answers, still reading or
+    // not, the count is partial, never a pass (as Findings says).
+    const securityPartial = warnings !== null && !inv ? `Partial: the resources' own security checks ${inventory.loading ? "are still being read" : inventory.off ? "aren't available to the app" : "didn't answer"}` : null;
+    const warningList = (warnings ?? []).map((w) => `${w.resource}: ${w.check}`).join("; ");
     const high = h ? usage(h.microsoftSql?.highUsage) + usage(h.postgreSql?.highUsage) : null;
     // Database Hub may leave out the account count while it still reports RU; either one means T5 is there.
     const cosmos = h?.cosmosDb && ((h.cosmosDb.totalAccounts ?? 0) > 0 || h.cosmosDb.maximumNormalizedRu !== null) ? h.cosmosDb : null;
@@ -73,7 +77,12 @@ export function LiveNow() {
         { signal: "Resources", value: inv?.totalCount ?? null, detail: inv ? inventoryMix(inv, true) : notRead(inventory) },
         ...down.map((r) => ({ signal: "Not up", value: r.status ?? "", detail: `${r.name} (${targetOfResource(r) || r.databaseType})` })),
         { signal: "High-usage signals, last 24 hours", value: high, detail: h ? [usageText("Microsoft SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join("; ") : notRead(health) },
-        { signal: "Security warnings", value: warnings?.length ?? null, detail: warnings ? warnings.map((w) => `${w.resource}: ${w.check}`).join("; ") : notRead(security) },
+        {
+            signal: "Security warnings",
+            // A partial count isn't a total: Copilot gets the warnings it has and why the rest is missing, never a zero.
+            value: securityPartial ? null : (warnings?.length ?? null),
+            detail: warnings === null ? notRead(security) : securityPartial ? `${securityPartial}; ${warnings.length} from the authentication, auditing, and key checks${warningList ? `: ${warningList}` : ""}` : warningList,
+        },
         ...(cosmos ? [{ signal: "Cosmos DB, peak normalized RU (%)", value: cosmos.maximumNormalizedRu, detail: `lowest availability ${cosmos.minimumServiceAvailability ?? "n/a"} %` }] : []),
     ];
 
@@ -136,8 +145,8 @@ export function LiveNow() {
                 <KpiTile
                     label="Security warnings"
                     value={warnings === null ? "\u2013" : String(warnings.length)}
-                    sub={warnings === null ? notRead(security) : warnings.length > 0 ? warnings.slice(0, 2).map((w) => `${w.resource.split("/").pop()}: ${w.check}`).join(" \u00b7 ") : "Authentication, auditing, and keys pass"}
-                    status={warnings === null ? null : warnings.length > 0 ? "Warning" : "Pass"}
+                    sub={warnings === null ? notRead(security) : (securityPartial ?? (warnings.length > 0 ? warnings.slice(0, 2).map((w) => `${w.resource.split("/").pop()}: ${w.check}`).join(" \u00b7 ") : "Authentication, auditing, and keys pass"))}
+                    status={warnings === null ? null : warnings.length > 0 ? "Warning" : securityPartial ? null : "Pass"}
                     onOpen={() => navigate("findings", { category: "security" })}
                     openLabel="Show the live security checks"
                 />

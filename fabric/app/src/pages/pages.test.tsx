@@ -58,6 +58,26 @@ function oneViewFailing(failing: EstateView, status: number): EstateReader {
     return (view, options) => (view === failing ? dbHub(view, options) : Promise.resolve(sample[view] as never));
 }
 
+/**
+ * Security routes with no warnings, and an inventory whose T3 has public network access on: a security issue only the
+ * inventory carries. The inventory answers, answers every route with a status, or is still being read.
+ */
+function onlyInventoryFlagsT3(inventory: "answers" | "reading" | number): EstateReader {
+    const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+    const none = { warnings: [], warningCount: 0, complete: true };
+    const security: EstateAnswer<"security"> = { ...sample.security, data: { authentication: { scope: "Azure SQL + Arc SQL Server", ...none }, auditing: { scope: "Azure SQL only", ...none }, customerManagedKeys: { scope: "Azure SQL only", ...none } } };
+    const data = liveDataOf(sample.inventory);
+    if (!data) throw new Error("The sample has an inventory.");
+    const flagged: EstateAnswer<"inventory"> = { ...sample.inventory, data: { ...data, resources: data.resources.map((r) => (r.name === "ContosoCare" ? { ...r, issues: { ...r.issues, security: { ...r.issues?.security, hasPublicNetworkAccessIssue: true } } } : r)) } };
+    const failing = typeof inventory === "number" ? refusingDbHub(inventory) : null;
+    return (view, options) => {
+        if (view === "security") return Promise.resolve(security as never);
+        if (view !== "inventory") return Promise.resolve(sample[view] as never);
+        if (inventory === "reading") return new Promise<never>(() => undefined);
+        return failing ? failing(view, options) : Promise.resolve(flagged as never);
+    };
+}
+
 const T2_SAVED: DeployedMigration = {
     resource: "arcsql01",
     readAt: "2026-11-19T22:10:00Z",
@@ -186,6 +206,35 @@ describe("Overview", () => {
         expect(within(again).getByText("Partial: 1 of 7 Database Hub calls didn't answer")).toBeInTheDocument();
         expect(within(again).getByRole("button", { name: /^Security warnings: 2\./ })).toBeInTheDocument();
         expect(document.body.textContent).not.toMatch(/HTTP|503|403|Unauthorized/);
+    });
+
+    it("counts the resources' own security issues with the warnings, and calls the count partial until the inventory answers, on both pages (R924)", async () => {
+        // Both answer: T3's public network access, which only the inventory carries, makes the count 1.
+        renderWithApp(<OverviewPage />, { live: onlyInventoryFlagsT3("answers") });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Security warnings: 1\./ })).toBeInTheDocument());
+        cleanup();
+        // The inventory doesn't answer: the warnings' zero isn't a pass, and Copilot gets no total.
+        const { copilot } = renderWithApp(<OverviewPage />, { live: onlyInventoryFlagsT3(503) });
+        const again = await screen.findByRole("region", { name: "Live now" });
+        const tile = await within(again).findByRole("button", { name: /^Security warnings: 0\./ });
+        await waitFor(() => expect(within(tile).getByText("Partial: the resources' own security checks didn't answer")).toBeInTheDocument());
+        expect(tile.closest(".kpi")).not.toHaveClass("kpi-pass");
+        expect(within(again).queryByText("Authentication, auditing, and keys pass")).not.toBeInTheDocument();
+        fireEvent.click(within(again).getByRole("button", { name: "Ask Copilot" }));
+        expect(vi.mocked(copilot.ask).mock.calls[0][0].rows?.find((r) => r.signal === "Security warnings")).toEqual({ signal: "Security warnings", value: null, detail: "Partial: the resources' own security checks didn't answer; 0 from the authentication, auditing, and key checks" });
+        cleanup();
+        // A cold open where the warnings answer first: partial while the inventory is still being read, on both pages.
+        renderWithApp(<OverviewPage />, { live: onlyInventoryFlagsT3("reading") });
+        const cold = await screen.findByRole("region", { name: "Live now" });
+        const coldTile = await within(cold).findByRole("button", { name: /^Security warnings: 0\./ });
+        expect(within(coldTile).getByText("Partial: the resources' own security checks are still being read")).toBeInTheDocument();
+        expect(coldTile.closest(".kpi")).not.toHaveClass("kpi-pass");
+        cleanup();
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: onlyInventoryFlagsT3("reading") });
+        const kpi = await screen.findByRole("button", { name: /^Security · live: 0\./ });
+        expect(within(kpi).getByText(/; partial: part of Database Hub is still being read$/)).toBeInTheDocument();
+        expect(kpi.closest(".kpi")).not.toHaveClass("kpi-pass");
     });
 
     it("reads health as the function passes it: a count it leaves out is zero, and Cosmos DB shows without an account count", async () => {
