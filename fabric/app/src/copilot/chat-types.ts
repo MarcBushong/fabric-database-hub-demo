@@ -52,6 +52,8 @@ export interface ChatState {
 export interface ChatController {
     state: ChatState;
     send(text: string, ctx?: AskContext | null): void;
+    /** For the last turn when it ended without an answer: asks the same conversation to write it (R925). */
+    retry(): void;
     stop(): void;
     newChat(): void;
     signInWithGitHub(): void;

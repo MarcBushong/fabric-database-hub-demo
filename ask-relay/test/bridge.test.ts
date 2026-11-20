@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { AskBridge, describeSessionError, redact, type SessionHost, type SessionLike, type SessionRequest } from "../src/bridge.js";
+import { AskBridge, describeSessionError, HISTORY_READ_MS, redact, type SessionHost, type SessionLike, type SessionRequest, type TurnSummary } from "../src/bridge.js";
 import type { ServerMessage } from "../src/protocol.js";
 
 const fakeToken = () => ["gho", "B".repeat(36)].join("_");
@@ -118,6 +118,141 @@ describe("AskBridge", () => {
         const bridge = new AskBridge(f.host, config, () => undefined, () => "id");
         await bridge.handle(start);
         await expect(bridge.handle(start)).rejects.toMatchObject({ code: "already_started" });
+    });
+});
+
+// R925 (2026-11-19): a live turn ended with tool rows and no answer. Every way the model's text can reach the relay is
+// scripted here as the SDK emits it, and the page must end each turn with all of that text, and the relay log the turn.
+describe("AskBridge: the end of a turn (R925)", () => {
+    type HistoryEvent = { type: string; data?: Record<string, unknown>; agentId?: string };
+    const ANSWER = "**T2** needs attention first: CPU above 90% for 14 minutes.";
+
+    function scripted(history: HistoryEvent[] | (() => Promise<HistoryEvent[]>) = []) {
+        const f = fakeHost();
+        Object.assign(f.session, { getEvents: typeof history === "function" ? history : async () => history });
+        const sent: ServerMessage[] = [];
+        const ends: TurnSummary[] = [];
+        const bridge = new AskBridge(f.host, { ...config, maxTurns: 5 }, (m) => sent.push(m), () => "id", undefined, (s) => ends.push(s));
+        const idle = () => vi.waitFor(() => expect(sent.at(-1)?.type).toBe("idle"));
+        const callTool = async (callId: string) => {
+            const answer = f.requests[0].tools[0].handler({}, { toolCallId: callId });
+            await bridge.handle({ type: "tool_result", callId, ok: true, result: "[[1]]" });
+            return answer;
+        };
+        return { ...f, sent, ends, bridge, idle, callTool };
+    }
+    const textOf = (sent: ServerMessage[]) => sent.filter((m): m is Extract<ServerMessage, { type: "message" }> => m.type === "message");
+
+    it("sends a final answer that comes as a new message after the tool calls, then idle, and logs the turn", async () => {
+        const s = scripted([{ type: "user.message", data: { messageId: "m1" } }]);
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "q" });
+        s.emit("assistant.message", { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c1");
+        s.emit("assistant.turn_end", { turnId: "t1" });
+        s.emit("assistant.message_delta", { messageId: "a2", deltaContent: "**T2** needs" });
+        s.emit("assistant.message", { messageId: "a2", content: ANSWER });
+        s.emit("session.idle", {});
+        await s.idle();
+        expect(s.sent.map((m) => m.type)).toEqual(["ready", "tool_call", "delta", "message", "idle"]);
+        expect(s.ends).toHaveLength(1);
+        expect(s.ends[0]).toMatchObject({ ended: "idle", tools: 1, failedTools: 0, messages: 2, textChars: ANSWER.length, finalTextChars: ANSWER.length, rounds: `0/1 ${ANSWER.length}/0`, fromHistory: 0 });
+    });
+
+    it("sends the full text of a message that came only as deltas, before idle", async () => {
+        const s = scripted([
+            { type: "user.message", data: { messageId: "m1" } },
+            { type: "assistant.message", data: { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] } },
+            { type: "assistant.message", data: { messageId: "a2", content: ANSWER } },
+        ]);
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "q" });
+        s.emit("assistant.message", { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c1");
+        s.emit("assistant.message_delta", { messageId: "a2", deltaContent: "**T2** needs attention" });
+        s.emit("session.idle", {});
+        await s.idle();
+        expect(s.sent.map((m) => m.type)).toEqual(["ready", "tool_call", "delta", "message", "idle"]);
+        expect(textOf(s.sent)).toEqual([{ type: "message", messageId: "a2", text: ANSWER }]);
+        expect(s.ends[0]).toMatchObject({ finalTextChars: ANSWER.length, fromHistory: 1 });
+    });
+
+    it("sends the last message before idle when the live idle comes first, and never sends it twice", async () => {
+        const s = scripted([
+            { type: "user.message", data: { messageId: "m0" } },
+            { type: "assistant.message", data: { messageId: "old", content: "An earlier turn's answer." } },
+            { type: "user.message", data: { messageId: "m1" } },
+            { type: "assistant.message", data: { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] } },
+            { type: "assistant.message", data: { messageId: "a2", content: ANSWER } },
+        ]);
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "q" });
+        s.emit("assistant.message", { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c1");
+        s.emit("session.idle", {});
+        await s.idle();
+        s.emit("assistant.message", { messageId: "a2", content: ANSWER });
+        expect(s.sent.map((m) => m.type)).toEqual(["ready", "tool_call", "message", "idle"]);
+        expect(textOf(s.sent).map((m) => m.messageId)).toEqual(["a2"]);
+    });
+
+    it("ends a turn whose model wrote no text: idle for the page, and finalTextChars 0 in the log, with no content or token", async () => {
+        const s = scripted([{ type: "user.message", data: { messageId: "m1" } }]);
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "How is my estate doing?" });
+        s.emit("assistant.message", { messageId: "a1", content: "The live view isn't available, so I'll check the history.", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c1");
+        s.emit("assistant.message", { messageId: "a2", content: "", toolRequests: [{ name: "suggest_followups" }] });
+        await s.callTool("c2");
+        s.emit("assistant.message", { messageId: "a3", content: "" });
+        s.emit("session.idle", {});
+        await s.idle();
+        expect(s.ends[0]).toMatchObject({ ended: "idle", tools: 2, messages: 3, finalTextChars: 0, rounds: "57/1 0/1 0/0" });
+        const logged = JSON.stringify(s.ends[0]);
+        expect(logged).not.toMatch(/live view|check the|my estate/i);
+        expect(logged).not.toContain(start.token);
+    });
+
+    it("still sends idle when the history can't be read, or doesn't answer in time", async () => {
+        const failing = scripted(async () => {
+            throw new Error("runtime gone");
+        });
+        await failing.bridge.handle(start);
+        await failing.bridge.handle({ type: "user", text: "q" });
+        failing.emit("session.idle", {});
+        await failing.idle();
+        expect(failing.ends[0]).toMatchObject({ ended: "idle", fromHistory: 0 });
+
+        vi.useFakeTimers();
+        try {
+            const slow = scripted(() => new Promise<HistoryEvent[]>(() => undefined));
+            await slow.bridge.handle(start);
+            await slow.bridge.handle({ type: "user", text: "q" });
+            slow.emit("session.idle", {});
+            await vi.advanceTimersByTimeAsync(HISTORY_READ_MS + 1);
+            expect(slow.sent.at(-1)?.type).toBe("idle");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("logs one turn end for an error, a failed tool, and a conversation closed mid-turn", async () => {
+        const s = scripted();
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "q" });
+        const answer = s.requests[0].tools[0].handler({}, { toolCallId: "c1" });
+        await s.bridge.handle({ type: "tool_result", callId: "c1", ok: false, result: "The query failed." });
+        await answer;
+        s.emit("session.error", { errorType: "rate_limited", message: "Too many requests" });
+        s.emit("session.idle", {});
+        await s.idle();
+        expect(s.ends).toHaveLength(1);
+        expect(s.ends[0]).toMatchObject({ ended: "error", error: "rate_limited", tools: 1, failedTools: 1 });
+
+        await s.bridge.handle({ type: "user", text: "again" });
+        await s.bridge.close();
+        expect(s.ends).toHaveLength(2);
+        expect(s.ends[1]).toMatchObject({ ended: "closed", tools: 0 });
     });
 });
 
