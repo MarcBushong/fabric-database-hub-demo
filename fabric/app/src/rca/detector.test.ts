@@ -87,6 +87,20 @@ describe("the blind detector on the contract's fixtures", () => {
         expect(findEpisodes({ evidence: fixtureEvidence("t1") }, at("16:50:00"), at("17:05:00")).filter((e) => e.family === "errors")).toEqual([]);
     });
 
+    // The real PostgreSQL run (2026-11-20): one deadlock, seen as an event and as a one-sample capture between the counter's samples.
+    it("keeps one deadlock episode, with its count, when the capture's escalation and the event see the same deadlock", () => {
+        const evidence = emptyEvidence();
+        const t = at("22:30:00");
+        evidence.events.push(
+            { target: "T4", at: t, kind: "deadlock", name: "pg_stat_database.deadlocks", count: 1, detail: "1 deadlock(s) in contosocare (pg_stat_database.deadlocks)." },
+            { target: "T4", at: t, kind: "capture", name: "escalated", code: "T4-20261120T223000Z", count: 1, detail: "deadlocks rose by 1 (RCA-PG-03): one blocking sample (RCA-PG-01, RCA-PG-02)." },
+            { target: "T4", at: t, kind: "capture", name: "relaxed", code: "T4-20261120T223000Z", count: 1, detail: "One sample taken: back to the 30-s sentinel." },
+        );
+        const deadlocks = findEpisodes({ evidence }, at("22:25:00"), at("22:35:00")).filter((e) => e.family === "deadlock");
+        expect(deadlocks).toHaveLength(1);
+        expect(deadlocks[0].peak).toBe(1);
+    });
+
     it("prefers T3's 15-second resource rows to Database Hub's bins for its CPU", () => {
         const evidence = emptyEvidence();
         for (let s = 0; s < 40 * 4; s++) {

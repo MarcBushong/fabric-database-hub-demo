@@ -122,8 +122,11 @@ export default function RcaPage() {
     let body;
     if (rca === false) {
         body = (
-            <EmptyState icon={<Warning20Regular />} title="The history model doesn't have the RCA tables yet">
-                <p>`./scripts/deploy.ps1` updates it. Sessions saved before then say "no RCA capture recorded", and the rest of the app works as before.</p>
+            <EmptyState icon={<Warning20Regular />} title="No RCA capture is recorded yet">
+                <p>
+                    The history model reads the Incident RCA's tables once the lakehouse has them, and the next session saved after the update creates them. Until then the rest of the app works as before. In this environment,
+                    FABRIC.SEMANTICMODEL.RCA in the deployment's results says what adds them.
+                </p>
             </EmptyState>
         );
     } else if (rca !== true || !listed) {

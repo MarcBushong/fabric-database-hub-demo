@@ -1,10 +1,11 @@
-// The local preview's Incident RCA (ADR 0031): the contract's two fixture documents, shifted onto the sample session (T1's
-// blocking chain into its second blocking beat, T4's chain and its replica's stall onto the sample's replica lag), answering
-// the RCA's own DAX the way the history model would, with the model's column names. Preview only: Vite builds only
-// index.html, so none of this ships, and the fixtures stay in rca/fixtures (vite.config.ts lets the preview read them).
+// The local preview's Incident RCA (ADR 0031), answering the RCA's own DAX the way the history model would, with the
+// model's column names: T1 from the contract's fixture (shifted into the sample session's second blocking beat), and T4
+// with its replica from a real capture (data/pg-local.evidence.json: the repo's runner against a local PostgreSQL 18.6
+// primary and hot standby on 2026-11-20, a chain, a deadlock, and a replay stall, found blind), shifted onto the sample's
+// replica lag. Preview only: Vite builds only index.html, so none of this ships; vite.config.ts lets it read rca/fixtures.
 
 import t1Text from "../../../../rca/fixtures/t1-blocking-chain.evidence.json?raw";
-import t4Text from "../../../../rca/fixtures/t4-replica-lag.evidence.json?raw";
+import pgText from "./data/pg-local.evidence.json?raw";
 import type { QuerySpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
 import { NEWEST_BIN_DAX } from "@/rca/client";
@@ -19,12 +20,11 @@ interface FixtureDocument {
     tables: Record<string, { rows: number; columns: Record<string, unknown[]> }>;
 }
 
-/** Each target's shift from the fixtures' 20 Nov onto the sample session's 17 Nov. */
-const SHIFT: Record<string, number> = {
-    T1: Date.UTC(2026, 10, 17, 14, 2, 30) - Date.UTC(2026, 10, 20, 16, 52, 30),
-    T4: Date.UTC(2026, 10, 17, 14, 21, 15) - Date.UTC(2026, 10, 20, 17, 11, 15),
-    "T4-replica": Date.UTC(2026, 10, 17, 14, 21, 15) - Date.UTC(2026, 10, 20, 17, 11, 15),
-};
+/** Each document, the targets the preview takes from it, and its shift onto the sample session's 17 Nov. */
+const DOCUMENTS: ReadonlyArray<{ text: string; targets: readonly string[]; shift: number }> = [
+    { text: t1Text, targets: ["T1"], shift: Date.UTC(2026, 10, 17, 14, 2, 30) - Date.UTC(2026, 10, 20, 16, 52, 30) },
+    { text: pgText, targets: ["T4", "T4-replica"], shift: Date.UTC(2026, 10, 17, 14, 22, 0) - Date.UTC(2026, 10, 20, 22, 30, 20) },
+];
 
 const TABLES = Object.keys(RCA_SPEC) as RcaTableKey[];
 
@@ -42,7 +42,8 @@ let cached: Map<string, SampleRow[]> | null = null;
 function modelRows(): Map<string, SampleRow[]> {
     if (cached) return cached;
     const out = new Map<string, SampleRow[]>();
-    for (const doc of [JSON.parse(t1Text) as FixtureDocument, JSON.parse(t4Text) as FixtureDocument]) {
+    for (const { text, targets, shift } of DOCUMENTS) {
+        const doc = JSON.parse(text) as FixtureDocument;
         const epoch = Date.parse(doc.epochUtc);
         for (const key of TABLES) {
             const spec = RCA_SPEC[key];
@@ -55,7 +56,7 @@ function modelRows(): Map<string, SampleRow[]> {
             for (let i = 0; i < table.rows; i++) {
                 const targetIndex = table.columns.target?.[i];
                 const target = typeof targetIndex === "number" ? doc.strings[targetIndex] : "";
-                const shift = SHIFT[target] ?? 0;
+                if (!targets.includes(target)) continue;
                 const row: Row = {};
                 for (const def of Object.values(fields)) {
                     const raw = table.columns[def.lake]?.[i];

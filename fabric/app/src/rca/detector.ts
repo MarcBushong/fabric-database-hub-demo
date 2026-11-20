@@ -330,6 +330,8 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
         const level = rule.family === "replica_lag" ? rule.floor : levelOf(rule, null);
         const hits = samples.filter((s) => meets(s.value, level, rule.strict));
         const peak = samples.reduce<Sample | null>((best, s) => (best === null || (s.value ?? -Infinity) > (best.value ?? -Infinity) ? s : best), null);
+        // A one-sample episode (a deadlock count that rose) can fall between the counter's samples: its escalation states the value.
+        const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
         out.push({
             key: `${c.target}-${family}-${stamp(c.start)}`,
@@ -340,8 +342,8 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
             start: c.start,
             end: c.end,
             last: hits.length ? hits[hits.length - 1].at : c.start,
-            peak: peak?.value ?? 0,
-            peakAt: peak?.at ?? c.start,
+            peak: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? stated : (peak?.value ?? 0),
+            peakAt: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? c.start : (peak?.at ?? c.start),
             level,
             baseline: null,
             valued: samples.length,
@@ -442,7 +444,9 @@ export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episod
     const byBins = episodesFromBins(input.bins ?? []);
     const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null);
     const has = (list: readonly Episode[], target: RcaTarget, family: string) => list.some((e) => e.target === target && e.family === family);
-    const chosen: Episode[] = [...byCapture, ...byRows, ...byEvents];
+    const overlaps = (a: Episode, b: Episode) => a.target === b.target && a.family === b.family && a.start <= (b.end ?? b.last) && b.start <= (a.end ?? a.last);
+    // The events count deadlocks and errors themselves: the capture's own episode for the same minutes would only repeat them.
+    const chosen: Episode[] = [...byCapture.filter((c) => !byEvents.some((e) => overlaps(c, e))), ...byRows, ...byEvents];
     for (const e of byBins) {
         // The capture's blocking episodes replace Database Hub's where the observer captured the target; its CPU rows replace the bins'.
         if (e.family === "blocking" && captured(evidence, e.target, from, to)) continue;
