@@ -212,7 +212,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
             {
                 var count = blocked.Value ?? 0;
                 var change = blocking.Observe(at, count > 0, count <= 0, () => string.Create(CultureInfo.InvariantCulture, $"processes_blocked {count:0} >= 1: blocking detail (RCA-SQL-01, RCA-SQL-02) every {Seconds(Every(Options.BlockingDetail))} s."));
-                Report(blocking, change, at, "processes_blocked 0 for 60 s: back to the 30-s sentinel.");
+                Report(blocking, change, at, $"processes_blocked 0 for {Duration(Options.QuietFor)}: {BackToSentinel}");
                 if (change == EpisodeChange.Started)
                 {
                     nextDetail = now;
@@ -308,7 +308,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         {
             var blocked = sessions.Count(r => (r.Long("blocking_session_id") ?? 0) != 0);
             var change = blocking.Observe(at, blocked > 0, blocked == 0, () => string.Empty, canStart: false);
-            Report(blocking, change, at, "processes_blocked 0 for 60 s: back to the 30-s sentinel.");
+            Report(blocking, change, at, $"processes_blocked 0 for {Duration(Options.QuietFor)}: {BackToSentinel}");
         }
     }
 
@@ -552,7 +552,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
             var median = Median.Of(before);
             var hot = count >= 10 && count >= 3 * median;
             var change = errors.Observe(nextErrorMinute, hot, !hot, () => string.Create(CultureInfo.InvariantCulture, $"errors {count} in the minute from {minute:HH:mm} UTC >= 10 and 3 times the median ({median:0.#}) of the minutes before: one blocking sample (RCA-SQL-01)."));
-            Report(errors, change, nextErrorMinute, "errors under 10 a minute, or 3 times their median, for 5 minutes: back to the 30-s sentinel.");
+            Report(errors, change, nextErrorMinute, $"errors under 10 a minute, or 3 times their median, for {Duration(Options.ErrorQuietFor)}: {BackToSentinel}");
             if (change == EpisodeChange.Started)
             {
                 pendingErrorSample = true;

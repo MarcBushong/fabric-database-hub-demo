@@ -183,7 +183,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         Resource(at, "RCA-PG-10", "reserved_connections", reserved, "count", sentinel);
 
         var lockChange = lockWaits.Observe(at, waiting > 0, waiting <= 0, () => string.Create(CultureInfo.InvariantCulture, $"connections_waiting_lock {waiting:0} >= 1: blocking detail (RCA-PG-01, RCA-PG-02, RCA-PG-11) every {Seconds(Every(Options.BlockingDetail))} s."));
-        Report(lockWaits, lockChange, at, "connections_waiting_lock 0 for 60 s: back to the 30-s sentinel.");
+        Report(lockWaits, lockChange, at, $"connections_waiting_lock 0 for {Duration(Options.QuietFor)}: {BackToSentinel}");
         if (lockChange == EpisodeChange.Started)
         {
             nextLockDetail = now;
@@ -193,7 +193,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         {
             var limit = max - reserved;
             var change = connections.Observe(at, total >= 0.8 * limit, total < 0.7 * limit, () => string.Create(CultureInfo.InvariantCulture, $"client connections {total:0} >= 80 % of {limit:0} (max_connections {max:0} minus {reserved:0} reserved): connection detail (RCA-PG-10) every {Seconds(Every(Options.BlockingDetail))} s."));
-            Report(connections, change, at, string.Create(CultureInfo.InvariantCulture, $"client connections under 70 % of {limit:0} for 60 s: back to the 30-s sentinel."));
+            Report(connections, change, at, string.Create(CultureInfo.InvariantCulture, $"client connections under 70 % of {limit:0} for {Duration(Options.QuietFor)}: {BackToSentinel}"));
         }
 
         nextConnectionDetail = now + Every(Options.BlockingDetail);
@@ -226,7 +226,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         {
             var waiting = activity.Count(a => string.Equals(a.Text("backend_type"), "client backend", StringComparison.Ordinal) && string.Equals(a.Text("wait_event_type"), "Lock", StringComparison.Ordinal));
             var change = lockWaits.Observe(at, waiting > 0, waiting == 0 && locks.Count == 0, () => string.Empty, canStart: false);
-            Report(lockWaits, change, at, "connections_waiting_lock 0 for 60 s: back to the 30-s sentinel.");
+            Report(lockWaits, change, at, $"connections_waiting_lock 0 for {Duration(Options.QuietFor)}: {BackToSentinel}");
         }
     }
 
@@ -247,7 +247,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
             await BlockingSampleAsync(now, detail: false, cancellationToken).ConfigureAwait(false);
         }
 
-        EpisodeEvent(at, "relaxed", id, "One sample taken: back to the 30-s sentinel.");
+        EpisodeEvent(at, "relaxed", id, "One sample taken: " + BackToSentinel);
     }
 
     /// <summary>The first of the replay detail's marks (its start, then every replay-detail interval) after <paramref name="after"/>.</summary>
@@ -394,7 +394,7 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
                 WriteReplica(sample, conflict: null);
             }
 
-            Report(stall, change, sample.At, "since_last_replayed_s below 5 for 3 samples: back to the 30-s sentinel.");
+            Report(stall, change, sample.At, "since_last_replayed_s below 5 for 3 samples: " + BackToSentinel);
             if (change == EpisodeChange.Started)
             {
                 await SettingsAsync(now, cancellationToken).ConfigureAwait(false);
@@ -431,7 +431,7 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
         {
             WriteReplica(sample, conflict);
             var change = stall.Observe(sample.At, false, sample.Since < 5, () => string.Empty, canStart: false);
-            Report(stall, change, sample.At, "since_last_replayed_s below 5 for 3 samples: back to the 30-s sentinel.");
+            Report(stall, change, sample.At, "since_last_replayed_s below 5 for 3 samples: " + BackToSentinel);
         }
     }
 

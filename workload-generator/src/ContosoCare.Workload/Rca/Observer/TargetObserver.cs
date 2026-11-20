@@ -275,6 +275,13 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
 
     protected static string Seconds(TimeSpan interval) => interval.TotalSeconds.ToString("0", CultureInfo.InvariantCulture);
 
+    /// <summary>A quiet time as an episode's end says it: <c>60 s</c>, or <c>5 minutes</c>.</summary>
+    protected static string Duration(TimeSpan interval) =>
+        interval >= TimeSpan.FromMinutes(2) && interval.Seconds == 0 ? string.Create(CultureInfo.InvariantCulture, $"{interval.TotalMinutes:0} minutes") : Seconds(interval) + " s";
+
+    /// <summary>How an episode's end says capture went back: <c>back to the 30-s sentinel.</c></summary>
+    protected string BackToSentinel => $"back to the {Seconds(Options.Sentinel)}-s sentinel.";
+
     protected static DateTimeOffset Earliest(params DateTimeOffset?[] times) => times.Where(t => t is not null).Select(t => t!.Value).DefaultIfEmpty(DateTimeOffset.MaxValue).Min();
 
     private void Throttle(string blockId, TimeSpan elapsed, DateTimeOffset now)
