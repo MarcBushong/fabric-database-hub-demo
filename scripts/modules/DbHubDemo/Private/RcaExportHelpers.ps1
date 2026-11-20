@@ -1277,7 +1277,7 @@ function Invoke-DemoRcaNotebookRun {
         [AllowEmptyString()]
         [string] $Evidence = '',
 
-        [ValidateRange(1, 60)]
+        [ValidateRange(1, 120)]
         [int] $TimeoutMinutes = 15,
 
         [System.Collections.IDictionary] $RunOption = @{}
