@@ -53,8 +53,9 @@ function Test-DemoActivityControl {
     $name = Get-DemoActivityControlName -Config $Config
     $setup = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
     $setup = $setup -replace ' -GrantRole$', ''
-    # The control's setup is part of every deploy.ps1 (ADR 0026); -RotateWebhook stays setup-activity-control.ps1's.
-    $deploy = $setup -replace 'setup-activity-control\.ps1', 'deploy.ps1'
+    # The control's setup is part of every deploy.ps1 (ADR 0026); -RotateWebhook stays setup-activity-control.ps1's. Its
+    # -ConfigPath only when one was given, as T4's fixes say it: validate.ps1 and status.ps1 pass none.
+    $deploy = if ($ConfigPath) { './scripts/deploy.ps1 -ConfigPath {0}' -f $ConfigPath } else { './scripts/deploy.ps1' }
     $version = '2024-10-23'
 
     $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion $version)

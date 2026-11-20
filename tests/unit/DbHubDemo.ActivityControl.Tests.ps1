@@ -1648,6 +1648,15 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty -Because 'validation only reads'
     }
 
+    It 'names deploy.ps1 for a control that isn''t set up, with -ConfigPath only when one was given, since validate.ps1 and status.ps1 pass none (the review of dd5aee1)' {
+        $script:accountExists = $false
+        $setup = @(Test-DemoActivityControl -Config (New-ControlConfig) -NowUtc $script:now) | Where-Object checkId -EQ 'CONTROL.SETUP'
+        $setup.status | Should -Be 'Manual action required'
+        $setup.remediation | Should -BeExactly 'Run ./scripts/deploy.ps1.'
+        $other = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/other.config.json' -NowUtc $script:now) | Where-Object checkId -EQ 'CONTROL.SETUP'
+        $other.remediation | Should -BeExactly 'Run ./scripts/deploy.ps1 -ConfigPath ./config/other.config.json.'
+    }
+
     It 'reports a missing A1 after a redeploy as a Warning with the grant script' {
         $script:assignments.RemoveAt(0)
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)

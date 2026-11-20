@@ -437,6 +437,56 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         (InModuleScope DbHubDemo -Parameters @{ Result = @($noIdentity) } { Get-DemoOwnerGrantNote -Result $Result }).Text | Should -BeNullOrEmpty
     }
 
+    It 'keeps the safety stop''s own note when its role is assigned but out of date, or waits for something other than the grant, and never says then that nothing stops T4 (the review of dd5aee1)' {
+        $config = New-TestConfig -WithT4
+        $grant = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'
+        $outcomeOf = { param([object[]] $Extra) InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + @($Extra); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config } }
+        # Assigned, but another environment's deploy.ps1 on older code wrote the shared role back without T5's container
+        # actions (R910, SafetyStopHelpers.ps1's stale result): the stop still stops the VMs and T4.
+        $missing = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete')
+        $stale = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role is assigned, but the custom role doesn''t have exactly its 9 approved actions.' -Evidence ([ordered]@{ command = $grant; roleDiffers = $true; assigned = $true; missingActions = $missing; extraActions = @() }) -Remediation ('An Owner of the subscription runs, once: {0}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $grant)
+        $staleText = 'so it still stops the VMs, stops T4, and reads T3, but it can''t delete T5''s container between sessions\.'
+        $outcome = & $outcomeOf @($stale)
+        $outcome.Kind | Should -Be 'Done'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'nothing stops T4|can''t stop anything'
+        @($outcome.Notes | Where-Object { $_ -match '^First, once: ' }) | Should -BeNullOrEmpty -Because 'the role is assigned, and nothing else waits for the grant'
+        ($outcome.Notes -join ' ') | Should -Match $staleText
+
+        # The session control's roles wait for the grant too: its note names Run all, never T4, and the stale note stays.
+        $a1 = New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'A1 isn''t in place.' -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $grant)
+        $outcome = & $outcomeOf @($stale, $a1)
+        $outcome.Notes[0] | Should -Be ('First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, Run all can''t run a whole session (from a PC, ./scripts/start-demo.ps1 works).' -f $grant)
+        ($outcome.Notes -join ' ') | Should -Match $staleText
+
+        # The control's roles wait for the grant, and the safety stop's role for something else (no identity yet): DONE still
+        # says that the safety stop isn't in place.
+        $noIdentity = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The identity doesn''t exist yet.' -Remediation 'Run ./scripts/deploy.ps1, which creates the identity and assigns the role when you may.'
+        $outcome = & $outcomeOf @($noIdentity, $a1)
+        $outcome.Notes[0] | Should -Match '^First, once: .* Until then, Run all can''t run a whole session \(from a PC, \./scripts/start-demo\.ps1 works\)\.$'
+        @($outcome.Notes | Where-Object { $_ -match '^The nightly safety stop ' }).Count | Should -Be 1
+    }
+
+    It 'names only the scripts for each session while Run all isn''t ready: Fabric skipped, or the notebook not in Fabric yet (the review of dd5aee1)' {
+        $config = New-TestConfig -WithT4
+        $scripts = 'Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.'
+        $sessionLine = { param([object] $Outcome) @(InModuleScope DbHubDemo -Parameters @{ Outcome = $Outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Where-Object { $_ -like 'Each session*' } }
+        # -SkipFabric: this run didn't put the control's notebook in Fabric.
+        $skipped = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4 -SkipFabric); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -SkipFabric }
+        # DEPLOY.CONTROL says the notebook isn't in Fabric yet, and the control's note says what it needs.
+        $control = New-DemoResult -CheckId 'DEPLOY.CONTROL' -Area 'workload' -Target 'fabric' -Status 'Warning' -Message 'NB_DatabaseHub_Control isn''t in Fabric yet: NB_DatabaseHub_Control wasn''t put in Fabric.' -Evidence ([ordered]@{ notebook = 'NB_DatabaseHub_Control'; place = 'the workspace "Database Hub Demo"'; resourceGroup = 'rg-dbhub-control'; ready = $false }) -Remediation 'Run ./scripts/deploy.ps1 again; it sets the session control up each time.'
+        $waiting = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + @($control); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        foreach ($outcome in $skipped, $waiting) {
+            $outcome.Kind | Should -Be 'Done' -Because 'neither keeps the deployment from DONE'
+            & $sessionLine $outcome | Should -Be $scripts
+        }
+        $skipped.SessionReady | Should -BeFalse
+        $waiting.SessionReady | Should -BeFalse
+        # Without DEPLOY.CONTROL in this run, DONE names Run all, as before.
+        $ready = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $ready.SessionReady | Should -BeTrue
+        & $sessionLine $ready | Should -Match '^Each session: open NB_DatabaseHub_Control and select Run all: '
+    }
+
     It 'is DONE, naming the Insights app as a failure that doesn''t block DONE with its reason and fix, when its prerequisites aren''t met (2026-11-05)' {
         $config = New-TestConfig -WithT4
         $result = @(New-DoneResult -WithT4) + @(

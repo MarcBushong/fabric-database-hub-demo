@@ -822,8 +822,10 @@ function Get-DemoOwnerGrantNote {
     The first note of DONE and NOT DONE when the person who ran deploy.ps1 couldn't assign the roles (2026-11-19, S7):
     an Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once, which grants the nightly safety stop's and
     the session control's roles together, and what waits for it, from this run's SAFETYSTOP.ROLE, CONTROL.ROLE.*, and
-    DEPLOY.T5.LIFECYCLE results. Returns Text and SessionWaits (Run all waits for the control's roles); Text is empty when
-    nothing waits for that grant. Pure. Internal.
+    DEPLOY.T5.LIFECYCLE results. Returns Text, SessionWaits (Run all waits for the control's roles), and StopCovered (Text
+    says the safety stop's role waits for the grant, so DONE leaves the safety stop's own note out); Text is empty when
+    nothing waits for that grant. A safety stop role that's assigned but out of date (R910) isn't counted: the stop still
+    stops T4, and the safety stop's own note says what it can't do (the review of dd5aee1). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -835,10 +837,12 @@ function Get-DemoOwnerGrantNote {
     $all = @($Result | Where-Object { $null -ne $_ })
     $grantPattern = '\./scripts/grant-safety-stop\.ps1(?: -ConfigPath [^\s;]+)?'
     $needsGrant = { param($Item) [string]$Item.status -in 'Warning', 'Fail', 'Manual action required' -and [string](Get-DemoMemberValue -InputObject $Item -Name 'remediation') -match $grantPattern }
-    $stopRole = @($all | Where-Object { [string]$_.checkId -eq 'SAFETYSTOP.ROLE' } | Select-Object -Last 1 | Where-Object { & $needsGrant $_ })
+    # Assigned but out of date (R910: another environment's older deploy.ps1 wrote the shared role back): it isn't missing.
+    $assigned = { param($Item) [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Item -Name 'evidence') -Name 'assigned') }
+    $stopRole = @($all | Where-Object { [string]$_.checkId -eq 'SAFETYSTOP.ROLE' } | Select-Object -Last 1 | Where-Object { (& $needsGrant $_) -and -not (& $assigned $_) })
     $controlRoles = @($all | Where-Object { [string]$_.checkId -like 'CONTROL.ROLE.*' -and (& $needsGrant $_) })
     if ($stopRole.Count -eq 0 -and $controlRoles.Count -eq 0) {
-        return [pscustomobject]@{ Text = ''; SessionWaits = $false }
+        return [pscustomobject]@{ Text = ''; SessionWaits = $false; StopCovered = $false }
     }
     $command = if ($stopRole.Count) { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $stopRole[0] -Name 'evidence') -Name 'command') } else { '' }
     if (-not $command) {
@@ -861,7 +865,7 @@ function Get-DemoOwnerGrantNote {
     }
     $list = if ($waits.Count -le 2) { $waits -join ' and ' } else { '{0}, and {1}' -f ($waits[0..($waits.Count - 2)] -join ', '), $waits[-1] }
     $text = 'First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, {1}.' -f $command, $list
-    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$controlRoles.Count }
+    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$controlRoles.Count; StopCovered = [bool]$stopRole.Count }
 }
 
 function Get-DemoT4OffReason {
@@ -1641,11 +1645,12 @@ function Get-DemoDeploymentOutcome {
         $notes.Add($t4CreateCost)
     }
     # The nightly safety stop (ADR 0024), said plainly when this run set it up only in part, such as without its role. Only
-    # its role missing is the grant's note above, so it isn't said twice.
+    # its role waiting for the Owner's grant is the grant's note above (StopCovered), so it isn't said twice; a role that's
+    # assigned but out of date, or that waits for something else, keeps this note (the review of dd5aee1).
     $safetyStop = Get-DemoSafetyStopNote -Result $all
     $stopProblems = @($all | Where-Object { [string]$_.checkId -like 'SAFETYSTOP.*' -and [string]$_.status -in 'Warning', 'Fail', 'Manual action required' })
     $onlyRole = $stopProblems.Count -eq 1 -and [string]$stopProblems[0].checkId -eq 'SAFETYSTOP.ROLE'
-    if ($safetyStop -and -not ($grant.Text -and $onlyRole)) {
+    if ($safetyStop -and -not ($grant.StopCovered -and $onlyRole)) {
         $notes.Add($safetyStop)
     }
     # The busy marker (2026-11-14): the nightly stop waited for this run, and when the demo stops tonight.
@@ -1695,7 +1700,10 @@ function Get-DemoDeploymentOutcome {
     $controlResult = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.CONTROL' }) | Select-Object -Last 1
     $controlEvidence = if ($null -ne $controlResult) { Get-DemoMemberValue -InputObject $controlResult -Name 'evidence' } else { $null }
     $sessionPlace = if ([bool](Get-DemoMemberValue -InputObject $controlEvidence -Name 'ready')) { [string](Get-DemoMemberValue -InputObject $controlEvidence -Name 'place') } else { '' }
-    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume; SessionPlace = $sessionPlace; SessionWaitsForGrant = [bool]$grant.SessionWaits }
+    # Whether that line can name Run all: not when this run skipped the control's Fabric part (-SkipFabric), or when
+    # DEPLOY.CONTROL says the notebook isn't ready; then it names the scripts only (the review of dd5aee1).
+    $sessionReady = -not $SkipFabric -and ($null -eq $controlResult -or [bool](Get-DemoMemberValue -InputObject $controlEvidence -Name 'ready'))
+    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume; SessionPlace = $sessionPlace; SessionReady = $sessionReady; SessionWaitsForGrant = [bool]$grant.SessionWaits }
     if ($WhatIfRun) {
         $outcome.Kind = 'WhatIf'
         $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 0 }
@@ -1909,10 +1917,15 @@ function Get-DemoDeploymentOutcomeLine {
                 $lines.Add($activityLine)
             }
             # Each session is one Run all (2026-11-19, ADR 0026); the scripts stay the way from a PC. While the session
-            # control's roles wait for an Owner (the first note), Run all waits too.
+            # control's roles wait for an Owner (the first note), Run all waits too; while its notebook isn't ready (this run
+            # skipped Fabric, or the control's note says what it needs), only the scripts are named (the review of dd5aee1).
             $place = [string](Get-DemoMemberValue -InputObject $Outcome -Name 'SessionPlace')
             $runAll = 'open NB_DatabaseHub_Control{0} and select Run all: it starts everything, runs the showcase, and stops it all at the end' -f $(if ($place) { ' in ' + $place } else { '' })
-            if ([bool](Get-DemoMemberValue -InputObject $Outcome -Name 'SessionWaitsForGrant')) {
+            $sessionReady = Get-DemoMemberValue -InputObject $Outcome -Name 'SessionReady'
+            if ($null -ne $sessionReady -and -not [bool]$sessionReady) {
+                $lines.Add('Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
+            }
+            elseif ([bool](Get-DemoMemberValue -InputObject $Outcome -Name 'SessionWaitsForGrant')) {
                 $lines.Add(('Each session, once that grant is done: {0}. Until then, from a PC: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.' -f $runAll))
             }
             else {
