@@ -6344,6 +6344,118 @@ function Invoke-DbHubCapture {
 
 $script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5')
 
+# How long after a session's planned end its stop still counts as that end when a start-demo.ps1 session took over from it
+# (Get-DbHubSessionTakeover): the notebook sends it within a minute or two of the end, and its job starts minutes later.
+$script:DbHubTakeoverEndMinutes = 30
+
+function Get-DbHubSessionTakeover {
+    <#
+    .SYNOPSIS
+    Whether a session's own end finds a start-demo.ps1 session that took over from it (2026-11-20, the owner's follow-up):
+    start-demo.ps1 replaces a running session's auto-stop with its own ($script:DbHubStartDemoMarker in the schedule's
+    description) and leaves the session's busy marker, so at the session's planned end, the control notebook's stop with the
+    session's ID stopped the demo under the newer session. Returns AutoStopUtc and RunEndUtc when the stop is for
+    SessionId, at that session's planned end (from two minutes before its runEndUtc in the status copy, for the clocks, to
+    $script:DbHubTakeoverEndMinutes after it, for a job that starts late), and the pending auto-stop is start-demo.ps1's,
+    later than now; $null otherwise, and the stop goes on as before. The notebook's end and its Stop now send the same
+    request, so an explicit Stop now before or well after the planned end, from the notebook or the Insights app, still
+    stops everything, and so does Stop now again after a taken-over end, whose status says it stopped.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowEmptyString()]
+        [string] $SessionId = ''
+    )
+
+    if ($SessionId -notmatch '^[0-9a-f]{32}$') {
+        return $null
+    }
+    $status = Read-DbHubSessionStatusCopy -Context $Context
+    if ($null -eq $status -or [string]$status['sessionId'] -ne $SessionId) {
+        return $null
+    }
+    $runEnd = ConvertTo-DbHubUtc -Value $status['runEndUtc']
+    if ($null -eq $runEnd -or $Context.NowUtc -lt $runEnd.AddMinutes(-2) -or $Context.NowUtc -gt $runEnd.AddMinutes($script:DbHubTakeoverEndMinutes)) {
+        return $null
+    }
+    $settings = $Context.Settings
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
+    $schedule = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/schedules/{1}' -f (Get-DbHubAccountPath -Settings $settings), $settings.autoStopSchedule) -ApiVersion $version
+    if ($schedule.StatusCode -ne 200) {
+        return $null
+    }
+    $properties = Get-DbHubMember -InputObject $schedule.Body -Name 'properties'
+    if (-not ([string](Get-DbHubMember -InputObject $properties -Name 'description')).StartsWith($script:DbHubStartDemoMarker, [System.StringComparison]::Ordinal)) {
+        return $null
+    }
+    $autoStop = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $properties -Name 'startTime')
+    if ($null -eq $autoStop -or $autoStop -le $Context.NowUtc) {
+        return $null
+    }
+    return [pscustomobject]@{ AutoStopUtc = $autoStop; RunEndUtc = $runEnd }
+}
+
+function Complete-DbHubTakenOverSession {
+    <#
+    .SYNOPSIS
+    A session's own end after a start-demo.ps1 session took over from it (Get-DbHubSessionTakeover, 2026-11-20): the newer
+    session's auto-stop wins, so nothing is stopped. The session still ends: T4's, its replica's, and T5's metrics are
+    saved for its history (Save-DbHubSessionMetric), its busy marker is cleared when it's still this session's, so the
+    nightly stop goes on as usual for the start-demo.ps1 session, and its status says it stopped, with takenOver (who, and
+    the auto-stop's time) and its plan (Write-DbHubStopStatus), so the control notebook saves its history. The VMs, T4,
+    its read replica, T5's container, and start-demo.ps1's auto-stop stay as they are. Returns the stop's result, status
+    TakenOver.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Takeover
+    )
+
+    $settings = $Context.Settings
+    $until = $Takeover.AutoStopUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $done.Add(('nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at {0}' -f $until))
+    $metricsStatus = ''
+    $metricsMessage = ''
+    if (Test-DbHubSessionCapable -Settings $settings) {
+        $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId
+        $metricsStatus = [string]$saved.Status
+        $metricsMessage = [string]$saved.Message
+        if ($saved.Status -in 'Pass', 'Warning') {
+            $done.Add('the history''s metrics saved to the control vault')
+        }
+        else {
+            $done.Add(('the history''s metrics not saved ({0})' -f $saved.Message))
+        }
+    }
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
+    if ($busy.By -eq 'session' -and [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId') -eq $SessionId) {
+        $cleared = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubBusyUntilUtc = ''; DbHubBusyBy = '' }
+        if ($cleared.Ok) {
+            $done.Add('busy marker cleared')
+        }
+        else {
+            Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
+        }
+    }
+    $message = 'The session''s end: a start-demo.ps1 session took over from it, so nothing was stopped; that session''s auto-stop stops the demo at {0}, and Stop now again, or ./scripts/stop-demo.ps1, stops it sooner.' -f $until
+    Write-DbHubLog -Context $Context -Message $message
+    $stopped = [pscustomobject]@{ Done = $done.ToArray(); Failed = @(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; T5Status = '' }
+    Write-DbHubStopStatus -Context $Context -Tags $Tags -SessionId $SessionId -Stopped $stopped -By 'session end' -TakenOver ([ordered]@{ by = 'start-demo'; autoStopUtc = $until })
+    return [pscustomobject]@{ action = 'stop'; status = 'TakenOver'; message = $message; done = $stopped.Done; failed = @(); t5Status = ''; autoStopUtc = $until }
+}
+
 function Write-DbHubStopStatus {
     # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
     # what failed, for the control notebook. Only when a session is known (the request's or the group's DbHubSessionId).
@@ -6366,7 +6478,10 @@ function Write-DbHubStopStatus {
         [object] $Stopped,
 
         [Parameter(Mandatory = $true)]
-        [string] $By
+        [string] $By,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $TakenOver = $null
     )
 
     if (-not (Test-DbHubSessionCapable -Settings $Context.Settings)) {
@@ -6380,6 +6495,10 @@ function Write-DbHubStopStatus {
         return
     }
     $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') }; planKept = $false }
+    # A session whose end found a start-demo.ps1 session that took over (2026-11-20): who, and when that one stops.
+    if ($null -ne $TakenOver) {
+        $status['takenOver'] = $TakenOver
+    }
     $earlier = Read-DbHubSessionStatusCopy -Context $Context
     if ($null -ne $earlier -and [string]$earlier['sessionId'] -eq $session) {
         foreach ($name in $script:DbHubStopStatusPlan) {
@@ -6425,6 +6544,12 @@ function Invoke-DbHubControl {
         return [pscustomobject]@{ action = $request.Action; status = 'NoEnvironment'; message = ('Nothing was done: {0}.' -f $why) }
     }
     if ($request.Action -eq 'stop') {
+        # A session's own end after a start-demo.ps1 session took over from it (2026-11-20): the newer session's auto-stop
+        # wins, so nothing is stopped, and the session ends with its metrics saved and its busy marker cleared.
+        $takeover = Get-DbHubSessionTakeover -Context $Context -SessionId $request.SessionId
+        if ($null -ne $takeover) {
+            return (Complete-DbHubTakenOverSession -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Takeover $takeover)
+        }
         $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -SessionId $request.SessionId
         $status = 'Stopped'
         $failedText = ''

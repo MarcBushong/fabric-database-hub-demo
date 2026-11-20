@@ -1485,6 +1485,81 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($script:calls | Where-Object { $_.Path -match '/runCommands' }) | Should -BeNullOrEmpty
     }
 
+    It 'ends a session that a start-demo.ps1 session took over without stopping the demo at its planned end, and an explicit Stop now before it still stops everything (2026-11-20)' {
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        $runEnd = ([datetime]$running.runEndUtc).ToUniversalTime()
+        # start-demo.ps1 takes over: its own auto-stop replaces the session's, 4 hours after its start, and the session's
+        # backup auto-stop goes; the session's busy marker stays (Resolve-DemoBusyNightlyStop leaves a running session's).
+        $takeoverUtc = $runEnd.AddMinutes(-30)
+        $script:autostop = $takeoverUtc.AddHours(4).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at {0:yyyy-MM-ddTHH:mm:ssZ}.' -f $takeoverUtc
+        $script:backup = ''
+        $script:backupDescription = ''
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:calls.Clear()
+
+        # The control notebook's stop at the session's planned end (WAIT_FOR_END): the newer session's auto-stop wins.
+        $script:clock = $runEnd.AddSeconds(30)
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc $script:clock)
+        $result.status | Should -Be 'TakenOver'
+        $result.message | Should -Match ('a start-demo\.ps1 session took over from it, so nothing was stopped; that session''s auto-stop stops the demo at {0}' -f [regex]::Escape($script:autostop))
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty -Because 'the start-demo.ps1 session keeps the VMs'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/containers/patient-events$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/schedules/' }) | Should -BeNullOrEmpty -Because 'start-demo.ps1''s auto-stop stays'
+        $script:autostop | Should -Not -BeNullOrEmpty
+        $script:replica | Should -Be 'Ready'
+        $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty -Because 'the session ended, so the nightly stop goes on as usual'
+        $script:groupTags['DbHubBusyBy'] | Should -BeNullOrEmpty
+        $metrics = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json)
+        $metrics.sessionId | Should -Be $script:sessionId
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        $stopped.stoppedBy | Should -Be 'session end'
+        $stopped.takenOver.by | Should -Be 'start-demo'
+        ([datetime]$stopped.takenOver.autoStopUtc).ToUniversalTime() | Should -Be ([datetime]$script:autostop).ToUniversalTime()
+        $stopped.planKept | Should -BeTrue -Because 'the notebook saves the session''s history with its beats'
+        @($stopped.done)[0] | Should -Match '^nothing stopped: a start-demo\.ps1 session took over from this one'
+
+        # An explicit Stop now before a taken-over session's planned end (the notebook's or the Insights app's) stops
+        # everything, as the person asked.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210' }) -Context (New-TestContext -NowUtc $script:clock)
+        $second = Get-SessionStatus
+        $second.phase | Should -Be 'running'
+        $script:autostop = ([datetime]$second.runEndUtc).ToUniversalTime().AddHours(2).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start.'
+        $script:clock = ([datetime]$second.runEndUtc).ToUniversalTime().AddMinutes(-40)
+        $script:calls.Clear()
+        $explicit = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = 'fedcba9876543210fedcba9876543210' }) -Context (New-TestContext -NowUtc $script:clock)
+        $explicit.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty -Because 'Stop now removes the pending auto-stop and stops the demo itself'
+        (Get-SessionStatus).PSObject.Properties.Name | Should -Not -Contain 'takenOver'
+
+        # So does one well after the planned end of a taken-over session whose end sent no stop (the notebook's Stop now
+        # sends the session's ID for 7 days after an unstopped end): only the end itself lets the newer session win.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = '0123456789abcdef0123456789abcdef' }) -Context (New-TestContext -NowUtc $script:clock)
+        $third = Get-SessionStatus
+        $third.phase | Should -Be 'running'
+        $script:autostop = ([datetime]$third.runEndUtc).ToUniversalTime().AddHours(2).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start.'
+        $script:clock = ([datetime]$third.runEndUtc).ToUniversalTime().AddMinutes(45)
+        $script:calls.Clear()
+        $late = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = '0123456789abcdef0123456789abcdef' }) -Context (New-TestContext -NowUtc $script:clock)
+        $late.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty
+    }
+
     It 'the auto-stop does the same, and writes its stop to the session the group names' {
         $script:t4 = 'Ready'
         $script:replica = 'Ready'

@@ -282,6 +282,15 @@ def runbook(body):
         session = body.get("sessionId") or ""
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
+        if scenario == "takenover" and session:
+            # A start-demo.ps1 session took over from this one (2026-11-20): the runbook stops nothing at its end, and says
+            # when that session's auto-stop stops the demo (Complete-DbHubTakenOverSession).
+            until = iso(Clock.now + real_dt.timedelta(hours=3))
+            VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "session end", "failed": [],
+                                                        "done": ["nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at " + until,
+                                                                 "the history's metrics saved to the control vault", "busy marker cleared"],
+                                                        "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."},
+                                                        "takenOver": {"by": "start-demo", "autoStopUtc": until}})
         if session:
             accepted = RUNBOOK["accepted"] or Clock.now
             document = {"version": 1, "sessionId": session, "capturedUtc": iso(Clock.now), "startUtc": iso(accepted), "endUtc": iso(Clock.now),
@@ -980,6 +989,22 @@ print(json.dumps(out))
         $report.printed | Should -Match 'Pass: the history is saved'
     }
 
+    It 'says that a start-demo.ps1 session took over at the session''s end, stops nothing, and still saves the session''s history (2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenover' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        $report.printed | Should -Match 'Taken over: a start-demo\.ps1 session runs the demo now, so nothing was stopped; its auto-stop stops it at \d\d:\d\d \(UTC\), and Stop now again, or \./scripts/stop-demo\.ps1, stops it sooner\. This session''s history is saved below\.'
+        $report.printed | Should -Match 'Done: the history''s metrics saved to the control vault\.'
+        $report.printed | Should -Not -Match 'Stopped: nothing stopped'
+        $report.printed | Should -Not -Match 'the VMs and T4 are already stopped'
+        $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive \(until \d\d:\d\d\)\.'
+        @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any end'
+        $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
+    }
     It 'saves the history of another environment''s session with that environment''s names, not the activity notebook''s defaults' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
