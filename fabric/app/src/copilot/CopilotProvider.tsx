@@ -7,8 +7,8 @@ import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useSta
 import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
-import { clearConversation, contextPrompt, loadAskSettings, loadConversation, recap, reduceConversation, saveConversation, toMarkdown, type AskSettings } from "./conversation";
-import type { EstateView } from "./estate";
+import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings } from "./conversation";
+import type { EstateAnswer, EstateView } from "./estate";
 import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
@@ -70,6 +70,10 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     /** The token the open conversation started with: a renewed token starts a new conversation at the next question. */
     const connectionToken = useRef<string | null>(null);
     const runner = useRef<ToolRunner | null>(null);
+    /** Set once the estate function said the live view isn't available: the rest of the conversation answers from history. */
+    const liveUnavailable = useRef<string | null>(null);
+    /** Copilot's text since its last query, by message: what suggest_followups checks before it ends a turn (R925). */
+    const answerText = useRef(new Map<string, number>());
     const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const signInRun = useRef<{ cancelled: boolean } | null>(null);
     const turnsRef = useRef(turns);
@@ -247,9 +251,11 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         (event: RelayEvent) => {
             switch (event.type) {
                 case "delta":
+                    answerText.current.set(event.messageId, (answerText.current.get(event.messageId) ?? 0) + event.text.length);
                     dispatch({ type: "delta", messageId: event.messageId, text: event.text });
                     break;
                 case "message":
+                    answerText.current.set(event.messageId, event.text.trim().length);
                     dispatch({ type: "message", messageId: event.messageId, text: event.text });
                     break;
                 case "usage":
@@ -258,6 +264,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 case "tool_call": {
                     const conn = connection.current;
                     const run = runner.current;
+                    // Text before a query is Copilot saying what it will check; the answer is what it writes after.
+                    if (event.name === "run_dax" || event.name === "estate_overview") answerText.current.clear();
                     if (!conn || !run) break;
                     void run.run(event.name, event.arguments).then((outcome) => conn.toolResult(event.callId, outcome.ok, outcome.text));
                     break;
@@ -295,6 +303,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             setConnecting(true);
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
+                // A conversation that learned the live view isn't available doesn't offer it again, even on a new session.
+                const live = liveUnavailable.current;
                 runner.current = createToolRunner({
                     runDax: async (query, rowLimit) => {
                         if (!queryClient) throw new Error("The history connector isn't ready yet.");
@@ -304,10 +314,16 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     estate: settings.estate
                         ? async (view) => {
                               const { readEstate } = await import("./estate");
-                              const answer = await readEstate(view as EstateView);
-                              return { source: answer.source, data: { scope: answer.scope, data: answer.data, errors: answer.errors, at: answer.at } };
+                              // unavailable: the function's plain sentence when no route answered for an authentication reason.
+                              const answer = (await readEstate(view as EstateView)) as EstateAnswer & { unavailable?: string };
+                              return { source: answer.source, data: answer.data, errors: answer.errors, at: answer.at, unavailable: answer.unavailable };
                           }
                         : undefined,
+                    liveOff: () => liveUnavailable.current,
+                    onLiveUnavailable: (reason) => {
+                        liveUnavailable.current = reason;
+                    },
+                    answered: () => [...answerText.current.values()].some((chars) => chars > 0),
                     onDax: (run) => dispatch({ type: "dax", run }),
                     onChart: (chart, run) => dispatch({ type: "chart", chart, runId: run.id }),
                     onFollowups: (questions) => dispatch({ type: "followups", questions }),
@@ -315,11 +331,11 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 });
                 const earlier = recap(turnsRef.current.slice(0, -2));
                 const systemMessage =
-                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup }) +
+                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup, liveUnavailable: live ?? undefined }) +
                     (earlier ? `\n\n# Earlier in this conversation (the previous session ended; continue from it)\n${earlier}` : "");
                 const conn = new ChatConnection(relay.chatUrl(), handleEvent);
                 try {
-                    await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate }) });
+                    await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate && !live }) });
                 } catch (err) {
                     // Nothing of a failed start stays open: no socket and no pings.
                     conn.close();
@@ -335,15 +351,11 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         [disconnect, handleEvent, queryClient, relay, settings],
     );
 
-    const send = useCallback(
-        (text: string, ctx?: AskContext | null) => {
-            const prompt = ctx ? contextPrompt({ ...ctx, prompt: text || ctx.prompt }) : text.trim();
-            if (!prompt || busy || plan.ok === false) return;
-            setAttached(null);
-            const shown = (text || ctx?.prompt || (ctx?.title ? `Explain "${ctx.title}"` : prompt)).trim();
-            dispatch({ type: "user", id: newId("u"), text: shown, from: ctx ? { title: ctx.title, page: ctx.page } : undefined, at: Date.now() });
-            dispatch({ type: "assistant-start", id: newId("a"), at: Date.now() });
+    /** Sends one prompt on the conversation, starting a session when there's none; the current assistant turn gets the answer. */
+    const deliver = useCallback(
+        (prompt: string) => {
             setBusy(true);
+            answerText.current.clear();
             if (idleTimer.current) clearTimeout(idleTimer.current);
             void (async () => {
                 try {
@@ -368,8 +380,32 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 }
             })();
         },
-        [busy, disconnect, ensureConnection, freshToken, plan.ok],
+        [disconnect, ensureConnection, freshToken],
     );
+
+    const send = useCallback(
+        (text: string, ctx?: AskContext | null) => {
+            const prompt = ctx ? contextPrompt({ ...ctx, prompt: text || ctx.prompt }) : text.trim();
+            if (!prompt || busy || plan.ok === false) return;
+            setAttached(null);
+            const shown = (text || ctx?.prompt || (ctx?.title ? `Explain "${ctx.title}"` : prompt)).trim();
+            dispatch({ type: "user", id: newId("u"), text: shown, from: ctx ? { title: ctx.title, page: ctx.page } : undefined, at: Date.now() });
+            dispatch({ type: "assistant-start", id: newId("a"), at: Date.now() });
+            deliver(prompt);
+        },
+        [busy, deliver, plan.ok],
+    );
+
+    /** Retry for a turn that ended without an answer: the same conversation is asked to write it, in the same turn (R925). */
+    const retry = useCallback(() => {
+        if (busy || plan.ok === false) return;
+        const all = turnsRef.current;
+        const last = all[all.length - 1];
+        if (!last || last.role !== "assistant" || !endedWithoutAnswer(last)) return;
+        const question = [...all].reverse().find((t) => t.role === "user");
+        dispatch({ type: "resume" });
+        deliver(retryPrompt(question?.role === "user" ? question.text : ""));
+    }, [busy, deliver, plan.ok]);
 
     const stop = useCallback(() => {
         connection.current?.abort();
@@ -381,6 +417,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         dispatch({ type: "reset" });
         clearConversation(perTab());
         setAttached(null);
+        // A new conversation tries the live view again.
+        liveUnavailable.current = null;
     }, [disconnect]);
 
     const cancelSignIn = useCallback(() => {
@@ -539,6 +577,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const chat: ChatController = {
         state: chatState,
         send,
+        retry,
         stop,
         newChat,
         signInWithGitHub,

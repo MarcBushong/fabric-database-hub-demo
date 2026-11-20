@@ -36,11 +36,28 @@ export interface EstateCall {
     at: Date;
 }
 
+/** One view of the live estate, as the app's estate function answers it (EstateAnswer in rayfin/functions). */
+export interface EstateToolAnswer {
+    /** The Database Hub routes that answered. */
+    source: string[];
+    data: unknown;
+    /** One plain sentence when the live view isn't available to the app: no route answered, for an authentication reason. */
+    unavailable?: string;
+    /** Per-route reasons, for the function's own log: never passed to Copilot or shown in the dock. */
+    errors?: string[];
+    at?: string;
+}
+
 export interface AskToolDeps {
     /** Runs DAX through the history connector; resolves to rows keyed by column name, or throws a plain-language Error. */
     runDax: (query: string, rowLimit: number) => Promise<ContextRow[]>;
     /** The live estate function, when it's deployed. */
-    estate?: (view: string) => Promise<{ source: string[]; data: unknown }>;
+    estate?: (view: string) => Promise<EstateToolAnswer>;
+    /** Why the live view is off for the rest of this conversation, once the estate function said it isn't available. */
+    liveOff?: () => string | null;
+    onLiveUnavailable?: (reason: string) => void;
+    /** Whether Copilot has written answer text since its last query; suggest_followups reminds it when it hasn't (R925). */
+    answered?: () => boolean;
     onDax?: (run: DaxRun) => void;
     onChart?: (chart: ChartSpec, run: DaxRun) => void;
     onFollowups?: (questions: string[]) => void;
@@ -53,6 +70,32 @@ export interface ToolOutcome {
     /** What Copilot reads. */
     text: string;
 }
+
+/** Plain words for a live view that didn't answer, for Copilot and the dock: never routes or HTTP codes (R925). */
+export const LIVE_UNAVAILABLE = "Database Hub's live view isn't available to the app right now.";
+export const LIVE_NO_ANSWER = "Database Hub's live view didn't answer just now.";
+const FROM_HISTORY = "Answer from the history model (run_dax), and say in plain words that the live view didn't answer; never quote error codes or routes.";
+const liveOffText = (reason: string) =>
+    `${reason} Don't call estate_overview again in this conversation. Answer from the history model (run_dax), say in plain words that the live view isn't available, and point the viewer to Database Hub's own pages in the Fabric portal for the live state.`;
+/** The function's sentence, unless it carries what an audience shouldn't see (an HTTP code or a route): then the dock's own. */
+const plainReason = (text: string) => {
+    if (/\bHTTP\b|\b(40[0-9]|429|5\d\d)\b|(^|\s)\/[A-Za-z]/.test(text)) return LIVE_UNAVAILABLE;
+    const trimmed = text.trim().slice(0, 200);
+    return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+};
+
+// The parts of the live view, by the route that reads them, in plain words for an answer that came back in part.
+const LIVE_PARTS: Array<[RegExp, string]> = [
+    [/savedView\/resources/i, "the inventory"],
+    [/health\/v2\/filtered-summary/i, "the SQL health summary"],
+    [/health\/v2\/filtered-usage/i, "the SQL usage details"],
+    [/postgreSql\/health/i, "the PostgreSQL health"],
+    [/cosmosDb\/health/i, "the Cosmos DB health"],
+    [/auth\/warnings/i, "the Microsoft Entra authentication findings"],
+    [/auditing\/warnings/i, "the auditing findings"],
+    [/cmk\/warnings/i, "the customer-managed key findings"],
+];
+const missingParts = (errors: string[]) => [...new Set(errors.map((e) => LIVE_PARTS.find(([part]) => part.test(e))?.[1] ?? "another part of the live view"))];
 
 // The units ChartView reads (contract.ts), by the names the model picks from.
 const UNITS: Record<string, string> = { percent: "%", seconds: "s", milliseconds: "ms", minutes: "min", mb: "MB", gb: "GB", count: "count", number: "" };
@@ -101,7 +144,8 @@ export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
         },
         {
             name: "suggest_followups",
-            description: "Shows two to four short follow-up questions as buttons the viewer can select. Call it once, at the end of every answer.",
+            description:
+                "Shows two to four short follow-up questions as buttons under your answer. Call it once, after you've written the answer itself as text: it adds buttons and never replaces the answer.",
             parameters: {
                 type: "object",
                 properties: { questions: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4 } },
@@ -228,24 +272,48 @@ export function createToolRunner(deps: AskToolDeps) {
         const questions = Array.isArray(args.questions) ? args.questions.map((q) => str(q, 200)).filter(Boolean).slice(0, 4) : [];
         if (questions.length === 0) return { ok: false, text: "questions is empty." };
         deps.onFollowups?.(questions);
-        return { ok: true, text: "Shown." };
+        // The live turn of 2026-11-19 ended here with no answer text (R925): when nothing's written since the last query, say so.
+        if (deps.answered && !deps.answered()) {
+            return { ok: true, text: "Shown under your answer. You haven't written the answer itself yet: write it now as text, from the results above." };
+        }
+        return { ok: true, text: "Shown under your answer." };
     }
 
     async function estateOverview(args: Record<string, unknown>): Promise<ToolOutcome> {
         if (!deps.estate) return { ok: false, text: "The live estate isn't available in this deployment. Answer from the history (run_dax) and say so." };
+        // Once the function said the live view isn't available, the rest of the conversation doesn't call it again.
+        const off = deps.liveOff?.();
+        if (off) return { ok: false, text: liveOffText(off) };
         const view = (ESTATE_VIEWS as readonly string[]).includes(str(args.view)) ? str(args.view) : "inventory";
         const id = `e${++n}`;
         const started = now();
+        let answer: EstateToolAnswer;
         try {
-            const { source, data } = await deps.estate(view);
-            deps.onEstate?.({ id, view, source, result: data, ms: now() - started, at: new Date(started) });
-            const text = JSON.stringify({ view, source, data });
-            return { ok: true, text: text.length > RESULT_CHARS ? `${text.slice(0, RESULT_CHARS)} [cut]` : text };
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            deps.onEstate?.({ id, view, source: [], error: message, ms: now() - started, at: new Date(started) });
-            return { ok: false, text: `The live estate couldn't be read: ${message}` };
+            answer = await deps.estate(view);
+        } catch {
+            deps.onEstate?.({ id, view, source: [], error: LIVE_NO_ANSWER, ms: now() - started, at: new Date(started) });
+            return { ok: false, text: `${LIVE_NO_ANSWER} ${FROM_HISTORY}` };
         }
+        const source = Array.isArray(answer?.source) ? answer.source.filter((s): s is string => typeof s === "string") : [];
+        const errors = Array.isArray(answer?.errors) ? answer.errors.map(String) : [];
+        const unavailable = typeof answer?.unavailable === "string" && answer.unavailable.trim() ? plainReason(answer.unavailable) : null;
+        // No route answered: Copilot gets one plain sentence, never the per-route reasons (they're for the function's log).
+        if (unavailable || source.length === 0) {
+            const reason = unavailable ?? LIVE_NO_ANSWER;
+            if (unavailable) deps.onLiveUnavailable?.(unavailable);
+            deps.onEstate?.({ id, view, source: [], error: reason, ms: now() - started, at: new Date(started) });
+            return { ok: false, text: unavailable ? liveOffText(reason) : `${reason} ${FROM_HISTORY}` };
+        }
+        deps.onEstate?.({ id, view, source, result: answer.data, ms: now() - started, at: new Date(started) });
+        const missing = errors.length > 0 ? missingParts(errors) : [];
+        const text = JSON.stringify({
+            view,
+            source,
+            at: answer.at,
+            data: answer.data,
+            ...(missing.length > 0 ? { missing, note: `These parts of the live view didn't answer: ${missing.join("; ")}. Say which, in plain words.` } : {}),
+        });
+        return { ok: true, text: text.length > RESULT_CHARS ? `${text.slice(0, RESULT_CHARS)} [cut]` : text };
     }
 
     return {

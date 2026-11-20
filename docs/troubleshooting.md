@@ -461,7 +461,8 @@ Ask never blocks **DONE**: its results are **Pass**, **Warning**, or **Not selec
 | It "couldn't be renewed just now" | Ask again in a moment |
 | The relay "is at its limit of conversations" (20 at once, `MAX_SESSIONS`; each ends 5 minutes after its last question) | Ask again in a minute |
 | Sign-in asked again in another tab or browser | Expected: it's per browser, and the portal's frame is separate |
-| An answer says the live estate isn't available | History questions still work; if it persists, Database Hub's routes may have changed ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)) |
+| An answer says the live estate isn't available: "Database Hub's live view isn't available to the app" (Database Hub refused the app's token, R924), or "didn't answer just now" (the routes timed out or changed) | Nothing: Copilot answers from the history and points to Database Hub's own pages. After "isn't available to the app", that conversation doesn't call the live view again; **New chat** tries again. The routes' HTTP codes stay in the estate function's own log (R925). If it persists, Database Hub's routes may have changed ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)) |
+| The dock says "Copilot didn't write an answer": Copilot ended the turn without text after its last query (R925) | **Retry** asks the same conversation to write it; if it happens again, **New chat**. The relay's `chat.turn.end` line for the turn has `finalTextChars` 0 ([its logs](../ask-relay/README.md#logs)): `az containerapp logs show --name ca-<prefix>-<environment>-ask --resource-group rg-<prefix>-<environment> --subscription <subscription ID>` |
 
 ## The on-demand activity control
 

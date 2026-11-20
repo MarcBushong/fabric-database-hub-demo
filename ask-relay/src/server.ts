@@ -335,7 +335,15 @@ export function createRelay(config: RelayConfig, deps: RelayDeps): { server: Ser
             if (message.type !== "pong") lastSeen = now();
             if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
         };
-        const bridge = new AskBridge(deps.host, config, out, () => randomUUID(), () => ws.close(4000, "expired"));
+        const bridge = new AskBridge(
+            deps.host,
+            config,
+            out,
+            () => randomUUID(),
+            () => ws.close(4000, "expired"),
+            // Counts and lengths only: what the turn did, never what anyone wrote, and never a token.
+            (summary) => log("chat.turn.end", { ...summary }),
+        );
         bridges.add(bridge);
         log("chat.open", { sockets: bridges.size, sessions: started.size });
 
