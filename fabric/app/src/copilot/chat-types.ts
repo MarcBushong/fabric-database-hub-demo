@@ -47,7 +47,7 @@ export interface ChatState {
     pending: AskContext | null;
     /** True once the history model is known to hold T5's (Azure Cosmos DB) metrics: the dock offers T5's starter. */
     cosmosHistory: boolean;
-    /** The pages' sentence while Database Hub refuses the app as a whole (useLiveOff): new conversations start without the live view. */
+    /** The function's sentence while Database Hub refuses the app as a whole, by the latest reads in this browser (liveOffNow): new conversations start without the live view. */
     liveOff: string | null;
 }
 
