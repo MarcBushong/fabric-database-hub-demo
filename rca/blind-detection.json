@@ -30,6 +30,6 @@
   "chat": {
     "modelGuideExcludes": ["Scenario Runs", "Incident Windows", "RCA Answer Key", "Analysis Findings"],
     "runDaxRefuses": ["'Scenario Runs'", "'Incident Windows'", "'RCA Answer Key'", "'Analysis Findings'", "Scenario Runs", "Incident Windows", "RCA Answer Key", "Analysis Findings"],
-    "note": "The dock's run_dax refuses a query that names an answer-key table, and the model guide it sends doesn't describe them, so the chat can't read the key even by writing DAX."
+    "note": "The dock's run_dax refuses a query that names an answer-key table or a measure that reads one, directly or through another measure (fabric/app/src/copilot/model-guide.generated.ts lists them, from the TMDL), and the model guide it sends describes none of them, so the chat can't read the key even by writing DAX."
   }
 }

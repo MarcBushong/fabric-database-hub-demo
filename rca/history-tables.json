@@ -248,5 +248,6 @@
     { "table": "RCA Replica", "name": "Replica Replay Stall (s)", "formatString": "#,0", "displayFolder": "RCA", "description": "The longest the read replica went without replaying a transaction, in seconds.", "definition": "CALCULATE ( MAX ( 'RCA Replica'[Since Last Replayed (s)] ), 'RCA Replica'[Side] = \"replica\" )" },
     { "table": "RCA Answer Key", "name": "Injected Faults", "formatString": "#,0", "displayFolder": "Answer key", "description": "Faults the workload injected (the scoreboard and the tests only).", "definition": "CALCULATE ( COUNTROWS ( 'RCA Answer Key' ), 'RCA Answer Key'[Kind] = \"run\" )" }
   ],
-  "purge": ["rca_sessions", "rca_waits", "rca_events", "rca_queries", "rca_resource", "rca_replica", "rca_coverage", "rca_answer_key"]
+  "purge": ["rca_sessions", "rca_waits", "rca_events", "rca_queries", "rca_resource", "rca_replica", "rca_coverage", "rca_answer_key"],
+  "purgeFiles": ["Files/rca/inbox"]
 }

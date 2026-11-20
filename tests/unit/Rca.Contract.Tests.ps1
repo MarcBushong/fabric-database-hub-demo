@@ -112,9 +112,10 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
         }
     }
 
-    It 'relates every table only to Target and Date, and purges all eight' {
+    It 'relates every table only to Target and Date, and purges all eight and the evidence inbox' {
         @($tables.relationships.toTable | Sort-Object) | Should -Be @('Date', 'Target')
         @($tables.purge | Sort-Object) | Should -Be @($tables.tables.name | Sort-Object)
+        @($tables.purgeFiles) | Should -Be @('Files/rca/inbox')
     }
 
     It 'gives every measure a known table, a format, and a description' {
@@ -227,6 +228,16 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         @($parameter.parts | Sort-Object) | Should -Be @($allParts | Sort-Object)
         $index = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/export-index.json') -Raw | ConvertFrom-Json
         ($index.documents | Measure-Object -Property parts -Sum).Sum | Should -Be $allParts.Count
+    }
+
+    It 'names RCA_EVIDENCE_FILE only inside the lakehouse inbox, and fits a full session in what the notebook reads' {
+        $pattern = $transportSchema['$defs'].evidenceFile.pattern
+        foreach ($good in @('Files/rca/inbox/00000000-0000-0000-0000-000000000000-run20261120T172000Z.json', 'Files/rca/inbox/s1.json')) { $good | Should -Match $pattern }
+        foreach ($bad in @('Files/rca/inbox/../secrets.json', '/Files/rca/inbox/s1.json', 'Tables/rca_sessions/s1.json', 'Files/rca/inbox/s1.txt', 'Files/rca/inbox/sub/s1.json', 'Files/rca/inbox/.json')) { $bad | Should -Not -Match $pattern }
+        # 64 part lines of 3,400 characters with their JSON quoting: under the 262,144 bytes the notebook passes to notebookutils.fs.head.
+        $full = [ordered]@{ kind = 'ContosoCare.RcaEvidenceParts'; version = 1; sessionId = 's1'; parts = @(1..64 | ForEach-Object { 'x' * 3400 }); status = 'Pass'; message = 'm' * 500 }
+        [System.Text.Encoding]::UTF8.GetByteCount(($full | ConvertTo-Json -Compress)) | Should -BeLessThan 262144
+        $transportSchema['$defs'].evidenceFile.description | Should -Match 'max_bytes 262144'
     }
 }
 

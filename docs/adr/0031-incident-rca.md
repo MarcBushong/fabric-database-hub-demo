@@ -97,7 +97,9 @@ Through the control channel that exists, with no new resource or grant ([transpo
 
 - **Export:** `ContosoCare.Workload rca export` reduces the capture into evidence documents: columnar JSON with string dictionaries ([schema](../../rca/evidence.schema.json)), gzipped and printed as part lines under a managed Run Command's 4 KB.
 - **Into the control vault:** the control runbook writes the parts as earlier versions of its existing `dbhub-session-metrics` secret and lists them in that secret's final version, the metrics document the control notebook already reads. The deployer's existing grant on the secret covers its versions.
-- **Into the history:** the control notebook passes the parts to `NB_DatabaseHub_LiveActivity` as `RCA_EVIDENCE`, which writes the tables. `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot run the same export with the operator's role and pass `RCA_EVIDENCE` straight to the notebook.
+- **The bundles stay in the vault** until `./scripts/destroy.ps1`, which deletes and purges the control vault. Disabling them once the notebook confirms the save would take Key Vault's data-plane Update Secret, which "requires the secrets/set permission" ([Update Secret](https://learn.microsoft.com/rest/api/keyvault/secrets/update-secret/update-secret)). The runbook's identity has only ARM read and write on the secret, and the deployer only Key Vault Secrets User, so that would be a new grant, which the rules forbid. The bundles hold what the history holds (normalized statements, programs, logins, and hosts; never a secret), and only those who can already read the history can read them.
+- **Into the history:** the control notebook stages the parts in the demo's lakehouse as one `RCA_EVIDENCE` document, `Files/rca/inbox/<name>.json`, and passes its path to `NB_DatabaseHub_LiveActivity` as `RCA_EVIDENCE_FILE`. The notebook writes the tables and deletes the file. `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot run the same export with the operator's role and stage the same file through OneLake's DFS API with the operator's existing workspace role ([transport](../../rca/README.md#rca_evidence_file)). The inline `RCA_EVIDENCE` stays supported.
+  - **Why a file:** neither a notebook run's parameters nor a job's document a size limit, and a full session is about 218 KB of parts. A private control vault is reachable only from the control workspace, so the job's fallback can't read the bundles itself.
 - **A session the nightly stop ended** keeps its evidence on the VM's disk, and the next start exports it.
 - **Not chosen for the default:**
 
@@ -126,7 +128,7 @@ Through the control channel that exists, with no new resource or grant ([transpo
 - **Detection tables carry no scenario, run ID, or incident key.** The answer key is its own table, in the model's Answer key folder, read only by the scoreboard and the tests.
 - **The model:** the eight tables in Direct Lake, related to Target and Date only, with measures such as Blocked Sessions (captured), Head Blocker Idle (s), Deadlocks (captured), Errors (captured), Lock Escalations (captured), Replica Replay Stall (s), and Injected Faults (Answer key). `npm run guide:build` regenerates the chat's model guide from the TMDL, without the answer key ([§8](#8-the-chat-as-the-first-line-investigator)).
 - **T4's and T5's beats join the answer key,** which closes ADR 0030's gap: Wave 2's scoreboard can grade them.
-- **The deployment notebook's purge** (`PURGE_DEMO_TABLES` and `CONFIRM`) drops the eight tables too.
+- **The deployment notebook's purge** (`PURGE_DEMO_TABLES` and `CONFIRM`) drops the eight tables too, and removes `Files/rca/inbox`.
 
 ### 6. Investigations, rules, and recommendations
 
@@ -159,7 +161,7 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 - **Tools, not raw DAX:** six deterministic tools in Phase 1, beside the dock's four (`run_dax`, `show_chart`, `suggest_followups`, `estate_overview`), within the relay's 16: `triage_window`, `find_incidents`, `explain_incident` (by a blind episode's key), `explain_locking`, `explain_errors`, and `explain_replica_lag`. Phase 2 adds `explain_waits`. Like `run_dax`, they run in the app with the viewer's own Fabric token, with at most one DAX query per RCA table, bounded results, and every query under "Show the sources"; the relay still runs nothing ([ADR 0028](0028-ask-copilot-in-the-insights-app.md#tools-that-run-in-the-page-as-the-viewer)).
 - **The playbook,** in the system message: scope the time window, triage, explain the top hypotheses with the tools, then answer with the root cause and its evidence and times, the recommendations with their Learn links and who approves each, the next steps, and what wasn't captured.
 - **The grounding rules:** every claim cites captured rows and their times; it says "not captured" rather than guess; it never names a scenario or says what was injected, which it can't know.
-- **The dock is blind too:** `run_dax` refuses DAX that names an answer-key table, and the model guide leaves them out. A page's Ask context never carries answer-key rows, so the scoreboard's three Ask entries that hand over its grading go ([open item 7](#decisions-and-open-items)).
+- **The dock is blind too:** `run_dax` refuses DAX that names an answer-key table or a measure that reads one, directly or through another measure, since DAX names a measure without its table; the model guide leaves them all out, with the grading analyses' rows and any description clause that names a scenario. A page's Ask context never carries answer-key rows, so the scoreboard's three Ask entries that hand over its grading go ([open item 7](#decisions-and-open-items)).
 - **Sample questions,** with the owner's live session of 2026-11-20 (ET):
   - "Why was ContosoCare slow at 11:56?" T3's CPU at 100 % from 11:56 to 12:17, and T5 at 100 % normalized RU with about 1,300 to 2,100 429s a minute. In Phase 2 also the cause: Query Store's regressed plan, `FORCE_LAST_GOOD_PLAN` off from 11:52, and the last good plan forced at 12:18:00, after which CPU averaged 42.5 % at 12:18 and 7 % at 12:19 to 12:20.
   - "Who blocked whom at 12:05, and what should we do?" The chain, head blocker first, with its procedure, program, login, idle time, open transaction, and lock; its depth and width; the escalation; the recommendations.
@@ -218,6 +220,7 @@ Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answ
 | **Database Hub's SQL telemetry** (T1, T2, T3) | A Microsoft-managed Azure Data Explorer cluster: the `ArcSqlTelemetry` database at `https://adx.centralus.arcdataservices.com/kusto/` ([connect](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#connect-to-the-telemetry)). Not in the customer's Fabric workspace, capacity, or Azure subscription | Up to 7 days; Learn's Query 2 shows the window a tenant actually has ([query 2](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#query-2-estate-summary-and-available-time-range)) | No: no retention, size, or location setting, and it's a preview. What the customer controls is which resources send it | The customer: "You can't change retention or add tables. To keep data longer, export query results to your own store" ([limitations](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#limitations)) |
 | **T4's, its replica's, and T5's metrics** | Azure Monitor platform metrics, Microsoft-managed | 93 days ([retention of metrics](https://learn.microsoft.com/azure/azure-monitor/metrics/data-platform-metrics#retention-of-metrics)); a deleted replica's metrics go with it ([ADR 0025](0025-t4-read-replica.md)) | No | The customer |
 | **The RCA's own capture** | On T1's VM and in T2's guest (`C:\ProgramData\DbHubDemo\rca\`) until its export | Deleted 7 days after its export | No | It goes into the demo's history |
+| **The RCA's bundles in transit** | Earlier versions of `dbhub-session-metrics` in the control vault (Azure Key Vault, in the demo's subscription) | Until `./scripts/destroy.ps1` deletes and purges the vault ([transport](#4-transport-into-the-history)) | No | It goes into the demo's history |
 | **The demo's history** | `LH_DatabaseHub`'s Delta tables, in the demo's Fabric workspace, in OneLake: the customer's own store | Until `./scripts/destroy.ps1` without `-KeepFabric`, or the deployment notebook's purge (`PURGE_DEMO_TABLES` and `CONFIRM`) | Yes: it's the customer's lakehouse | The demo does it for them |
 
 - **Database Hub's telemetry costs nothing and needs nothing deployed:** "Enabling performance monitoring doesn't incur an extra cost", and "the data isn't stored at rest outside the geography of the monitored SQL resource" ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)). The Database Hub "is free". Reading it takes the Reader role, or higher, on each subscription, and "The endpoint returns rows only for resources your account can access" ([prerequisites](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#prerequisites)).
@@ -285,11 +288,35 @@ Built in parallel against [the contract](../../rca/README.md), each part with it
 |---|---|---|
 | The contract | This ADR's first commit | The schemas, the tables' spec, the capture catalog, the blind-detection lists, the fixtures, and their tests |
 | 1.1, 1.2 Capture | A session of its own | The observer lane, its triggers, names, and normalization, the local store, `rca export` and `rca part` |
-| 1.3 to 1.5 Transport and history | A session of its own | The runbook's export and bundles; the scripts' `RCA_EVIDENCE`; the notebook's decoder and eight tables; the purge; the model |
+| 1.3 to 1.5 Transport and history | A session of its own | The runbook's export and bundles; the staged `RCA_EVIDENCE_FILE` (and the inline `RCA_EVIDENCE`); the notebook's decoder and eight tables; the purge, with `Files/rca/inbox`; the model |
 | 1.6, 1.7 The app and its docs | This ADR's session | The blind detector and rules, the DAX loader, the six tools, the playbook, the RCA view in every theme, the postmortem's Cause, the chat's blindness, the gating; the docs |
-| 1.8 Live validation | After the three merge | A full Run all on a test environment; the evaluation set's Phase 1 cases; real fixtures recorded from it |
+| 1.8 Proven live, like a release | After the three merge | The phase's final SHA, live on **both** a net-new deployment and an update of an existing environment from the then-current `main`: a plain `./scripts/deploy.ps1` ends **DONE** with 0 **Fail** on its first run, `./scripts/validate.ps1` has 0 **Fail**, and no **Warning** is new against the release before it. Then a full Run all on each, the evaluation set's Phase 1 cases, and real fixtures recorded from it |
 
-Phase 2 (waits by class, `explain_waits`, the view's waits and plans) and Phase 3 (the chat proven with the real model) follow, one pull request each. The estimate: 30 to 43 engineer-days for all three, Phase 1 the longest.
+Phase 2 (waits by class, `explain_waits`, the view's waits and plans) and Phase 3 (the chat proven with the real model) follow, one pull request each, and each ends the way Phase 1 does: Phase 2's step 2.4 proves its final SHA live on a new deployment and an update, by the same three measures. The estimate: 30 to 43 engineer-days for all three, Phase 1 the longest.
+
+### The upgrade matrix
+
+No release may break an existing deployment or add a bug for a new or an existing user. Each piece works beside an older or a newer neighbor, says so with a status line and its fix, and `./scripts/deploy.ps1` brings them all to one version:
+
+| The older piece | Beside | What happens | It says so | The fix |
+|---|---|---|---|---|
+| The runner, without `rca` commands | A newer runbook or scripts | No capture and no export; the session is saved as before | `RCA.EXPORT` **Warning**: that VM's runner has no RCA export | `./scripts/deploy.ps1` updates the runner |
+| The control's runbook, without the export | A newer runner | Run all saves the session without its capture, which stays on the VM's disk until an export: `stop-demo.ps1 -SaveHistory` or `deploy.ps1`'s snapshot, whose scripts are always current | `CONTROL.RUNBOOKS`: `deploy.ps1` republishes the runbooks, or says why it couldn't, with the fix | `./scripts/deploy.ps1` |
+| `NB_DatabaseHub_LiveActivity`, without `RCA_EVIDENCE_FILE` | A newer control notebook or scripts | It ignores the parameter and saves the session as before; the capture isn't written, and the staged file stays until the purge | `RCA.EXPORT` **Warning**: the notebook didn't report `RCA.EVIDENCE` | `./scripts/deploy.ps1` updates the notebooks; the next session is written |
+| The lakehouse, without the RCA tables | A newer semantic model | Never happens: the deployment creates the eight tables, empty, before it deploys the model, so the model never points at a missing table | None needed | None |
+| The semantic model, without the RCA tables | A newer app | The app behaves exactly as the release does: no Root cause view or links, no investigation tools or starters, the postmortem's Cause as it was. Step 1.6's tests check each | Where the view would be: "The history model doesn't have the RCA tables yet: `./scripts/deploy.ps1` updates it." | `./scripts/deploy.ps1` updates the model |
+| The app | A newer model | The app ignores the new tables | None needed | `./scripts/deploy.ps1` updates the app |
+| A session saved before the feature | The new app | Its windows say "no RCA capture recorded", and the chat answers from the telemetry; nothing else changes | The view's and the tools' Not captured | None: it's history |
+| T2's kept `PaygWizard` guest | The new runner | T2 isn't captured: the runner's login there isn't sysadmin | `RCA.CAPTURE.T2` **Warning** | `./scripts/deploy.ps1` rebuilds T2 from the image |
+
+**One deliberate change everywhere, with or without the RCA tables:** the dock is blind, as the owner decided. `run_dax` refuses the answer key's tables and the measures that read them, the model guide leaves them out, and the starter that asked about the latest incident window now finds it from the telemetry.
+
+## Risks
+
+- **The bundles stay in the control vault until `./scripts/destroy.ps1`.** The step that would have disabled them once the notebook confirmed the save is dropped: it takes Key Vault's data-plane Update Secret (`secrets/set`), a new grant. They hold what the history holds, never a secret; only those who can already read the history can read them; and `destroy.ps1` purges the vault ([transport](#4-transport-into-the-history)).
+- **A full session's parts are larger than any documented notebook parameter:** solved by `RCA_EVIDENCE_FILE`, which the notebook reads with `notebookutils.fs.head` and an explicit 262,144 bytes, since its default is 100 KB.
+- **Sparse telemetry hides real episodes,** as T3's 65.95 % peak on session 81446b84 showed: the detector opens an episode on one severe sample, bridges gaps, and prefers RCA-AZ-01's dense CPU ([the detector](#the-shared-blind-detector)). A lone mild spike stays a single-sample episode at low confidence, and says so.
+- **The chat's prose** is checked only by the real model: Phase 3.
 
 ## Consequences
 
@@ -299,7 +326,7 @@ Phase 2 (waits by class, `explain_waits`, the view's waits and plans) and Phase 
 - The runner grows an observer lane, an export command, and a reducer; the runbook an export step; the notebook eight tables; the model eight tables; the app a detector, a view, and six tools.
 - The evidence is a sample, not a trace: an event between samples shows only through counters and the event session. The chat says "not captured" for the rest.
 - The export budget caps the detail per session; cuts are recorded and said.
-- ADR 0028's dock changes: `run_dax` refuses the answer-key tables, and the model guide leaves them out.
+- ADR 0028's dock changes: `run_dax` refuses the answer-key tables and the measures that read them, and the model guide leaves them out. The chat no longer reads Analysis Findings; a blind view of findings could come back in Phase 2.
 
 ## Validation
 

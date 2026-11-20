@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/transport.schema.json",
   "title": "Incident RCA transport, version 1 (ADR 0031)",
-  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE parameter NB_DatabaseHub_LiveActivity reads. rca/README.md, Transport, gives the encoding and the size limits.",
+  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. rca/README.md, Transport, gives the encoding and the size limits.",
   "oneOf": [
     { "$ref": "#/$defs/bundle" },
     { "$ref": "#/$defs/bundleIndex" },
@@ -81,6 +81,11 @@
         "status": { "$ref": "#/$defs/status" },
         "message": { "type": "string", "maxLength": 500 }
       }
+    },
+    "evidenceFile": {
+      "type": "string",
+      "pattern": "^Files/rca/inbox/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$",
+      "description": "RCA_EVIDENCE_FILE, NB_DatabaseHub_LiveActivity's other parameter: a path in the demo's lakehouse to a file holding exactly one RCA_EVIDENCE document (#/$defs/parameter). The notebook reads it with notebookutils.fs.head and max_bytes 262144, and deletes it once the tables are written."
     }
   }
 }
