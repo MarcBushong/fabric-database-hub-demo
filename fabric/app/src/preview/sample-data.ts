@@ -3,6 +3,7 @@
 
 import type { QuerySpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
+import { withSession } from "./sample-session";
 
 /** The newest telemetry day: the sample's week ends here. */
 export const SAMPLE_LATEST_DAY = Date.UTC(2026, 10, 17);
@@ -164,7 +165,7 @@ const FINDINGS: Array<[string, string, string, string, number, string, number]> 
     ["cpu.T3.peak", "cpu", "CPU", "T3", 3, "CPU peaked at 97.5 % at 14:05 UTC, 3.4 times its 7-day median, during the plan-regression beat.", 6],
     ["blocking.T1.chain", "blocking", "Blocking", "T1", 3, "A blocking chain held 12 sessions for 18 minutes; the head blocker ran ContosoCare.Demo/blocking-chain.", 4],
     ["storage_io.T2.pageiolatch", "storage_io", "Storage IO", "T2", 3, "Buffer IO (PAGEIOLATCH) waits ran at 6.2 times their baseline for 30 minutes with no scenario running.", 5],
-    ["postgresql.T4-replica.lag", "postgresql", "PostgreSQL", "T4-replica", 3, "Read replica lag on pgreplica01 peaked at 241.4 s at 17:05 UTC (a Warning at 60 s or more).", 6],
+    ["postgresql.T4-replica.lag", "postgresql", "PostgreSQL", "T4-replica", 3, "Read replica lag on pgreplica01 peaked at 241.4 s at 14:25 UTC (a Warning at 60 s or more).", 6],
     ["telemetry_coverage.T2", "telemetry_coverage", "Telemetry coverage", "T2", 2, "T2 sent 8 of 9 telemetry tables; query store telemetry needs the Arc extension's monitoring setting.", 6],
     ["wait_profile.T3.governor", "wait_profile", "Wait profile", "T3", 4, "Log Rate Governor waits stayed under 2 % of T3's wait time outside the log-rate scenario.", 6],
     ["database_growth.T1", "database_growth", "Database growth", "T1", 4, "ContosoCare grew 1.2 GB in 7 days (2.1 % a day).", 6],
@@ -479,8 +480,13 @@ function rangeOf(spec: QuerySpec, target: string): [number, number] {
     return i ? [i.start - 90 * MIN, i.end + 90 * MIN] : [0, Number.MAX_SAFE_INTEGER];
 }
 
-/** The sample's answer to a catalog query, by its ID and parameters. */
+/** The sample's answer to a catalog query, by its ID and parameters: the week, with its latest session laid over it. */
 export function sampleRows(spec: QuerySpec): Row[] {
+    return withSession(spec, weekRows);
+}
+
+/** The week's answer, before the latest session is laid over it. */
+function weekRows(spec: QuerySpec): Row[] {
     const replay = /^replay-(T[123])$/.exec(spec.id);
     if (replay) {
         const [from, to] = rangeOf(spec, replay[1]);

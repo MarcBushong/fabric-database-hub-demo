@@ -21,7 +21,7 @@ One **Run all** in the control notebook runs a whole session, and both scripts b
 1. **Resume your Fabric capacity** if it's paused: in the Azure portal, open the capacity and select **Resume** ([pause and resume](https://learn.microsoft.com/fabric/enterprise/pause-resume)). It runs the notebook, and Run all never resumes it (`fabric.manageCapacity` lets `start-demo.ps1` and `stop-demo.ps1` do it for a capacity that's yours alone). It bills while it runs, outside every estimate, so pause it after. Don't resume it on stage: it takes minutes. To check it from a terminal: `./scripts/configure-fabric.ps1 -SkipNotebookImport -SkipTelemetry` reports `FABRIC.P5.CAPACITY` **Pass** when it's Active (P5).
 2. **Run all, about 30 minutes before your audience:** open `NB_DatabaseHub_Control` where **DONE** says, and select **Run all**, with nothing to edit. It starts the VMs, T4, T4's read replica, and T5's container, runs the 90-minute showcase of bounded incidents on all five targets, and prints a presenter's guide: each beat's time in your clock, and Copilot prompts with this session's names and times. The first data reaches Database Hub 10 to 35 minutes after Run all ([what fills each visual, and when](database-hub-visuals.md#what-fills-each-database-hub-visual-and-when)).
 3. **Show the DBA moments, in order:** [Open at Overview](#open-at-overview), [T2 ready to migrate](#optimization-t2-ready-to-migrate), [the Database Agent loop on T3](#the-database-agent-loop-on-t3), and [T5's RU storm](#t5-azure-cosmos-dbs-ru-storm). Or follow [the 15-minute script](#the-15-minute-script) or [the 30-minute script](#the-30-minute-script).
-4. **The end:** Run all stops everything, and saves the session's history once its telemetry has arrived, about 15 minutes after the session's end. Then [show the Insights app](#demo-it-yourself-the-insights-app), and pause your capacity when nothing else needs it.
+4. **The end:** Run all stops everything, and saves the session's history once its telemetry has arrived, about 15 minutes after the session's end. Then [show the Insights app](#demo-it-yourself-the-insights-app), starting with [the 3-minute WOW](#the-3-minute-wow-what-only-the-app-shows), and pause your capacity when nothing else needs it.
 
 **The session's clock,** in minutes after a target's activity starts: T1, T3, and T5 start at about the same time, T2 and T4 a few minutes later. The guide prints the exact times.
 
@@ -112,7 +112,7 @@ One hot partition uses up T5's 400 RU/s, Database Hub shows normalized RU at 100
 
 ## Demo it yourself: the Insights app
 
-Anyone who deploys the demo shows the Insights app, `APP_DatabaseHub_Insights` (Fabric Apps, a preview), with nothing to set up in it ([the app's guide](../fabric/app/README.md#demo-it-yourself)). Open it from its item in the demo's workspace once the session's history is saved, about 15 minutes after the session's end; before the first session it says **No history yet**.
+Anyone who deploys the demo shows the Insights app, `APP_DatabaseHub_Insights` (Fabric Apps, a preview), with nothing to set up in it ([the app's guide](../fabric/app/README.md#demo-it-yourself)). Open it from its item in the demo's workspace once the session's history is saved, about 15 minutes after the session's end. It opens on **Mission Control**: start with [the 3-minute WOW](#the-3-minute-wow-what-only-the-app-shows), then the DBA console below. Before the first session it says **No session in this period**.
 
 1. **Overview:** what needs attention, from the history. Overview shows **Live now** only when the app reads Database Hub live; today it doesn't (R924), and **Live views** says so in one line, so open **Database Hub** from there for what's live this minute. **Say:** "One console for the estate: what the history kept, and Database Hub beside it for what's live right now."
 2. **Drill down:** a target's health tile opens its page; on T3, **Ask why** on the CPU peak asks Copilot about it, with the rows and the DAX behind them.
@@ -121,6 +121,19 @@ Anyone who deploys the demo shows the Insights app, `APP_DatabaseHub_Insights` (
 5. **Ask, the Copilot chat,** on any visual, with what's on screen, after a GitHub sign-in once per browser, on your own GitHub Copilot plan ([the Copilot chat](../README.md#the-copilot-chat-in-the-insights-app)). **Manage:** **Reset** or **Start a session** (which bills) says what it will do and asks first; an operator's request goes to the session control, and otherwise the app copies the request for Run all.
 
 **If it isn't there:** No **Live now** and no live checks on Findings mean Database Hub refuses the app (R924), which **Live views** says in one line; **Live · unavailable** says why when the app's live function isn't deployed or Database Hub didn't answer just now. The pages show the history, **Ready to migrate** shows T2's assessment as Azure had it at the last deploy, and Database Hub has the live view. No T5 means the deployment has no Cosmos DB. **Ready to migrate** links `arcsql01` in the Azure portal until Azure has an assessment result at a deploy: `./scripts/deploy.ps1` again once `T2.ARC.MIGRATIONASSESSMENT` is **Pass**. An empty agent loop means the history isn't saved yet; an empty **Readiness**, that no session has run yet (each Run all runs `NB_DatabaseHub_Deployment`'s read-only checks, which fill it).
+
+### The 3-minute WOW: what only the app shows
+
+The app knows what the session injected; Database Hub sees the symptoms. Open it after a session's end, with Database Hub in the next tab ([ADR 0030](adr/0030-insights-app-mission-control.md)). Your numbers are your session's.
+
+1. **Mission Control (0:00–0:30):** ContosoCare's map, each database as the service it runs (Billing, Front desk, Scheduling, Reporting and its DR copy, Patient events), with the session's plan as recorded at its end and its big numbers. **Say:** "This is ContosoCare. The app knows the plan: what we injected, where, and when."
+2. **Database Hub beside it (0:30–1:00):** **Database Hub, live** opens it: the same target's symptom in its charts, or its issue while it's open (Database Hub keeps 7 days of telemetry or less). **Say:** "Database Hub sees the symptom."
+3. **The scoreboard (1:00–1:45):** **Scoreboard**, "Did we catch it?": each fault, when its signal was visible in the telemetry, the response (T3's Database Agent loop), and the recovery, with the times to detect and recover. **Say:** "The app knows what really happened." "Signal visible" is measured in the telemetry; don't say Database Hub detected it at that time.
+4. **The business lens (1:45–2:00):** **Business impact**: for example "Patient events: 35 % of requests throttled for 9 min", next to the measured normalized RU and 429s behind it.
+5. **The postmortem (2:00–2:30):** **Write the postmortem**: the timeline, impact, cause, response, and times to detect and recover, with every query. **Download Markdown** needs no sign-in; **Draft with Copilot** drafts it on your own GitHub Copilot.
+6. **Replay (2:30–3:00):** **Replay**: drag the scrubber, and the map's shockwave plays again with every engine's chart; the ribbon says what's next. **Say:** "Database Hub watches your estate. A Fabric app turns it into your team's own operations product."
+
+- **At a booth:** **Kiosk** on Mission Control rotates the map, the scoreboard, and the replay without the app's chrome: Space pauses, Esc leaves, and F11 goes full screen where the frame doesn't allow it.
 
 ## How the scripts are written
 
