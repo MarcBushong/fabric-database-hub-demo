@@ -189,6 +189,12 @@ function Get-DemoEnvironmentStatus {
                 $evidence['workload'] = $workload
             }
             $message = '{0} is running; bootstrap {1}: {2}' -f $vm, $evidence['state'], [string](Get-DemoMemberValue -InputObject $health -Name 'message')
+            # A Ready bootstrap with warnings names them, each with its step (F24, 2026-11-20).
+            $warningNote = Get-DemoHealthWarningNote -Health $health -VmName $vm
+            if ($null -ne $warningNote) {
+                $message = '{0} {1}' -f $message.TrimEnd(), $warningNote.Text
+                $evidence['warningCount'] = $warningNote.Count
+            }
             if ($null -ne $days) {
                 $message += (' Guest evaluation days left: {0}.' -f $days)
             }

@@ -83,6 +83,8 @@ function Get-DemoVmStepRecord {
 }
 
 function Add-DemoVmWarning {
+    # Adds a non-blocking warning to health.json's list, once. With -Step, it names the step it came from ("<Step>: ..."),
+    # so validate.ps1 and status.ps1 can say which step warned (F24, 2026-11-20).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -90,9 +92,15 @@ function Add-DemoVmWarning {
 
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
-        [string] $Message
+        [string] $Message,
+
+        [AllowEmptyString()]
+        [string] $Step = ''
     )
 
+    if ($Message -and $Step -and -not $Message.StartsWith(('{0}: ' -f $Step), [System.StringComparison]::Ordinal)) {
+        $Message = '{0}: {1}' -f $Step, $Message
+    }
     if ($Message -and @($State['warnings']) -notcontains $Message) {
         $State['warnings'] = @(@($State['warnings']) + $Message)
     }

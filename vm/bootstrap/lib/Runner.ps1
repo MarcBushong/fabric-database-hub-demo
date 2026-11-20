@@ -103,6 +103,9 @@ function Invoke-DemoVmStateMachine {
         }
         $state['generation'] = $Generation
         $state['completedUtc'] = $null
+        # The warnings are this generation's (F24, 2026-11-20): every step is checked again, and one whose cause is still
+        # there says it again, so a note an earlier pass left, such as a restart that has happened since, goes away.
+        $state['warnings'] = @()
     }
     if ($state['pendingReboot']) {
         Write-DemoVmLog -Message 'Resuming after a restart.'
@@ -164,7 +167,7 @@ function Invoke-DemoVmStateMachine {
             Write-DemoVmLog -Step $name -Message 'Converging.'
             $result = Get-DemoVmStepOutcome -Output @(& $definition['Set'] $definition)
             foreach ($warning in @($result.WarningMessage)) {
-                Add-DemoVmWarning -State $state -Message $warning
+                Add-DemoVmWarning -State $state -Message $warning -Step $name
             }
 
             if ($result.Outcome -eq 'Done') {

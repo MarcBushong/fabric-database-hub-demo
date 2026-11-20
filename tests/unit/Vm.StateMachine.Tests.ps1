@@ -190,13 +190,32 @@ Describe 'VM step runner' {
         (Get-DemoVmState)['steps']['Stubborn']['lastError'] | Should -Match 'check still fails'
     }
 
-    It 'keeps step warnings, such as trust on first use, and reports Warning when Ready' {
+    It 'keeps step warnings, such as trust on first use, each naming its step, and reports Warning when Ready' {
         $root = New-TestRoot
         $steps = @(@{ Name = 'Media'; Test = { $false }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } })
         Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
         $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
         $health.status | Should -Be 'Warning'
-        $health.warnings | Should -Contain 'Trusted on first use.'
+        $health.warnings | Should -Contain 'Media: Trusted on first use.' -Because 'validate.ps1 says which step warned (F24)'
+    }
+
+    It 'starts the warnings again with a new generation, so a step whose cause is gone no longer warns (F24)' {
+        $root = New-TestRoot
+        $script:restartDone = $false
+        $steps = @(
+            @{ Name = 'Restart'; Test = { $script:restartDone }; Set = { $script:restartDone = $true; New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Setup asked for a restart; the next start completes it.' } }
+            @{ Name = 'Media'; Test = { $false }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } }
+        )
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Restart: Setup asked for a restart; the next start completes it.', 'Media: Trusted on first use.')
+        # The same generation keeps them: its steps aren't checked again.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings).Count | Should -Be 2
+        # A new generation checks every step again: Restart is in its desired state now, and Media still warns.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+        $health.status | Should -Be 'Warning'
     }
 
     It 'writes health.json that matches vm/health/health.schema.json' {

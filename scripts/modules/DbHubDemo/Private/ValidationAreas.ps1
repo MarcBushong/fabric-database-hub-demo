@@ -184,6 +184,14 @@ function Invoke-DemoValidationInfrastructure {
             'Warning' { 'The bootstrap is still working or waiting; run validate.ps1 again later.' }
             default { '' }
         }
+        # A Ready bootstrap with warnings (F24, 2026-11-20): which step warned, and what to do, not "still working".
+        $warningNote = Get-DemoHealthWarningNote -Health $health -VmName $vmName
+        if ($null -ne $warningNote) {
+            $text = '{0} {1}' -f $text.TrimEnd(), $warningNote.Text
+            $remediation = $warningNote.Remediation
+            $healthEvidence['warningCount'] = $warningNote.Count
+            $healthEvidence['warnings'] = Get-DemoMemberList -InputObject $health -Name 'warnings'
+        }
         $results.Add((New-DemoResult -CheckId ('INFRA.HEALTH.{0}' -f $suffix) -Area 'infra' -Target $target -Status $healthStatus -Message $text -Evidence $healthEvidence -Remediation $remediation -DocUrl $healthDoc -EvaluationOnly:$evaluationOnly))
 
         if ($guestCheck) {

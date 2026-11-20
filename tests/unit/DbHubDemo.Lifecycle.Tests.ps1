@@ -2766,6 +2766,14 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 1 -Exactly
     }
 
+    It 'names the step behind a Ready VM''s Warning on STATUS.VM_SQLVM01 (F24, 2026-11-20)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'sqlvm01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Warning'; state = 'Ready'; message = 'Every step is in the desired state.'; warningCount = 1; warnings = @('AssociatedServices: SQL Server setup asked for a restart; the next start completes it.') } }
+        $vm = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }
+        $vm.status | Should -Be 'Warning'
+        $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap has a warning: AssociatedServices: SQL Server setup asked for a restart; the next start completes it.'
+        $vm.evidence.warningCount | Should -Be 1
+    }
     It 'flags T2''s guest that a golden capture left air-gapped while archost01 runs, from the same health read (live, 2026-11-03)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'archost01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {

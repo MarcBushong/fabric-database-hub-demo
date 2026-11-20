@@ -427,6 +427,56 @@ function Get-DemoValidationQuietReason {
     return ''
 }
 
+function Get-DemoHealthWarningNote {
+    <#
+    .SYNOPSIS
+    What a VM's health summary says about the warnings that keep a Ready bootstrap's status a Warning (F24, 2026-11-20):
+    Count, Text (a sentence that names each warning shown, each naming the step it came from), Remediation, and Known
+    (whether the summary lists them: a VM whose bootstrap bundle predates 2026-11-20 doesn't). $null when the bootstrap
+    isn't Ready with a Warning. Pure. Internal.
+
+    .DESCRIPTION
+    health.json's status is a Warning when the state is Ready and it has warnings (vm/health/README.md). Before, the
+    validator's INFRA.HEALTH.<vm> and status.ps1's STATUS.VM_<vm> said only "<vm> reports Ready: Every step is in the
+    desired state." with "The bootstrap is still working or waiting" as the fix (dbhubfn and dbhubfu, 2026-11-20). Since
+    2026-11-20 the bootstrap names each warning's step, a new bootstrap generation starts its list again, and the summary
+    view prints the first two (warnings, warningCount).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Health,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
+    if ($null -eq $Health -or [string](Get-DemoMemberValue -InputObject $Health -Name 'state') -ne 'Ready' -or [string](Get-DemoMemberValue -InputObject $Health -Name 'status') -ne 'Warning') {
+        return $null
+    }
+    $full = 'Get-DemoVmHealth -Config $config -VmName {0} -View Full lists them all.' -f $VmName
+    $count = Get-DemoMemberValue -InputObject $Health -Name 'warningCount'
+    $shown = Get-DemoMemberList -InputObject $Health -Name 'warnings'
+    if ($null -eq $count -and $shown.Count -eq 0) {
+        return [pscustomobject]@{
+            Count       = $null
+            Known       = $false
+            Text        = 'Its bootstrap reported a warning that this VM''s summary doesn''t name (its bootstrap bundle predates 2026-11-20).'
+            Remediation = ('Nothing blocks the demo. Get-DemoVmHealth -Config $config -VmName {0} -View Full lists the warning and its step; the next ./scripts/deploy.ps1 sends {0} the bundle whose summary names it, and checks every step again.' -f $VmName)
+        }
+    }
+    $total = if ($null -ne $count) { [int]$count } else { $shown.Count }
+    $list = (@($shown | ForEach-Object { ([string]$_).Trim().TrimEnd('.') }) -join '; ')
+    $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
+    $noun = if ($total -eq 1) { 'a warning' } else { '{0} warnings' -f $total }
+    return [pscustomobject]@{
+        Count       = $total
+        Known       = $true
+        Text        = ('Its bootstrap has {0}: {1}{2}.' -f $noun, $list, $more)
+        Remediation = ('Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. It stays until the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts, checks its step again; one whose cause is gone then goes away. {1}' -f $VmName, $full)
+    }
+}
 function Test-DemoValidationWorkloadBound {
     <#
     .SYNOPSIS

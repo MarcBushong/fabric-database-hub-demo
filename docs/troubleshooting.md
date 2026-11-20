@@ -229,6 +229,7 @@ First, `deploy.ps1` checks whether this copy is behind GitHub's `main`. A clean 
 | `START.T1.MONITORING` **Warning**: "still reports ... NotRunning 5 minutes after the SQL IaaS Agent service was restarted" | `./scripts/start-demo.ps1` again a few minutes later |
 | `T1.SQLVM.ASSOCIATEDSERVICES` **Warning**: inventory still lists Analysis or Integration Services | Nothing: T1's `AssociatedServices` step removes them |
 | A T1 health **Warning** about sysadmin | Handled: BUILTIN\Administrators was made a sysadmin |
+| `INFRA.HEALTH.<vm>` or `STATUS.VM_<vm>` **Warning** for a Ready VM: "... reports Ready: Every step is in the desired state. Its bootstrap has a warning: `<Step>: ...`" | Nothing blocks the demo: the warning starts with the step that gave it and says what happens next. Since 2026-11-20 (F24), each new bootstrap generation, which the next `./scripts/deploy.ps1` that sends the VM a new bundle starts, checks every step again, and a warning whose cause is gone goes away. `Get-DemoVmHealth -Config $config -VmName <vm> -View Full` lists them all; a VM whose summary doesn't name them yet gets that bundle from the next `./scripts/deploy.ps1` |
 
 ## T2: Arc Jumpstart's image (`JumpstartImage`)
 

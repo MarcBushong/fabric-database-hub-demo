@@ -1578,6 +1578,27 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         Mock -CommandName Get-GoldenImdsVmId -MockWith { $hostVmId }
     }
 
+    It 'prints the first two warnings, each naming its step and cut to 240 characters, and how many there are, in the summary (F24)' {
+        $root = New-HealthRoot
+        $long = 'AssociatedServices: ' + ('x' * 300)
+        $health = [ordered]@{ schemaVersion = 1; role = 'SqlVm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; warnings = @('SqlAdminAccess: SYSTEM was not a sysadmin.', $long, 'Media: Trusted on first use.'); steps = @() }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($health | ConvertTo-Json -Depth 5))
+        $text = & $healthScript -Root $root -View Summary
+        $summary = $text | ConvertFrom-Json
+        $summary.warningCount | Should -Be 3
+        @($summary.warnings).Count | Should -Be 2
+        $summary.warnings[0] | Should -Be 'SqlAdminAccess: SYSTEM was not a sysadmin.'
+        $summary.warnings[1].Length | Should -Be 240
+        $summary.warnings[1] | Should -BeLike 'AssociatedServices: xxx*...'
+        $text.Length | Should -BeLessThan 3500 -Because 'the summary fits the 4 KB a Run Command keeps'
+        # A health.json without warnings prints none.
+        $health.Remove('warnings')
+        $health['status'] = 'Pass'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($health | ConvertTo-Json -Depth 5))
+        $clean = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $clean.warningCount | Should -Be 0
+        @($clean.warnings).Count | Should -Be 0
+    }
     It 'reports a source a golden capture left air-gapped, with its role and no ID, in both views' {
         $root = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $false })
         $text = & $healthScript -Root $root -View Summary

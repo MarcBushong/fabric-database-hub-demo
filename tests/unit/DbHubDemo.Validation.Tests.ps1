@@ -298,6 +298,32 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $other.status | Should -Be 'Fail'
     }
 
+    It 'names the step that warned, and what to do, for a Ready VM whose status is a Warning (F24, 2026-11-20)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 3; warnings = @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.', 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $context = New-TestContext -Target T1
+        $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
+        $health.status | Should -Be 'Warning'
+        $health.message | Should -Be 'sqlvm01 reports Ready: Every step is in the desired state. Its bootstrap has 3 warnings: AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it; SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure (1 more).'
+        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it and says what happens next\. It stays until the next bootstrap generation, which the next \./scripts/deploy\.ps1 that sends sqlvm01 a new bundle starts, checks its step again'
+        $health.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists them all\.$'
+        $health.remediation | Should -Not -Match 'still working' -Because 'a Ready bootstrap isn''t working or waiting'
+        $health.evidence['warningCount'] | Should -Be 3
+        @($health.evidence['warnings']).Count | Should -Be 2
+
+        # A VM whose bundle predates the summary's warnings: it says so, and how to see them.
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = '' }
+        $fresh = New-TestContext -Target T1
+        $old = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $fresh } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
+        $old.message | Should -Match 'Its bootstrap reported a warning that this VM''s summary doesn''t name \(its bootstrap bundle predates 2026-11-20\)\.$'
+        $old.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists the warning and its step'
+
+        # A bootstrap that's still working keeps its own fix.
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'InProgress'; status = 'Warning'; message = 'Step SeedDatabase is converging.'; currentStep = 'SeedDatabase' }
+        $working = New-TestContext -Target T1
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $working } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }).remediation | Should -Be 'The bootstrap is still working or waiting; run validate.ps1 again later.'
+    }
     It 'warns, with the extension-update finding, when health.json can''t be read' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Reading health.json on sqlvm01 failed (execution state Pending, exit code ).' }

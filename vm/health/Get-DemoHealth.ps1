@@ -9,7 +9,9 @@ already redacted by the bootstrap. Windows PowerShell 5.1.
 
 With -View Summary (Phase 7), only the fields the orchestrator gates on are printed: role, state, status,
 the first 500 characters of message, currentStep, generation, updatedUtc, and from details the install mode,
-Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-09 it also prints the configured install
+Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-20 (F24) it also prints the first two
+warnings, each cut to 240 characters and naming the step it came from, and how many there are (warningCount): a Ready VM
+with warnings reports Warning, and the validator says which step warned. Since 2026-11-09 it also prints the configured install
 mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
 guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
 unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
@@ -360,6 +362,10 @@ if ($View -eq 'Summary') {
     if ($message.Length -gt 500) {
         $message = $message.Substring(0, 500)
     }
+    # The warnings that keep a Ready VM's status a Warning, each naming its step (F24, 2026-11-20): the first two, each
+    # cut to 240 characters, with how many there are, so the summary still fits.
+    $allWarnings = @(& $read $health @('warnings') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $shownWarnings = @($allWarnings | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     $summary = [ordered]@{
         schemaVersion  = 1
         role           = & $read $health @('role')
@@ -397,6 +403,8 @@ if ($View -eq 'Summary') {
         imagePinned    = & $read $health @('details', 'jumpstart', 'image', 'pinned')
         signInFound    = & $read $health @('details', 'signIn', 'found')
         signInNote     = & $read $health @('details', 'signIn', 'note')
+        warningCount   = $allWarnings.Count
+        warnings       = $shownWarnings
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts
