@@ -1416,6 +1416,30 @@ Describe 'Invoke-DemoDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -Times 3 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and -not $SwitchTo }
     }
 
+    It 'gives T2''s onboarding and T2''s profile this run''s own key for a guest restart, as the parallel path does, and a rerun its own (-Sequential; review of e617f34)' {
+        # Without one, the T2 host's hourly keys differ by caller, so the onboarding and T2's profile could each restart arcsql01.
+        $script:keys = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith {
+            $script:keys.Add('arc ' + (& (Get-Module -Name DbHubDemo) { Get-DemoRunRecoveryKey }))
+            New-TestResult 'T2.ARC.CONNECTED' 'Pass' 't2' 'T2'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -MockWith {
+            if ($Target -eq 'T2') {
+                $script:keys.Add('profile ' + (& (Get-Module -Name DbHubDemo) { Get-DemoRunRecoveryKey }))
+            }
+            New-TestResult ('{0}.PROFILE_{1}' -f $CheckPrefix, $Target) 'Pass' 'workload' $Target
+        }
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:keys.Count | Should -Be 2
+        $key = $script:keys[0].Substring(4)
+        $key | Should -Match '^deploy-[0-9a-f]{12}$'
+        $script:keys[1] | Should -Be ('profile ' + $key)
+        $script:keys.Clear()
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:keys[0] | Should -Match '^arc deploy-[0-9a-f]{12}$'
+        $script:keys[0] | Should -Not -Be ('arc ' + $key)
+    }
+
     It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY (-Sequential, 2026-11-06)' {
         $results = @(Invoke-DemoDeployment -Config $config)
         $script:history.Count | Should -Be 1
