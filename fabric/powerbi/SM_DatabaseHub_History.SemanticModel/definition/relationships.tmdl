@@ -61,3 +61,67 @@ relationship 'Incident Windows to Status'
 relationship 'Incident Windows to Date'
     fromColumn: 'Incident Windows'.'Report Date UTC'
     toColumn: Date.Date
+
+relationship 'RCA Sessions to Target'
+    fromColumn: 'RCA Sessions'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Sessions to Date'
+    fromColumn: 'RCA Sessions'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Waits to Target'
+    fromColumn: 'RCA Waits'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Waits to Date'
+    fromColumn: 'RCA Waits'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Events to Target'
+    fromColumn: 'RCA Events'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Events to Date'
+    fromColumn: 'RCA Events'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Queries to Target'
+    fromColumn: 'RCA Queries'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Queries to Date'
+    fromColumn: 'RCA Queries'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Resource to Target'
+    fromColumn: 'RCA Resource'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Resource to Date'
+    fromColumn: 'RCA Resource'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Replica to Target'
+    fromColumn: 'RCA Replica'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Replica to Date'
+    fromColumn: 'RCA Replica'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Coverage to Target'
+    fromColumn: 'RCA Coverage'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Coverage to Date'
+    fromColumn: 'RCA Coverage'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Answer Key to Target'
+    fromColumn: 'RCA Answer Key'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Answer Key to Date'
+    fromColumn: 'RCA Answer Key'.'Report Date UTC'
+    toColumn: Date.Date

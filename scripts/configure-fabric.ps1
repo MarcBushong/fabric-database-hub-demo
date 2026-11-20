@@ -615,6 +615,18 @@ if ($null -ne $liveImport) {
 }
 $liveReady = $null -ne $liveImport -and $liveImport.status -eq 'Pass'
 $firstRun = $liveReady -and ($liveOperation -eq 'created' -or $newLakehouse)
+# An update whose history model reads tables the lakehouse doesn't have yet (2026-11-20: the Incident RCA's eight, ADR
+# 0031): this release's notebook, just updated, creates them on its next run, so it runs once now, as for a first
+# deployment, and the history model's step that follows reads them. Read-only check (OneLake's Path - List), only after
+# the subscription guard; one that can't list the tables runs nothing, and the model's step leaves the tables out.
+if ($liveReady -and -not $firstRun -and -not $RunLiveActivity -and $liveOperation -eq 'updated' -and $config -and -not $WhatIfPreference -and -not $guardFailed) {
+    $tablePlan = Get-DemoRcaModelTablePlan -Config $config -WorkspaceId ([string]$fabric['workspaceId']) -LakehouseId ([string]$fabric['lakehouseId'])
+    $tableEvidence = $tablePlan.Result.evidence
+    if (@($tablePlan.Excluded).Count -gt 0 -and [bool]$tableEvidence['listed']) {
+        Write-DemoLog -Message ('NB_DatabaseHub_LiveActivity was updated, and the lakehouse doesn''t have {0} yet: the notebook runs once now and creates them, so the history model reads them.' -f (@($tableEvidence['excluded']) -join ', '))
+        $firstRun = $true
+    }
+}
 if ($newLakehouse -and $liveOperation -eq 'unchanged') {
     $results.Add((New-DemoResult -CheckId 'FABRIC.NOTEBOOKS.IMPORT' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' `
                 -Message ('The lakehouse "{0}" was just created, but NB_DatabaseHub_LiveActivity was already in the workspace and was left as it is, so it may still be bound to another lakehouse, and the history tables weren''t created.' -f [string]$fabric['lakehouseName']) `

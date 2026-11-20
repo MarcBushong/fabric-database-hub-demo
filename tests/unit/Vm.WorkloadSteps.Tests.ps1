@@ -847,6 +847,111 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Invoke-DemoWorkloadControl -ActionName 'Format' -Request '' -StateRoot $root
         (Get-ControlResult).status | Should -Be 'Fail'
     }
+
+    Context 'Rca: the Incident RCA''s evidence export (ADR 0031)' {
+        BeforeAll {
+            $rcaFixtures = Join-Path -Path $repoRoot -ChildPath 'rca/fixtures'
+            $script:rcaIndexLine = 'DBHUBDEMO-RCA-INDEX ' + (Get-Content -LiteralPath (Join-Path -Path $rcaFixtures -ChildPath 'export-index.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 5 -Compress)
+            $script:rcaParts = @(Get-Content -LiteralPath (Join-Path -Path $rcaFixtures -ChildPath 't1-blocking-chain.parts.txt') | Where-Object { $_ })
+            $script:rcaSession = '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21'
+            function Get-RcaResult {
+                $script:lines[0] | Should -Match '^DBHUBDEMO-WORKLOAD \{'
+                $script:lines[0].Substring('DBHUBDEMO-WORKLOAD '.Length) | ConvertFrom-Json
+            }
+        }
+
+        It 'checks its part line against rca/transport.schema.json''s' {
+            $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') -Raw | ConvertFrom-Json -AsHashtable
+            $script:ControlRcaPartPattern | Should -BeExactly $schema['$defs']['partLine']['pattern']
+            $script:ControlRcaDocumentPattern | Should -BeExactly $schema['$defs']['documentRef']['properties']['documentId']['pattern']
+        }
+
+        It 'exports on T1 with the session''s ID, and prints the runner''s index line last, whole' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ("observer: 2 documents`r`n" + $script:rcaIndexLine + "`r`n"); StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true }) -StateRoot $root
+            $script:lines.Count | Should -Be 2
+            $result = Get-RcaResult
+            $result.action | Should -Be 'Rca'
+            $result.status | Should -Be 'Pass'
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            ($script:lines -join "`n").Length | Should -BeLessThan 4096 -Because 'the instance view keeps the last 4 KB'
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $TimeoutSeconds -eq 600 }
+            # Outside a control session, and without --final.
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export' }) -StateRoot $root
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'rca export --session none' }
+        }
+
+        It 'prints the part asked for, and refuses another part or a line outside the contract' {
+            $root = New-ControlRoot
+            $script:rcaOut = $script:rcaParts[1]
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaOut; StdErr = '' } }
+            $request = @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 2 }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Pass'
+            $script:lines[1] | Should -BeExactly $script:rcaParts[1]
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'rca part --document 20261120T165000Z-sqlvm01-0001 --part 2' -and $TimeoutSeconds -eq 120 }
+            # The VM side knows the document and the part asked for; the runbook checks the count and the SHA-256 against the
+            # export's index (Test-DbHubRcaPartLine).
+            foreach ($other in @($script:rcaParts[0], ($script:rcaParts[1] + '!'), ($script:rcaParts[1] -replace '-0001 ', '-0002 '))) {
+                $script:lines.Clear()
+                $script:rcaOut = $other
+                Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+                $script:lines.Count | Should -Be 1
+                (Get-RcaResult).status | Should -Be 'Fail'
+            }
+        }
+
+        It 'says Not selected when nothing was captured since the last export, and Not supported for a runner older than the export' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Not selected'
+            $script:lines.Clear()
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "Unrecognized command or argument 'rca'." } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Not supported'
+            $result.evidence.oldRunner | Should -BeTrue
+            $result.message | Should -Match 'predates the RCA export .* \./scripts/deploy\.ps1 updates it'
+        }
+
+        It 'refuses a request outside the contract without running the runner' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { throw 'must not run' }
+            foreach ($request in @(
+                    @{ command = 'export'; sessionId = '5F1C0E7A9B2D4C6E8F0A1B3C5D7E9F21' }
+                    @{ command = 'export'; sessionId = 'none; whoami' }
+                    @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 0 }
+                    @{ command = 'part'; documentId = '../20261120T165000Z-sqlvm01-0001'; part = 1 }
+                    @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = '1 --session x' }
+                    @{ command = 'run'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 1 }
+                )) {
+                $script:lines.Clear()
+                Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+                $script:lines.Count | Should -Be 1
+                (Get-RcaResult).status | Should -Be 'Fail' -Because ($request | ConvertTo-Json -Compress)
+            }
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 0
+        }
+
+        It 'runs in T2''s guest on archost01, without making the guest ready or restarting it' {
+            $root = New-ControlRoot -Role 'ArcHost' -NoInstall
+            Mock -CommandName Invoke-DemoControlT2Attempt -MockWith { [pscustomobject]@{ Run = [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaIndexLine; StdErr = '' }; ReadyNote = [ordered]@{}; Failure = $null } }
+            Mock -CommandName Invoke-DemoControlT2Recovery -MockWith { throw 'must not restart the guest' }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Pass'
+            (Get-RcaResult).evidence.guest | Should -Be 'arcsql01'
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            Should -Invoke -CommandName Invoke-DemoControlT2Attempt -Times 1 -Exactly -ParameterFilter { -not $Activity -and ($Arguments -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $GuestName -eq 'arcsql01' -and $LockSeconds -eq 30 }
+            # A guest without the runner yet has captured nothing: Not selected.
+            $script:lines.Clear()
+            Mock -CommandName Invoke-DemoControlT2Attempt -MockWith { throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.' }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Not selected'
+        }
+    }
 }
 
 Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (control start reliability)' {

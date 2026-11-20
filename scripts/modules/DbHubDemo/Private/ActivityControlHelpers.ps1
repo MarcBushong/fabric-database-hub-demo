@@ -602,6 +602,12 @@ function Get-DemoActivityControlRunbookSetting {
         monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 8; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
+        # The Incident RCA's export (ADR 0031): the VM-side control's Rca action, and its bounds. A stop exports for at most
+        # stopMinutes before the VMs deallocate, a monitoring re-check for at most recheckMinutes; up to maxParallel part
+        # Run Commands per VM at a time, and never more than a VM's 25 managed Run Commands
+        # (https://learn.microsoft.com/azure/virtual-machines/run-command-overview).
+        rcaScriptTemplate      = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Rca')
+        rca                    = [ordered]@{ stopMinutes = 6; recheckMinutes = 8; startMinutes = 6; maxParallel = 10; exportSeconds = 600; partSeconds = 120 }
     }
 }
 

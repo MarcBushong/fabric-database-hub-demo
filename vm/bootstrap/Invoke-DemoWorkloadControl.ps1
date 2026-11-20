@@ -44,9 +44,13 @@ Actions:
   the readiness wait and the recovery above already cover.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
+- Rca (sqlvm01, and archost01 for T2's guest) { command, sessionId, final, documentId, part, timeoutSeconds,
+  lockSeconds }: the Incident RCA's evidence export (ADR 0031): 'rca export' or 'rca part' with the runner on sqlvm01,
+  or in T2's guest over PowerShell Direct, which it never starts or restarts. It prints the result line, then the
+  runner's own line (rca/README.md, Transport), last, so the instance view's 4 KB keeps it whole.
 
 .PARAMETER Action
-EnableT3, EnableT4, Runner, or StopGuest.
+EnableT3, EnableT4, Runner, StopGuest, or Rca.
 
 .PARAMETER RequestBase64
 The request as Base64-encoded UTF-8 JSON.
@@ -75,6 +79,10 @@ $script:ControlSqlStarting = @(2, 26, 40, 53, -1, 10061)
 $script:ControlAzureSqlTransient = @(615, 926, 4060, 4221, 40197, 40501, 40613, 49918, 49919, 49920)
 # T4's read replica (ADR 0025): a flexible server's FQDN, lowercase, as Get-DemoVmWorkloadSetting accepts it.
 $script:ControlReplicaFqdnPattern = '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.postgres\.database\.azure\.com$'
+# The Incident RCA's export (ADR 0031): rca/transport.schema.json's part line and document ID, and a control session's ID.
+$script:ControlRcaPartPattern = '^DBHUBDEMO-RCA 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4} [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$'
+$script:ControlRcaDocumentPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$'
+$script:ControlRcaSessionPattern = '^[0-9a-f]{32}$'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1') -Force
 
 function Write-DemoControlLine {
@@ -1577,6 +1585,205 @@ function Invoke-DemoControlStopGuest {
     Write-DemoControlResult -ActionName 'StopGuest' -Status 'Warning' -Message ('{0} was still {1} after {2} minutes. Deallocating the host shuts it down through its automatic stop action (ShutDown).' -f $guestName, $state, $minutes) -Evidence @{ guest = $guestName; state = $state; seconds = [int]$clock.Elapsed.TotalSeconds }
 }
 
+function Get-DemoControlRcaArgument {
+    <#
+    .SYNOPSIS
+    The runner arguments of an Rca request (ADR 0031, rca/README.md, The runner's commands), from validated values only:
+    'rca export --session <id or none> [--final]', or 'rca part --document <documentId> --part <index>'. Throws on a
+    request that isn't one of them. Returns Arguments, Command, DocumentId, Part, and TimeoutSeconds.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request
+    )
+
+    $command = if ($Request.Contains('command')) { [string]$Request['command'] } else { '' }
+    $timeout = 600
+    if ($command -ceq 'export') {
+        $session = if ($Request.Contains('sessionId') -and $null -ne $Request['sessionId']) { [string]$Request['sessionId'] } else { '' }
+        if ($session -and $session -cnotmatch $script:ControlRcaSessionPattern) {
+            throw 'The request''s sessionId must be a control session''s ID (32 lowercase hex characters) or empty.'
+        }
+        if (-not $session) {
+            $session = 'none'
+        }
+        $arguments = @('rca', 'export', '--session', $session)
+        if ($Request.Contains('final') -and [bool]$Request['final']) {
+            $arguments += '--final'
+        }
+        $documentId = ''
+        $part = 0
+    }
+    elseif ($command -ceq 'part') {
+        $documentId = if ($Request.Contains('documentId')) { [string]$Request['documentId'] } else { '' }
+        if ($documentId -cnotmatch $script:ControlRcaDocumentPattern) {
+            throw 'The request''s documentId isn''t an evidence document''s ID (rca/README.md, The evidence document).'
+        }
+        $part = 0
+        if ($Request.Contains('part') -and $null -ne $Request['part'] -and [string]$Request['part'] -match '^[0-9]{1,2}$') {
+            $part = [int]$Request['part']
+        }
+        if ($part -lt 1 -or $part -gt 99) {
+            throw 'The request''s part must be a whole number from 1 to 99.'
+        }
+        $arguments = @('rca', 'part', '--document', $documentId, '--part', [string]$part)
+        $timeout = 120
+    }
+    else {
+        throw 'The request''s command must be export or part.'
+    }
+    if ($Request.Contains('timeoutSeconds') -and $null -ne $Request['timeoutSeconds'] -and [int]$Request['timeoutSeconds'] -ge 30) {
+        $timeout = [System.Math]::Min(900, [int]$Request['timeoutSeconds'])
+    }
+    return [pscustomobject]@{ Arguments = $arguments; Command = $command; DocumentId = $documentId; Part = $part; TimeoutSeconds = $timeout }
+}
+
+function Get-DemoControlRcaLine {
+    <#
+    .SYNOPSIS
+    The one line the runner printed for an Rca request, checked against the contract (rca/transport.schema.json): the
+    export's 'DBHUBDEMO-RCA-INDEX <json>', or the part's 'DBHUBDEMO-RCA 1 <documentId> <index>/<count> <sha256> <base64>'
+    for the document and part asked for. At most 3,400 ASCII characters. '' when the output has no such line.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('export', 'part')]
+        [string] $Command,
+
+        [AllowEmptyString()]
+        [string] $DocumentId = '',
+
+        [int] $Part = 0
+    )
+
+    $found = ''
+    foreach ($raw in ([string]$Text -split '\r?\n')) {
+        $line = $raw.Trim()
+        if ($line.Length -gt 3400 -or $line -match '[^\x20-\x7E]') {
+            continue
+        }
+        if ($Command -eq 'export') {
+            if ($line.StartsWith('DBHUBDEMO-RCA-INDEX {', [System.StringComparison]::Ordinal) -and $line.EndsWith('}', [System.StringComparison]::Ordinal)) {
+                $found = $line
+            }
+            continue
+        }
+        if ($line -cmatch $script:ControlRcaPartPattern) {
+            $fields = $line.Split(' ')
+            if ($fields[2] -ceq $DocumentId -and [int]($fields[3].Split('/')[0]) -eq $Part) {
+                $found = $line
+            }
+        }
+    }
+    return $found
+}
+
+function Invoke-DemoControlRca {
+    <#
+    .SYNOPSIS
+    The Rca action (ADR 0031): the runner's evidence export on this VM, which the control's runbook and the operator's
+    scripts run through managed Run Commands. On sqlvm01 the runner exports what its observer captured on T1, T3, T4, and
+    T4's read replica; on archost01 it runs in T2's guest over PowerShell Direct, as the Runner action does, without
+    making the guest ready or restarting it: an export never starts anything.
+
+    .DESCRIPTION
+    It prints two lines: the one result line (DBHUBDEMO-WORKLOAD, with an ADR 0012 status: Pass, Not selected when
+    there was nothing to export, Not supported for a runner older than the export, Fail otherwise), then the runner's own
+    line, checked against the contract (Get-DemoControlRcaLine), last, so the 4 KB of output that the instance view keeps
+    always holds it whole (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Settings
+    )
+
+    $role = [string]$Settings['role']
+    try {
+        $rca = Get-DemoControlRcaArgument -Request $Request
+    }
+    catch {
+        Write-DemoControlResult -ActionName 'Rca' -Status 'Fail' -Message $_.Exception.Message -Evidence ([ordered]@{ host = $role })
+        return
+    }
+    $label = 'runner rca {0}' -f $rca.Command
+    $evidence = [ordered]@{ host = $role; command = $rca.Command }
+    if ($role -eq 'SqlVm') {
+        $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $StateRoot).InstallRecord
+        if ($null -eq $install) {
+            Write-DemoControlResult -ActionName 'Rca' -Status 'Not selected' -Message 'The workload runner is not installed on T1 yet, so it has captured nothing to export.' -Evidence $evidence
+            return
+        }
+        $run = Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $rca.Arguments -TimeoutSeconds $rca.TimeoutSeconds
+    }
+    elseif ($role -eq 'ArcHost') {
+        $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
+        $guestName = [string]$guest.Name
+        if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
+            $guestName = [string]$Settings['guest']['name']
+        }
+        $evidence['guest'] = $guestName
+        $lockSeconds = 30
+        if ($Request.Contains('lockSeconds') -and $null -ne $Request['lockSeconds']) {
+            $lockSeconds = [int][System.Math]::Max(0, [System.Math]::Min(600, [int]$Request['lockSeconds']))
+        }
+        try {
+            $attempt = Invoke-DemoControlT2Attempt -StateRoot $StateRoot -GuestName $guestName -Guest $guest -Arguments $rca.Arguments -TimeoutSeconds $rca.TimeoutSeconds -Activity $false -LockSeconds $lockSeconds
+        }
+        catch {
+            $text = [string]$_.Exception.Message
+            $status = 'Fail'
+            if ($text -match 'isn''t set up yet|not installed in the guest yet') {
+                $status = 'Not selected'
+            }
+            Write-DemoControlResult -ActionName 'Rca' -Status $status -Message ('{0} in {1}: {2}' -f $label, $guestName, (Get-DemoControlTail -Text $text -Length 400)) -Evidence $evidence
+            return
+        }
+        $run = $attempt.Run
+    }
+    else {
+        Write-DemoControlResult -ActionName 'Rca' -Status 'Fail' -Message ('The RCA export runs on sqlvm01 (T1, T3, T4, and its read replica) and on archost01 (T2''s guest), not with role {0}.' -f $role) -Evidence $evidence
+        return
+    }
+
+    $evidence['exitCode'] = [int]$run.ExitCode
+    $line = Get-DemoControlRcaLine -Text $run.StdOut -Command $rca.Command -DocumentId $rca.DocumentId -Part $rca.Part
+    $errorText = Get-DemoControlTail -Text $run.StdErr -Length 300
+    if ($run.ExitCode -ne 0 -and ([string]$run.StdErr + [string]$run.StdOut) -match 'Unrecognized command or argument|Required command was not provided') {
+        $evidence['oldRunner'] = $true
+        Write-DemoControlResult -ActionName 'Rca' -Status 'Not supported' -Message ('{0}: this VM''s runner predates the RCA export (ADR 0031), so nothing was exported; ./scripts/deploy.ps1 updates it.' -f $label) -Evidence $evidence
+        return
+    }
+    if ($rca.Command -eq 'export' -and $run.ExitCode -eq 2) {
+        Write-DemoControlResult -ActionName 'Rca' -Status 'Not selected' -Message ('{0}: nothing was captured since the last export.' -f $label) -Evidence $evidence
+        if ($line) {
+            Write-DemoControlLine -Line $line
+        }
+        return
+    }
+    if ($run.ExitCode -ne 0 -or -not $line) {
+        $why = if ($run.ExitCode -ne 0) { 'exit code {0}' -f $run.ExitCode } else { 'no line the contract allows' }
+        Write-DemoControlResult -ActionName 'Rca' -Status 'Fail' -Message ('{0}: {1}. {2}' -f $label, $why, $errorText).Trim() -Evidence $evidence
+        return
+    }
+    Write-DemoControlResult -ActionName 'Rca' -Status 'Pass' -Message ('{0}: its line follows.' -f $label) -Evidence $evidence
+    Write-DemoControlLine -Line $line
+}
+
 function Invoke-DemoWorkloadControl {
     [CmdletBinding()]
     param(
@@ -1623,8 +1830,11 @@ function Invoke-DemoWorkloadControl {
             }
             Invoke-DemoControlStopGuest -Request $body -Settings $settings -StateRoot $StateRoot
         }
+        'Rca' {
+            Invoke-DemoControlRca -StateRoot $StateRoot -Request $body -Settings $settings
+        }
         default {
-            Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, or StopGuest.'
+            Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, StopGuest, or Rca.'
         }
     }
 }

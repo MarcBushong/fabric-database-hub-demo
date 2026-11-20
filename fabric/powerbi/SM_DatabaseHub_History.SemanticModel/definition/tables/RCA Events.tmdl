@@ -1,0 +1,141 @@
+/// One server-side event, or one count of identical events per minute: an error, an attention, a deadlock, a lock escalation, a tuning change, or the observer's own capture escalation. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Events'
+
+    /// Deadlocks the observer captured.
+    measure 'Deadlocks (captured)' = CALCULATE ( SUM ( 'RCA Events'[Event Count] ), 'RCA Events'[Kind] = "deadlock" )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// Errors the observer captured, intercepted ones included.
+    measure 'Errors (captured)' = CALCULATE ( SUM ( 'RCA Events'[Event Count] ), 'RCA Events'[Kind] = "error" )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// Lock escalations the observer captured.
+    measure 'Lock Escalations (captured)' = CALCULATE ( SUM ( 'RCA Events'[Event Count] ), 'RCA Events'[Kind] = "escalation" )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When it happened; for a count, the start of its minute.
+    column 'Event Time UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: event_time_utc
+
+    /// T1 to T5, or T4-replica.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// error, attention, deadlock, escalation, tuning, or capture.
+    column Kind
+        dataType: string
+        sourceColumn: kind
+
+    /// The source event: the Extended Events event (error_reported, attention, xml_deadlock_report, database_xml_deadlock_report, lock_escalation), the counter (pg_stat_database.deadlocks), the tuning change, or for capture: escalated or relaxed.
+    column 'Event Name'
+        dataType: string
+        sourceColumn: event_name
+
+    /// The session the event belongs to; for a deadlock, its victim.
+    column 'Session ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: session_id
+
+    /// As in RCA Sessions: the workload's own sessions only, without internal segments.
+    column Program
+        dataType: string
+        sourceColumn: program_name
+
+    /// As in RCA Sessions.
+    column 'Run Token'
+        dataType: string
+        isHidden
+        sourceColumn: run_token
+
+    /// The workload's own sessions only.
+    column Login
+        dataType: string
+        sourceColumn: login_name
+
+    /// The workload's own sessions only.
+    column Host
+        dataType: string
+        sourceColumn: host_name
+
+    /// The module the event's statement belongs to.
+    column Module
+        dataType: string
+        sourceColumn: module_name
+
+    /// The SQL Server error number or the PostgreSQL SQLSTATE; for capture, the episode's ID.
+    column Code
+        dataType: string
+        sourceColumn: code
+
+    /// The SQL Server error severity.
+    column Severity
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: severity
+
+    /// True when the statement's own TRY...CATCH handled the error (error_reported's is_intercepted).
+    column Intercepted
+        dataType: boolean
+        sourceColumn: intercepted
+
+    /// 1 for one event; the count when identical events are counted per minute.
+    column 'Event Count'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: event_count
+
+    /// The object the event names: the escalated table, a deadlock's first resource, the tuned query.
+    column Object
+        dataType: string
+        sourceColumn: object_name
+
+    /// The lock mode of an escalation.
+    column 'Lock Mode'
+        dataType: string
+        sourceColumn: lock_mode
+
+    /// The event in plain words, normalized: the error message, the escalation's lock counts, the tuning state, or the signal and value that started or ended a capture episode.
+    column Detail
+        dataType: string
+        sourceColumn: detail
+
+    /// For a deadlock: its graph reduced to JSON (rca/README.md, Deadlocks).
+    column 'Deadlock JSON'
+        dataType: string
+        isHidden
+        sourceColumn: deadlock_json
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Events' = entity
+        mode: directLake
+        source
+            entityName: rca_events
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

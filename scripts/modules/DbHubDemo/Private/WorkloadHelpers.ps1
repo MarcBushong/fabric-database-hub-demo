@@ -215,7 +215,7 @@ function Get-DemoWorkloadControlScript {
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest')]
+        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca')]
         [string] $Action,
 
         [Parameter(Mandatory)]
@@ -283,7 +283,7 @@ function Invoke-DemoWorkloadAction {
         [string] $VmName,
 
         [Parameter(Mandatory)]
-        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest')]
+        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca')]
         [string] $Action,
 
         [System.Collections.IDictionary] $Request = @{},

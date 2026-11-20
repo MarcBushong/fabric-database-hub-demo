@@ -11,7 +11,9 @@
 # and a token lives only in the context object of one job.
 #
 # The stop path (Stop-DbHubDemo) deallocates the VMs and stops T4 through Azure Resource Manager only, never through
-# Run Command, which waited more than 10 minutes on a saturated sqlvm01 in Phase 25a.
+# Run Command, which waited more than 10 minutes on a saturated sqlvm01 in Phase 25a. A session's stop first exports its
+# evidence for the Incident RCA (2026-11-20, ADR 0031) through read-only managed Run Commands, bounded by rca.stopMinutes:
+# what isn't exported by then stays on the VMs, and the next session's start exports it.
 # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has nothing to start, and an account has no stop: T1's runner
 # drives it from sqlvm01, so its activity ends with sqlvm01. Its container's provisioned throughput bills every hour the
 # container exists, so since 2026-11-19 the container exists only during a session once its lifecycle is Session (the demo
@@ -1983,11 +1985,13 @@ function Stop-DbHubDemo {
     .SYNOPSIS
     Stop now, and what the auto-stop does: removes the auto-stop schedule and the run's monitoring re-checks,
     deallocates both VMs, stops T4, and deletes T5's container (2026-11-19), through Azure Resource Manager only. Never
-    Run Command (Phase 25a, finding 5): deallocation ends every session on T1 and T2 (the T2 guest shuts down through the
-    host's automatic stop action, ShutDown), T3's sessions end with T1's runner, and T3 auto-pauses after its delay. The
-    activity profiles end at their own end; the profile host ends what a stopped run left behind when it starts again.
-    Returns Done, Failed, MetricsStatus, MetricsMessage, and T5Status (Remove-DbHubT5Container's outcome, '' when it wasn't
-    asked; apart from Failed, review of ab91ee5).
+    Run Command (Phase 25a, finding 5) to stop anything: deallocation ends every session on T1 and T2 (the T2 guest shuts
+    down through the host's automatic stop action, ShutDown), T3's sessions end with T1's runner, and T3 auto-pauses after
+    its delay. The activity profiles end at their own end; the profile host ends what a stopped run left behind when it
+    starts again. A session's stop first exports its evidence for the Incident RCA (2026-11-20, ADR 0031,
+    Invoke-DbHubRcaStop) through managed Run Commands that only read, bounded by rca.stopMinutes, while the VMs still run.
+    Returns Done, Failed, MetricsStatus, MetricsMessage, T5Status (Remove-DbHubT5Container's outcome, '' when it wasn't
+    asked; apart from Failed, review of ab91ee5), and Rca (the export's State, Index, and Lines, or $null).
 
     .DESCRIPTION
     With the control's session settings (2026-11-14, ADR 0026), and T4's read replica there or a session's busy marker set:
@@ -2030,7 +2034,7 @@ function Stop-DbHubDemo {
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Deallocate the VMs, stop T4, and delete T5''s container')) {
-        return [pscustomobject]@{ Done = @(); Failed = @(); MetricsStatus = ''; MetricsMessage = '' }
+        return [pscustomobject]@{ Done = @(); Failed = @(); MetricsStatus = ''; MetricsMessage = ''; Rca = $null }
     }
     $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
@@ -2046,13 +2050,24 @@ function Stop-DbHubDemo {
     $session = Test-DbHubSessionCapable -Settings $settings
     $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
     $replicaThere = $false
+    $rca = $null
     # With -KeepT4, T4's read replica stays too, unless the run's session asked for it (-RemoveReplica).
     $replicaGoes = -not $KeepT4 -or $RemoveReplica
     if ($session) {
         $replicaThere = (Get-DbHubT4Replica -Context $Context -Tags $Tags).State -notin 'NotConfigured', 'Missing', 'Unknown'
         if (($replicaThere -and $replicaGoes) -or $busy.By -eq 'session') {
+            # The session's evidence for the Incident RCA first (ADR 0031), while the VMs still run: its bundles go into the
+            # vault before the metrics' final version, which lists them. Bounded (rca.stopMinutes); what isn't exported by
+            # then stays on the VMs, and the next session's start exports it.
+            if ($null -eq $OnlyVm) {
+                $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId
+            }
+            $rcaIndex = $null
+            if ($null -ne $rca) {
+                $rcaIndex = $rca.Index
+            }
             # The history's metrics first, while the replica exists.
-            $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId
+            $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId -Rca $rcaIndex
             $metricsStatus = [string]$saved.Status
             $metricsMessage = [string]$saved.Message
             if ($saved.Status -in 'Pass', 'Warning') {
@@ -2165,7 +2180,7 @@ function Stop-DbHubDemo {
             Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
         }
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; T5Status = $t5Status }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; T5Status = $t5Status; Rca = $rca }
 }
 
 function Get-DbHubLastShutdownUtc {
@@ -3503,7 +3518,13 @@ function Start-DbHubActivityRun {
 
         # Called once, when T4 is first seen Ready, for a session's read replica.
         [AllowNull()]
-        [scriptblock] $OnT4Ready = $null
+        [scriptblock] $OnT4Ready = $null,
+
+        # Called with a VM's name once it runs, after this control's earlier Run Commands there are deleted and right before
+        # its activity goes out (2026-11-20, ADR 0031): a session's start sends an earlier session's evidence export there.
+        # It returns the name of a Run Command it sent, which no cleanup of this run deletes, or ''.
+        [AllowNull()]
+        [scriptblock] $OnVmReady = $null
     )
 
     $settings = $Context.Settings
@@ -3813,6 +3834,12 @@ function Start-DbHubActivityRun {
             $vmPlan.Running = $true
             # This control's earlier Run Commands on the VM go first: a VM takes 25 managed ones.
             Clear-DbHubOldRunCommand -Context $Context -VmName $vm -Keep $runNames.ToArray()
+            if ($null -ne $OnVmReady) {
+                $readyName = [string](& $OnVmReady $vm)
+                if ($readyName) {
+                    $runNames.Add($readyName)
+                }
+            }
             $chosen = @($vmPlan.Activities)
             if ($vm -eq $sqlVm -and $t4Pending -and $t4State -eq 'Ready') {
                 $chosen += $t4Activity
@@ -4105,7 +4132,14 @@ function Set-DbHubVaultSecret {
         $body['tags'] = $Tags
     }
     $put = Invoke-DbHubArm -Context $Context -Method PUT -Path $path -ApiVersion $version -Body $body
-    return [pscustomobject]@{ Ok = ($put.StatusCode -in 200, 201); StatusCode = $put.StatusCode; Error = $put.Error }
+    # The version this write created (2026-11-20, ADR 0031): Azure Resource Manager returns it in secretUriWithVersion, which
+    # the RCA's bundle index lists (https://learn.microsoft.com/rest/api/keyvault/keyvault/secrets/create-or-update).
+    $written = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $put.Body -Name 'properties') -Name 'secretUriWithVersion')
+    $secretVersion = ''
+    if ($written -match ('/secrets/{0}/([0-9a-f]{{32}})$' -f [regex]::Escape($Name))) {
+        $secretVersion = $Matches[1]
+    }
+    return [pscustomobject]@{ Ok = ($put.StatusCode -in 200, 201); StatusCode = $put.StatusCode; Error = $put.Error; Version = $secretVersion }
 }
 
 function Set-DbHubResourceGroupTag {
@@ -4199,6 +4233,9 @@ function New-DbHubSessionStatus {
         # When T5 is back at its baseline after its last ru-storm (2026-11-18; since 2026-11-19 its showcase runs the whole
         # session, and its baseline runs on after it: Get-DbHubT5LastStormEnd); empty without T5's showcase.
         t5                = [ordered]@{ endUtc = '' }
+        # The session's evidence for the Incident RCA (ADR 0031): the bundles its exports wrote, the documents in them, and
+        # what's left on the VMs (ConvertTo-DbHubRcaState); the re-checks and the stop add to it.
+        rca               = (ConvertTo-DbHubRcaState -State $null -SessionId $SessionId)
         message           = ''
     }
 }
@@ -5919,6 +5956,9 @@ function Save-DbHubSessionMetric {
     T5's metrics (2026-11-18, ADR 0027) go in the same secret, as the cosmos member of T4's document (or of an empty one
     when T4 has none), because the identity may write only the two session secrets. They're read first: with them, T4's
     document gets at most half of the secret's 24,000-byte bound, and T5's the rest.
+    The Incident RCA's bundle index (-Rca, 2026-11-20, ADR 0031) goes in as the rca member, at most 4,000 bytes, which the
+    two documents' bound leaves room for; with nothing else, the document holds it alone. This write is the secret's final
+    version, after the bundles it lists.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -5928,7 +5968,10 @@ function Save-DbHubSessionMetric {
         [object] $Tags,
 
         [AllowEmptyString()]
-        [string] $SessionId = ''
+        [string] $SessionId = '',
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Rca = $null
     )
 
     $now = Get-DbHubUtcNow
@@ -5941,15 +5984,23 @@ function Save-DbHubSessionMetric {
     if ($null -ne $started -and $started -lt $now -and $started -gt $now.AddHours(-6)) {
         $from = $started.AddMinutes(-10)
     }
+    $rcaJson = ''
+    if ($null -ne $Rca) {
+        $rcaJson = ConvertTo-Json -InputObject $Rca -Depth 6 -Compress
+    }
+    $room = 24000
+    if ($rcaJson) {
+        $room = 24000 - [System.Text.Encoding]::UTF8.GetByteCount($rcaJson) - 16
+    }
     $cosmos = Read-DbHubCosmosMetricSeries -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now
-    $bound = 24000
+    $bound = $room
     if ($cosmos.Found) {
-        $bound = 12000
+        $bound = [int][System.Math]::Floor($room / 2)
     }
     $document = Get-DbHubPostgresMetricDocument -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now -SessionId $session -MaxBytes $bound
     $cosmosDocument = $null
     if ($cosmos.Found) {
-        $cosmosDocument = ConvertTo-DbHubCosmosMetricDocument -Read $cosmos -SessionId $session -MaxBytes (24000 - $document.Bytes - 16)
+        $cosmosDocument = ConvertTo-DbHubCosmosMetricDocument -Read $cosmos -SessionId $session -MaxBytes ($room - $document.Bytes - 16)
     }
     $hasCosmos = $null -ne $cosmosDocument -and [bool]$cosmosDocument.Json
     $messages = @($document.Message)
@@ -5967,6 +6018,14 @@ function Save-DbHubSessionMetric {
             $json = ConvertTo-Json -InputObject ([ordered]@{ version = 1; sessionId = $session; capturedBy = 'control'; capturedUtc = $cosmosDocument.CapturedUtc; startUtc = $cosmosDocument.StartUtc; endUtc = $cosmosDocument.EndUtc; windowMinutes = $cosmosDocument.WindowMinutes; intervalMinutes = $cosmosDocument.IntervalMinutes; servers = @(); series = @() }) -Depth 4 -Compress
         }
         $json = '{0},"cosmos":{1}}}' -f $json.Substring(0, $json.Length - 1), $cosmosDocument.Json
+    }
+    if ($rcaJson) {
+        if (-not $json) {
+            # The bundle index alone (2026-11-20, ADR 0031), in a document without servers, which the notebook reads as no
+            # T4 metrics; its window says which session it's for.
+            $json = ConvertTo-Json -InputObject ([ordered]@{ version = 1; sessionId = $session; capturedBy = 'control'; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); startUtc = (ConvertTo-DbHubTimeText -Value $from); endUtc = (ConvertTo-DbHubTimeText -Value $now); windowMinutes = [int]($now - $from).TotalMinutes; intervalMinutes = 1; servers = @(); series = @() }) -Depth 4 -Compress
+        }
+        $json = '{0},"rca":{1}}}' -f $json.Substring(0, $json.Length - 1), $rcaJson
     }
     if (-not $json) {
         return [pscustomobject]@{ Status = $document.Status; Message = $message; Bytes = 0; Replica = $false; Cosmos = $false }
@@ -5987,12 +6046,1328 @@ function Save-DbHubSessionMetric {
     if ($hasCosmos) {
         $cosmosText = 'yes'
     }
-    $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $json -Tags @{ sessionId = $session; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); replica = $replicaText; t5 = $cosmosText }
+    $rcaText = 'no'
+    if ($rcaJson) {
+        $rcaText = 'yes'
+    }
+    $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $json -Tags @{ sessionId = $session; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); replica = $replicaText; t5 = $cosmosText; rca = $rcaText }
     if (-not $written.Ok) {
         return [pscustomobject]@{ Status = 'Failed'; Message = ('The history''s metrics couldn''t be written to the control vault: {0}' -f $written.Error); Bytes = 0; Replica = $document.Replica; Cosmos = $false }
     }
     Write-DbHubLog -Context $Context -Message $message
     return [pscustomobject]@{ Status = $status; Message = $message; Bytes = [System.Text.Encoding]::UTF8.GetByteCount($json); Replica = $document.Replica; Cosmos = $hasCosmos }
+}
+
+# ---- The Incident RCA's evidence (ADR 0031, rca/README.md) -------------------------------------------------------------
+# The runner's observer keeps what it captures on the VMs. 'rca export' reduces it into evidence documents, and 'rca part'
+# prints each document's parts, one line of at most 3,400 characters per managed Run Command, because the instance view
+# keeps the last 4 KB of output (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed). The parts
+# go into the control vault as earlier versions of the metrics secret (bundles: at most 6 parts and 24,000 bytes each),
+# which the rca member of its final version lists (the bundle index); the control notebook reads them and passes them to
+# NB_DatabaseHub_LiveActivity as RCA_EVIDENCE. Nothing new is granted: the identity writes the same secret, and the
+# deployer's Key Vault Secrets User on it covers every version. Run Command and the vault are reached through Azure
+# Resource Manager only, as everywhere else here.
+
+$script:DbHubRcaPartPattern = '^DBHUBDEMO-RCA 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4} [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$'
+$script:DbHubRcaDocumentPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$'
+$script:DbHubRcaStatuses = @('Pass', 'Fail', 'Warning', 'Manual action required', 'Not supported', 'Not selected')
+$script:DbHubRcaTerminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
+# What a document may decompress to: far above what the export's 64 KiB of gzip holds, so a bad stream stops early.
+$script:DbHubRcaMaxJsonBytes = 16MB
+
+function Get-DbHubRcaSetting {
+    # The export's bounds from the settings (Get-DemoActivityControlRunbookSetting), with their defaults, and whether these
+    # are the control's settings with the VM-side Rca action's script (settings published before ADR 0031 have none).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings
+    )
+
+    $rca = Get-DbHubMember -InputObject $Settings -Name 'rca'
+    $read = {
+        param([string] $Name, [int] $Default, [int] $Low, [int] $High)
+        $value = Get-DbHubMember -InputObject $rca -Name $Name
+        if (Test-DbHubInteger -Value $value -Minimum $Low -Maximum $High) {
+            return [int]$value
+        }
+        return $Default
+    }
+    $template = [string](Get-DbHubMember -InputObject $Settings -Name 'rcaScriptTemplate')
+    return [pscustomobject]@{
+        Supported      = ($template.Contains('__REQUEST__') -and (Test-DbHubSessionCapable -Settings $Settings))
+        StopMinutes    = (& $read 'stopMinutes' 6 1 30)
+        RecheckMinutes = (& $read 'recheckMinutes' 8 1 30)
+        StartMinutes   = (& $read 'startMinutes' 6 1 30)
+        MaxParallel    = (& $read 'maxParallel' 10 1 20)
+        ExportSeconds  = (& $read 'exportSeconds' 600 60 900)
+        PartSeconds    = (& $read 'partSeconds' 120 30 900)
+    }
+}
+
+function Get-DbHubRcaHost {
+    # The VMs whose runner's observer captures evidence (rca/README.md, The flow), with their targets: sqlvm01 for T1, T3,
+    # T4, and T4's read replica; the T2 host for T2, whose guest's runner it reaches. T5 has no observer.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings
+    )
+
+    return @(
+        [pscustomobject]@{ Vm = [string]$Settings.sqlVmName; Targets = @('T1', 'T3', 'T4', 'T4-replica') }
+        [pscustomobject]@{ Vm = [string]$Settings.hostVmName; Targets = @('T2') }
+    )
+}
+
+function Get-DbHubRcaScript {
+    # The managed Run Command script of one Rca request: the VM-side control's template with the Rca action
+    # (Get-DemoWorkloadControlTemplate, baked into the settings), the request as Base64 JSON, checked before it goes between
+    # single quotes. It holds no secret.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request
+    )
+
+    $template = [string](Get-DbHubMember -InputObject $Settings -Name 'rcaScriptTemplate')
+    if (-not $template.Contains('__REQUEST__')) {
+        throw 'The runbook settings have no RCA export template.'
+    }
+    $json = ConvertTo-Json -InputObject $Request -Depth 4 -Compress
+    $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+    if ($encoded -notmatch '^[A-Za-z0-9+/=]+$') {
+        throw 'An RCA request did not encode to Base64.'
+    }
+    return $template.Replace('__REQUEST__', $encoded)
+}
+
+function Read-DbHubRunCommandView {
+    # One managed Run Command's instance view (Virtual Machine Run Commands - Get By Virtual Machine, $expand=instanceView):
+    # Found, ExecutionState, ExitCode, and Output, the last 4 KB.
+    # https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName, $Name) -ApiVersion $version
+    if ($read.StatusCode -ne 200) {
+        return [pscustomobject]@{ Found = $false; ExecutionState = ''; ExitCode = $null; Output = '' }
+    }
+    $view = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'instanceView'
+    $exit = Get-DbHubMember -InputObject $view -Name 'exitCode'
+    $code = $null
+    if ($null -ne $exit) {
+        $code = [int]$exit
+    }
+    return [pscustomobject]@{ Found = $true; ExecutionState = [string](Get-DbHubMember -InputObject $view -Name 'executionState'); ExitCode = $code; Output = [string](Get-DbHubMember -InputObject $view -Name 'output') }
+}
+
+function Clear-DbHubRcaRunCommand {
+    # Deletes one of the export's managed Run Commands without waiting, once it's read or its time is up: deleting one whose
+    # script still runs stops it (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), and no part
+    # of the evidence stays in an instance view.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    $null = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName, $Name) -ApiVersion $version
+}
+
+function Get-DbHubRcaRoom {
+    <#
+    .SYNOPSIS
+    How many managed Run Commands the export may add on a VM: a VM takes 25 in all
+    (https://learn.microsoft.com/azure/virtual-machines/run-command-overview), less those it has. The export's own earlier
+    ones that have ended go first, and with -ClearFinished (a session's end) this control's other finished ones too, as a
+    run's start does (Clear-DbHubOldRunCommand): a terminal execution state, or a time in the name more than an hour old.
+    Returns -1 when the VM's Run Commands couldn't be listed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [switch] $ClearFinished
+    )
+
+    $settings = $Context.Settings
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    $list = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $VmName) -ApiVersion $version
+    if ($list.StatusCode -ne 200) {
+        return -1
+    }
+    $prefix = [string]$settings.runCommandPrefix
+    $count = 0
+    foreach ($item in @(Get-DbHubMember -InputObject $list.Body -Name 'value')) {
+        if ($null -eq $item) {
+            continue
+        }
+        $name = [string](Get-DbHubMember -InputObject $item -Name 'name')
+        $ours = $name.StartsWith($prefix + 'rca-', [System.StringComparison]::Ordinal) -or ($ClearFinished -and $name.StartsWith($prefix, [System.StringComparison]::Ordinal))
+        if ($ours -and $name -match '^[A-Za-z0-9-]{1,64}$') {
+            $view = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $item -Name 'properties') -Name 'instanceView'
+            $finished = [string](Get-DbHubMember -InputObject $view -Name 'executionState') -in $script:DbHubRcaTerminal
+            $stamp = [DateTime]::MinValue
+            if (-not $finished -and $name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$stamp)) {
+                $finished = $stamp.AddHours(1) -lt $Context.NowUtc
+            }
+            if ($finished) {
+                Clear-DbHubRcaRunCommand -Context $Context -VmName $VmName -Name $name
+                continue
+            }
+        }
+        $count++
+    }
+    return [int][System.Math]::Max(0, 25 - $count)
+}
+
+function ConvertFrom-DbHubRcaOutput {
+    <#
+    .SYNOPSIS
+    What one Rca Run Command printed (the VM-side control's Invoke-DemoControlRca): its result line, DBHUBDEMO-WORKLOAD
+    with an ADR 0012 status, and the runner's own line after it (DBHUBDEMO-RCA-INDEX for the export, DBHUBDEMO-RCA for a
+    part). Returns Status ('' without a result line), Message, OldRunner (the runner predates the export), OldBundle (the
+    VM's bootstrap bundle predates the Rca action), and Line.
+    #>
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Output
+    )
+
+    $answer = [pscustomobject]@{ Status = ''; Message = ''; OldRunner = $false; OldBundle = $false; Line = '' }
+    foreach ($raw in ([string]$Output -split '\r?\n')) {
+        $text = $raw.Trim()
+        if ($text.StartsWith('DBHUBDEMO-WORKLOAD ', [System.StringComparison]::Ordinal)) {
+            $parsed = $null
+            try {
+                $parsed = $text.Substring(19) | ConvertFrom-Json
+            }
+            catch {
+                $parsed = $null
+            }
+            if ($null -eq $parsed) {
+                continue
+            }
+            $answer.Status = [string](Get-DbHubMember -InputObject $parsed -Name 'status')
+            $answer.Message = ConvertTo-DbHubSafeText -Text ([string](Get-DbHubMember -InputObject $parsed -Name 'message'))
+            $answer.OldRunner = (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $parsed -Name 'evidence') -Name 'oldRunner') -eq $true
+            # A VM-side control from before the Rca action answers with its list of actions.
+            $answer.OldBundle = $answer.Status -eq 'Fail' -and $answer.Message -match '^Unknown action' -and $answer.Message -notmatch '\bRca\b'
+        }
+        elseif ($text.StartsWith('DBHUBDEMO-RCA-INDEX ', [System.StringComparison]::Ordinal) -or $text.StartsWith('DBHUBDEMO-RCA ', [System.StringComparison]::Ordinal)) {
+            $answer.Line = $text
+        }
+    }
+    return $answer
+}
+
+function ConvertFrom-DbHubRcaExportIndex {
+    <#
+    .SYNOPSIS
+    The export's index line, 'DBHUBDEMO-RCA-INDEX <json>' (rca/transport.schema.json, exportIndex): Valid, Why, Documents
+    (documentId, parts, sha256), Status, and Message. An index of another kind or version isn't used: its Why says so, with
+    ./scripts/deploy.ps1 as the fix (rca/README.md, Versioning).
+    #>
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Line
+    )
+
+    $answer = [pscustomobject]@{ Valid = $false; Why = ''; Documents = @(); Status = ''; Message = '' }
+    if (-not ([string]$Line).StartsWith('DBHUBDEMO-RCA-INDEX ', [System.StringComparison]::Ordinal) -or $Line.Length -gt 3400) {
+        $answer.Why = 'the export printed no index line'
+        return $answer
+    }
+    try {
+        $index = $Line.Substring(20) | ConvertFrom-Json
+    }
+    catch {
+        $answer.Why = 'its index line isn''t JSON'
+        return $answer
+    }
+    $version = Get-DbHubMember -InputObject $index -Name 'version'
+    if ([string](Get-DbHubMember -InputObject $index -Name 'kind') -cne 'ContosoCare.RcaExportIndex' -or -not (Test-DbHubInteger -Value $version -Minimum 1 -Maximum 1)) {
+        $answer.Why = 'its index is of a kind or version this runbook doesn''t know (run ./scripts/deploy.ps1, which updates the runner and the runbooks together)'
+        return $answer
+    }
+    $list = Get-DbHubListMember -InputObject $index -Name 'documents'
+    $status = [string](Get-DbHubMember -InputObject $index -Name 'status')
+    $message = Get-DbHubMember -InputObject $index -Name 'message'
+    if (-not $list.Present -or -not $list.IsList -or @($list.Items).Count -gt 32 -or $status -cnotin $script:DbHubRcaStatuses -or $message -isnot [string] -or $message.Length -gt 500) {
+        $answer.Why = 'its index doesn''t follow the contract'
+        return $answer
+    }
+    $documents = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    foreach ($item in @($list.Items)) {
+        $id = [string](Get-DbHubMember -InputObject $item -Name 'documentId')
+        $parts = Get-DbHubMember -InputObject $item -Name 'parts'
+        $sha = [string](Get-DbHubMember -InputObject $item -Name 'sha256')
+        if ($id -cnotmatch $script:DbHubRcaDocumentPattern -or -not (Test-DbHubInteger -Value $parts -Minimum 1 -Maximum 99) -or $sha -cnotmatch '^[0-9a-f]{64}$' -or -not $seen.Add($id)) {
+            $answer.Why = 'its index lists a document that doesn''t follow the contract'
+            return $answer
+        }
+        $documents.Add([ordered]@{ documentId = $id; parts = [int]$parts; sha256 = $sha })
+    }
+    $answer.Valid = $true
+    $answer.Documents = $documents.ToArray()
+    $answer.Status = $status
+    $answer.Message = ConvertTo-DbHubSafeText -Text $message
+    return $answer
+}
+
+function Test-DbHubRcaPartLine {
+    # Whether a line is the part asked for: the contract's pattern (rca/transport.schema.json, partLine), at most 3,400
+    # characters, and the document, index, count, and SHA-256 the export's index gave.
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Line,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Document,
+
+        [Parameter(Mandatory = $true)]
+        [int] $Part
+    )
+
+    if ([string]::IsNullOrEmpty($Line) -or $Line.Length -gt 3400 -or $Line -cnotmatch $script:DbHubRcaPartPattern) {
+        return $false
+    }
+    $fields = $Line.Split(' ')
+    return ($fields[2] -ceq [string]$Document['documentId'] -and $fields[3] -ceq ('{0}/{1}' -f $Part, [int]$Document['parts']) -and $fields[4] -ceq [string]$Document['sha256'])
+}
+
+function Invoke-DbHubRcaExport {
+    <#
+    .SYNOPSIS
+    The runner's evidence export on the demo's VMs, through managed Run Commands (ADR 0031): on each VM that runs, one
+    'rca export' (with -Final, a session's last), then one 'rca part' for each part of each document it lists, and of each
+    document an earlier export listed but didn't fetch whole (-Pending), up to maxParallel at a time per VM and never more
+    than the VM has room for (Get-DbHubRcaRoom). Each Run Command is deleted once it's read. At -DeadlineUtc it stops: a
+    part not read by then stays on the VM, and its document is in Pending for the next export. Returns Hosts (per VM: Vm,
+    Targets, Outcome, Message), Lines (each document's part lines, by document ID, for the documents fetched whole), and
+    Pending (documentId, parts, sha256, and vm of each document not fetched whole).
+
+    .DESCRIPTION
+    -Sent names export Run Commands already sent, by VM name, which this export reads instead of sending one (a session's
+    start sends its earlier session's export on a VM right before that VM's activity goes out: Send-DbHubRcaEarlierExport).
+    A host's Outcome: Exported, Partial (some documents not fetched whole), Nothing (nothing new was captured), OldRunner,
+    OldBundle, Failed, TimedOut, NotRunning, or NoRoom.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [switch] $Final,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $DeadlineUtc,
+
+        [AllowEmptyCollection()]
+        [object[]] $Pending = @(),
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Sent = $null,
+
+        [switch] $ClearFinished,
+
+        [AllowEmptyCollection()]
+        [string[]] $OnlyVm = @(),
+
+        [int] $PollSeconds = 10
+    )
+
+    $settings = $Context.Settings
+    $bounds = Get-DbHubRcaSetting -Settings $settings
+    $stamp = (Get-DbHubUtcNow).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+    $prefix = [string]$settings.runCommandPrefix
+    $hosts = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $work = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $documents = [ordered]@{}
+    $pendingOut = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $addDocument = {
+        param([object] $State, [System.Collections.IDictionary] $Reference)
+        $id = [string]$Reference['documentId']
+        if ($documents.Contains($id)) {
+            return
+        }
+        $State.Sequence++
+        $documents[$id] = [pscustomobject]@{ Reference = [ordered]@{ documentId = $id; parts = [int]$Reference['parts']; sha256 = [string]$Reference['sha256'] }; Vm = $State.Vm; Sequence = $State.Sequence; Lines = (New-Object -TypeName 'string[]' -ArgumentList ([int]$Reference['parts'])); Gone = $false }
+        for ($part = 1; $part -le [int]$Reference['parts']; $part++) {
+            $State.Queue.Add([pscustomobject]@{ DocumentId = $id; Part = $part })
+        }
+    }
+    foreach ($entry in (Get-DbHubRcaHost -Settings $settings)) {
+        if (@($OnlyVm).Count -gt 0 -and $entry.Vm -notin $OnlyVm) {
+            continue
+        }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Free = 0; Sequence = 0; Listed = 0 }
+        $hosts.Add($state)
+        $earlier = @($Pending | Where-Object { $null -ne $_ -and [string](Get-DbHubMember -InputObject $_ -Name 'vm') -eq $entry.Vm })
+        $power = Get-DbHubVmState -Context $Context -VmName $entry.Vm
+        if ($power -ne 'running') {
+            $state.Outcome = 'NotRunning'
+            $state.Message = '{0} is {1}, so what its observer captured stays on it until the next export.' -f $entry.Vm, $power
+            foreach ($item in $earlier) {
+                $pendingOut.Add($item)
+            }
+            continue
+        }
+        $free = Get-DbHubRcaRoom -Context $Context -VmName $entry.Vm -ClearFinished:$ClearFinished
+        if ($free -lt 0) {
+            $state.Outcome = 'Failed'
+            $state.Message = '{0}''s Run Commands couldn''t be listed, so nothing was exported from it.' -f $entry.Vm
+            foreach ($item in $earlier) {
+                $pendingOut.Add($item)
+            }
+            continue
+        }
+        $sentName = ''
+        if ($null -ne $Sent -and $Sent.Contains($entry.Vm)) {
+            $sentName = [string]$Sent[$entry.Vm]
+        }
+        if (-not $sentName) {
+            if ($free -lt 2) {
+                $state.Outcome = 'NoRoom'
+                $state.Message = '{0} already has 25 managed Run Commands, the most a VM takes, so nothing was exported from it.' -f $entry.Vm
+                foreach ($item in $earlier) {
+                    $pendingOut.Add($item)
+                }
+                continue
+            }
+            $name = '{0}rca-{1}-x-{2}' -f $prefix, $entry.Vm, $stamp
+            $request = [ordered]@{ command = 'export'; sessionId = $SessionId; final = [bool]$Final; timeoutSeconds = $bounds.ExportSeconds }
+            if (-not (Send-DbHubRunCommand -Context $Context -VmName $entry.Vm -Name $name -Script (Get-DbHubRcaScript -Settings $settings -Request $request) -TimeoutSeconds ($bounds.ExportSeconds + 120) -ConflictDelaySeconds 10)) {
+                $state.Outcome = 'Failed'
+                $state.Message = 'Azure didn''t accept the export''s Run Command on {0}.' -f $entry.Vm
+                foreach ($item in $earlier) {
+                    $pendingOut.Add($item)
+                }
+                continue
+            }
+            $sentName = $name
+            $free--
+        }
+        $state.Export = $sentName
+        $state.ExportDone = $false
+        $state.Free = $free
+        foreach ($item in $earlier) {
+            & $addDocument $state (ConvertTo-DbHubDictionary -InputObject $item)
+        }
+        $work.Add($state)
+    }
+
+    while ($true) {
+        $busy = $false
+        $late = (Get-DbHubUtcNow) -ge $DeadlineUtc
+        foreach ($state in $work) {
+            if (-not $state.ExportDone) {
+                $view = Read-DbHubRunCommandView -Context $Context -VmName $state.Vm -Name $state.Export
+                if ($view.Found -and $view.ExecutionState -in $script:DbHubRcaTerminal) {
+                    $state.ExportDone = $true
+                    Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $state.Export
+                    $state.Free++
+                    $out = ConvertFrom-DbHubRcaOutput -Output $view.Output
+                    if ($out.OldBundle) {
+                        $state.Outcome = 'OldBundle'
+                        $state.Message = '{0}''s bootstrap bundle predates the RCA export, so nothing was exported from it; ./scripts/deploy.ps1 sends the current one.' -f $state.Vm
+                    }
+                    elseif ($out.OldRunner -or $out.Status -eq 'Not supported') {
+                        $state.Outcome = 'OldRunner'
+                        $state.Message = '{0}''s workload runner predates the RCA export, so nothing was exported from it; ./scripts/deploy.ps1 updates it.' -f $state.Vm
+                    }
+                    elseif ($out.Status -eq 'Not selected') {
+                        $state.Outcome = 'Nothing'
+                        $state.Message = '{0}: {1}' -f $state.Vm, $out.Message
+                    }
+                    elseif ($out.Status -eq 'Pass') {
+                        $index = ConvertFrom-DbHubRcaExportIndex -Line $out.Line
+                        if ($index.Valid) {
+                            $state.Outcome = 'Exported'
+                            $state.Listed = @($index.Documents).Count
+                            if ($state.Listed -eq 0) {
+                                $state.Outcome = 'Nothing'
+                                $state.Message = '{0}: nothing new was captured since the last export.' -f $state.Vm
+                            }
+                            foreach ($reference in @($index.Documents)) {
+                                & $addDocument $state $reference
+                            }
+                        }
+                        else {
+                            $state.Outcome = 'Failed'
+                            $state.Message = '{0}''s export ran, but {1}.' -f $state.Vm, $index.Why
+                        }
+                    }
+                    else {
+                        $state.Outcome = 'Failed'
+                        $detail = $out.Message
+                        if (-not $out.Status) {
+                            $detail = 'its Run Command ended {0} with no result line' -f $view.ExecutionState
+                        }
+                        $state.Message = '{0}''s export failed: {1}' -f $state.Vm, $detail
+                    }
+                }
+                elseif ($late) {
+                    Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $state.Export
+                    $state.ExportDone = $true
+                    $state.Outcome = 'TimedOut'
+                    $state.Message = '{0}''s export didn''t end in time, so what its observer captured stays on it until the next export.' -f $state.Vm
+                }
+            }
+            foreach ($flight in @($state.InFlight.ToArray())) {
+                $view = Read-DbHubRunCommandView -Context $Context -VmName $state.Vm -Name $flight.Name
+                $ended = $view.Found -and $view.ExecutionState -in $script:DbHubRcaTerminal
+                if (-not $ended -and -not $late) {
+                    continue
+                }
+                Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $flight.Name
+                $state.Free++
+                $null = $state.InFlight.Remove($flight)
+                if (-not $ended) {
+                    continue
+                }
+                $document = $documents[$flight.DocumentId]
+                $out = ConvertFrom-DbHubRcaOutput -Output $view.Output
+                if ($out.Status -eq 'Pass' -and (Test-DbHubRcaPartLine -Line $out.Line -Document $document.Reference -Part $flight.Part)) {
+                    $document.Lines[$flight.Part - 1] = $out.Line
+                }
+                elseif ($out.Status -eq 'Fail' -and $out.Message -match 'exit code 1\b') {
+                    # The runner says the document or part doesn't exist (rca/README.md, The runner's commands).
+                    $document.Gone = $true
+                }
+            }
+            while (-not $late -and $state.Queue.Count -gt 0 -and $state.InFlight.Count -lt $bounds.MaxParallel -and $state.Free -gt 0) {
+                $item = $state.Queue[0]
+                $state.Queue.RemoveAt(0)
+                $document = $documents[$item.DocumentId]
+                if ($document.Gone) {
+                    continue
+                }
+                $name = '{0}rca-{1}-{2:d2}{3:d2}-{4}' -f $prefix, $state.Vm, $document.Sequence, $item.Part, $stamp
+                $request = [ordered]@{ command = 'part'; documentId = $item.DocumentId; part = $item.Part; timeoutSeconds = $bounds.PartSeconds }
+                if (Send-DbHubRunCommand -Context $Context -VmName $state.Vm -Name $name -Script (Get-DbHubRcaScript -Settings $settings -Request $request) -TimeoutSeconds ($bounds.PartSeconds + 60) -ConflictDelaySeconds 10) {
+                    $state.InFlight.Add([pscustomobject]@{ Name = $name; DocumentId = $item.DocumentId; Part = $item.Part })
+                    $state.Free--
+                }
+            }
+            if (-not $state.ExportDone -or $state.InFlight.Count -gt 0 -or ($state.Queue.Count -gt 0 -and -not $late)) {
+                $busy = $true
+            }
+        }
+        if (-not $busy -or $late) {
+            break
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    $lines = [ordered]@{}
+    $vms = @{}
+    foreach ($id in @($documents.Keys)) {
+        $document = $documents[$id]
+        $missing = @($document.Lines | Where-Object { [string]::IsNullOrEmpty($_) }).Count
+        if ($missing -eq 0) {
+            $lines[$id] = [string[]]$document.Lines
+            $vms[$id] = $document.Vm
+        }
+        elseif (-not $document.Gone) {
+            $kept = ConvertTo-DbHubDictionary -InputObject $document.Reference
+            $kept['vm'] = $document.Vm
+            $pendingOut.Add($kept)
+        }
+    }
+    $answers = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($state in $hosts) {
+        $left = @($pendingOut | Where-Object { [string](Get-DbHubMember -InputObject $_ -Name 'vm') -eq $state.Vm }).Count
+        $whole = @($documents.Values | Where-Object { $_.Vm -eq $state.Vm -and $lines.Contains([string]$_.Reference['documentId']) })
+        $gone = @($documents.Values | Where-Object { $_.Vm -eq $state.Vm -and $_.Gone }).Count
+        $outcome = $state.Outcome
+        $message = $state.Message
+        if ($outcome -in 'Exported', 'Nothing' -and ($left -gt 0 -or $gone -gt 0)) {
+            $outcome = 'Partial'
+        }
+        if ($outcome -in 'Exported', 'Partial') {
+            $partCount = 0
+            foreach ($document in $whole) {
+                $partCount += [int]$document.Reference['parts']
+            }
+            $message = '{0}: {1} document(s) in {2} part(s).' -f $state.Vm, $whole.Count, $partCount
+            if ($left -gt 0) {
+                $message = '{0} {1} document(s) weren''t fetched whole in time; they stay on {2} for the next export.' -f $message, $left, $state.Vm
+            }
+            if ($gone -gt 0) {
+                $message = '{0} {1} document(s) that its export listed weren''t on {2} any more.' -f $message, $gone, $state.Vm
+            }
+        }
+        $answers.Add([pscustomobject]@{ Vm = $state.Vm; Targets = $state.Targets; Outcome = $outcome; Message = $message })
+    }
+    return [pscustomobject]@{ Hosts = $answers.ToArray(); Lines = $lines; Vms = $vms; Pending = $pendingOut.ToArray() }
+}
+
+function Expand-DbHubRcaDocument {
+    <#
+    .SYNOPSIS
+    One evidence document from its part lines (rca/README.md, Part lines): every index from 1 to its count once, each part's
+    Base64 decoded on its own, concatenated in order, the SHA-256 that every part names checked, then gunzipped and parsed.
+    Returns Ok, Why, and Document (the parsed JSON). A document with a missing or bad part is never used in part.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]] $Line
+    )
+
+    $fail = {
+        param([string] $Why)
+        return [pscustomobject]@{ Ok = $false; Why = $Why; Document = $null }
+    }
+    $pieces = @{}
+    $count = 0
+    $sha = ''
+    $id = ''
+    foreach ($text in $Line) {
+        if ([string]$text -cnotmatch $script:DbHubRcaPartPattern) {
+            return (& $fail 'a part doesn''t follow the contract')
+        }
+        $fields = $text.Split(' ')
+        $position = $fields[3].Split('/')
+        if (-not $id) {
+            $id = $fields[2]
+            $count = [int]$position[1]
+            $sha = $fields[4]
+        }
+        $index = [int]$position[0]
+        if ($fields[2] -cne $id -or [int]$position[1] -ne $count -or $fields[4] -cne $sha -or $index -gt $count -or $pieces.ContainsKey($index)) {
+            return (& $fail 'its parts disagree')
+        }
+        $pieces[$index] = $fields[5]
+    }
+    if ($count -eq 0 -or $pieces.Count -ne $count) {
+        return (& $fail ('{0} of its {1} part(s) arrived' -f $pieces.Count, $count))
+    }
+    $buffer = New-Object -TypeName 'System.IO.MemoryStream'
+    try {
+        for ($index = 1; $index -le $count; $index++) {
+            $bytes = [System.Convert]::FromBase64String([string]$pieces[$index])
+            $buffer.Write($bytes, 0, $bytes.Length)
+        }
+    }
+    catch {
+        return (& $fail 'a part''s Base64 doesn''t decode')
+    }
+    $gzip = $buffer.ToArray()
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = -join ($hasher.ComputeHash($gzip) | ForEach-Object { $_.ToString('x2') })
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    if ($hash -cne $sha) {
+        return (& $fail 'its SHA-256 doesn''t match')
+    }
+    $text = ''
+    try {
+        $compressed = New-Object -TypeName 'System.IO.MemoryStream' -ArgumentList (, [byte[]]$gzip)
+        $stream = New-Object -TypeName 'System.IO.Compression.GZipStream' -ArgumentList $compressed, ([System.IO.Compression.CompressionMode]::Decompress)
+        $plain = New-Object -TypeName 'System.IO.MemoryStream'
+        try {
+            $chunk = New-Object -TypeName 'byte[]' -ArgumentList 65536
+            while (($read = $stream.Read($chunk, 0, $chunk.Length)) -gt 0) {
+                $plain.Write($chunk, 0, $read)
+                if ($plain.Length -gt $script:DbHubRcaMaxJsonBytes) {
+                    return (& $fail 'it decompresses to more than the export can hold')
+                }
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($plain.ToArray())
+        $document = $text | ConvertFrom-Json
+    }
+    catch {
+        return (& $fail 'it doesn''t decompress to JSON')
+    }
+    if ([string](Get-DbHubMember -InputObject $document -Name 'kind') -cne 'ContosoCare.RcaEvidence' -or -not (Test-DbHubInteger -Value (Get-DbHubMember -InputObject $document -Name 'version') -Minimum 1 -Maximum 1) -or [string](Get-DbHubMember -InputObject $document -Name 'documentId') -cne $id) {
+        return (& $fail 'it isn''t an evidence document of version 1 with its own ID (run ./scripts/deploy.ps1, which updates the runner and the runbooks together)')
+    }
+    return [pscustomobject]@{ Ok = $true; Why = ''; Document = $document }
+}
+
+function Get-DbHubRcaCoverage {
+    # The rca_coverage rows of a parsed evidence document (rca/history-tables.json): Target, Captured, Gaps, StartUtc, and
+    # EndUtc, the strings and times decoded (rca/README.md, The evidence document).
+    param(
+        [AllowNull()]
+        [object] $Document
+    )
+
+    $strings = @(Get-DbHubMember -InputObject $Document -Name 'strings')
+    $epoch = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $Document -Name 'epochUtc')
+    $table = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $Document -Name 'tables') -Name 'rca_coverage'
+    $columns = Get-DbHubMember -InputObject $table -Name 'columns'
+    $rows = Get-DbHubMember -InputObject $table -Name 'rows'
+    if ($null -eq $epoch -or -not (Test-DbHubInteger -Value $rows -Minimum 0 -Maximum 20000)) {
+        return @()
+    }
+    $text = {
+        param([string] $Column, [int] $Row)
+        $values = @(Get-DbHubMember -InputObject $columns -Name $Column)
+        if ($Row -ge $values.Count -or $null -eq $values[$Row]) {
+            return ''
+        }
+        $at = [int]$values[$Row]
+        if ($at -lt 0 -or $at -ge $strings.Count) {
+            return ''
+        }
+        return [string]$strings[$at]
+    }
+    $time = {
+        param([string] $Column, [int] $Row)
+        $values = @(Get-DbHubMember -InputObject $columns -Name $Column)
+        if ($Row -ge $values.Count -or $null -eq $values[$Row]) {
+            return $null
+        }
+        return $epoch.AddMilliseconds([double]$values[$Row])
+    }
+    $captured = @(Get-DbHubMember -InputObject $columns -Name 'captured')
+    $found = for ($row = 0; $row -lt [int]$rows; $row++) {
+        [pscustomobject]@{
+            Target   = (& $text 'target' $row)
+            Captured = ($row -lt $captured.Count -and $captured[$row] -eq $true)
+            Gaps     = (& $text 'gaps' $row)
+            StartUtc = (& $time 'window_start_utc' $row)
+            EndUtc   = (& $time 'window_end_utc' $row)
+        }
+    }
+    return @($found)
+}
+
+function Get-DbHubRcaCaptureLine {
+    <#
+    .SYNOPSIS
+    The RCA.CAPTURE.<target> lines of an export (ADR 0031): for each target the documents cover, Pass when the observer
+    captured its whole window, otherwise a Warning with the gaps it recorded (rca_coverage: what wasn't captured and why);
+    for each target whose VM didn't export, a Warning with why. Returns Step, Status, Message, and Fix.
+    #>
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Document = @(),
+
+        [AllowEmptyCollection()]
+        [object[]] $HostResult = @()
+    )
+
+    $rows = @(foreach ($item in $Document) { Get-DbHubRcaCoverage -Document $item })
+    $lines = foreach ($target in @('T1', 'T2', 'T3', 'T4', 'T4-replica')) {
+        $mine = @($rows | Where-Object { $_.Target -ceq $target })
+        if ($mine.Count -gt 0) {
+            $start = @($mine | Where-Object { $null -ne $_.StartUtc } | ForEach-Object { $_.StartUtc } | Sort-Object | Select-Object -First 1)
+            $end = @($mine | Where-Object { $null -ne $_.EndUtc } | ForEach-Object { $_.EndUtc } | Sort-Object | Select-Object -Last 1)
+            $span = ''
+            if ($start.Count -gt 0 -and $end.Count -gt 0) {
+                $span = ' from {0} to {1} UTC' -f $start[0].ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture), $end[0].ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+            $gaps = @($mine | ForEach-Object { ([string]$_.Gaps) -split '\r?\n' } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+            $notCaptured = @($mine | Where-Object { -not $_.Captured }).Count
+            if ($notCaptured -eq 0 -and $gaps.Count -eq 0) {
+                [pscustomobject]@{ Step = ('RCA.CAPTURE.{0}' -f $target); Status = 'Pass'; Message = ('{0}: the observer captured{1}.' -f $target, $span); Fix = '' }
+                continue
+            }
+            $said = @($gaps | Select-Object -First 3) -join ' '
+            if (-not $said) {
+                $said = 'the observer didn''t run for the whole window.'
+            }
+            $head = '{0}: captured{1}, with gaps:' -f $target, $span
+            if ($notCaptured -eq $mine.Count) {
+                $head = '{0}: not captured{1}:' -f $target, $span
+            }
+            [pscustomobject]@{ Step = ('RCA.CAPTURE.{0}' -f $target); Status = 'Warning'; Message = ('{0} {1}' -f $head, $said); Fix = 'Each gap says what wasn''t captured and why; docs/troubleshooting.md, "The Incident RCA''s capture", has the fixes.' }
+            continue
+        }
+        $owner = @($HostResult | Where-Object { @($_.Targets) -contains $target }) | Select-Object -First 1
+        if ($null -eq $owner -or $owner.Outcome -in 'Exported', 'Partial', 'Nothing', '') {
+            continue
+        }
+        $fix = 'What the observer captured stays on the VM for 7 days, and the next session''s start exports it.'
+        if ($owner.Outcome -in 'OldRunner', 'OldBundle') {
+            $fix = 'Run ./scripts/deploy.ps1, which updates the runner and its bootstrap bundle on the VMs.'
+        }
+        [pscustomobject]@{ Step = ('RCA.CAPTURE.{0}' -f $target); Status = 'Warning'; Message = ('{0}: not exported. {1}' -f $target, $owner.Message); Fix = $fix }
+    }
+    return @($lines)
+}
+
+function New-DbHubRcaBundle {
+    # The part lines as bundles (rca/transport.schema.json, bundle): each at most 6 parts and 24,000 bytes of UTF-8, in the
+    # order given. Returns each bundle's compact JSON.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Builds JSON in memory only; it changes no system state.')]
+    param(
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [AllowEmptyCollection()]
+        [string[]] $Line = @()
+    )
+
+    $session = $null
+    if ($SessionId) {
+        $session = $SessionId
+    }
+    $make = {
+        param([string[]] $Parts)
+        return (ConvertTo-Json -InputObject ([ordered]@{ kind = 'ContosoCare.RcaBundle'; version = 1; sessionId = $session; parts = $Parts }) -Depth 4 -Compress)
+    }
+    $bundles = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $current = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    foreach ($text in $Line) {
+        if ($current.Count -gt 0) {
+            $grown = New-Object -TypeName 'System.Collections.Generic.List[string]' -ArgumentList (, [string[]]$current.ToArray())
+            $grown.Add($text)
+            if ($current.Count -ge 6 -or [System.Text.Encoding]::UTF8.GetByteCount((& $make $grown.ToArray())) -gt 24000) {
+                $bundles.Add((& $make $current.ToArray()))
+                $current.Clear()
+            }
+        }
+        $current.Add($text)
+    }
+    if ($current.Count -gt 0) {
+        $bundles.Add((& $make $current.ToArray()))
+    }
+    return $bundles.ToArray()
+}
+
+function ConvertTo-DbHubRcaState {
+    # A session's RCA state as its status keeps it (New-DbHubSessionStatus): sessionId, bundles (the metrics secret's
+    # earlier versions that hold its parts), documents (documentId, parts, sha256), pending (documents not fetched whole, with
+    # their vm), leftVms (VMs whose final export didn't run), final, status, and message. From a status's copy, or empty.
+    param(
+        [AllowNull()]
+        [object] $State,
+
+        [AllowEmptyString()]
+        [string] $SessionId = ''
+    )
+
+    $answer = [ordered]@{ sessionId = $SessionId; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $false; status = ''; message = '' }
+    if ($null -eq $State -or [string](Get-DbHubMember -InputObject $State -Name 'sessionId') -ne $SessionId) {
+        return $answer
+    }
+    $answer['bundles'] = @(@(Get-DbHubMember -InputObject $State -Name 'bundles') | Where-Object { [string]$_ -cmatch '^[0-9a-f]{32}$' } | ForEach-Object { [string]$_ })
+    $answer['documents'] = @(@(Get-DbHubMember -InputObject $State -Name 'documents') | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-DbHubDictionary -InputObject $_ })
+    $answer['pending'] = @(@(Get-DbHubMember -InputObject $State -Name 'pending') | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-DbHubDictionary -InputObject $_ })
+    $answer['leftVms'] = @(@(Get-DbHubMember -InputObject $State -Name 'leftVms') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $answer['final'] = (Get-DbHubMember -InputObject $State -Name 'final') -eq $true
+    $answer['status'] = [string](Get-DbHubMember -InputObject $State -Name 'status')
+    $answer['message'] = [string](Get-DbHubMember -InputObject $State -Name 'message')
+    return $answer
+}
+
+function Invoke-DbHubRcaSessionExport {
+    <#
+    .SYNOPSIS
+    A session's evidence into the control vault (ADR 0031): Invoke-DbHubRcaExport, then each document it fetched whole
+    checked (Expand-DbHubRcaDocument, and that it's this session's), and their parts written as bundles, earlier versions of
+    the metrics secret. Returns State (the session's RCA state, -Earlier's and this export's: ConvertTo-DbHubRcaState),
+    Index (the bundle index for the rca member of the metrics' final version: every bundle of the session so far), and
+    Lines (RCA.EXPORT and the RCA.CAPTURE.<target> lines: Step, Status, Message, Fix).
+
+    .DESCRIPTION
+    A bundle that couldn't be written puts its documents back in the pending list: the runner keeps an exported document for
+    7 days, so the next export fetches it again. The index holds at most 16 bundles and 32 documents (rca/README.md,
+    Limits); a document past them isn't listed, and RCA.EXPORT says so.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [switch] $Final,
+
+        [int] $Minutes = 6,
+
+        [AllowNull()]
+        [object] $Earlier = $null,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Sent = $null,
+
+        [switch] $ClearFinished,
+
+        [AllowEmptyCollection()]
+        [string[]] $OnlyVm = @(),
+
+        [int] $PollSeconds = 10
+    )
+
+    $state = ConvertTo-DbHubRcaState -State $Earlier -SessionId $SessionId
+    $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
+    if (-not $bounds.Supported) {
+        $state['status'] = 'Not supported'
+        $state['message'] = 'The control''s runbook settings predate the RCA export (ADR 0031), so no evidence was exported; ./scripts/deploy.ps1 publishes them again.'
+        return [pscustomobject]@{ State = $state; Index = $null; Lines = @([pscustomobject]@{ Step = 'RCA.EXPORT'; Status = 'Warning'; Message = $state['message']; Fix = 'Run ./scripts/deploy.ps1.' }) }
+    }
+    $earlierBundles = @($state['bundles']).Count
+    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc ((Get-DbHubUtcNow).AddMinutes($Minutes)) -Pending @($state['pending']) -Sent $Sent -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -PollSeconds $PollSeconds
+    $pending = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($item in @($run.Pending)) {
+        $pending.Add($item)
+    }
+    $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    foreach ($item in @($state['documents'])) {
+        $null = $known.Add([string]$item['documentId'])
+    }
+    # Each document fetched whole, checked: its SHA-256, and that it's this session's.
+    $notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $good = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $parsed = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($id in @($run.Lines.Keys)) {
+        $lines = [string[]]$run.Lines[$id]
+        $expanded = Expand-DbHubRcaDocument -Line $lines
+        if (-not $expanded.Ok) {
+            $notes.Add(('{0} was skipped: {1}.' -f $id, $expanded.Why))
+            continue
+        }
+        $documentSession = [string](Get-DbHubMember -InputObject $expanded.Document -Name 'sessionId')
+        if ($documentSession -ne $SessionId) {
+            $notes.Add(('{0} was skipped: it''s another session''s.' -f $id))
+            continue
+        }
+        if ($known.Contains($id)) {
+            continue
+        }
+        $good.Add([pscustomobject]@{ Reference = [ordered]@{ documentId = $id; parts = $lines.Count; sha256 = $lines[0].Split(' ')[4] }; Lines = $lines; Vm = [string]$run.Vms[$id] })
+        $parsed.Add($expanded.Document)
+    }
+
+    # Bundles: the index lists at most 16 bundles and 32 documents.
+    $name = [string](Get-DbHubMember -InputObject $Context.Settings -Name 'metricsName')
+    if (-not $name) {
+        $name = 'dbhub-session-metrics'
+    }
+    $bundles = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    foreach ($version in @($state['bundles'])) {
+        $bundles.Add([string]$version)
+    }
+    $batch = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $unlisted = 0
+    foreach ($document in $good) {
+        if (@($state['documents']).Count + $batch.Count -ge 32) {
+            $unlisted++
+            continue
+        }
+        $batch.Add($document)
+    }
+    $allLines = @(foreach ($document in $batch) { $document.Lines })
+    $back = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    $offset = 0
+    foreach ($text in (New-DbHubRcaBundle -SessionId $SessionId -Line $allLines)) {
+        $count = @((ConvertFrom-Json -InputObject $text).parts).Count
+        $ids = @($allLines[$offset..($offset + $count - 1)] | ForEach-Object { $_.Split(' ')[2] } | Select-Object -Unique)
+        $offset += $count
+        $version = ''
+        if ($bundles.Count -lt 16) {
+            $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $text -Tags @{ sessionId = $SessionId; rca = 'bundle' }
+            if ($written.Ok -and $written.Version) {
+                $version = [string]$written.Version
+            }
+        }
+        if ($version) {
+            $bundles.Add($version)
+            continue
+        }
+        # Not written, or past the index's 16 bundles: the next export fetches these documents again.
+        foreach ($id in $ids) {
+            $null = $back.Add($id)
+        }
+    }
+    $documents = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($item in @($state['documents'])) {
+        $documents.Add($item)
+    }
+    $newCount = 0
+    $newParts = 0
+    foreach ($document in $batch) {
+        $id = [string]$document.Reference['documentId']
+        if ($back.Contains($id)) {
+            $again = ConvertTo-DbHubDictionary -InputObject $document.Reference
+            $again['vm'] = $document.Vm
+            $pending.Add($again)
+            continue
+        }
+        $documents.Add($document.Reference)
+        $newCount++
+        $newParts += [int]$document.Reference['parts']
+    }
+
+    $hosts = @($run.Hosts)
+    $left = @($hosts | Where-Object { $_.Outcome -in 'NotRunning', 'TimedOut', 'Failed', 'NoRoom' } | ForEach-Object { [string]$_.Vm })
+    # Between a session's start and its end, a VM that doesn't run keeps what it captured for the stop or the next start,
+    # and the session's host check says that it stopped: no export problem to report.
+    $reported = @($hosts | Where-Object { $Final -or $_.Outcome -ne 'NotRunning' })
+    $state['bundles'] = $bundles.ToArray()
+    $state['documents'] = $documents.ToArray()
+    $state['pending'] = $pending.ToArray()
+    if ($Final) {
+        $state['leftVms'] = $left
+        $state['final'] = $left.Count -eq 0 -and $pending.Count -eq 0
+    }
+    $status = 'Pass'
+    if (@($reported | Where-Object { $_.Outcome -notin 'Exported', 'Nothing' }).Count -gt 0 -or $notes.Count -gt 0 -or ($Final -and $pending.Count -gt 0) -or $unlisted -gt 0) {
+        $status = 'Warning'
+    }
+    elseif ($documents.Count -eq 0) {
+        $status = 'Not selected'
+    }
+    $message = 'No new evidence document; {0} in all for this session.' -f $documents.Count
+    if ($newCount -gt 0) {
+        $message = '{0} new evidence document(s), {1} part(s), in {2} bundle(s) in the control vault; {3} in all for this session.' -f $newCount, $newParts, ($bundles.Count - $earlierBundles), $documents.Count
+    }
+    $extra = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    foreach ($item in $reported) {
+        if ($item.Message -and $item.Outcome -notin 'Exported', 'Nothing') {
+            $extra.Add([string]$item.Message)
+        }
+    }
+    foreach ($note in $notes) {
+        $extra.Add($note)
+    }
+    if ($unlisted -gt 0) {
+        $extra.Add(('{0} document(s) weren''t listed: the index holds at most 32.' -f $unlisted))
+    }
+    if ($back.Count -gt 0) {
+        $extra.Add(('{0} document(s) weren''t written to the vault, so the next export fetches them again.' -f $back.Count))
+    }
+    if ($extra.Count -gt 0) {
+        $message = '{0} {1}' -f $message, ($extra -join ' ')
+    }
+    $state['status'] = $status
+    $state['message'] = ConvertTo-DbHubSafeText -Text $message
+    $fix = ''
+    if ($status -eq 'Warning') {
+        $fix = 'What wasn''t exported stays on the VMs for 7 days, and the next session''s start exports it; a runner or bootstrap bundle that predates the export is updated by ./scripts/deploy.ps1.'
+    }
+    $out = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $out.Add([pscustomobject]@{ Step = 'RCA.EXPORT'; Status = $status; Message = $message; Fix = $fix })
+    foreach ($line in (Get-DbHubRcaCaptureLine -Document $parsed.ToArray() -HostResult $reported)) {
+        $out.Add($line)
+    }
+    return [pscustomobject]@{ State = $state; Index = (New-DbHubRcaIndex -State $state); Lines = $out.ToArray(); New = $newCount }
+}
+
+function New-DbHubRcaIndex {
+    # The bundle index (rca/transport.schema.json, bundleIndex) from a session's RCA state: its bundles and documents, its
+    # status, and its message, at most 500 characters, the whole within 4,000 bytes of JSON. $null without a bundle.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Builds an in-memory record only; it changes no system state.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $State
+    )
+
+    if (@($State['bundles']).Count -eq 0) {
+        return $null
+    }
+    $session = $null
+    if ([string]$State['sessionId']) {
+        $session = [string]$State['sessionId']
+    }
+    $status = [string]$State['status']
+    if ($status -cnotin $script:DbHubRcaStatuses) {
+        $status = 'Warning'
+    }
+    $message = [string]$State['message']
+    if ($message.Length -gt 500) {
+        $message = $message.Substring(0, 497) + '...'
+    }
+    $index = [ordered]@{ kind = 'ContosoCare.RcaBundleIndex'; version = 1; sessionId = $session; bundles = @($State['bundles']); documents = @(@($State['documents']) | ForEach-Object { [ordered]@{ documentId = [string]$_['documentId']; parts = [int]$_['parts']; sha256 = [string]$_['sha256'] } }); status = $status; message = $message }
+    while ([System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $index -Depth 5 -Compress)) -gt 4000 -and $index['message'].Length -gt 40) {
+        $index['message'] = $index['message'].Substring(0, [int]($index['message'].Length / 2)) + '...'
+    }
+    return $index
+}
+
+function Send-DbHubRcaEarlierExport {
+    <#
+    .SYNOPSIS
+    At a session's start, on a VM that's about to get the session's activity (Start-DbHubActivityRun's OnVmReady): the
+    export of an earlier session whose stop didn't export everything (the nightly stop or the VMs' auto-shutdown ended it,
+    or its export ran out of time), so its evidence is exported before this session's activity starts. Only sends the
+    Run Command (Invoke-DbHubRcaEarlier reads it after the session's start); returns its name, or ''.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Earlier
+    )
+
+    if ($null -eq $Earlier -or -not (Get-DbHubRcaSetting -Settings $Context.Settings).Supported) {
+        return ''
+    }
+    $state = ConvertTo-DbHubRcaState -State $Earlier['rca'] -SessionId ([string]$Earlier['sessionId'])
+    $needs = $VmName -in @($state['leftVms']) -or (-not $state['final'] -and @($state['leftVms']).Count -eq 0)
+    if (-not $needs) {
+        return ''
+    }
+    $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
+    if ((Get-DbHubRcaRoom -Context $Context -VmName $VmName) -lt 2) {
+        return ''
+    }
+    $name = '{0}rca-{1}-x-{2}' -f $Context.Settings.runCommandPrefix, $VmName, (Get-DbHubUtcNow).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+    $request = [ordered]@{ command = 'export'; sessionId = [string]$Earlier['sessionId']; final = $true; timeoutSeconds = $bounds.ExportSeconds }
+    if (Send-DbHubRunCommand -Context $Context -VmName $VmName -Name $name -Script (Get-DbHubRcaScript -Settings $Context.Settings -Request $request) -TimeoutSeconds ($bounds.ExportSeconds + 120) -ConflictDelaySeconds 10) {
+        return $name
+    }
+    return ''
+}
+
+function Get-DbHubRcaEarlier {
+    # The earlier session whose evidence a session's start exports (Send-DbHubRcaEarlierExport): from the status that the
+    # session's start replaces, when it's another session's, its RCA state exists (it ran with ADR 0031's runbooks), and its
+    # final export didn't run on every VM or left documents behind. $null otherwise.
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $Previous,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId
+    )
+
+    if ($null -eq $Previous) {
+        return $null
+    }
+    $earlier = [string]$Previous['sessionId']
+    $rca = Get-DbHubMember -InputObject $Previous -Name 'rca'
+    if ($earlier -cnotmatch '^[0-9a-f]{32}$' -or $earlier -eq $SessionId -or $null -eq $rca) {
+        return $null
+    }
+    $state = ConvertTo-DbHubRcaState -State $rca -SessionId $earlier
+    if ($state['final'] -and @($state['pending']).Count -eq 0) {
+        return $null
+    }
+    return [ordered]@{ sessionId = $earlier; rca = $state }
+}
+
+function Invoke-DbHubRcaEarlier {
+    <#
+    .SYNOPSIS
+    After a session's start: reads the earlier session's exports that its start sent (Send-DbHubRcaEarlierExport), fetches
+    their parts and the earlier session's pending documents, and writes them as bundles (Invoke-DbHubRcaSessionExport).
+    Puts their bundle index in the status's rcaEarlier, which the control notebook saves with that session's history, and
+    adds its RCA.EXPORT step. Never throws.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Earlier,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Sent,
+
+        [int] $PollSeconds = 10
+    )
+
+    if ($null -eq $Earlier -or $null -eq $Sent -or $Sent.Count -eq 0) {
+        return
+    }
+    try {
+        $session = [string]$Earlier['sessionId']
+        $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
+        $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StartMinutes -Earlier $Earlier['rca'] -Sent $Sent -OnlyVm @($Sent.Keys) -PollSeconds $PollSeconds
+        if ($null -ne $done.Index) {
+            $Status['rcaEarlier'] = $done.Index
+        }
+        $first = @($done.Lines) | Select-Object -First 1
+        $state = 'Info'
+        if ($first.Status -in 'Warning', 'Fail') {
+            $state = 'Warning'
+        }
+        Add-DbHubSessionStep -Status $Status -Step 'RCA.EXPORT' -State $state -Message ('The evidence that session {0}''s stop didn''t export: {1} Run all saves it with that session''s history at this session''s end.' -f $session.Substring(0, 8), $first.Message) -Fix ([string]$first.Fix)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The earlier session''s evidence wasn''t exported: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Update-DbHubSessionRca {
+    <#
+    .SYNOPSIS
+    DbHub-Monitor's export at each 30-minute re-check while a session runs (ADR 0031): what the observer captured since the
+    last export goes into the control vault now, so a session's end has only its last half hour left to export. The state
+    (Invoke-DbHubRcaSessionExport) goes into the session's status with its RCA.EXPORT and RCA.CAPTURE.<target> steps (only
+    the ones it doesn't have yet), written only while its copy is still the one read, as Update-DbHubSessionHealth does; when
+    another job wrote it meanwhile, the state goes into that newer copy, while the session still runs. Never throws. Returns
+    Outcome (NoSession, NotSupported, Late, Exported, Nothing, Changed, Failed) and Note.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status and evidence, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $PollSeconds = 10
+    )
+
+    $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    if ($session -notmatch '^[0-9a-f]{32}$') {
+        return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+    }
+    try {
+        $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
+        if (-not $bounds.Supported) {
+            return [pscustomobject]@{ Outcome = 'NotSupported'; Note = '' }
+        }
+        $status = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $status -or [string]$status['sessionId'] -ne $session -or [string]$status['phase'] -ne 'running') {
+            return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+        }
+        # The session's own stop exports its last minutes; a re-check this close to the end leaves them to it.
+        $end = ConvertTo-DbHubUtc -Value $status['runEndUtc']
+        if ($null -ne $end -and (Get-DbHubUtcNow) -ge $end.AddMinutes(-10)) {
+            return [pscustomobject]@{ Outcome = 'Late'; Note = '' }
+        }
+        $readUpdated = [string]$status['updatedUtc']
+        $before = ConvertTo-DbHubRcaState -State $status['rca'] -SessionId $session
+        $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Minutes $bounds.RecheckMinutes -Earlier $status['rca'] -PollSeconds $PollSeconds
+        $write = $status
+        $again = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $again -or [string]$again['sessionId'] -ne $session -or [string]$again['phase'] -ne 'running') {
+            Write-DbHubLog -Context $Context -Message ('The session ended while its evidence was exported, so this re-check''s {0} new bundle(s) aren''t in its index; the documents stay on the VMs for 7 days.' -f (@($done.State['bundles']).Count - @($before['bundles']).Count))
+            return [pscustomobject]@{ Outcome = 'Changed'; Note = '' }
+        }
+        if ([string]$again['updatedUtc'] -ne $readUpdated) {
+            $write = $again
+        }
+        $changed = @($done.State['bundles']).Count -ne @($before['bundles']).Count -or @($done.State['pending']).Count -ne @($before['pending']).Count
+        $write['rca'] = $done.State
+        $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+        foreach ($step in @($write['steps'])) {
+            $null = $known.Add(('{0}|{1}' -f [string](Get-DbHubMember -InputObject $step -Name 'step'), [string](Get-DbHubMember -InputObject $step -Name 'message')))
+        }
+        foreach ($line in @($done.Lines)) {
+            # A re-check that found nothing new says nothing.
+            if ($line.Status -eq 'Not selected' -or ($line.Step -eq 'RCA.EXPORT' -and $line.Status -eq 'Pass' -and $done.New -eq 0)) {
+                continue
+            }
+            $state = 'Pass'
+            if ($line.Status -in 'Warning', 'Fail') {
+                $state = 'Warning'
+            }
+            if ($known.Add(('{0}|{1}' -f $line.Step, (ConvertTo-DbHubSafeText -Text $line.Message)))) {
+                Add-DbHubSessionStep -Status $write -Step $line.Step -State $state -Message $line.Message -Fix $line.Fix
+                $changed = $true
+            }
+        }
+        $outcome = 'Nothing'
+        if (@($done.State['bundles']).Count -gt @($before['bundles']).Count) {
+            $outcome = 'Exported'
+        }
+        if (-not $changed) {
+            return [pscustomobject]@{ Outcome = $outcome; Note = '' }
+        }
+        $null = Write-DbHubSessionStatus -Context $Context -Status $write
+        return [pscustomobject]@{ Outcome = $outcome; Note = (' The session''s evidence: {0}' -f [string]$done.State['message']) }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at this re-check: {0}' -f $_.Exception.Message)
+        return [pscustomobject]@{ Outcome = 'Failed'; Note = '' }
+    }
+}
+
+function Get-DbHubRcaResult {
+    # The RCA part of a stop's result line (the job's output): the export's status and message, or $null when it didn't run.
+    param(
+        [AllowNull()]
+        [object] $Rca
+    )
+
+    if ($null -eq $Rca) {
+        return $null
+    }
+    return [ordered]@{ status = [string]$Rca.State['status']; message = [string]$Rca.State['message']; bundles = @($Rca.State['bundles']).Count; documents = @($Rca.State['documents']).Count; final = [bool]$Rca.State['final'] }
+}
+
+function Invoke-DbHubRcaStop {
+    <#
+    .SYNOPSIS
+    A session's stop (Stop now, or the auto-stop): its final export before the VMs deallocate (ADR 0031), with its earlier
+    bundles and pending documents from its status's copy. Returns State, Index, and Lines (Invoke-DbHubRcaSessionExport),
+    or $null without a session or with settings that predate the export. Never throws.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [int] $PollSeconds = 10
+    )
+
+    $session = $SessionId
+    if (-not $session) {
+        $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    }
+    if ($session -notmatch '^[0-9a-f]{32}$') {
+        return $null
+    }
+    try {
+        $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
+        $earlier = $null
+        $copy = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -ne $copy -and [string]$copy['sessionId'] -eq $session) {
+            $earlier = Get-DbHubMember -InputObject $copy -Name 'rca'
+        }
+        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -PollSeconds $PollSeconds)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at its stop: {0}' -f $_.Exception.Message)
+        $state = ConvertTo-DbHubRcaState -State $null -SessionId $session
+        $state['status'] = 'Warning'
+        $state['message'] = 'The evidence export failed: {0}' -f (ConvertTo-DbHubSafeText -Text $_.Exception.Message)
+        return [pscustomobject]@{ State = $state; Index = $null; Lines = @([pscustomobject]@{ Step = 'RCA.EXPORT'; Status = 'Warning'; Message = $state['message']; Fix = 'What wasn''t exported stays on the VMs for 7 days, and the next session''s start exports it.' }) }
+    }
 }
 
 function Start-DbHubSession {
@@ -6049,6 +7424,10 @@ function Start-DbHubSession {
         return [pscustomobject]$result
     }
     $status = New-DbHubSessionStatus -Context $Context -SessionId ([string]$Request.SessionId) -RequestedBy ([string]$Request.RequestedBy) -DurationMinutes ([int]$Request.DurationMinutes) -Tags $Tags
+    # The status this session replaces, read before its first write (ADR 0031): an earlier session whose stop didn't export
+    # all its evidence (the nightly stop or the VMs' auto-shutdown ended it) gets it exported by this start.
+    $rcaEarlier = Get-DbHubRcaEarlier -Previous (Read-DbHubSessionStatusCopy -Context $Context) -SessionId ([string]$Request.SessionId)
+    $rcaSent = [ordered]@{}
     $sessionShared = @{ Status = $status; Context = $Context; Tags = $Tags; Work = $null; LastWriteUtc = [datetime]::MinValue; PollSeconds = $PollSeconds }
     $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'accepted'
     $refuse = {
@@ -6178,7 +7557,20 @@ function Start-DbHubSession {
             $null = Write-DbHubSessionStatus -Context $shared.Context -Status $shared.Status
         }
     }
-    $run = Start-DbHubActivityRun -Context $Context -Request $Request -Tags $Tags -Plan $plan -OnProgress $onProgress -OnT4Ready $onT4Ready -WaitMinutes $WaitMinutes -T4WaitMinutes $T4WaitMinutes -PollSeconds $PollSeconds
+    # An earlier session's evidence that its stop didn't export (ADR 0031): exported on each VM right before this session's
+    # activity goes out there, so the export holds none of this session's; its parts are fetched after the start.
+    $onVmReady = {
+        param([string] $VmName)
+        if ($null -eq $rcaEarlier) {
+            return ''
+        }
+        $sentName = Send-DbHubRcaEarlierExport -Context $Context -VmName $VmName -Earlier $rcaEarlier
+        if ($sentName) {
+            $rcaSent[$VmName] = $sentName
+        }
+        return $sentName
+    }
+    $run = Start-DbHubActivityRun -Context $Context -Request $Request -Tags $Tags -Plan $plan -OnProgress $onProgress -OnT4Ready $onT4Ready -OnVmReady $onVmReady -WaitMinutes $WaitMinutes -T4WaitMinutes $T4WaitMinutes -PollSeconds $PollSeconds
     $result.runEndUtc = [string]$run.runEndUtc
     $result.autoStopUtc = [string]$run.autoStopUtc
     $result.dispatched = @($run.dispatched)
@@ -6206,6 +7598,8 @@ function Start-DbHubSession {
             # What the run left running because it didn't start it, and how to stop everything (#27, user-directed 2026-11-17).
             Add-DbHubSessionStep -Status $status -Step 'Stop' -State 'Warning' -Message $left -Fix $leftFix
         }
+        # An earlier session's export that went out before the run failed is still read, so its evidence isn't left behind.
+        Invoke-DbHubRcaEarlier -Context $Context -Status $status -Earlier $rcaEarlier -Sent $rcaSent -PollSeconds ([System.Math]::Min(10, $PollSeconds))
         $status['message'] = [string]$run.message
         $phase = 'failed'
         if ([string]$run.status -eq 'Refused') {
@@ -6303,6 +7697,10 @@ function Start-DbHubSession {
     # Command that failed, is a Warning now; DbHub-Monitor's re-checks look again while the session runs.
     $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status)
 
+    # An earlier session's evidence, exported right before this session's activity went out (ADR 0031): its parts now,
+    # into the vault, and its bundle index into this status (rcaEarlier), which Run all saves with that session's history.
+    Invoke-DbHubRcaEarlier -Context $Context -Status $status -Earlier $rcaEarlier -Sent $rcaSent -PollSeconds ([System.Math]::Min(10, $PollSeconds))
+
     $warnings = @(@($status['steps']) | Where-Object { $_['state'] -in 'Warning', 'Fail' }).Count
     $result.status = 'Started'
     if ($warnings -gt 0 -or @($run.skipped).Count -gt 0) {
@@ -6331,7 +7729,14 @@ function Invoke-DbHubCapture {
     if (-not (Test-DbHubSessionCapable -Settings $Context.Settings)) {
         return [pscustomobject]@{ action = 'capture'; status = 'Refused'; message = 'The control''s runbook settings predate the session (2026-11-14): run ./scripts/deploy.ps1, which publishes them again.'; sessionId = [string]$Request.SessionId }
     }
-    $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId ([string]$Request.SessionId)
+    # The session's bundle index stays in the metrics' final version (ADR 0031): from the state its exports left in its
+    # status's copy, when there's one for this session.
+    $rcaIndex = $null
+    $copy = Read-DbHubSessionStatusCopy -Context $Context
+    if ($null -ne $copy -and [string]$copy['sessionId'] -eq [string]$Request.SessionId -and $copy.Contains('rca')) {
+        $rcaIndex = New-DbHubRcaIndex -State (ConvertTo-DbHubRcaState -State $copy['rca'] -SessionId ([string]$Request.SessionId))
+    }
+    $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId ([string]$Request.SessionId) -Rca $rcaIndex
     $state = 'Captured'
     if ($saved.Status -eq 'Warning') {
         $state = 'Partial'
@@ -6342,7 +7747,7 @@ function Invoke-DbHubCapture {
     return [pscustomobject]@{ action = 'capture'; status = $state; message = $saved.Message; sessionId = [string]$Request.SessionId; bytes = $saved.Bytes; replica = $saved.Replica; cosmos = [bool](Get-DbHubMember -InputObject $saved -Name 'Cosmos') }
 }
 
-$script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5')
+$script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5', 'rcaEarlier')
 
 function Write-DbHubStopStatus {
     # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
@@ -6389,6 +7794,16 @@ function Write-DbHubStopStatus {
         }
         $status['planKept'] = $true
     }
+    # The session's evidence (ADR 0031): the stop's export and its lines (RCA.EXPORT, RCA.CAPTURE.<target>) for the
+    # notebook, or the state the session's re-checks left, so the next session's start knows what's still on the VMs.
+    $rca = Get-DbHubMember -InputObject $Stopped -Name 'Rca'
+    if ($null -ne $rca) {
+        $status['rca'] = $rca.State
+        $status['rcaLines'] = @(@($rca.Lines) | ForEach-Object { [ordered]@{ step = [string]$_.Step; status = [string]$_.Status; message = (ConvertTo-DbHubSafeText -Text ([string]$_.Message)); fix = (ConvertTo-DbHubSafeText -Text ([string]$_.Fix)) } })
+    }
+    elseif ($null -ne $earlier -and [string]$earlier['sessionId'] -eq $session -and $earlier.Contains('rca')) {
+        $status['rca'] = $earlier['rca']
+    }
     $null = Write-DbHubSessionStatus -Context $Context -Status $status
 }
 
@@ -6433,7 +7848,7 @@ function Invoke-DbHubControl {
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
         Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
-        return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status }
+        return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     }
     if ($request.Action -eq 'reset') {
         return (Reset-DbHubActivity -Context $Context -Request $request -Tags $group.Tags)
@@ -6585,7 +8000,7 @@ function Invoke-DbHubStop {
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
     Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By 'Auto-stop'
-    return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status }
+    return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
 }
 
 function Invoke-DbHubMonitor {
@@ -6622,6 +8037,9 @@ function Invoke-DbHubMonitor {
     # A running session's hosts first (2026-11-16): a VM that stopped or whose start failed, or a dispatch Run Command that
     # failed, goes into the session's status as a Warning, which Run all's live cell prints.
     $health = Update-DbHubSessionHealth -Context $Context -Tags $group.Tags
+    # Then the session's evidence for the Incident RCA (ADR 0031): what the observer captured since the last export goes
+    # into the control vault now, so the session's end has only its last half hour left to export.
+    $evidence = Update-DbHubSessionRca -Context $Context -Tags $group.Tags
     $vm = [string]$settings.sqlVmName
     $state = Get-DbHubVmState -Context $Context -VmName $vm
     if ($state -ne 'running') {
@@ -6630,7 +8048,7 @@ function Invoke-DbHubMonitor {
         if ($health.Outcome -in 'Warned', 'Known') {
             $skippedStatus = 'Partial'
         }
-        return [pscustomobject]@{ action = 'monitor'; status = $skippedStatus; monitoring = ''; session = $health.Outcome; message = ('T1''s monitoring plugin wasn''t checked: {0} is {1}.{2}' -f $vm, $state, $health.Note) }
+        return [pscustomobject]@{ action = 'monitor'; status = $skippedStatus; monitoring = ''; session = $health.Outcome; rca = $evidence.Outcome; message = ('T1''s monitoring plugin wasn''t checked: {0} is {1}.{2}{3}' -f $vm, $state, $health.Note, $evidence.Note) }
     }
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $look = Initialize-DbHubMonitorState
@@ -6660,5 +8078,5 @@ function Invoke-DbHubMonitor {
     if ($outcome -in 'StillNotRunning', 'RestartRefused', 'Unread', 'Unfinished' -or $health.Outcome -in 'Warned', 'Known') {
         $status = 'Partial'
     }
-    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; session = $health.Outcome; message = ($texts[$outcome] + $health.Note) }
+    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; session = $health.Outcome; rca = $evidence.Outcome; message = ($texts[$outcome] + $health.Note + $evidence.Note) }
 }

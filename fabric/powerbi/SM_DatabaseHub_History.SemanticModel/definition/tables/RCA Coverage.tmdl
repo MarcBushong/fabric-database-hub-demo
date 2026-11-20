@@ -1,0 +1,61 @@
+/// What the observer captured for one target over one document's window, and what it didn't, with why. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Coverage'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// T1 to T5, or T4-replica.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// Start of the window.
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_start_utc
+
+    /// End of the window.
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_end_utc
+
+    /// True when the sentinel ran for the whole window.
+    column Captured
+        dataType: boolean
+        sourceColumn: captured
+
+    /// Comma-separated capture IDs that returned rows.
+    column Sources
+        dataType: string
+        sourceColumn: sources
+
+    /// One gap per line: what wasn't captured and why (a permission, a timeout, the export's budget).
+    column Gaps
+        dataType: string
+        sourceColumn: gaps
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Coverage' = entity
+        mode: directLake
+        source
+            entityName: rca_coverage
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

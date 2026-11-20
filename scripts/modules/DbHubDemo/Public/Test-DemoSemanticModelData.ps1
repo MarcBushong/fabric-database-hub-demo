@@ -36,6 +36,12 @@ function Test-DemoSemanticModelData {
     Columns, as DAX references, that a measure blank over the whole history is evaluated over: it passes when it isn't
     blank for at least one of their values. The defaults are the axes the report's visuals put in context.
 
+    .PARAMETER OptionalTable
+    Tables, by their model names, that the deployed model may not have: by default the Incident RCA's eight, which
+    configure-powerbi.ps1 leaves out while the lakehouse lacks them (Get-DemoRcaModelTablePlan; ADR 0031). They're counted
+    first, in one query; one the model can't count isn't in it, so its rows and measures aren't checked, and the summary
+    says so.
+
     .EXAMPLE
     Test-DemoSemanticModelData -WorkspaceId $workspaceId -SemanticModelId $modelId -Token $powerBIToken | Format-Table checkId, status, message
     #>
@@ -58,7 +64,10 @@ function Test-DemoSemanticModelData {
         [int] $BatchSize = 12,
 
         [AllowEmptyCollection()]
-        [string[]] $Grain = @("'Telemetry Snapshots'[Bucket UTC]", "'Incident Windows'[Incident Key]", "'Signal'[Signal]")
+        [string[]] $Grain = @("'Telemetry Snapshots'[Bucket UTC]", "'Incident Windows'[Incident Key]", "'Signal'[Signal]"),
+
+        [AllowEmptyCollection()]
+        [string[]] $OptionalTable = @(Get-DemoRcaHistoryTable | ForEach-Object Model)
     )
 
     $docUrl = 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
@@ -90,6 +99,24 @@ function Test-DemoSemanticModelData {
     }
     $query = { param([string] $Dax) Invoke-DemoDaxQuery -WorkspaceId $WorkspaceId -SemanticModelId $SemanticModelId -Query $Dax -Token $Token }
     $results = [System.Collections.Generic.List[object]]::new()
+
+    # The optional tables first (ADR 0031): all of them in one query, and each alone only when that fails. One the deployed
+    # model can't count isn't in it, so its rows and measures aren't checked.
+    $absent = @()
+    $optional = @($OptionalTable | Where-Object { $_ -and $sources.Contains($_) } | Select-Object -Unique)
+    if ($optional.Count -gt 0) {
+        $probe = {
+            param([string[]] $Names)
+            & $query ('EVALUATE ROW ( {0} )' -f ((@(for ($index = 0; $index -lt $Names.Count; $index++) { '"p{0}", COUNTROWS ( ''{1}'' )' -f $index, $Names[$index].Replace("'", "''") })) -join ', '))
+        }
+        if ((& $probe $optional).StatusCode -ne 200) {
+            $absent = @($optional | Where-Object { (& $probe @($_)).StatusCode -ne 200 })
+        }
+        foreach ($name in $absent) {
+            $sources.Remove($name)
+        }
+        $measures = @($measures | Where-Object { $_.Table -notin $absent })
+    }
 
     # Row counts first: they explain blank measures, and an access or setting problem shows up here once.
     $columns = @(for ($index = 0; $index -lt $sources.Count; $index++) {
@@ -272,6 +299,10 @@ function Test-DemoSemanticModelData {
     $statuses = @($results | Where-Object { $_.checkId -ne 'FABRIC.SEMANTICMODEL.INFOMEASURES' } | ForEach-Object { $_.status })
     $status = if ($statuses -contains 'Fail') { 'Fail' } elseif ($statuses -contains 'Warning') { 'Warning' } else { 'Pass' }
     $message = '{0} of {1} measures returned a value ({2} of them only in the context their visual sets), {3} returned blank, and {4} raised an error.' -f $counts['withValue'], $counts['measures'], $counts['perGrain'], $counts['blank'], $counts['errors']
+    if ($absent.Count -gt 0) {
+        $counts['notInModel'] = $absent
+        $message += ' The deployed model doesn''t read {0} yet (FABRIC.SEMANTICMODEL.RCA says why), so their measures weren''t evaluated.' -f ($absent -join ', ')
+    }
     $remediation = switch ($status) {
         'Fail' { 'Fix the failing measures or tables above, then run configure-powerbi.ps1 again.' }
         'Warning' { 'Blank measures fill after a scenario runs and NB_DatabaseHub_LiveActivity records it; Phase 20''s end-to-end run checks them again.' }

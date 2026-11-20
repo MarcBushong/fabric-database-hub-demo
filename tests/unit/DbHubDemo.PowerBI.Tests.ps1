@@ -72,7 +72,7 @@ BeforeAll {
     # per-grain retries of blank measures. -Blank and -Broken name measures that return blank or raise a DAX error;
     # -PerGrain names blank measures that return a value for 7 values of the first grain. The responder is a closure
     # with no $script: references, because configure-powerbi.ps1's own script scope is "$script:" while it runs.
-    function Get-DaxResponder([string[]] $Blank = @(), [string[]] $Broken = @(), [hashtable] $Rows = @{}, [string[]] $PerGrain = @()) {
+    function Get-DaxResponder([string[]] $Blank = @(), [string[]] $Broken = @(), [hashtable] $Rows = @{}, [string[]] $PerGrain = @(), [string[]] $Missing = @()) {
         $respond = {
             param($Request)
             $reply = {
@@ -83,6 +83,12 @@ BeforeAll {
             $query = (($Request.Body | ConvertFrom-Json -AsHashtable)['queries'])[0]['query']
             if ($query -match 'INFO\.MEASURES') {
                 return (& $refusal 'INFO functions are not supported.')
+            }
+            # -Missing: tables the deployed model doesn't have (the Incident RCA's before its lakehouse has them, ADR 0031).
+            foreach ($table in $Missing) {
+                if ($query.Contains("'" + $table + "'")) {
+                    return (& $refusal ('Query (1, 1) Cannot find table ''{0}''.' -f $table))
+                }
             }
             $grains = [regex]::Matches($query, '"(?<alias>g\d+)", COUNTROWS \( FILTER \( VALUES \( [^)]+\), NOT ISBLANK \( ''(?:[^'']|'''')+''\[(?<name>[^\]]+)\] \) \) \)')
             if ($grains.Count -gt 0) {
@@ -146,8 +152,9 @@ Describe 'Get-DemoFabricSemanticModelDefinition' {
         $paths | Should -Contain 'definition/tables/Telemetry Snapshots.tmdl'
         $paths | Should -Not -Contain '.platform'
         @($paths | Where-Object { $_ -match '\\' }) | Should -BeNullOrEmpty
-        $model.Evidence.tables | Should -Be 10
-        $model.Evidence.measures | Should -Be 114
+        $model.Evidence.tables | Should -Be 18
+        $model.Evidence.measures | Should -Be 121
+        @($model.Evidence.excludedTables) | Should -BeNullOrEmpty
         $expressions = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((@($model.Definition.parts) | Where-Object { $_.path -eq 'definition/expressions.tmdl' }).payload))
         $expressions | Should -Match ([regex]::Escape("https://onelake.dfs.fabric.microsoft.com/$script:workspaceId/$script:lakehouseId"))
         foreach ($part in $model.Definition.parts) {
@@ -162,6 +169,96 @@ Describe 'Get-DemoFabricSemanticModelDefinition' {
         $expressions = Join-Path -Path $copy -ChildPath 'definition/expressions.tmdl'
         (Get-Content -LiteralPath $expressions -Raw).Replace('00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000', "$script:workspaceId/$script:lakehouseId") | Set-Content -LiteralPath $expressions -NoNewline
         { Get-DemoFabricSemanticModelDefinition -Path $copy -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId } | Should -Throw '*placeholder exactly once*'
+    }
+
+    It 'leaves out the tables -ExcludeTable names, with their refs and relationships, and refuses one the model doesn''t have (ADR 0031)' {
+        $rca = @('RCA Sessions', 'RCA Waits', 'RCA Events', 'RCA Queries', 'RCA Resource', 'RCA Replica', 'RCA Coverage', 'RCA Answer Key')
+        $model = Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -ExcludeTable $rca
+        $decode = { param([string] $Path) [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((@($model.Definition.parts) | Where-Object { $_.path -eq $Path }).payload)) }
+        $paths = @($model.Definition.parts | ForEach-Object { $_.path })
+        @($paths | Where-Object { $_ -like 'definition/tables/RCA *' }) | Should -BeNullOrEmpty
+        $paths | Should -Contain 'definition/tables/Telemetry Snapshots.tmdl'
+        $model.Evidence.tables | Should -Be 10
+        $model.Evidence.measures | Should -Be 114
+        @($model.Evidence.excludedTables) | Should -Be $rca
+        $modelTmdl = & $decode 'definition/model.tmdl'
+        $modelTmdl | Should -Not -Match 'RCA '
+        @([regex]::Matches($modelTmdl, '(?m)^ref table ')).Count | Should -Be 10
+        $relationships = & $decode 'definition/relationships.tmdl'
+        $relationships | Should -Not -Match 'RCA '
+        @([regex]::Matches($relationships, '(?m)^relationship ')).Count | Should -Be 16
+        $relationships | Should -Match "(?m)^relationship 'Incident Windows to Date'$"
+        $relationships | Should -Match '\n$'
+        # The model the release had before the Incident RCA, part for part.
+        $full = Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId
+        @($full.Definition.parts).Count | Should -Be (@($model.Definition.parts).Count + 8)
+        { Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -ExcludeTable 'Not A Table' } | Should -Throw '*no table*'
+    }
+}
+
+Describe 'Get-DemoRcaModelTablePlan (ADR 0031)' {
+    BeforeAll {
+        $script:oneLakeList = '^' + [regex]::Escape(('https://onelake.dfs.fabric.microsoft.com/{0}?resource=filesystem&recursive=false&directory={1}%2FTables%2Fdbo' -f $script:workspaceId, $script:lakehouseId)) + '$'
+        $script:rcaNames = @('rca_sessions', 'rca_waits', 'rca_events', 'rca_queries', 'rca_resource', 'rca_replica', 'rca_coverage', 'rca_answer_key')
+        function New-TableListing([string[]] $Tables) {
+            New-WebResponse 200 @{ paths = @(foreach ($table in $Tables) { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
+        }
+    }
+
+    It 'reads every RCA table when the lakehouse has them: one read-only list on OneLake, with the token it was given' {
+        Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-TableListing (@('scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results') + $script:rcaNames)) })
+        $plan = Get-DemoRcaModelTablePlan -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -Token $script:token
+        @($plan.Excluded) | Should -BeNullOrEmpty
+        $plan.Result.checkId | Should -Be 'FABRIC.SEMANTICMODEL.RCA'
+        $plan.Result.status | Should -Be 'Pass'
+        $script:requests.Count | Should -Be 1
+        $script:requests[0].Method | Should -Be 'Get'
+        $script:requests[0].Authentication | Should -Be 'Bearer'
+        [object]::ReferenceEquals($script:requests[0].Token, $script:token) | Should -BeTrue
+    }
+
+    It 'leaves out the RCA tables a current-release lakehouse doesn''t have yet, and says what adds them' {
+        Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-TableListing @('scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results', 'rca_sessions')) })
+        $plan = Get-DemoRcaModelTablePlan -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -Token $script:token
+        @($plan.Excluded) | Should -Be @('RCA Waits', 'RCA Events', 'RCA Queries', 'RCA Resource', 'RCA Replica', 'RCA Coverage', 'RCA Answer Key')
+        $plan.Result.status | Should -Be 'Warning'
+        $plan.Result.message | Should -Match '^The lakehouse doesn''t have 7 of the Incident RCA''s 8 tables yet \(rca_waits, rca_events, .*\), so the history model leaves them out'
+        $plan.Result.remediation | Should -Match 'configure-fabric\.ps1 -SkipHubChecks -RunLiveActivity'
+        [bool]$plan.Result.evidence['listed'] | Should -BeTrue
+    }
+
+    It 'leaves all eight out when the lakehouse has no table folder yet, or OneLake refuses the list, or there''s no token' {
+        Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-WebResponse 404 @{ error = @{ code = 'PathNotFound'; message = 'The specified path does not exist.' } }) })
+        $plan = Get-DemoRcaModelTablePlan -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -Token $script:token
+        @($plan.Excluded).Count | Should -Be 8
+        [bool]$plan.Result.evidence['listed'] | Should -BeTrue
+
+        Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-WebResponse 403 @{ error = @{ code = 'AuthorizationPermissionMismatch'; message = 'This request is not authorized.' } }) })
+        $plan = Get-DemoRcaModelTablePlan -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -Token $script:token
+        @($plan.Excluded).Count | Should -Be 8
+        $plan.Result.status | Should -Be 'Warning'
+        $plan.Result.message | Should -Match 'couldn''t be listed \(HTTP 403 AuthorizationPermissionMismatch'
+        [bool]$plan.Result.evidence['listed'] | Should -BeFalse
+
+        Set-WebMock @()
+        $plan = Get-DemoRcaModelTablePlan -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId
+        @($plan.Excluded).Count | Should -Be 8
+        $plan.Result.message | Should -Match 'no OneLake \(Storage\) token was requested'
+        $script:requests.Count | Should -Be 0
+    }
+
+    It 'asks the Azure CLI for a Storage token only, and requests or assigns no role (no new grant)' {
+        Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-TableListing $script:rcaNames) })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoAccessToken -MockWith { [pscustomobject]@{ Token = ([System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword); Claims = $null; Error = '' } }
+        $config = Get-HubTestConfig
+        $plan = Get-DemoRcaModelTablePlan -Config $config -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId
+        $plan.Result.status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoAccessToken -Times 1 -Exactly -ParameterFilter { $Resource -eq 'https://storage.azure.com/' }
+        @($script:requests | Where-Object { $_.Uri -notmatch '^https://onelake\.dfs\.fabric\.microsoft\.com/' -or $_.Method -ne 'Get' }) | Should -BeNullOrEmpty
+        foreach ($file in 'scripts/modules/DbHubDemo/Private/OneLakeHelpers.ps1', 'scripts/modules/DbHubDemo/Public/Get-DemoRcaModelTablePlan.ps1') {
+            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath $file) -Raw
+            $text | Should -Not -Match 'roleAssignments|Microsoft\.Authorization|addWorkspaceRoleAssignment|az role|New-AzRoleAssignment' -Because $file
+        }
     }
 }
 
@@ -294,12 +391,12 @@ Describe 'Test-DemoSemanticModelData' {
         $script:queriesUri = '^' + [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/executeQueries") + '$'
     }
 
-    It 'evaluates all 114 measures: values Pass, blanks Warning, DAX errors Fail, and INFO.MEASURES() is Not supported' {
+    It 'evaluates all 121 measures: values Pass, blanks Warning, DAX errors Fail, and INFO.MEASURES() is Not supported' {
         Set-WebMock @(@{ Method = 'Post'; Match = $script:queriesUri; Respond = (Get-DaxResponder -Blank @('Scenario Requests') -Broken @('Focus Verdict') -Rows @{ 'Scenario Runs' = 0 }) })
         $results = @(Test-DemoSemanticModelData -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Token $script:token)
         $measures = @($results | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' })
-        $measures.Count | Should -Be 114
-        @($measures.checkId | Sort-Object -Unique).Count | Should -Be 114
+        $measures.Count | Should -Be 121
+        @($measures.checkId | Sort-Object -Unique).Count | Should -Be 121
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.SCENARIO_RUNS.SCENARIO_REQUESTS' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.SCENARIO_RUNS.SCENARIO_REQUESTS' }).message | Should -Match 'scenario_runs has no rows yet'
         ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.INCIDENT_WINDOWS.FOCUS_VERDICT' }).status | Should -Be 'Fail'
@@ -416,8 +513,12 @@ Describe 'configure-powerbi.ps1' {
         $reportList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=Report")
         $refreshes = "$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/refreshes"
         $pages = $script:pages
+        # The lakehouse's tables, which decide whether the model reads the Incident RCA's (ADR 0031): all thirteen here.
+        $tables = @{ paths = @(foreach ($table in 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results', 'rca_sessions', 'rca_waits', 'rca_events', 'rca_queries', 'rca_resource', 'rca_replica', 'rca_coverage', 'rca_answer_key') { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword }
         # Static, ordered responses only: while configure-powerbi.ps1 runs, "$script:" in a responder would be its scope.
         Set-WebMock @(
+            @{ Method = 'Get'; Match = '^https://onelake\.dfs\.fabric\.microsoft\.com/'; Responses = @(New-WebResponse 200 $tables) }
             @{ Method = 'Get'; Match = $modelList; Responses = @(New-WebResponse 200 @{ value = @() }) }
             @{ Method = 'Get'; Match = $reportList; Responses = @(New-WebResponse 200 @{ value = @() }) }
             @{ Method = 'Post'; Match = $script:itemsUri; Responses = @((New-WebResponse 201 @{ id = $script:modelId; type = 'SemanticModel' }), (New-WebResponse 201 @{ id = $script:reportId; type = 'Report' })) }
@@ -431,16 +532,61 @@ Describe 'configure-powerbi.ps1' {
         $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token -PowerBIToken $script:token 6>&1
         $LASTEXITCODE | Should -Be 0
         $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
-        foreach ($checkId in 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY', 'FABRIC.SEMANTICMODEL.REFRESH', 'FABRIC.SEMANTICMODEL.ROWS', 'FABRIC.SEMANTICMODEL.DATA', 'FABRIC.IMPORT.RPT_DATABASEHUB_HISTORY', 'FABRIC.REPORT.BINDING', 'FABRIC.REPORT.PAGES') {
+        foreach ($checkId in 'FABRIC.SEMANTICMODEL.RCA', 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY', 'FABRIC.SEMANTICMODEL.REFRESH', 'FABRIC.SEMANTICMODEL.ROWS', 'FABRIC.SEMANTICMODEL.DATA', 'FABRIC.IMPORT.RPT_DATABASEHUB_HISTORY', 'FABRIC.REPORT.BINDING', 'FABRIC.REPORT.PAGES') {
             ($records | Where-Object { $_.checkId -eq $checkId }).status | Should -Be 'Pass' -Because $checkId
         }
         @($records.checkId | Where-Object { $_ -match 'ORGAPP|WORKSPACEAPP' }) | Should -BeNullOrEmpty
         $reportCreate = $script:requests | Where-Object { $_.Uri -match $script:itemsUri -and $_.Body -match '"type":"Report"' } | Select-Object -First 1
         (Get-SentDefinition $reportCreate 'definition.pbir') | Should -Match ([regex]::Escape("semanticmodelid=$script:modelId"))
+        $modelCreate = $script:requests | Where-Object { $_.Uri -match $script:itemsUri -and $_.Body -match '"type":"SemanticModel"' } | Select-Object -First 1
+        (Get-SentDefinition $modelCreate 'definition/model.tmdl') | Should -Match "(?m)^ref table 'RCA Answer Key'$"
         # Only the model and the report are created: the Fabric app (Rayfin) is a separate item, and no org app is made.
         @($script:requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -match $script:itemsUri }).Count | Should -Be 2
         @($script:requests | Where-Object { $_.Uri -match 'OrgApp|/apps' -or [string]$_.Body -match 'OrgApp' }) | Should -BeNullOrEmpty
-        @($script:requests | Where-Object { $_.Uri -notmatch '^https://api\.(fabric\.microsoft\.com/v1|powerbi\.com/v1\.0/myorg)/' }) | Should -BeNullOrEmpty
+        @($script:requests | Where-Object { $_.Uri -notmatch '^https://(api\.(fabric\.microsoft\.com/v1|powerbi\.com/v1\.0/myorg)|onelake\.dfs\.fabric\.microsoft\.com)/' }) | Should -BeNullOrEmpty
+        @($script:requests | Where-Object { $_.Uri -match '^https://onelake\.' -and $_.Method -ne 'Get' }) | Should -BeNullOrEmpty
+    }
+
+    It 'updates an environment from the release before the Incident RCA: the model leaves out the RCA tables its lakehouse lacks, and the rest deploys as before (ADR 0031)' {
+        $modelList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=SemanticModel")
+        $reportList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=Report")
+        $refreshes = "$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/refreshes"
+        $pages = $script:pages
+        # The current release's lakehouse: its five history tables, none of the RCA's. Its model and report exist already.
+        $tables = @{ paths = @(foreach ($table in 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results') { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword }
+        Set-WebMock @(
+            @{ Method = 'Get'; Match = '^https://onelake\.dfs\.fabric\.microsoft\.com/'; Responses = @(New-WebResponse 200 $tables) }
+            @{ Method = 'Get'; Match = $modelList; Responses = @(New-WebResponse 200 @{ value = @(@{ id = $script:modelId; displayName = 'SM_DatabaseHub_History'; type = 'SemanticModel' }) }) }
+            @{ Method = 'Get'; Match = $reportList; Responses = @(New-WebResponse 200 @{ value = @(@{ id = $script:reportId; displayName = 'RPT_DatabaseHub_History'; type = 'Report' }) }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items/$script:modelId/updateDefinition"); Responses = @(New-WebResponse 200 $null) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items/$script:reportId/updateDefinition"); Responses = @(New-WebResponse 200 $null) }
+            @{ Method = 'Post'; Match = ('^' + [regex]::Escape($refreshes) + '$'); Responses = @(New-WebResponse 202 $null @{ 'x-ms-request-id' = @($script:refreshId) }) }
+            @{ Method = 'Get'; Match = [regex]::Escape("$refreshes/$script:refreshId"); Responses = @(New-WebResponse 200 @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/executeQueries"); Respond = (Get-DaxResponder -Missing @('RCA Sessions', 'RCA Waits', 'RCA Events', 'RCA Queries', 'RCA Resource', 'RCA Replica', 'RCA Coverage', 'RCA Answer Key')) }
+            @{ Method = 'Get'; Match = ('^' + [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId") + '$'); Responses = @(New-WebResponse 200 @{ datasetId = $script:modelId }) }
+            @{ Method = 'Get'; Match = [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId/pages"); Responses = @(New-WebResponse 200 @{ value = @(for ($i = 0; $i -lt 4; $i++) { @{ name = "p$i"; displayName = $pages[$i]; order = $i } }) }) }
+        )
+        $output = Join-Path -Path $TestDrive -ChildPath 'update.jsonl'
+        $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token -PowerBIToken $script:token 6>&1
+        $LASTEXITCODE | Should -Be 0
+        $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+        $rca = $records | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.RCA' }
+        $rca.status | Should -Be 'Warning'
+        @($rca.evidence.excluded).Count | Should -Be 8
+        foreach ($checkId in 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY', 'FABRIC.SEMANTICMODEL.REFRESH', 'FABRIC.SEMANTICMODEL.DATA', 'FABRIC.IMPORT.RPT_DATABASEHUB_HISTORY', 'FABRIC.REPORT.BINDING', 'FABRIC.REPORT.PAGES') {
+            ($records | Where-Object { $_.checkId -eq $checkId }).status | Should -Be 'Pass' -Because $checkId
+        }
+        @($records | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        # The definition it sent: the ten tables the release had, with no RCA table, ref, or relationship.
+        $update = $script:requests | Where-Object { $_.Uri -match "items/$script:modelId/updateDefinition" } | Select-Object -First 1
+        $sent = @(($update.Body | ConvertFrom-Json -AsHashtable -Depth 64)['definition']['parts'] | ForEach-Object { $_['path'] })
+        @($sent | Where-Object { $_ -like 'definition/tables/*' }).Count | Should -Be 10
+        @($sent | Where-Object { $_ -like 'definition/tables/RCA *' }) | Should -BeNullOrEmpty
+        (Get-SentDefinition $update 'definition/model.tmdl') | Should -Not -Match 'RCA '
+        (Get-SentDefinition $update 'definition/relationships.tmdl') | Should -Not -Match 'RCA '
+        # The data check evaluates the model it deployed: no RCA measure.
+        @($records | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.RCA_*' }) | Should -BeNullOrEmpty
     }
 
     It 'checks the deployed model alone with -CheckModelData: finds it by name with public functions and imports nothing' {
