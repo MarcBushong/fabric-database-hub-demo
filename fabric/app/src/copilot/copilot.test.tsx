@@ -4,9 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
+import { RCA_PRESENCE_DAX } from "@/rca/loader";
+import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
 import { AccountChips } from "@/shell/AccountChips";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
+import { NEWEST_BIN_DAX } from "./investigations";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
@@ -145,8 +148,23 @@ const signedInNineHoursAgo = () => ({ accessToken: fakeToken(), expiresAt: Date.
 
 /** What the history model's T5 probe answers: 1 once the lakehouse holds T5's (Azure Cosmos DB) metrics. */
 let hasCosmos = 0;
+/** Whether the history model has the Incident RCA's tables: without them, the presence check fails, as on a model from before the feature. */
+let hasRca = false;
 const queryClient: QueryClient = {
-    run: vi.fn(async (spec) => ({ spec, columns: [], rows: spec.dax === COSMOS_PROBE_DAX ? [{ HasCosmos: hasCosmos }] : [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0), provenance: "history" as const })),
+    run: vi.fn(async (spec) => {
+        if (spec.dax === RCA_PRESENCE_DAX && !hasRca) throw new Error("The model has no table named 'RCA Coverage'.");
+        const rows =
+            spec.dax === COSMOS_PROBE_DAX
+                ? [{ HasCosmos: hasCosmos }]
+                : spec.dax === RCA_PRESENCE_DAX
+                  ? [{ Rows: 0 }]
+                  : spec.dax === NEWEST_BIN_DAX
+                    ? [{ Newest: "2026-11-20T17:20:00" }]
+                    : spec.dax.includes("'RCA ")
+                      ? []
+                      : [{ CpuPct: 88.2 }];
+        return { spec, columns: [], rows, requestId: "q", fetchedAt: new Date(0), provenance: "history" as const };
+    }),
     peek: () => undefined,
     clear: () => undefined,
 };
@@ -163,6 +181,7 @@ function renderDock(initialOpen = true, estate = false) {
 
 beforeEach(() => {
     hasCosmos = 0;
+    hasRca = false;
     FakeSocket.startError = null;
     FakeSocket.script = null;
     FakeSocket.startGate = null;
@@ -259,6 +278,43 @@ describe("the Copilot dock", () => {
         renderDock();
         expect(await screen.findByRole("button", { name: "Was Cosmos DB throttled?" })).toBeInTheDocument();
         expect(run.mock.calls.filter(([spec]) => spec.dax === COSMOS_PROBE_DAX)).toHaveLength(1);
+    });
+
+    // ADR 0031: with the RCA tables, the dock offers the investigations, blind; without them (above), it offers none.
+    it("offers the investigation starters and tools once the history model has the RCA tables, with the playbook and without the answer key", async () => {
+        hasRca = true;
+        window.localStorage.setItem("dbhub-insights.github.v1", JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        FakeSocket.script = (socket, message) => {
+            if (message.type === "user") socket.emit({ type: "tool_call", callId: "c1", name: "find_incidents", arguments: {} });
+            if (message.type === "tool_result") {
+                socket.emit({ type: "message", messageId: "m1", text: "Nothing abnormal was captured in the newest 90 minutes." });
+                socket.emit({ type: "idle" });
+            }
+        };
+        renderDock();
+        const latest = await screen.findByRole("button", { name: "What caused the latest incident?" });
+        expect(screen.getByRole("button", { name: "Who blocked whom?" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "What happened in the latest incident?" })).not.toBeInTheDocument();
+        fireEvent.click(latest);
+        expect(await screen.findByText(/Nothing abnormal was captured/)).toBeInTheDocument();
+        const start = FakeSocket.last!.sent[0];
+        expect((start.tools as Array<{ name: string }>).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", ...INVESTIGATION_TOOL_NAMES]);
+        const system = String(start.systemMessage);
+        expect(system).toContain("# Investigating incidents");
+        for (const key of ["Incident Windows", "Scenario Runs", "Analysis Findings", "[In Incident Window]", "fixed minutes"]) expect(system).not.toContain(key);
+        const result = FakeSocket.last!.sent.find((m) => m.type === "tool_result");
+        expect(result).toMatchObject({ callId: "c1", ok: true });
+        const answer = JSON.parse(String(result?.result)) as { tool: string; window: { fromUtc: string; toUtc: string } };
+        expect(answer).toMatchObject({ tool: "find_incidents", window: { fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" } });
+        expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX)).toHaveLength(1);
     });
 
     it("keeps the viewer signed in 9 hours after sign-in: it renews before asking GitHub who the token is (security review, 2026-11-19)", async () => {

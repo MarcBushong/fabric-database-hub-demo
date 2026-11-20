@@ -178,8 +178,8 @@
         { "name": "write_lag_s", "type": "double", "model": { "column": "Write Lag (s)", "formatString": "#,0.000" }, "description": "pg_stat_replication.write_lag on the primary." },
         { "name": "flush_lag_s", "type": "double", "model": { "column": "Flush Lag (s)", "formatString": "#,0.000" }, "description": "pg_stat_replication.flush_lag on the primary." },
         { "name": "send_gap_bytes", "type": "double", "model": { "column": "Send Gap (bytes)", "formatString": "#,0" }, "description": "The primary's current WAL position minus what it sent." },
-        { "name": "wal_bytes_per_s", "type": "double", "model": { "column": "WAL Bytes/s", "formatString": "#,0" }, "description": "WAL the primary generated per second since the previous sample (pg_stat_wal)." },
-        { "name": "startup_wait", "type": "string", "model": { "column": "Startup Wait" }, "description": "The replica's startup (replay) process wait, wait_event_type:wait_event." },
+        { "name": "wal_bytes_per_s", "type": "double", "model": { "column": "WAL Bytes/s", "formatString": "#,0" }, "description": "WAL the primary generated per second since the previous sample (pg_stat_wal); null on the first sample, which has none before it." },
+        { "name": "startup_wait", "type": "string", "model": { "column": "Startup Wait" }, "description": "The replica's startup (replay) process wait, wait_event_type:wait_event: only on a replay-detail sample that found it waiting on a lock, with the conflict's columns; null otherwise." },
         { "name": "conflict_relation", "type": "string", "model": { "column": "Conflict Relation" }, "description": "The table whose lock replay waits for, from pg_locks." },
         { "name": "conflict_wanted_mode", "type": "string", "model": { "column": "Conflict Wanted Mode" }, "description": "The lock mode replay waits for (AccessExclusiveLock)." },
         { "name": "conflict_wait_start_utc", "type": "timestamp", "model": { "column": "Conflict Wait Start UTC", "formatString": "yyyy-mm-dd hh:nn:ss" }, "description": "When replay started to wait (pg_locks.waitstart)." },
@@ -188,8 +188,8 @@
         { "name": "conflict_holder_program", "type": "string", "model": { "column": "Conflict Holder Program" }, "description": "The holder's application name, as program_name in RCA Sessions." },
         { "name": "conflict_holder_run_token", "type": "string", "model": { "column": "Conflict Holder Run Token", "hidden": true }, "description": "As run_token in RCA Sessions." },
         { "name": "conflict_holder_statement", "type": "string", "model": { "column": "Conflict Holder Statement" }, "description": "The holder's statement, normalized." },
-        { "name": "conflicts_cancelled", "type": "long", "model": { "column": "Conflicts Cancelled", "formatString": "#,0" }, "description": "Queries the replica cancelled for conflicts since the previous sample (pg_stat_database_conflicts)." },
-        { "name": "max_standby_streaming_delay_s", "type": "double", "model": { "column": "Max Standby Streaming Delay (s)", "formatString": "#,0" }, "description": "The replica's max_standby_streaming_delay." }
+        { "name": "conflicts_cancelled", "type": "long", "model": { "column": "Conflicts Cancelled", "formatString": "#,0" }, "description": "Queries the replica cancelled for conflicts since the previous sample (pg_stat_database_conflicts); null on the first sample." },
+        { "name": "max_standby_streaming_delay_s", "type": "double", "model": { "column": "Max Standby Streaming Delay (s)", "formatString": "#,0" }, "description": "The replica's max_standby_streaming_delay, read once when a replay episode starts (RCA-PG-09) and kept on later samples; null before the first episode." }
       ]
     },
     {
@@ -206,7 +206,7 @@
         { "name": "window_start_utc", "type": "timestamp", "required": true, "model": { "column": "Window Start UTC", "formatString": "yyyy-mm-dd hh:nn:ss" }, "description": "Start of the window." },
         { "name": "window_end_utc", "type": "timestamp", "required": true, "model": { "column": "Window End UTC", "formatString": "yyyy-mm-dd hh:nn:ss" }, "description": "End of the window." },
         { "name": "captured", "type": "boolean", "required": true, "model": { "column": "Captured" }, "description": "True when the sentinel ran for the whole window." },
-        { "name": "sources", "type": "string", "model": { "column": "Sources" }, "description": "Comma-separated capture IDs that returned rows." },
+        { "name": "sources", "type": "string", "model": { "column": "Sources" }, "description": "Comma-separated capture IDs that returned rows for the target in the window, sentinel and detail alike. RCA-PG-08 (the WAL receiver) adds only coverage gaps." },
         { "name": "gaps", "type": "string", "model": { "column": "Gaps" }, "description": "One gap per line: what wasn't captured and why (a permission, a timeout, the export's budget)." }
       ]
     },
@@ -248,5 +248,6 @@
     { "table": "RCA Replica", "name": "Replica Replay Stall (s)", "formatString": "#,0", "displayFolder": "RCA", "description": "The longest the read replica went without replaying a transaction, in seconds.", "definition": "CALCULATE ( MAX ( 'RCA Replica'[Since Last Replayed (s)] ), 'RCA Replica'[Side] = \"replica\" )" },
     { "table": "RCA Answer Key", "name": "Injected Faults", "formatString": "#,0", "displayFolder": "Answer key", "description": "Faults the workload injected (the scoreboard and the tests only).", "definition": "CALCULATE ( COUNTROWS ( 'RCA Answer Key' ), 'RCA Answer Key'[Kind] = \"run\" )" }
   ],
-  "purge": ["rca_sessions", "rca_waits", "rca_events", "rca_queries", "rca_resource", "rca_replica", "rca_coverage", "rca_answer_key"]
+  "purge": ["rca_sessions", "rca_waits", "rca_events", "rca_queries", "rca_resource", "rca_replica", "rca_coverage", "rca_answer_key"],
+  "purgeFiles": ["Files/rca/inbox"]
 }

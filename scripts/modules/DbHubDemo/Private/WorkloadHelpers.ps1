@@ -50,8 +50,8 @@ function Get-DemoWorkloadSourceHash {
     <#
     .SYNOPSIS
     SHA-256 of everything that goes into the runner build: its source, the build and package pins, global.json,
-    the embedded scenario catalog and demo T-SQL, the runtime identifier, the SDK pin, and the publish
-    properties. Internal and pure.
+    the embedded scenario catalog, demo T-SQL, and Incident RCA capture catalog (rca/capture, rca/history-tables.json),
+    the runtime identifier, the SDK pin, and the publish properties. Internal and pure.
 
     .DESCRIPTION
     Publish-DemoWorkloadRunner names the zip after this hash and reuses a zip with the same hash, so
@@ -98,6 +98,17 @@ function Get-DemoWorkloadSourceHash {
         foreach ($file in Get-ChildItem -LiteralPath $common -File -Filter '*.sql') {
             $files.Add($file)
         }
+    }
+    # The Incident RCA's capture catalog and history tables' spec, which the runner embeds (ADR 0031).
+    $capture = Join-Path -Path $root -ChildPath 'rca/capture'
+    if (Test-Path -LiteralPath $capture) {
+        foreach ($file in Get-ChildItem -LiteralPath $capture -File -Filter '*.sql') {
+            $files.Add($file)
+        }
+    }
+    $historyTables = Join-Path -Path $root -ChildPath 'rca/history-tables.json'
+    if (Test-Path -LiteralPath $historyTables -PathType Leaf) {
+        $files.Add((Get-Item -LiteralPath $historyTables))
     }
     $lines = foreach ($file in $files) {
         $relative = [System.IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')

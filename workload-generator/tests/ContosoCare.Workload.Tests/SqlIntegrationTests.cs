@@ -16,12 +16,12 @@ namespace ContosoCare.Workload.Tests;
 /// </summary>
 public sealed class SqlIntegrationTests
 {
-    private const string ServerVariable = "CONTOSOCARE_TEST_SQL_SERVER";
-    private static readonly string? Server = Environment.GetEnvironmentVariable(ServerVariable);
+    internal const string ServerVariable = "CONTOSOCARE_TEST_SQL_SERVER";
+    internal static readonly string? Server = Environment.GetEnvironmentVariable(ServerVariable);
     private static readonly SemaphoreSlim Prepared = new(1, 1);
     private static bool ready;
 
-    private static TargetEndpoint Endpoint => TargetEndpoint.Create(DemoTarget.T2, Server, sqlLoginFromEnvironment: false, managedIdentityClientId: null);
+    internal static TargetEndpoint Endpoint => TargetEndpoint.Create(DemoTarget.T2, Server, sqlLoginFromEnvironment: false, managedIdentityClientId: null);
 
     [Fact]
     public async Task BeginClampsAndLimitsRuns()
@@ -411,7 +411,8 @@ public sealed class SqlIntegrationTests
         }
     }
 
-    private static async Task PrepareAsync()
+    /// <summary>Creates or reuses the instance's ContosoCare database, set up and seeded; skips the test without an instance. The RCA tests share it.</summary>
+    internal static async Task PrepareAsync()
     {
         Assert.SkipUnless(Server is not null, $"Set {ServerVariable} to a disposable SQL Server instance to run the integration tests.");
         await Prepared.WaitAsync(TestContext.Current.CancellationToken);

@@ -3,9 +3,14 @@
 //   show_chart        draws a native app chart (ChartSpec) from a run_dax result
 //   suggest_followups shows the next questions as one-click chips
 //   estate_overview   the live estate, through the app's estate function (only when it's deployed)
+//   find_incidents, triage_window, explain_*   the Incident RCA's investigations (src/rca/tools.ts), when the model has its tables
+// Blind (ADR 0031): run_dax refuses a query that names the demo's answer key (./answer-key.ts).
 // Copilot gets each tool's answer as text; the dock keeps the full results for charts, tables, and "Show the DAX".
 
+import { INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS } from "@/rca/tools";
+import { answerKeyIn, answerKeyRefusal } from "./answer-key";
 import { CHART_KINDS, MAX_CHART_ROWS, validateChartSpec, type ChartSpec, type ContextRow } from "./contract";
+import { ANSWER_KEY_MEASURES } from "./model-guide.generated";
 import type { ToolSpec } from "./relay";
 
 export const DAX_ROW_LIMIT = 2000;
@@ -62,6 +67,8 @@ export interface AskToolDeps {
     onChart?: (chart: ChartSpec, run: DaxRun) => void;
     onFollowups?: (questions: string[]) => void;
     onEstate?: (call: EstateCall) => void;
+    /** The Incident RCA's investigation tools, when the model has the RCA tables (src/rca/tools.ts). */
+    investigations?: { run: (name: string, args: unknown) => Promise<ToolOutcome> };
     now?: () => number;
 }
 
@@ -101,7 +108,7 @@ const missingParts = (errors: string[]) => [...new Set(errors.map((e) => LIVE_PA
 const UNITS: Record<string, string> = { percent: "%", seconds: "s", milliseconds: "ms", minutes: "min", mb: "MB", gb: "GB", count: "count", number: "" };
 export const ESTATE_VIEWS = ["inventory", "health", "security"] as const;
 
-export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
+export function toolSpecs(options: { estate: boolean; rca?: boolean }): ToolSpec[] {
     const specs: ToolSpec[] = [
         {
             name: "run_dax",
@@ -169,6 +176,7 @@ export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
             },
         });
     }
+    if (options.rca) specs.push(...INVESTIGATION_TOOL_SPECS);
     return specs;
 }
 
@@ -188,6 +196,8 @@ export function checkDax(query: unknown): string | null {
     const body = stripDaxComments(query);
     if (!/^(DEFINE|EVALUATE)\b/i.test(body)) return "The query must start with EVALUATE (or DEFINE ... EVALUATE).";
     if (!/\bEVALUATE\b/i.test(body)) return "The query has no EVALUATE statement.";
+    const key = answerKeyIn(body, ANSWER_KEY_MEASURES);
+    if (key) return answerKeyRefusal(key);
     return null;
 }
 
@@ -324,6 +334,10 @@ export function createToolRunner(deps: AskToolDeps) {
 
     return {
         results,
+        /** Whether a tool reads data: text Copilot wrote before it is what it will check, not the answer (R925). */
+        isQuery(name: string): boolean {
+            return name === "run_dax" || name === "estate_overview" || INVESTIGATION_TOOL_NAMES.includes(name);
+        },
         async run(name: string, args: unknown): Promise<ToolOutcome> {
             const input = typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
             switch (name) {
@@ -336,6 +350,7 @@ export function createToolRunner(deps: AskToolDeps) {
                 case "estate_overview":
                     return estateOverview(input);
                 default:
+                    if (deps.investigations && INVESTIGATION_TOOL_NAMES.includes(name)) return deps.investigations.run(name, input);
                     return { ok: false, text: `There's no tool named ${name}.` };
             }
         },

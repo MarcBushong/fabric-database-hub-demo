@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ALLOWED_ROUTES, readEstate, type EstateScope, type EstateView } from "../../rayfin/functions/src/estate-core";
+import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
 import { checkDax, createToolRunner, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
 
 // Every route path the estate function can call, as text Copilot must never get (R925 review).
@@ -24,6 +25,16 @@ describe("checkDax", () => {
         expect(checkDax("SELECT * FROM t")).toMatch(/EVALUATE/);
         expect(checkDax("DEFINE VAR x = 1")).toMatch(/no EVALUATE/);
         expect(checkDax(`EVALUATE ${"x".repeat(20_001)}`)).toMatch(/longer/);
+    });
+
+    // ADR 0031: the chat can't read the demo's answer key, even by writing DAX, nor through a measure that reads it.
+    it("refuses the answer key's tables and the measures that read them, in plain words", () => {
+        expect(checkDax("EVALUATE TOPN ( 20, 'Incident Windows' )")).toMatch(/^Incident Windows holds the demo's answer key/);
+        expect(checkDax("EVALUATE FILTER ( 'analysis   findings', TRUE () )")).toMatch(/^Analysis Findings holds/);
+        expect(checkDax("EVALUATE Scenario Runs")).toMatch(/^Scenario Runs holds/);
+        expect(checkDax('EVALUATE ROW ( "n", [Incidents] )')).toMatch(/^\[Incidents\] reads the demo's answer key/);
+        expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], \"c\", [cpu in incident window] )")).toMatch(/^\[CPU In Incident Window\] reads/);
+        expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], \"CpuPct\", [CPU (%)], \"Blocked\", [Blocked Processes (peak)] )")).toBeNull();
     });
 });
 
@@ -215,9 +226,21 @@ describe("the tool runner", () => {
 });
 
 describe("toolSpecs and resultForModel", () => {
-    it("declares estate_overview only when the estate function is deployed", () => {
+    it("declares estate_overview only when the estate function is deployed, and the investigations only with the RCA tables", () => {
         expect(toolSpecs({ estate: false }).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups"]);
         expect(toolSpecs({ estate: true }).map((t) => t.name)).toContain("estate_overview");
+        expect(toolSpecs({ estate: true, rca: true }).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", "estate_overview", ...INVESTIGATION_TOOL_NAMES]);
+    });
+
+    it("routes the investigations to their runner, counts them as queries, and says so when they aren't offered", async () => {
+        const investigations = { run: vi.fn().mockResolvedValue({ ok: true, text: "{}" }) };
+        const runner = createToolRunner({ runDax: vi.fn(), investigations });
+        expect(await runner.run("find_incidents", { at: "11:56" })).toEqual({ ok: true, text: "{}" });
+        expect(investigations.run).toHaveBeenCalledWith("find_incidents", { at: "11:56" });
+        expect(runner.isQuery("explain_locking")).toBe(true);
+        expect(runner.isQuery("show_chart")).toBe(false);
+        const without = createToolRunner({ runDax: vi.fn() });
+        expect(await without.run("find_incidents", {})).toEqual({ ok: false, text: "There's no tool named find_incidents." });
     });
 
     it("bounds what Copilot reads to 120 rows", () => {

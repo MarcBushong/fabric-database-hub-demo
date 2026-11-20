@@ -50,6 +50,7 @@ internal static partial class CommandLine
         root.Subcommands.Add(ProfileCommand());
         root.Subcommands.Add(WarmupCommand());
         root.Subcommands.Add(SetupCommand());
+        root.Subcommands.Add(RcaCommand());
         return root;
     }
 
@@ -355,6 +356,7 @@ internal static partial class CommandLine
                     var opener = new SqlConnectionOpener(target.Resolve(parseResult), log);
                     await using var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken).ConfigureAwait(false);
                     checks.AddRange(await new DemoDatabase(connection).ResetAsync(options, cancellationToken).ConfigureAwait(false));
+                    checks.Add(await DropObserverSessionAsync(connection, targetValue, cancellationToken).ConfigureAwait(false));
                 }
 
                 foreach (var check in checks)
@@ -626,6 +628,8 @@ internal static partial class CommandLine
         var hostFile = ProfileFile();
         var hostStateFile = HostStateFile();
         var notAfter = new Option<string?>("--not-after") { Description = "Stop activity 2 minutes before this time (ISO 8601 with an offset, typically the next auto-shutdown)." };
+        var rcaStore = RcaStoreOption();
+        var noRca = new Option<bool>("--no-rca") { Description = "Don't run the Incident RCA observer lane (ADR 0031): no capture, and no answer key." };
         host.Options.Add(t3Server);
         host.Options.Add(t3Identity);
         host.Options.Add(t4Server);
@@ -640,6 +644,8 @@ internal static partial class CommandLine
         host.Options.Add(hostFile);
         host.Options.Add(hostStateFile);
         host.Options.Add(notAfter);
+        host.Options.Add(rcaStore);
+        host.Options.Add(noRca);
         host.SetAction(async (parseResult, cancellationToken) =>
         {
             using var log = GlobalOptions.CreateLog(parseResult);
@@ -659,23 +665,29 @@ internal static partial class CommandLine
                 }
 
                 var targets = new List<ProfileTarget>();
+                var observed = new ObservedTargets();
                 CosmosRestClient? cosmos = null;
                 try
                 {
                     if (primary == DemoTarget.T4)
                     {
-                        var runner = hostTarget.PostgresRunner(parseResult, log);
+                        var endpoint = hostTarget.ResolvePostgres(parseResult);
+                        var replica = hostTarget.ResolvePostgresReplica(parseResult, endpoint);
+                        var runner = PgRunner(endpoint, replica, log);
                         targets.Add(new ProfileTarget(DemoTarget.T4, runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = runner.HasReplica });
+                        observed.AddPostgres(endpoint, replica, log);
                     }
                     else if (primary == DemoTarget.T5)
                     {
                         cosmos = CosmosClient(hostTarget.ResolveCosmos(parseResult));
                         targets.Add(new ProfileTarget(DemoTarget.T5, new CosmosScenarioRunner(cosmos, hostTarget.RunStore(parseResult), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(hostFile) ?? FileProfileStore.DefaultPathFor(DemoTarget.T5))));
+                        observed.Note(DemoTarget.T5);
                     }
                     else
                     {
                         var endpoint = hostTarget.Resolve(parseResult);
                         targets.Add(new ProfileTarget(endpoint.Target, new ScenarioRunner(new SqlConnectionOpener(endpoint, log), log, TimeProvider.System), Store(endpoint.Target, () => endpoint, parseResult.GetValue(hostFile), log)));
+                        observed.AddSql(endpoint, log);
                     }
 
                     if (parseResult.GetValue(t3Server) is { } server)
@@ -687,6 +699,7 @@ internal static partial class CommandLine
 
                         var t3 = TargetEndpoint.Create(DemoTarget.T3, server, sqlLoginFromEnvironment: false, parseResult.GetValue(t3Identity));
                         targets.Add(new ProfileTarget(DemoTarget.T3, new ScenarioRunner(new SqlConnectionOpener(t3, log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(hostFile) ?? FileProfileStore.DefaultPath)));
+                        observed.AddSql(t3, log);
                     }
 
                     if (parseResult.GetValue(t4Server) is { } pgServer)
@@ -697,8 +710,10 @@ internal static partial class CommandLine
                         }
 
                         var t4 = PgEndpoint.Create(pgServer, parseResult.GetValue(t4User), passwordFromEnvironment: false, parseResult.GetValue(t4Identity));
-                        var t4Runner = PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log);
+                        var t4ReplicaEndpoint = t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server");
+                        var t4Runner = PgRunner(t4, t4ReplicaEndpoint, log);
                         targets.Add(new ProfileTarget(DemoTarget.T4, t4Runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = t4Runner.HasReplica });
+                        observed.AddPostgres(t4, t4ReplicaEndpoint, log);
                     }
                     else if (parseResult.GetValue(t4Replica) is not null)
                     {
@@ -711,10 +726,11 @@ internal static partial class CommandLine
                         cosmos = CosmosClient(CosmosEndpoint.Create(cosmosServer, parseResult.GetValue(t5Identity)));
                         var store = new CosmosRunStore(parseResult.GetValue(t5RunFile) ?? CosmosRunStore.DefaultPath);
                         targets.Add(new ProfileTarget(DemoTarget.T5, new CosmosScenarioRunner(cosmos, store, log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(t5File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T5))));
+                        observed.Note(DemoTarget.T5);
                     }
 
                     var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath) with { RaisePriority = true };
-                    await new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options).RunAsync(targets, limit, cancellationToken).ConfigureAwait(false);
+                    await RunHostAsync(options, targets, limit, observed, parseResult.GetValue(rcaStore), parseResult.GetValue(noRca), log, cancellationToken).ConfigureAwait(false);
                     return ExitCodes.Success;
                 }
                 finally

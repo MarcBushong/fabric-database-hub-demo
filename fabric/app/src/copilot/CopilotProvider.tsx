@@ -47,7 +47,7 @@ function hash(text: string): string {
 
 /** The system message (with the model guide) and the page tools, loaded when the first conversation starts rather than with the app. */
 function loadChatModules() {
-    return Promise.all([import("./guide"), import("./tools")]).catch(() => {
+    return Promise.all([import("./guide"), import("./tools"), import("./investigations")]).catch(() => {
         throw new Error("The chat's tools didn't load. Reload the page and ask again.");
     });
 }
@@ -151,6 +151,28 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             () => undefined,
         );
     }, [isOpen, queryClient, relay]);
+
+    // Whether the history model has the Incident RCA's tables (ADR 0031), asked once, when the dock first opens or a
+    // conversation starts: with them, the dock offers the investigation starters, and each conversation the tools and the
+    // playbook. A model from before the feature, or a failed check, leaves them out, and the chat answers from the telemetry.
+    const [rcaHistory, setRcaHistory] = useState(false);
+    const rcaProbe = useRef<Promise<boolean> | null>(null);
+    const probeRca = useCallback((): Promise<boolean> => {
+        if (!queryClient) return Promise.resolve(false);
+        rcaProbe.current ??= import("./investigations").then(
+            (m) => m.hasRcaTables(queryClient),
+            () => false,
+        );
+        return rcaProbe.current;
+    }, [queryClient]);
+    useEffect(() => {
+        if (!isOpen || !relay) return;
+        let cancelled = false;
+        void probeRca().then((has) => !cancelled && setRcaHistory(has));
+        return () => {
+            cancelled = true;
+        };
+    }, [isOpen, probeRca, relay]);
 
     // Who the stored sign-in belongs to, and whether that account can use GitHub Copilot here (checked below freshToken).
     const token = session?.accessToken ?? null;
@@ -278,7 +300,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     const conn = connection.current;
                     const run = runner.current;
                     // Text before a query is Copilot saying what it will check; the answer is what it writes after.
-                    if (event.name === "run_dax" || event.name === "estate_overview") answerText.current.clear();
+                    if (run ? run.isQuery(event.name) : event.name === "run_dax" || event.name === "estate_overview") answerText.current.clear();
                     if (!conn || !run) break;
                     void run.run(event.name, event.arguments).then((outcome) => conn.toolResult(event.callId, outcome.ok, outcome.text));
                     break;
@@ -317,7 +339,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             const stale = () => conversationNo.current !== no;
             setConnecting(true);
             try {
-                const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
+                const [{ buildSystemMessage }, { createToolRunner, toolSpecs }, { createInvestigations }] = await loadChatModules();
+                const rca = await probeRca();
                 if (stale()) throw newChatStarted();
                 // A conversation that learned the live view isn't available doesn't offer it again, even on a new session;
                 // nor does one that starts while Database Hub refuses the app as a whole, by the latest reads (liveOffNow).
@@ -349,14 +372,15 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     onChart: (chart, run) => dispatchHere({ type: "chart", chart, runId: run.id }),
                     onFollowups: (questions) => dispatchHere({ type: "followups", questions }),
                     onEstate: (call) => dispatchHere({ type: "estate", call }),
+                    investigations: rca && queryClient ? createInvestigations(queryClient, { onDax: (run) => dispatchHere({ type: "dax", run }) }) : undefined,
                 });
                 const earlier = recap(turnsRef.current.slice(0, -2));
                 const systemMessage =
-                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup, liveUnavailable: live ?? undefined }) +
+                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup, liveUnavailable: live ?? undefined, rca }) +
                     (earlier ? `\n\n# Earlier in this conversation (the previous session ended; continue from it)\n${earlier}` : "");
                 const conn = new ChatConnection(relay.chatUrl(), handleEvent);
                 try {
-                    await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate && !live }) });
+                    await conn.open({ token: accessToken, systemMessage, tools: toolSpecs({ estate: settings.estate && !live, rca }) });
                 } catch (err) {
                     // Nothing of a failed start stays open: no socket and no pings.
                     conn.close();
@@ -377,7 +401,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 if (!stale()) setConnecting(false);
             }
         },
-        [disconnect, handleEvent, queryClient, relay, settings],
+        [disconnect, handleEvent, probeRca, queryClient, relay, settings],
     );
 
     /** Sends one prompt on the conversation, starting a session when there's none; the current assistant turn gets the answer. */
@@ -637,6 +661,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         connecting,
         pending: attached?.ctx ?? null,
         cosmosHistory,
+        rcaHistory,
         liveOff,
         signInStarting,
     };

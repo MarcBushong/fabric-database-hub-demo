@@ -18,7 +18,7 @@ What the runner's observer captures, how it reaches the history, and what the In
 1. **Capture, on the VMs.** The observer lane of `ContosoCare.Workload profile run` (on T1 for T1, T3, T4, T4's replica; in T2's guest for T2) runs the sentinel every 30 s for the whole session, escalates to detail capture when a signal crosses its threshold ([below](#capture-triggers)), and keeps what it captures in `C:\ProgramData\DbHubDemo\rca\<session>\` (SYSTEM and Administrators only, at most 20 MB per target, deleted 7 days after its export).
 2. **Export.** At the session's end (and at each 30-minute re-check), `ContosoCare.Workload rca export` reduces the capture into evidence documents and prints them as part lines ([transport](#transport)).
 3. **Into the control vault.** The control's runbook runs the export through managed Run Commands, one part per command, writes the parts as earlier versions of the control vault's existing `dbhub-session-metrics` secret (bundles), and lists those versions in the `rca` member of the secret's final version, the metrics document the control notebook already reads.
-4. **Into the history.** The control notebook reads the bundles and passes every part to `NB_DatabaseHub_LiveActivity` as `RCA_EVIDENCE`, which decodes the documents and writes the eight tables. `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s history snapshot run the same export with the operator's role and pass `RCA_EVIDENCE` straight to the notebook job.
+4. **Into the history.** The control notebook reads the bundles, stages every part in the lakehouse as one `RCA_EVIDENCE` document, and passes its path to `NB_DatabaseHub_LiveActivity` as `RCA_EVIDENCE_FILE`; the notebook decodes the documents and writes the eight tables. `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s history snapshot run the same export with the operator's role and stage the same file ([`RCA_EVIDENCE_FILE`](#rca_evidence_file)).
 5. **Read.** `SM_DatabaseHub_History` reads the tables (Direct Lake); the app's rules, investigation tools, RCA view, and chat read the seven detection tables through it, never the answer key.
 
 ## Blind detection
@@ -46,6 +46,15 @@ The sentinel runs on every target every 30 s for the whole session. A signal ove
 
 T5 has no sentinel in the observer: its 429s and normalized RU are Azure Monitor metrics that the history saves already, which detection reads from Telemetry Snapshots.
 
+**What a sample holds:** the columns of the queries that ran at that moment.
+
+- **The replica's sentinel** reads RCA-PG-06, 07, and 08 every 30 s: `since_last_replayed_s`, `received_not_replayed_bytes`, and `conflicts_cancelled`. RCA-PG-08's receiver status only adds coverage gaps. Replay detail adds RCA-PG-01 and 02: `startup_wait` and the conflict's columns, on a sample that found the startup process waiting on a lock. RCA-PG-09 runs once when an episode starts, and its `max_standby_streaming_delay_s` stays on later samples.
+- **T4's sentinel** also reads the primary's side (RCA-PG-04 and 05) every 30 s while T4 has a standby, and every 5 s during a replay episode.
+- **Rates and deltas** between samples (`wal_bytes_per_s`, `conflicts_cancelled`) are null on a target's first sample, which has nothing before it.
+- **A blocking sample** is a capture time with at least one waiting session. RCA-SQL-01, and RCA-PG-01 and 02, return only the sessions in a blocking edge (the waiters and those they wait on), so a chain's samples stop while nothing waits, and a formation ends where its samples stop for more than 1.5 sample intervals.
+- **An escalation's login and host:** RCA-XE-01's `lock_escalation` event has no username or hostname action, so the observer takes them from the same session's blocking sample in the episode (the same session ID and run token), else leaves them null.
+- **`rca_coverage.sources`** names every capture query that returned rows for the target in the window, sentinel and detail alike.
+
 ## Names
 
 What the observer records about who ran a session, so the evidence names nothing the workload planned:
@@ -66,7 +75,7 @@ One JSON document per host and export, UTF-8, no byte order mark. The schema say
 | `documentId` | `<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>`, for example `20261120T165000Z-sqlvm01-0001`. Unique; the notebook writes a document once |
 | `sessionId` | The control's session ID (32 lowercase hex, the resource group's `DbHubSessionId`), or null outside a control session |
 | `producer` | `ContosoCare.Workload`, its version, the host (`sqlvm01` or `arcsql01`), lane `observer` |
-| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended |
+| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended. Like `epochUtc`, ISO 8601 UTC with milliseconds: `2026-11-20T16:50:00.000Z` |
 | `sequence`, `final` | The export's number for the host and session, from 1; `final` on the session's last |
 | `targets` | The targets covered; each has an `rca_coverage` row |
 | `epochUtc` | The base of every time in the document |
@@ -147,6 +156,15 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 - writes each document once (by `documentId`), the detection tables and `rca_answer_key` together, deleting the run's earlier rows first, as it writes the other tables;
 - reports `RCA.EVIDENCE` with ADR 0012's statuses: **Pass** when every document was written, **Warning** with the reason when one was skipped (a missing part, a bad SHA-256, a newer version, another session), **Not selected** when none was passed.
 
+### `RCA_EVIDENCE_FILE`
+
+The notebook's other parameter, for any session: a path in the demo's lakehouse, `Files/rca/inbox/<name>.json` (transport.schema.json, `evidenceFile`), to a file that holds exactly one `RCA_EVIDENCE` document. Neither a notebook run's parameters nor a job's document a size limit, and a full session's 64 parts come to about 218 KB, so the parts travel as a file. The inline `RCA_EVIDENCE` stays supported.
+
+- **Staging:** the control notebook writes the file with `notebookutils.fs.put` ([file system utilities](https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-file-system)). `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot write it through OneLake's DFS API, the ADLS Gen2 API at `onelake.dfs.fabric.microsoft.com` ([OneLake access with APIs](https://learn.microsoft.com/fabric/onelake/onelake-access-api)), with the operator's existing workspace role. No new grant: a private control vault is reachable only from the control workspace, so the job's fallback can't read the bundles itself.
+- **Reading:** the notebook reads the file with `notebookutils.fs.head(path, 262144)`, because `head` returns only the first 100 KB (102,400 bytes) by default ([`head`](https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-file-system)). It applies every rule of `RCA_EVIDENCE` above, with the same `RCA.EVIDENCE` status. A file that's missing, larger than 262,144 bytes, or not one `RCA_EVIDENCE` document is a **Warning** with the reason, and nothing of it is written.
+- **Both parameters:** the notebook merges their parts and still writes each document once (by `documentId`).
+- **Cleanup:** the notebook deletes the file with `notebookutils.fs.rm` once the tables are written, and keeps it when the write fails, so the next run can write it. The deployment notebook's purge removes `Files/rca/inbox` with the eight tables (history-tables.json, `purgeFiles`).
+
 ### Limits
 
 | Limit | Value | Why |
@@ -154,6 +172,7 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 | A part line | 3,400 characters (2,400 bytes of gzip) | A managed Run Command keeps the last 4 KB of output |
 | A document | 64 KiB of gzip (at most 28 parts) | The reducer cuts in reverse priority and records each cut as a gap in `rca_coverage` |
 | A session | 96 KiB of gzip across both hosts (at most 64 parts in `RCA_EVIDENCE`) | The reducer aims at 64 KiB; the fixtures measure about 3 KB of gzip for 15 minutes of 10-second blocking detail on one target |
+| `RCA_EVIDENCE_FILE` | 262,144 bytes: one `RCA_EVIDENCE` document of 64 parts is about 218 KB | What the notebook passes to `notebookutils.fs.head`, whose default is 100 KB |
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
 
@@ -168,5 +187,5 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 | Step | Builds | Tests against this contract |
 |---|---|---|
 | 1.1 and 1.2, the capture | The observer lane, its triggers, normalization and names, the local store, `rca export` and `rca part` | Fixture documents round trip through its encoder and decoder; its documents validate against evidence.schema.json; the observer's code names nothing in blind-detection.json; the capture's T-SQL parses (as `SqlScriptTests`) |
-| 1.3 to 1.5, the transport and the history | The runbook's export, bundles, and index; the scripts' `RCA_EVIDENCE`; the notebook's decoder and the eight tables; the deployment notebook's purge of them; the model's tables, relationships, and measures | Bundles and the index validate against transport.schema.json; the fixtures' parts decode to the fixture documents; the notebook's tables and the model's TMDL match history-tables.json |
+| 1.3 to 1.5, the transport and the history | The runbook's export, bundles, and index; the staged `RCA_EVIDENCE_FILE` (and the inline `RCA_EVIDENCE`); the notebook's decoder and the eight tables; the deployment notebook's purge of them and of `Files/rca/inbox`; the model's tables, relationships, and measures | Bundles and the index validate against transport.schema.json; the fixtures' parts decode to the fixture documents; the notebook's tables and the model's TMDL match history-tables.json |
 | 1.6, the app | The blind rules, the shared blind detector, the DAX loader, the six Phase 1 tools, the RCA view, the postmortem's Cause, the chat's blindness, the gating | Its loader's names match history-tables.json; its rules find the fixtures' facts ([fixtures](fixtures/README.md)); its detection code names nothing in blind-detection.json |
