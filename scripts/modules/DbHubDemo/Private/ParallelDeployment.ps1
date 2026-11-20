@@ -1471,6 +1471,12 @@ function Invoke-DemoParallelDeployment {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'
         }
     }
+    # Then T5's container lifecycle once more (2026-11-19, F14): its first check ran right after the control's roles were
+    # granted, which a read can miss for a while, so the status page's T5 row said Run all couldn't start a session while
+    # the Control row said it was ready. Only when this run granted the role and that check didn't see it. Never a Fail.
+    if (-not $whatIf) {
+        $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
+    }
     # 10. T4's read replica (2026-11-16): DONE's checks and the history snapshot have read it, so it's deleted, and the run
     # leaves nothing new billing between sessions, unless a session uses it now; start-demo.ps1 and Run all create it for
     # each session. On every run, a NOT DONE one included; never a Fail, and never in DONE's way.

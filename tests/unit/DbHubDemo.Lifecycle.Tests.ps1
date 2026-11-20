@@ -1243,6 +1243,15 @@ Describe 'Invoke-DemoDeployment' {
         @($script:recorded | Where-Object { $_.Contains('AppControlNotebookId') })[-1]['AppControlNotebookId'] | Should -Be 'abababab-abab-abab-abab-abababababab'
     }
 
+    It 'checks T5''s container lifecycle again at the run''s end, once the session control is done, with the run''s own results (-Sequential, 2026-11-19, F14)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith { $script:order.Add(('Control:{0}' -f $Part)) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5LifecycleRecheck -MockWith { $script:order.Add(('T5Recheck:{0}' -f $Results.GetType().Name)) }
+        $null = @(Invoke-DemoDeployment -Config $config)
+        @($script:order | Where-Object { $_ -like 'T5Recheck:*' }) | Should -Be @('T5Recheck:List`1') -Because 'it changes the run''s results in place'
+        $script:order.IndexOf('T5Recheck:List`1') | Should -BeGreaterThan $script:order.IndexOf('Control:Fabric')
+        $script:order.IndexOf('Control:Azure') | Should -BeLessThan $script:order.IndexOf('Control:Fabric')
+    }
+
     It 'reads the Rayfin CLI''s sign-in from before the guard when the Fabric stage can run, and the sign-in''s start takes that read (-Sequential, 2026-11-06)' {
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:signInCalls.Add('guard'); New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
         Invoke-DemoDeployment -Config $config | Out-Null

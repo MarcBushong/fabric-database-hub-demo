@@ -1321,6 +1321,85 @@ function Get-DemoT5LifecycleResult {
     return (New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $said.Status -Message $said.Text -Evidence $evidence -Remediation $said.Fix -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['provisionThroughput']))
 }
 
+function Invoke-DemoT5LifecycleRecheck {
+    <#
+    .SYNOPSIS
+    DEPLOY.T5.LIFECYCLE once more at a deploy.ps1 run's end (2026-11-19, F14), when its first check didn't see the session
+    control's role that this run's grant reports in place. Returns the new result, or $null when it isn't checked again.
+    Internal.
+
+    .DESCRIPTION
+    The run checks T5's container lifecycle right after the session control's Azure part (Update-DemoT5ContainerLifecycle),
+    whose last step grants the control's roles, and a role assignment that was just created can be missing from a read for
+    a while. So on a new environment the status page's T5.Lifecycle row said the session control had no role yet and Run all
+    couldn't start a session, while the Control row said Run all was ready (live, 2026-11-19, two new environments). Once
+    the control is done, when this run's CONTROL.ROLE.A1 is a Pass (the role is assigned at the demo resource group) and the
+    first check found no role (NoRole), couldn't read it (Unknown, or no mode), or found it without the container's actions
+    although this run's CONTROL.ROLE.DEFINITION is a Pass (Lacking), it checks again with Update-DemoT5ContainerLifecycle,
+    which rewrites the row, and the new result replaces the first in -Results, so the console, the status page, and DONE
+    say what holds at the run's end. A first check that found the role (Control), T5 off, or a run that couldn't grant the
+    role (a Contributor's) isn't checked again.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        # The run's results, changed in place: the new DEPLOY.T5.LIFECYCLE replaces the first.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]] $Results
+    )
+
+    $index = -1
+    for ($i = $Results.Count - 1; $i -ge 0; $i--) {
+        if ($null -ne $Results[$i] -and [string](Get-DemoMemberValue -InputObject $Results[$i] -Name 'checkId') -eq 'DEPLOY.T5.LIFECYCLE') {
+            $index = $i
+            break
+        }
+    }
+    if ($index -lt 0) {
+        return $null
+    }
+    $first = $Results[$index]
+    $mode = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $first -Name 'evidence') -Name 'mode')
+    if ([string]$first.status -eq 'Not selected' -or $mode -eq 'Control') {
+        return $null
+    }
+    $last = { param([string] $CheckId) @($Results | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $CheckId }) | Select-Object -Last 1 }
+    $assigned = & $last 'CONTROL.ROLE.A1'
+    if ($null -eq $assigned -or [string]$assigned.status -ne 'Pass') {
+        return $null
+    }
+    if ($mode -eq 'Lacking') {
+        $defined = & $last 'CONTROL.ROLE.DEFINITION'
+        if ($null -eq $defined -or [string]$defined.status -ne 'Pass') {
+            return $null
+        }
+    }
+    $prior = @(for ($i = 0; $i -lt $Results.Count; $i++) { if ($i -ne $index) { $Results[$i] } })
+    $again = @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $prior -Confirm:$false) | Select-Object -Last 1
+    if ($null -eq $again) {
+        return $null
+    }
+    $evidence = Get-DemoMemberValue -InputObject $again -Name 'evidence'
+    if ($evidence -is [System.Collections.IDictionary]) {
+        $evidence['checkedAgain'] = $true
+        $evidence['firstMode'] = $mode
+    }
+    $Results[$index] = $again
+    if ([string](Get-DemoMemberValue -InputObject $evidence -Name 'mode') -ne $mode -or [string]$again.status -ne [string]$first.status) {
+        Write-DemoLog -Message ('T5''s container lifecycle, checked again at the run''s end, once the session control''s role showed: {0}' -f [string]$again.message)
+    }
+    return $again
+}
+
 function Invoke-DemoT5ContainerStop {
     <#
     .SYNOPSIS
