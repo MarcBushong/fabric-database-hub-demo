@@ -5,6 +5,7 @@ import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
+import { forgetLiveAnswers, noteLiveAnswer } from "./live-refusal";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
@@ -133,6 +134,7 @@ beforeEach(() => {
     FakeSocket.script = null;
     FakeSocket.all = [];
     estateMock.readEstate.mockReset();
+    forgetLiveAnswers();
     vi.mocked(queryClient.run).mockClear();
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -537,5 +539,41 @@ describe("the end of a turn (R925)", () => {
         expect(resultOf(second, "e2")).toMatchObject({ ok: true });
         expect(screen.getByRole("button", { name: /Live estate from Database Hub: inventory/ })).toBeInTheDocument();
         expect(screen.queryByRole("button", { name: /Live estate from Database Hub: health/ })).not.toBeInTheDocument();
+    });
+
+    // The owner's question 2, the coordinator's decision: while Database Hub refuses the app as a whole (every view
+    // unavailable, as the pages read it), a new conversation starts without the live view and hides its starters.
+    it("starts without the live view while Database Hub refuses the app as a whole, and uses it again once a view answers", async () => {
+        const sentence = "Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in.";
+        const toolsOf = (socket: FakeSocket) => (socket.sent[0].tools as Array<{ name: string }>).map((t) => t.name);
+        for (const view of ["inventory", "health", "security"] as const) noteLiveAnswer(view, { data: {}, unavailable: sentence });
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") {
+                s.emit({ type: "message", messageId: `h${FakeSocket.all.length}`, text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo"));
+        expect(screen.getByRole("button", { name: "Which target worked hardest this week?" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "How is my estate doing right now?" })).not.toBeInTheDocument();
+        await ask();
+        await screen.findByText(ANSWER);
+        const first = FakeSocket.all[0];
+        expect(toolsOf(first)).not.toContain("estate_overview");
+        expect(String(first.sent[0].systemMessage)).toContain(`LIVE estate: ${sentence}`);
+        expect(estateMock.readEstate).not.toHaveBeenCalled();
+
+        // A page's read answers: the next conversation offers the live view, and its starters, again.
+        act(() => noteLiveAnswer("inventory", { data: { totalCount: 4 } }));
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        expect(screen.getByRole("button", { name: "How is my estate doing right now?" })).toBeInTheDocument();
+        await ask("How is my estate doing now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
+        expect(toolsOf(FakeSocket.all[1])).toContain("estate_overview");
+        expect(String(FakeSocket.all[1].sent[0].systemMessage)).not.toContain(sentence);
     });
 });

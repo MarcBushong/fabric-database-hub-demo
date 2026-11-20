@@ -2,14 +2,15 @@
 // time on the viewer's own GitHub Copilot, the page tools that answer Copilot's tool calls, and the transcript,
 // kept for the browser session. It implements the contract (contract.ts) through use-copilot.ts's context.
 
-import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
 import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings, type ConversationAction } from "./conversation";
-import type { EstateAnswer, EstateView } from "./estate";
+import type { EstateView } from "./estate";
 import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
+import { liveRefusedAsAWhole, onLiveRefusal } from "./live-refusal";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -131,6 +132,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     // Whether the history holds T5's (Azure Cosmos DB) metrics, asked once when the dock first opens, so T5's starter
     // shows only when it has an answer. A failure (the local preview's sample, a model without T5's measures) leaves it out.
     const [cosmosHistory, setCosmosHistory] = useState(false);
+    /** Database Hub refuses the app as a whole (every live view unavailable, as the pages read it): the live starters hide. */
+    const liveRefused = useSyncExternalStore(onLiveRefusal, liveRefusedAsAWhole);
     const cosmosProbed = useRef(false);
     useEffect(() => {
         if (!isOpen || !relay || !queryClient || cosmosProbed.current) return;
@@ -305,8 +308,9 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             setConnecting(true);
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
-                // A conversation that learned the live view isn't available doesn't offer it again, even on a new session.
-                const live = liveUnavailable.current;
+                // A conversation that learned the live view isn't available doesn't offer it again, even on a new session;
+                // nor does one that starts while Database Hub refuses the app as a whole (live-refusal.ts).
+                const live = liveUnavailable.current ?? liveRefusedAsAWhole();
                 // The conversation this runner serves: once New chat starts another, what its calls return is dropped.
                 const servedNo = conversationNo.current;
                 const dispatchHere = (action: ConversationAction) => {
@@ -321,8 +325,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     estate: settings.estate
                         ? async (view) => {
                               const { readEstate } = await import("./estate");
-                              // unavailable: the function's plain sentence when no route answered for an authentication reason.
-                              const answer = (await readEstate(view as EstateView)) as EstateAnswer & { unavailable?: string };
+                              // unavailable: the function's plain sentence when nothing was read and won't be on the next read (R924).
+                              const answer = await readEstate(view as EstateView);
                               return { source: answer.source, data: answer.data, errors: answer.errors, at: answer.at, unavailable: answer.unavailable };
                           }
                         : undefined,
@@ -406,13 +410,13 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     /** Retry for a turn that ended without an answer: the same conversation is asked to write it, in the same turn (R925). */
     const retry = useCallback(() => {
         if (busy || plan.ok === false) return;
-        const all = turnsRef.current;
-        const last = all[all.length - 1];
+        // The turns this button was rendered with: turnsRef follows them only after the render's effects.
+        const last = turns[turns.length - 1];
         if (!last || last.role !== "assistant" || !endedWithoutAnswer(last)) return;
-        const question = [...all].reverse().find((t) => t.role === "user");
+        const question = [...turns].reverse().find((t) => t.role === "user");
         dispatch({ type: "resume" });
         deliver(retryPrompt(question?.role === "user" ? question.text : ""));
-    }, [busy, deliver, plan.ok]);
+    }, [busy, deliver, plan.ok, turns]);
 
     const stop = useCallback(() => {
         connection.current?.abort();
@@ -581,6 +585,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         connecting,
         pending: attached?.ctx ?? null,
         cosmosHistory,
+        liveRefused,
     };
     const chat: ChatController = {
         state: chatState,
