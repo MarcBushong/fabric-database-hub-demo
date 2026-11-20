@@ -13,7 +13,6 @@ export type SignInMode = "device" | "off" | null;
 
 export interface DeviceState {
     userCode: string;
-    verificationUri: string;
     expiresAt: number;
     /** False when the browser refused the clipboard: the dock asks the viewer to copy the code. */
     copied: boolean;

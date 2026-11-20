@@ -10,7 +10,7 @@ import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } 
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
 import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings, type ConversationAction } from "./conversation";
 import type { EstateView } from "./estate";
-import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
+import { clearSession, deviceStartOf, fromPoll, GITHUB_DEVICE_PAGE, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type DeviceCode, type GitHubSession } from "./github-session";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -469,11 +469,15 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         setDevice(null);
     }, []);
 
+    // The provider goes away (AuthGate signs the viewer out of Fabric): a sign-in it started stops waiting for GitHub.
+    useEffect(() => cancelSignIn, [cancelSignIn]);
+
     /**
      * GitHub's device flow through the relay: gets a code, shows it in the dock with "Copy the code and open GitHub", and
      * waits for it. It opens no tab of its own: one opened in the click, before the code arrives, can stay blank inside
      * Fabric's frame, where the browser may open it but give the app no handle to send it to GitHub (the owner's report,
-     * 2026-11-20). The dock's button opens GitHub in its own click, which works there.
+     * 2026-11-20). The dock's button opens GitHub in its own click, which works there. The run stays this tab's sign-in
+     * until its session is saved, so a click meanwhile starts no second one (the review of 1c94891, 2026-11-20).
      */
     const signInWithGitHub = useCallback(() => {
         if (!relay) return;
@@ -483,22 +487,35 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         signInRun.current = run;
         setDevice(null);
         setSignInStarting(true);
+        const end = () => {
+            if (signInRun.current === run) signInRun.current = null;
+            setSignInStarting(false);
+            setDevice(null);
+        };
         void (async () => {
-            let start;
+            let start: DeviceCode | null;
             try {
-                start = await relay.startDeviceFlow();
+                // Checked: GitHub's codes only, and never the address the relay names (deviceStartOf).
+                start = deviceStartOf(await relay.startDeviceFlow());
             } catch (err) {
                 if (!run.cancelled) {
-                    setSignInStarting(false);
+                    end();
                     setAuthError(describeAskError(err));
                 }
                 return;
             }
             if (run.cancelled) return;
-            setSignInStarting(false);
-            const copied = await (navigator.clipboard?.writeText(start.userCode).then(() => true, () => false) ?? Promise.resolve(false));
+            if (!start) {
+                end();
+                setAuthError("The chat relay didn't pass on a sign-in code from GitHub. Select Sign in with GitHub to try again.");
+                return;
+            }
+            const userCode = start.userCode;
+            const copied = await (navigator.clipboard?.writeText(userCode).then(() => true, () => false) ?? Promise.resolve(false));
             if (run.cancelled) return;
-            setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened: false });
+            // One update: the chip and the panel go from getting a code to showing it, never back to "Sign in" between.
+            setSignInStarting(false);
+            setDevice({ userCode, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened: false });
             const code = start.deviceCode;
             const outcome = await waitForDeviceToken({
                 poll: () => relay.pollDeviceFlow(code),
@@ -510,17 +527,22 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 isTransient,
             });
             if (outcome.status === "cancelled" || run.cancelled) return;
-            setDevice(null);
-            signInRun.current = null;
             if (outcome.status === "ok") {
                 const next = fromPoll(outcome, Date.now());
+                // Whose token it is, while the code stays on screen: Cancel, a newer sign-in, or the provider going away
+                // still wins, and nothing is saved for a run that's over.
                 const who = await relay.user(next.accessToken).catch(() => null);
+                if (run.cancelled) return;
                 const withLogin = { ...next, login: who?.login ?? null };
                 saveSession(local(), withLogin);
                 renewedAfterRefusal.current = null;
+                end();
                 applySession(withLogin);
                 return;
             }
+            end();
+            // Signed in meanwhile another way (another tab's sign-in): this run's end has nothing to report.
+            if (sessionRef.current) return;
             setAuthError(
                 outcome.status === "denied"
                     ? "GitHub sign-in was cancelled on github.com. Select Sign in with GitHub to try again."
@@ -584,8 +606,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         };
         if (settings && !relay) return { ...base, status: "unavailable", detail: "Ask isn't deployed in this environment." };
         if (signInMode === "off") return { ...base, status: "unavailable", detail: "GitHub sign-in isn't set up on the chat relay." };
-        if (device) return { ...base, status: "signing-in", detail: `Enter ${device.userCode} at ${device.verificationUri.replace(/^https:\/\//, "")}: the Copilot panel has the code and the link.` };
-        if (signInStarting) return { ...base, status: "signing-in", detail: "Getting a sign-in code from GitHub. The Copilot panel shows it." };
+        // A session wins: the chip offers its menu (sign out, switch) as the panel shows the conversation.
         if (session) {
             return {
                 ...base,
@@ -596,6 +617,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 detail: plan.ok === false ? plan.detail : undefined,
             };
         }
+        if (device) return { ...base, status: "signing-in", detail: `Enter ${device.userCode} at ${GITHUB_DEVICE_PAGE}: the Copilot panel has the code and the link.` };
+        if (signInStarting) return { ...base, status: "signing-in", detail: "Getting a sign-in code from GitHub. The Copilot panel shows it." };
         return { ...base, status: "signed-out", detail: authError ?? undefined };
     }, [authError, device, plan, relay, session, settings, signInMode, signInStarting, signInWithGitHub, signOut, user, warmUp]);
 

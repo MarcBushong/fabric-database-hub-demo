@@ -50,6 +50,7 @@ import { ChartView } from "@/visuals/ChartView";
 import type { ChatController } from "./chat-types";
 import type { CopilotDockProps } from "./contract";
 import { endedWithoutAnswer, NO_ANSWER, type AssistantTurn, type Part, type UserTurn } from "./conversation";
+import { GITHUB_DEVICE_PAGE, GITHUB_DEVICE_URL } from "./github-session";
 import { Markdown } from "./markdown";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
@@ -254,7 +255,7 @@ function SignIn({ chat }: { chat: ChatController }) {
                         </>
                     ) : (
                         <>
-                            Open <strong>{state.device.verificationUri.replace(/^https:\/\//, "")}</strong> in a new tab{state.device.copied ? " (the code is on your clipboard)" : ""}, enter the code, and authorize{" "}
+                            Open <strong>{GITHUB_DEVICE_PAGE}</strong> in a new tab{state.device.copied ? " (the code is on your clipboard)" : ""}, enter the code, and authorize{" "}
                             <strong>Database Hub Insights Ask</strong>.
                         </>
                     )}{" "}
@@ -270,7 +271,8 @@ function SignIn({ chat }: { chat: ChatController }) {
                         icon={copied ? <Checkmark16Regular /> : <Copy16Regular />}
                         onClick={async () => {
                             setCopied(await copyText(state.device?.userCode ?? ""));
-                            window.open(state.device?.verificationUri ?? "https://github.com/login/device", "_blank", "noopener,noreferrer");
+                            // GitHub's own device page, never one the relay names (github-session.ts, deviceStartOf).
+                            window.open(GITHUB_DEVICE_URL, "_blank", "noopener,noreferrer");
                         }}
                     >
                         Copy the code and open GitHub

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { loadSession, renewSession, saveSession, SESSION_KEY, waitForDeviceToken, type GitHubSession, type LockManagerLike } from "./github-session";
+import { deviceStartOf, loadSession, renewSession, saveSession, SESSION_KEY, waitForDeviceToken, type GitHubSession, type LockManagerLike } from "./github-session";
 import { isTransient, RelayError, type DevicePoll } from "./relay";
 
 // Built at run time so secret scanners never see a token-shaped literal.
@@ -144,5 +144,31 @@ describe("waiting for GitHub's device flow (security review, 2026-11-19)", () =>
         expect(await run([{ status: "denied" }]).outcome).toEqual({ status: "denied" });
         const blips = Array.from({ length: 50 }, () => new RelayError("Bad gateway", 502));
         expect(await run(blips, 60).outcome).toEqual({ status: "expired" });
+    });
+});
+
+describe("a device-flow start from the relay (the review of 1c94891, 2026-11-20)", () => {
+    const start = { deviceCode: "d".repeat(40), userCode: "WDJB-MJHT", expiresIn: 900, interval: 5 };
+
+    it("keeps GitHub's codes and timing, and nothing of the address the relay names", () => {
+        for (const verificationUri of ["https://github.com/login/device", "https://github-login.example/device", "http://github.com/login/device", "https://github.com.evil.example/login/device", "https://user@github.com/login/device", "javascript:alert(1)", undefined, 42]) {
+            expect(deviceStartOf({ ...start, verificationUri })).toEqual({ deviceCode: start.deviceCode, userCode: "WDJB-MJHT", expiresIn: 900, interval: 5 });
+        }
+    });
+
+    it("has no code to show for an answer without GitHub's codes, and takes GitHub's defaults for its timing", () => {
+        const noCode: unknown[] = [
+            null,
+            "WDJB-MJHT",
+            {},
+            { deviceCode: "d" },
+            { userCode: "WDJB-MJHT" },
+            { deviceCode: "d", userCode: "" },
+            { deviceCode: "d", userCode: "Enter your GitHub password at github-login.example" },
+            { deviceCode: "x".repeat(300), userCode: "WDJB-MJHT" },
+        ];
+        for (const answer of noCode) expect(deviceStartOf(answer)).toBeNull();
+        expect(deviceStartOf({ deviceCode: "d", userCode: " WDJB-MJHT ", expiresIn: "soon", interval: -1 })).toEqual({ deviceCode: "d", userCode: "WDJB-MJHT", expiresIn: 900, interval: 5 });
+        expect(deviceStartOf({ deviceCode: "d", userCode: "WDJB-MJHT", expiresIn: 86400, interval: 600 })).toMatchObject({ expiresIn: 1800, interval: 60 });
     });
 });

@@ -56,6 +56,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Fixed
 
 - The Insights app's **Sign in to GitHub** in its header opened an empty page inside Fabric (the owner's report): it now opens the Copilot panel, which gets GitHub's code and shows it with **Copy the code and open GitHub**, opens no tab of its own, and the header shows the sign-in's progress and why one didn't finish.
+- The GitHub sign-in opens only GitHub's own device page, github.com/login/device, whatever page the chat relay's answer names; an answer without a code no longer breaks the app; and selecting the header's chip while a sign-in finishes no longer starts a second one that left it saying "signing in".
 - An update that broke PowerShell Direct into T2's guest ([#65](https://github.com/MarcBushong/fabric-database-hub-demo/issues/65)).
 - A first deployment on a busy Fabric capacity ended **NOT DONE** ([#68](https://github.com/MarcBushong/fabric-database-hub-demo/issues/68)).
 - `destroy.ps1` kept the demo's workspace because of the Insights app's functions item; run it again if an earlier destroy left it.

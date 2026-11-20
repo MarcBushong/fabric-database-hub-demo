@@ -146,6 +146,41 @@ async function renewNow({ storage, current, refresh, now, force = false }: Renew
 
 export type DeviceOutcome = Extract<DevicePoll, { status: "ok" | "denied" | "expired" | "error" }> | { status: "cancelled" };
 
+/** GitHub's device page on github.com: the only page the sign-in sends a viewer to, whatever the relay's answer names. */
+export const GITHUB_DEVICE_URL = "https://github.com/login/device";
+/** The same page as the panel and the header name it. */
+export const GITHUB_DEVICE_PAGE = "github.com/login/device";
+
+/** A device-flow start as the page uses it: GitHub's two codes and its timing, with no address in it. */
+export interface DeviceCode {
+    deviceCode: string;
+    userCode: string;
+    /** Seconds until GitHub's codes expire. */
+    expiresIn: number;
+    /** Seconds between polls, as GitHub asked. */
+    interval: number;
+}
+
+/** A sign-in code as GitHub shows one ("WDJB-MJHT"): letters, digits, and hyphens, never a sentence a viewer could follow. */
+const USER_CODE = /^[A-Za-z0-9-]{4,16}$/;
+const seconds = (value: unknown, fallback: number, max: number) => (typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(value, max) : fallback);
+
+/**
+ * The relay's answer to a device-flow start, checked (the review of 1c94891, 2026-11-20): GitHub's two codes, with GitHub's
+ * defaults for a missing expiry or interval, or null when it has no code to show. Its verification URI is never used: the
+ * relay passes GitHub's on as a string it doesn't check, so a relay that's compromised or misconfigured could name a
+ * lookalike page that asks for a GitHub password. The page sends viewers only to GITHUB_DEVICE_URL, the one address
+ * GitHub's device flow uses for github.com.
+ */
+export function deviceStartOf(raw: unknown): DeviceCode | null {
+    if (!raw || typeof raw !== "object") return null;
+    const answer = raw as Record<string, unknown>;
+    const deviceCode = typeof answer.deviceCode === "string" ? answer.deviceCode : "";
+    const userCode = typeof answer.userCode === "string" ? answer.userCode.trim() : "";
+    if (!deviceCode || deviceCode.length > 256 || !USER_CODE.test(userCode)) return null;
+    return { deviceCode, userCode, expiresIn: seconds(answer.expiresIn, 900, 1800), interval: seconds(answer.interval, 5, 60) };
+}
+
 export interface DeviceWaitOptions {
     poll: () => Promise<DevicePoll>;
     sleep: (ms: number) => Promise<void>;

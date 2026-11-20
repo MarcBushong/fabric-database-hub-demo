@@ -1,4 +1,4 @@
-import { act, configure, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
@@ -787,5 +787,163 @@ describe("the header's GitHub chip", () => {
         fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
         await waitFor(() => expect(document.querySelector(".copilot-dock")).toHaveTextContent(reason));
         expect(await screen.findByRole("button", { name: /Sign in to GitHub\s*Didn't finish/ })).toBeInTheDocument();
+    });
+
+    // The review of 1c94891 (2026-11-20): the chip never starts a second sign-in while one runs.
+    it("starts no second sign-in when the chip is selected while one runs: with the code on its way, and with it shown", async () => {
+        let release: () => void = () => undefined;
+        const codeReady = new Promise<void>((resolve) => (release = resolve));
+        const stub = fetchStub({
+            "/healthz": { ok: true, version: "t", signIn: "device" },
+            "/auth/device": async () => {
+                await codeReady;
+                return json(device);
+            },
+        });
+        vi.stubGlobal("fetch", stub);
+        vi.stubGlobal("open", vi.fn(() => null));
+        const starts = () => stub.mock.calls.filter(([url]) => String(url).endsWith("/auth/device")).length;
+        renderShell();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        // The code is on its way: selecting the chip only brings the panel up.
+        fireEvent.click(await screen.findByRole("button", { name: "GitHub: signing in" }));
+        await act(async () => release());
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        // The code is shown: the same.
+        fireEvent.click(screen.getByRole("button", { name: "GitHub: signing in" }));
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        });
+        expect(starts()).toBe(1);
+        expect(screen.getByText("WDJB-MJHT")).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    // The review of 1c94891: the relay passes GitHub's verification URI on unchecked, so a relay could name a lookalike page.
+    it("sends the viewer only to GitHub's own device page, whatever page the relay's answer names", async () => {
+        vi.stubGlobal("fetch", fetchStub({ "/healthz": { ok: true, version: "t", signIn: "device" }, "/auth/device": { ...device, verificationUri: "https://github-login.example/device" } }));
+        const open = vi.fn(() => null);
+        vi.stubGlobal("open", open);
+        renderShell();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        expect(document.querySelector(".copilot-dock")).toHaveTextContent("Open github.com/login/device in a new tab");
+        expect(document.body.textContent).not.toContain("github-login.example");
+        fireEvent.click(screen.getByRole("button", { name: "Copy the code and open GitHub" }));
+        await waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+        expect(open).toHaveBeenCalledWith("https://github.com/login/device", "_blank", "noopener,noreferrer");
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    it("doesn't break on a relay answer without GitHub's page, and says where it was asked when the answer has no code", async () => {
+        let answer: unknown = { deviceCode: "d", userCode: "WDJB-MJHT", expiresIn: 900, interval: 5 };
+        vi.stubGlobal("fetch", fetchStub({ "/healthz": { ok: true, version: "t", signIn: "device" }, "/auth/device": () => json(answer) }));
+        const open = vi.fn(() => null);
+        vi.stubGlobal("open", open);
+        renderShell();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        // No verificationUri at all: the code shows, with GitHub's own device page, and the header's chip follows it.
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        expect(document.querySelector(".copilot-dock")).toHaveTextContent("Open github.com/login/device in a new tab");
+        expect(screen.getByRole("button", { name: "GitHub: signing in" })).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+        // No code either: the sign-in says it got none, in the panel and on the chip.
+        answer = { verificationUri: "https://github.com/login/device", expiresIn: 900, interval: 5 };
+        fireEvent.click(await screen.findByRole("button", { name: "Sign in to GitHub" }));
+        await waitFor(() => expect(document.querySelector(".copilot-dock")).toHaveTextContent("didn't pass on a sign-in code from GitHub"));
+        expect(await screen.findByRole("button", { name: /Sign in to GitHub\s*Didn't finish/ })).toBeInTheDocument();
+        expect(open).not.toHaveBeenCalled();
+    });
+
+    describe("while the relay says whose token GitHub gave (the review of 1c94891)", () => {
+        function slowIdentity(token: string) {
+            let release: () => void = () => undefined;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const stub = fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/device": device,
+                "/auth/token": { status: "ok", accessToken: token, expiresIn: null, refreshToken: null, refreshTokenExpiresIn: null },
+                "/auth/user": async () => {
+                    await gate;
+                    return json({ login: "octo", name: null, avatarUrl: null });
+                },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            });
+            vi.stubGlobal("fetch", stub);
+            vi.stubGlobal("open", vi.fn(() => null));
+            return { release: () => release(), calls: (path: string) => stub.mock.calls.filter(([url]) => String(url).endsWith(path)).length };
+        }
+
+        async function untilTheTokenArrives(calls: (path: string) => number) {
+            fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+            expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+            // GitHub's interval passes: the poll brings the token, and the relay is slow to say whose it is.
+            await act(async () => {
+                await vi.advanceTimersByTimeAsync(5_100);
+            });
+            await waitFor(() => expect(calls("/auth/user")).toBe(1));
+        }
+
+        it("keeps the sign-in until it's saved: selecting the chip meanwhile starts no second one", async () => {
+            vi.useFakeTimers({ shouldAdvanceTime: true });
+            try {
+                const token = fakeToken();
+                const relay = slowIdentity(token);
+                renderShell();
+                await untilTheTokenArrives(relay.calls);
+                // The sign-in is still this tab's: the chip and the panel say so, and the chip only brings the panel up.
+                fireEvent.click(screen.getByRole("button", { name: "GitHub: signing in" }));
+                expect(screen.getByText("WDJB-MJHT")).toBeInTheDocument();
+                await act(async () => relay.release());
+                expect(await within(screen.getByRole("group", { name: "Accounts" })).findByRole("button", { name: /^GitHub: octo/ })).toBeInTheDocument();
+                expect(relay.calls("/auth/device")).toBe(1);
+                expect(JSON.parse(window.localStorage.getItem(SESSION) ?? "{}")).toMatchObject({ accessToken: token, login: "octo" });
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("lets Cancel win meanwhile: nothing is saved, and the chip offers a new sign-in", async () => {
+            vi.useFakeTimers({ shouldAdvanceTime: true });
+            try {
+                const relay = slowIdentity(fakeToken());
+                renderShell();
+                await untilTheTokenArrives(relay.calls);
+                fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+                await act(async () => {
+                    relay.release();
+                    await vi.advanceTimersByTimeAsync(200);
+                });
+                expect(window.localStorage.getItem(SESSION)).toBeNull();
+                const header = within(screen.getByRole("group", { name: "Accounts" }));
+                expect(header.getByRole("button", { name: "Sign in to GitHub" })).toBeInTheDocument();
+                expect(header.queryByRole("button", { name: /^GitHub: octo/ })).not.toBeInTheDocument();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    // The review of 1c94891: AuthGate unmounts the provider when the viewer signs out of Fabric.
+    it("stops waiting for GitHub when the app's chat goes away, as when the viewer signs out of Fabric", async () => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        try {
+            const stub = fetchStub({ "/healthz": { ok: true, version: "t", signIn: "device" }, "/auth/device": device, "/auth/token": { status: "pending", interval: 5 } });
+            vi.stubGlobal("fetch", stub);
+            vi.stubGlobal("open", vi.fn(() => null));
+            const polls = () => stub.mock.calls.filter(([url]) => String(url).endsWith("/auth/token")).length;
+            const view = renderShell();
+            fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+            expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+            await act(async () => {
+                await vi.advanceTimersByTimeAsync(5_100);
+            });
+            await waitFor(() => expect(polls()).toBe(1));
+            view.unmount();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(polls()).toBe(1);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
