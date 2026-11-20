@@ -111,6 +111,11 @@ describe("Mission Control", () => {
             expect(notice.textContent).toContain("Signals per bin and target (The query returned more rows than the app allows: pick a shorter period)");
             expect(notice.textContent).toContain("Waits before and during: T1 (The model didn't answer)");
             expect(notice.textContent).toContain("Database Agent loop on T3 (The model didn't answer)");
+            // The postmortem waits for the telemetry: written now, it would have no measured fault.
+            const write = screen.getByRole("button", { name: "Write the postmortem" });
+            await waitFor(() => expect(write).toHaveAttribute("aria-disabled", "true"));
+            fireEvent.click(write);
+            expect(screen.queryByRole("dialog", { hidden: true })).toBeNull();
             const runs = vi.mocked(client.run).mock.calls.length;
             fireEvent.click(screen.getByRole("button", { name: "Retry" }));
             await waitFor(() => expect(vi.mocked(client.run).mock.calls.length).toBeGreaterThanOrEqual(runs + 3));
@@ -128,6 +133,24 @@ describe("Mission Control", () => {
             expect(setView).toHaveBeenCalledWith({ session: null, replay: null });
             fireEvent.click(screen.getByRole("button", { name: "Show all history" }));
             expect(setView).toHaveBeenCalledWith({ window: "all" });
+        },
+        SLOW,
+    );
+
+    it(
+        "takes only a session the viewer picked to the other pages: without one, they follow the latest, so no later visit opens on a session nobody chose",
+        async () => {
+            const latest = renderWithApp(<MissionControlPage />, { client: sampleClient() });
+            await screen.findByRole("heading", { level: 1, name: /^Session 7f3a9c21/ });
+            fireEvent.click(screen.getByRole("button", { name: "Scoreboard" }));
+            expect(latest.navigate).toHaveBeenLastCalledWith("scoreboard", { session: null });
+            fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+            expect(latest.navigate).toHaveBeenLastCalledWith("replay", { session: null });
+            latest.unmount();
+            const picked = renderWithApp(<MissionControlPage />, { client: sampleClient(), view: { session: SESSION_KEY } });
+            await screen.findByRole("heading", { level: 1, name: /^Session 7f3a9c21/ });
+            fireEvent.click(screen.getByRole("button", { name: "Scoreboard" }));
+            expect(picked.navigate).toHaveBeenLastCalledWith("scoreboard", { session: SESSION_KEY });
         },
         SLOW,
     );
@@ -153,7 +176,7 @@ describe("Scoreboard", () => {
     it(
         "lists every injected fault with when its signal showed, the response, and the recovery, and the one it didn't catch",
         async () => {
-            renderWithApp(<ScoreboardPage />, { client: sampleClient() });
+            const { navigate } = renderWithApp(<ScoreboardPage />, { client: sampleClient() });
             expect(await screen.findByRole("heading", { level: 1, name: "Did we catch it? 34 of 35" }, { timeout: 15000 })).toBeInTheDocument();
             const table = screen.getByRole("table", { name: "Every injected fault" });
             const rows = within(table).getAllByRole("row").slice(1);
@@ -168,6 +191,9 @@ describe("Scoreboard", () => {
             expect(screen.getByRole("heading", { name: "T4 and T5: what their metrics show" })).toBeInTheDocument();
             fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
             expect(within(screen.getByRole("table", { name: "Every injected fault" })).getByRole("columnheader", { name: /Business impact \(measured\)/ })).toBeInTheDocument();
+            // No session was picked, so Mission Control keeps following the latest.
+            fireEvent.click(screen.getByRole("button", { name: "Mission Control" }));
+            expect(navigate).toHaveBeenLastCalledWith("mission", { session: null });
         },
         SLOW,
     );
@@ -180,6 +206,7 @@ describe("Scoreboard", () => {
             const alert = await screen.findByText("The query returned more rows than the app allows: pick a shorter period.", { selector: ".vcard-error span" });
             expect(alert.closest('[role="alert"]')).not.toBeNull();
             expect(screen.queryByRole("table", { name: "Every injected fault" })).toBeNull();
+            await waitFor(() => expect(screen.getByRole("button", { name: "Write the postmortem" })).toHaveAttribute("aria-disabled", "true"));
         },
         SLOW,
     );
@@ -189,7 +216,7 @@ describe("Session replay", () => {
     it(
         "drives the map and the ribbon from one scrubber, counts down to the next injection, and keeps the moment in the address",
         async () => {
-            const { setView } = renderWithApp(<ReplayPage />, { client: sampleClient(), view: { page: "replay", replay: 28 } });
+            const { setView, navigate } = renderWithApp(<ReplayPage />, { client: sampleClient(), view: { page: "replay", replay: 28 } });
             // The replay starts 3 minutes before the session's first fault (13:30): minute 28 is 13:55.
             expect(await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 })).toBeInTheDocument();
             await waitFor(() => expect(screen.getByText("T1 Deep blocking chain and lock escalation", { selector: "strong" }).parentElement?.textContent).toBe("Next: T1 Deep blocking chain and lock escalation in 5 min"));
@@ -197,8 +224,25 @@ describe("Session replay", () => {
             // The countdown changes with every step of the playback, so it isn't a live region.
             expect(screen.getByText("T1 Deep blocking chain and lock escalation", { selector: "strong" }).closest("[aria-live]")).toBeNull();
             fireEvent.change(screen.getByRole("slider", { name: "Replay position" }), { target: { value: "36" } });
-            // The address takes the moment once it holds still, not at every step of a drag.
-            await waitFor(() => expect(setView).toHaveBeenCalledWith({ replay: 36, session: SESSION_KEY }), { timeout: 3000 });
+            // The address takes the moment once it holds still, not at every step of a drag, and not the session nobody picked.
+            await waitFor(() => expect(setView).toHaveBeenCalledWith({ replay: 36 }), { timeout: 3000 });
+            expect(setView.mock.calls.some(([patch]) => "session" in patch)).toBe(false);
+            fireEvent.click(screen.getByRole("button", { name: "Scoreboard" }));
+            expect(navigate).toHaveBeenLastCalledWith("scoreboard", { session: null });
+            // Copying the link to the moment is a pick: the link, and this browser, keep its session.
+            fireEvent.click(screen.getByRole("button", { name: "Link to this moment" }));
+            expect(setView).toHaveBeenLastCalledWith({ replay: 36, session: SESSION_KEY });
+        },
+        SLOW,
+    );
+
+    it(
+        "waits to write the postmortem while the telemetry it's scored from hasn't loaded",
+        async () => {
+            renderWithApp(<ReplayPage />, { client: sampleClient({ "signals-per-bin": "The model didn't answer." }), view: { page: "replay" } });
+            expect(await screen.findByRole("heading", { level: 1, name: "Session 7f3a9c21, beat by beat" }, { timeout: 15000 })).toBeInTheDocument();
+            expect(await screen.findByText(/^Some of the history didn't load, so this view may be incomplete: Signals per bin and target/)).toBeInTheDocument();
+            await waitFor(() => expect(screen.getByRole("button", { name: "Write the postmortem" })).toHaveAttribute("aria-disabled", "true"));
         },
         SLOW,
     );
@@ -269,7 +313,22 @@ describe("Kiosk", () => {
     );
 
     it(
-        "keeps its session on screen when its history expires and a refresh fails, and asks again on its own",
+        "counts the plan's faults when the telemetry didn't load, and says nothing is measured rather than 0 of 0",
+        async () => {
+            renderWithApp(<KioskPage />, { client: sampleClient({ "signals-per-bin": "The query returned more rows than the app allows: pick a shorter period." }), view: { page: "kiosk" } });
+            const seen = await screen.findByText("The telemetry didn't load, so nothing is measured", {}, { timeout: 15000 });
+            expect(seen.parentElement?.textContent).toBe("Seen in telemetry–The telemetry didn't load, so nothing is measured");
+            expect(within(screen.getByText("Faults injected").parentElement as HTMLElement).getByText("35")).toBeInTheDocument();
+            fireEvent.keyDown(window, { key: "ArrowRight" });
+            expect(screen.getByRole("heading", { level: 2, name: "Did we catch it?" })).toBeInTheDocument();
+            expect(screen.getByText(`The telemetry didn't load, so none of the 35 faults is measured yet: the kiosk tries again every ${RETRY_SECONDS} s.`)).toBeInTheDocument();
+            expect(screen.queryByText(/\b0 of 0\b/)).toBeNull();
+        },
+        SLOW,
+    );
+
+    it(
+        "keeps its session on screen when its history expires and a refresh fails, asks again on its own, then keeps refreshing",
         async () => {
             vi.useFakeTimers({ shouldAdvanceTime: true });
             try {
@@ -311,6 +370,15 @@ describe("Kiosk", () => {
                 await vi.advanceTimersByTimeAsync(RETRY_SECONDS * 1000);
                 await waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThan(failed));
                 await waitFor(() => expect(screen.queryByText(/trying again every/)).toBeNull());
+                // And the queries the retry ran keep refreshing each time their five minutes pass, so a later session shows.
+                const ranOf = (id: string) => fetch.mock.calls.filter(([spec]) => spec.id === id).length;
+                const sessionsRan = ranOf("scenario-runs");
+                const seriesRan = ranOf("signals-per-bin");
+                now += 6 * 60000;
+                await vi.advanceTimersByTimeAsync(1000);
+                await waitFor(() => expect(ranOf("scenario-runs")).toBeGreaterThan(sessionsRan));
+                await waitFor(() => expect(ranOf("signals-per-bin")).toBeGreaterThan(seriesRan));
+                expect(screen.getByText(/34 of 35$/)).toBeInTheDocument();
             } finally {
                 vi.useRealTimers();
             }
