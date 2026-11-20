@@ -2,15 +2,15 @@
 // time on the viewer's own GitHub Copilot, the page tools that answer Copilot's tool calls, and the transcript,
 // kept for the browser session. It implements the contract (contract.ts) through use-copilot.ts's context.
 
-import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
+import { useLiveOff } from "@/data/live-estate";
 import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
 import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings, type ConversationAction } from "./conversation";
 import type { EstateView } from "./estate";
 import { clearSession, fromPoll, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type GitHubSession } from "./github-session";
-import { liveRefusedAsAWhole, onLiveRefusal } from "./live-refusal";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -132,8 +132,16 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     // Whether the history holds T5's (Azure Cosmos DB) metrics, asked once when the dock first opens, so T5's starter
     // shows only when it has an answer. A failure (the local preview's sample, a model without T5's measures) leaves it out.
     const [cosmosHistory, setCosmosHistory] = useState(false);
-    /** Database Hub refuses the app as a whole (every live view unavailable, as the pages read it): the live starters hide. */
-    const liveRefused = useSyncExternalStore(onLiveRefusal, liveRefusedAsAWhole);
+    // Whether Database Hub refuses the app as a whole, as the pages read it (useLiveOff, R924): while it does, a new
+    // conversation starts without the live view, and the live starters hide. LiveOffWatch reads it while the dock is open,
+    // and again for each new conversation.
+    const [liveOff, setLiveOff] = useState<string | null>(null);
+    const liveOffRef = useRef<string | null>(null);
+    const reportLiveOff = useCallback((off: string | null) => {
+        liveOffRef.current = off;
+        setLiveOff(off);
+    }, []);
+    const [liveWatch, setLiveWatch] = useState(0);
     const cosmosProbed = useRef(false);
     useEffect(() => {
         if (!isOpen || !relay || !queryClient || cosmosProbed.current) return;
@@ -309,8 +317,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
                 // A conversation that learned the live view isn't available doesn't offer it again, even on a new session;
-                // nor does one that starts while Database Hub refuses the app as a whole (live-refusal.ts).
-                const live = liveUnavailable.current ?? liveRefusedAsAWhole();
+                // nor does one that starts while Database Hub refuses the app as a whole (useLiveOff).
+                const live = liveUnavailable.current ?? liveOffRef.current;
                 // The conversation this runner serves: once New chat starts another, what its calls return is dropped.
                 const servedNo = conversationNo.current;
                 const dispatchHere = (action: ConversationAction) => {
@@ -429,8 +437,9 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         dispatch({ type: "reset" });
         clearConversation(perTab());
         setAttached(null);
-        // A new conversation tries the live view again.
+        // A new conversation tries the live view again, unless the app is refused as a whole: that's read again too.
         liveUnavailable.current = null;
+        setLiveWatch((n) => n + 1);
     }, [disconnect]);
 
     const cancelSignIn = useCallback(() => {
@@ -585,7 +594,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         connecting,
         pending: attached?.ctx ?? null,
         cosmosHistory,
-        liveRefused,
+        liveOff,
     };
     const chat: ChatController = {
         state: chatState,
@@ -602,5 +611,19 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     };
 
     const value: CopilotContextValue = { api, dock, account, attached, chat };
-    return <CopilotContext.Provider value={value}>{children}</CopilotContext.Provider>;
+    return (
+        <CopilotContext.Provider value={value}>
+            {children}
+            {isOpen && settings?.estate ? <LiveOffWatch key={liveWatch} onChange={reportLiveOff} /> : null}
+        </CopilotContext.Provider>
+    );
+}
+
+/** The pages' own answer to whether Database Hub refuses the app as a whole (useLiveOff), so the dock and the pages agree. */
+function LiveOffWatch({ onChange }: { onChange: (off: string | null) => void }) {
+    const off = useLiveOff();
+    useEffect(() => {
+        onChange(off);
+    }, [off, onChange]);
+    return null;
 }

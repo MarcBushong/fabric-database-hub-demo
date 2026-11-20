@@ -5,7 +5,6 @@
 
 import { getRayfinClient } from "@/lib/rayfin-client";
 import type { EstateAnswer, EstateView } from "../../rayfin/functions/src/estate-core";
-import { noteLiveAnswer } from "./live-refusal";
 
 // The answer's shapes, one per view, for pages: inventory (resources by engine and their findings), health (SQL and
 // PostgreSQL high-usage counts and named databases, Cosmos DB availability and normalized RU, last 24 hours), and
@@ -51,8 +50,6 @@ export function readEstate<V extends EstateView>(view: V, options: { force?: boo
     const value = invoke({ view }, { timeoutMs: 120_000 }).then((raw) => {
         const answer = (typeof raw === "string" ? JSON.parse(raw) : raw) as EstateAnswer<V>;
         if (!answer || typeof answer !== "object" || !Array.isArray(answer.source)) throw new Error("The estate function returned an unexpected answer.");
-        // Whether Database Hub refuses the app as a whole, for the dock's next conversation (live-refusal.ts).
-        noteLiveAnswer(view, answer);
         return answer;
     });
     cache.set(view, { at: Date.now(), value });
