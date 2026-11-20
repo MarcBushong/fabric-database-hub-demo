@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentBeat, Bin, CosmosCapture, PostgresCapture, SessionRun } from "@/data/model";
 import type { Row } from "@/data/query-client";
-import { sessionsQuery } from "@/data/queries";
+import { seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
 import { postgresHealth } from "@/lib/health";
 import { buildPostmortem, postmortemAsk, postmortemFileName } from "@/lib/postmortem";
@@ -386,19 +386,24 @@ describe("the postmortem", () => {
         expect(markdown).toContain("| 13:30 | T1 | Injected | Deep blocking chain and lock escalation on T1 (not measured) |");
         expect(markdown).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
         expect(markdown).toContain("- **The telemetry didn't load, so its 4 faults aren't measured:** select Retry on the page, then write the postmortem again.");
-        // Copilot gets the same faults, each marked not measured, rather than no rows at all.
+        // Copilot's draft is blind (ADR 0031): the window and what was measured, never the plan's faults.
         const ctx = postmortemAsk(unscored);
-        expect(ctx.totalRows).toBe(4);
-        expect(ctx.rows?.[0]).toMatchObject({ target: "T1", fault: "Deep blocking chain and lock escalation", visible: null, evidence: "Not measured: the telemetry didn't load." });
+        expect(ctx.totalRows).toBe(0);
+        expect(JSON.stringify(ctx)).not.toMatch(/inject|Deep blocking chain|Scenario Runs/i);
     });
 
-    it("hands Copilot the template, the measured rows, and the queries through the ask contract", () => {
-        const ctx = postmortemAsk(input);
-        expect(ctx).toMatchObject({ title: "Postmortem: ContosoCare session 7f3a9c21", page: "scoreboard", visualId: "postmortem.plan", source: "history", totalRows: 4 });
-        expect(ctx.prompt).toMatch(/^Write the postmortem of ContosoCare session 7f3a9c21 .+ with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups\./);
+    it("hands Copilot a blind draft: the window, the measured episodes, and the measured queries, never what was injected (ADR 0031)", () => {
+        const cpu = [20, 85, 90, 88, 20].map((value, i) => ({ at: at(i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value }));
+        const pg: PostgresCapture = { capturedAt: null, windowStart: at(0), windowEnd: at(30), intervalMinutes: 5, servers: {}, points: cpu };
+        const episodes = postgresEpisodes(pg);
+        const ctx = postmortemAsk({ ...input, episodes, askSpecs: [seriesQuery({ targets: ["T1", "T2", "T3"], window: null })] });
+        expect(ctx).toMatchObject({ page: "scoreboard", visualId: "postmortem.plan", source: "history", totalRows: episodes.length });
+        expect(ctx.title).toMatch(/^Postmortem draft: ContosoCare from .+ 13:30 to .+ UTC$/);
+        expect(ctx.prompt).toMatch(/^Write the postmortem of what ContosoCare's databases went through from .+ UTC, in Markdown, with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Follow-ups\./);
         expect(ctx.prompt).toMatch(/never that Database Hub detected something/);
-        expect(ctx.rows?.[2]).toMatchObject({ target: "T3", service: "Scheduling", injected: "2026-11-17T14:03:00.000Z", ttdMin: 1, ttrMin: 24, status: "Pass" });
-        expect(ctx.dax).toMatch(/^\/\/ Sessions and activity requests\nEVALUATE/);
+        expect(ctx.rows?.[0]).toMatchObject({ target: "T4", service: "Reporting", signal: "CPU" });
+        expect(ctx.dax).toMatch(/^\/\/ .+\nEVALUATE/);
+        expect(JSON.stringify(ctx)).not.toMatch(/inject|Scenario Runs|Incident Windows|Analysis Findings|blocking chain/i);
     });
 
     it("tells a fault's injection before its signal, though the signal's bin starts before the injection (F17)", () => {

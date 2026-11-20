@@ -26,12 +26,12 @@ export function Insights({ insights, label, page }: { insights: Insight[]; label
                             <p className="insight-detail">{insight.detail}</p>
                         </div>
                         <div className="insight-actions">
-                            {insight.status === "Warning" || insight.status === "Fail" ? (
+                            {(insight.status === "Warning" || insight.status === "Fail") && !insight.fromAnswerKey ? (
                                 <AskWhy
                                     prompt={`${insight.title} ${insight.detail} Why did this happen, and what should I check first?`}
                                     title={insight.title}
                                     visualId={`${page}.insight.${insight.id}`}
-                                    anomaly={{ metric: insight.metric, ...(insight.incident ? { incidentKey: insight.incident } : {}), ...(insight.target ? { target: insight.target } : {}) }}
+                                    anomaly={{ metric: insight.metric, ...(insight.target ? { target: insight.target } : {}) }}
                                 />
                             ) : null}
                             {insight.page ? (

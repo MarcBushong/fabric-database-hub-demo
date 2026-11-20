@@ -147,7 +147,7 @@ export default function ScoreboardPage() {
                         <PostmortemButton
                             ready={Boolean(plan) && !data.loading}
                             scoreError={data.scoreError}
-                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, generatedAt: new Date() })}
+                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, generatedAt: new Date() })}
                         />
                         <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: view.session })}>
                             Mission Control
@@ -201,6 +201,8 @@ export default function ScoreboardPage() {
                     table={{ columns: POSTMORTEM_COLUMNS, rows: csvRows, caption: "Every injected fault" }}
                     summary={`${summary.visible} of ${summary.faults} faults had their signal visible in the telemetry.`}
                     askPrompt="Did we catch every fault in this session? Which ones were slowest to detect or recover, and why?"
+                    // The scoreboard grades the session against its answer key: shown here, labeled, and never handed to the chat (ADR 0031).
+                    ask={false}
                 >
                     <DataGrid columns={columns(lens)} rows={rows} caption="Every injected fault" exportName="scoreboard" onRowClick={(r) => setSelected(r.key)} rowLabel={(r) => `Select ${r.target} ${r.fault}`} />
                 </VisualCard>
@@ -218,6 +220,7 @@ export default function ScoreboardPage() {
                         table={{ columns: AGG_COLUMNS, rows: engines.map((a) => ({ ...a })), caption: "Times to detect and recover per engine" }}
                         summary={engines.map((a) => `${a.label}: detect ${minutesText(a.ttdMedian)}, recover ${minutesText(a.ttrMedian)}`).join("; ")}
                         askPrompt="Which engine was slowest to show and to recover from the injected faults, and what would make it faster?"
+                        ask={false}
                     >
                         <ChartView hideHeader height={220} spec={aggChart(engines, "Times per engine")} colors={{ "Time to detect": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
                     </VisualCard>
@@ -231,6 +234,7 @@ export default function ScoreboardPage() {
                         table={{ columns: AGG_COLUMNS, rows: types.map((a) => ({ ...a })), caption: "Times to detect and recover per fault type" }}
                         summary={types.map((a) => `${a.label}: detect ${minutesText(a.ttdMedian)}, recover ${minutesText(a.ttrMedian)}`).join("; ")}
                         askPrompt="Which kinds of fault take longest to detect and to recover from?"
+                        ask={false}
                     >
                         <ChartView hideHeader height={220} spec={aggChart(types, "Times per fault type")} colors={{ "Time to detect": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
                     </VisualCard>
@@ -248,6 +252,8 @@ export default function ScoreboardPage() {
                     table={null}
                     summary={episodes.map((e) => e.impact.sentence).join(". ")}
                     askPrompt="What did T4's and T5's metrics show in this session, and did they recover?"
+                    // Their episodes are found in their own metrics, so the measured queries stay (ADR 0031).
+                    ask={{ specs: data.askSpecs }}
                 >
                     <ul className="sb-episodes">
                         {episodes.map((e) => (

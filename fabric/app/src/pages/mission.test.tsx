@@ -87,7 +87,9 @@ describe("Mission Control", () => {
             expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Downloaded contosocare-postmortem-7f3a9c21-\d{8}T\d{4}Z\.md$/), "success");
             fireEvent.click(within(dialog).getByRole("button", { name: "Draft with Copilot", hidden: true }));
             expect(copilot.ask).toHaveBeenCalledWith(expect.objectContaining({ page: "scoreboard", visualId: "postmortem.plan", totalRows: expect.any(Number) }));
-            expect(vi.mocked(copilot.ask).mock.calls[0][0].prompt).toMatch(/with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups\./);
+            // The draft is blind (ADR 0031): the window and what was measured, never what was injected.
+            expect(vi.mocked(copilot.ask).mock.calls[0][0].prompt).toMatch(/with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Follow-ups\./);
+            expect(JSON.stringify(vi.mocked(copilot.ask).mock.calls[0][0])).not.toMatch(/inject|Scenario Runs/i);
         },
         SLOW,
     );

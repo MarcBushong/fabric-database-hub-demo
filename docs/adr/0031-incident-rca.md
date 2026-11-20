@@ -161,7 +161,7 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 - **Tools, not raw DAX:** six deterministic tools in Phase 1, beside the dock's four (`run_dax`, `show_chart`, `suggest_followups`, `estate_overview`), within the relay's 16: `triage_window`, `find_incidents`, `explain_incident` (by a blind episode's key), `explain_locking`, `explain_errors`, and `explain_replica_lag`. Phase 2 adds `explain_waits`. Like `run_dax`, they run in the app with the viewer's own Fabric token, with at most one DAX query per RCA table, bounded results, and every query under "Show the sources"; the relay still runs nothing ([ADR 0028](0028-ask-copilot-in-the-insights-app.md#tools-that-run-in-the-page-as-the-viewer)).
 - **The playbook,** in the system message: scope the time window, triage, explain the top hypotheses with the tools, then answer with the root cause and its evidence and times, the recommendations with their Learn links and who approves each, the next steps, and what wasn't captured.
 - **The grounding rules:** every claim cites captured rows and their times; it says "not captured" rather than guess; it never names a scenario or says what was injected, which it can't know.
-- **The dock is blind too:** `run_dax` refuses DAX that names an answer-key table or a measure that reads one, directly or through another measure, since DAX names a measure without its table; the model guide leaves them all out, with the grading analyses' rows and any description clause that names a scenario. A page's Ask context never carries answer-key rows, so the scoreboard's three Ask entries that hand over its grading go ([open item 7](#decisions-and-open-items)).
+- **The dock is blind too:** `run_dax` refuses DAX that names an answer-key table or a measure that reads one, directly or through another measure, since DAX names a measure without its table; the model guide leaves them all out, with the grading analyses' rows and any description clause that names a scenario. Every page's Ask hands the chat measured data only, and the entries that had nothing else to hand over are gone ([decision 7](#decisions-and-open-items)).
 - **Sample questions,** with the owner's live session of 2026-11-20 (ET):
   - "Why was ContosoCare slow at 11:56?" T3's CPU at 100 % from 11:56 to 12:17, and T5 at 100 % normalized RU with about 1,300 to 2,100 429s a minute. In Phase 2 also the cause: Query Store's regressed plan, `FORCE_LAST_GOOD_PLAN` off from 11:52, and the last good plan forced at 12:18:00, after which CPU averaged 42.5 % at 12:18 and 7 % at 12:19 to 12:20.
   - "Who blocked whom at 12:05, and what should we do?" The chain, head blocker first, with its procedure, program, login, idle time, open transaction, and lock; its depth and width; the escalation; the recommendations.
@@ -172,7 +172,7 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 
 ### 9. The postmortem's Cause
 
-Today the Cause section lists what was injected ([`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163). In Phase 1 it comes from the blind RCA: for each episode, `explain_incident`'s root cause, confidence, and cited rows, or "not captured" and why (RCA Coverage). The injected list moves to a section of its own, "What the demo injected (answer key)", with the scoreboard's measurements. The Copilot draft writes only the blind sections, and the app appends that one itself.
+Today the Cause section lists what was injected ([`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163). In Phase 1 it comes from the blind RCA: for each episode, `explain_incident`'s root cause, confidence, and cited rows, or "not captured" and why (RCA Coverage). The injected list moves to a section of its own, "What the demo injected (answer key)", with the scoreboard's measurements, which the app writes itself. The Copilot draft is blind already ([decision 7](#decisions-and-open-items)): it gets the window, T4's and T5's measured episodes, and the measured queries, and investigates the rest with the tools.
 
 ### 10. Permissions, cost, and volume
 
@@ -207,10 +207,16 @@ Today the Cause section lists what was injected ([`lib/postmortem.ts`](../../fab
 
 Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answer key in exactly two places (the coordinator, 2026-11-20, settled by the owner's question about grading).
 
+**7. Every Ask that hands the chat the answer key, reworked:** the coordinator's call on 2026-11-20, following the owner's rule that the chat is blind, which the owner can change. Each Ask passes measured data only, or goes where nothing measured is left to ask about. The visuals stay as they are, and a page may show the answer key, labeled, as the scoreboard does.
+
+- **Gone, with nothing measured to hand over:** the scoreboard's three grading entries (every injected fault, times per engine, times per fault type); Replay's "Every moment of the session"; the Incidents page's timeline and list; Overview's incidents, its newest incident's Ask why, and its recent sessions; Manage's "What the control ran"; a SQL target's incidents on the Estate page; and Ask why on the insights computed from incident windows.
+- **The measured part only:** Overview's own question and its findings; the Estate inventory, T4's and T5's charts and findings, and a target's findings; Trends' CPU, CPU peaks, waits, and week over week; Performance's charts; the Incidents page's selected incident, its replay, and its waits, each as measured bins under a neutral title, with no window key, label, source, or scenario; Mission Control's services, each with its key number and the telemetry behind it; the scoreboard's T4 and T5 metrics; and the postmortem's Copilot draft ([§9](#9-the-postmortems-cause)).
+- **The measured queries:** variants of the page queries that pick their run from Telemetry Snapshots rather than Analysis Findings and leave out the incident and findings measures. Findings go without DAX, and without the grading analyses' rows. An anomaly never carries an incident window's key.
+- **The test:** `fabric/app/src/copilot/ask-blind.test.tsx` renders every page in 15 cases, the postmortem's draft included, clicks every Ask, and fails when a context names an answer-key table, one of the 50 measures that read one, a scenario, or what was injected. A second test fails when a new place hands Copilot a context without a case. Since no remaining Ask names the key, none ends in `run_dax`'s refusal.
+
 **Open for the owner, numbered after the decisions:**
 
 - **6. Names** ([§2](#2-names)): **recommended,** (a′) and (c) as a Wave 2 follow-up; Phase 1 does (b).
-- **7. The scoreboard's Ask entries** that hand its grading to Copilot (`ScoreboardPage.tsx`, lines 203, 220, and 233): **recommended,** remove them in Phase 1, so the chat never sees the answer key, and keep the one about T4's and T5's metrics (line 250), which reads metrics only. The alternative keeps them, each in a conversation of its own labeled "Answer key", without the investigation tools.
 - **8. The release's wording** that reads as blind detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)): one-line fixes, for the release's owner. Wave 2's detector then makes "caught" true as written.
 
 ## Where the data lives, how long it's kept, and who keeps it
@@ -309,7 +315,7 @@ No release may break an existing deployment or add a bug for a new or an existin
 | A session saved before the feature | The new app | Its windows say "no RCA capture recorded", and the chat answers from the telemetry; nothing else changes | The view's and the tools' Not captured | None: it's history |
 | T2's kept `PaygWizard` guest | The new runner | T2 isn't captured: the runner's login there isn't sysadmin | `RCA.CAPTURE.T2` **Warning** | `./scripts/deploy.ps1` rebuilds T2 from the image |
 
-**One deliberate change everywhere, with or without the RCA tables:** the dock is blind, as the owner decided. `run_dax` refuses the answer key's tables and the measures that read them, the model guide leaves them out, and the starter that asked about the latest incident window now finds it from the telemetry.
+**One deliberate change everywhere, with or without the RCA tables:** the dock is blind, as the owner decided. `run_dax` refuses the answer key's tables and the measures that read them, the model guide leaves them out, the starter that asked about the latest incident window now finds it from the telemetry, and every page's Ask hands the chat measured data only ([decision 7](#decisions-and-open-items)).
 
 ## Risks
 
@@ -332,6 +338,7 @@ No release may break an existing deployment or add a bug for a new or an existin
 
 - **The spike (2026-11-20):** every T4 capture query ran on a local PostgreSQL 18.6 primary and hot standby while the repository's own runner ran its locking, idle-in-transaction, and replica-lag scenarios; all 24 T-SQL blocks parse with the SQL Server 2022 grammar (`TSql160Parser`, as `SqlScriptTests`), and their column references are on their objects' Learn pages; 101 Vitest tests in the app's harness checked the rules, the tools, and the evaluation set.
 - **The contract:** after the blind changes, all 24 T-SQL blocks parse again and all 12 PostgreSQL blocks run again on the local primary and standby. `tests/unit/Rca.Contract.Tests.ps1` (29 tests) checks the schemas against the tables' spec, the fixtures against the schemas, their parts' decoding and SHA-256, the transport's sizes, the blind-detection lists, and the capture catalog; a probe file that named a scenario in `fabric/app/src/rca/` made it fail.
+- **The app's blind Ask (decision 7):** the app's 388 Vitest tests pass, with `ask-blind.test.tsx`'s 16; an answer-key table put in Overview's question, or "injected" in the postmortem's draft, made it fail.
 - **What needs a live target:** the SQL Server and Azure SQL Database blocks (T3's `sys.dm_exec_requests` scope and its XACT resources, the event sessions), Azure PostgreSQL's `pg_read_all_stats`, and the chat's prose with the real model. Step 1.8 checks the first three; Phase 3 the last.
 
 ## Sources

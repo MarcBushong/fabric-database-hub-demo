@@ -42,6 +42,7 @@ import { cosmosFindingsQuery, cosmosSeriesQuery, estateQuery, findingsQuery, inc
 import type { Row } from "@/data/query-client";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf, libraryPrompts, type AgentSurface } from "@/lib/agent-prompts";
+import { measuredFindings, withoutColumns } from "@/lib/ask";
 import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
 import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
@@ -107,6 +108,10 @@ function useEstateData() {
     const cosmosFindingsSpec = useMemo(() => (view.targets.includes("T5") ? cosmosFindingsQuery() : null), [view.targets]);
     const cosmosSeriesState = useQuery(cosmosSeriesSpec);
     const cosmosFindingsState = useQuery(cosmosFindingsSpec);
+    // What Ask Copilot hands the chat instead (ADR 0031): the same measurements, with no answer-key table or measure in the DAX.
+    const estateAskSpec = useMemo(() => (filters.targets.length ? estateQuery(filters, { measured: true }) : null), [filters]);
+    const pgSeriesAskSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null), [view.targets]);
+    const cosmosSeriesAskSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null), [view.targets]);
     const targets = useMemo(() => toTargets(estate.data?.rows ?? []), [estate.data]);
     const bins = useMemo(() => toBins(series.data?.rows ?? []), [series.data]);
     const findings = useMemo(() => toFindings(findingsState.data?.rows ?? []), [findingsState.data]);
@@ -123,6 +128,9 @@ function useEstateData() {
         pgFindingsSpec,
         cosmosSeriesSpec,
         cosmosFindingsSpec,
+        estateAskSpec,
+        pgSeriesAskSpec,
+        cosmosSeriesAskSpec,
         estate,
         series,
         findingsState,
@@ -238,6 +246,12 @@ function Inventory() {
                 table={{ columns: INVENTORY_COLUMNS.map((c) => ({ key: c.key, label: c.label, kind: c.kind ?? "text" })) as ColumnSpec[], rows: rows as unknown as Row[], caption: "Estate inventory" }}
                 summary={`${rows.length} targets.`}
                 askPrompt="Summarize the estate: which target is busiest, which needs attention, and why?"
+                ask={{
+                    // The measurements only: the incident windows, the findings to review, and the status they set are the answer key (ADR 0031).
+                    specs: [d.estateAskSpec, d.pgSeriesAskSpec],
+                    table: withoutColumns({ columns: INVENTORY_COLUMNS.map((c) => ({ key: c.key, label: c.label, kind: c.kind ?? "text" })) as ColumnSpec[], rows: rows as unknown as Row[], caption: "Estate inventory" }, ["incidents", "attention", "status"]),
+                    prompt: "Summarize the estate: which target is busiest, and why?",
+                }}
             >
                 <DataGrid columns={INVENTORY_COLUMNS} rows={rows} caption="Estate inventory" exportName="estate-inventory" onRowClick={(r) => navigate("estate", { target: r.target })} rowLabel={(r) => `Open ${r.target}`} filterable={false} />
             </VisualCard>
@@ -407,6 +421,7 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 table={incidentsState.data ? { columns: incidentsSpec.columns, rows: incidentsState.data.rows, caption: `${target}'s incident windows` } : null}
                 summary={`${incidents.length} incidents.`}
                 quiet
+                ask={false}
             >
                 <ol className="feed">
                     {incidents.map((i) => (
@@ -438,6 +453,10 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 table={d.findingsState.data ? { columns: d.findingsSpec.columns, rows: d.findingsState.data.rows.filter((r) => r.TargetKey === target), caption: `${target}'s findings` } : null}
                 summary={`${findings.length} findings.`}
                 quiet
+                ask={{
+                    specs: [],
+                    table: d.findingsState.data ? { columns: d.findingsSpec.columns, rows: measuredFindings(d.findingsState.data.rows.filter((r) => r.TargetKey === target)), caption: `${target}'s findings` } : null,
+                }}
             >
                 <ol className="feed">
                     {findings.map((f) => (
@@ -535,7 +554,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                                         visualId="estate.t4.lag"
                                         prompt={`Why did T4's read replica lag reach ${formatNumber(lagPeak.value, "seconds")} at ${formatDateTimeUtc(lagPeak.at)}? What load on T4 caused it, and how do I keep the replica close?`}
                                         anomaly={{ metric: "Read replica lag", target: "T4-replica", at: lagPeak.at.toISOString(), value: lagPeak.value, unit: "s" }}
-                                        specs={[d.pgSeriesSpec]}
+                                        specs={[d.pgSeriesAskSpec]}
                                         rows={lagRows}
                                     />
                                 ) : undefined
@@ -551,6 +570,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="Read replica lag"
                         subtitle={`Database Hub's Read replica lag (physical_replication_delay_in_seconds), the highest value in each interval. ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.`}
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && lagRows.length === 0}
@@ -572,6 +592,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="CPU"
                         subtitle={`cpu_percent on T4 and its read replica. ${POSTGRES_CPU_WARNING_PERCENT} % or more on T4 is a warning.`}
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && cpuRows.length === 0}
@@ -587,6 +608,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="Connections"
                         subtitle="Active connections on T4 and its read replica, and T4's failed connections (dashed)."
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && connRows.length === 0}
@@ -602,6 +624,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="What the notebook found"
                         subtitle="The findings of the latest PostgreSQL capture, worst first."
                         specs={[d.pgFindingsSpec]}
+                        ask={{ specs: [] }}
                         loading={d.pgFindings.loading}
                         error={d.pgFindings.error}
                         empty={!d.pgFindings.loading && d.pgFindingRows.length === 0}
@@ -700,7 +723,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                                         visualId="estate.t5.ru"
                                         prompt={`Why did T5's normalized RU consumption reach ${formatNumber(ruPeak.value, "percent")} at ${formatDateTimeUtc(ruPeak.at)}, with ${formatNumber(throttled, "int")} requests throttled (429)? Should I raise the provisioned RU/s, switch to autoscale, or spread a hot partition key?`}
                                         anomaly={{ metric: "Normalized RU consumption", target: "T5", at: ruPeak.at.toISOString(), value: ruPeak.value, unit: "%" }}
-                                        specs={[d.cosmosSeriesSpec]}
+                                        specs={[d.cosmosSeriesAskSpec]}
                                         rows={ruRows}
                                     />
                                 ) : undefined
@@ -723,6 +746,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="Normalized RU, and when it throttled"
                         subtitle={`The highest normalized RU consumption in each interval: at 100 % the account throttles requests (429).${provisioned !== null ? ` Provisioned throughput stays at ${formatNumber(provisioned, "int")} RU/s.` : ""} Shaded: the intervals that throttled.`}
                         specs={[d.cosmosSeriesSpec, d.cosmosFindingsSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && ruRows.length === 0}
@@ -749,6 +773,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="Requests and 429s"
                         subtitle="Requests in each interval, and the ones Cosmos DB throttled (429)."
                         specs={[d.cosmosSeriesSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && requestRows.length === 0}
@@ -764,6 +789,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="Gateway latency"
                         subtitle="Server-side latency through the gateway, the average in each interval."
                         specs={[d.cosmosSeriesSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && latencyRows.length === 0}
@@ -780,6 +806,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="What the notebook found"
                         subtitle="The findings of the latest Cosmos DB capture: the throttling, each episode, and the recovery."
                         specs={[d.cosmosFindingsSpec]}
+                        ask={{ specs: [] }}
                         loading={d.cosmosFindingsState.loading}
                         error={d.cosmosFindingsState.error}
                         empty={!d.cosmosFindingsState.loading && d.cosmosFindingRows.length === 0}

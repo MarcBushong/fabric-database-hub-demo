@@ -400,6 +400,8 @@ export default function ManagePage() {
                 table={sessionsState.data ? { columns: sessionsSpec.columns, rows: sessionsState.data.rows, caption: "Sessions and activity requests" } : null}
                 summary={last ? `The last request was ${formatAgo(last.requestedAt)}.` : "No session yet."}
                 askPrompt="Summarize what the session control ran recently and whether anything failed."
+                // What the control ran is the demo's plan, the answer key: no Ask (ADR 0031).
+                ask={false}
             >
                 <ol className="feed">
                     {sessions.slice(0, 12).map((s) => (

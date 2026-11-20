@@ -111,7 +111,7 @@ export default function ReplayPage() {
                         <PostmortemButton
                             ready={Boolean(plan) && !data.loading}
                             scoreError={data.scoreError}
-                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, generatedAt: new Date() })}
+                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, generatedAt: new Date() })}
                         />
                     </div>
                 </header>
@@ -157,6 +157,8 @@ export default function ReplayPage() {
                 table={{ columns: EVENT_SPEC_COLUMNS, rows, caption: "The session's moments" }}
                 summary={`${rows.length} moments.`}
                 askPrompt="Walk me through this session's replay: what happened first, what followed, and how fast each signal showed and recovered?"
+                // Every moment is timed from what was injected, the answer key: nothing measured is left to ask about (ADR 0031).
+                ask={false}
             >
                 <DataGrid
                     columns={EVENT_COLUMNS}

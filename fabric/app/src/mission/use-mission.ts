@@ -120,6 +120,8 @@ export interface MissionData {
     postgres: PostgresCapture | null;
     /** The queries behind it, for the DAX, Ask Copilot, and the postmortem. */
     specs: QuerySpec[];
+    /** Its measured queries only, with no answer-key table or measure: what Ask Copilot hands the chat (ADR 0031). */
+    askSpecs: QuerySpec[];
     loading: boolean;
     /** The sessions query's failure, with no sessions loaded before: without it there's no plan. */
     error: Error | null;
@@ -263,6 +265,12 @@ export function useMission(others = 0): MissionData {
         () => [sessionsSpec, seriesSpec, incidentsSpec, beatsSpec, ...waitSpecs, cosmosSeriesSpec, cosmosFindingsSpec, pgSeriesSpec].filter((s): s is QuerySpec => s !== null),
         [sessionsSpec, seriesSpec, incidentsSpec, beatsSpec, waitSpecs, cosmosSeriesSpec, cosmosFindingsSpec, pgSeriesSpec],
     );
+    const pgSeriesAskSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null), [view.targets]);
+    const cosmosSeriesAskSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null), [view.targets]);
+    const askSpecs = useMemo(
+        () => [seriesSpec, ...waitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec].filter((s): s is QuerySpec => s !== null),
+        [seriesSpec, waitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec],
+    );
 
     // The sessions query's failure with nothing loaded before leaves no plan (the page's empty state says it); every other
     // failure is named in loadError, beside what the page still shows, and refetch runs those queries again.
@@ -342,6 +350,7 @@ export function useMission(others = 0): MissionData {
         cosmos,
         postgres,
         specs,
+        askSpecs,
         loading: sessions.loading || series.loading || beatsState.loading || waits.loading,
         error,
         loadError,

@@ -259,7 +259,7 @@ export default function IncidentsPage() {
                         empty={!list.loading && incidents.length === 0}
                         table={list.data && listSpec ? { columns: listSpec.columns, rows: list.data.rows, caption: "Incident windows" } : null}
                         summary={`${incidents.length} incident windows.`}
-                        askPrompt="Walk me through these incidents: which are related, and which matters most?"
+                        ask={false}
                     >
                         {incidents.length > 0 ? <Timeline incidents={incidents} selected={selected} onSelect={select} /> : null}
                     </VisualCard>
@@ -273,12 +273,13 @@ export default function IncidentsPage() {
                                 sub={comparison?.peakAt ? `at ${formatTimeUtc(comparison.peakAt)} UTC` : selected.peakUnit}
                                 status="Warning"
                                 actions={
-                                    signal ? (
+                                    // Only the measured part (ADR 0031): the signal's own bins, peak, and baseline, with no window key, label, or source.
+                                    signal && comparison && comparison.peak !== null ? (
                                         <AskWhy
-                                            title={`${selected.label} incident`}
+                                            title={`${selected.target} ${signal.label}`}
                                             visualId="incidents.selected"
-                                            prompt={`Why did ${selected.target}'s ${signal.label} reach ${formatNumber(comparison?.peak ?? selected.peakValue, signal.kind)} ${windowPhrase(selected.start, selected.end)}${comparison?.baseline ? `, against a baseline of ${formatNumber(comparison.baseline, signal.kind)}` : ""}? What caused it, which sessions and queries were involved, and what should I change?`}
-                                            anomaly={{ metric: signal.label, target: selected.target, at: (comparison?.peakAt ?? selected.start).toISOString(), value: comparison?.peak ?? selected.peakValue ?? undefined, baseline: comparison?.baseline ?? undefined, incidentKey: selected.key }}
+                                            prompt={`Why did ${selected.target}'s ${signal.label} reach ${formatNumber(comparison.peak, signal.kind)}${comparison.peakAt ? ` at ${formatTimeUtc(comparison.peakAt)} UTC on ${formatDayUtc(comparison.peakAt)}` : ` ${windowPhrase(selected.start, selected.end)}`}${comparison.baseline ? `, against a baseline of ${formatNumber(comparison.baseline, signal.kind)}` : ""}? What caused it, which sessions and queries were involved, and what should I change?`}
+                                            anomaly={{ metric: signal.label, target: selected.target, at: (comparison.peakAt ?? selected.start).toISOString(), value: comparison.peak, baseline: comparison.baseline ?? undefined }}
                                             specs={[seriesSpec, spotSpec]}
                                             rows={series.data?.rows}
                                             columns={seriesSpec?.columns}
@@ -307,6 +308,11 @@ export default function IncidentsPage() {
                             fetchedAt={series.data?.fetchedAt}
                             onRefresh={series.refetch}
                             askPrompt={`Replay this ${selected.target} incident for me: what happened first, what followed, and what caused it?`}
+                            ask={{
+                                // The bins as measured, under a neutral title: the window's label is the answer key (ADR 0031).
+                                title: `${selected.target}, bin by bin`,
+                                prompt: `Walk me through these minutes on ${selected.target}, bin by bin: what happened first, what followed, and what caused it?`,
+                            }}
                             toolbar={
                                 <Button size="small" appearance="subtle" icon={<Bot16Regular />} onClick={() => setAgentOpen(true)}>
                                     Ask the agent
@@ -339,6 +345,11 @@ export default function IncidentsPage() {
                             table={{ columns: SPOTLIGHT_COLUMNS, rows: spotChartRows, caption: "Wait seconds per bin, before and during the incident window" }}
                             summary={spotRows.map((r) => `${r.category}: ${r.before.toFixed(2)} s before, ${r.during.toFixed(2)} s during`).join("; ")}
                             askPrompt="Which wait category explains this incident, and what does it point to?"
+                            ask={{
+                                // The waits per bin as measured; "before" and "during" would hand the chat the window, which is the answer key (ADR 0031).
+                                table: spotSpec && spot.data ? { columns: spotSpec.columns, rows: spot.data.rows, caption: "Wait seconds per bin and category" } : null,
+                                prompt: "Which wait category stands out in these minutes, when, and what does it point to?",
+                            }}
                         >
                             <ChartView hideHeader height={240} spec={{ kind: "bar", title: "Waits before and during", rows: spotChartRows, x: "category", y: ["Before", "During"], unit: "s" }} colors={{ Before: "var(--colorNeutralStroke1)", During: TARGETS[selected.target].color }} />
                         </VisualCard>
@@ -356,6 +367,7 @@ export default function IncidentsPage() {
                         table={list.data && listSpec ? { columns: listSpec.columns, rows: list.data.rows, caption: "Incident windows" } : null}
                         summary={`${rows.length} incident windows.`}
                         quiet
+                        ask={false}
                     >
                         <DataGrid columns={LIST_COLUMNS} rows={rows} caption="Incident windows" exportName="incident-windows" onRowClick={(r) => select(r.key)} rowLabel={(r) => `Replay ${r.target} ${r.signal}, ${formatDateTimeUtc(r.start)}`} />
                     </VisualCard>

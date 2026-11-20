@@ -51,6 +51,12 @@ export interface VisualCardProps {
     onRefresh?: () => void;
     /** Ask Copilot's question; without it, Copilot explains the visual. */
     askPrompt?: string;
+    /**
+     * What Ask Copilot hands the chat, when it isn't the visual's own queries and rows (ADR 0031: the chat is blind, so a
+     * visual that shows the demo's answer key passes only its measured part), or false to offer no Ask: nothing measured
+     * is left to ask about.
+     */
+    ask?: false | { specs?: Array<QuerySpec | null | undefined>; table?: VisualTable | null; prompt?: string; title?: string };
     /** Hide the provenance chip (a page that says it once already). */
     quiet?: boolean;
     /** Live data from Database Hub instead of the history: when it was read, the API calls behind it, and their failures (counted, never shown). */
@@ -100,29 +106,35 @@ export function VisualCard(props: VisualCardProps) {
     // Saved data (not the history model's) is history to Copilot, as of when it was saved, with no DAX or filters behind it.
     const own = props.live ? { provenance: "live" as const, at: props.live.at } : props.saved ? { provenance: "history" as const, at: props.saved.at } : null;
 
-    const ask = () =>
-        copilot.ask(
+    const ask = () => {
+        const over = props.ask || {};
+        const askSpecs = (over.specs ?? props.specs).filter((s): s is QuerySpec => Boolean(s));
+        const askTable = over.table !== undefined ? over.table : props.table;
+        return copilot.ask(
             buildAskContext({
-                title: props.title,
+                title: over.title ?? props.title,
                 page: view.page,
                 visualId: props.id,
-                specs: own ? [] : specs,
-                rows: props.table?.rows,
-                columns: props.table?.columns,
-                prompt: props.askPrompt,
+                specs: own ? [] : askSpecs,
+                rows: askTable?.rows,
+                columns: askTable?.columns,
+                prompt: over.prompt ?? props.askPrompt,
                 provenance: own ? own.provenance : provenance,
                 meta: own ? null : meta,
                 asOf: own?.at,
                 ...(own ? {} : { filters, window: view.window }),
             }),
         );
+    };
 
     const tools = (inFocus: boolean) => (
         <div className="vcard-tools" role="toolbar" aria-label={`${props.title}: actions`}>
             {props.toolbar}
-            <Button size="small" appearance="subtle" className="ask-copilot" icon={<Sparkle16Filled />} onClick={ask} disabled={props.loading && !props.table}>
-                Ask Copilot
-            </Button>
+            {props.ask === false ? null : (
+                <Button size="small" appearance="subtle" className="ask-copilot" icon={<Sparkle16Filled />} onClick={ask} disabled={props.loading && !props.table}>
+                    Ask Copilot
+                </Button>
+            )}
             <Tooltip content={showData ? "Hide the data table" : "Show the data as a table"} relationship="label">
                 <Button size="small" appearance="subtle" icon={<TableSimple16Regular />} aria-pressed={showData} onClick={() => setShowData((v) => !v)} disabled={!props.table} />
             </Tooltip>

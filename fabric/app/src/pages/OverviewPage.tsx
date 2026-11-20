@@ -4,7 +4,6 @@ import { ArrowRight16Regular, DatabaseSearch20Regular, Open16Regular, Sparkle16F
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
-import { AskWhy } from "@/components/AskWhy";
 import { EmptyState } from "@/components/EmptyState";
 import { HealthTile } from "@/components/HealthTile";
 import { Insights } from "@/components/Insights";
@@ -29,10 +28,10 @@ import {
     waitsQuery,
 } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
-import { buildAskContext } from "@/lib/ask";
+import { buildAskContext, measuredFindings } from "@/lib/ask";
 import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth } from "@/lib/health";
-import { coverageInsight, dominantWaitInsight, familySignal, freshnessInsight, lagInsight } from "@/lib/insights";
+import { coverageInsight, dominantWaitInsight, freshnessInsight, lagInsight } from "@/lib/insights";
 import { worstStatus } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
 
@@ -138,10 +137,10 @@ export default function OverviewPage() {
                 title: "Overview: what needs attention",
                 page: "overview",
                 visualId: "overview.attention",
-                specs: [estateSpec, findingsSpec, incidentsSpec],
-                rows: [
-                    ...health.map((h) => ({ target: h.key, status: h.status ?? "", ...Object.fromEntries(h.metrics.map((m) => [m.label, m.value])), incidents: h.incidents, findingsNeedingAttention: h.attention })),
-                ],
+                // The measurements only (ADR 0031): each target's numbers and the telemetry behind them. Its status, incident
+                // windows, and findings to review come from the answer key, so the chat judges from what was measured.
+                specs: [filters.targets.length ? estateQuery(filters, { measured: true }) : null, view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null, view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null],
+                rows: [...health.map((h) => ({ target: h.key, ...Object.fromEntries(h.metrics.map((m) => [m.label, m.value])) }))],
                 prompt: OVERVIEW_PROMPT,
                 provenance,
                 meta,
@@ -244,38 +243,25 @@ export default function OverviewPage() {
                         table={incidentsState.data && incidentsSpec ? { columns: incidentsSpec.columns, rows: incidentsState.data.rows, caption: "Incident windows in the period" } : null}
                         summary={`${incidents.length} incident windows.`}
                         askPrompt="Which of these incidents matters most, what caused it, and is it resolved?"
+                        // The incident windows are the demo's answer key, with nothing measured beside them here: no Ask (ADR 0031).
+                        ask={false}
                         quiet
                     >
                         <ol className="feed">
-                            {incidents.slice(0, 5).map((i, n) => {
-                                const signal = familySignal(i.family);
-                                return (
-                                    <li key={i.key}>
-                                        <TargetChip target={i.target} full={false} />
-                                        <time>{formatDateTimeUtc(i.start)}</time>
-                                        <span className="feed-text">
-                                            <Link as="button" onClick={() => navigate("incidents", { incident: i.key })}>
-                                                {FAMILY_LABEL[i.family] ?? i.label}
-                                            </Link>{" "}
-                                            <span className="muted">
-                                                {formatDuration(i.durationMin)} · peak {formatNumber(i.peakValue, "decimal")} {i.peakUnit}
-                                            </span>
+                            {incidents.slice(0, 5).map((i) => (
+                                <li key={i.key}>
+                                    <TargetChip target={i.target} full={false} />
+                                    <time>{formatDateTimeUtc(i.start)}</time>
+                                    <span className="feed-text">
+                                        <Link as="button" onClick={() => navigate("incidents", { incident: i.key })}>
+                                            {FAMILY_LABEL[i.family] ?? i.label}
+                                        </Link>{" "}
+                                        <span className="muted">
+                                            {formatDuration(i.durationMin)} · peak {formatNumber(i.peakValue, "decimal")} {i.peakUnit}
                                         </span>
-                                        <span>
-                                            {n === 0 ? (
-                                                <AskWhy
-                                                    title={`${i.label} incident`}
-                                                    visualId="overview.incidents.newest"
-                                                    prompt={`Why did ${i.target}'s ${signal.label} spike from ${formatDateTimeUtc(i.start)} for ${formatDuration(i.durationMin)} (peak ${formatNumber(i.peakValue, "decimal")} ${i.peakUnit})? What caused it, and what should I check or change?`}
-                                                    anomaly={{ metric: signal.label, target: i.target, at: i.start.toISOString(), value: i.peakValue ?? undefined, unit: i.peakUnit, incidentKey: i.key }}
-                                                    specs={[incidentsSpec]}
-                                                    rows={incidentsState.data?.rows.slice(0, 1)}
-                                                />
-                                            ) : null}
-                                        </span>
-                                    </li>
-                                );
-                            })}
+                                    </span>
+                                </li>
+                            ))}
                         </ol>
                     </VisualCard>
 
@@ -292,6 +278,8 @@ export default function OverviewPage() {
                         table={findingsState.data ? { columns: findingsSpec.columns, rows: findingsState.data.rows, caption: "Findings in the period" } : null}
                         summary={`${attention.length} findings need attention.`}
                         askPrompt="Which of these findings should I address first, and how?"
+                        // The measured analyses' rows only, with no DAX: Analysis Findings also holds the grading analyses' (ADR 0031).
+                        ask={{ specs: [], table: findingsState.data ? { columns: findingsSpec.columns, rows: measuredFindings(findingsState.data.rows), caption: "Findings in the period" } : null }}
                         quiet
                     >
                         <ol className="feed">
@@ -366,6 +354,8 @@ export default function OverviewPage() {
                         emptyText="No session in this period. Run all in NB_DatabaseHub_Control starts one."
                         table={sessionsState.data ? { columns: sessionsSpec.columns, rows: sessionsState.data.rows, caption: "Sessions and activity requests" } : null}
                         summary={`${sessions.length} activity requests.`}
+                        // What the control ran is the demo's plan, the answer key: no Ask (ADR 0031).
+                        ask={false}
                         quiet
                     >
                         <ol className="feed">

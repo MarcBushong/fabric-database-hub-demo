@@ -39,6 +39,8 @@ export interface PostmortemInput {
     provenance: DataProvenance;
     /** The queries behind it, listed at its end. */
     specs: ReadonlyArray<QuerySpec | null | undefined>;
+    /** The measured ones only, with no answer-key table or measure: what a Copilot draft gets (ADR 0031). */
+    askSpecs?: ReadonlyArray<QuerySpec | null | undefined>;
     generatedAt: Date;
 }
 
@@ -276,46 +278,46 @@ export function postmortemRows(scores: readonly FaultScore[], episodes: readonly
     ];
 }
 
-/** The template Copilot follows: the sections, and the rules that keep it to the measured rows. */
+/**
+ * The template Copilot follows for a draft. The chat is blind (ADR 0031): it gets the session's time range and what was
+ * measured, never what the demo injected or how it was graded, so it investigates the window the way a DBA would. The
+ * Markdown the app writes itself keeps the answer key, labeled.
+ */
 export function postmortemPrompt(plan: Plan): string {
     return [
-        `Write the postmortem of ${planTitle(plan)} (${windowText(plan)}) in Markdown, with exactly these sections: Summary, Timeline (UTC), Impact on ContosoCare, Cause, Response, Times to detect and recover, Follow-ups.`,
-        "Use only the attached rows: each is a fault the demo injected on purpose (or an episode in T4's or T5's metrics), when its signal showed in the telemetry, when it was answered, and when it recovered, measured from the history.",
-        "Every figure must come from the rows; write 'not measured' where a row has none, and never estimate user latency or cost.",
+        `Write the postmortem of what ContosoCare's databases went through ${windowPhrase(plan)}, in Markdown, with exactly these sections: Summary, Timeline (UTC), Impact on ContosoCare, Cause, Response, Follow-ups.`,
+        "Investigate it from the measurements, the way a DBA would: the attached DAX reads that window's telemetry, the attached rows are T4's and T5's episodes in their own Azure Monitor metrics, and the investigation tools, when they're offered, read the root-cause capture.",
+        "Every figure must come from what you read; write 'not measured' where nothing was, and never estimate user latency or cost.",
         "Say 'signal visible in telemetry', never that Database Hub detected something: the history doesn't record what Database Hub saw.",
-        "Name each service with its target (for example Scheduling, T3). End with the queries behind it, from the attached DAX.",
+        "Name each service with its target (for example Scheduling, T3). End with the queries behind it.",
     ].join(" ");
 }
 
-/** The plan's faults that weren't scored, for Copilot: injected (Scenario Runs), and not measured. */
-function unscoredRows(plan: Plan, scores: readonly FaultScore[]): Array<Record<string, unknown>> {
-    return unscoredOf(plan, scores).map((run) => ({
-        target: run.target,
-        service: serviceName(run.target),
-        fault: faultTitle(run),
-        injected: run.windowStart,
-        visible: null,
-        ttdMin: null,
-        answered: null,
-        answer: "",
-        recovered: null,
-        ttrMin: null,
-        status: "",
-        impact: "",
-        evidence: NOT_MEASURED,
-    }));
+function windowPhrase(plan: Plan): string {
+    return `from ${formatDayUtc(plan.start)} ${plan.start.getUTCFullYear()} ${formatTimeUtc(plan.start)} to ${formatTimeUtc(plan.end)} UTC`;
 }
 
-/** What Copilot gets: the template, the rows, and the queries, through the app's existing ask contract. */
+/** The measured rows a draft gets: T4's and T5's episodes, found in their own metrics. */
+const EPISODE_COLUMNS: ColumnSpec[] = [
+    { key: "target", label: "Target", kind: "text" },
+    { key: "service", label: "ContosoCare service", kind: "text" },
+    { key: "signal", label: "Signal", kind: "text" },
+    { key: "visible", label: "Signal visible in telemetry (UTC)", kind: "datetime" },
+    { key: "recovered", label: "Recovered or ended (UTC)", kind: "datetime" },
+    { key: "peak", label: "Peak", kind: "decimal" },
+    { key: "impact", label: "Measured impact", kind: "text" },
+];
+
+/** What Copilot gets: the template, the measured rows, and the measured queries, through the app's existing ask contract. */
 export function postmortemAsk(input: PostmortemInput): AskContext {
-    const rows = [...postmortemRows(input.scores, input.episodes), ...unscoredRows(input.plan, input.scores)];
+    const rows = input.episodes.map((e) => ({ target: e.target, service: serviceName(e.target), signal: e.signal, visible: e.visibleAt, recovered: e.recoveredAt ?? e.endAt, peak: e.peak, impact: e.impact.sentence }));
     return buildAskContext({
-        title: `Postmortem: ${planTitle(input.plan)}`,
+        title: `Postmortem draft: ContosoCare ${windowPhrase(input.plan)}`,
         page: "scoreboard",
         visualId: "postmortem.plan",
-        specs: input.specs,
+        specs: input.askSpecs ?? [],
         rows,
-        columns: POSTMORTEM_COLUMNS,
+        columns: EPISODE_COLUMNS,
         prompt: postmortemPrompt(input.plan),
         provenance: input.provenance,
         meta: null,

@@ -34,6 +34,8 @@ export interface Insight {
     /** The target the page drills into. */
     target?: EstateTarget;
     incident?: string;
+    /** Computed from the demo's answer key (its incident windows): shown, but never handed to the chat, which is blind (ADR 0031). */
+    fromAnswerKey?: boolean;
 }
 
 type BinField = "cpu" | "blocked" | "lockWaitS" | "bufferIoS" | "logRateS" | "waitS" | "ioMb" | "batch" | "sessions";
@@ -164,6 +166,7 @@ export function incidentInsight(incident: Incident, comparison: IncidentComparis
                 : `${incident.source}.`,
         page: "incidents",
         incident: incident.key,
+        fromAnswerKey: true,
     };
 }
 
@@ -182,6 +185,7 @@ export function incidentsOverview(incidents: readonly Incident[]): Insight | nul
         detail: `${[...families].join(", ")}; the longest ran ${formatDuration(longest.durationMin)} on ${longest.target} from ${formatDateTimeUtc(longest.start)}.`,
         page: "incidents",
         incident: incidents[0].key,
+        fromAnswerKey: true,
     };
 }
 
