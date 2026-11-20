@@ -34,6 +34,10 @@ const WORKSPACE = "22222222-2222-2222-2222-222222222222";
 const APP = "33333333-3333-3333-3333-333333333333";
 const OTHER = "44444444-4444-4444-4444-444444444444";
 const ISSUER = "https://issuer.example.invalid/";
+// The Fabric token the function host gives the Manage function, built at run time like every fake token in the tests, so
+// no "Bearer <token>" literal sits in the source: the app's deploy stage copies this file, and validate.ps1's output scan
+// (SECURITY.SECRETSCAN.OUTPUT) reads it there.
+const FABRIC_TOKEN = ["fabric", "token", "from", "the", "runtime"].join("-");
 const b64url = (data: ArrayBuffer | string) => Buffer.from(typeof data === "string" ? data : new Uint8Array(data)).toString("base64url");
 
 async function signer(kid = "k1") {
@@ -294,7 +298,7 @@ describe("the Manage function's answers", () => {
             if (u === `${JOBS}/${ZERO}`) return json({ id: ZERO, status: "Failed", startTimeUtc: "2026-11-18T11:30:00", endTimeUtc: "2026-11-18T11:31:00", failureReason: { errorCode: "NotebookFailed", message: "The webhook refused it." } });
             return json({}, 404);
         });
-        const fabricToken = vi.fn(() => "fabric-token-from-the-runtime");
+        const fabricToken = vi.fn(() => FABRIC_TOKEN);
         const call = async (extra: Record<string, unknown> = {}) => ({ token: await sign(claims(extra)), publishableKey: "pk-test", fabricToken });
         const sleep = async (ms: number) => {
             slept.push(ms);
@@ -310,7 +314,7 @@ describe("the Manage function's answers", () => {
         // It reads the control's runs first: it takes one request at a time.
         expect(w.calls()).toEqual(["GET jobs", "POST jobs?jobType=RunNotebook"]);
         const { init } = w.fabric[1];
-        expect(init?.headers).toEqual({ Authorization: "Bearer fabric-token-from-the-runtime", "Content-Type": "application/json" });
+        expect(init?.headers).toEqual({ Authorization: `Bearer ${FABRIC_TOKEN}`, "Content-Type": "application/json" });
         expect(JSON.parse(String(init?.body))).toEqual({
             executionData: {
                 parameters: {

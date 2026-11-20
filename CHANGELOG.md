@@ -74,6 +74,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - A new environment's Insights app copied every Manage request for Run all; its first `deploy.ps1` now gives Manage the control notebook (`FABRIC.APP.ACTIONS`).
 - A `rayfin up` whose Azure CLI token expired during the command was taken for Fabric refusing the token, so the Insights app fell back to the PC's own Rayfin sign-in, which a new PC doesn't have. `configure-fabric-app.ps1` now takes a new token right before each `rayfin up`, and runs it once more with a new one when the token expired (F16).
 - `destroy.ps1` called an environment that was still being deployed one "deployed by an earlier version of the demo"; it now says it hasn't recorded its workspaces yet.
+- `validate.ps1` reported a **Fail** in `SECURITY.SECRETSCAN.OUTPUT` on every environment: a test of the Insights app held a fake bearer token as text, and the app's deploy stage, `out/fabric-app`, copies its tests too. The test builds it at run time now, and a new test runs the output scan over the staged app. The next `./scripts/deploy.ps1` replaces the stage's copy.
 
 ### Security
 

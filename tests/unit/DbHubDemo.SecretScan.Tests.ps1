@@ -237,3 +237,27 @@ Describe 'Find-DemoSecretLeak (Phase 14 secret scan)' {
         @($scan.Pruned) | Should -Be @($modules)
     }
 }
+
+Describe 'The Insights app''s deploy stage and the output scan (SECURITY.SECRETSCAN.OUTPUT)' {
+    AfterEach {
+        Clear-DemoSecret
+    }
+
+    It 'holds nothing the output scan flags: every file the deploy stage copies from fabric/app, tests included (2026-11-20)' {
+        # validate.ps1 scans out/, and the app's deploy stage, out/fabric-app, is a copy of fabric/app with its tests
+        # (Sync-DemoFabricAppStage). A test's literal "Bearer <token>" fixture made SECURITY.SECRETSCAN.OUTPUT a Fail on every
+        # environment (the final tests, 2026-11-20), while the repository's own secret scan, with other rules, passed. So the
+        # real source is staged here, as a deploy does it, and read with the product's own scan and rules.
+        $repo = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $stage = Join-Path -Path $TestDrive -ChildPath ('fabric-app-' + [guid]::NewGuid().ToString('N'))
+        $staged = @(Sync-DemoFabricAppStage -SourcePath (Join-Path -Path $repo -ChildPath 'fabric/app') -StagePath $stage -SkipInstall -Confirm:$false)
+        $copy = $staged | Where-Object { $_.checkId -eq 'FABRIC.APP.STAGE' }
+        $copy.status | Should -Be 'Pass'
+        # The rules alone, as in a session that registered no secret.
+        Clear-DemoSecret
+        $scan = Find-DemoSecretLeak -Path $stage -DependencyRoot $stage
+        (@($scan.Scanned).Count + @($scan.Skipped).Count) | Should -BeGreaterOrEqual ([int]$copy.evidence['files']) -Because 'every file the stage copied is read, or listed as skipped'
+        @($scan.Scanned | Where-Object { $_ -match '\.test\.tsx?$' }).Count | Should -BeGreaterThan 0 -Because 'the stage copies the app''s tests, and the output scan reads them there'
+        @($scan.Findings | ForEach-Object { '{0}:{1} ({2})' -f [System.IO.Path]::GetRelativePath($stage, $_.Source).Replace('\', '/'), $_.Line, $_.Rule }) | Should -BeNullOrEmpty -Because 'tests build their fake tokens at run time, so the stage holds no text the output scan takes for a secret'
+    }
+}
