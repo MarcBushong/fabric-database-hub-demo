@@ -23,8 +23,8 @@ role definitions, once no role assignment holds them. What isn't this environmen
 It asks for confirmation, listing what it deletes and what it keeps, unless -Force.
 T3's selection in Database Hub's Database agent settings stays too, because no API removes it (2026-11-20): before it
 asks, and at its end (DESTROY.HUB.AGENT.T3, Manual action required, which doesn't change the exit code), it says to
-remove T3 there and Save, before or after this run. Database Hub keeps a deleted database selected, and every later
-Save there fails until it's removed.
+remove T3 there and Save, before or after this run. Deleted databases can stay in that list, selected, for a while, and
+while one is, every Save there fails (docs/database-agents.md).
 With -IfExpired (the scheduled expiry workflow) it deletes only when the resource group's expiresOn tag
 (expiresOn in the configuration) has passed, and otherwise does nothing. Running it again after an
 interruption finishes the cleanup.

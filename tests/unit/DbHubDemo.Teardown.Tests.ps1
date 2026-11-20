@@ -616,7 +616,7 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     }
 
     It 'says once T3 is gone to remove it from Database agent settings (DESTROY.HUB.AGENT.T3), and changes nothing else, the exit code included (2026-11-20)' {
-        # Live, 2026-11-20: Database Hub kept the T3s earlier destroys had deleted selected, and every later Save failed.
+        # Live, 2026-11-20: T3s that earlier destroys had deleted stayed selected, and every later Save failed.
         # The manifest names T3: the one recorded while the group exists, and once it's gone, the one that run kept.
         $manifestPath = Join-Path -Path $TestDrive -ChildPath 'agent/destroy-manifest-demo.json'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith {

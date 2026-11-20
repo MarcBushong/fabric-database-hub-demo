@@ -2441,7 +2441,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         $agent = @($results | Where-Object { $_.checkId -eq 'HUB.AGENT.T3' })
         $agent.Count | Should -Be 1
         $agent[0].status | Should -Be 'Manual action required'
-        $agent[0].message | Should -Match 'select azuresql01-abc123/ContosoCare'
+        $agent[0].message | Should -Match 'check azuresql01-abc123/ContosoCare and Save'
     }
 
     It 'starts from preflight, so the template creates T2''s host again, when the host the state records doesn''t exist, and says so (2026-11-17)' {

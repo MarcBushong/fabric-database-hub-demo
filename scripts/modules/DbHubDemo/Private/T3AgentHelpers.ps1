@@ -12,14 +12,17 @@ $script:DemoAgentDocUrl = 'https://learn.microsoft.com/fabric/database/hub/enabl
 $script:DemoAutoTuningDocUrl = 'https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview'
 # The Agent policy options the beat's issues need (Learn's UI labels): the regression, its long-running lookup, and T3's CPU.
 $script:DemoAgentPolicy = @('Flag long-running queries', 'Force last known good plans', 'Flag high CPU')
-# A Save checks every selected database and fails as a whole if any fails (Learn, checked 2026-11-20), and Database Hub
-# keeps a deleted database selected (live, 2026-11-20: an earlier destroy's T3s failed the owner's Save with this error).
-# Its list names databases without their server, so every environment's T3 is a row named ContosoCare. The selection is
-# saved for the tenant, and every database starts selected ("All databases are included by default", the owner's screen,
-# 2026-11-20), so the steps clear it only where nobody else uses Database Agents, and never in what destroy.ps1 says (the
-# coordinator's decision, 2026-11-20).
+# A Save checks every selected database and fails as a whole if any fails (Learn, checked 2026-11-20), and deleted databases
+# can stay in the list, selected, for a while (live, 2026-11-20: 19 ContosoCare rows, of which 3 still existed, failed the
+# owner's Save with this error; the cause is still being verified). Its list names databases without their server, so every
+# environment's T3 is a row named ContosoCare. The selection is saved for the tenant, and every database starts selected
+# ("All databases are included by default", the owner's screen, 2026-11-20), so the steps clear it only where nobody else
+# uses Database Agents, and never in what destroy.ps1 says (the coordinator's decision, 2026-11-20). docs/database-agents.md
+# has every step, with what was seen live: a reset (a Save with nothing selected) saved, then one row at a time saved the
+# databases that exist, paused ones included.
 $script:DemoAgentSaveError = 'Database agent changes couldn''t be saved'
-$script:DemoAgentLookAlike = 'The list shows no server: with several ContosoCare rows, check one at a time and Save, and uncheck again any whose Save fails'
+$script:DemoAgentLookAlike = 'Rows show only ContosoCare, with no server: with several, check one at a time and Save, keeping each that saves'
+$script:DemoAgentGuide = 'docs/database-agents.md'
 
 function Get-DemoT3AgentUri {
     <#
@@ -408,18 +411,18 @@ function Get-DemoDatabaseHubLink {
 function Get-DemoT3AgentSetupItem {
     <#
     .SYNOPSIS
-    HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one manual step, optional (the owner's decision, 2026-11-19), which
-    no API offers, as a Manual action required that only a person confirms (Test-DemoConfirmOnlyResult): deploy.ps1's
-    ending and the status page list it under "Please confirm", with Database Hub's link, the exact database to select, and
-    the Agent policy options. It's once per deployment: the selection stays across sessions and upgrades, unless T3 is
-    recreated (stop-demo.ps1 -RemoveT3). Only the Database Agent loop on T3 needs it. Database Agents also needs T3 in the
-    supported region associated with the Fabric tenant's home region, which no API reads, so it's named here too.
-    Since 2026-11-20 it says how to tell T3's row from other environments' ContosoCare rows and what to uncheck when a
-    Save fails: the selection is the tenant's, every database starts selected, Database Hub keeps a deleted database in
-    it, and a Save fails as a whole when any selected database fails its check (live, 2026-11-20). It clears the selection
-    only where nobody else in the tenant uses Database Agents; where others do, it leaves theirs and points to
-    docs/troubleshooting.md, whose T3 section says to ask whoever manages Database Agents when a Save fails on one of
-    theirs (the coordinator's decision, 2026-11-20). Returns $null when T3 doesn't exist. Pure. Internal.
+    HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one manual step, which no API offers, as a Manual action required
+    that only a person confirms (Test-DemoConfirmOnlyResult): deploy.ps1's ending and the status page list it under "Please
+    confirm", with Database Hub's link, the exact database to select, and the Agent policy options. It never keeps a run
+    from DONE (the owner's decision, 2026-11-19), and since 2026-11-20 (the owner's request) it says so first: "Required
+    once for the Database Agent beat; everything else works without it." It's once per deployment: the selection stays
+    across sessions and updates, unless T3 is recreated (stop-demo.ps1 -RemoveT3, or a new deployment). Database Agents
+    also needs T3 in the supported region associated with the Fabric tenant's home region, which no API reads, so it's
+    named here too. The selection is the tenant's, every database starts selected, and a Save fails as a whole when any
+    selected database fails its check, so it gives two cases (the coordinator's decision, 2026-11-20): where nobody else
+    in the tenant uses Database Agents, a reset (clear the selection, then Save) before T3; where others do, T3 added to
+    theirs. Saving works with T3 paused (live, 2026-11-20), and its issues come while it's awake. docs/database-agents.md
+    has every step and what to do when a Save fails. Returns $null when T3 doesn't exist. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -441,10 +444,10 @@ function Get-DemoT3AgentSetupItem {
     $link = Get-DemoDatabaseHubLink -Config $Config
     $database = '{0}/ContosoCare' -f $ServerName
     $where = if ($Region) { $Region } else { [string]$Config['location'] }
-    $failed = 'uncheck your databases that no longer exist, are paused, have one vCore, or are outside {0}'
     # The status page keeps 1,200 characters of each "Please confirm" line (Set-DemoProgressValue), so this stays shorter.
-    $message = 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment (it stays through sessions and upgrades, unless T3 is recreated). Open {0}, select Manage agents, then Database agent settings, and turn Enabled on. If only you use Database Agents in this tenant, clear the selection (all databases start selected); if others do, don''t clear or uncheck theirs: see docs/troubleshooting.md (T3). Select {1}; under Agent policy turn on {2}; Apply, then Save. {3}. T3 must be awake (right after deploy.ps1, or in a session), and its region ({4}) must be your Fabric tenant''s home region (Fabric: ? > About Fabric). If Save says "{5}", {6}, and Save again.' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $script:DemoAgentLookAlike, $where, $script:DemoAgentSaveError, ($failed -f 'that region')
-    return (New-DemoResult -CheckId 'HUB.AGENT.T3' -Area 'hub' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database; policy = @($script:DemoAgentPolicy); region = $where; oncePerDeployment = $true }) -Remediation ('In Database Hub, Manage agents > Database agent settings: Enabled; clear the selection if only you use Database Agents in this tenant, or keep the others'' databases if not; select {0}, Apply, Save. If Save says "{1}", {2}, and Save again; if it fails on someone else''s database, ask whoever manages Database Agents in your tenant to add T3. The walkthrough''s Database Agent loop shows the rest.' -f $database, $script:DemoAgentSaveError, ($failed -f 'your Fabric home region')) -DocUrl $script:DemoAgentDocUrl)
+    $message = 'Required once for the Database Agent beat; everything else works without it. Once per deployment (it stays through sessions and updates; redo it if T3 is recreated): open {0}, then Agent (preview), Manage agents, Database agent settings, and turn Enabled on. All databases start selected, and the selection is the tenant''s. If only you use Database Agents in this tenant, reset it: clear the selection and Save; then check {1} and Save. If others use it, don''t clear or uncheck theirs: add T3. Then T3''s Agent policy (the gear): turn on {2}; Apply, then Save. {3}. Saving works with T3 paused; its issues come only while it''s awake, in a session. Its region ({4}) must be your Fabric home region (Fabric: ? > About Fabric). Step by step, and when Save says "{5}": {6}.' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $script:DemoAgentLookAlike, $where, $script:DemoAgentSaveError, $script:DemoAgentGuide
+    $remediation = 'In Database Hub: Agent (preview) > Manage agents > Database agent settings, Enabled on. Only you use Database Agents in this tenant: clear the selection and Save (the reset), then check {0} and Save; with several ContosoCare rows, check one at a time and Save, keeping each that saves. Others use it: keep theirs and add T3; if Save fails on one of theirs, ask whoever manages Database Agents in your tenant to add T3. Then T3''s Agent policy (the gear): {1}; Apply, Save. Step by step: {2}.' -f $database, ($script:DemoAgentPolicy -join ', '), $script:DemoAgentGuide
+    return (New-DemoResult -CheckId 'HUB.AGENT.T3' -Area 'hub' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database; policy = @($script:DemoAgentPolicy); region = $where; oncePerDeployment = $true; guide = $script:DemoAgentGuide }) -Remediation $remediation -DocUrl $script:DemoAgentDocUrl)
 }
 
 function Get-DemoT3AgentRemovalItem {
@@ -452,13 +455,13 @@ function Get-DemoT3AgentRemovalItem {
     .SYNOPSIS
     DESTROY.HUB.AGENT.T3 (2026-11-20): what destroy.ps1 can't do, remove T3 from Database Hub's Database agent settings,
     which no API offers, as a Manual action required that changes nothing and leaves destroy.ps1's exit code alone. The
-    selection is the tenant's, Database Hub keeps a deleted database in it, and a Save checks every selected database and
-    fails as a whole when any fails ("If any selected database fails that permission check, the entire save fails", Learn,
-    enable Database Agents), so a deleted T3 fails every later Save, anyone's in the tenant, as when the next deployment's
-    T3 is selected (live, 2026-11-20). It says to uncheck only T3 and leave every other database as it is, and how to find
-    T3's row among other environments' ContosoCare rows without clearing the selection, which would stop the agent for
-    whoever selected them (the coordinator's decision, 2026-11-20). Returns $null without T3's server name. Pure.
-    Internal.
+    selection is the tenant's, deleted databases can stay in it for a while (live, 2026-11-20), and a Save checks every
+    selected database and fails as a whole when any fails ("If any selected database fails that permission check, the
+    entire save fails", Learn, enable Database Agents), so while the deleted T3 stays selected, every Save fails, anyone's
+    in the tenant, as when the next deployment's T3 is selected (live, 2026-11-20). It says to uncheck only T3 and leave
+    every other database as it is, and how to find T3's row among other environments' ContosoCare rows without clearing the
+    selection, which would stop the agent for whoever selected them (the coordinator's decision, 2026-11-20); its steps
+    point to docs/database-agents.md. Returns $null without T3's server name. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -476,7 +479,7 @@ function Get-DemoT3AgentRemovalItem {
     }
     $link = Get-DemoDatabaseHubLink -Config $Config
     $database = '{0}/ContosoCare' -f $ServerName
-    $message = 'If you selected T3 for Database Agents, uncheck only it, {0}, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Database Hub keeps a deleted database selected, and a Save checks every selected database, so every later Save there, by anyone in your tenant, fails ("{1}") until it''s removed, as when you select the next deployment''s T3.' -f $database, $script:DemoAgentSaveError
-    $remediation = 'Open {0}, select Manage agents, then Database agent settings; uncheck {1}, then Save, and leave every other database as it is: the selection is your tenant''s. The list shows no server: with several ContosoCare rows, do it after destroy.ps1, when T3''s row fails every Save: uncheck one row at a time and Save, check it again if Save still fails, and stop when a Save succeeds. Nothing to do if you never selected it. Why: {2}' -f $link, $database, $script:DemoAgentDocUrl
+    $message = 'If you selected T3 for Database Agents, uncheck only it, {0}, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while, and a Save checks every selected database, so while the deleted T3 stays selected, every Save there, by anyone in your tenant, fails ("{1}"), as when you select the next deployment''s T3.' -f $database, $script:DemoAgentSaveError
+    $remediation = 'Open {0}, then Agent (preview), Manage agents, Database agent settings; uncheck {1}, then Save, and leave every other database as it is: the selection is your tenant''s. The list shows no server: with several ContosoCare rows, do it after destroy.ps1, when T3''s row fails every Save: uncheck one row at a time and Save, check it again if Save still fails, and stop when a Save succeeds. Nothing to do if you never selected it. Step by step: {2}. Why: {3}' -f $link, $database, $script:DemoAgentGuide, $script:DemoAgentDocUrl
     return (New-DemoResult -CheckId 'DESTROY.HUB.AGENT.T3' -Area 'teardown' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database }) -Remediation $remediation -DocUrl $script:DemoAgentDocUrl)
 }

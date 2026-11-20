@@ -553,13 +553,13 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
     }
 
     It 'says before it asks to remove T3 from Database agent settings and Save, and why, with Learn''s page; nothing without T3''s name (2026-11-20)' {
-        # Live, 2026-11-20: Database Hub kept the T3s earlier destroys had deleted in the tenant's selection, and every Save failed.
+        # Live, 2026-11-20: T3s that earlier destroys had deleted stayed in the tenant's selection, and every Save failed.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith {
             [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; T3Agent = 'azuresql01-abc123'; Delete = @(); Keep = @('the Fabric capacity and your licenses, which you manage') }
         }
         $result = @(Remove-DemoEnvironment -Config $config -WhatIf)
         $result.checkId | Should -Be @('PREFLIGHT.GUARD.CONTEXT', 'DESTROY.RESOURCEGROUP') -Because 'a what-if deletes nothing, so DESTROY.HUB.AGENT.T3 comes only once T3 is gone'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'If you selected T3 for Database Agents, uncheck only it, azuresql01-abc123/ContosoCare, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Database Hub keeps a deleted database selected*DESTROY.HUB.AGENT.T3 at the end says how (https://learn.microsoft.com/fabric/database/hub/enable-database-agents).' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'If you selected T3 for Database Agents, uncheck only it, azuresql01-abc123/ContosoCare, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while*DESTROY.HUB.AGENT.T3 at the end says how (https://learn.microsoft.com/fabric/database/hub/enable-database-agents).' }
 
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
         $null = @(Remove-DemoEnvironment -Config $config -WhatIf)

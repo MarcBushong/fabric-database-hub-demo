@@ -485,11 +485,11 @@ function Get-DemoDestroyExtraPlan {
     }
     $delete.Add(('the custom role "{0}" once no role assignment holds it' -f $script:SafetyStopRoleName))
     $keep.Add('the Fabric capacity and your licenses, which you manage')
-    # T3's selection in Database agent settings (2026-11-20): Database Hub keeps a deleted database selected, and a Save
-    # fails while one is. Its name comes from the group's tag, which is empty once the group is gone; a read that fails
-    # leaves the line out, and DESTROY.HUB.AGENT.T3 still names it from the manifest. The golden boot test's group has a
-    # deploymentId tag but never a T3 (infra/golden-test.bicep), so it names none, and NoT3 keeps Remove-DemoEnvironment
-    # from naming one from the manifest (review of 5d1f4b0).
+    # T3's selection in Database agent settings (2026-11-20): deleted databases can stay in that list, selected, for a
+    # while, and a Save fails while one is. Its name comes from the group's tag, which is empty once the group is gone; a
+    # read that fails leaves the line out, and DESTROY.HUB.AGENT.T3 still names it from the manifest. The golden boot
+    # test's group has a deploymentId tag but never a T3 (infra/golden-test.bicep), so it names none, and NoT3 keeps
+    # Remove-DemoEnvironment from naming one from the manifest (review of 5d1f4b0).
     $t3Agent = ''
     $noT3 = $false
     try {

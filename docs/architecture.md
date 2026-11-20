@@ -63,7 +63,7 @@ flowchart TB
 `deploy.ps1` deploys everything in the diagram with one command, in parallel tracks, and keeps it up to date. [What's deployed, and by what](../README.md#whats-deployed-and-by-what) lists each part with what creates and deletes it, and [components and defaults](#components-and-defaults) has each part's details. T2 needs no person: its host downloads [Arc Jumpstart](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md)'s prebuilt SQL Server 2022 Standard guest disk and makes it `arcsql01`, with no Bastion. What needs a person, none of which keeps the run from **DONE**:
 
 - **An Owner's one grant,** only when you aren't an Owner: `./scripts/grant-safety-stop.ps1`, once, for the roles of the nightly safety stop and the session control. **DONE** prints it first.
-- **Optional, once per deployment:** selecting T3 for Database Agents in Database Hub's **Manage agents**, about 30 seconds (`HUB.AGENT.T3`, under **DONE**'s **Please confirm**), which only the Database Agent loop needs.
+- **Once per deployment, required for the Database Agent beat:** selecting T3 for Database Agents in Database Hub's **Manage agents**, a minute or two (`HUB.AGENT.T3`, under **DONE**'s **Please confirm**; [step by step](database-agents.md)); everything else works without it.
 - **Each viewer of Ask,** the Copilot chat in the Insights app: a GitHub sign-in once per browser, on their own GitHub Copilot plan.
 - **The Fabric capacity:** you or its administrator resume it before Run all and pause it after. It's outside every estimate, with Fabric and Power BI licenses and each viewer's GitHub Copilot plan.
 - **Only if Fabric refuses your `az login` token:** the Insights app's browser sign-in, `./scripts/configure-fabric-app.ps1 -SignIn`.
@@ -315,7 +315,7 @@ sequenceDiagram
 | `T3.SQL` | Any other T-SQL run from T1 | Pass, Warning, or Fail |
 | `T3.AGENT` | What Database Agents needs from T3 that a script can read: not a one-vCore serverless database, not in an elastic pool, Azure RBAC write on the database for the signed-in account, and performance monitoring on | Pass, or a Warning that names each gap with its fix; never a Fail, because only the Database Agent loop needs it |
 | `T3.AUTOTUNING` | Automatic tuning's `FORCE_LAST_GOOD_PLAN` (for `plan-regression`), and the Database Agent beat's hold on it | Pass or Warning |
-| `HUB.AGENT.T3` | T3 selected in Database Hub's **Manage agents** > **Database agent settings**, which no API offers: optional, once per deployment, and only the Database Agent loop needs it | Manual action required, under **DONE**'s **Please confirm** |
+| `HUB.AGENT.T3` | T3 selected in Database Hub's **Manage agents** > **Database agent settings**, which no API offers: once per deployment, required for the Database Agent beat, and everything else works without it ([step by step](database-agents.md)) | Manual action required, under **DONE**'s **Please confirm** |
 
 ## T4 as built
 
