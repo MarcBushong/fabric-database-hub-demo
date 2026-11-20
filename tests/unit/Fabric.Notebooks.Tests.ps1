@@ -469,15 +469,16 @@ Describe 'NB_DatabaseHub_Deployment content' {
         $markdown | Should -Match 'the scripts'' import binds the notebook to it'
     }
 
-    It 'never drops a table on Run all with its defaults, and drops all five only with PURGE_DEMO_TABLES and CONFIRM (2026-11-03)' {
+    It 'never drops a table on Run all with its defaults, and drops all thirteen and the staged RCA evidence only with PURGE_DEMO_TABLES and CONFIRM (2026-11-03, ADR 0031)' {
         if (-not $python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
         }
-        # Runs the notebook's own parameters and cleanup cells, with a stand-in for Spark that records each DROP.
+        # Runs the notebook's own parameters and cleanup cells, with stand-ins for Spark that record each DROP, and for
+        # notebookutils.fs that records each removal.
         $script = Join-Path -Path $TestDrive -ChildPath 'cleanup.py'
         Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
-import json, sys
+import json, sys, types
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
 params = next(cell for cell in cells if cell.startswith("# Parameters cell"))
 cleanup = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: drops"))
@@ -493,22 +494,35 @@ class Session:
     def sql(self, text):
         self.dropped.append(text)
 
+class Files:
+    def __init__(self):
+        self.removed = []
+    def exists(self, path):
+        return True
+    def rm(self, path, recurse=False):
+        self.removed.append((path, recurse))
+        return True
+
 def run(**overrides):
     ns = {}
     exec(params, ns)
     ns.update(overrides)
-    session = Session()
-    ns["_spark"] = lambda: session
+    session, files = Session(), Files()
+    ns.update(_spark=lambda: session, _notebookutils=lambda: types.SimpleNamespace(fs=files), redact=str)
     exec(cleanup, ns)
-    return ns, session.dropped
+    return ns, session.dropped, files.removed
 
-ns, dropped = run()
+ns, dropped, removed = run()
 assert ns["CONFIRM"] is True and ns["PURGE_DEMO_TABLES"] is False, (ns["CONFIRM"], ns["PURGE_DEMO_TABLES"])
-assert dropped == [], dropped
-ns, dropped = run(PURGE_DEMO_TABLES=True)
-assert len(dropped) == 5 and all(text.startswith("DROP TABLE IF EXISTS ") for text in dropped), dropped
-ns, dropped = run(PURGE_DEMO_TABLES=True, CONFIRM=False)
-assert dropped == [], dropped
+assert dropped == [] and removed == [], (dropped, removed)
+ns, dropped, removed = run(PURGE_DEMO_TABLES=True)
+assert len(dropped) == 13 and all(text.startswith("DROP TABLE IF EXISTS ") for text in dropped), dropped
+assert removed == [("Files/rca", True)], removed
+workspace, lakehouse = "-".join(("1" * 8, "2" * 4, "3" * 4, "4" * 4, "5" * 12)), "-".join(("6" * 8, "7" * 4, "8" * 4, "9" * 4, "a" * 12))
+ns, dropped, removed = run(PURGE_DEMO_TABLES=True, WORKSPACE_ID=workspace, LAKEHOUSE_ID=lakehouse)
+assert removed == [("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca" % (workspace, lakehouse), True)], removed
+ns, dropped, removed = run(PURGE_DEMO_TABLES=True, CONFIRM=False)
+assert dropped == [] and removed == [], (dropped, removed)
 print("ok")
 '@
         $PSNativeCommandUseErrorActionPreference = $false
@@ -565,16 +579,20 @@ part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
 session_cell = next(cell for cell in cells if cell.startswith("# This session"))
 functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests|session_beats)\(.*?(?=^\S|\Z)", part3))
 
-def run(session_id, plan, saved=False):
-    exits = []
+def run(session_id, plan, saved=False, rca=False, rca_only=False):
+    exits, saves = [], []
+    # The Incident RCA's evidence (ADR 0031): part 4's save, which reports RCA.EVIDENCE, as a stand-in.
     ns = {"json": json, "re": re, "dt": dt, "RUN_ID": "run-1", "NOTEBOOK_NAME": "NB_DatabaseHub_LiveActivity", "SELECTED_TARGETS": ["T1", "T2", "T3"],
           "SESSION_REQUESTS": [], "SAVE_RESULTS": True, "SESSION_ID": session_id, "SESSION_PLAN": plan,
+          "RCA_ONLY": rca_only, "RCA_STATE": {"passed": rca}, "save_rca_evidence": lambda: saves.append(True),
+          "rca_exit_value": lambda: "RCA.EVIDENCE Pass: Wrote 2 evidence document(s).",
           "_parse_utc": lambda text: dt.datetime.fromisoformat(text.replace("Z", "+00:00")),
           "utc_now": lambda: dt.datetime(2026, 11, 14, 16, 0, tzinfo=dt.timezone.utc),
           "session_saved": lambda session: saved,
           "_notebookutils": lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda value: exits.append(value)))}
     exec(functions, ns)
     exec(session_cell, ns)
+    ns["RCA_SAVES"] = len(saves)
     return ns, exits
 
 sid = "0123456789abcdef0123456789abcdef"
@@ -591,7 +609,13 @@ ns, exits = run(sid, plan)
 report["session"] = {"rows": [[row["request_id"], row["target"], row["profile"], row["duration_minutes"], row["dispatch_mode"]] for row in ns["SESSION_REQUESTS"]],
                      "save": ns["SAVE_RESULTS"], "exits": exits}
 ns, exits = run(sid, plan, saved=True)
-report["saved"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits}
+report["saved"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits, "rca": ns["RCA_SAVES"]}
+ns, exits = run(sid, plan, saved=True, rca=True)
+report["savedWithRca"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits, "rca": ns["RCA_SAVES"]}
+ns, exits = run(sid, "", rca=True, rca_only=True)
+report["rcaOnly"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits, "rca": ns["RCA_SAVES"]}
+ns, exits = run(sid, plan)
+report["session"]["rca"] = ns["RCA_SAVES"]
 ns, exits = run(sid, "not json")
 report["bad"] = {"rows": [row["profile"] for row in ns["SESSION_REQUESTS"]], "exits": exits}
 print(json.dumps(report))
@@ -610,10 +634,23 @@ print(json.dumps(report))
         $rows[1] | Should -Be @('session:0123456789abcdef0123456789abcdef:00', 'T1', 'incident:blocking-chain', 10, 'session')
         $rows[2] | Should -Be @('session:0123456789abcdef0123456789abcdef:01', 'T3', 'incident:resource-governance', 12, 'session')
         $report.session.save | Should -BeTrue
-        # A session already saved: nothing is recorded or saved, and the run ends there.
+        # A session already saved: nothing is recorded or saved, and the run ends there, with the exit value a control
+        # notebook from before the Incident RCA reads. Its RCA evidence is written all the same (each document once), and the
+        # exit value adds RCA.EVIDENCE only when evidence was passed (ADR 0031).
         $report.saved.rows | Should -Be 0
         $report.saved.save | Should -BeFalse
-        @($report.saved.exits).Count | Should -Be 1
+        @($report.saved.exits) | Should -Be @('Session 0123456789abcdef0123456789abcdef is already saved.')
+        $report.saved.rca | Should -Be 1
+        $report.savedWithRca.save | Should -BeFalse
+        @($report.savedWithRca.exits) | Should -Be @('Session 0123456789abcdef0123456789abcdef is already saved. RCA.EVIDENCE Pass: Wrote 2 evidence document(s).')
+        $report.savedWithRca.rca | Should -Be 1
+        # RCA_ONLY: an earlier session's evidence alone, then the run ends with RCA.EVIDENCE; nothing else is recorded or saved.
+        $report.rcaOnly.rows | Should -Be 0
+        $report.rcaOnly.save | Should -BeFalse
+        @($report.rcaOnly.exits) | Should -Be @('RCA.EVIDENCE Pass: Wrote 2 evidence document(s).')
+        $report.rcaOnly.rca | Should -Be 1
+        # A session not saved yet writes its evidence in the persist cell, not here.
+        $report.session.rca | Should -Be 0
         # A plan it can't read keeps the session's own row out too (no window), and never stops the run.
         @($report.bad.rows) | Should -BeNullOrEmpty
         @($report.bad.exits) | Should -BeNullOrEmpty
@@ -1580,6 +1617,497 @@ print(json.dumps({
     }
 }
 
+Describe 'The Incident RCA''s evidence in NB_DatabaseHub_LiveActivity (ADR 0031)' {
+    BeforeAll {
+        $live = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
+        $part4 = @($live.Code | Where-Object { $_.Source -match '^# Helpers, part 4' })
+        $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
+
+        # The notebook's own cells run here (parameters, the four helper cells, section 3, and the persist cell) against a
+        # lakehouse in memory, with the contract's fixtures: their parts, staged as the control notebook stages them.
+        $rcaReport = $null
+        $rcaSkip = ''
+        if (-not $pandasPython) {
+            $rcaSkip = 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+        }
+        else {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $null = & $pandasPython -c 'import pandas' 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $rcaSkip = 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            }
+        }
+        if (-not $rcaSkip) {
+            $script = Join-Path -Path $TestDrive -ChildPath 'rca_evidence.py'
+            Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import base64, contextlib, copy, datetime as dt, gzip, hashlib, io, json, re, sys, types
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+spark_types = types.ModuleType("pyspark.sql.types")
+for name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, name, type(name, (), {}))
+spark_types.StructField = lambda name, kind, nullable: name
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+notebook, repo = sys.argv[1], sys.argv[2]
+code = ["".join(cell["source"]) for cell in json.load(open(notebook, encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+setup = [cell for cell in code if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+this_session = next(cell for cell in code if cell.startswith("# This session"))
+persist = next(cell for cell in code if cell.startswith("# Persist:"))
+spec = {table["name"]: table for table in json.load(open(repo + "/rca/history-tables.json", encoding="utf-8"))["tables"]}
+
+
+def fixture(name):
+    return json.load(open(repo + "/rca/fixtures/" + name, encoding="utf-8"))
+
+
+PARAMETER = fixture("rca-evidence.parameter.json")
+DOCUMENTS = {document["documentId"]: document for document in (fixture("t1-blocking-chain.evidence.json"), fixture("t4-replica-lag.evidence.json"))}
+SID = PARAMETER["sessionId"]
+# GUID-shaped IDs, built here so no file holds one.
+WS = "-".join(("1" * 8, "2" * 4, "3" * 4, "4" * 4, "5" * 12))
+LH = "-".join(("6" * 8, "7" * 4, "8" * 4, "9" * 4, "a" * 12))
+ROOT = "abfss://%s@onelake.dfs.fabric.microsoft.com/%s/" % (WS, LH)
+
+
+class Files:
+    """notebookutils.fs over the lakehouse's Files, in memory: files by their OneLake path, and folders."""
+
+    def __init__(self):
+        self.files, self.folders, self.reads = {}, set(), []
+
+    def add(self, relative, text):
+        self.files[ROOT + relative] = text
+        parent = (ROOT + relative).rsplit("/", 1)[0]
+        while parent.startswith(ROOT + "Files/"):
+            self.folders.add(parent)
+            parent = parent.rsplit("/", 1)[0]
+
+    def head(self, path, max_bytes):
+        self.reads.append(path[len(ROOT):])
+        return self.files[path][:max_bytes]
+
+    def exists(self, path):
+        return path in self.files or path in self.folders
+
+    def ls(self, path):
+        prefix = path.rstrip("/") + "/"
+        names = {item[len(prefix):].split("/")[0] for item in list(self.files) + list(self.folders) if item.startswith(prefix)}
+        return [types.SimpleNamespace(name=name) for name in sorted(names)]
+
+    def rm(self, path, recurse=False):
+        if path in self.files:
+            del self.files[path]
+        elif self.ls(path) and not recurse:
+            raise IOError("the folder isn't empty")
+        else:
+            self.folders.discard(path)
+        return True
+
+    def left(self):
+        return sorted(item[len(ROOT):] for item in self.files) + sorted(item[len(ROOT):] + "/" for item in self.folders)
+
+
+class Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def filter(self, condition):
+        column, value = re.fullmatch(r"(\w+) = '([^']*)'", condition).groups()
+        return Rows([row for row in self.rows if row.get(column) == value])
+
+    def limit(self, count):
+        return Rows(self.rows[:count])
+
+    def count(self):
+        return len(self.rows)
+
+
+class Lake:
+    def __init__(self):
+        self.tables, self.columns, self.log = {}, {}, []
+        self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
+        self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+
+    def table(self, name):
+        rows = Rows(self.tables[name])
+        rows.schema = types.SimpleNamespace(fields=[types.SimpleNamespace(name=column) for column, _ in self.columns[name]])
+        return rows
+
+    def createDataFrame(self, data, schema):
+        lake, rows = self, [dict(zip(schema, values)) for values in data]
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                lake.log.append("append %s %d" % (table, len(rows)))
+                lake.tables.setdefault(table, []).extend(rows)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+    def sql(self, statement):
+        result = []
+        by_run = re.fullmatch(r"DELETE FROM (\w+) WHERE run_id = '([^']*)'", statement)
+        by_document = re.fullmatch(r"DELETE FROM (\w+) WHERE document_id IN \(('[^']*'(?:, '[^']*')*)\)", statement)
+        if by_run or by_document:
+            column, gone = ("run_id", {by_run.group(2)}) if by_run else ("document_id", set(re.findall(r"'([^']*)'", by_document.group(2))))
+            name = (by_run or by_document).group(1)
+            kept = [row for row in self.tables[name] if row.get(column) not in gone]
+            self.log.append("delete %s %d" % (name, len(self.tables[name]) - len(kept)))
+            self.tables[name][:] = kept
+        elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
+            self.tables.setdefault(statement.split()[5], [])
+        elif statement.startswith("SELECT COUNT(*) AS n FROM "):
+            result = [{"n": 0}]
+        elif statement.startswith("DESCRIBE DETAIL "):
+            result = [{"numFiles": 1}]
+        else:
+            raise AssertionError("unexpected statement: " + statement)
+        return types.SimpleNamespace(collect=lambda: result)
+
+
+def run(lake, files, session_id=SID, evidence_file="", evidence="", rca_only=False, save=True, reference=False):
+    """One run of the notebook: its setup, section 3, and the persist cell, which sections 4 to 10 add nothing to here."""
+    exits, printed = [], io.StringIO()
+    utils = types.SimpleNamespace(fs=files, notebook=types.SimpleNamespace(exit=exits.append))
+    ns = {}
+    with contextlib.redirect_stdout(printed):
+        exec(setup[0], ns)
+        ns.update(SESSION_ID=session_id, SESSION_PLAN="", RCA_EVIDENCE=evidence, RCA_EVIDENCE_FILE=evidence_file, RCA_ONLY=rca_only,
+                  SAVE_RESULTS=save, WORKSPACE_ID=WS, LAKEHOUSE_ID=LH)
+        for cell in setup[1:]:
+            exec(cell, ns)
+        lake.columns = ns["TABLE_COLUMNS"]
+        ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": LH}, _notebookutils=lambda: utils,
+                  REFERENCE_RUN=reference, incident_window_rows=lambda: ([], []),
+                  merge_incident_windows=lambda session, recorded, detected: (0, 0))
+        exec(this_session, ns)
+        exec(persist, ns)
+    state = ns["RCA_STATE"]
+    findings = [row for row in lake.tables.get("analysis_findings", []) if row["analysis"] == "rca_evidence"]
+    return {"status": state["status"], "message": state["message"], "documents": state["documents"], "skipped": state["skipped"],
+            "exits": exits, "findings": [[row["status"], row["target"], row["finding"]] for row in findings],
+            "counts": {name: len(lake.tables[name]) for name in ns["RCA_TABLES"] if name in lake.tables},
+            "telemetry": len(lake.tables.get("telemetry_snapshots", [])), "left": files.left(), "reads": list(files.reads)}, ns
+
+
+def encode(document, size=2400):
+    """The runner's part lines for a document (rca/README.md, Part lines)."""
+    stream = gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+    digest = hashlib.sha256(stream).hexdigest()
+    chunks = [stream[index:index + size] for index in range(0, len(stream), size)]
+    return ["DBHUBDEMO-RCA 1 %s %d/%d %s %s" % (document["documentId"], index + 1, len(chunks), digest, base64.b64encode(chunk).decode("ascii"))
+            for index, chunk in enumerate(chunks)]
+
+
+def evidence(parts, **changes):
+    return json.dumps(dict({"kind": "ContosoCare.RcaEvidenceParts", "version": 1, "sessionId": SID, "parts": parts}, **changes))
+
+
+def plain(value):
+    return value.isoformat() if isinstance(value, (dt.datetime, dt.date)) else value
+
+
+def expected(document):
+    """The document's rows decoded on their own, from the contract, to compare with what the notebook wrote."""
+    epoch = dt.datetime.fromisoformat(document["epochUtc"].replace("Z", "+00:00"))
+    rows = {}
+    for tables, strings in ((document["tables"], document["strings"]), (document["answerKey"]["tables"], document["answerKey"]["strings"])):
+        for name, table in tables.items():
+            kinds = {column["name"]: column["type"] for column in spec[name]["columns"]}
+            decoded = []
+            for index in range(table["rows"]):
+                row = {}
+                for column, values in table["columns"].items():
+                    value = values[index]
+                    if value is not None and kinds[column] == "string":
+                        value = strings[value]
+                    elif value is not None and kinds[column] == "timestamp":
+                        value = (epoch + dt.timedelta(milliseconds=value)).isoformat()
+                    elif value is not None and kinds[column] == "double":
+                        value = float(value)
+                    row[column] = value
+                decoded.append(row)
+            rows[name] = decoded
+    return rows
+
+
+report = {}
+lake, files = Lake(), Files()
+ns = run(lake, files, evidence_file="")[1]
+report["contract"] = {
+    "tables": {name: {"role": table["role"], "primary": table["primary"], "columns": [list(column) for column in table["columns"]],
+                      "required": list(table["required"])} for name, table in ns["RCA_TABLES"].items()},
+    "tableColumns": {name: [list(column) for column in ns["TABLE_COLUMNS"][name]] for name in ns["RCA_TABLES"]},
+    "dateSources": {name: list(ns["REPORT_DATE_SOURCES"][name]) for name in ns["RCA_TABLES"]}}
+decoded, skipped = ns["decode_rca_parts"](PARAMETER["parts"])
+report["decode"] = {"same": decoded == DOCUMENTS, "documents": sorted(decoded), "skipped": skipped}
+
+# The fixtures' parts, staged as the control notebook stages them, in a reference run of the session's save.
+lake, files = Lake(), Files()
+staged = "Files/rca/inbox/20261120T172500Z-5f1c0e7a-0001.json"
+files.add(staged, json.dumps(PARAMETER))
+first, ns = run(lake, files, evidence_file=staged, reference=True)
+mismatches, others, dates, leaks = [], [], [], []
+answers = {value for document in DOCUMENTS.values() for row in expected(document).get("rca_answer_key", [])
+           for value in (row["scenario"], row["scenario_run_id"])}
+for document_id, document in DOCUMENTS.items():
+    for name, rows in expected(document).items():
+        written = [row for row in lake.tables[name] if row["document_id"] == document_id]
+        if len(written) != len(rows):
+            mismatches.append("%s %s: %d rows, not %d" % (document_id, name, len(written), len(rows)))
+            continue
+        for want, got in zip(rows, written):
+            if {column: plain(got[column]) for column in want} != want:
+                mismatches.append("%s %s: a row differs" % (document_id, name))
+            if any(got[column["name"]] is not None for column in spec[name]["columns"] if column["name"] not in want):
+                mismatches.append("%s %s: a column the document left out isn't null" % (document_id, name))
+            if got["run_id"] != "session-" + SID:
+                others.append(got["run_id"])
+            primary = got[spec[name]["primaryTime"]]
+            if got["report_date_utc"] != primary.date():
+                dates.append("%s %s" % (name, got["report_date_utc"]))
+for name, rows in lake.tables.items():
+    if name in ns["RCA_DETECTION_TABLES"]:
+        leaks += sorted({str(value) for row in rows for value in row.values() if value in answers})
+first.update(mismatches=mismatches, otherRunIds=sorted(set(others)), badDates=dates, leaks=leaks,
+             answerKeyRows=len(lake.tables["rca_answer_key"]),
+             expectedCounts={name: sum(len(expected(document).get(name, [])) for document in DOCUMENTS.values()) for name in spec})
+report["fixtures"] = first
+
+# The same evidence again, inline: each document once, its earlier rows deleted first.
+again, _ = run(lake, files, evidence=json.dumps(PARAMETER))
+again["deleted"] = sum(int(entry.split()[-1]) for entry in lake.log if entry.startswith("delete rca_"))
+report["again"] = again
+
+# A document with a missing part, one whose SHA-256 doesn't match, and a newer version's, beside one that's whole.
+parts = list(PARAMETER["parts"])
+t4 = "20261120T170000Z-sqlvm01-0002"
+missing = [part for part in parts if not part.startswith("DBHUBDEMO-RCA 1 %s 2/" % t4)]
+report["missing"] = run(Lake(), Files(), evidence=evidence(missing))[0]
+corrupt = [re.sub(r" ([0-9a-f]{64}) ", " " + "0" * 64 + " ", part) if t4 in part else part for part in parts]
+report["corrupt"] = run(Lake(), Files(), evidence=evidence(corrupt))[0]
+newer = copy.deepcopy(DOCUMENTS[t4])
+newer["version"] = 2
+report["newerDocument"] = run(Lake(), Files(), evidence=evidence([part for part in parts if t4 not in part] + encode(newer)))[0]
+report["newerParameter"] = run(Lake(), Files(), evidence=evidence(parts, version=2))[0]
+report["otherSession"] = run(Lake(), Files(), session_id="f" * 32, evidence=evidence(parts))[0]
+report["unreadable"] = run(Lake(), Files(), evidence=evidence(parts + ["DBHUBDEMO-RCA 2 something else"]))[0]
+
+# A secret-looking string in a document is redacted before it's written; a document passed inline is read the same way.
+leaky = copy.deepcopy(DOCUMENTS["20261120T165000Z-sqlvm01-0001"])
+token = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
+first_statement = next(value for value in leaky["tables"]["rca_sessions"]["columns"]["statement_text"] if value is not None)
+leaky["strings"][first_statement] = "SELECT 1 -- " + token
+lake = Lake()
+report["redacted"] = run(lake, Files(), evidence=evidence(encode(leaky)))[0]
+report["redacted"]["statement"] = next(row["statement_text"] for row in lake.tables["rca_sessions"] if row["statement_text"] is not None)
+
+# Nothing passed: Not selected, no RCA row and no finding, and the eight tables all the same, so the model frames them.
+lake = Lake()
+report["none"] = run(lake, Files())[0]
+report["none"]["tables"] = sorted(name for name in lake.tables if name.startswith("rca_"))
+
+# The staged file: one outside the inbox isn't read; one that SAVE_RESULTS False leaves stays; a day-old one goes.
+files = Files()
+files.add("Files/other.json", json.dumps(PARAMETER))
+report["outside"] = run(Lake(), files, evidence_file="Files/other.json")[0]
+files = Files()
+files.add(staged, json.dumps(PARAMETER))
+report["unsaved"] = run(Lake(), files, evidence_file=staged, save=False)[0]
+files = Files()
+now = dt.datetime.now(dt.timezone.utc)
+old = "Files/rca/inbox/%s-5f1c0e7a-0009.json" % (now - dt.timedelta(days=2)).strftime("%Y%m%dT%H%M%SZ")
+recent = "Files/rca/inbox/%s-5f1c0e7a-0010.json" % (now - dt.timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+for name in (old, recent, "Files/rca/inbox/notes.txt"):
+    files.add(name, "{}")
+report["sweep"] = run(Lake(), files)[0]
+report["sweep"]["old"], report["sweep"]["recent"] = old, recent
+
+# RCA_ONLY: an earlier session's evidence alone, under its session's run ID; nothing else is written, and the run ends.
+lake, files = Lake(), Files()
+files.add(staged, json.dumps(PARAMETER))
+only, _ = run(lake, files, evidence_file=staged, rca_only=True)
+only["runIds"] = sorted({row["run_id"] for name in spec for row in lake.tables.get(name, [])})
+report["rcaOnly"] = only
+print(json.dumps(report, default=str))
+'@
+            $PSNativeCommandUseErrorActionPreference = $false
+            $output = & $pandasPython $script $live.Path $repoRoot 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw ('The RCA evidence script failed: {0}' -f ($output -join "`n"))
+            }
+            $rcaReport = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        }
+    }
+
+    It 'has one helpers cell for it, which makes no network call and reads no secret' {
+        $part4.Count | Should -Be 1
+        $part4[0].Source | Should -Not -Match 'requests\.|get_token\(|getToken\(|getSecret\(|KEY_VAULT|vault\.azure\.net'
+        foreach ($url in [regex]::Matches($part4[0].Source, 'https://[^\s)"]+')) {
+            $url.Value | Should -Match '^https://learn\.microsoft\.com/'
+        }
+    }
+
+    It 'mirrors rca/history-tables.json: the eight tables, their columns and types in order, the required ones, the primary times, and the notebook''s columns' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $tables = $rcaReport['contract']['tables']
+        @($tables.Keys) | Should -Be @($contract['tables'] | ForEach-Object { $_['name'] })
+        foreach ($table in $contract['tables']) {
+            $name = $table['name']
+            $mine = $tables[$name]
+            $mine['role'] | Should -Be ($(if ($table['role'] -eq 'answerKey') { 'answerKey' } else { 'detection' })) -Because $name
+            $mine['primary'] | Should -Be $table['primaryTime'] -Because $name
+            @($mine['columns'] | ForEach-Object { $_ -join ':' }) | Should -Be @($table['columns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] }) -Because $name
+            @($mine['required']) | Should -Be @($table['columns'] | Where-Object { $_['required'] } | ForEach-Object { $_['name'] }) -Because $name
+            $notebookColumns = @($contract['notebookColumns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] })
+            @($rcaReport['contract']['tableColumns'][$name] | ForEach-Object { $_ -join ':' }) | Should -Be @($notebookColumns[0..1] + @($table['columns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] }) + $notebookColumns[2]) -Because $name
+            @($rcaReport['contract']['dateSources'][$name]) | Should -Be @($table['primaryTime']) -Because $name
+        }
+        @($contract['purge']) | Should -Be @($tables.Keys)
+    }
+
+    It 'decodes the fixtures'' parts into the fixture documents, and writes their rows once to the right tables, the answer key only to rca_answer_key' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $rcaReport['decode']['same'] | Should -BeTrue
+        @($rcaReport['decode']['skipped']) | Should -BeNullOrEmpty
+        $fixtures = $rcaReport['fixtures']
+        $fixtures['status'] | Should -Be 'Pass'
+        $fixtures['message'] | Should -Match '^Wrote 2 evidence document\(s\) from sqlvm01 \(T1, T4, T4-replica; 2026-11-20 16:50 to 17:20 UTC\): \d+ detection row\(s\)\.$'
+        @($fixtures['documents']) | Should -Be @('20261120T165000Z-sqlvm01-0001', '20261120T170000Z-sqlvm01-0002')
+        @($fixtures['mismatches']) | Should -BeNullOrEmpty
+        @($fixtures['otherRunIds']) | Should -BeNullOrEmpty
+        @($fixtures['badDates']) | Should -BeNullOrEmpty
+        foreach ($name in $fixtures['expectedCounts'].Keys) {
+            [int]$fixtures['counts'][$name] | Should -Be ([int]$fixtures['expectedCounts'][$name]) -Because $name
+        }
+        $fixtures['answerKeyRows'] | Should -BeGreaterThan 0
+        # Blind detection: no detection row holds a scenario or an injected run's ID, which only rca_answer_key has.
+        @($fixtures['leaks']) | Should -BeNullOrEmpty
+        # The finding (analysis_findings, which the answer key's side reads), and the reference run's exit value.
+        @($fixtures['findings'] | ForEach-Object { $_[0..1] -join ' ' }) | Should -Be @('Pass all')
+        $fixtures['findings'][0][2] | Should -BeExactly ('RCA.EVIDENCE: ' + $fixtures['message'])
+        @($fixtures['exits']) | Should -Be @('RCA.EVIDENCE Pass: ' + $fixtures['message'])
+        # The staged file was read once and deleted, and the inbox with it.
+        @($fixtures['reads']) | Should -Be @('Files/rca/inbox/20261120T172500Z-5f1c0e7a-0001.json')
+        @($fixtures['left']) | Should -BeNullOrEmpty
+    }
+
+    It 'writes each document once: a second save of the same evidence deletes its earlier rows first' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $again = $rcaReport['again']
+        $again['status'] | Should -Be 'Pass'
+        foreach ($name in $rcaReport['fixtures']['counts'].Keys) {
+            $again['counts'][$name] | Should -Be $rcaReport['fixtures']['counts'][$name] -Because $name
+        }
+        $again['deleted'] | Should -Be (($rcaReport['fixtures']['counts'].Values | Measure-Object -Sum).Sum)
+    }
+
+    It 'skips a document with a missing part, a bad SHA-256, a newer version, or another session, and says why' -ForEach @(
+        @{ Case = 'missing'; Written = 1; Why = 'part\(s\) 2 of 2 are missing' }
+        @{ Case = 'corrupt'; Written = 1; Why = 'SHA-256 doesn''t match' }
+        @{ Case = 'newerDocument'; Written = 1; Why = 'version 2 is newer than this notebook''s 1 \(\./scripts/deploy\.ps1 updates the notebook\)' }
+        @{ Case = 'newerParameter'; Written = 0; Why = 'version 2 is newer than this notebook''s 1' }
+        @{ Case = 'otherSession'; Written = 0; Why = 'it''s session 5f1c0e7a''s evidence, not this run''s \(ffffffff\)' }
+        @{ Case = 'unreadable'; Written = 2; Why = '1 part line\(s\) that part format 1 doesn''t describe' }
+    ) {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $result = $rcaReport[$Case]
+        $result['status'] | Should -Be 'Warning'
+        $result['message'] | Should -Match $Why
+        @($result['documents']).Count | Should -Be $Written
+        if ($Written -eq 1) {
+            # The whole document is written; the other one isn't, not even in part.
+            @($result['documents']) | Should -Be @('20261120T165000Z-sqlvm01-0001')
+            $result['counts']['rca_replica'] | Should -Be 0
+        }
+        @($result['findings'] | ForEach-Object { $_[0] }) | Should -Be @('Warning')
+    }
+
+    It 'redacts a value that looks like a secret, and reads evidence passed inline the same way' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $rcaReport['redacted']['status'] | Should -Be 'Pass'
+        $rcaReport['redacted']['statement'] | Should -BeExactly 'SELECT 1 -- [REDACTED:jwt]'
+    }
+
+    It 'is Not selected without evidence, and still creates the eight tables, so the history model frames them' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $none = $rcaReport['none']
+        $none['status'] | Should -Be 'Not selected'
+        @($none['findings']) | Should -BeNullOrEmpty
+        @($none['exits']) | Should -BeNullOrEmpty
+        @($none['tables']) | Should -Be @($contract['purge'] | Sort-Object)
+        foreach ($name in $contract['purge']) {
+            $none['counts'][$name] | Should -Be 0 -Because $name
+        }
+    }
+
+    It 'reads only a file in Files/rca/inbox, keeps one that SAVE_RESULTS False didn''t write, and deletes a day-old one a failed run left' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $outside = $rcaReport['outside']
+        $outside['status'] | Should -Be 'Warning'
+        $outside['message'] | Should -Match 'RCA_EVIDENCE_FILE must name a file in Files/rca/inbox'
+        @($outside['reads']) | Should -BeNullOrEmpty
+        @($outside['left']) | Should -Be @('Files/other.json')
+
+        $unsaved = $rcaReport['unsaved']
+        $unsaved['status'] | Should -Be 'Not selected'
+        @($unsaved['left']) | Should -Contain 'Files/rca/inbox/20261120T172500Z-5f1c0e7a-0001.json'
+
+        # Any run sweeps the inbox: only the notebook's own names, and only after a day.
+        $sweep = $rcaReport['sweep']
+        $sweep['status'] | Should -Be 'Not selected'
+        @($sweep['left']) | Should -Not -Contain $sweep['old']
+        @($sweep['left']) | Should -Contain $sweep['recent']
+        @($sweep['left']) | Should -Contain 'Files/rca/inbox/notes.txt'
+    }
+
+    It 'writes only the RCA evidence with RCA_ONLY, under its session''s run ID, and ends the run with RCA.EVIDENCE' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $only = $rcaReport['rcaOnly']
+        $only['status'] | Should -Be 'Pass'
+        @($only['runIds']) | Should -Be @('session-5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21')
+        $only['telemetry'] | Should -Be 0
+        @($only['exits']) | Should -Be @('RCA.EVIDENCE Pass: ' + $only['message'])
+        @($only['left']) | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Report tables for the Power BI history report (Phase 19)' {
     BeforeAll {
         $deployment = Get-Notebook -Name 'NB_DatabaseHub_Deployment'
@@ -1652,10 +2180,12 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         }
     }
 
-    It 'prepares the report tables in the persist cell, after both writes and only when SAVE_RESULTS is True' {
+    It 'prepares the report tables in the persist cell, after the RCA evidence and both writes, and only when SAVE_RESULTS is True' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+else:'
+        # The RCA evidence first, so its RCA.EVIDENCE finding is saved with the others (ADR 0031); a reference run that was
+        # passed evidence ends with RCA.EVIDENCE as its exit value, after the session's rows.
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+#[^\n]*\n\s+save_rca_evidence\(\)\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+if REFERENCE_RUN and RCA_STATE\["passed"\] and _notebookutils\(\) is not None:\s+#[^\n]*\n\s+_notebookutils\(\)\.notebook\.exit\(rca_exit_value\(\)\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
@@ -1726,9 +2256,12 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         }
     }
 
-    It 'drops incident_windows in the deployment notebook''s cleanup and says the semantic model needs the tables back' {
+    It 'drops incident_windows and the Incident RCA''s eight tables in the deployment notebook''s cleanup and says the semantic model needs the tables back' {
         $cleanup = @($deployment.Code | Where-Object { $_.Source -match '^# RESOURCE-CHANGING CELL: drops' })[0].Source
-        $cleanup | Should -Match 'DEMO_TABLES = \("validation_results", "scenario_runs", "telemetry_snapshots", "analysis_findings", "incident_windows"\)'
+        $tables = @([regex]::Matches([regex]::Match($cleanup, '(?s)DEMO_TABLES = \((.*?)\)\n').Groups[1].Value, '"(\w+)"') | ForEach-Object { $_.Groups[1].Value })
+        $purge = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purge
+        $tables | Should -Be (@('validation_results', 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows') + @($purge))
+        $cleanup | Should -Match 'DEMO_FOLDERS = \("Files/rca",\)'
         $cleanup | Should -Match 'SM_DatabaseHub_History'
         $cleanup | Should -Match 'NB_DatabaseHub_LiveActivity runs with SAVE_RESULTS = True and recreates the tables'
     }
