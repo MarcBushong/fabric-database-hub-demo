@@ -14,9 +14,12 @@ internal sealed class SqlCaptureConnector(TargetEndpoint endpoint, RunnerLog log
 {
     // Permission denied on a server or database permission, an object, or a DMV (VIEW SERVER PERFORMANCE STATE,
     // VIEW DATABASE STATE, CREATE or ALTER ANY EVENT SESSION): 297, 300, 262, 229, 230, 15151, 15247, 916.
+    // https://learn.microsoft.com/sql/relational-databases/errors-events/database-engine-events-and-errors
     private static readonly HashSet<int> PermissionErrors = [297, 300, 262, 229, 230, 15151, 15247, 916];
 
-    // The client's command timeout (-2) and a lock timeout (1222, LOCK_TIMEOUT 1000).
+    // The client's command timeout (-2, SqlCommand.CommandTimeout) and a lock timeout (1222, SET LOCK_TIMEOUT 1000):
+    // https://learn.microsoft.com/dotnet/api/microsoft.data.sqlclient.sqlcommand.commandtimeout and
+    // https://learn.microsoft.com/sql/t-sql/statements/set-lock-timeout-transact-sql
     private static readonly HashSet<int> TimeoutErrors = [-2, 1222];
 
     public string Description => endpoint.Describe();

@@ -12,7 +12,8 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// detail (RCA-SQL-01, 02 every 10 s) until 60 s without one; an error rate's jump takes one RCA-SQL-01 sample; a
 /// deadlock count that rose with no graph reads system_health (RCA-SQL-12, T1 and T2). On T3, RCA-AZ-01 every 30
 /// minutes and at the end. The event session ContosoCare_RCA is created at the start (after dropping one left behind)
-/// and dropped at the end (ADR 0010's amendment).
+/// and dropped at the end (ADR 0010's amendment). On T3 it's database-scoped
+/// (https://learn.microsoft.com/azure/azure-sql/database/xevent-db-diff-from-svr).
 /// </summary>
 internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, ICaptureConnector connector, ObserverOptions options, RunnerLog log)
     : TargetObserver(target, gate, connector, options, log, FixFor(gate))
