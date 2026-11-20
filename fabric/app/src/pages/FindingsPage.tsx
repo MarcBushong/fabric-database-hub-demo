@@ -165,8 +165,10 @@ export default function FindingsPage() {
     // Whether Database Hub refuses the app as a whole takes every view, health's too (cached and shared, R924).
     const health = useLiveEstate("health");
     const liveOff = liveOffOf([inventory, health, security]);
-    // One of the two views behind the security checks came back without data: its part is missing, not clean.
-    const securityPartial = !security.loading && !inventory.loading && (security.answer === null) !== (inventory.answer === null);
+    // Until both views behind the security checks have answered (the warnings, and the resources' own checks in the
+    // inventory), the count is partial, never a clean pass: one is still being read, or came back without data.
+    const securityWaiting = security.answer === null ? security : inventory;
+    const securityPartial = (security.answer === null) !== (inventory.answer === null) ? (securityWaiting.loading ? "part of Database Hub is still being read" : "part of Database Hub didn't answer") : null;
     const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), liveDataOf(inventory.answer)) : null), [security.answer, inventory.answer]);
     const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(liveDataOf(inventory.answer)) : null), [inventory.answer]);
     const hubUrl = hubUrlOf(runtime);
@@ -194,8 +196,8 @@ export default function FindingsPage() {
                     const liveRows = c.id === "security" ? liveSecurity : c.id === "optimization" ? liveOptimization : null;
                     if (liveRows) {
                         const needs = liveRows.filter((r) => r.attention === "Needs attention").length;
-                        const partial = c.id === "security" && securityPartial;
-                        return <KpiTile key={c.id} label={`${c.label} \u00b7 live`} value={String(needs)} sub={`need attention in Database Hub, ${liveRows.length - needs} recommended${partial ? "; partial: part of Database Hub didn't answer" : ""}`} status={needs > 0 ? "Warning" : partial ? null : "Pass"} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} checks`} />;
+                        const partial = c.id === "security" ? securityPartial : null;
+                        return <KpiTile key={c.id} label={`${c.label} \u00b7 live`} value={String(needs)} sub={`need attention in Database Hub, ${liveRows.length - needs} recommended${partial ? `; partial: ${partial}` : ""}`} status={needs > 0 ? "Warning" : partial ? null : "Pass"} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} checks`} />;
                     }
                     return <KpiTile key={c.id} label={c.label} value={String(count(c.id))} sub={c.description} status={worstStatus(rows.filter((r) => r.category === c.id && r.statusSort <= 3).map((r) => r.status))?.name ?? null} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} findings`} />;
                 })}
