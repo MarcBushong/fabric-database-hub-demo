@@ -375,7 +375,21 @@ describe("the postmortem", () => {
         expect(markdown).not.toContain("every signal showed and recovered");
         expect(markdown).toContain("- **Deep blocking chain and lock escalation on T1 has no recovery time:** The next fault with this signal began first.");
         expect(markdown).toContain("- **Reporting (T4), CPU from 13:35 UTC, has no recovery time:** Its metrics break off after 13:45 UTC, so its recovery isn't in the capture.");
-        expect(buildPostmortem({ ...input, scores: [], episodes: [], beat: null }).markdown).toContain("- None from the data: nothing was injected or measured in this window.");
+        expect(buildPostmortem({ ...input, plan: { ...plan, faults: [] }, scores: [], episodes: [], beat: null }).markdown).toContain("- None from the data: nothing was injected or measured in this window.");
+    });
+
+    it("reads what was injected from the plan: faults the telemetry couldn't score are not measured, never 'nothing was injected'", () => {
+        const unscored = { ...input, scores: [], episodes: [], beat: null };
+        const { markdown } = buildPostmortem(unscored);
+        expect(markdown).not.toMatch(/No fault was injected|Nothing was injected|nothing was injected/);
+        expect(markdown).toContain("- 4 faults injected by the demo's session control on T1, T2, T3 (Scenario Runs) aren't measured here: the telemetry didn't load.");
+        expect(markdown).toContain("| 13:30 | T1 | Injected | Deep blocking chain and lock escalation on T1 (not measured) |");
+        expect(markdown).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
+        expect(markdown).toContain("- **The telemetry didn't load, so its 4 faults aren't measured:** select Retry on the page, then write the postmortem again.");
+        // Copilot gets the same faults, each marked not measured, rather than no rows at all.
+        const ctx = postmortemAsk(unscored);
+        expect(ctx.totalRows).toBe(4);
+        expect(ctx.rows?.[0]).toMatchObject({ target: "T1", fault: "Deep blocking chain and lock escalation", visible: null, evidence: "Not measured: the telemetry didn't load." });
     });
 
     it("hands Copilot the template, the measured rows, and the queries through the ask contract", () => {

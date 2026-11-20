@@ -4,12 +4,26 @@
 // viewer's own Copilot through the app's existing ask contract (useCopilot().ask), with a structured template.
 
 import type { AskContext, DataProvenance } from "@/copilot/contract";
-import type { AgentBeat } from "@/data/model";
+import type { AgentBeat, SessionRun } from "@/data/model";
 import type { ColumnSpec, QuerySpec } from "@/data/queries";
 import { buildAskContext, joinDax } from "./ask";
 import { serviceOf } from "./business";
 import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc } from "./format";
-import { boundText, EVENT_LABEL, minutesText, planEvents, RECOVERED_BINS, shortSessionId, summarize, TELEMETRY_LAG_MINUTES, type FaultScore, type MeasuredEpisode, type Plan } from "./scoreboard";
+import {
+    boundText,
+    EVENT_LABEL,
+    minutesText,
+    planEvents,
+    RECOVERED_BINS,
+    scenarioOf,
+    scenarioTitle,
+    shortSessionId,
+    summarize,
+    TELEMETRY_LAG_MINUTES,
+    type FaultScore,
+    type MeasuredEpisode,
+    type Plan,
+} from "./scoreboard";
 
 export interface PostmortemInput {
     plan: Plan;
@@ -61,6 +75,19 @@ function serviceName(target: string): string {
     return serviceOf(target)?.service ?? target;
 }
 
+/**
+ * The plan's faults when none is scored. What was injected is the plan's (Scenario Runs) and what showed is the scores',
+ * and a plan is scored whole (scorePlan) or not at all: a plan with faults and no scores wasn't measured, because its
+ * telemetry didn't load. That's never "nothing was injected".
+ */
+function unscoredOf(plan: Plan, scores: readonly FaultScore[]): SessionRun[] {
+    return scores.length === 0 ? plan.faults : [];
+}
+
+const faultTitle = (run: SessionRun) => scenarioTitle(scenarioOf(run));
+
+const NOT_MEASURED = "Not measured: the telemetry didn't load.";
+
 /** The postmortem's file name: letters, digits, and dashes only. */
 export function postmortemFileName(plan: Plan, generatedAt: Date): string {
     const id = (plan.kind === "session" ? shortSessionId(plan.key) : plan.key).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "plan";
@@ -81,13 +108,19 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     );
 
     lines.push("## Summary", "");
-    if (scores.length === 0) lines.push("- No fault was injected in this window: Scenario Runs has no incident request in it.");
-    else {
+    const unscored = unscoredOf(plan, scores);
+    const injected = scores.length + unscored.length;
+    if (injected === 0) lines.push("- No fault was injected in this window: Scenario Runs has no incident request in it.");
+    if (scores.length > 0) {
         const targets = [...new Set(scores.map((s) => s.target))].sort().join(", ");
         lines.push(
             `- ${scores.length} fault${scores.length === 1 ? "" : "s"} injected by the demo's session control on ${targets} (Scenario Runs); ${summary.visible} had their signal visible in the telemetry${summary.notVisible ? `, ${summary.notVisible} didn't` : ""}${summary.unmeasured ? `, and ${summary.unmeasured} had no signal the history measures` : ""}.`,
         );
         lines.push(`- Median time to detect: ${minutesText(summary.ttdMedian)}. Median time to recover: ${minutesText(summary.ttrMedian)}.`);
+    }
+    if (unscored.length > 0) {
+        const targets = [...new Set(unscored.map((r) => r.target))].sort().join(", ");
+        lines.push(`- ${unscored.length} fault${unscored.length === 1 ? "" : "s"} injected by the demo's session control on ${targets} (Scenario Runs) ${unscored.length === 1 ? "isn't" : "aren't"} measured here: the telemetry didn't load.`);
     }
     if (beat?.regressAt && beat.respondAt) {
         const cpu = beat.cpuBefore !== null && beat.cpuAfter !== null ? `; ${beat.target}'s CPU fell from ${formatNumber(beat.cpuBefore, "percent")} to ${formatNumber(beat.cpuAfter, "percent")}` : "";
@@ -100,9 +133,13 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("");
 
     lines.push("## Timeline (UTC)", "");
-    const events = planEvents(scores, episodes);
-    if (events.length === 0) lines.push("No event in this window.");
-    else lines.push(...table(["Time", "Target", "Event", "Detail"], events.map((e) => [time(e.at), e.target, EVENT_LABEL[e.kind], e.label])));
+    const timeline = [
+        ...planEvents(scores, episodes).map((e) => ({ at: e.at, row: [time(e.at), e.target, EVENT_LABEL[e.kind], e.label] })),
+        // A fault that isn't measured still has its injection, from Scenario Runs.
+        ...unscored.map((r) => ({ at: r.windowStart ?? plan.start, row: [time(r.windowStart), r.target, EVENT_LABEL.injected, `${faultTitle(r)} on ${r.target} (not measured)`] })),
+    ].sort((a, b) => a.at.getTime() - b.at.getTime());
+    if (timeline.length === 0) lines.push("No event in this window.");
+    else lines.push(...table(["Time", "Target", "Event", "Detail"], timeline.map((t) => t.row)));
     lines.push("");
 
     const impacts = [
@@ -110,17 +147,18 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         ...episodes.map((e) => ({ at: e.visibleAt, target: e.target, impact: e.impact })),
     ].sort((a, b) => a.at.getTime() - b.at.getTime());
     lines.push("## Impact on ContosoCare", "");
-    if (impacts.length === 0) lines.push("No measured impact: no signal showed in this window.");
+    if (impacts.length === 0) lines.push(unscored.length > 0 ? NOT_MEASURED : "No measured impact: no signal showed in this window.");
     else lines.push(...table(["Service", "Target", "What it felt", "Measured signal"], impacts.map((i) => [i.impact.service, i.target, i.impact.headline.replace(/^[^:]+:\s*/, ""), i.impact.evidence])));
     lines.push("");
 
     lines.push("## Cause", "");
-    if (scores.length > 0) {
+    if (injected > 0) {
         lines.push("Every fault was injected on purpose by the demo's session control (NB_DatabaseHub_Control), bounded in time, inside the ContosoCare database only, on sessions tagged `ContosoCare.Demo/`:", "");
         for (const s of scores) lines.push(`- **${s.title}** on ${s.target} (${serviceName(s.target)}), ${time(s.injectedAt)} to ${time(s.injectedEnd)} UTC.`);
+        for (const r of unscored) lines.push(`- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`);
     }
-    if (episodes.length > 0) lines.push(`${scores.length > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
-    if (scores.length === 0 && episodes.length === 0) lines.push("Nothing was injected in this window.");
+    if (episodes.length > 0) lines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
+    if (injected === 0 && episodes.length === 0) lines.push("Nothing was injected in this window.");
     lines.push("");
 
     lines.push("## Response", "");
@@ -128,10 +166,12 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     for (const s of answered) lines.push(`- **${s.title}** on ${s.target}: ${s.answer}, at ${time(s.answeredAt)} UTC.`);
     const unanswered = scores.length - answered.length;
     if (unanswered > 0) lines.push(`- ${answered.length > 0 ? "The other" : "The"} ${unanswered} fault${unanswered === 1 ? "" : "s"} had no response step: each ended at its time limit.`);
-    if (scores.length === 0) lines.push("- No response step in this window.");
+    if (unscored.length > 0) lines.push(`- ${NOT_MEASURED}`);
+    else if (scores.length === 0) lines.push("- No response step in this window.");
     lines.push("");
 
     lines.push("## Times to detect and recover", "");
+    if (unscored.length > 0) lines.push(NOT_MEASURED, "");
     if (scores.length > 0) {
         lines.push(
             ...table(
@@ -148,6 +188,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
 
     lines.push("## Follow-ups", "");
     const follow: string[] = [];
+    if (unscored.length > 0) follow.push(`**The telemetry didn't load, so ${unscored.length === 1 ? "its fault isn't" : `its ${unscored.length} faults aren't`} measured:** select Retry on the page, then write the postmortem again.`);
     for (const s of scores.filter((x) => x.status === "Warning")) follow.push(`**${s.title} on ${s.target} wasn't visible:** ${s.note} Check ${s.target}'s telemetry on Readiness, and that the request ran (What the control ran, on Manage).`);
     for (const s of scores.filter((x) => x.status === "Pass" && x.ongoing)) follow.push(`**${s.title} on ${s.target} hadn't recovered when the telemetry ends:** check ${s.target} in Database Hub now.`);
     for (const s of scores.filter((x) => x.status === "Pass" && !x.ongoing && !x.recoveredAt)) follow.push(`**${s.title} on ${s.target} has no recovery time:** ${s.recoveryNote || s.note}`);
@@ -244,9 +285,28 @@ export function postmortemPrompt(plan: Plan): string {
     ].join(" ");
 }
 
+/** The plan's faults that weren't scored, for Copilot: injected (Scenario Runs), and not measured. */
+function unscoredRows(plan: Plan, scores: readonly FaultScore[]): Array<Record<string, unknown>> {
+    return unscoredOf(plan, scores).map((run) => ({
+        target: run.target,
+        service: serviceName(run.target),
+        fault: faultTitle(run),
+        injected: run.windowStart,
+        visible: null,
+        ttdMin: null,
+        answered: null,
+        answer: "",
+        recovered: null,
+        ttrMin: null,
+        status: "",
+        impact: "",
+        evidence: NOT_MEASURED,
+    }));
+}
+
 /** What Copilot gets: the template, the rows, and the queries, through the app's existing ask contract. */
 export function postmortemAsk(input: PostmortemInput): AskContext {
-    const rows = postmortemRows(input.scores, input.episodes);
+    const rows = [...postmortemRows(input.scores, input.episodes), ...unscoredRows(input.plan, input.scores)];
     return buildAskContext({
         title: `Postmortem: ${planTitle(input.plan)}`,
         page: "scoreboard",

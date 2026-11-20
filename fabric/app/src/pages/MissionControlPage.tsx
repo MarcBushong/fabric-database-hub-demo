@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import { Button, Link, MessageBar, MessageBarBody } from "@fluentui/react-components";
-import { DocumentText16Regular, Replay20Regular, Open16Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
+import { Replay20Regular, Open16Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { EmptyState } from "@/components/EmptyState";
@@ -23,7 +23,7 @@ import type { EstateTarget } from "@/lib/view-state";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { enterFullscreen } from "@/mission/kiosk";
 import { mapNodes } from "@/mission/nodes";
-import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
+import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import { ServiceMap, type Lens } from "@/mission/ServiceMap";
 import { SessionRibbon } from "@/mission/SessionRibbon";
@@ -89,15 +89,13 @@ export default function MissionControlPage() {
                     </div>
                     <div className="mc-actions">
                         <LensSwitch lens={lens} onChange={setLens} />
-                        <Button size="small" appearance="primary" icon={<Replay20Regular />} disabled={!plan} onClick={() => navigate("replay", { session: plan?.key ?? null })}>
+                        <Button size="small" appearance="primary" icon={<Replay20Regular />} disabled={!plan} onClick={() => navigate("replay", { session: view.session })}>
                             Replay
                         </Button>
-                        <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: plan?.key ?? null })}>
+                        <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: view.session })}>
                             Scoreboard
                         </Button>
-                        <Button size="small" icon={<DocumentText16Regular />} disabled={!plan || data.loading} onClick={openPostmortem}>
-                            Write the postmortem
-                        </Button>
+                        <PostmortemButton ready={Boolean(plan) && !data.loading} scoreError={data.scoreError} onClick={openPostmortem} />
                         <Button
                             size="small"
                             icon={<Tv20Regular />}
@@ -168,7 +166,7 @@ export default function MissionControlPage() {
                     </aside>
                 </div>
                 {plan ? (
-                    <SessionRibbon plan={plan} scores={scores} episodes={episodes} onSelect={() => navigate("scoreboard", { session: plan.key })} />
+                    <SessionRibbon plan={plan} scores={scores} episodes={episodes} onSelect={() => navigate("scoreboard", { session: view.session })} />
                 ) : data.missingSession ? (
                     <MissingSession session={data.missingSession} onAllHistory={() => setView({ window: "all" })} onLatest={() => setView({ session: null, replay: null })} />
                 ) : !data.loading ? (

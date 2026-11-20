@@ -25,9 +25,11 @@ interface Settled {
 export function useQuery(spec: QuerySpec | null): QueryState {
     const client = useContext(QueryClientContext);
     const key = spec ? `${spec.id}\n${spec.dax}` : "";
-    const [force, setForce] = useState<{ key: string; n: number }>({ key: "", n: 0 });
+    // A refetch runs the query past the cache until that run loads (`done`); from then on the cache answers again, so the
+    // query keeps refreshing each time its entry expires, as it did before the refetch.
+    const [force, setForce] = useState<{ key: string; n: number; done: boolean }>({ key: "", n: 0, done: true });
     const [settled, setSettled] = useState<Settled | null>(null);
-    const forced = force.key === key ? force.n : 0;
+    const forced = force.key === key && !force.done ? force.n : 0;
     const cached = spec && client && forced === 0 ? client.peek(spec) : undefined;
     // The last result that loaded, even past the cache's freshness: what a view keeps showing while it refreshes.
     const last = spec && client ? client.peekStale?.(spec) : undefined;
@@ -37,7 +39,9 @@ export function useQuery(spec: QuerySpec | null): QueryState {
         let cancelled = false;
         client.run(spec, { force: forced > 0 }).then(
             (data) => {
-                if (!cancelled) setSettled({ key, n: forced, data });
+                if (cancelled) return;
+                setSettled({ key, n: forced, data });
+                if (forced > 0) setForce((f) => (f.key === key && f.n === forced ? { ...f, done: true } : f));
             },
             (error: unknown) => {
                 if (!cancelled) setSettled({ key, n: forced, error: error instanceof Error ? error : new Error(String(error)) });
@@ -50,7 +54,8 @@ export function useQuery(spec: QuerySpec | null): QueryState {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [key, client, forced, cached]);
 
-    const refetch = useCallback(() => setForce((f) => ({ key, n: (f.key === key ? f.n : 0) + 1 })), [key]);
+    // `n` only grows, so a new refetch never matches an earlier run's result.
+    const refetch = useCallback(() => setForce((f) => ({ key, n: f.n + 1, done: false })), [key]);
 
     if (!spec) return { data: undefined, error: undefined, loading: false, refetch };
     if (cached) return { data: cached, error: undefined, loading: false, refetch };
