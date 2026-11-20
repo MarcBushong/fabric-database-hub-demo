@@ -490,6 +490,33 @@ Describe 'Workload bounds' {
             (Test-DemoValidationWorkloadBound -Target T1 -StdOut '...truncated output' -NowUtc $now).status | Should -Be 'Warning'
         }
     }
+
+    It 'checks the bounds from the relay''s compact form when the status it kept is cut, as during every session (F20)' {
+        InModuleScope DbHubDemo {
+            $now = [datetime]::new(2026, 10, 21, 12, 0, 0, [System.DateTimeKind]::Utc)
+            $cut = '...ns": [], "dataHeadroomMb": 1834, "host": { "status": "Pass" } }'
+            $runnerProfile = [ordered]@{ name = 'business-day'; expiresAt = '2026-10-21T22:58:00.000Z' }
+            $bounds = {
+                param([string] $Deadline, [int] $Maximum = 3600)
+                # As the relay's evidence comes back: through JSON, so its times are DateTime values.
+                ([ordered]@{ listed = 5; running = @([ordered]@{ runId = 'r1'; scenario = 'cpu-pressure'; startedAt = '2026-10-21T11:50:00.000Z'; deadlineAt = $Deadline; maxDurationSeconds = $Maximum }); demoSessions = 14 } | ConvertTo-Json -Depth 5 | ConvertFrom-Json -AsHashtable)
+            }
+            $pass = Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T12:20:00.000Z') -RunnerProfile $runnerProfile -NowUtc $now
+            $pass.status | Should -Be 'Pass'
+            $pass.message | Should -Be '1 running scenario(s) on T1, each within its deadline and maximum duration; the activity profile ''business-day'' ends at 2026-10-21 22:58:00Z.'
+            $pass.evidence.source | Should -Be 'relay'
+            $pass.evidence.demoSessions | Should -Be 14
+            ([datetime]$pass.evidence.runs[0].deadlineAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 21, 12, 20, 0, [System.DateTimeKind]::Utc))
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T10:30:00.000Z') -RunnerProfile $runnerProfile -NowUtc $now).status | Should -Be 'Warning'
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T14:20:00.000Z' 1800) -RunnerProfile $runnerProfile -NowUtc $now).status | Should -Be 'Fail'
+            # A VM whose bundle predates it, and a status too long for the relay to carry the bounds: a Warning that says which.
+            $old = Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -NowUtc $now
+            $old.status | Should -Be 'Warning'
+            $old.message | Should -Match 'bootstrap bundle predates the compact bounds'
+            $old.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which sends the VMs the current bootstrap bundle'
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -RunnerProfile $runnerProfile -BoundsCut -NowUtc $now).message | Should -Match 'too long to carry them'
+        }
+    }
 }
 
 Describe 'Workload host' {
@@ -668,6 +695,26 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
     }
 
+    It 'asks the relay for the running runs'' bounds, and checks them from a status with 5 runs, whose kept tail has none (F20)' {
+        $status = New-RunnerStatus -Runs 5
+        $script:tail = Get-RelayTail $status
+        (InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:tail } { param($T) Test-DemoValidationWorkloadBound -Target T2 -StdOut $T }).status | Should -Be 'Warning' -Because 'the kept tail alone doesn''t parse, so it was a Warning during every session'
+        $script:relayBounds = [ordered]@{ listed = 5; running = @([ordered]@{ runId = '20261103T140500-healthy-baseline'; scenario = 'healthy-baseline'; startedAt = [datetime]::UtcNow.AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ss.fffZ'); deadlineAt = [datetime]::UtcNow.AddMinutes(3).ToString('yyyy-MM-ddTHH:mm:ss.fffZ'); maxDurationSeconds = 600 }); demoSessions = 9 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail; profile = [ordered]@{ name = 'business-day'; expiresAt = '2099-11-03T21:01:12.000Z' } }
+            if ($Bounds) {
+                $evidence['bounds'] = $script:relayBounds
+            }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $bound = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.BOUNDS' }
+        $bound.status | Should -Be 'Pass'
+        $bound.evidence['source'] | Should -Be 'relay'
+        $bound.evidence['runningRuns'] | Should -Be 1
+        $bound.evidence['demoSessions'] | Should -Be 9
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 1 -Exactly -ParameterFilter { $Target -eq 'T2' -and $Bounds -and ($ArgumentList -join ' ') -eq 'status --json --runs 5' }
+    }
     It 'still reads a status with one run, which the relay keeps whole, without the relay''s profile' {
         $status = New-RunnerStatus -Runs 1
         $status.Length | Should -BeLessOrEqual 1800

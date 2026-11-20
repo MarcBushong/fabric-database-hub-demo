@@ -761,6 +761,49 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         $result.evidence.profile.name | Should -Be 'business-day'
     }
 
+    It 'Runner keeps a status''s running runs'' bounds from the whole output when the request asks, so validate.ps1 checks them during a session (F20)' {
+        $root = New-ControlRoot
+        # Five runs, two of them still Running: the kept tail has neither, and the line still fits.
+        $script:status = (New-RunnerStatus -Runs 5) -replace '("runId": "20261103T133500-io-pressure",\s+"scenario": "io-pressure",\s+"target": "T1",\s+"status": )"Completed"', '$1"Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        $result.evidence.stdout | Should -Not -Match '"description"' -Because 'the kept tail leaves the status''s top out'
+        $result.evidence.bounds.listed | Should -Be 5
+        $running = @($result.evidence.bounds.running)
+        $running.Count | Should -Be 2
+        $running.runId | Should -Be @('20261103T133500-io-pressure', '20261103T140500-healthy-baseline')
+        $running[1].scenario | Should -Be 'healthy-baseline'
+        # The test reads the line with ConvertFrom-Json, which makes its ISO 8601 times DateTime values.
+        ([datetime]$running[1].startedAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 3, 14, 5, 0, [System.DateTimeKind]::Utc))
+        ([datetime]$running[1].deadlineAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 3, 14, 13, 0, [System.DateTimeKind]::Utc))
+        $script:lines[0] | Should -Match ([regex]::Escape('"startedAt":"2026-11-03T14:05:00.000Z"'))
+        $running[1].maxDurationSeconds | Should -Be 600
+        $result.evidence.bounds.demoSessions | Should -Be 0
+        $result.evidence.PSObject.Properties['boundsCut'] | Should -BeNullOrEmpty
+
+        # Without the request's bounds, the line is as before.
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5') }) -StateRoot $root
+        (Get-ControlResult).evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+    }
+
+    It 'Runner leaves the bounds out, and says so, when the line wouldn''t fit what a Run Command keeps (F20)' {
+        $root = New-ControlRoot
+        # Every run Running, a long error output, and the longest message (a guest recovery's, for example): the bounds would
+        # push the line past its budget.
+        $script:status = (New-RunnerStatus -Runs 5) -replace '"status": "Completed"', '"status": "Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = ('warn: the profile host''s lane polled late. ' * 20) } }
+        Mock -CommandName Get-DemoVmRunnerOutcome -MockWith { [pscustomobject]@{ Status = 'Pass'; Message = ('The guest''s PowerShell Direct channel broke, and its restart cleared it. ' * 12) } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900
+        $result = Get-ControlResult
+        $result.evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+        $result.evidence.boundsCut | Should -BeTrue
+        $result.evidence.profile.name | Should -Be 'business-day'
+    }
+
     It 'Runner adds no profile for output that has none' {
         $root = New-ControlRoot
         Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[{"checkId":"WORKLOAD.T1.PROFILE.SET","status":"Pass","message":"ok"}]'; StdErr = '' } }

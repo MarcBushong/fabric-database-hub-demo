@@ -522,7 +522,7 @@ Run all in `NB_DatabaseHub_Control`, and the session control behind it (formerly
 - **`STATUS.PROFILE_<target>` couldn't read the profile:** the runner failed; the message has its error.
 - **`STOP.PROFILE_T2`, `START.PROFILE_T2`, or `STATUS.PROFILE_T2` Not selected, "T2 isn't set up yet":** the next `./scripts/deploy.ps1` finishes T2.
 - **"archost01 shows no power state (its last operation failed ...)", or `STOP.VM_ARCHOST01` notes it:** the stop deallocates it at once, since it may still bill ([states and billing](https://learn.microsoft.com/azure/virtual-machines/states-billing)).
-- **`WORKLOAD.<target>.BOUNDS` Warning, "couldn't be parsed (a Run Command keeps only the last 4,096 bytes of output)":** `WORKLOAD.<target>.HOST` still reads the host; `Invoke-DemoWorkloadCommand -Target T1 -ArgumentList status, --runs, 3` shows the runs.
+- **`WORKLOAD.<target>.BOUNDS` Warning, "couldn't be parsed (... this VM's bootstrap bundle predates the compact bounds ...)":** since 2026-11-20 (F20) the VM's relay reads the running runs' bounds from the runner's whole status, which a Run Command's 4,096 bytes can't carry during a session; a VM gets that relay with its next `./scripts/deploy.ps1`. "... too long to carry them" is rare (five running runs with a long message). Either way, `WORKLOAD.<target>.HOST` still reads the host, and `Invoke-DemoWorkloadCommand -Target T1 -ArgumentList status, --runs, 3` shows the runs.
 - **T4 had no baseline for a while after `deploy.ps1`, or while T1 ran `capacity-max`:** its refused start retries every 30 seconds; a run left Running blocks T4 until its deadline.
 
 ## Bastion, the host password, and Key Vault

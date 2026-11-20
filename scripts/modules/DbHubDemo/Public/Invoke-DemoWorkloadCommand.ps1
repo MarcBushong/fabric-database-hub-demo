@@ -39,6 +39,11 @@ function Invoke-DemoWorkloadCommand {
     retries (Set-DemoTargetProfile spends one budget across its attempts); the session control's runbooks send their
     own (ADR 0020).
 
+    .PARAMETER Bounds
+    For 'status --json' (validate.ps1's WORKLOAD.<target>.BOUNDS, F20, 2026-11-20): the VM side also returns the running
+    runs' bounds, read from the runner's whole output (the Result's evidence bounds), since the output it keeps is cut from
+    the front once the status lists two or more runs. A VM whose bootstrap bundle predates it returns none.
+
     .EXAMPLE
     Invoke-DemoWorkloadCommand -Config $config -Target T1 -ArgumentList 'status', '--json'
 
@@ -63,7 +68,9 @@ function Invoke-DemoWorkloadCommand {
         [int] $TimeoutSeconds = 1800,
 
         [ValidateRange(0, 1800)]
-        [int] $ReadySeconds = 0
+        [int] $ReadySeconds = 0,
+
+        [switch] $Bounds
     )
 
     foreach ($argument in $ArgumentList) {
@@ -80,6 +87,9 @@ function Invoke-DemoWorkloadCommand {
         return
     }
     $request = @{ target = $Target; arguments = @($ArgumentList); timeoutSeconds = $TimeoutSeconds; readySeconds = $ReadySeconds }
+    if ($Bounds) {
+        $request['bounds'] = $true
+    }
     # Issue #65: T2's relay restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
     $recoveryKey = Get-DemoRunRecoveryKey
     if ($Target -eq 'T2' -and $recoveryKey) {

@@ -433,6 +433,13 @@ function Test-DemoValidationWorkloadBound {
     WORKLOAD.<target>.BOUNDS from the runner's 'status --json' document: every running scenario has a
     deadline within its maximum duration and isn't past it, and an activity profile other than off has an
     end time (ADR 0010). Internal.
+
+    .DESCRIPTION
+    Since 2026-11-20 (F20) it reads the VM relay's compact form when it's there: -Bounds (the running runs, read from the
+    runner's whole output) and -RunnerProfile (the profile, read the same way), since the output the relay keeps is cut
+    from the front once a status lists two or more runs, so during a session the check was a Warning, never a result.
+    Without them (a VM whose bootstrap bundle predates it), it parses -StdOut as before. -BoundsCut: the relay left the
+    bounds out because the status was too long to carry them.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -444,27 +451,52 @@ function Test-DemoValidationWorkloadBound {
         [AllowEmptyString()]
         [string] $StdOut,
 
+        [AllowNull()]
+        [object] $Bounds = $null,
+
+        [AllowNull()]
+        [object] $RunnerProfile = $null,
+
+        [switch] $BoundsCut,
+
         [datetime] $NowUtc = [System.DateTime]::UtcNow
     )
 
     $checkId = 'WORKLOAD.{0}.BOUNDS' -f $Target
     $docUrl = 'https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-sessions-transact-sql'
-    $document = $null
-    $start = ([string]$StdOut).IndexOf('{')
-    $end = ([string]$StdOut).LastIndexOf('}')
-    if ($start -ge 0 -and $end -gt $start) {
-        try {
-            $document = $StdOut.Substring($start, $end - $start + 1) | ConvertFrom-Json -Depth 16
-        }
-        catch {
-            $document = $null
-        }
+    $profileNode = $null
+    $running = @()
+    $sessions = 0
+    $source = 'relay'
+    if ($null -ne $Bounds -and $null -ne $RunnerProfile) {
+        $profileNode = $RunnerProfile
+        # Get-DemoMemberList returns its array as one object: assigned, never wrapped in @().
+        $running = Get-DemoMemberList -InputObject $Bounds -Name 'running'
+        $sessions = [int](Get-DemoMemberValue -InputObject $Bounds -Name 'demoSessions')
     }
-    if ($null -eq $document -or $null -eq (Get-DemoMemberValue -InputObject $document -Name 'profile')) {
-        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Warning' -Message ('The runner''s status for {0} couldn''t be parsed (a Run Command keeps only the last 4,096 bytes of output), so the scenario bounds weren''t checked.' -f $Target) -Remediation ('Run Invoke-DemoWorkloadCommand -Target {0} -ArgumentList status, --runs, 3 and read the deadlines.' -f $Target) -DocUrl $docUrl)
+    else {
+        $source = 'status'
+        $document = $null
+        $start = ([string]$StdOut).IndexOf('{')
+        $end = ([string]$StdOut).LastIndexOf('}')
+        if ($start -ge 0 -and $end -gt $start) {
+            try {
+                $document = $StdOut.Substring($start, $end - $start + 1) | ConvertFrom-Json -Depth 16
+            }
+            catch {
+                $document = $null
+            }
+        }
+        if ($null -eq $document -or $null -eq (Get-DemoMemberValue -InputObject $document -Name 'profile')) {
+            $why = if ($BoundsCut) { 'the VM''s relay left the running runs out because the status was too long to carry them' } else { 'a Run Command keeps only the last 4,096 bytes of output, and this VM''s bootstrap bundle predates the compact bounds validate.ps1 reads since 2026-11-20' }
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Warning' -Message ('The runner''s status for {0} couldn''t be parsed ({1}), so the scenario bounds weren''t checked.' -f $Target, $why) -Evidence ([ordered]@{ boundsCut = [bool]$BoundsCut }) -Remediation ('Run ./scripts/deploy.ps1, which sends the VMs the current bootstrap bundle, then validate.ps1 -Area Workload again; or read the deadlines yourself: Invoke-DemoWorkloadCommand -Target {0} -ArgumentList status, --runs, 3.' -f $Target) -DocUrl $docUrl)
+        }
+        $profileNode = Get-DemoMemberValue -InputObject $document -Name 'profile'
+        $allRuns = Get-DemoMemberList -InputObject $document -Name 'runs'
+        $running = @($allRuns | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'status') -eq 'Running' })
+        $sessions = (Get-DemoMemberList -InputObject $document -Name 'demoSessions').Count
     }
 
-    $profileNode = Get-DemoMemberValue -InputObject $document -Name 'profile'
     $profileName = [string](Get-DemoMemberValue -InputObject $profileNode -Name 'name')
     $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $profileNode -Name 'expiresAt')
     $failures = [System.Collections.Generic.List[string]]::new()
@@ -472,8 +504,6 @@ function Test-DemoValidationWorkloadBound {
     if ($profileName -and $profileName -ne 'off' -and $null -eq $expires) {
         $warnings.Add(('the activity profile ''{0}'' has no end time' -f $profileName))
     }
-    $allRuns = Get-DemoMemberList -InputObject $document -Name 'runs'
-    $running = @($allRuns | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'status') -eq 'Running' })
     $runEvidence = [System.Collections.Generic.List[object]]::new()
     foreach ($run in $running) {
         $runId = [string](Get-DemoMemberValue -InputObject $run -Name 'runId')
@@ -489,14 +519,16 @@ function Test-DemoValidationWorkloadBound {
         elseif ($deadline -lt $NowUtc.AddMinutes(-5)) {
             $warnings.Add(('run {0} is still Running {1:N0} minutes after its deadline' -f $runId, ($NowUtc - $deadline).TotalMinutes))
         }
-        $runEvidence.Add([ordered]@{ runId = $runId; scenario = [string](Get-DemoMemberValue -InputObject $run -Name 'scenario'); deadlineAt = [string](Get-DemoMemberValue -InputObject $run -Name 'deadlineAt'); maxDurationSeconds = $maximum })
+        $runEvidence.Add([ordered]@{ runId = $runId; scenario = [string](Get-DemoMemberValue -InputObject $run -Name 'scenario'); deadlineAt = $(if ($null -ne $deadline) { $deadline.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); maxDurationSeconds = $maximum })
     }
     $evidence = [ordered]@{
         profile          = $profileName
         profileExpiresAt = if ($expires) { $expires.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { $null }
         runningRuns      = $running.Count
         runs             = $runEvidence.ToArray()
-        demoSessions     = (Get-DemoMemberList -InputObject $document -Name 'demoSessions').Count
+        demoSessions     = $sessions
+        # Where the runs came from: the relay's compact bounds (F20), or the status the relay kept.
+        source           = $source
     }
     if ($failures.Count -gt 0) {
         return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Fail' -Message ('A scenario on {0} isn''t bounded: {1}.' -f $Target, ($failures -join '; ')) -Evidence $evidence -Remediation ('Stop it: Invoke-DemoWorkloadCommand -Target {0} -ArgumentList stop; then report the run (ADR 0010).' -f $Target) -DocUrl $docUrl)

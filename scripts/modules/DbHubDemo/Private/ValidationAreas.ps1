@@ -614,7 +614,7 @@ function Invoke-DemoValidationWorkload {
             }
         }
         try {
-            $run = Invoke-DemoWorkloadCommand -Config $Context.Config -Target $target -ArgumentList @('status', '--json', '--runs', '5') -TimeoutSeconds 180 -Confirm:$false
+            $run = Invoke-DemoWorkloadCommand -Config $Context.Config -Target $target -ArgumentList @('status', '--json', '--runs', '5') -TimeoutSeconds 180 -Bounds -Confirm:$false
         }
         catch {
             $message = Protect-DemoText -Text $_.Exception.Message
@@ -627,7 +627,9 @@ function Invoke-DemoValidationWorkload {
         }
         $results.Add($commandResult)
         if ($run.Status -in 'Pass', 'Warning') {
-            $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut))
+            # The relay's evidence: the running runs' bounds and the profile, both read from the runner's whole output (F20).
+            $relayEvidence = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence'
+            $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut -Bounds (Get-DemoMemberValue -InputObject $relayEvidence -Name 'bounds') -RunnerProfile (Get-DemoMemberValue -InputObject $relayEvidence -Name 'profile') -BoundsCut:([bool](Get-DemoMemberValue -InputObject $relayEvidence -Name 'boundsCut'))))
             # The relay reads the profile from the runner's whole output, which the cut stdout no longer shows once the status
             # lists two or more runs (re-review of PR 16, 2026-11-04).
             $runnerProfile = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence') -Name 'profile'
