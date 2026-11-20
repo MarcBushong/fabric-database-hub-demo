@@ -11,7 +11,8 @@ function Get-DemoDeploymentState {
     those hashes), NetworkMode, T3UseFreeLimit ($null when unknown), T3AdminGroupName, BastionExpiresUtc,
     HostPasswordUtc, TrackT1, TrackT2, TrackT4, and TrackFabric (the last step each parallel track finished, ADR 0018),
     FabricSha256 (the Fabric content the Fabric step last published in full, in the DbHubFabricSha256 tag; 2026-11-16,
-    Get-DemoFabricContentReopen),
+    Get-DemoFabricContentReopen), AppControlNotebookId (the NB_DatabaseHub_Control item ID the Insights app's Manage was
+    last deployed with, empty when it had none, in the DbHubAppControlNotebook tag; 2026-11-19, Get-DemoInsightsAppManageGap),
     T2Source (golden or build), FabricCapacityResumed and FabricCapacityResumedUtc (the capacity start-demo.ps1 resumed
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid; while it's still set after that, the guided stop's cleanup didn't finish and its Bastion
@@ -79,6 +80,7 @@ function Get-DemoDeploymentState {
         TrackT4           = & $read 'TrackT4'
         TrackFabric       = & $read 'TrackFabric'
         FabricSha256      = (& $read 'FabricSha256').ToLowerInvariant()
+        AppControlNotebookId = (& $read 'AppControlNotebookId').ToLowerInvariant()
         T2Source          = & $read 'T2Source'
         FabricCapacityResumed    = & $read 'FabricCapacityResumed'
         FabricCapacityResumedUtc = & $read 'FabricCapacityResumedUtc'

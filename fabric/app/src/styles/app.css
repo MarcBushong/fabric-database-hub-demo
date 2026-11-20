@@ -1846,6 +1846,13 @@ button.kpi-main:hover {
     justify-content: center;
 }
 
+/* The recommended tier and size, when the assessment saved at deploy names one. */
+.migration-size {
+    color: var(--colorNeutralForeground3);
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: var(--fontSizeBase200);
+}
+
 .migration-empty {
     display: grid;
     gap: 6px;

@@ -9,6 +9,7 @@ import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import type { ColumnSpec, QuerySpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
+import { liveRouteLines, liveRoutes } from "@/data/live-estate";
 import { buildAskContext } from "@/lib/ask";
 import { copyText } from "@/lib/clipboard";
 import { csvFileName, downloadText, toCsv } from "@/lib/csv";
@@ -52,8 +53,10 @@ export interface VisualCardProps {
     askPrompt?: string;
     /** Hide the provenance chip (a page that says it once already). */
     quiet?: boolean;
-    /** Live data from Database Hub instead of the history: when it was read, the API calls that answered, and the ones that failed. */
+    /** Live data from Database Hub instead of the history: when it was read, the API calls behind it, and their failures (counted, never shown). */
     live?: LiveSource | null;
+    /** Data saved outside the history model, such as T2's migration assessment read from Azure at deploy time (R924): when, and its label and tooltip. */
+    saved?: { at: string; label: string; tip: string } | null;
     children: ReactNode;
 }
 
@@ -93,6 +96,9 @@ export function VisualCard(props: VisualCardProps) {
     const specs = props.specs.filter((s): s is QuerySpec => Boolean(s));
     const rows = props.table?.rows ?? [];
     const csvText = () => (props.table ? toCsv(props.table.columns, props.table.rows) : "");
+    const partial = props.live && props.live.errors.length > 0 ? liveRoutes(props.live.source, props.live.errors) : null;
+    // Saved data (not the history model's) is history to Copilot, as of when it was saved, with no DAX or filters behind it.
+    const own = props.live ? { provenance: "live" as const, at: props.live.at } : props.saved ? { provenance: "history" as const, at: props.saved.at } : null;
 
     const ask = () =>
         copilot.ask(
@@ -100,14 +106,14 @@ export function VisualCard(props: VisualCardProps) {
                 title: props.title,
                 page: view.page,
                 visualId: props.id,
-                specs: props.live ? [] : specs,
+                specs: own ? [] : specs,
                 rows: props.table?.rows,
                 columns: props.table?.columns,
                 prompt: props.askPrompt,
-                provenance: props.live ? "live" : provenance,
-                meta: props.live ? null : meta,
-                asOf: props.live?.at,
-                ...(props.live ? {} : { filters, window: view.window }),
+                provenance: own ? own.provenance : provenance,
+                meta: own ? null : meta,
+                asOf: own?.at,
+                ...(own ? {} : { filters, window: view.window }),
             }),
         );
 
@@ -185,7 +191,7 @@ export function VisualCard(props: VisualCardProps) {
                         <strong>Database Hub API</strong> · read-only calls through the app's function, scoped to the demo's resource groups
                     </p>
                     <pre className="vcard-routes" aria-label="Database Hub API">
-                        {[...props.live.source, ...props.live.errors.map((e) => `failed: ${e}`)].join("\n")}
+                        {liveRouteLines(props.live.source, props.live.errors)}
                     </pre>
                 </div>
             ) : null}
@@ -222,7 +228,11 @@ export function VisualCard(props: VisualCardProps) {
             {props.live ? (
                 <footer className="vcard-foot">
                     <ProvenanceBadge provenance="live" asOf={new Date(props.live.at)} />
-                    {props.live.errors.length > 0 ? <span className="vcard-partial">{`Partial: ${props.live.errors.length} of ${props.live.source.length + props.live.errors.length} API calls failed`}</span> : null}
+                    {partial ? <span className="vcard-partial">{`Partial: ${partial.failed.length} of ${partial.called.length} Database Hub calls didn't answer`}</span> : null}
+                </footer>
+            ) : props.saved ? (
+                <footer className="vcard-foot">
+                    <ProvenanceBadge provenance="history" asOf={new Date(props.saved.at)} label={props.saved.label} tip={props.saved.tip} />
                 </footer>
             ) : !props.quiet && (props.fetchedAt || provenance !== "history") ? (
                 <footer className="vcard-foot">

@@ -36,7 +36,7 @@ BeforeAll {
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); AppControlNotebookId = ''; Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -1225,6 +1225,22 @@ Describe 'Invoke-DemoDeployment' {
         Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 2 -Exactly -Because 'only the two runs above started it'
         $script:order | Should -Not -Contain 'App'
+    }
+
+    It 'puts the session control''s notebook in Fabric before the Insights app''s step, so a first deployment''s Manage has its IDs, and records them (-Sequential, 2026-11-19)' {
+        # The final tests' net-new run: the app's step read NB_DatabaseHub_Control's IDs before the control's Fabric part
+        # put the notebook in Fabric, so Manage copied each request ("Manage's function is missing NB_DatabaseHub_Control").
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith { $script:order.Add(('Control:{0}' -f $Part)) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            $script:order.Add('App')
+            New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric'
+            New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Manage sends its actions from the app.' -Evidence ([ordered]@{ controlNotebookId = 'ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB'; nonBlocking = 'insightsApp' })
+        }
+        $script:state = New-TestState
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:order.IndexOf('Control:Fabric') | Should -BeGreaterThan $script:order.IndexOf('PowerBI') -Because 'the workspace exists by then'
+        $script:order.IndexOf('Control:Fabric') | Should -BeLessThan $script:order.IndexOf('App')
+        @($script:recorded | Where-Object { $_.Contains('AppControlNotebookId') })[-1]['AppControlNotebookId'] | Should -Be 'abababab-abab-abab-abab-abababababab'
     }
 
     It 'reads the Rayfin CLI''s sign-in from before the guard when the Fabric stage can run, and the sign-in''s start takes that read (-Sequential, 2026-11-06)' {

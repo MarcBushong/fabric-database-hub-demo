@@ -18,8 +18,11 @@ function Resolve-DemoFabricAppItem {
       portal path for a notebook isn't documented on Learn, TODO(verify); without it, Manage copies requests and doesn't
       open the notebook.
     - t2MigrationAssessment: with -Config, T2's SQL Server instance enabled by Azure Arc in the Azure portal (2026-11-18),
-      built from the instance resource's own ID (one read-only ARM list, Get-DemoT2MigrationPortalLink); the app's
+      built from the instance resource's own ID (one read-only ARM list, Get-DemoT2Migration); the app's
       migration card links to it when Database Hub isn't read live, and names the path, Migration, Assessments.
+    With -Config, the evidence's t2Migration is that instance's migration assessment as Azure has it now, from the same
+    read (R924): its readiness per Azure SQL target and the recommended tier and size, which the app's migration card
+    shows, with its time, when Database Hub's live view isn't available to the app.
     Every link carries ?ctid=<tenant>, so it opens in the demo's tenant. The evidence goes only to the Git-ignored
     out/ folder and the stage's public/dbhub-app.json, never to Git.
     No single model with the name is Manual action required (run configure-powerbi.ps1); a missing dashboard or
@@ -120,14 +123,20 @@ function Resolve-DemoFabricAppItem {
         $links['controlNotebook'] = '{0}/groups/{1}/synapsenotebooks/{2}{3}' -f $portal, $controlWorkspaceId.ToLowerInvariant(), $controlNotebookId.ToLowerInvariant(), $ctid
     }
     # T2's migration assessment in the Azure portal (2026-11-18), for the app's migration card when Database Hub isn't
-    # read live: from the Arc SQL Server instance's own resource ID. Without it, the card names the portal path.
+    # read live: from the Arc SQL Server instance's own resource ID. Without it, the card names the portal path. From the
+    # same read, the assessment's verdict as Azure has it now (R924), which the card shows, with its time, instead.
+    $t2Migration = $null
     if ($Config) {
-        $migration = Get-DemoT2MigrationPortalLink -Config $Config
-        if ($migration) {
-            $links['t2MigrationAssessment'] = $migration
+        $migration = Get-DemoT2Migration -Config $Config
+        if ($migration.Link) {
+            $links['t2MigrationAssessment'] = $migration.Link
         }
+        $t2Migration = $migration.Verdict
     }
     $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlWorkspaceId = $controlWorkspaceId; controlNotebookId = $controlNotebookId; links = $links }
+    if ($null -ne $t2Migration) {
+        $evidence['t2Migration'] = $t2Migration
+    }
     if ($problems.Count -gt 0) {
         $evidence['problems'] = @($problems)
     }

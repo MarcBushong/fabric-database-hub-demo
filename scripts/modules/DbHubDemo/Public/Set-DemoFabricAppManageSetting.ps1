@@ -12,7 +12,9 @@ function Set-DemoFabricAppManageSetting {
       (rayfin/.deployments.json: fabricApiUrl, fabricTenantId, fabricWorkspaceId, fabricItemId), which bind a caller's
       token to this app. The app's first rayfin up records them, so configure-fabric-app.ps1 writes the settings again
       after it, and deploys once more. issuer and audience stay empty until the identity proof shows their exact form.
-    - controlWorkspaceId and controlNotebookId: NB_DatabaseHub_Control's, from Resolve-DemoFabricAppItem.
+    - controlWorkspaceId and controlNotebookId: NB_DatabaseHub_Control's, from Resolve-DemoFabricAppItem. deploy.ps1's
+      parallel path puts the notebook in Fabric after its tracks, so a first deployment's Fabric track has none; the run
+      then deploys the app once more (Complete-DemoInsightsAppManage, 2026-11-19), and -Sequential puts it there first.
     - operators: their object IDs and lowercased names, from Resolve-DemoFabricAppOperator.
     - catalog: the control's own rules (Get-DemoFabricAppManageCatalog: its targets, T5 only while it's on, its incidents,
       and a run's and a session's minutes), so the function sends only what the control accepts.
@@ -118,7 +120,7 @@ function Set-DemoFabricAppManageSetting {
     }
     if (-not $notebook) {
         $missing.Add('NB_DatabaseHub_Control')
-        $fixes.Add('./scripts/deploy.ps1 sets up the session control and its notebook; then run it again.')
+        $fixes.Add('Run ./scripts/deploy.ps1: it puts the session control''s notebook in Fabric, then deploys the app once more with its IDs (DEPLOY.CONTROL says what the notebook still needs).')
     }
     if ($null -eq $catalog -or @($catalog['targets']).Count -eq 0) {
         $missing.Add('the control''s catalog')
