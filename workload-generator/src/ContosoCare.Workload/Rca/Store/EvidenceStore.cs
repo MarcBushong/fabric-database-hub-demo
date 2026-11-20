@@ -102,7 +102,11 @@ internal sealed class EvidenceStore : ICaptureStore
         }
     }
 
-    /// <summary>Creates the store's folder; on Windows the default store's folder allows only SYSTEM and Administrators.</summary>
+    /// <summary>
+    /// Creates the store's folder; on Windows the default store's folder allows only SYSTEM and Administrators, with
+    /// inheritance off (https://learn.microsoft.com/dotnet/api/system.io.filesystemaclextensions.create and
+    /// https://learn.microsoft.com/dotnet/api/system.security.accesscontrol.objectsecurity.setaccessruleprotection).
+    /// </summary>
     public void EnsureRoot()
     {
         if (Directory.Exists(Root))

@@ -8,7 +8,7 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// T4 and its read replica: the runner's existing sign-in (T1's managed identity as contosocare_runner, or the local
 /// test role), with the observer's own application name, a 1-second lock_timeout, and a 10-second statement_timeout.
 /// Every block runs after pg_stat_clear_snapshot() in the same round trip, so no statistics view repeats an earlier
-/// snapshot (rca/capture/postgresql.sql).
+/// snapshot (rca/capture/postgresql.sql; https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-FUNCTIONS).
 /// </summary>
 internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : ICaptureConnector
 {
@@ -18,7 +18,8 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
     // insufficient_privilege.
     private static readonly HashSet<string> PermissionStates = ["42501"];
 
-    // query_canceled (statement_timeout) and lock_not_available (lock_timeout).
+    // query_canceled (statement_timeout) and lock_not_available (lock_timeout), as PostgreSQL's error codes name them:
+    // https://www.postgresql.org/docs/18/errcodes-appendix.html and https://www.postgresql.org/docs/18/runtime-config-client.html
     private static readonly HashSet<string> TimeoutStates = ["57014", "55P03"];
 
     public string Description => endpoint.Describe();

@@ -34,7 +34,9 @@ internal sealed record DeadlockSummary(bool InDatabase, long? Victim, ReducedNam
 /// Reads the Extended Events XML the observer's session returns (RCA-XE-02, RCA-XE-04) and system_health's deadlock
 /// reports (RCA-SQL-12), and reduces a deadlock graph to the JSON the rules read: the victim, each process's session,
 /// what it holds and wants, and its module and statement for the workload's own sessions only; each resource's type,
-/// object, index, mode, holder, and waiter.
+/// object, index, mode, holder, and waiter. The formats: the ring_buffer target's XML
+/// (https://learn.microsoft.com/sql/relational-databases/extended-events/targets-for-extended-events-in-sql-server#ring_buffer-target)
+/// and the deadlock graph's (https://learn.microsoft.com/sql/relational-databases/sql-server-deadlocks-guide#deadlock-information-tools).
 /// </summary>
 internal static class ExtendedEvents
 {
