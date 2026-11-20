@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and each release is a dated merge to `main`.
 
-## [Unreleased]
+## [2026-11-20]
 
 **The Ignite updates.** Microsoft Fabric Database Hub is generally available since 2026-11-17, and the demo follows it.
 
