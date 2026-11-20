@@ -47,16 +47,48 @@ internal sealed class ManualTime(DateTimeOffset start) : TimeProvider
 internal sealed class MemorySink : ICaptureSpan
 {
     private readonly Lock gate = new();
+    private readonly List<CaptureNote> notes = [];
+    private readonly List<(string Target, DateTimeOffset At, bool Began)> membership = [];
+    private DateTimeOffset? closedAt;
 
     public List<CaptureRow> Rows { get; } = [];
 
-    public List<CaptureNote> Notes { get; } = [];
+    /// <summary>A copy, safe to read while an observer writes.</summary>
+    public List<CaptureNote> Notes
+    {
+        get
+        {
+            lock (gate)
+            {
+                return [.. notes];
+            }
+        }
+    }
 
     public Dictionary<string, DateTimeOffset> Watermarks { get; } = new(StringComparer.Ordinal);
 
-    public List<(string Target, DateTimeOffset At, bool Began)> Membership { get; } = [];
+    /// <summary>A copy, safe to read while the lane writes.</summary>
+    public List<(string Target, DateTimeOffset At, bool Began)> Membership
+    {
+        get
+        {
+            lock (gate)
+            {
+                return [.. membership];
+            }
+        }
+    }
 
-    public DateTimeOffset? ClosedAt { get; private set; }
+    public DateTimeOffset? ClosedAt
+    {
+        get
+        {
+            lock (gate)
+            {
+                return closedAt;
+            }
+        }
+    }
 
     public void Write(CaptureRow row)
     {
@@ -70,7 +102,7 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
-            Notes.Add(note);
+            notes.Add(note);
         }
     }
 
@@ -86,7 +118,7 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
-            Membership.Add((target, at, true));
+            membership.Add((target, at, true));
         }
     }
 
@@ -94,11 +126,17 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
-            Membership.Add((target, at, false));
+            membership.Add((target, at, false));
         }
     }
 
-    public void Close(DateTimeOffset at) => ClosedAt = at;
+    public void Close(DateTimeOffset at)
+    {
+        lock (gate)
+        {
+            closedAt = at;
+        }
+    }
 
     public List<CaptureRow> Table(string table) => [.. Rows.Where(r => r.Table == table)];
 
