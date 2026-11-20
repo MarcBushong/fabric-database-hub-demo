@@ -1,12 +1,17 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, configure, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
+import { setLiveEstateReader, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
+
+// These tests play conversations through several scripted hops, which take longer than the defaults on a busy machine.
+configure({ asyncUtilTimeout: 4000 });
+vi.setConfig({ testTimeout: 15_000 });
 
 // Built at run time so secret scanners never see a token-shaped literal.
 const fakeToken = () => ["gho", "D".repeat(36)].join("_");
@@ -15,6 +20,15 @@ const RELAY = "https://relay.example";
 // The app's estate function, as the dock reads it (estate.ts), for the live view's tests.
 const estateMock = vi.hoisted(() => ({ readEstate: vi.fn() }));
 vi.mock("./estate", () => ({ readEstate: estateMock.readEstate }));
+
+// What the pages' live reads answer (useLiveEstate, and so useLiveOff, which the dock follows): data, unless a test
+// sets the sentence Database Hub refuses the app with.
+let pagesRefusal: string | null = null;
+const LIVE_SCOPE = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-test"] };
+const pagesReader: EstateReader = async <V extends EstateView>(view: V) =>
+    (pagesRefusal
+        ? { view, source: ["GET /auth/warnings"], scope: LIVE_SCOPE, data: {}, errors: ["GET /auth/warnings: HTTP 401 Unauthorized"], at: "2026-11-19T22:00:00Z", unavailable: pagesRefusal }
+        : { view, source: ["POST /savedView/resources/list"], scope: LIVE_SCOPE, data: { totalCount: 4 }, errors: [], at: "2026-11-19T22:00:00Z" }) as unknown as EstateAnswer<V>;
 
 class FakeSocket {
     static last: FakeSocket | null = null;
@@ -129,6 +143,8 @@ beforeEach(() => {
     FakeSocket.script = null;
     FakeSocket.all = [];
     estateMock.readEstate.mockReset();
+    pagesRefusal = null;
+    setLiveEstateReader(pagesReader);
     vi.mocked(queryClient.run).mockClear();
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -138,6 +154,7 @@ beforeEach(() => {
 
 afterEach(() => {
     vi.unstubAllGlobals();
+    setLiveEstateReader(null);
 });
 
 describe("the Copilot dock", () => {
@@ -437,8 +454,8 @@ describe("the end of a turn (R925)", () => {
         const sentence = "Database Hub's live view isn't available to the app";
         estateMock.readEstate.mockResolvedValue({
             view: "health",
-            source: [],
-            scope: { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroup: "rg-test" },
+            source: ["POST /health/v2/filtered-summary"],
+            scope: { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-test"] },
             data: {},
             errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized"],
             unavailable: sentence,
@@ -490,5 +507,84 @@ describe("the end of a turn (R925)", () => {
         await ask("How is my estate doing now?");
         await waitFor(() => expect(FakeSocket.all).toHaveLength(3));
         expect((FakeSocket.all[2].sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
+    });
+
+    // The review of 754fc4c: New chat while the last conversation's live call still runs (a cold start), then a new question.
+    it("keeps the live view on in a new chat when the last conversation's live call ends after it, and keeps that call's row out", async () => {
+        const sentence = "Database Hub's live view isn't available to the app";
+        const scope = { subscriptionId: "11111111-2222-3333-4444-555555555555", resourceGroups: ["rg-test"] };
+        let release: (answer: unknown) => void = () => undefined;
+        estateMock.readEstate
+            .mockImplementationOnce(() => new Promise((resolve) => (release = resolve)))
+            .mockResolvedValue({ view: "inventory", source: ["POST /savedView/resources/list"], scope, data: { totalCount: 4, countByType: { AzureSql: 1 }, resources: [], complete: true }, errors: [], at: "2026-11-19T21:50:00Z" });
+        FakeSocket.script = (s, m) => {
+            if (s === FakeSocket.all[0]) {
+                if (m.type === "user") s.emit({ type: "tool_call", callId: "e1", name: "estate_overview", arguments: { view: "health" } });
+            } else if (m.type === "tool_result" && m.callId === "e2") {
+                s.emit({ type: "message", messageId: "n2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await ask();
+        await waitFor(() => expect(estateMock.readEstate).toHaveBeenCalledTimes(1));
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        await ask("How is my estate doing now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
+        const second = FakeSocket.all[1];
+        await waitFor(() => expect(second.sent.some((m) => m.type === "user")).toBe(true));
+        expect((second.sent[0].tools as Array<{ name: string }>).map((t) => t.name)).toContain("estate_overview");
+
+        // The first conversation's call ends now, with the live view unavailable to it.
+        await act(async () => {
+            release({ view: "health", source: ["POST /health/v2/filtered-summary"], scope, data: {}, errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized"], unavailable: sentence, at: "2026-11-19T21:49:30Z" });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        // The new conversation's own live call still reaches the function, and nothing of the first one shows in it.
+        await act(async () => second.emit({ type: "tool_call", callId: "e2", name: "estate_overview", arguments: { view: "inventory" } }));
+        await screen.findByText(ANSWER);
+        expect(estateMock.readEstate).toHaveBeenCalledTimes(2);
+        expect(resultOf(second, "e2")).toMatchObject({ ok: true });
+        expect(screen.getByRole("button", { name: /Live estate from Database Hub: inventory/ })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: /Live estate from Database Hub: health/ })).not.toBeInTheDocument();
+    });
+
+    // The owner's question 2, the coordinator's decision: while Database Hub refuses the app as a whole, as the pages read
+    // it (useLiveOff: every view unavailable), a new conversation starts without the live view and hides its starters.
+    it("starts without the live view while Database Hub refuses the app as a whole, as the pages read it, and uses it again once a view answers", async () => {
+        const sentence = "Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in.";
+        const toolsOf = (socket: FakeSocket) => (socket.sent[0].tools as Array<{ name: string }>).map((t) => t.name);
+        pagesRefusal = sentence;
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") {
+                s.emit({ type: "message", messageId: `h${FakeSocket.all.length}`, text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await waitFor(() => expect(screen.getByTestId("account")).toHaveTextContent("signed-in octo"));
+        await screen.findByRole("button", { name: "Which target worked hardest this week?" });
+        await waitFor(() => expect(screen.queryByRole("button", { name: "How is my estate doing right now?" })).not.toBeInTheDocument());
+        await ask();
+        await screen.findByText(ANSWER);
+        const first = FakeSocket.all[0];
+        expect(toolsOf(first)).not.toContain("estate_overview");
+        expect(String(first.sent[0].systemMessage)).toContain(`LIVE estate: ${sentence}`);
+        expect(estateMock.readEstate).not.toHaveBeenCalled();
+
+        // Database Hub answers again: the next conversation reads the pages' state again, and offers the live view.
+        pagesRefusal = null;
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        await screen.findByRole("button", { name: "How is my estate doing right now?" });
+        await ask("How is my estate doing now?");
+        await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
+        expect(toolsOf(FakeSocket.all[1])).toContain("estate_overview");
+        expect(String(FakeSocket.all[1].sent[0].systemMessage)).not.toContain(sentence);
     });
 });
