@@ -83,7 +83,13 @@ const WORDING: Record<string, Wording> = {
     connections: { what: "connections refused", signal: "failed connections", kind: "int" },
 };
 
-const percent = (share: number) => `${Math.round(share * 100)} %`;
+/** A share in whole percent that never rounds some to none, or nearly all to all: "less than 1 %", "more than 99 %". */
+function percent(share: number): string {
+    const p = share * 100;
+    if (p > 0 && p < 0.5) return "less than 1 %";
+    if (p >= 99.5 && p < 100) return "more than 99 %";
+    return `${Math.round(p)} %`;
+}
 
 function forDuration(input: Pick<ImpactInput, "durationMin" | "ongoing">): string {
     if (input.durationMin === null || !Number.isFinite(input.durationMin) || input.durationMin < 0) return "";

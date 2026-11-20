@@ -133,6 +133,18 @@ describe("the business lens", () => {
         const { markdown } = buildPostmortem({ plan, scores: [score], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: at(130) });
         expect(markdown).toContain("| up to 0.6 blocked processes, 2.0 times its baseline |");
     });
+
+    it("never rounds a throttled share to none, or to all, beside the 429s it comes from", () => {
+        const headline = (throttled: number) => impactOf({ target: "T5", family: "throttle", durationMin: 2, peak: 100, throttled, requests: 1000 }).headline;
+        expect(headline(3)).toBe("Patient events: less than 1 % of requests throttled for 2 min");
+        expect(headline(999)).toBe("Patient events: more than 99 % of requests throttled for 2 min");
+        expect([0, 5, 520, 1000].map(headline)).toEqual([
+            "Patient events: 0 % of requests throttled for 2 min",
+            "Patient events: 1 % of requests throttled for 2 min",
+            "Patient events: 52 % of requests throttled for 2 min",
+            "Patient events: 100 % of requests throttled for 2 min",
+        ]);
+    });
 });
 
 describe("the scoreboard", () => {
