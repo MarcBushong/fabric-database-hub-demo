@@ -13,7 +13,7 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import { FINDING_CATEGORIES, findingCategory, toFindings, toPostgresFindings, toTargetNames, type FindingCategory, type TargetName } from "@/data/model";
 import { findingsQuery, postgresFindingsQuery, targetNamesQuery } from "@/data/queries";
-import { liveDataOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView } from "@/data/live-estate";
+import { liveDataOf, liveOffOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type MissedAnswer } from "@/data/live-estate";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
@@ -79,12 +79,16 @@ const LIVE_TABS: Partial<Record<FindingCategory, { title: string; view: string; 
     },
 };
 
-/** One live source for a visual: when the oldest answer was read, every route that answered, and every route that failed. */
-function liveSourceOf(answers: ReadonlyArray<EstateAnswer<EstateView> | null>) {
+/**
+ * One live source for a visual: when the oldest answer was read, every route behind it, and every route that didn't
+ * answer, a view's that came back without data included (R924), so the partial bar names it.
+ */
+function liveSourceOf(answers: ReadonlyArray<EstateAnswer<EstateView> | null>, missed: ReadonlyArray<MissedAnswer | null> = []) {
     const present = answers.filter((a): a is EstateAnswer<EstateView> => a !== null);
     if (present.length === 0) return null;
+    const read = [...present, ...missed.filter((m): m is MissedAnswer => m !== null)];
     const at = present.map((a) => a.at).sort()[0];
-    return { at, source: present.flatMap((a) => a.source), errors: present.flatMap((a) => a.errors) };
+    return { at, source: read.flatMap((a) => a.source), errors: read.flatMap((a) => a.errors) };
 }
 
 function t2Instance(t2: TargetName | undefined): string {
@@ -92,10 +96,12 @@ function t2Instance(t2: TargetName | undefined): string {
     return t2.instance && t2.instance !== "MSSQLSERVER" ? `${t2.resource}\\${t2.instance}` : t2.resource;
 }
 
-function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRow[]; answers: Array<EstateAnswer<EstateView> | null>; loading: boolean; unavailable: string | null; onRefresh: () => void; hubUrl: string }) {
+function LiveChecks(props: { tab: "security" | "optimization"; rows: LiveCheckRow[]; answers: Array<EstateAnswer<EstateView> | null>; missed: Array<MissedAnswer | null>; loading: boolean; unavailable: string | null; off: string | null; onRefresh: () => void; hubUrl: string }) {
     const info = LIVE_TABS[props.tab];
     if (!info) return null;
-    const live = liveSourceOf(props.answers);
+    const live = liveSourceOf(props.answers, props.missed);
+    // While Database Hub refuses the app as a whole (R924), the tab has no live section; Live views says why.
+    if (!live && props.off) return null;
     const open = (
         <Button as="a" size="small" href={props.hubUrl} target="_blank" rel="noopener noreferrer" icon={<Open16Regular />} iconPosition="after">
             {`Open Database Hub, then ${info.view}`}
@@ -156,6 +162,11 @@ export default function FindingsPage() {
     // The live reads are cached for a minute and shared with the Copilot dock, so the tiles and tabs read them once.
     const security = useLiveEstate("security");
     const inventory = useLiveEstate("inventory");
+    // Whether Database Hub refuses the app as a whole takes every view, health's too (cached and shared, R924).
+    const health = useLiveEstate("health");
+    const liveOff = liveOffOf([inventory, health, security]);
+    // One of the two views behind the security checks came back without data: its part is missing, not clean.
+    const securityPartial = !security.loading && !inventory.loading && (security.answer === null) !== (inventory.answer === null);
     const liveSecurity = useMemo(() => (security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), liveDataOf(inventory.answer)) : null), [security.answer, inventory.answer]);
     const liveOptimization = useMemo(() => (inventory.answer ? liveOptimizationRows(liveDataOf(inventory.answer)) : null), [inventory.answer]);
     const hubUrl = hubUrlOf(runtime);
@@ -183,7 +194,8 @@ export default function FindingsPage() {
                     const liveRows = c.id === "security" ? liveSecurity : c.id === "optimization" ? liveOptimization : null;
                     if (liveRows) {
                         const needs = liveRows.filter((r) => r.attention === "Needs attention").length;
-                        return <KpiTile key={c.id} label={`${c.label} \u00b7 live`} value={String(needs)} sub={`need attention in Database Hub, ${liveRows.length - needs} recommended`} status={needs > 0 ? "Warning" : "Pass"} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} checks`} />;
+                        const partial = c.id === "security" && securityPartial;
+                        return <KpiTile key={c.id} label={`${c.label} \u00b7 live`} value={String(needs)} sub={`need attention in Database Hub, ${liveRows.length - needs} recommended${partial ? "; partial: part of Database Hub didn't answer" : ""}`} status={needs > 0 ? "Warning" : partial ? null : "Pass"} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} checks`} />;
                     }
                     return <KpiTile key={c.id} label={c.label} value={String(count(c.id))} sub={c.description} status={worstStatus(rows.filter((r) => r.category === c.id && r.statusSort <= 3).map((r) => r.status))?.name ?? null} onOpen={() => setTab(c.id)} openLabel={`Show the ${c.label.toLowerCase()} findings`} />;
                 })}
@@ -196,18 +208,18 @@ export default function FindingsPage() {
                 ))}
             </TabList>
 
-            {tab === "security" ? <LiveChecks tab="security" rows={liveSecurity ?? []} answers={[security.answer, inventory.answer]} loading={security.loading || inventory.loading} unavailable={security.unavailable ?? inventory.unavailable} onRefresh={() => (security.refresh(), inventory.refresh())} hubUrl={hubUrl} /> : null}
+            {tab === "security" ? <LiveChecks tab="security" rows={liveSecurity ?? []} answers={[security.answer, inventory.answer]} missed={[security.missed, inventory.missed]} loading={security.loading || inventory.loading} unavailable={security.unavailable ?? inventory.unavailable} off={liveOff} onRefresh={() => (security.refresh(), inventory.refresh())} hubUrl={hubUrl} /> : null}
             {tab === "optimization" ? (
                 <>
                     <MigrationCard className="span-12" resourceName={t2Instance(t2)} />
 
-                    <LiveChecks tab="optimization" rows={liveOptimization ?? []} answers={[inventory.answer]} loading={inventory.loading} unavailable={inventory.unavailable} onRefresh={inventory.refresh} hubUrl={hubUrl} />
+                    <LiveChecks tab="optimization" rows={liveOptimization ?? []} answers={[inventory.answer]} missed={[inventory.missed]} loading={inventory.loading} unavailable={inventory.unavailable} off={liveOff} onRefresh={inventory.refresh} hubUrl={hubUrl} />
                 </>
             ) : null}
             <VisualCard
                 id={`findings.${tab}`}
                 title={tab === "all" ? "Every finding" : CATEGORY_LABEL[tab]}
-                subtitle={tab === "security" || tab === "optimization" ? "From the history, beside Database Hub's live view: the latest capture of each finding in the period." : "The latest capture of each finding in the period. Sort, filter, and export."}
+                subtitle={(tab === "security" || tab === "optimization") && !liveOff ? "From the history, beside Database Hub's live view: the latest capture of each finding in the period." : "The latest capture of each finding in the period. Sort, filter, and export."}
                 specs={[findingsSpec, pgSpec]}
                 loading={findingsState.loading}
                 error={findingsState.error}
