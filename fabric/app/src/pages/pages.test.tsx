@@ -10,7 +10,7 @@ import OverviewPage from "@/pages/OverviewPage";
 import PerformancePage from "@/pages/PerformancePage";
 import ReadinessPage from "@/pages/ReadinessPage";
 import TrendsPage from "@/pages/TrendsPage";
-import { liveDataOf, type EstateAnswer, type EstateReader } from "@/data/live-estate";
+import { liveDataOf, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
 import type { DeployedMigration } from "@/lib/runtime-config";
 import { sampleLiveAnswers } from "@/preview/sample-live";
 import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
@@ -49,6 +49,13 @@ function refusingDbHub(status = 401): EstateReader {
     const token = ["eyJ", "x".repeat(24)].join("");
     const refuse = () => Promise.resolve(new Response(JSON.stringify({ code: "Unauthorized", subCode: 1, message: "Authentication failed for all authenticators", httpStatusCode: status }), { status }));
     return (view) => readEstateCore(view, scope, token, refuse);
+}
+
+/** The sample's answers for every view but one, which the app's own function reads from routes that each answer with one status. */
+function oneViewFailing(failing: EstateView, status: number): EstateReader {
+    const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+    const dbHub = refusingDbHub(status);
+    return (view, options) => (view === failing ? dbHub(view, options) : Promise.resolve(sample[view] as never));
 }
 
 const T2_SAVED: DeployedMigration = {
@@ -109,27 +116,76 @@ describe("Overview", () => {
         expect(screen.queryByText(/^Live$/)).not.toBeInTheDocument();
     });
 
-    it("says why when the function answers with no data, instead of tiles that keep reading", async () => {
+    it("hides the live section when the function has no scope, and Live views names the fix, never a route's reason", async () => {
         const reason = "The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1.";
         const noScope: EstateReader = (view) => Promise.resolve({ view, source: [], scope: { subscriptionId: "", resourceGroups: [] }, data: {}, errors: ["a route's own reason, for the log"], at: "2026-10-21T21:00:00.000Z", unavailable: reason });
         renderWithApp(<OverviewPage />, { live: noScope });
-        const line = await screen.findByText(/^The estate function has no scope: deploy the app with scripts\/configure-fabric-app\.ps1\. Every page shows the history/);
-        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
-        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+        expect(await screen.findByRole("region", { name: "At a glance" })).toBeInTheDocument();
+        await waitFor(() => expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument());
+        expect(screen.queryByText(/Live · unavailable/)).not.toBeInTheDocument();
+        cleanup();
+        renderWithApp(<LinksPage />, { live: noScope });
+        expect(await screen.findByText("The estate function has no scope: deploy the app with scripts/configure-fabric-app.ps1. The app shows the history.")).toBeInTheDocument();
         expect(document.body.textContent).not.toContain("for the log");
     });
 
-    it("says in plain words when Database Hub refuses the app, and never shows a route's error (R924)", async () => {
+    it("hides the live section while Database Hub refuses the app, from the first render once that's known, and brings it back by itself (R924)", async () => {
+        const reading: EstateReader = () => new Promise<never>(() => undefined);
         renderWithApp(<OverviewPage />, { live: refusingDbHub() });
-        const line = await screen.findByText(/^Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in\. Every page shows the history; Database Hub has the live view\.$/);
-        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
-        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
-        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP/);
+        expect(await screen.findByRole("region", { name: "At a glance" })).toBeInTheDocument();
+        // The first read in this browser: Live now reads, then goes when Database Hub refuses the app. The history stays.
+        await waitFor(() => expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument());
+        expect(screen.queryByText(/Live · unavailable/)).not.toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP|isn't available/);
         cleanup();
-        // Database Hub didn't answer, for a reason a later read may not meet: plain words too, never the 503.
+        // The next open hides it from the first render, while its read still runs: no live section that reads, then goes.
+        renderWithApp(<OverviewPage />, { live: reading });
+        expect(await screen.findByRole("region", { name: "At a glance" })).toBeInTheDocument();
+        expect(screen.queryByRole("region", { name: "Live now" })).not.toBeInTheDocument();
+        cleanup();
+        // Database Hub answers the app again: Live now is back by itself, and the next open reads it as before.
+        renderWithApp(<OverviewPage />, { live: "sample" });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Resources in Database Hub: 6\./ })).toBeInTheDocument());
+        cleanup();
+        renderWithApp(<OverviewPage />, { live: reading });
+        expect(await screen.findByRole("region", { name: "Live now" })).toBeInTheDocument();
+    });
+
+    it("says in plain words when Database Hub didn't answer just now, never the error (R924)", async () => {
         renderWithApp(<OverviewPage />, { live: refusingDbHub(503) });
-        expect(await screen.findByText(/^Database Hub's live view didn't answer the app just now\. Every page shows the history; Database Hub has the live view\.$/)).toBeInTheDocument();
+        const line = await screen.findByText(/^Database Hub's live view didn't answer the app just now\. Every page shows the history; Database Hub has the live view\.$/);
+        expect(within(line).getByText("Live · unavailable")).toHaveClass("provenance-off");
         expect(document.body.textContent).not.toMatch(/503|Unauthorized|HTTP/);
+        cleanup();
+        // One view refused, the others not answering just now: Database Hub doesn't refuse the app as a whole, so the line stays.
+        const mixed = refusingDbHub(503);
+        const refusedSecurity = refusingDbHub(403);
+        renderWithApp(<OverviewPage />, { live: (view, options) => (view === "security" ? refusedSecurity(view, options) : mixed(view, options)) });
+        expect(await screen.findByText(/^Database Hub's live view didn't answer the app just now\. Every page shows the history/)).toBeInTheDocument();
+    });
+
+    it("shows a view that came back without data as not read, never as zero, and counts its routes as partial, in both directions (R924)", async () => {
+        const { copilot } = renderWithApp(<OverviewPage />, { live: oneViewFailing("security", 403) });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        const tile = within(live).getByRole("button", { name: /^Security warnings: \u2013\./ });
+        await waitFor(() => expect(within(tile).getByText("Not available to the app")).toBeInTheDocument());
+        expect(tile.closest(".kpi")).not.toHaveClass("kpi-pass");
+        expect(within(live).queryByText("Authentication, auditing, and keys pass")).not.toBeInTheDocument();
+        expect(within(live).getByText("Partial: 3 of 7 Database Hub calls didn't answer")).toBeInTheDocument();
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Resources in Database Hub: 6\./ })).toBeInTheDocument());
+        fireEvent.click(within(live).getByRole("button", { name: "Ask Copilot" }));
+        const rows = vi.mocked(copilot.ask).mock.calls[0][0].rows ?? [];
+        expect(rows.find((r) => r.signal === "Security warnings")).toEqual({ signal: "Security warnings", value: null, detail: "Not available to the app" });
+        cleanup();
+        // The other way: inventory doesn't answer while security does. Its tile says so instead of reading forever.
+        renderWithApp(<OverviewPage />, { live: oneViewFailing("inventory", 503) });
+        const again = await screen.findByRole("region", { name: "Live now" });
+        const resources = within(again).getByRole("button", { name: /^Resources in Database Hub: \u2013\./ });
+        await waitFor(() => expect(within(resources).getByText("Didn't answer just now")).toBeInTheDocument());
+        expect(within(again).getByText("Partial: 1 of 7 Database Hub calls didn't answer")).toBeInTheDocument();
+        expect(within(again).getByRole("button", { name: /^Security warnings: 2\./ })).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/HTTP|503|403|Unauthorized/);
     });
 
     it("reads health as the function passes it: a count it leaves out is zero, and Cosmos DB shows without an account count", async () => {
@@ -387,20 +443,41 @@ describe("Findings", () => {
         expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
     });
 
-    it("shows T2 ready to migrate from the assessment saved at deploy when Database Hub refuses the app, with its time and the portal (R924)", async () => {
+    it("shows T2 ready to migrate from the assessment saved at deploy while Database Hub refuses the app, with its time and the portal, and no live line (R924)", async () => {
         const { copilot } = renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: refusingDbHub(), runtime: { t2Migration: T2_SAVED } });
         const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
         expect(within(card).getByText("Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database.")).toBeInTheDocument();
         expect(within(card).getByText(/^Arc-enabled SQL Server \(T2\), assessed by Azure Arc every week; this assessment was uploaded 17 Nov 23:05 UTC\. Read from Azure when the app was deployed, as of 19 Nov 22:10 UTC\.$/)).toBeInTheDocument();
-        expect(within(card).getByText(/^Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in\. This is the assessment as Azure had it when the app was deployed/)).toBeInTheDocument();
         expect(within(card).getByRole("list", { name: "Readiness per Azure SQL target" }).textContent).toBe("ReadyAzure SQL Managed InstanceGeneral Purpose, 4 vCoresReadySQL Server on Azure Virtual MachinesNot readyAzure SQL DatabaseAsk why");
         expect(within(card).getByText(/^Saved at deploy/)).toBeInTheDocument();
         expect(within(card).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("target", "_blank");
-        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP/);
+        // No live line and no live section: the optimization checks' panel goes once Database Hub refuses the app.
+        await waitFor(() => expect(screen.queryByRole("region", { name: "Optimization, live from Database Hub" })).not.toBeInTheDocument());
+        expect(within(card).queryByText(/Live · unavailable|isn't available/)).not.toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators|HTTP|Live · unavailable/);
         fireEvent.click(within(card).getByRole("button", { name: "Ask Copilot" }));
         expect(vi.mocked(copilot.ask).mock.calls[0][0]).toMatchObject({ source: "history", asOf: "2026-11-19T22:10:00Z", visualId: "migration.readiness", totalRows: 3 });
         fireEvent.click(within(card).getByRole("button", { name: "Ask why" }));
         expect(vi.mocked(copilot.ask).mock.calls[1][0]).toMatchObject({ source: "history", asOf: "2026-11-19T22:10:00Z" });
+        cleanup();
+        // Once that's known, the next open shows the saved readiness at once, while its read still runs.
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T2" }, live: () => new Promise<never>(() => undefined), runtime: { t2Migration: T2_SAVED } });
+        expect(await screen.findByRole("region", { name: "Ready to migrate: arcsql01" })).toBeInTheDocument();
+    });
+
+    it("hides the live sections while Database Hub refuses the app, keeps the history's findings, and names T2's portal path without a live line (R924)", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: refusingDbHub() });
+        await waitFor(() => expect(within(screen.getByRole("table", { name: "Findings" })).getAllByRole("row")).toHaveLength(2));
+        await waitFor(() => expect(screen.queryByRole("region", { name: "Security posture, live from Database Hub" })).not.toBeInTheDocument());
+        expect(screen.getByText("The latest capture of each finding in the period. Sort, filter, and export.")).toBeInTheDocument();
+        expect(screen.queryByText(/Live · unavailable|beside Database Hub's live view/)).not.toBeInTheDocument();
+        cleanup();
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: refusingDbHub() });
+        const panel = await screen.findByRole("region", { name: "T2's migration assessment" });
+        expect(within(panel).getByText("In the Azure portal, open arcsql01, then, under Migration, select Assessments.")).toBeInTheDocument();
+        expect(within(panel).getByRole("link", { name: "arcsql01 in the Azure portal" })).toHaveAttribute("rel", "noopener noreferrer");
+        expect(screen.queryByRole("region", { name: "Optimization, live from Database Hub" })).not.toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/Live · unavailable|isn't available/);
     });
 
     it("names a partial live answer's routes that didn't answer, never their errors (R924)", async () => {
@@ -410,6 +487,27 @@ describe("Findings", () => {
         expect(await screen.findByText("Partial answer: GET /cmk/warnings didn't answer. What the other routes read is below.")).toBeInTheDocument();
         expect(screen.getByText(/^Partial: 1 of \d Database Hub calls didn't answer$/)).toBeInTheDocument();
         expect(document.body.textContent).not.toMatch(/401|Unauthorized|authenticators/);
+    });
+
+    it("shows the security checks that answered with a partial bar naming the routes that didn't, in both directions, never a clean zero (R924)", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: oneViewFailing("security", 503) });
+        const panel = await screen.findByRole("region", { name: "Security posture, live from Database Hub" });
+        expect(await within(panel).findByText("Partial answer: GET /auth/warnings, GET /auditing/warnings, GET /cmk/warnings didn't answer. What the other routes read is below.")).toBeInTheDocument();
+        const kpi = screen.getByRole("button", { name: /^Security · live: 0\./ });
+        expect(within(kpi).getByText(/; partial: part of Database Hub didn't answer$/)).toBeInTheDocument();
+        expect(kpi.closest(".kpi")).not.toHaveClass("kpi-pass");
+        cleanup();
+        // The other way: the resources' checks don't answer (Database Hub refuses only them), the warnings do. Not hidden.
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: oneViewFailing("inventory", 403) });
+        const again = await screen.findByRole("region", { name: "Security posture, live from Database Hub" });
+        expect(await within(again).findByText("Partial answer: POST /savedView/resources/list didn't answer. What the other routes read is below.")).toBeInTheDocument();
+        expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
+        expect(document.body.textContent).not.toMatch(/HTTP|503|403|Unauthorized/);
+        cleanup();
+        // T2's card keeps its line then: the inventory, which carries the assessment, didn't answer, but the app isn't refused.
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: oneViewFailing("inventory", 403), runtime: { t2Migration: T2_SAVED } });
+        const card = await screen.findByRole("region", { name: "Ready to migrate: arcsql01" });
+        expect(await within(card).findByText(/^Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in\. This is the assessment as Azure had it when the app was deployed/)).toBeInTheDocument();
     });
 });
 describe("Readiness", () => {
@@ -585,5 +683,23 @@ describe("Live views", () => {
         }
         expect(screen.getByRole("link", { name: "Open in Fabric" })).toHaveAttribute("href", expect.stringMatching(/\/groups\/[0-9a-f-]+\/appbackends\/[0-9a-f-]+$/));
         expect(FIXTURES["connector-check"]).toHaveLength(1);
+        // Without the app's function, the pages say so themselves: no line here.
+        expect(screen.queryByText(/isn't available to Fabric apps/)).not.toBeInTheDocument();
+    });
+
+    it("says in one quiet line that Database Hub's live data isn't available to Fabric apps yet, until it answers the app again (R924)", async () => {
+        renderWithApp(<LinksPage />, { live: refusingDbHub() });
+        const line = await screen.findByText("Database Hub's live data isn't available to Fabric apps yet, and the app shows the history.");
+        expect(line.textContent).not.toMatch(/401|HTTP|sign-in/);
+        expect(screen.getByRole("link", { name: "Database Hub: open in a new tab" })).toHaveAttribute("target", "_blank");
+        cleanup();
+        renderWithApp(<LinksPage />, { live: "sample" });
+        expect(await screen.findByTestId("probe-ok")).toBeInTheDocument();
+        await waitFor(() => expect(screen.queryByText(/isn't available to Fabric apps/)).not.toBeInTheDocument());
+        cleanup();
+        // Database Hub refuses one view only: not the app as a whole, so no line.
+        renderWithApp(<LinksPage />, { live: oneViewFailing("inventory", 403) });
+        await waitFor(() => expect(JSON.parse(window.localStorage.getItem("dbhub-insights.live-off.v1") ?? "{}")).toHaveProperty("inventory"));
+        expect(screen.queryByText(/isn't available to Fabric apps/)).not.toBeInTheDocument();
     });
 });
