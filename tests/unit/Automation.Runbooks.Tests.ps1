@@ -134,6 +134,32 @@ BeforeAll {
         $script:t5ContainerCreateSeconds = 30
         $script:t5ContainerDeleteSeconds = 20
         $script:t5ContainerBody = $null
+        # The Incident RCA's export (2026-11-20, ADR 0031): each Rca Run Command sent (its VM, name, decoded request, and
+        # time), the ones deleted, and what the VM-side control answers, a script block given the command: an instance
+        # view, or $null while it runs. By default the runner has nothing to export, as a runner with no capture.
+        $script:rcaCommands = [System.Collections.Generic.List[object]]::new()
+        $script:rcaDeleted = [System.Collections.Generic.List[string]]::new()
+        $script:rcaRunner = { New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.' }
+        # Key Vault versions of the secrets the runbook writes, counted (Secrets - Create Or Update returns secretUriWithVersion).
+        $script:secretVersions = 0
+    }
+
+    # An Rca Run Command's instance view (Invoke-DemoControlRca): its result line, then the runner's own line, if any.
+    function New-TestRcaView([string] $Status, [string] $Message = '', [string] $Line = '', [hashtable] $Evidence = @{}) {
+        $result = [ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Rca'; status = $Status; message = $Message; evidence = $Evidence }
+        $output = 'DBHUBDEMO-WORKLOAD ' + (ConvertTo-Json -InputObject $result -Depth 4 -Compress)
+        if ($Line) {
+            $output = $output + "`n" + $Line
+        }
+        return @{ executionState = 'Succeeded'; exitCode = 0; output = $output }
+    }
+
+    # The request in an Rca Run Command's script (Get-DbHubRcaScript), decoded.
+    function ConvertFrom-TestRcaScript([string] $Script) {
+        if ($Script -notmatch "-RequestBase64 '([A-Za-z0-9+/=]+)'") {
+            return $null
+        }
+        return ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Matches[1])) | ConvertFrom-Json)
     }
 
     # The Automation sandbox's internal cmdlets for an existing variable, as the runbooks call them.
@@ -197,8 +223,10 @@ BeforeAll {
                 if ($script:secretsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.KeyVault/vaults/secrets/write."}}') }
                 $name = $Matches[1]
                 if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
-                $script:secrets[$name].Add([pscustomobject]@{ Value = [string]$Body.properties.value; Tags = $Body['tags']; At = $script:clock })
-                return (New-Response 200 '{}')
+                $script:secretVersions++
+                $version = '{0:x32}' -f $script:secretVersions
+                $script:secrets[$name].Add([pscustomobject]@{ Value = [string]$Body.properties.value; Tags = $Body['tags']; At = $script:clock; Version = $version })
+                return (New-Response 200 ('{{"name":"{0}","properties":{{"secretUri":"https://kv-test.example/secrets/{0}","secretUriWithVersion":"https://kv-test.example/secrets/{0}/{1}"}}}}' -f $name, $version))
             }
             '/databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics\?' {
                 # T5's metrics (2026-11-18): three 1-minute points of each, normalized RU at 100% in the middle one, which
@@ -349,6 +377,37 @@ BeforeAll {
                     $substatuses += @{ code = 'ComponentStatus/Resource Provider Plugin/succeeded'; message = ('{{"ExtensionServiceHealthReport":{{"MainServiceStatus":"Running","MainServiceLastReportedTime":"{0}"}}}}' -f ([datetime]$reportedAt).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)) }
                 }
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ settings = @{ FeatureFlags = $flags }; instanceView = @{ statuses = $statuses; substatuses = $substatuses } } } -Depth 8))
+            }
+            '/virtualMachines/(\w+)/runCommands/(DbHubControl-rca-[A-Za-z0-9-]+)$' {
+                # The Incident RCA's export (2026-11-20): the Rca Run Commands, recorded with their decoded requests.
+                $vmName = $Matches[1]
+                $name = $Matches[2]
+                if ($Method -eq 'PUT') {
+                    if ($script:runCommandRefused -contains $vmName) {
+                        return (New-Response 400 '{"error":{"code":"BadRequest","message":"The Run Command was refused."}}')
+                    }
+                    # A Run Command created again under its name is a new one.
+                    $null = $script:rcaDeleted.Remove($name)
+                    $script:rcaCommands.Add([pscustomobject]@{ Vm = $vmName; Name = $name; Request = (ConvertFrom-TestRcaScript -Script ([string]$Body.properties.source.script)); At = $script:clock })
+                    return (New-Response 201 '{}')
+                }
+                if ($Method -eq 'DELETE') {
+                    $script:rcaDeleted.Add($name)
+                    return (New-Response 200)
+                }
+                return (New-Response 404)
+            }
+            '/virtualMachines/(\w+)/runCommands/(DbHubControl-rca-[A-Za-z0-9-]+)\?\$expand=instanceView$' {
+                $name = $Matches[2]
+                $command = @($script:rcaCommands | Where-Object { $_.Name -eq $name }) | Select-Object -Last 1
+                if ($null -eq $command -or $script:rcaDeleted -contains $name) {
+                    return (New-Response 404)
+                }
+                $view = & $script:rcaRunner $command
+                if ($null -eq $view) {
+                    $view = @{ executionState = 'Running' }
+                }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $name; properties = @{ instanceView = $view } } -Depth 6))
             }
             '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
                 if ($script:runCommands.ContainsKey($Matches[1])) {
@@ -1482,7 +1541,11 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.phase | Should -Be 'stopped'
         $status.stoppedBy | Should -Be 'Stop now'
         @($status.done) | Should -Contain 'T4''s read replica pgreplica01-abc123 deleted'
-        @($script:calls | Where-Object { $_.Path -match '/runCommands' }) | Should -BeNullOrEmpty
+        # Its only Run Commands are the evidence export's (ADR 0031), each deleted once read; nothing is stopped through one.
+        @($script:calls | Where-Object { $_.Path -match '/runCommands/' -and $_.Method -eq 'PUT' -and $_.Path -notmatch '/runCommands/DbHubControl-rca-' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/runCommands/' -and $_.Method -eq 'DELETE' -and $_.Path -notmatch '/runCommands/DbHubControl-rca-' }) | Should -BeNullOrEmpty
+        @($script:rcaCommands | ForEach-Object { $_.Request.command }) | Should -Be @('export', 'export')
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
     }
 
     It 'the auto-stop does the same, and writes its stop to the session the group names' {
@@ -2934,6 +2997,387 @@ Describe 'The dispatch Run Command''s script: a target whose activity wasn''t se
         $real.ExitCode | Should -Be 1
         $real.Failed[0].Target | Should -Be 'T1'
         $real.Failed[0].Message | Should -Match 'settings\.json is missing'
+    }
+}
+
+Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Run Commands, its bundles, and its index' {
+    BeforeAll {
+        $script:rcaRoot = Join-Path -Path $repoRoot -ChildPath 'rca'
+        $script:transportSchema = Join-Path -Path $script:rcaRoot -ChildPath 'transport.schema.json'
+        $script:fixtureSession = '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21'
+        $script:fixtureIndex = Get-Content -LiteralPath (Join-Path -Path $script:rcaRoot -ChildPath 'fixtures/export-index.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 5 -Compress
+        $script:fixtureParts = @(Get-ChildItem -Path (Join-Path -Path $script:rcaRoot -ChildPath 'fixtures') -Filter '*.parts.txt' -File | Sort-Object -Property Name | ForEach-Object { Get-Content -LiteralPath $_.FullName } | Where-Object { $_ })
+        $script:fixtureIds = @('20261120T165000Z-sqlvm01-0001', '20261120T170000Z-sqlvm01-0002')
+
+        # The runner on sqlvm01 with the fixtures' documents: each export lists the next of -Batches (comma-separated
+        # document IDs), and 'rca part' prints a fixture's part; archost01's runner has nothing to export.
+        function Set-FixtureRunner([string[]] $Batches = @($script:fixtureIds -join ',')) {
+            $script:exportBatches = [System.Collections.Generic.Queue[string]]::new()
+            foreach ($batch in $Batches) {
+                $script:exportBatches.Enqueue($batch)
+            }
+            $script:rcaRunner = {
+                param($Command)
+                $request = $Command.Request
+                if ($Command.Vm -ne 'sqlvm01') {
+                    return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+                }
+                if ($request.command -eq 'export') {
+                    if ($null -eq $Command.PSObject.Properties['Answer']) {
+                        $ids = if ($script:exportBatches.Count -gt 0) { $script:exportBatches.Dequeue().Split(',') } else { @() }
+                        $index = $script:fixtureIndex | ConvertFrom-Json
+                        $index.documents = @($index.documents | Where-Object { $_.documentId -in $ids })
+                        $Command | Add-Member -NotePropertyName 'Answer' -NotePropertyValue ('DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject $index -Depth 5 -Compress))
+                    }
+                    if (@(($Command.Answer.Substring(20) | ConvertFrom-Json).documents).Count -eq 0) {
+                        return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+                    }
+                    return (New-TestRcaView -Status 'Pass' -Message 'runner rca export: its line follows.' -Line $Command.Answer)
+                }
+                $line = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $request.documentId -and $_.Split(' ')[3].StartsWith(('{0}/' -f $request.part)) }) | Select-Object -First 1
+                if (-not $line) {
+                    return (New-TestRcaView -Status 'Fail' -Message 'runner rca part: exit code 1. The document or part doesn''t exist.')
+                }
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+            }
+        }
+
+        # The documents in bundles' parts, decoded as the notebook decodes them (rca/README.md, Part lines).
+        function Expand-TestBundle([string[]] $Json) {
+            $parts = @(foreach ($text in $Json) { ($text | ConvertFrom-Json).parts })
+            $documents = [ordered]@{}
+            foreach ($group in ($parts | Group-Object -Property { $_.Split(' ')[2] })) {
+                $buffer = [System.IO.MemoryStream]::new()
+                foreach ($line in ($group.Group | Sort-Object -Property { [int]$_.Split(' ')[3].Split('/')[0] })) {
+                    $bytes = [System.Convert]::FromBase64String($line.Split(' ')[5])
+                    $buffer.Write($bytes, 0, $bytes.Length)
+                }
+                $stream = [System.IO.Compression.GZipStream]::new([System.IO.MemoryStream]::new($buffer.ToArray()), [System.IO.Compression.CompressionMode]::Decompress)
+                $reader = [System.IO.StreamReader]::new($stream)
+                $documents[$group.Name] = $reader.ReadToEnd() | ConvertFrom-Json
+                $reader.Dispose()
+            }
+            return $documents
+        }
+    }
+
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:replicaSku = 'Standard_D4ds_v5'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:autostop = '2026-10-27T15:30:00Z'
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:fixtureSession; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        function Get-SessionStatus {
+            $writes = $script:secrets['dbhub-session-status']
+            return ($writes[$writes.Count - 1].Value | ConvertFrom-Json)
+        }
+        function Get-RcaBundle {
+            return @($script:secrets['dbhub-session-metrics'] | Where-Object { [string]$_.Tags['rca'] -eq 'bundle' })
+        }
+    }
+
+    It 'Stop now exports the session''s evidence before the VMs deallocate: its bundles first, then the metrics'' final version, whose rca member lists them' {
+        Set-FixtureRunner
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.rca.status | Should -Be 'Pass'
+        $result.rca.documents | Should -Be 2
+        $versions = @($script:secrets['dbhub-session-metrics'])
+        $versions.Count | Should -Be 2 -Because 'one bundle of the 4 parts, then the metrics'
+        $bundle = $versions[0]
+        [string]$bundle.Tags['rca'] | Should -Be 'bundle'
+        [string]$bundle.Tags['sessionId'] | Should -Be $script:fixtureSession
+        Test-Json -Json $bundle.Value -SchemaFile $script:transportSchema | Should -BeTrue
+        @(($bundle.Value | ConvertFrom-Json).parts | Sort-Object) | Should -Be @($script:fixtureParts | Sort-Object)
+        $final = $versions[1]
+        [string]$final.Tags['rca'] | Should -Be 'yes'
+        $document = $final.Value | ConvertFrom-Json
+        @($document.series).Count | Should -BeGreaterThan 0 -Because 'T4''s metrics stay, beside the index'
+        Test-Json -Json (ConvertTo-Json -InputObject $document.rca -Depth 6 -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
+        [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $document.rca -Depth 6 -Compress)) | Should -BeLessOrEqual 4000
+        @($document.rca.bundles) | Should -Be @($bundle.Version)
+        @($document.rca.documents.documentId) | Should -Be $script:fixtureIds
+        $document.rca.sessionId | Should -Be $script:fixtureSession
+        $document.rca.status | Should -Be 'Pass'
+        [System.Text.Encoding]::UTF8.GetByteCount($final.Value) | Should -BeLessOrEqual 24000
+        # The parts decode to the fixture documents.
+        $decoded = Expand-TestBundle -Json @($bundle.Value)
+        @($decoded.Keys) | Should -Be $script:fixtureIds
+        $decoded[$script:fixtureIds[1]].final | Should -BeTrue
+        # Every Run Command of the export went out, and was deleted, before the first deallocation.
+        $firstDeallocate = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Select-Object -First 1))
+        $lastRca = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Path -match '/runCommands/DbHubControl-rca-' -and $_.Method -in 'PUT', 'DELETE' }) | Select-Object -Last 1))
+        $firstDeallocate | Should -BeGreaterThan 0
+        $lastRca | Should -BeLessThan $firstDeallocate
+        $metricsWrite = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Path -match '/secrets/dbhub-session-metrics$' }) | Select-Object -Last 1))
+        $metricsWrite | Should -BeLessThan $firstDeallocate
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+        $exports = @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' })
+        @($exports | ForEach-Object Vm | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
+        @($exports | ForEach-Object { $_.Request.sessionId } | Select-Object -Unique) | Should -Be @($script:fixtureSession)
+        @($exports | ForEach-Object { $_.Request.final } | Select-Object -Unique) | Should -Be @($true)
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }).Count | Should -Be 4
+        # The stopped status keeps the state, and the lines the notebook prints.
+        $status = Get-SessionStatus
+        $status.rca.final | Should -BeTrue
+        @($status.rca.bundles) | Should -Be @($bundle.Version)
+        @($status.rcaLines | ForEach-Object step) | Should -Be @('RCA.EXPORT', 'RCA.CAPTURE.T1', 'RCA.CAPTURE.T4', 'RCA.CAPTURE.T4-replica')
+        @($status.rcaLines | ForEach-Object status | Select-Object -Unique) | Should -Be @('Pass')
+        ($status.rcaLines | Where-Object step -EQ 'RCA.CAPTURE.T1').message | Should -Be 'T1: the observer captured from 16:50 to 17:05 UTC.'
+    }
+
+    It 'fetches at most 10 parts at a time on a VM, and never more than its 25 managed Run Commands allow' {
+        $index = [ordered]@{ kind = 'ContosoCare.RcaExportIndex'; version = 1; documents = @(1..3 | ForEach-Object { [ordered]@{ documentId = ('20261120T1{0}0000Z-sqlvm01-000{0}' -f $_); parts = 9; sha256 = ([string]$_ * 64) } }); status = 'Pass'; message = '3 documents.' }
+        $script:indexLine = 'DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject $index -Depth 5 -Compress)
+        $script:most = 0
+        $script:rcaRunner = {
+            param($Command)
+            $open = @($script:rcaCommands | Where-Object { $_.Vm -eq 'sqlvm01' -and $script:rcaDeleted -notcontains $_.Name }).Count
+            $script:most = [System.Math]::Max($script:most, $open)
+            if ($Command.Vm -ne 'sqlvm01') { return (New-TestRcaView -Status 'Not selected' -Message 'nothing') }
+            if ($Command.Request.command -eq 'export') { return (New-TestRcaView -Status 'Pass' -Message 'ok' -Line $script:indexLine) }
+            # Each part runs a minute, and ends without its line, as when PowerShell Direct breaks: the next export tries again.
+            if (($script:clock - $Command.At).TotalSeconds -lt 60) { return $null }
+            return (New-TestRcaView -Status 'Fail' -Message 'runner rca part in arcsql01: The pipe has been ended.')
+        }
+        $context = New-TestContext
+        $done = Invoke-DbHubRcaSessionExport -Context $context -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        $script:most | Should -Be 10 -Because 'ten parts, and nothing else of the export, at a time'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }).Count | Should -Be 27
+        $done.State['status'] | Should -Be 'Warning'
+        @($done.State['pending']).Count | Should -Be 3
+        # 20 other Run Commands on the VM leave room for 5: the export's, then 4 parts at a time.
+        Reset-TestAzure
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:runCommands['sqlvm01'] = @(1..20 | ForEach-Object { @{ name = ('DbHubDemo-Other-{0}' -f $_) } })
+        $script:most = 0
+        $script:rcaRunner = {
+            param($Command)
+            $open = @($script:rcaCommands | Where-Object { $_.Vm -eq 'sqlvm01' -and $script:rcaDeleted -notcontains $_.Name }).Count
+            $script:most = [System.Math]::Max($script:most, $open)
+            if ($Command.Request.command -eq 'export') { return (New-TestRcaView -Status 'Pass' -Message 'ok' -Line $script:indexLine) }
+            if (($script:clock - $Command.At).TotalSeconds -lt 60) { return $null }
+            return (New-TestRcaView -Status 'Fail' -Message 'runner rca part in arcsql01: The pipe has been ended.')
+        }
+        $null = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        $script:most | Should -Be 5
+    }
+
+    It 'stops at its time, deletes what''s still running, and keeps the documents it didn''t fetch whole for the next export' {
+        Set-FixtureRunner
+        $fixture = $script:rcaRunner
+        # The second document's parts never end.
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'part' -and $Command.Request.documentId -eq '20261120T170000Z-sqlvm01-0002') { return $null }
+            return (& $fixture $Command)
+        }.GetNewClosure()
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped' -Because 'the export never fails the stop'
+        $result.rca.status | Should -Be 'Warning'
+        $status = Get-SessionStatus
+        $status.rca.final | Should -BeFalse
+        @($status.rca.documents.documentId) | Should -Be @('20261120T165000Z-sqlvm01-0001')
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261120T170000Z-sqlvm01-0002@sqlvm01')
+        ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '1 document\(s\) weren''t fetched whole in time; they stay on sqlvm01 for the next export'
+        ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').fix | Should -Match 'the next session''s start exports it'
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+        $index = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json).rca
+        @($index.documents.documentId) | Should -Be @('20261120T165000Z-sqlvm01-0001')
+        $index.status | Should -Be 'Warning'
+    }
+
+    It 'says a runner or a bootstrap bundle older than the export is updated by deploy.ps1, as RCA.EXPORT and RCA.CAPTURE Warnings, and still stops' -ForEach @(
+        @{ Case = 'runner'; View = { New-TestRcaView -Status 'Not supported' -Message 'runner rca export: this VM''s runner predates the RCA export (ADR 0031), so nothing was exported; ./scripts/deploy.ps1 updates it.' -Evidence @{ oldRunner = $true } }; Says = 'workload runner predates the RCA export' }
+        @{ Case = 'bundle'; View = { New-TestRcaView -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, or StopGuest.' }; Says = 'bootstrap bundle predates the RCA export' }
+    ) {
+        $script:oldView = $View
+        $script:rcaRunner = { & $script:oldView }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $lines = @((Get-SessionStatus).rcaLines)
+        ($lines | Where-Object step -EQ 'RCA.EXPORT').status | Should -Be 'Warning'
+        ($lines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match $Says
+        @($lines | Where-Object step -Like 'RCA.CAPTURE.*' | ForEach-Object step) | Should -Be @('RCA.CAPTURE.T1', 'RCA.CAPTURE.T2', 'RCA.CAPTURE.T3', 'RCA.CAPTURE.T4', 'RCA.CAPTURE.T4-replica')
+        ($lines | Where-Object step -EQ 'RCA.CAPTURE.T2').fix | Should -Be 'Run ./scripts/deploy.ps1, which updates the runner and its bootstrap bundle on the VMs.'
+        @(Get-RcaBundle) | Should -BeNullOrEmpty
+        ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'rca'
+    }
+
+    It 'skips a document whose parts don''t add up to its SHA-256, and says so' {
+        Set-FixtureRunner
+        $fixture = $script:rcaRunner
+        $script:rcaRunner = {
+            param($Command)
+            $view = & $fixture $Command
+            if ($Command.Request.command -eq 'part' -and $Command.Request.documentId -eq '20261120T165000Z-sqlvm01-0001' -and $Command.Request.part -eq 2) {
+                # Other valid Base64 in the part's slice: the part's own checks pass, the document's SHA-256 doesn't.
+                $lines = $view['output'] -split "`n"
+                $fields = $lines[-1].Split(' ')
+                $fields[5] = $(if ($fields[5].StartsWith('AAAA')) { 'BBBB' } else { 'AAAA' }) + $fields[5].Substring(4)
+                $lines[-1] = $fields -join ' '
+                $view['output'] = $lines -join "`n"
+            }
+            return $view
+        }.GetNewClosure()
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.rca.status | Should -Be 'Warning'
+        $status = Get-SessionStatus
+        @($status.rca.documents.documentId) | Should -Be @('20261120T170000Z-sqlvm01-0002')
+        ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '20261120T165000Z-sqlvm01-0001 was skipped: its SHA-256 doesn''t match\.'
+        @((Get-RcaBundle)[0].Value | ConvertFrom-Json | ForEach-Object { $_.parts } | ForEach-Object { $_.Split(' ')[2] } | Select-Object -Unique) | Should -Be @('20261120T170000Z-sqlvm01-0002')
+    }
+
+    It 'exports at each re-check while the session runs, and the stop''s index lists every bundle of the session' {
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        Set-FixtureRunner -Batches '20261120T165000Z-sqlvm01-0001'
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:fixtureSession; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands) | Should -BeNullOrEmpty -Because 'no earlier session left evidence behind'
+        (Get-SessionStatus).rca.sessionId | Should -Be $script:fixtureSession
+        $script:clock = $script:clock.AddMinutes(30)
+        $check = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $check.rca | Should -Be 'Exported'
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        @($running.rca.documents.documentId) | Should -Be @('20261120T165000Z-sqlvm01-0001')
+        @($running.rca.bundles).Count | Should -Be 1
+        $running.rca.final | Should -BeFalse
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { $_.Request.final } | Select-Object -Unique) | Should -Be @($false)
+        @($running.steps | Where-Object step -EQ 'RCA.EXPORT').Count | Should -Be 1
+        # Nothing new at the next re-check: nothing is written.
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $again = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(5))
+        $again.rca | Should -Be 'Nothing'
+        $script:secrets['dbhub-session-status'].Count | Should -Be $writes
+        # The stop's export holds the second document; its index lists both bundles.
+        Set-FixtureRunner -Batches '20261120T170000Z-sqlvm01-0002'
+        $stop = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock.AddMinutes(40))
+        $stop.status | Should -BeIn 'Stopped', 'Partial'
+        $index = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json).rca
+        @($index.bundles).Count | Should -Be 2
+        @($index.bundles) | Should -Be @(Get-RcaBundle | ForEach-Object Version)
+        @($index.documents.documentId) | Should -Be $script:fixtureIds
+        @((Expand-TestBundle -Json @(Get-RcaBundle | ForEach-Object Value)).Keys) | Should -Be $script:fixtureIds
+        (Get-SessionStatus).rca.final | Should -BeTrue
+    }
+
+    It 'leaves a re-check''s last minutes to the stop, and reports nothing for a VM that doesn''t run between them' {
+        $status = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T15:05:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $status -Depth 8 -Compress
+        (Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }).Outcome | Should -Be 'Late'
+        @($script:rcaCommands) | Should -BeNullOrEmpty
+        $status['runEndUtc'] = '2026-10-27T16:30:00Z'
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $status -Depth 8 -Compress
+        $script:vm['archost01'] = 'deallocated'
+        (Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }).Outcome | Should -Be 'Nothing'
+        $script:secrets.ContainsKey('dbhub-session-status') | Should -BeFalse -Because 'nothing new was exported, and a VM that doesn''t run is the host check''s to report'
+    }
+
+    It 'exports at the next session''s start what an earlier session''s stop didn''t, right before each VM''s activity, and keeps its index for Run all' {
+        # The earlier session: the nightly stop ended it, after a re-check had exported part of it.
+        $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        Set-FixtureRunner
+        $next = 'fedcba9876543210fedcba9876543210'
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $next; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        $exports = @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' })
+        @($exports | ForEach-Object Vm | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
+        @($exports | ForEach-Object { $_.Request.sessionId } | Select-Object -Unique) | Should -Be @($script:fixtureSession)
+        foreach ($vm in 'sqlvm01', 'archost01') {
+            $export = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match ('/virtualMachines/{0}/runCommands/DbHubControl-rca-' -f $vm) }) | Select-Object -First 1))
+            $dispatch = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match ('/virtualMachines/{0}/runCommands/DbHubControl-{0}-\d{{14}}$' -f $vm) }) | Select-Object -First 1))
+            $export | Should -BeLessThan $dispatch -Because "$vm's export holds none of the new session's activity"
+        }
+        $status = Get-SessionStatus
+        $status.sessionId | Should -Be $next
+        $status.rcaEarlier.sessionId | Should -Be $script:fixtureSession
+        @($status.rcaEarlier.bundles).Count | Should -Be 2 -Because 'the earlier session''s re-check bundle, and this start''s'
+        @($status.rcaEarlier.documents.documentId) | Should -Be $script:fixtureIds
+        Test-Json -Json (ConvertTo-Json -InputObject $status.rcaEarlier -Depth 6 -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
+        ($status.steps | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '^The evidence that session 5f1c0e7a''s stop didn''t export: 2 new evidence document'
+        $status.rca.sessionId | Should -Be $next
+        @($status.rca.bundles) | Should -BeNullOrEmpty -Because 'the new session''s own state starts empty'
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'exports nothing at a start after a session whose stop exported everything, or one from before the export' {
+        foreach ($rca in @([ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; status = 'Pass'; message = '' }, $null)) {
+            $previous = [ordered]@{ sessionId = $script:fixtureSession; phase = 'stopped' }
+            if ($null -ne $rca) {
+                $previous['rca'] = $rca
+            }
+            Get-DbHubRcaEarlier -Previous $previous -SessionId 'fedcba9876543210fedcba9876543210' | Should -BeNullOrEmpty
+        }
+        Get-DbHubRcaEarlier -Previous ([ordered]@{ sessionId = $script:fixtureSession; rca = [ordered]@{ sessionId = $script:fixtureSession; final = $false } }) -SessionId $script:fixtureSession | Should -BeNullOrEmpty -Because 'a session is never its own earlier session'
+    }
+
+    It 'packs at most 6 parts in a bundle, each within 24,000 bytes, and reads the version each write created' {
+        $lines = @(1..13 | ForEach-Object { $script:fixtureParts[($_ - 1) % 4] })
+        $bundles = @(New-DbHubRcaBundle -SessionId $script:fixtureSession -Line $lines)
+        @($bundles | ForEach-Object { @(($_ | ConvertFrom-Json).parts).Count }) | Should -Be @(6, 6, 1)
+        foreach ($bundle in $bundles) {
+            [System.Text.Encoding]::UTF8.GetByteCount($bundle) | Should -BeLessOrEqual 24000
+            Test-Json -Json $bundle -SchemaFile $script:transportSchema | Should -BeTrue
+        }
+        (@(New-DbHubRcaBundle -SessionId '' -Line @($script:fixtureParts[0]))[0] | ConvertFrom-Json).sessionId | Should -BeNullOrEmpty
+        $written = Set-DbHubVaultSecret -Context (New-TestContext) -Name 'dbhub-session-metrics' -Value '{}'
+        $written.Version | Should -Match '^[0-9a-f]{32}$'
+        $written.Version | Should -Be $script:secrets['dbhub-session-metrics'][-1].Version
+    }
+
+    It 'decodes, checks, and bundles the evidence the same way in Windows PowerShell 5.1' {
+        $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $IsWindows -or -not $powershell) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
+            return
+        }
+        $probe = {
+            param([string] $Common, [string[]] $Parts)
+            . $Common
+            $out = @()
+            foreach ($id in @($Parts | ForEach-Object { $_.Split(' ')[2] } | Select-Object -Unique)) {
+                $expanded = Expand-DbHubRcaDocument -Line @($Parts | Where-Object { $_.Split(' ')[2] -eq $id })
+                $coverage = @(Get-DbHubRcaCoverage -Document $expanded.Document | ForEach-Object { '{0}:{1}:{2:HH:mm}-{3:HH:mm}' -f $_.Target, $_.Captured, $_.StartUtc, $_.EndUtc })
+                $out += ('{0}|{1}|{2}|{3}' -f $id, $expanded.Ok, $expanded.Document.documentId, ($coverage -join ','))
+            }
+            $out += @(New-DbHubRcaBundle -SessionId '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21' -Line $Parts)
+            $out += (ConvertTo-Json -InputObject (New-DbHubRcaIndex -State ([ordered]@{ sessionId = 'abc'; bundles = @('0123456789abcdef0123456789abcdef'); documents = @([ordered]@{ documentId = 'x'; parts = 2; sha256 = 'y' }); status = 'Pass'; message = 'ok' })) -Depth 5 -Compress)
+            return $out
+        }
+        $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
+        $here = @(& $probe $common $script:fixtureParts)
+        $inputFile = Join-Path -Path $TestDrive -ChildPath 'rca-probe.json'
+        Set-Content -LiteralPath $inputFile -Value (ConvertTo-Json -InputObject @{ common = $common; parts = $script:fixtureParts; probe = $probe.ToString() } -Depth 4) -Encoding utf8
+        $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common ([string[]]`$in.parts); `$out | ForEach-Object {{ [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$_)) }}" -f $inputFile
+        $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
+        $LASTEXITCODE | Should -Be 0
+        $there = @($output | Select-Object -Last $here.Count | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]$_).Trim())) })
+        $there | Should -Be $here
+        $here[0] | Should -Be '20261120T165000Z-sqlvm01-0001|True|20261120T165000Z-sqlvm01-0001|T1:True:16:50-17:05'
+        $here[1] | Should -Be '20261120T170000Z-sqlvm01-0002|True|20261120T170000Z-sqlvm01-0002|T4:True:17:00-17:20,T4-replica:True:17:00-17:20'
     }
 }
 
