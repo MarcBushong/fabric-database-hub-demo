@@ -15,6 +15,8 @@ export interface TmdlMeasure {
     folder: string;
     format: string;
     hidden: boolean;
+    /** Its DAX and properties, as written: what reachesAnswerKey reads for the tables and measures it uses. */
+    body: string;
 }
 
 export interface TmdlTable {
@@ -61,7 +63,8 @@ export function parseTable(text: string): TmdlTable {
                 current = { name: unquote(member[2]), dataType: "", description: doc.join(" "), hidden: false };
                 table.columns.push(current);
             } else if (member[1] === "measure") {
-                current = { name: unquote(member[2]), description: doc.join(" "), folder: "", format: "", hidden: false };
+                const dax = line.slice(member[0].length).replace(/^\s*=\s*/, "");
+                current = { name: unquote(member[2]), description: doc.join(" "), folder: "", format: "", hidden: false, body: dax };
                 table.measures.push(current);
             } else if (inPartition) {
                 const kind = /=\s*(\w+)/.exec(line);
@@ -84,6 +87,7 @@ export function parseTable(text: string): TmdlTable {
             if (prop?.[1] === "dataType") current.dataType = prop[2];
             if (line === "isHidden") current.hidden = true;
         } else {
+            current.body = current.body ? `${current.body}\n${line}` : line;
             if (prop?.[1] === "displayFolder") current.folder = prop[2];
             if (prop?.[1] === "formatString") current.format = prop[2];
             if (line === "isHidden") current.hidden = true;
@@ -115,6 +119,26 @@ export function parseRelationships(text: string): Relationship[] {
 
 /** A column or measure reference in DAX form: 'Table'[Name]. */
 const ref = (table: string, name: string) => `'${table.replace(/'/g, "''")}'[${name}]`;
+
+/**
+ * The measures that read one of these tables, directly or through another measure, with every measure the tables
+ * hold: the guide leaves them out and run_dax refuses them, because DAX names a measure without its table.
+ */
+export function reachesAnswerKey(tables: TmdlTable[], keyTables: readonly string[]): string[] {
+    const measures = tables.flatMap((t) => t.measures.map((m) => ({ table: t.name, name: m.name, body: m.body.toLowerCase() })));
+    const reached = new Set(measures.filter((m) => keyTables.includes(m.table) || keyTables.some((k) => m.body.includes(k.toLowerCase()))).map((m) => m.name));
+    for (let grew = true; grew; ) {
+        grew = false;
+        for (const m of measures) {
+            if (reached.has(m.name)) continue;
+            if ([...reached].some((name) => m.body.includes(`[${name.toLowerCase()}]`))) {
+                reached.add(m.name);
+                grew = true;
+            }
+        }
+    }
+    return [...reached].sort((a, b) => a.localeCompare(b));
+}
 
 /** 'Table'.'Column' or Table.Column (TMDL) as 'Table'[Column] (DAX). */
 export function toDaxRef(tmdlRef: string): string {

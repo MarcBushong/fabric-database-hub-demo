@@ -1,14 +1,17 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { buildGuideSource, OUTPUT } from "../../scripts/build-model-guide";
+import { buildGuideSource, OUTPUT, withoutScenarioClauses } from "../../scripts/build-model-guide";
+import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
+import { readContract } from "@/rca/testdata/contract";
+import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "./answer-key";
 import { contextPrompt, endedWithoutAnswer, hasAnswer, NO_ANSWER, recap, reduceConversation, retryPrompt, toMarkdown, type AssistantTurn, type Turn } from "./conversation";
 import { buildSystemMessage } from "./guide";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
-import { MODEL_GUIDE } from "./model-guide.generated";
+import { ANSWER_KEY_MEASURES, MODEL_GUIDE } from "./model-guide.generated";
 import { COSMOS_PROBE_DAX } from "./starters";
-import { parseTable, toDaxRef } from "./tmdl";
+import { parseTable, reachesAnswerKey, toDaxRef } from "./tmdl";
 
 describe("the model guide", () => {
     it("matches the history model's TMDL (run npm run guide:build after changing the model)", () => {
@@ -16,11 +19,46 @@ describe("the model guide", () => {
     });
 
     it("names the model's tables, measures, and target keys exactly as DAX needs them", () => {
-        for (const name of ["'Telemetry Snapshots'[Bucket UTC]", "[CPU (%)]", "[Wait Time (s)]", "'Incident Windows'[Window Start UTC]", "{ \"T4\", \"T4 · Azure Database for PostgreSQL\""]) {
+        for (const name of ["'Telemetry Snapshots'[Bucket UTC]", "[CPU (%)]", "[Wait Time (s)]", "'Validation Results'", "{ \"T4\", \"T4 · Azure Database for PostgreSQL\""]) {
             expect(MODEL_GUIDE).toContain(name);
         }
         expect(MODEL_GUIDE).not.toMatch(/\[Focus /);
         expect(MODEL_GUIDE).toContain("'Telemetry Snapshots'[Target Key] -> 'Target'[Target Key]");
+    });
+
+    // ADR 0031: the chat investigates the way a DBA's tools would, so nothing it reads describes what the demo injected.
+    it("leaves the demo's answer key out: its tables, every measure that reads them, the grading rows, and scenario wording", () => {
+        const contract = readContract<{ answerKey: { modelTables: string[]; telemetryAnalyses: string[] }; chat: { modelGuideExcludes: string[] } }>("blind-detection.json");
+        expect([...ANSWER_KEY_TABLES].sort()).toEqual([...contract.answerKey.modelTables].sort());
+        expect([...ANSWER_KEY_TABLES].sort()).toEqual([...contract.chat.modelGuideExcludes].sort());
+        expect([...ANSWER_KEY_ANALYSES].sort()).toEqual([...contract.answerKey.telemetryAnalyses].sort());
+        for (const table of ANSWER_KEY_TABLES) expect(MODEL_GUIDE).not.toContain(table);
+        // Through another measure, too: [CPU In Incident Window] reads [In Incident Window], which reads 'Incident Windows'.
+        expect(ANSWER_KEY_MEASURES).toEqual(expect.arrayContaining(["In Incident Window", "CPU In Incident Window", "Incidents", "Findings", "Latest Capture UTC"]));
+        for (const measure of ANSWER_KEY_MEASURES) expect(MODEL_GUIDE).not.toContain(`[${measure}]`);
+        for (const analysis of ANSWER_KEY_ANALYSES) expect(MODEL_GUIDE).not.toContain(`{ "${analysis}"`);
+        expect(MODEL_GUIDE).not.toMatch(/scenario|inject/i);
+        expect(MODEL_GUIDE).toContain("[Log Rate Governor Wait (s)] (Waits and IO): Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance.");
+        // run_dax refuses a measure by its name alone, so none may also name a column the chat can query.
+        const columns = new Set([...MODEL_GUIDE.matchAll(/'[^']+'\[([^\]]+)\]/g)].map((m) => m[1].toLowerCase()));
+        expect(ANSWER_KEY_MEASURES.filter((m) => columns.has(m.toLowerCase()))).toEqual([]);
+    });
+
+    it("finds the measures that reach a table, directly or through other measures, and drops scenario clauses", () => {
+        const measure = (name: string, body: string) => ({ name, body, description: "", folder: "", format: "", hidden: false });
+        const table = (name: string, measures: ReturnType<typeof measure>[]) => ({ name, description: "", source: "", columns: [], rows: [], measures });
+        const reached = reachesAnswerKey(
+            [
+                table("Key", [measure("Hosted", "COUNTROWS ( 'Key' )")]),
+                table("Facts", [measure("Direct", "MAX ( 'Key'[At] )"), measure("Through", "IF ( [hosted], 1 )"), measure("Twice", "[Through] + 1"), measure("Clean", "SUM ( 'Facts'[Value] )")]),
+            ],
+            ["Key"],
+        );
+        expect(reached).toEqual(["Direct", "Hosted", "Through", "Twice"]);
+        expect(withoutScenarioClauses("Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, the T3 log-rate scenario's signature.")).toBe(
+            "Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance.",
+        );
+        expect(withoutScenarioClauses("CPU per bin. Shows the injected scenario. Per target.")).toBe("CPU per bin. Per target.");
     });
 
     it("parses a table's description, columns, measures, and calculated rows", () => {
@@ -62,6 +100,19 @@ describe("the model guide", () => {
         expect(withLive).toContain("suggest_followups");
         expect(withLive).toContain(MODEL_GUIDE.slice(0, 200));
         expect(buildSystemMessage({ estate: false })).toMatch(/LIVE estate: not available/);
+    });
+
+    it("is blind, and adds the investigation playbook only when the model has the RCA tables (ADR 0031)", () => {
+        const plain = buildSystemMessage({ estate: false });
+        const rca = buildSystemMessage({ estate: false, rca: true });
+        for (const message of [plain, rca]) {
+            expect(message).not.toMatch(/scenario|inject|fixed minutes|incident window/i);
+            for (const table of ANSWER_KEY_TABLES) expect(message).not.toContain(table);
+        }
+        expect(plain).not.toContain(INVESTIGATION_PLAYBOOK);
+        expect(rca.endsWith(INVESTIGATION_PLAYBOOK)).toBe(true);
+        expect(rca).toContain("times as the investigation tools state them");
+        expect(new TextEncoder().encode(rca).length).toBeLessThan(96 * 1024);
     });
 
     // R925: the model ended a turn with suggest_followups and no answer, and said "401" to the audience.
