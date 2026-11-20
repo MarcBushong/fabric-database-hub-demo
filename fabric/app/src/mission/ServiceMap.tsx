@@ -117,7 +117,7 @@ export function ServiceMap(props: {
         <svg className={`mc-map${motion ? " mc-motion" : ""}${dense ? " mc-dense" : ""}`} viewBox="0 0 1000 520" role="group" aria-label={props.title} preserveAspectRatio="xMidYMid meet">
             <defs>
                 <radialGradient id="mc-hub-fill" cx="50%" cy="45%" r="60%">
-                    <stop offset="0%" stopColor="var(--stage-cyan)" stopOpacity="0.35" />
+                    <stop offset="0%" stopColor="var(--stage-accent)" stopOpacity="0.35" />
                     <stop offset="100%" stopColor="var(--stage-panel)" stopOpacity="1" />
                 </radialGradient>
             </defs>

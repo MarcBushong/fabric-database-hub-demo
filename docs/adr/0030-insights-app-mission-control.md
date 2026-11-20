@@ -1,8 +1,8 @@
 # ADR 0030: The Insights app's own look, and what only it can show (Wave 1)
 
-- **Status:** Proposed (2026-11-19). Wave 1 is built and tested in the local preview with sample data, and an independent review's 10 findings are fixed, as are the 3 gaps its re-review found ([Validation](#validation)); the release's final tests see it in a deployed app. The coordinator kept the palette and Mission Control's dark default for this release; they and the service names are the owner's to confirm ([below](#open-for-the-owner)).
+- **Status:** Proposed (2026-11-19). Wave 1 is built and tested in the local preview with sample data, and an independent review's 10 findings are fixed, as are the 3 gaps its re-review found ([Validation](#validation)); the release's final tests see it in a deployed app. The owner chose the palette on 2026-11-20: Microsoft's colors ([the look](#the-look-microsofts-colors)). The coordinator kept Mission Control's dark default for this release; it and the service names are the owner's to confirm ([below](#open-for-the-owner)).
 - **Date:** 2026-11-19
-- **Decision source:** User-directed (2026-11-19): "Make sure the Fabric Rayfin app can do things the Database Hub standalone can't and visually different. Brainstorm some cool things to show case the power of Rayfin apps to show a WOW of that with this." The owner chose "Wave 1 now, in this release" (ideas 1 to 6 of the coordinator's brainstorm). The coordinator made the look's calls (ContosoCare's palette, Mission Control dark by default), which the owner can change.
+- **Decision source:** User-directed (2026-11-19): "Make sure the Fabric Rayfin app can do things the Database Hub standalone can't and visually different. Brainstorm some cool things to show case the power of Rayfin apps to show a WOW of that with this." The owner chose "Wave 1 now, in this release" (ideas 1 to 6 of the coordinator's brainstorm). The coordinator made the look's calls (ContosoCare's palette, Mission Control dark by default), which the owner can change. On 2026-11-20 the owner chose the palette: a Microsoft palette, pleasing to the eye, that feels elevated and pleasant to look at.
 - **Related:** [ADR 0029](0029-insights-app-dba-console.md) (the DBA console; this ADR replaces its Fabric-teal theme), [ADR 0012](0012-validation-model.md) (statuses), [ADR 0026](0026-one-run-all-session.md) (one Run all, which records the session's plan), [ADR 0028](0028-ask-copilot-in-the-insights-app.md) (Ask Copilot), [the app's README](../../fabric/app/README.md)
 
 ## Context
@@ -55,17 +55,21 @@ One scrubber drives the service map (its states and a shockwave on each fault), 
 
 A chrome-free view (`#/kiosk`) that rotates Mission Control (20 seconds), the scoreboard (20), and the replay (45, playing the session through), for a booth or NOC screen. Space pauses it (WCAG 2.2.2), the arrows change scenes, and Esc leaves for Mission Control. **Full screen** uses the Fullscreen API when the frame allows it; otherwise the kiosk says to press F11. A screen reader hears the scene and whether it's paused, never the countdown. The kiosk keeps showing its last history while a query refreshes or after one fails (the app's queries keep their last result, `useQuery`'s `stale`), and asks again every 30 seconds; once a retry loads, its queries refresh with the cache's 5 minutes again.
 
-### The look: ContosoCare's own
+### The look: Microsoft's colors
 
-- **One set of tokens:** the brand ramp (`src/theme/identity.ts`: deep navy with cyan and magenta accents; `APP_BRAND` is the one swap point, and Fabric's teal stays there for a one-line swap back) themes the whole app through Fluent, and the stage tokens (`src/theme/stage.ts`) color the new pages in dark, light, and high contrast.
+The owner's choice (2026-11-20); until then, ContosoCare's navy with cyan and magenta.
+
+- **One set of tokens:** the brand ramp is Fluent 2's own Microsoft blue (`MICROSOFT_BRAND` in `src/theme/identity.ts`, the ramp Fluent's web themes are made from; `APP_BRAND` is the one swap point, and Fabric's teal stays in `fluent.ts` for a one-line swap back). It themes the whole app through Fluent, and the stage tokens (`src/theme/stage.ts`) color the new pages in dark, light, and high contrast.
+- **Accents, used sparingly:** the Microsoft logo's four colors (`MICROSOFT_ACCENTS`) mark T1 to T4 (the map's node, the target's chip, its chart series) and the charts' first four categories; Fluent's purple and teal mark T5 and T4's read replica. On dark surfaces they're the logo's own colors; on light ones, the same hues deepened to 3:1. Never a large fill. High contrast keeps its own palette.
+- **Elevated:** Fluent's layered neutrals, a panel a layer above the stage (neutral backgrounds 3, 2, and 1 in dark; 3, 1, and 4 in light), Fluent's shadows (`shadow8` under a stage panel, `shadow4` under the app's cards and `shadow8` on a hovered tile), and one restrained wash of Microsoft blue at the stage's top; no grid, and no layout change. The stage's accent is the brand's blue, and its alert the logo's orange-red.
 - **Mission Control, the scoreboard, the replay, and the kiosk sit on a dark stage** until the viewer picks a theme; a picked light or high-contrast theme applies to them too.
 - **Visualization first:** a full-bleed map and a time ribbon, not a card grid. **Motion with a purpose:** health pulses and an incident shockwave, both off under `prefers-reduced-motion`, which the replay honors too.
-- **Accessibility stays:** the contrast tests cover the new tokens (4.5:1 for text, 3:1 for marks, on every stage surface in every theme); every map node and control is reachable by keyboard, with a label, and every fault is a row in the scoreboard's table; status always has a shape and a word (ADR 0012).
+- **Accessibility stays:** the contrast tests cover the new tokens (4.5:1 for text, 3:1 for marks, on every stage surface in every theme), and pin the brand to Fluent's web blue, T1 to T4 to the logo's colors, and the stage to Fluent's neutrals and shadows; every map node and control is reachable by keyboard, with a label, and every fault is a row in the scoreboard's table; status always has a shape and a word (ADR 0012).
 - **The bundle:** the four pages load lazily, so the main chunk stays about where it was (+3.5 KB raw, about +1 KB gzip, from the routes).
 
 ### Open for the owner
 
-1. The palette: ContosoCare's own app-wide (kept by the coordinator for this release), only on the new pages, or Fabric's teal (`APP_BRAND`).
+1. The palette: **decided by the owner on 2026-11-20:** Microsoft's colors, app-wide ([the look](#the-look-microsofts-colors)).
 2. Mission Control dark by default (kept by the coordinator for this release), or following the system (`stageTheme`).
 3. The service names, T1 Billing and T2 Front desk especially (`SERVICES`).
 

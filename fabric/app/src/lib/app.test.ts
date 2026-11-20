@@ -2,6 +2,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
+import { webDarkTheme, webLightTheme } from "@fluentui/react-components";
+
 import { DBHUB_BASE, LIVE_NO_SCOPE, LIVE_REFUSED, readEstate } from "../../rayfin/functions/src/estate-core";
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
 import { estateQuery } from "@/data/queries";
@@ -16,7 +18,7 @@ import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
 import { DEFAULT_VIEW, mergeView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
 import { APP_TOKENS, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
-import { APP_BRAND, CONTOSOCARE_BRAND } from "@/theme/identity";
+import { APP_BRAND, MICROSOFT_ACCENTS, MICROSOFT_BRAND, MICROSOFT_LOGO } from "@/theme/identity";
 import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
 
 describe("themes", () => {
@@ -59,10 +61,40 @@ describe("themes", () => {
         }
     });
 
-    it("uses ContosoCare's own brand ramp, not Fabric's teal, from one set of tokens (ADR 0030)", () => {
-        expect(APP_BRAND).toBe(CONTOSOCARE_BRAND);
-        expect(FLUENT_THEMES.light.colorBrandBackground).toBe(CONTOSOCARE_BRAND[80]);
+    it("uses Fluent 2's Microsoft blue as the brand, not Fabric's teal, from one set of tokens (ADR 0030, the owner's choice)", () => {
+        expect(APP_BRAND).toBe(MICROSOFT_BRAND);
+        // The same ramp Fluent's own web themes are made from: their brand tokens come out the same.
+        for (const token of ["colorBrandBackground", "colorBrandBackgroundHover", "colorBrandForeground1", "colorBrandForegroundLink", "colorBrandStroke1"] as const) {
+            expect(FLUENT_THEMES.light[token].toLowerCase(), token).toBe(webLightTheme[token].toLowerCase());
+        }
+        expect(FLUENT_THEMES.dark.colorBrandBackground.toLowerCase()).toBe(webDarkTheme.colorBrandBackground.toLowerCase());
         expect(FLUENT_THEMES.light.colorBrandBackground).not.toBe(FABRIC_BRAND[80]);
+    });
+
+    it("marks T1 to T4 and the charts' first four categories with the Microsoft logo's colors, as they are on dark surfaces", () => {
+        expect(MICROSOFT_ACCENTS.dark).toMatchObject(MICROSOFT_LOGO);
+        for (const id of ["light", "dark"] as const) {
+            const accents = MICROSOFT_ACCENTS[id];
+            const graphic = APP_TOKENS[id].graphic;
+            const logo = [accents.blue, accents.green, accents.yellow, accents.red];
+            expect(["--target-t1", "--target-t2", "--target-t3", "--target-t4"].map((t) => graphic[t]), `${id} targets`).toEqual(logo);
+            expect(["--chart-1", "--chart-2", "--chart-3", "--chart-4"].map((t) => graphic[t]), `${id} charts`).toEqual(logo);
+            // Each target and category its own color, so no two series share one.
+            const targets = Object.entries(graphic).filter(([name]) => name.startsWith("--target-"));
+            expect(new Set(targets.map(([, color]) => color.toLowerCase())).size, `${id} targets`).toBe(targets.length);
+        }
+    });
+
+    it("layers the stage on Fluent's own neutrals and shadows: a panel a layer above the stage, with Fluent's shadow under it", () => {
+        const lower = (tokens: Record<string, string>) => Object.fromEntries(Object.entries(tokens).map(([k, v]) => [k, v.toLowerCase()]));
+        expect(lower(STAGE_TOKENS.dark.surfaces)).toEqual({ "--stage-bg": webDarkTheme.colorNeutralBackground3, "--stage-panel": webDarkTheme.colorNeutralBackground2, "--stage-panel-2": webDarkTheme.colorNeutralBackground1 });
+        expect(lower(STAGE_TOKENS.light.surfaces)).toEqual({ "--stage-bg": webLightTheme.colorNeutralBackground3, "--stage-panel": webLightTheme.colorNeutralBackground1, "--stage-panel-2": webLightTheme.colorNeutralBackground4 });
+        expect(STAGE_TOKENS.dark.decor["--stage-shadow"]).toBe(webDarkTheme.shadow8);
+        expect(STAGE_TOKENS.light.decor["--stage-shadow"]).toBe(webLightTheme.shadow8);
+        expect(STAGE_TOKENS.contrast.decor["--stage-shadow"]).toBe("none");
+        // The stage's accent is the brand's own blue, the one buttons and links use.
+        expect(STAGE_TOKENS.light.text["--stage-accent-ink"]).toBe(MICROSOFT_BRAND[80]);
+        expect(STAGE_TOKENS.dark.graphic["--stage-accent"]).toBe(MICROSOFT_BRAND[100]);
     });
 
     it("keeps the stage's text readable (4.5:1) and its marks visible (3:1), with the app's own tokens on it, in every theme", () => {

@@ -558,7 +558,7 @@ body {
     border-radius: var(--borderRadiusXLarge);
     background: var(--colorNeutralBackground1);
     border: 1px solid var(--colorNeutralStroke2);
-    box-shadow: var(--shadow2);
+    box-shadow: var(--shadow4);
 }
 
 .vcard-head {
@@ -714,7 +714,7 @@ body {
     border-radius: var(--borderRadiusLarge);
     background: var(--colorNeutralBackground1);
     border: 1px solid var(--colorNeutralStroke2);
-    box-shadow: var(--shadow2);
+    box-shadow: var(--shadow4);
     overflow: hidden;
 }
 
@@ -1107,7 +1107,7 @@ button.kpi-main:hover {
     border-radius: var(--borderRadiusLarge);
     background: var(--colorNeutralBackground1);
     border: 1px solid var(--colorNeutralStroke2);
-    box-shadow: var(--shadow2);
+    box-shadow: var(--shadow4);
     text-align: left;
     font: inherit;
     color: inherit;
@@ -1118,7 +1118,7 @@ button.kpi-main:hover {
 
 .health-tile:hover {
     border-color: var(--colorNeutralStroke1Hover);
-    box-shadow: var(--shadow4);
+    box-shadow: var(--shadow8);
 }
 
 .tile-link {
@@ -1379,7 +1379,7 @@ button.kpi-main:hover {
     border-radius: var(--borderRadiusXLarge);
     background: var(--colorNeutralBackground1);
     border: 1px solid var(--colorNeutralStroke2);
-    box-shadow: var(--shadow2);
+    box-shadow: var(--shadow4);
 }
 
 .action-card h3 {
@@ -1435,7 +1435,7 @@ button.kpi-main:hover {
     border-radius: var(--borderRadiusXLarge);
     background: var(--colorNeutralBackground1);
     border: 1px solid var(--colorNeutralStroke2);
-    box-shadow: var(--shadow2);
+    box-shadow: var(--shadow4);
 }
 
 .link-card h3 {

@@ -1,10 +1,10 @@
-// The app's themes: Fluent 2 (Fabric's own design system) with the app's own brand ramp (ContosoCare's navy and cyan,
+// The app's themes: Fluent 2 (Fabric's own design system) with the app's own brand ramp (Fluent 2's Microsoft blue,
 // src/theme/identity.ts, ADR 0030), in light, dark, and high contrast. The app's own tokens (status, targets, charts)
 // live beside them, so the contrast tests read the same values the app applies.
 
 import { createDarkTheme, createLightTheme, teamsHighContrastTheme, type BrandVariants, type Theme } from "@fluentui/react-components";
 
-import { APP_BRAND } from "./identity";
+import { APP_BRAND, MICROSOFT_ACCENTS, MICROSOFT_BRAND, type Accents } from "./identity";
 
 export type ThemeId = "light" | "dark" | "contrast";
 export type ThemeChoice = ThemeId | "system";
@@ -57,6 +57,29 @@ export interface AppTokens {
     graphic: Record<string, string>;
 }
 
+/**
+ * Each target's mark and the charts' categories, from one theme's accents: the Microsoft logo's four colors on T1 to T4 and
+ * the first four categories, Fluent's purple and teal on T5 and T4's read replica, then gray and a deeper Microsoft blue.
+ */
+function accentTokens(a: Accents, deepBlue: string): Record<string, string> {
+    return {
+        "--target-t1": a.blue,
+        "--target-t2": a.green,
+        "--target-t3": a.yellow,
+        "--target-t4": a.red,
+        "--target-t4r": a.teal,
+        "--target-t5": a.purple,
+        "--chart-1": a.blue,
+        "--chart-2": a.green,
+        "--chart-3": a.yellow,
+        "--chart-4": a.red,
+        "--chart-5": a.purple,
+        "--chart-6": a.teal,
+        "--chart-7": a.gray,
+        "--chart-8": deepBlue,
+    };
+}
+
 export const APP_TOKENS: Record<ThemeId, AppTokens> = {
     light: {
         surfaces: ["#FFFFFF", "#FAFAFA", "#F5F5F5"],
@@ -67,22 +90,7 @@ export const APP_TOKENS: Record<ThemeId, AppTokens> = {
             "--status-pass": "#0E700E",
             "--status-muted": "#5C5C5C",
         },
-        graphic: {
-            "--target-t1": "#0F6CBD",
-            "--target-t2": "#038387",
-            "--target-t3": "#8764B8",
-            "--target-t4": "#CA5010",
-            "--target-t4r": "#986F0B",
-            "--target-t5": "#498205",
-            "--chart-1": "#0F6CBD",
-            "--chart-2": "#038387",
-            "--chart-3": "#8764B8",
-            "--chart-4": "#CA5010",
-            "--chart-5": "#498205",
-            "--chart-6": "#C239B3",
-            "--chart-7": "#986F0B",
-            "--chart-8": "#4F6BED",
-        },
+        graphic: accentTokens(MICROSOFT_ACCENTS.light, MICROSOFT_BRAND[60]),
     },
     dark: {
         surfaces: ["#1F1F1F", "#292929", "#333333"],
@@ -93,22 +101,7 @@ export const APP_TOKENS: Record<ThemeId, AppTokens> = {
             "--status-pass": "#5EC75E",
             "--status-muted": "#B8B8B8",
         },
-        graphic: {
-            "--target-t1": "#479EF5",
-            "--target-t2": "#4BC5C7",
-            "--target-t3": "#B696E1",
-            "--target-t4": "#F7894A",
-            "--target-t4r": "#E8B83A",
-            "--target-t5": "#8FD14F",
-            "--chart-1": "#479EF5",
-            "--chart-2": "#4BC5C7",
-            "--chart-3": "#B696E1",
-            "--chart-4": "#F7894A",
-            "--chart-5": "#8FD14F",
-            "--chart-6": "#E879D9",
-            "--chart-7": "#E8B83A",
-            "--chart-8": "#93A4F4",
-        },
+        graphic: accentTokens(MICROSOFT_ACCENTS.dark, MICROSOFT_BRAND[130]),
     },
     contrast: {
         surfaces: ["#000000"],

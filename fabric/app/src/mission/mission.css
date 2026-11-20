@@ -1,4 +1,5 @@
-/* Wave 1 (ADR 0030): the app's own stage, ContosoCare's navy with cyan and magenta, for Mission Control, the scoreboard,
+/* Wave 1 (ADR 0030): the app's own stage, in Microsoft's colors (Fluent 2's layered neutrals and shadows, Microsoft blue,
+   and the logo's colors as accents), for Mission Control, the scoreboard,
    the replay, and the kiosk. Colors come only from the stage's tokens and the app's (src/theme/identity.ts, fluent.ts);
    motion carries meaning (health pulses, an incident's shockwave) and stops with reduced motion. */
 
@@ -52,7 +53,7 @@
     font-weight: 700;
     letter-spacing: 0.14em;
     text-transform: uppercase;
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .mc-titles h1 {
@@ -104,7 +105,7 @@
 
 .stage .mc-hub-link,
 .stage a {
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .mc-filter {
@@ -133,7 +134,7 @@
 }
 
 .mc-running {
-    border: 1px solid var(--stage-cyan);
+    border: 1px solid var(--stage-accent);
 }
 
 .mc-main {
@@ -199,7 +200,7 @@
 }
 
 .mc-link-alert {
-    stroke: var(--stage-magenta);
+    stroke: var(--stage-alert);
     stroke-width: 2.5;
 }
 
@@ -209,7 +210,7 @@
 
 .mc-hub-ring {
     fill: none;
-    stroke: var(--stage-cyan);
+    stroke: var(--stage-accent);
     stroke-width: 2;
 }
 
@@ -276,7 +277,7 @@
 }
 
 .mc-line {
-    fill: var(--stage-cyan-ink);
+    fill: var(--stage-accent-ink);
     font-size: 13px;
     font-weight: 600;
 }
@@ -286,7 +287,7 @@
 }
 
 .mc-badge circle {
-    fill: var(--stage-magenta);
+    fill: var(--stage-alert);
 }
 
 .mc-badge text {
@@ -305,12 +306,12 @@
 
 .mc-pulse {
     stroke-width: 3;
-    stroke: var(--stage-cyan);
+    stroke: var(--stage-accent);
     animation: mc-pulse 3.2s ease-out infinite;
 }
 
 .mc-shock {
-    stroke: var(--stage-magenta);
+    stroke: var(--stage-alert);
     stroke-width: 4;
     opacity: 0;
     animation: mc-shock 1.8s ease-out 1;
@@ -367,7 +368,7 @@
 }
 
 .mc-state-visible .mc-pulse {
-    stroke: var(--stage-magenta);
+    stroke: var(--stage-alert);
     animation-duration: 0.9s;
 }
 
@@ -376,16 +377,16 @@
 }
 
 .mc-state-visible .mc-glyph {
-    fill: var(--stage-magenta-ink);
+    fill: var(--stage-alert-ink);
 }
 
 .mc-state-answered .mc-pulse {
-    stroke: var(--stage-cyan);
+    stroke: var(--stage-accent);
     animation-duration: 1.6s;
 }
 
 .mc-state-answered .mc-glyph {
-    fill: var(--stage-cyan-ink);
+    fill: var(--stage-accent-ink);
 }
 
 .mc-satellite .mc-key {
@@ -460,6 +461,7 @@
     border-radius: 12px;
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
+    box-shadow: var(--stage-shadow);
 }
 
 .mc-stat-label {
@@ -484,11 +486,11 @@
 }
 
 .mc-stat-good .mc-stat-value {
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .mc-stat-alert .mc-stat-value {
-    color: var(--stage-magenta-ink);
+    color: var(--stage-alert-ink);
 }
 
 /* ---------- The session ribbon ---------- */
@@ -503,6 +505,7 @@
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
     min-width: 0;
+    box-shadow: var(--stage-shadow);
 }
 
 .rb-countdown {
@@ -517,11 +520,11 @@
 .rb-now {
     font-weight: 700;
     font-variant-numeric: tabular-nums;
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .rb-countdown strong {
-    color: var(--stage-magenta-ink);
+    color: var(--stage-alert-ink);
 }
 
 .rb-lanes {
@@ -561,7 +564,7 @@
     padding: 0;
     border-radius: 3px;
     border: 1px solid var(--stage-line);
-    background: color-mix(in srgb, var(--stage-cyan) 20%, transparent);
+    background: color-mix(in srgb, var(--stage-accent) 20%, transparent);
     cursor: pointer;
 }
 
@@ -587,7 +590,7 @@
     position: absolute;
     height: 4px;
     border-radius: 2px;
-    background: var(--stage-magenta);
+    background: var(--stage-alert);
     pointer-events: none;
 }
 
@@ -606,11 +609,11 @@
 }
 
 .rb-m-visible {
-    color: var(--stage-magenta-ink);
+    color: var(--stage-alert-ink);
 }
 
 .rb-m-answered {
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .rb-m-recovered {
@@ -624,7 +627,7 @@
     width: 2px;
     margin-left: -1px;
     background: var(--stage-ink);
-    box-shadow: 0 0 8px var(--stage-cyan);
+    box-shadow: 0 0 8px var(--stage-accent);
     pointer-events: none;
 }
 
@@ -701,7 +704,7 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     letter-spacing: 0.04em;
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .cr-utc {
@@ -725,7 +728,7 @@
 .cr-scrubber {
     grid-area: scrub;
     width: 100%;
-    accent-color: var(--stage-cyan);
+    accent-color: var(--stage-accent);
 }
 
 .cr-body {
@@ -769,6 +772,7 @@
     border-radius: 10px;
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
+    box-shadow: var(--stage-shadow);
 }
 
 .cr-lane-label strong {
@@ -801,12 +805,12 @@
 }
 
 .cr-band {
-    fill: var(--stage-cyan);
+    fill: var(--stage-accent);
     opacity: 0.1;
 }
 
 .cr-band-hot {
-    fill: var(--stage-magenta);
+    fill: var(--stage-alert);
     opacity: 0.24;
 }
 
@@ -859,6 +863,7 @@
     border-radius: 10px;
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
+    box-shadow: var(--stage-shadow);
 }
 
 .sb-episodes,
@@ -920,7 +925,7 @@
 .kiosk-brand {
     font-weight: 700;
     letter-spacing: 0.06em;
-    color: var(--stage-cyan-ink);
+    color: var(--stage-accent-ink);
 }
 
 .kiosk-scenes {
@@ -943,8 +948,8 @@
 
 .kiosk-scenes button[aria-current="step"] {
     color: var(--stage-ink);
-    border-color: var(--stage-cyan);
-    box-shadow: inset 0 0 0 1px var(--stage-cyan);
+    border-color: var(--stage-accent);
+    box-shadow: inset 0 0 0 1px var(--stage-accent);
 }
 
 .kiosk-status {
@@ -965,7 +970,7 @@
 .kiosk-progress span {
     display: block;
     height: 100%;
-    background: linear-gradient(90deg, var(--stage-cyan), var(--stage-magenta));
+    background: linear-gradient(90deg, var(--stage-accent), var(--stage-accent-ink));
     transition: width 1s linear;
 }
 
@@ -1020,6 +1025,7 @@
     border-radius: 12px;
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
+    box-shadow: var(--stage-shadow);
 }
 
 .kiosk-impacts strong {
