@@ -12,7 +12,7 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replica
 import type { Row } from "@/data/query-client";
 import { impactOf, type Impact } from "./business";
 import { engineOf } from "./estate";
-import { formatNumber, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
+import { formatLevel, formatNumber, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
 import { FAMILY_SIGNAL, REPLICA_LAG_WARNING_SECONDS, signalValue } from "./insights";
 import { SCENARIOS } from "./scenarios";
 import { quantile } from "./stats";
@@ -115,11 +115,11 @@ export function detectionBound(family: string, baseline: number | null): Bound |
     if (family === "cpu") {
         const relative = baseline === null ? null : Math.max(baseline * 1.5, baseline + 10);
         return relative !== null && relative < rule.floor
-            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatNumber(baseline, "percent")}`, short: `baseline ${formatNumber(baseline, "percent")}` }
+            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatLevel(baseline, "percent")}`, short: `baseline ${formatLevel(baseline, "percent")}` }
             : { value: rule.floor, strict: false, minBins: rule.minBins, ...episode };
     }
     const relative = baseline === null ? 0 : baseline * 1.5;
-    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatNumber(baseline)}`, short: `baseline ${formatNumber(baseline)}` };
+    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatLevel(baseline, "decimal")}`, short: `baseline ${formatLevel(baseline, "decimal")}` };
     return { value: rule.floor, strict: rule.strict, minBins: rule.minBins, ...episode };
 }
 
@@ -127,8 +127,15 @@ function meets(value: number | null, bound: Bound): boolean {
     return value !== null && (bound.strict ? value > bound.value : value >= bound.value);
 }
 
+/** The bound in words, its level written as it is: "at least 0.45" for 1.5 times a baseline of 0.3, never "at least 0". */
 export function boundText(bound: Bound, kind: NumberKind): string {
-    return `${bound.strict ? "above" : "at least"} ${formatNumber(bound.value, kind)}`;
+    return `${bound.strict ? "above" : "at least"} ${formatLevel(bound.value, kind)}`;
+}
+
+/** The scoreboard's "How it was measured": the bound in short, and why the signal wasn't visible when it wasn't. */
+export function howMeasured(s: Pick<FaultScore, "bound" | "kind" | "status" | "note">): string {
+    if (!s.bound) return s.note;
+    return `${boundText(s.bound, s.kind)} (${s.bound.short})${s.bound.minBins > 1 ? `, ${s.bound.minBins} bins` : ""}${s.status === "Pass" ? "" : `. ${s.note}`}`;
 }
 
 /** A family's signal in a bin: its column, or its wait category (null when the bin has no categories). */
@@ -426,12 +433,11 @@ function levelOf(bins: readonly Bin[], signal: Signal, bound: Bound, from: numbe
 }
 
 /**
- * The level a signal stayed under and its peak, as text that never writes them alike: formatNumber's, or with more decimals
- * where that rounds the peak to the level (0.96 s under 1 s read "under 1.0 s; its peak was 1.0 s"). Null when they're
- * alike even at 4 decimals.
+ * The level a signal stayed under and its peak, as text that never writes them alike: as formatLevel writes them, or with
+ * more decimals where that rounds the peak to the level (0.999 s under 1 s). Null when they're alike even at 4 decimals.
  */
 function levelAndPeak(level: number, peak: number, kind: NumberKind): { level: string; peak: string } | null {
-    const texts = { level: formatNumber(level, kind), peak: formatNumber(peak, kind) };
+    const texts = { level: formatLevel(level, kind), peak: formatLevel(peak, kind) };
     for (let digits = 1; texts.level === texts.peak; digits++) {
         if (digits > 4) return null;
         texts.level = formatNumberDigits(level, kind, digits);
@@ -447,7 +453,8 @@ function levelAndPeak(level: number, peak: number, kind: NumberKind): { level: s
  */
 function notVisibleNote(signal: Signal, bound: Bound, seen: LevelSeen, until: string, yet: boolean): string {
     const lead = `Not visible${yet ? " yet" : ""}`;
-    const level = formatNumber(bound.value, signal.kind);
+    // The level as boundText writes it, so this note and the bound beside it in a table read alike.
+    const level = formatLevel(bound.value, signal.kind);
     if (seen.peak === null || !seen.peakAt) return `${lead}: no bin had a value for ${signal.label} from its injection ${until}.`;
     const at = `at ${formatTimeUtc(seen.peakAt)} UTC`;
     if (seen.atBound === 0) {

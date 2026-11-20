@@ -13,6 +13,7 @@ import {
     aggregate,
     cosmosEpisodes,
     detectionBound,
+    howMeasured,
     minutesText,
     nextInjection,
     planEvents,
@@ -204,15 +205,33 @@ describe("the scoreboard", () => {
         };
         const until = "until 14:25 UTC, 15 minutes after its window";
         // Buffer IO waits' level is the notebook's 1 s (their baseline is 0.5 s): a bin at 0.96 s, which one decimal writes as 1.0 s.
-        expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.96 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.00 s ${until}; its peak was 0.96 s at 14:03 UTC.`);
+        expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.96 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s ${until}; its peak was 0.96 s at 14:03 UTC.`);
         // CPU's level is 30 % (a baseline of 20 %): a bin at 29.97 %.
-        expect(note("incident:cpu-pressure", bins("T1", (m) => (m === 33 ? { cpu: 29.97 } : {})))).toBe(`Not visible: CPU stayed under 30.00 % ${until}; its peak was 29.97 % at 14:03 UTC.`);
+        expect(note("incident:cpu-pressure", bins("T1", (m) => (m === 33 ? { cpu: 29.97 } : {})))).toBe(`Not visible: CPU stayed under 30.0 % ${until}; its peak was 29.97 % at 14:03 UTC.`);
         // Alike even at 4 decimals: "just under", with no number for the peak.
         expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.99999 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s ${until}; its peak, at 14:03 UTC, was just under it.`);
         // Apart at one decimal: as before.
         expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.9 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s ${until}; its peak was 0.9 s at 14:03 UTC.`);
         // A strict bound, the notebook's floor of 0, reads "at or under", which a peak of 0 is.
         expect(note("incident:blocking-chain", bins("T1"))).toBe(`Not visible: blocked processes stayed at or under 0 ${until}; its peak was 0 at 14:00 UTC.`);
+    });
+
+    it("writes a level that isn't whole with its decimals, in the note, the scoreboard's column, and the postmortem's table, never 'at least 0' (the review of F23)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:blocking-chain", 30, 40)];
+        const plan = toPlans(runs)[0];
+        // Blocked processes average 0.3 per bin outside the fault, so its level is 1.5 times that, 0.45.
+        const score = (during: number) => scorePlan(plan, { bins: bins("T1", (m) => ({ blocked: m >= 31 && m <= 38 ? during : 0.3 })), beats: [], runs })[0];
+        const visible = score(2);
+        expect(visible.status).toBe("Pass");
+        expect(visible.note).toBe("Visible: blocked processes at least 0.45 (1.5 times its baseline of 0.3).");
+        expect(howMeasured(visible)).toBe("at least 0.45 (baseline 0.3)");
+        const { markdown } = buildPostmortem({ plan, scores: [visible], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: at(130) });
+        expect(markdown).toContain("| Deep blocking chain and lock escalation | T1 | blocked processes | at least 0.45 (1.5 times its baseline of 0.3) |");
+        // Under its level: the same level, and the peak with its decimals.
+        const under = score(0.4);
+        expect(under.status).toBe("Warning");
+        expect(howMeasured(under)).toBe("at least 0.45 (baseline 0.3). Not visible: blocked processes stayed under 0.45 until 14:25 UTC, 15 minutes after its window; its peak was 0.4 at 14:01 UTC.");
+        expect([visible.note, howMeasured(visible), markdown, howMeasured(under)].join("\n")).not.toMatch(/at least 0(?![.\d])|under 0(?![.\d])/);
     });
 
     it("says the telemetry breaks off, never that it ends, when a hole follows a signal's last bin at its level, and ends its visible time there (the review of F23)", () => {

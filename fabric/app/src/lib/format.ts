@@ -40,6 +40,18 @@ export function formatNumberDigits(value: number, kind: NumberKind, digits: numb
     return `${new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
 }
 
+/**
+ * A level, a baseline, or a peak beside them, as text that reads true: a whole number as formatNumber writes it, any other
+ * with its decimals (two, more under 0.1 for two significant digits, at most 4; trailing zeros dropped), whatever its
+ * kind: "at least 0.45 (1.5 times its baseline of 0.3)", never "at least 0".
+ */
+export function formatLevel(value: unknown, kind: NumberKind): string {
+    if (!isNumber(value)) return "–";
+    if (Number.isInteger(value)) return formatNumber(value, kind);
+    const digits = Math.min(4, Math.max(2, 1 - Math.floor(Math.log10(Math.abs(value)))));
+    return `${new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+}
+
 /** Parses the connector's DateTime values: ISO text without a zone (a UTC instant), epoch numbers, or Dates. */
 export function toDate(value: unknown): Date | null {
     if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;

@@ -17,7 +17,7 @@ import type { ColumnSpec } from "@/data/queries";
 import { serviceOf } from "@/lib/business";
 import { formatTimeUtc } from "@/lib/format";
 import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/postmortem";
-import { aggregate, boundText, minutesText, RECOVERED_BINS, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
+import { aggregate, howMeasured, minutesText, RECOVERED_BINS, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { ChartView } from "@/visuals/ChartView";
 import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
@@ -117,9 +117,7 @@ export default function ScoreboardPage() {
                 recovered: s.recoveredAt,
                 ttr: s.ttrMin,
                 impact: s.impact?.sentence ?? (s.status === "Pass" ? "" : s.note),
-                how: s.bound
-                    ? `${boundText(s.bound, s.kind)} (${s.bound.short})${s.bound.minBins > 1 ? `, ${s.bound.minBins} bins` : ""}${s.status === "Pass" ? "" : `. ${s.note}`}`
-                    : s.note,
+                how: howMeasured(s),
                 score: s,
             })),
         [scores],
