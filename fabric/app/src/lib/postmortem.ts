@@ -90,6 +90,17 @@ const faultTitle = (run: SessionRun) => scenarioTitle(scenarioOf(run));
 
 const NOT_MEASURED = "Not measured: the telemetry didn't load.";
 
+/**
+ * Why the impact table is empty, from what was measured (F23): never "no signal showed" when a fault's signal rose short of
+ * its rule, or the notebook's own check saw it.
+ */
+function noImpactText(scores: readonly FaultScore[], unscored: boolean): string {
+    if (unscored) return NOT_MEASURED;
+    if (scores.some((s) => s.status === "Pass")) return "No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.";
+    if (scores.length > 0) return "No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.";
+    return "No measured impact: nothing was injected or measured in this window.";
+}
+
 /** The postmortem's file name: letters, digits, and dashes only. */
 export function postmortemFileName(plan: Plan, generatedAt: Date): string {
     const id = (plan.kind === "session" ? shortSessionId(plan.key) : plan.key).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "plan";
@@ -149,7 +160,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         ...episodes.map((e) => ({ at: e.visibleAt, target: e.target, impact: e.impact })),
     ].sort((a, b) => a.at.getTime() - b.at.getTime());
     lines.push("## Impact on ContosoCare", "");
-    if (impacts.length === 0) lines.push(unscored.length > 0 ? NOT_MEASURED : "No measured impact: no signal showed in this window.");
+    if (impacts.length === 0) lines.push(noImpactText(scores, unscored.length > 0));
     else lines.push(...table(["Service", "Target", "What it felt", "Measured signal"], impacts.map((i) => [i.impact.service, i.target, i.impact.headline.replace(/^[^:]+:\s*/, ""), i.impact.evidence])));
     lines.push("");
 

@@ -151,9 +151,47 @@ describe("the scoreboard", () => {
         expect(plan.answeredAt).toEqual(at(56));
         expect(plan.answer).toMatch(/last good plan/);
         expect(plan.impact?.sentence).toBe("Scheduling: under heavy load for 23 min (CPU peak 85.0 %, 4.3 times its baseline)");
-        // T2's IO pressure never reached 1 s of Buffer IO waits per bin: not visible, and said why.
+        // T2's IO pressure never reached 1 s of Buffer IO waits per bin: not visible, and said why, with what it measured.
         expect(io).toMatchObject({ status: "Warning", visibleAt: null, ttdMin: null, impact: null });
-        expect(io.note).toBe("Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s until 14:33 UTC, 15 minutes after its window.");
+        expect(io.note).toBe("Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s until 14:33 UTC, 15 minutes after its window; its peak was 0.5 s at 14:10 UTC.");
+    });
+
+    it("says what a fault's signal measured when it wasn't visible, never that it stayed under a level a bin reached (F23)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40)];
+        const plan = toPlans(runs)[0];
+        const note = (b: Bin[]) => {
+            const [score] = scorePlan(plan, { bins: b, beats: [], runs });
+            expect(score.status).toBe("Warning");
+            return score.note;
+        };
+        // CPU's baseline is 20 %, so its level is 30 %, for 2 bins in a row; one bin rises, at 14:03 in 1-minute bins or 14:05 in 5-minute ones.
+        const oneMinute = (cpu: number) => bins("T1", (m) => (m === 33 ? { cpu } : {}));
+        const fiveMinute = (cpu: number) => Array.from({ length: 25 }, (_, i): Bin => ({ ...bins("T1")[0], at: at(i * 5), cpu: i === 7 ? cpu : 20 }));
+        // Over its level in one bin, short of its rule's two in a row: what it reached, never "stayed under".
+        expect(note(oneMinute(66))).toBe("Not visible by its rule: CPU reached 30.0 % or more in 1 bin, never 2 in a row, until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:03 UTC.");
+        expect(note(fiveMinute(66))).toBe("Not visible by its rule: CPU reached 30.0 % or more in 1 bin, never 2 in a row, until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:05 UTC.");
+        // Under its level throughout: "stayed under", with the peak it measured.
+        expect(note(oneMinute(25))).toBe("Not visible: CPU stayed under 30.0 % until 14:25 UTC, 15 minutes after its window; its peak was 25.0 % at 14:03 UTC.");
+        expect(note(fiveMinute(25))).toBe("Not visible: CPU stayed under 30.0 % until 14:25 UTC, 15 minutes after its window; its peak was 25.0 % at 14:05 UTC.");
+        // As found live: a baseline near 0 % (a level of 10 %), bins at 65.95 %, and bins without a CPU value between them.
+        const sparse = bins("T1", (m) => ({ cpu: m >= 30 && m < 40 ? (m % 3 === 0 ? 65.95 : null) : 0 }));
+        expect(note(sparse)).toBe(
+            "Not visible by its rule: CPU reached 10.0 % or more in 4 bins, never 2 in a row (6 of its 25 bins had no value), until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:00 UTC.",
+        );
+    });
+
+    it("says a signal was still visible at the telemetry's end only when its last bin was, and when it went back under too late to confirm (F23)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40)];
+        const plan = toPlans(runs)[0];
+        // CPU at 90 % from 14:01 to 14:08; the telemetry ends with one bin back under it, at 14:09.
+        const ending = bins("T1", (m) => (m >= 31 && m <= 38 ? { cpu: 90 } : {})).filter((b) => b.at < at(40));
+        const [under] = scorePlan(plan, { bins: ending, beats: [], runs });
+        expect(under).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: false, visibleMin: 8, recoveryWord: "Unconfirmed" });
+        expect(under.recoveryNote).toBe("Back under its bound at 14:09 UTC, but its telemetry ends before 2 bins in a row under it.");
+        expect(under.impact?.sentence).toBe("Billing: under heavy load for 8 min (CPU peak 90.0 %, 4.5 times its baseline)");
+        // Its last bin still at the level: still visible, for at least the time it was.
+        const [still] = scorePlan(plan, { bins: ending.filter((b) => b.at < at(39)), beats: [], runs });
+        expect(still).toMatchObject({ ongoing: true, recoveryWord: "Still visible", recoveryNote: "Still visible when the telemetry ends." });
     });
 
     it("shares a signal between faults that raise it at once, keeps the agent's response to its own beat, and reads a deadlock as blocking", () => {
@@ -399,6 +437,16 @@ describe("the postmortem", () => {
         expect(ctx.prompt).toMatch(/never that Database Hub detected something/);
         expect(ctx.rows?.[2]).toMatchObject({ target: "T3", service: "Scheduling", injected: "2026-11-17T14:03:00.000Z", ttdMin: 1, ttrMin: 24, status: "Pass" });
         expect(ctx.dax).toMatch(/^\/\/ Sessions and activity requests\nEVALUATE/);
+    });
+
+    it("says no fault's signal was visible by its rule, never that no signal showed, when each rose short of its rule (F23)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40)];
+        const sessionPlan = toPlans(runs)[0];
+        const scores = scorePlan(sessionPlan, { bins: bins("T1", (m) => (m === 33 ? { cpu: 66 } : {})), beats: [], runs });
+        const { markdown } = buildPostmortem({ ...input, plan: sessionPlan, scores, episodes: [], beat: null });
+        expect(markdown).not.toMatch(/no signal showed|stayed under/);
+        expect(markdown).toContain("No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.");
+        expect(markdown).toContain("- **CPU pressure on T1 wasn't visible:** Not visible by its rule: CPU reached 30.0 % or more in 1 bin, never 2 in a row, until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:03 UTC.");
     });
 
     it("tells a fault's injection before its signal, though the signal's bin starts before the injection (F17)", () => {
