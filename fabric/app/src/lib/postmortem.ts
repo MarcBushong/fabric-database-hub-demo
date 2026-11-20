@@ -91,14 +91,16 @@ const faultTitle = (run: SessionRun) => scenarioTitle(scenarioOf(run));
 const NOT_MEASURED = "Not measured: the telemetry didn't load.";
 
 /**
- * Why the impact table is empty, from what was measured (F23): never "no signal showed" when a fault's signal rose short of
- * its rule, or the notebook's own check saw it.
+ * Why the impact table is empty, from what was measured (F23), said of every fault only when it's so of every fault: the
+ * notebook's own check, when it saw every one; "not visible by its rule", when every one was measured and wasn't;
+ * otherwise what the follow-ups give each fault.
  */
 function noImpactText(scores: readonly FaultScore[], unscored: boolean): string {
     if (unscored) return NOT_MEASURED;
-    if (scores.some((s) => s.status === "Pass")) return "No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.";
-    if (scores.length > 0) return "No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.";
-    return "No measured impact: nothing was injected or measured in this window.";
+    if (scores.length === 0) return "No measured impact: nothing was injected or measured in this window.";
+    if (scores.every((s) => s.status === "Pass" && !s.bound)) return "No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.";
+    if (scores.every((s) => s.status === "Warning" && s.bound)) return "No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.";
+    return "No measured impact in this view; the follow-ups say what was measured for each fault, or why it wasn't.";
 }
 
 /** The postmortem's file name: letters, digits, and dashes only. */

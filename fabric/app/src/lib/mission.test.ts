@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { AgentBeat, Bin, CosmosCapture, PostgresCapture, SessionRun } from "@/data/model";
+import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
 import type { Row } from "@/data/query-client";
 import { sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
@@ -192,6 +192,51 @@ describe("the scoreboard", () => {
         // Its last bin still at the level: still visible, for at least the time it was.
         const [still] = scorePlan(plan, { bins: ending.filter((b) => b.at < at(39)), beats: [], runs });
         expect(still).toMatchObject({ ongoing: true, recoveryWord: "Still visible", recoveryNote: "Still visible when the telemetry ends." });
+    });
+
+    it("never writes a peak equal to the level it stayed under: more decimals, or 'just under' (the review of F23)", () => {
+        const note = (profile: string, b: Bin[]) => {
+            const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", profile, 30, 40)];
+            const [score] = scorePlan(toPlans(runs)[0], { bins: b, beats: [], runs });
+            // The detection is unchanged: not visible, a Warning.
+            expect(score.status).toBe("Warning");
+            return score.note;
+        };
+        const until = "until 14:25 UTC, 15 minutes after its window";
+        // Buffer IO waits' level is the notebook's 1 s (their baseline is 0.5 s): a bin at 0.96 s, which one decimal writes as 1.0 s.
+        expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.96 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.00 s ${until}; its peak was 0.96 s at 14:03 UTC.`);
+        // CPU's level is 30 % (a baseline of 20 %): a bin at 29.97 %.
+        expect(note("incident:cpu-pressure", bins("T1", (m) => (m === 33 ? { cpu: 29.97 } : {})))).toBe(`Not visible: CPU stayed under 30.00 % ${until}; its peak was 29.97 % at 14:03 UTC.`);
+        // Alike even at 4 decimals: "just under", with no number for the peak.
+        expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.99999 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s ${until}; its peak, at 14:03 UTC, was just under it.`);
+        // Apart at one decimal: as before.
+        expect(note("incident:io-pressure", bins("T1", (m) => (m === 33 ? { bufferIoS: 0.9 } : {})))).toBe(`Not visible: Buffer IO (PAGEIOLATCH) waits stayed under 1.0 s ${until}; its peak was 0.9 s at 14:03 UTC.`);
+        // A strict bound, the notebook's floor of 0, reads "at or under", which a peak of 0 is.
+        expect(note("incident:blocking-chain", bins("T1"))).toBe(`Not visible: blocked processes stayed at or under 0 ${until}; its peak was 0 at 14:00 UTC.`);
+    });
+
+    it("says the telemetry breaks off, never that it ends, when a hole follows a signal's last bin at its level, and ends its visible time there (the review of F23)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40)];
+        const plan = toPlans(runs)[0];
+        const hot = (m: number) => m >= 31 && m <= 38;
+        // CPU at 90 % from 14:01 to 14:08, no value at 14:09, then 20 % to 15:30; or no bin at all at 14:09 and 14:10.
+        const noValue = bins("T1", (m) => (hot(m) ? { cpu: 90 } : m === 39 ? { cpu: null } : {}));
+        const gap = bins("T1", (m) => (hot(m) ? { cpu: 90 } : {})).filter((b) => b.at < at(39) || b.at >= at(41));
+        for (const shape of [noValue, gap]) {
+            const [score] = scorePlan(plan, { bins: shape, beats: [], runs });
+            // The detection is unchanged: visible at 14:01, a minute after its injection, and no recovery time.
+            expect(score).toMatchObject({ status: "Pass", ttdMin: 1, recoveredAt: null, ttrMin: null });
+            expect(score.visibleAt).toEqual(at(31));
+            expect(summarize([score])).toMatchObject({ faults: 1, visible: 1, notVisible: 0, recovered: 0 });
+            // What it says: its telemetry breaks off after 14:08, and it was visible until then, at least.
+            expect(score).toMatchObject({ ongoing: false, visibleMin: 8, recoveryWord: "Telemetry breaks off" });
+            expect(score.recoveryNote).toBe("Its telemetry breaks off after 14:08 UTC, its last bin at its bound, so its recovery isn't measured.");
+            expect(score.impact?.sentence).toBe("Billing: under heavy load for at least 8 min (CPU peak 90.0 %, 4.5 times its baseline)");
+            // The postmortem's follow-up says the same, never that it hadn't recovered when the telemetry ends.
+            const { markdown } = buildPostmortem({ plan, scores: [score], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: at(130) });
+            expect(markdown).toContain("- **CPU pressure on T1 has no recovery time:** Its telemetry breaks off after 14:08 UTC, its last bin at its bound, so its recovery isn't measured.");
+            expect(markdown).not.toContain("when the telemetry ends");
+        }
     });
 
     it("shares a signal between faults that raise it at once, keeps the agent's response to its own beat, and reads a deadlock as blocking", () => {
@@ -447,6 +492,29 @@ describe("the postmortem", () => {
         expect(markdown).not.toMatch(/no signal showed|stayed under/);
         expect(markdown).toContain("No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.");
         expect(markdown).toContain("- **CPU pressure on T1 wasn't visible:** Not visible by its rule: CPU reached 30.0 % or more in 1 bin, never 2 in a row, until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:03 UTC.");
+    });
+
+    it("says something of every fault in an empty impact only when it's so of every fault (the review of F23)", () => {
+        const impactOfPlan = (runs: SessionRun[], b: Bin[], incidents: Incident[] = []) => {
+            const sessionPlan = toPlans(runs)[0];
+            const scores = scorePlan(sessionPlan, { bins: b, beats: [], runs, incidents });
+            const { markdown } = buildPostmortem({ ...input, plan: sessionPlan, scores, episodes: [], beat: null });
+            return { statuses: scores.map((s) => s.status), markdown, line: markdown.split("## Impact on ContosoCare\n\n")[1]?.split("\n")[0] };
+        };
+        const neutral = "No measured impact in this view; the follow-ups say what was measured for each fault, or why it wasn't.";
+        // A lone RU storm on T5 with no T5 episode in view isn't measured: never "not visible by its rule".
+        const storm = impactOfPlan([run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T5", "incident:ru-storm", 30, 40)], []);
+        expect(storm.statuses).toEqual(["Not supported"]);
+        expect(storm.markdown).toContain("and 1 had no signal the history measures.");
+        expect(storm.line).toBe(neutral);
+        // A Warning measured in view beside a Pass from the notebook's own check: never "their bins aren't in this view".
+        const passed: Incident = { key: `request:${SESSION}:01`, label: "", source: "", target: "T3", scenario: "cpu-pressure", family: "cpu", start: at(50), end: at(60), durationMin: 10, peakValue: null, peakUnit: "", verdict: "Pass" };
+        const t3 = run(`${SESSION}:01`, "T3", "incident:cpu-pressure", 50, 60);
+        const mixed = impactOfPlan([run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40), t3], bins("T1", (m) => (m === 33 ? { cpu: 66 } : {})), [passed]);
+        expect(mixed.statuses).toEqual(["Warning", "Pass"]);
+        expect(mixed.line).toBe(neutral);
+        // The notebook's check alone, for every fault: then it says so.
+        expect(impactOfPlan([run(SESSION, "all", "session", 0, 90), t3], [], [passed]).line).toBe("No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.");
     });
 
     it("tells a fault's injection before its signal, though the signal's bin starts before the injection (F17)", () => {

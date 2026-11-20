@@ -32,6 +32,14 @@ export function formatNumber(value: unknown, kind: NumberKind = "decimal"): stri
     }
 }
 
+/** The unit formatNumber writes after each kind's number. */
+const UNIT: Partial<Record<NumberKind, string>> = { percent: " %", seconds: " s", minutes: " min", mb: " MB", ms: " ms" };
+
+/** A value with exactly `digits` decimals and its kind's unit: to tell apart two values that formatNumber writes alike. */
+export function formatNumberDigits(value: number, kind: NumberKind, digits: number): string {
+    return `${new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+}
+
 /** Parses the connector's DateTime values: ISO text without a zone (a UTC instant), epoch numbers, or Dates. */
 export function toDate(value: unknown): Date | null {
     if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
