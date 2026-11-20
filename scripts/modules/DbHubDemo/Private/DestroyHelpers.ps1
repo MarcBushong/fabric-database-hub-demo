@@ -208,8 +208,9 @@ function Get-DemoDestroyFabricPlan {
     Which Fabric workspaces destroy.ps1 deletes, read-only: the demo's (fabric.workspaceName), when every item in it is
     one the demo creates; and the control's (control.fabricWorkspaceName), when everything in it is the control
     notebook, and that notebook names this environment's resource group, or the workspace is empty and the control
-    serves this environment. Either goes only when no other demo environment records it, none was deployed by a version
-    that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard, 2026-11-17);
+    serves this environment. Either goes only when no other demo environment records it, none that records no workspace
+    might use it (one being deployed, or deployed by an earlier version), and Azure Resource Graph answered
+    (Get-DemoFabricWorkspaceGuard, 2026-11-17);
     otherwise Guard says why it stays (Unreadable, Claimed, or Untagged), with ClaimedBy, Untagged, and Remediation.
     Returns Ok, Error, Kind (Get-DemoFabricListFailureKind, when a list failed), Demo, and Control; each workspace has
     Name, Id, Exists, Delete, Items (type: name), Foreign (what the demo didn't create), Reason, and the guard's fields.
@@ -324,8 +325,8 @@ function Get-DemoDestroyFabricPlan {
     }
 
     # 2026-11-17 (the coordinator's decision: destroy.ps1 never deletes what another environment might use): a workspace
-    # those checks found to be this environment's goes only when no other demo environment records it, none was deployed
-    # by a version that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard).
+    # those checks found to be this environment's goes only when no other demo environment records it, none that records
+    # no workspace might use it, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard).
     $deleting = @(@($answer.Demo, $answer.Control) | Where-Object { $null -ne $_ -and $_.Delete })
     if ($deleting.Count -gt 0) {
         $claim = $null
