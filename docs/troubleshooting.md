@@ -450,6 +450,7 @@ The scripts never create or scale the Fabric capacity, and resume or pause it on
 | `FABRIC.APP.HOSTING` **Fail**: the assets answered anonymously | `staticHosting.assetAccess: protected` in `fabric/app/rayfin/rayfin.yml`, then deploy again |
 | `FABRIC.APP.OPERATORS` **Warning**: "The admin group's members couldn't be read" (Manage is the deployer's only) | Make the deployer a group owner (P6), then `./scripts/deploy.ps1` |
 | `FABRIC.APP.ACTIONS` **Warning**: "Manage's function is missing ..." (requests are copied for Run all; [Manage](../fabric/app/README.md#manage-bounded-confirmed-actions)) | `./scripts/deploy.ps1` again: since 2026-11-19 it deploys the app once more after it puts the control notebook in Fabric, a resume included, and `-Sequential` puts the notebook in Fabric first (before, a new environment's first run always left "missing NB_DatabaseHub_Control"; R926). `DEPLOY.CONTROL` says what a notebook that isn't in Fabric still needs |
+| `FABRIC.APP.MIGRATION` **Warning**: "T2's first migration assessment uploaded at ..., after this run deployed the Insights app ... But the app's deploy once more didn't pass" (F18: an update's stop at its end waited for that upload, then deployed the app again so its Migration card shows T2's readiness) | `./scripts/configure-fabric-app.ps1`: it deploys the app with T2's readiness as Azure has it now. The app deployed earlier in the run works; until then, its Migration card links T2's **Assessments** page in the Azure portal |
 
 ### Ask, the Copilot chat in the Insights app (2026-11-18)
 

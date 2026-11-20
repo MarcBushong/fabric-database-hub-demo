@@ -2129,6 +2129,8 @@ Describe 'The stop at the end of an update: an update leaves the demo as it foun
             $end.Result.status | Should -Be 'Pass'
             $end.Result.message | Should -Match 'It waited first for T2''s first migration assessment, which uploaded at 2026-11-19T18:06:00Z after about a minute\.$'
             @($end.Result.evidence['waitedFor']).Count | Should -Be 1
+            # The ending reads it to deploy the Insights app once more with T2's readiness (F18).
+            ([datetime]$end.Result.evidence['t2AssessmentUploadedAt']).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 19, 18, 6, 0, [System.DateTimeKind]::Utc))
         }
 
         It 'waits at most its bound, then stops anyway and says where the assessment goes on' {
@@ -2137,6 +2139,7 @@ Describe 'The stop at the end of an update: an update leaves the demo as it foun
             $end.Result.status | Should -Be 'Pass'
             $end.Result.message | Should -Match 'Not finished: T2''s first migration assessment hadn''t uploaded after about a minute, so it may not finish; the next \./scripts/deploy\.ps1 or \./scripts/configure-arc\.ps1 starts it again\.$'
             (Get-EndStopRow).Message | Should -Match 'configure-arc\.ps1 starts it again'
+            $end.Result.evidence['t2AssessmentUploadedAt'] | Should -Be ''
         }
 
         It 'waits for a bootstrap pass that still runs on a host it deallocates, and not for one on a VM it leaves alone' {
@@ -2323,6 +2326,105 @@ Describe 'The stop at the end of an update: an update leaves the demo as it foun
             Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunningHourlyCost -Times 0 -Exactly
             @($outcome.Notes | Where-Object { $_ -match '^Running and billing, because this run started or created them' }).Count | Should -Be 1
             (Get-ModelStep -Path $run.ProgressPath -Id 'EndStop')['state'] | Should -Be 'Skipped'
+        }
+    }
+
+    Context 'the Insights app once more, with T2''s readiness, once its first assessment uploaded (F18, 2026-11-20)' {
+        BeforeAll {
+            # The Insights app's records as its step reports them in deploy.ps1: non-blocking (ConvertTo-DemoInsightsAppRecord).
+            function New-AppRecord([string] $CheckId, [string] $Status = 'Pass', [System.Collections.IDictionary] $Evidence = [ordered]@{}) {
+                $Evidence['nonBlocking'] = 'insightsApp'
+                New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message ('{0} {1}' -f $CheckId, $Status) -Evidence $Evidence
+            }
+            # An update that found the demo stopped, turned T2's assessment on, started its first run, and deployed the app
+            # before it uploaded: FABRIC.APP.ESTATE without t2MigrationReadAt. -UploadedBefore: it had uploaded already, so
+            # the stop at the end doesn't wait for it.
+            function New-UpdateResult([string] $ReadAt = '', [string] $UploadedBefore = '') {
+                $assessment = New-DemoResult -CheckId 'T2.ARC.MIGRATIONASSESSMENT' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'started' -Evidence ([ordered]@{ enabled = $true; uploadedAt = $UploadedBefore; runStarted = 'Succeeded' })
+                @(New-DoneResult) + @(New-VmStartResult) + @($assessment, (New-AppRecord 'FABRIC.APP.DEPLOY'), (New-AppRecord 'FABRIC.APP.ESTATE' 'Not supported' ([ordered]@{ t2MigrationReadAt = $ReadAt })), (New-AppRecord 'ASK.RELAY'))
+            }
+            function Get-ModelStep([string] $Path, [string] $Id) {
+                $model = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+                foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq $Id) { return $item } } }
+            }
+        }
+
+        BeforeEach {
+            $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
+            Mock -ModuleName DbHubDemo -CommandName Write-Host -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Enter-DemoKeepAwake -MockWith { $true }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoProgressPageWriter -MockWith { $null }
+            Mock -ModuleName DbHubDemo -CommandName Open-DemoProgressPage -MockWith { 'The status page is open in your browser.' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+            # T2's first assessment uploads while the stop at the end waits.
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { $script:order.Add('ArcRead'); [pscustomobject]@{ HostedInstances = @(); Target = [pscustomobject]@{ Setting = [pscustomobject]@{ MinimumCoresPerOse = 4 } } } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoArcInstanceInfo -MockWith { [pscustomobject]@{ Name = 'arcsql01'; MigrationAssessment = [pscustomobject]@{ Enabled = $true; UploadedAt = '2026-11-23T15:20:00Z' } } }
+            # The app's step once more: deployed, with T2's readiness, unless a test says it didn't deploy.
+            $script:againDeploy = 'Pass'
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+                $script:order.Add('AppStep')
+                @(
+                    (New-AppRecord 'FABRIC.APP.DEPLOY' $script:againDeploy)
+                    (New-AppRecord 'FABRIC.APP.ESTATE' 'Not supported' ([ordered]@{ t2MigrationReadAt = $(if ($script:againDeploy -eq 'Pass') { '2026-11-23T15:21:00Z' } else { '' }) }))
+                    (New-AppRecord 'ASK.RELAY' 'Pass')
+                )
+            }
+        }
+
+        It 'deploys the app once more after the stop, and deploy.ps1''s results have FABRIC.APP.ESTATE once, with t2MigrationReadAt' {
+            $configFile = Join-Path -Path $TestDrive -ChildPath 'f18.config.json'
+            $run = Start-DemoDeploymentRun -Config $script:config -ConfigPath $configFile -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $result = New-UpdateResult
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result $result -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'Done'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 1 -Exactly -ParameterFilter { $ConfigPath -eq $configFile }
+            $script:order.IndexOf('AppStep') | Should -BeGreaterThan $script:order.IndexOf('Stop') -Because 'the VMs are deallocated first; the app needs only Fabric'
+            $endStop = @($outcome.Added | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' })
+            $endStop[0].status | Should -Be 'Pass'
+            ([datetime]$endStop[0].evidence['t2AssessmentUploadedAt']).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 23, 15, 20, 0, [System.DateTimeKind]::Utc))
+            $merged = @(Merge-DemoRunResult -Result $result -Added @($outcome.Added))
+            $estate = @($merged | Where-Object { $_.checkId -eq 'FABRIC.APP.ESTATE' })
+            $estate.Count | Should -Be 1
+            ([datetime]$estate[0].evidence['t2MigrationReadAt']).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 23, 15, 21, 0, [System.DateTimeKind]::Utc))
+            $deploy = @($merged | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' })
+            $deploy.Count | Should -Be 1
+            $deploy[0].evidence['redeployedFor'] | Should -Be 't2Migration'
+            @($merged | Where-Object { $_.checkId -eq 'ASK.RELAY' }).Count | Should -Be 1
+            @($merged | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' }).Count | Should -Be 1
+            @($merged | Where-Object { $_.checkId -eq 'T2.ARC.MIGRATIONASSESSMENT' }).Count | Should -Be 1
+        }
+
+        It 'doesn''t deploy the app once more when <Case>' -ForEach @(
+            @{ Case = 'the app has T2''s readiness already'; ReadAt = '2026-11-23T14:00:00Z'; Before = ''; Keep = $false }
+            @{ Case = 'the assessment had uploaded before the stop, so the stop didn''t wait for it'; ReadAt = ''; Before = '2026-11-23T14:00:00Z'; Keep = $false }
+            @{ Case = 'the demo keeps running, so nothing waited for the assessment'; ReadAt = ''; Before = ''; Keep = $true }
+        ) {
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (New-UpdateResult -ReadAt $ReadAt -UploadedBefore $Before) -State (New-FinishedState -WithT4) -KeepRunning:$Keep
+            $outcome.Kind | Should -Be 'Done'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 0 -Exactly
+            @($outcome.Added | Where-Object { [string]$_.checkId -like 'FABRIC.APP.*' }).Count | Should -Be 0
+        }
+
+        It 'keeps the app as this run deployed it, with a Warning and its fix, when the deploy once more doesn''t pass' {
+            $script:againDeploy = 'Manual action required'
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $result = New-UpdateResult
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result $result -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'Done'
+            $app = @($outcome.Added | Where-Object { [string]$_.checkId -like 'FABRIC.APP.*' })
+            $app.Count | Should -Be 1
+            $app[0].checkId | Should -Be 'FABRIC.APP.MIGRATION'
+            $app[0].status | Should -Be 'Warning'
+            $app[0].message | Should -Match '^T2''s first migration assessment uploaded at 2026-11-23 15:20 UTC, after this run deployed the Insights app, .+ But the app''s deploy once more didn''t pass \(FABRIC\.APP\.DEPLOY: FABRIC\.APP\.DEPLOY Manual action required\)'
+            $app[0].remediation | Should -Match '^Run \./scripts/configure-fabric-app\.ps1: it deploys the app with T2''s readiness'
+            $app[0].evidence['nonBlocking'] | Should -Be 'insightsApp'
+            $merged = @(Merge-DemoRunResult -Result $result -Added @($outcome.Added))
+            @($merged | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' }).status | Should -Be 'Pass'
+            $row = Get-ModelStep -Path $run.ProgressPath -Id 'Fabric.App'
+            $row['state'] | Should -Be 'Done'
+            $row['status'] | Should -Be 'Warning'
+            $row['message'] | Should -Match 'FABRIC\.APP\.MIGRATION'
         }
     }
 }

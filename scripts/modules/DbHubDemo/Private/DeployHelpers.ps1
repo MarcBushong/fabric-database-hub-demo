@@ -1364,6 +1364,140 @@ function Complete-DemoInsightsAppManage {
     return $records
 }
 
+function Get-DemoEndStopUploadText {
+    # When T2's first migration assessment uploaded as the stop at the end of an update waited for it (DEPLOY.ENDSTOP's
+    # evidence t2AssessmentUploadedAt, F18), as text, or ''. The evidence went through JSON (New-DemoResult), which turns an
+    # ISO 8601 time into a DateTime: that's "yyyy-MM-dd HH:mm UTC" again. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $EndStop = $null
+    )
+
+    $value = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $EndStop -Name 'evidence') -Name 't2AssessmentUploadedAt'
+    if ($value -is [datetime] -or $value -is [System.DateTimeOffset]) {
+        return (ConvertTo-DemoUtcDate -Value $value).ToString("yyyy-MM-dd HH:mm 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$value
+}
+
+function Get-DemoInsightsAppMigrationGap {
+    <#
+    .SYNOPSIS
+    Why the Insights app's step runs once more at the end of an update, or '' when it doesn't (F18, 2026-11-20): the stop
+    at the end waited for T2's first migration assessment and saw it upload, after this run had deployed the app with no
+    readiness saved. Pure. Internal.
+
+    .DESCRIPTION
+    The app shows T2's readiness as Azure had it when configure-fabric-app.ps1 last deployed it (dbhub-app.json's
+    t2Migration, R924). On the first update that turns T2's assessment on, the app deploys a few minutes before that
+    assessment's first upload, so its Migration card showed only the Azure portal's path until the next deploy.ps1
+    (dbhubfu, 2026-11-20). The stop at the end of an update already waits for that upload (Wait-DemoUpdateStopWork), and
+    DEPLOY.ENDSTOP's evidence t2AssessmentUploadedAt says when it came. The step runs once more when that time is set, this
+    run deployed the app (FABRIC.APP.DEPLOY Pass), and its FABRIC.APP.ESTATE has no t2MigrationReadAt.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $EndStop = $null
+    )
+
+    $uploadedAt = Get-DemoEndStopUploadText -EndStop $EndStop
+    if (-not $uploadedAt) {
+        return ''
+    }
+    $app = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    $deploy = @($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    $estate = @($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.ESTATE' }) | Select-Object -Last 1
+    if ($null -eq $deploy -or [string]$deploy.status -ne 'Pass' -or $null -eq $estate) {
+        return ''
+    }
+    if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $estate -Name 'evidence') -Name 't2MigrationReadAt')) {
+        return ''
+    }
+    return ('T2''s first migration assessment uploaded at {0}, after this run deployed the Insights app, so the app is deployed once more and its Migration card shows T2''s readiness now, not at the next ./scripts/deploy.ps1.' -f $uploadedAt)
+}
+
+function Complete-DemoInsightsAppMigration {
+    <#
+    .SYNOPSIS
+    The Insights app's step once more at the end of an update, once T2's first migration assessment uploaded
+    (Get-DemoInsightsAppMigrationGap, F18, 2026-11-20), so the app's Migration card shows T2's readiness from this run on.
+    Returns the records the run's results get, or nothing when the step isn't needed. Internal.
+
+    .DESCRIPTION
+    Complete-DemoDeploymentRun calls it after the stop at the end, so the VMs are deallocated already: the app's step needs
+    only Fabric, and the readiness comes from T2's SQL Server instance resource in Azure, which keeps it.
+    - The app deployed again (FABRIC.APP.DEPLOY Pass): its records, which replace the earlier ones with the same check IDs
+      in the run's results (Merge-DemoRunResult), so FABRIC.APP.ESTATE has t2MigrationReadAt; their FABRIC.APP.DEPLOY's
+      evidence says why (redeployedFor t2Migration).
+    - It didn't: the earlier records stay, since the app deployed earlier in this run still works, and FABRIC.APP.MIGRATION
+      (a Warning) says that its Migration card shows the Azure portal's path until the next deploy, with the fix. The
+      status page's Insights app and Ask rows show the earlier records again, with that Warning.
+    Never a Fail and never in DONE's way: the app's records are non-blocking (ConvertTo-DemoInsightsAppRecord).
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $EndStop = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $reason = Get-DemoInsightsAppMigrationGap -Result $Result -EndStop $EndStop
+    if (-not $reason) {
+        return @()
+    }
+    Write-DemoLog -Message $reason
+    $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Result -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    $deploy = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    if ($null -ne $deploy -and [string]$deploy.status -eq 'Pass') {
+        # The script's records come back through JSON, so their evidence is an object; a test's may be a dictionary.
+        $evidence = Get-DemoMemberValue -InputObject $deploy -Name 'evidence'
+        if ($evidence -is [System.Collections.IDictionary]) {
+            $evidence['redeployedFor'] = 't2Migration'
+        }
+        elseif ($null -ne $evidence -and $evidence -isnot [string] -and $evidence -isnot [System.ValueType]) {
+            $evidence | Add-Member -NotePropertyName 'redeployedFor' -NotePropertyValue 't2Migration' -Force
+        }
+        return $records
+    }
+    $why = if ($null -ne $deploy) { '{0}: {1}' -f [string]$deploy.checkId, [string]$deploy.message } else { (Get-DemoInsightsAppSummary -Result $records).Reason }
+    $warning = ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.MIGRATION' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('{0} But the app''s deploy once more didn''t pass ({1}), so its Migration card shows the Azure portal''s path to T2''s assessment until the next deploy. The app deployed earlier in this run works as before.' -f $reason, $why.TrimEnd('.')) -Evidence ([ordered]@{ t2AssessmentUploadedAt = (Get-DemoEndStopUploadText -EndStop $EndStop) }) -Remediation 'Run ./scripts/configure-fabric-app.ps1: it deploys the app with T2''s readiness as Azure has it now, without the rest of the deployment.' -DocUrl 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment')
+    # The status page shows the app as this run deployed it, with the Warning, not the deploy once more that didn't pass.
+    try {
+        $earlier = @(@($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) }) + @($warning))
+        $app = Get-DemoInsightsAppSummary -Result $earlier
+        if ($null -ne $app) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage -MaxLength 1200
+        }
+        $ask = Get-DemoAskSummary -Result $earlier
+        if ($null -ne $ask) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State $ask.State -Status $ask.Status -Message $ask.StepMessage -MaxLength 1200
+        }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The Insights app''s rows couldn''t be shown again on the status page: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $warning.message, $warning.remediation)
+    return @($warning)
+}
+
 function Get-DemoResolvedWorkspaceId {
     # The Fabric workspace's ID that configure-fabric.ps1's records name (FABRIC.RESOLVE.WORKSPACE: found, created, or the
     # fabric.workspaceId override), or '' when none did. Pure. Internal.

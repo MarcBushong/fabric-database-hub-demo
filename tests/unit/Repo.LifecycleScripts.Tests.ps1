@@ -447,6 +447,22 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Sequential'] }
         }
 
+        It 'writes the Insights app once, as the ending deployed it again with T2''s readiness, to out/deploy.jsonl (F18, 2026-11-20)' {
+            $capture['earlier'] = New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message 'Azure had no assessment result for T2 at this deploy.' -Evidence ([ordered]@{ t2MigrationReadAt = ''; nonBlocking = 'insightsApp' })
+            $capture['again'] = New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message 'T2''s migration readiness as Azure had it at this deploy.' -Evidence ([ordered]@{ t2MigrationReadAt = '2026-11-23T15:21:00Z'; nonBlocking = 'insightsApp' })
+            Mock -CommandName Invoke-DemoDeployment -MockWith { @((New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok'), $capture['earlier']) }
+            Mock -CommandName Complete-DemoDeploymentRun -MockWith { [pscustomobject]@{ Kind = 'Done'; ExitCode = 0; Minutes = 1; Reason = ''; Next = ''; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = ''; Added = @((New-DemoResult -CheckId 'DEPLOY.ENDSTOP' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Stopped at the end.'), $capture['again']) } }
+            $output = Join-Path -Path $TestDrive -ChildPath ('f18-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $output
+            $LASTEXITCODE | Should -Be 0
+            $exported = @(Get-Content -LiteralPath $output | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+            $estate = @($exported | Where-Object { $_.checkId -eq 'FABRIC.APP.ESTATE' })
+            $estate.Count | Should -Be 1
+            ([datetime]$estate[0].evidence.t2MigrationReadAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 23, 15, 21, 0, [System.DateTimeKind]::Utc))
+            @($exported | Where-Object { $_.checkId -eq 'TEST.RESULT' }).Count | Should -Be 1
+            @($exported | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' }).Count | Should -Be 1
+        }
+
         It 'resolves relative paths against PowerShell''s location, not the process''s working directory (review fix 8)' {
             # .NET resolves relative paths against [Environment]::CurrentDirectory, which Push-Location doesn't change.
             $location = Join-Path -Path $TestDrive -ChildPath ('location-' + [guid]::NewGuid().ToString('N'))

@@ -2,6 +2,14 @@
 
 All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and each release is a dated merge to `main`.
 
+## [Unreleased]
+
+**The release's follow-ups.** Small fixes found during the 2026-11-20 release tests. **How to update:** run `./scripts/deploy.ps1`; your configuration needs no edit.
+
+### Fixed
+
+- On the first update that turns on T2's migration assessment, the Insights app's **Ready to migrate** linked the Azure portal until the next `./scripts/deploy.ps1`, because the app deployed a few minutes before the assessment's first upload (F18). The stop at the end of an update already waits for that upload; the app now deploys once more after it, so the card shows T2's readiness from that update on (`FABRIC.APP.ESTATE`'s `t2MigrationReadAt`). When that deploy doesn't pass, the app deployed earlier in the run stays, and `FABRIC.APP.MIGRATION` (a **Warning**) says how to add the readiness.
+
 ## [2026-11-20]
 
 **The Ignite updates.** Microsoft Fabric Database Hub is generally available since 2026-11-17, and the demo follows it.

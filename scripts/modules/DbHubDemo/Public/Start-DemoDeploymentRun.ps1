@@ -95,6 +95,8 @@ function Start-DemoDeploymentRun {
         Busy         = $null
         # The out folder: the ending keeps what this run found there for the next run of the deployment (F10, 2026-11-19).
         OutputDirectory = $paths.Directory
+        # The configuration's file, for the Insights app's step once more at the ending (F18, 2026-11-20).
+        ConfigPath   = $ConfigPath
     }
     if (-not $PSCmdlet.ShouldProcess($paths.Model, 'Write the status page and keep this PC awake')) {
         return $run

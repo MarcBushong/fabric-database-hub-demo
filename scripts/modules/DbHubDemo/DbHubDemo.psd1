@@ -81,6 +81,7 @@
         'Invoke-DemoValidation'
         'Invoke-DemoVmRunCommand'
         'Invoke-DemoWorkloadCommand'
+        'Merge-DemoRunResult'
         'New-DemoAdminPassword'
         'New-DemoBastion'
         'New-DemoBootstrapBundle'
