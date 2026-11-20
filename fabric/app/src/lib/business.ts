@@ -8,7 +8,7 @@
 // integration's events (docs/architecture.md). Which of T1 and T2 is billing and which the front desk is this file's
 // choice: change it here, in one place.
 
-import { formatDuration, formatLevel, formatNumber, type NumberKind } from "./format";
+import { formatDuration, formatLevel, formatNumber, percent, type NumberKind } from "./format";
 import { timesText } from "./insights";
 import type { EstateTarget } from "./view-state";
 
@@ -83,14 +83,6 @@ const WORDING: Record<string, Wording> = {
     connections: { what: "connections refused", signal: "failed connections", kind: "int" },
 };
 
-/** A share in whole percent that never rounds some to none, or nearly all to all: "less than 1 %", "more than 99 %". */
-export function percent(share: number): string {
-    const p = share * 100;
-    if (p > 0 && p < 0.5) return "less than 1 %";
-    if (p >= 99.5 && p < 100) return "more than 99 %";
-    return `${Math.round(p)} %`;
-}
-
 function forDuration(input: Pick<ImpactInput, "durationMin" | "ongoing">): string {
     if (input.durationMin === null || !Number.isFinite(input.durationMin) || input.durationMin < 0) return "";
     return ` for ${input.ongoing ? "at least " : ""}${formatDuration(Math.max(1, input.durationMin))}`;
@@ -106,7 +98,7 @@ export function impactOf(input: ImpactInput): Impact {
         const { throttled, requests } = input;
         const share = throttled !== null && throttled !== undefined && requests ? throttled / requests : null;
         headline = share !== null ? `${service}: ${percent(share)} of requests throttled${span}` : `${service}: requests throttled${span}`;
-        const peak = input.peak !== null ? `normalized RU ${formatNumber(input.peak, "percent")}, ` : "";
+        const peak = input.peak !== null ? `normalized RU ${formatLevel(input.peak, "percent")}, ` : "";
         evidence = share !== null ? `${peak}429s on ${formatNumber(throttled, "int")} of ${formatNumber(requests, "int")} requests` : `${peak}429s`;
     } else if (input.family === "replica_lag") {
         const minutes = input.peak !== null ? input.peak / 60 : null;

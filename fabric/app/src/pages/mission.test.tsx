@@ -240,6 +240,35 @@ describe("Scoreboard", () => {
     );
 
     it(
+        "writes the T4 and T5 card's peaks as measured, never 100 % for a peak under 100, in both lenses",
+        async () => {
+            const episode = (from: string, to: string, peak: number): Row => ({
+                FindingId: `cosmosdb.T5.throttle.20261117T${from.replace(":", "")}`,
+                TargetKey: "T5",
+                Status: "Warning",
+                StatusSort: 3,
+                Finding: `Throttling from ${from} to ${to} UTC.`,
+                Evidence: JSON.stringify({ throttled: 520, requests: 1000, peakNormalizedRuPercent: peak, stopped: true, recoveredAtUtc: `2026-11-17T${to}:00Z` }),
+                WindowStart: `2026-11-17T${from}:00`,
+                WindowEnd: `2026-11-17T${to}:00`,
+                CapturedAt: "2026-11-17T15:06:00",
+            });
+            renderWithApp(<ScoreboardPage />, { client: sampleClient({}, { "cosmos-findings": [episode("14:00", "14:05", 99.6), episode("14:20", "14:25", 99.996)] }) });
+            await screen.findByRole("heading", { level: 1, name: /^Did we catch it\?/ }, { timeout: 15000 });
+            // The card's own body (a VisualCard's group, named by its title).
+            const card = () => screen.getAllByRole("group", { name: "T4 and T5: what their metrics show" }).find((g) => g.classList.contains("vcard-body"));
+            await waitFor(() => expect(card()?.textContent).toContain("normalized RU and 429s: peak 99.6 %."), { timeout: 15000 });
+            expect(card()?.textContent).toContain("normalized RU and 429s: peak 99.996 %.");
+            expect(card()?.textContent).not.toMatch(/normalized RU and 429s: peak 100/);
+            fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
+            await waitFor(() => expect(card()?.textContent).toContain("(normalized RU 99.6 %, 429s on 520 of 1,000 requests)"));
+            expect(card()?.textContent).toContain("(normalized RU 99.996 %, 429s on 520 of 1,000 requests)");
+            expect(card()?.textContent).not.toMatch(/normalized RU 100/);
+        },
+        SLOW,
+    );
+
+    it(
         "shows the telemetry's failure in its faults card, not a count of faults it couldn't read",
         async () => {
             renderWithApp(<ScoreboardPage />, { client: sampleClient({ "signals-per-bin": "The query returned more rows than the app allows: pick a shorter period." }) });

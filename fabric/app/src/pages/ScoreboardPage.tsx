@@ -15,7 +15,7 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { serviceOf } from "@/lib/business";
-import { formatTimeUtc } from "@/lib/format";
+import { formatLevel, formatTimeUtc } from "@/lib/format";
 import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/postmortem";
 import { aggregate, howMeasured, minutesText, RECOVERED_BINS, SCOREBOARD_SUBTITLE, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
@@ -253,7 +253,7 @@ export default function ScoreboardPage() {
                             <li key={e.key}>
                                 <TargetChip target={e.target} />
                                 <span className="sb-ep-time">{`${time(e.visibleAt)}–${time(e.recoveredAt ?? e.endAt)} UTC`}</span>
-                                <span>{lens === "business" ? e.impact.sentence : `${e.signal}: peak ${e.peak === null ? "–" : e.kind === "percent" ? `${Math.round(e.peak)} %` : `${Math.round(e.peak)} s`}. ${e.note}`}</span>
+                                <span>{lens === "business" ? e.impact.sentence : `${e.signal}: peak ${formatLevel(e.peak, e.kind)}. ${e.note}`}</span>
                             </li>
                         ))}
                     </ul>

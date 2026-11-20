@@ -43,13 +43,37 @@ export function formatNumberDigits(value: number, kind: NumberKind, digits: numb
 /**
  * A level, a baseline, or a peak beside them, as text that reads true: a whole number as formatNumber writes it, any other
  * with its decimals (two, more under 0.1 for two significant digits, at most 4; trailing zeros dropped), whatever its
- * kind: "at least 0.45 (1.5 times its baseline of 0.3)", never "at least 0".
+ * kind: "at least 0.45 (1.5 times its baseline of 0.3)", never "at least 0". A percentage under 100 is never written as
+ * 100: a peak of 99.996 % gets more decimals, or reads "just under 100 %".
  */
 export function formatLevel(value: unknown, kind: NumberKind): string {
     if (!isNumber(value)) return "–";
     if (Number.isInteger(value)) return formatNumber(value, kind);
-    const digits = Math.min(4, Math.max(2, 1 - Math.floor(Math.log10(Math.abs(value)))));
-    return `${new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+    let digits = Math.min(4, Math.max(2, 1 - Math.floor(Math.log10(Math.abs(value)))));
+    const withDigits = () => `${new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+    let text = withDigits();
+    if (kind === "percent" && value < 100) {
+        const hundred = formatNumber(100, kind);
+        while (text === hundred && digits < 4) {
+            digits++;
+            text = withDigits();
+        }
+        if (text === hundred) return "just under 100 %";
+    }
+    return text;
+}
+
+/**
+ * A share (0 to 1) in percent, whole or with `digits` decimals, that never rounds some to none, or nearly all to all:
+ * "less than 1 %" ("less than 0.1 %" with one decimal), "more than 99 %" ("more than 99.9 %").
+ */
+export function percent(share: number, digits = 0): string {
+    const p = share * 100;
+    const fixed = new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    const text = fixed.format(p);
+    if (p > 0 && text === fixed.format(0)) return `less than ${fixed.format(10 ** -digits)} %`;
+    if (p < 100 && text === fixed.format(100)) return `more than ${fixed.format(100 - 10 ** -digits)} %`;
+    return `${text} %`;
 }
 
 /** Parses the connector's DateTime values: ISO text without a zone (a UTC instant), epoch numbers, or Dates. */

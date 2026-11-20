@@ -44,7 +44,7 @@ import { useQuery } from "@/data/use-query";
 import { hubUrlOf, libraryPrompts, type AgentSurface } from "@/lib/agent-prompts";
 import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
-import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
+import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
 import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
@@ -710,7 +710,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             label="Throttled requests (429)"
                             value={formatNumber(throttled, "int")}
                             status={capture ? (throttled > 0 ? "Warning" : "Pass") : null}
-                            sub={requests > 0 ? `${formatNumber((100 * throttled) / requests, "percent")} of ${formatNumber(requests, "int")} requests` : "No requests in the capture"}
+                            sub={requests > 0 ? `${percent(throttled / requests, 1)} of ${formatNumber(requests, "int")} requests` : "No requests in the capture"}
                         />
                         <KpiTile label="Recovery" value={recovery ? (recovery.status === "Pass" ? "Recovered" : "Not yet") : throttled > 0 ? "\u2013" : "No throttling"} status={recovery?.status ?? (throttled > 0 ? null : "Pass")} sub={recovery ? recovery.text : "Back at baseline before the capture ended"} />
                         <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatNumber(lowest, "percent")} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
