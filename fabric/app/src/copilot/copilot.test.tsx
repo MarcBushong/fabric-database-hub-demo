@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
-import { setLiveEstateReader, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
+import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -37,6 +37,8 @@ class FakeSocket {
     static startError: { code: string; message: string } | null = null;
     /** When set, plays the relay's side of the conversation instead of the default script: it gets each question and tool answer. */
     static script: ((socket: FakeSocket, message: Record<string, unknown>) => void) | null = null;
+    /** When set, the relay answers a start only once this resolves: the session is still starting until then. */
+    static startGate: Promise<void> | null = null;
     readyState = 0;
     closed = false;
     sent: Array<Record<string, unknown>> = [];
@@ -56,8 +58,12 @@ class FakeSocket {
         const message = JSON.parse(data) as Record<string, unknown>;
         this.sent.push(message);
         if (message.type === "start") {
-            if (FakeSocket.startError) this.emit({ type: "error", ...FakeSocket.startError, fatal: true });
-            else this.emit({ type: "ready", sessionId: "ask-1", model: null, login: "octo", plan: "enterprise" });
+            const reply = () => {
+                if (FakeSocket.startError) this.emit({ type: "error", ...FakeSocket.startError, fatal: true });
+                else this.emit({ type: "ready", sessionId: "ask-1", model: null, login: "octo", plan: "enterprise" });
+            };
+            if (FakeSocket.startGate) void FakeSocket.startGate.then(reply);
+            else reply();
         }
         if (FakeSocket.script && (message.type === "user" || message.type === "tool_result")) {
             FakeSocket.script(this, message);
@@ -98,6 +104,12 @@ function Harness() {
             {dock.isOpen ? <CopilotDock mode="docked" onModeChange={() => undefined} onClose={() => dock.setOpen(false)} headingId="dock-title" /> : null}
         </>
     );
+}
+
+/** A page's own live read (useLiveEstate), as Overview's and Findings' are, outside the dock. */
+function PageRead() {
+    const inventory = useLiveEstate("inventory");
+    return <span>{inventory.answer ? "page: data" : inventory.loading ? "page: reading" : "page: none"}</span>;
 }
 
 type Route = unknown | ((init?: RequestInit) => Response);
@@ -141,6 +153,7 @@ beforeEach(() => {
     hasCosmos = 0;
     FakeSocket.startError = null;
     FakeSocket.script = null;
+    FakeSocket.startGate = null;
     FakeSocket.all = [];
     estateMock.readEstate.mockReset();
     pagesRefusal = null;
@@ -586,5 +599,106 @@ describe("the end of a turn (R925)", () => {
         await waitFor(() => expect(FakeSocket.all).toHaveLength(2));
         expect(toolsOf(FakeSocket.all[1])).toContain("estate_overview");
         expect(String(FakeSocket.all[1].sent[0].systemMessage)).not.toContain(sentence);
+    });
+
+    // The re-review of 35abaab: a page reads the live estate again while the dock stays open with no conversation, where
+    // New chat is off. The dock follows the page's read, as the pages would.
+    it("follows a page's later live read while it stays open: the live starters return, and the next session offers the live view", async () => {
+        const sentence = "Database Hub's live view isn't available to the app: Database Hub refuses the app's own sign-in.";
+        pagesRefusal = sentence;
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") {
+                s.emit({ type: "message", messageId: "h1", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock(true, true);
+        await screen.findByRole("button", { name: "Which target worked hardest this week?" });
+        await waitFor(() => expect(screen.queryByRole("button", { name: "How is my estate doing right now?" })).not.toBeInTheDocument());
+
+        // A page reads the live estate again, and Database Hub answers this time.
+        pagesRefusal = null;
+        render(<PageRead />);
+        await screen.findByText("page: data");
+        await screen.findByRole("button", { name: "How is my estate doing right now?" });
+        await ask();
+        await screen.findByText(ANSWER);
+        const tools = (FakeSocket.all[0].sent[0].tools as Array<{ name: string }>).map((t) => t.name);
+        expect(tools).toContain("estate_overview");
+        expect(String(FakeSocket.all[0].sent[0].systemMessage)).not.toContain(sentence);
+    });
+
+    // The re-review of 6125812: New chat while the first question's session starts, then a new question. The session that
+    // started for the conversation that's gone is closed unused; the new question starts its own and shows its rows.
+    it("starts the new conversation's own session when New chat comes while a session starts, and shows its query rows", async () => {
+        const FIRST = "First question, overtaken by New chat";
+        let release: () => void = () => undefined;
+        FakeSocket.startGate = new Promise<void>((resolve) => (release = resolve));
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit(dax("c1"));
+            else {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock();
+        await ask(FIRST);
+        await waitFor(() => expect(FakeSocket.all[0]?.sent.some((m) => m.type === "start")).toBe(true));
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        // The first session's start completes after New chat.
+        await act(async () => {
+            release();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+        await ask(QUESTION);
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        const [first, second] = FakeSocket.all;
+        expect(first.closed).toBe(true);
+        expect(first.sent.some((m) => m.type === "user")).toBe(false);
+        expect(second.sent.filter((m) => m.type === "user").map((m) => m.text)).toEqual([QUESTION]);
+        expect(screen.queryByText(FIRST)).not.toBeInTheDocument();
+        expect(screen.queryByText("Copilot didn't write an answer")).not.toBeInTheDocument();
+    });
+
+    // The same, with the new question asked while the first session is still starting: when the first start completes,
+    // its question is dropped quietly, with no error in the new conversation's turn and nothing of the new one closed.
+    it("drops the first question quietly when the new conversation's question comes while the first session still starts", async () => {
+        const FIRST = "First question, overtaken by New chat";
+        let release: () => void = () => undefined;
+        FakeSocket.startGate = new Promise<void>((resolve) => (release = resolve));
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit(dax("c1"));
+            else {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        renderDock();
+        await ask(FIRST);
+        await waitFor(() => expect(FakeSocket.all[0]?.sent.some((m) => m.type === "start")).toBe(true));
+        await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        });
+        await ask(QUESTION);
+        await waitFor(() => expect(FakeSocket.all[1]?.sent.some((m) => m.type === "start")).toBe(true));
+        // Both starts complete now, the first conversation's first.
+        await act(async () => {
+            release();
+        });
+        const answer = await screen.findByText(ANSWER);
+        expect(follows(screen.getByText("Peak CPU"), answer)).toBe(true);
+        const [first, second] = FakeSocket.all;
+        expect(first.closed).toBe(true);
+        expect(first.sent.some((m) => m.type === "user")).toBe(false);
+        expect(second.closed).toBe(false);
+        expect(second.sent.filter((m) => m.type === "user").map((m) => m.text)).toEqual([QUESTION]);
+        expect(screen.queryByText(/New chat started another conversation/)).not.toBeInTheDocument();
+        expect(document.querySelectorAll(".copilot-answer")).toHaveLength(1);
     });
 });

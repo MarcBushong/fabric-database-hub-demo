@@ -114,6 +114,8 @@ const LIVE_VIEWS = ["inventory", "health", "security"] as const;
 // Each view's last "unavailable" sentence in this browser (R924), so that while Database Hub refuses the app, a page
 // doesn't show its live parts reading and then drop them. A read with data forgets its view's.
 const LIVE_OFF_KEY = "dbhub-insights.live-off.v1";
+// The Copilot dock follows what this browser remembers (onLiveOffChange): every page's live read can change it.
+const liveOffListeners = new Set<() => void>();
 
 function rememberedLiveOff(): Partial<Record<EstateView, string>> {
     try {
@@ -140,6 +142,7 @@ function rememberLiveOff(view: EstateView, reason: string | null): void {
     } catch {
         // Storage can be unavailable in a locked-down frame.
     }
+    for (const listener of liveOffListeners) listener();
 }
 
 /**
@@ -148,6 +151,23 @@ function rememberLiveOff(view: EstateView, reason: string | null): void {
  */
 export function liveOffOf(states: ReadonlyArray<Pick<LiveState<EstateView>, "off">>): string | null {
     return states.length > 0 && states.every((s) => s.off) ? states[0].off : null;
+}
+
+/**
+ * liveOffOf over the latest read of each view in this browser, whichever page or the dock read it: for a decision made
+ * now, such as whether the dock's next conversation offers the live view.
+ */
+export function liveOffNow(): string | null {
+    const saved = rememberedLiveOff();
+    return liveOffOf(LIVE_VIEWS.map((view) => ({ off: saved[view] ?? null })));
+}
+
+/** Calls listener after each live read that this browser remembers (liveOffNow may have changed); returns the unsubscribe. */
+export function onLiveOffChange(listener: () => void): () => void {
+    liveOffListeners.add(listener);
+    return () => {
+        liveOffListeners.delete(listener);
+    };
 }
 
 /** liveOffOf for a page that doesn't read every view itself: it reads the other ones too, cached and shared. */
