@@ -2,6 +2,7 @@
 // resource (its issues need attention; its enhancements are recommendations), named with the demo's targets.
 
 import type { FlagCategory, FlagGroups, InventoryData, LiveResource, SecurityData } from "@/data/live-estate";
+import type { DeployedMigration } from "@/lib/runtime-config";
 
 /** Database Hub's flag names, as a DBA reads them, and the area each belongs to. */
 const FLAGS: Record<string, { text: string; area: string }> = {
@@ -218,6 +219,8 @@ export interface MigrationTargetRow extends Record<string, unknown> {
     target: string;
     azureTarget: string;
     readiness: string;
+    /** The recommended service tier and size, when the assessment names one ("GeneralPurpose, 4 vCores"). */
+    recommended?: string;
 }
 
 export interface LiveMigration {
@@ -242,38 +245,64 @@ function joinAnd(items: readonly string[]): string {
     return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
 }
 
+interface AssessmentInput {
+    resource: string;
+    target: string;
+    type: string;
+    enabled: boolean;
+    uploadedAt: string | null | undefined;
+    dataStatus: string;
+    targets: Record<string, string> | undefined;
+    recommended?: Record<string, string>;
+}
+
+/** One assessment as the card shows it: its readiness per Azure SQL target, in Learn's words, the documented three first. */
+function toMigration(a: AssessmentInput): LiveMigration {
+    const targets = a.targets ?? {};
+    const known = new Map(MIGRATION_TARGETS);
+    const keys = [...MIGRATION_TARGETS.map(([key]) => key).filter((key) => key in targets), ...Object.keys(targets).filter((key) => !known.has(key))];
+    const rows: MigrationTargetRow[] = keys.map((key) => ({
+        id: `${a.resource}:${key}`,
+        resource: a.resource,
+        target: a.target,
+        azureTarget: known.get(key) ?? typeText(key.charAt(0).toUpperCase() + key.slice(1)),
+        readiness: readinessText(String(targets[key] ?? "")),
+        ...(a.recommended?.[key] ? { recommended: a.recommended[key] } : {}),
+    }));
+    const uploaded = a.uploadedAt ? new Date(a.uploadedAt) : null;
+    const status = a.dataStatus || "Unknown";
+    return {
+        resource: a.resource,
+        target: a.target,
+        type: a.type,
+        enabled: a.enabled,
+        uploadedAt: uploaded && !Number.isNaN(uploaded.getTime()) ? uploaded : null,
+        dataStatus: status,
+        hasResults: /^(available|stale)$/i.test(status) && rows.some((row) => row.readiness !== "Unknown"),
+        rows,
+        ready: rows.filter((row) => row.readiness === "Ready").map((row) => row.azureTarget),
+        notReady: rows.filter((row) => row.readiness === "Not ready").map((row) => row.azureTarget),
+    };
+}
+
 /** Every migration assessment in the inventory, T2's first: its readiness per Azure SQL target, in Learn's words. */
 export function liveMigrations(inventory: InventoryData | null | undefined): LiveMigration[] {
     const out: LiveMigration[] = [];
     for (const r of uniqueResources(inventory?.resources ?? [])) {
         const a = r.migrationAssessment;
         if (!a) continue;
-        const known = new Map(MIGRATION_TARGETS);
-        const keys = [...MIGRATION_TARGETS.map(([key]) => key).filter((key) => key in (a.targets ?? {})), ...Object.keys(a.targets ?? {}).filter((key) => !known.has(key))];
-        const target = targetOfResource(r);
-        const rows = keys.map((key) => ({
-            id: `${r.name}:${key}`,
-            resource: r.name,
-            target,
-            azureTarget: known.get(key) ?? typeText(key.charAt(0).toUpperCase() + key.slice(1)),
-            readiness: readinessText(String(a.targets[key] ?? "")),
-        }));
-        const uploaded = a.uploadedAt ? new Date(a.uploadedAt) : null;
-        const status = a.dataStatus || "Unknown";
-        out.push({
-            resource: r.name,
-            target,
-            type: typeText(r.databaseType),
-            enabled: a.enabled,
-            uploadedAt: uploaded && !Number.isNaN(uploaded.getTime()) ? uploaded : null,
-            dataStatus: status,
-            hasResults: /^(available|stale)$/i.test(status) && rows.some((row) => row.readiness !== "Unknown"),
-            rows,
-            ready: rows.filter((row) => row.readiness === "Ready").map((row) => row.azureTarget),
-            notReady: rows.filter((row) => row.readiness === "Not ready").map((row) => row.azureTarget),
-        });
+        out.push(toMigration({ resource: r.name, target: targetOfResource(r), type: typeText(r.databaseType), enabled: a.enabled, uploadedAt: a.uploadedAt, dataStatus: a.dataStatus, targets: a.targets }));
     }
     return out.sort((a, b) => Number(b.target === "T2") - Number(a.target === "T2") || a.resource.localeCompare(b.resource));
+}
+
+/**
+ * T2's assessment as Azure Resource Manager had it when the app was last deployed (dbhub-app.json's t2Migration; R924),
+ * for when Database Hub isn't read live: the same rows, with the recommended tier and size when Azure names one.
+ */
+export function savedMigration(saved: DeployedMigration): LiveMigration {
+    const known = Object.values(saved.targets).some((value) => readinessText(value) !== "Unknown");
+    return toMigration({ resource: saved.resource, target: "T2", type: "Arc-enabled SQL Server", enabled: saved.enabled, uploadedAt: saved.uploadedAt, dataStatus: known ? "Available" : "Unavailable", targets: saved.targets, recommended: saved.recommended });
 }
 
 /** "Ready for Azure SQL Managed Instance and SQL Server on Azure Virtual Machines; not ready for Azure SQL Database." */

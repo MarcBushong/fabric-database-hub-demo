@@ -315,6 +315,57 @@ Describe 'Invoke-DemoInsightsAppStep (2026-11-05)' {
     }
 }
 
+Describe 'Complete-DemoInsightsAppManage: the app''s step once more after the control''s notebook is in Fabric (2026-11-19)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:notebookId = 'abababab-abab-abab-abab-abababababab'
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}: {1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
+        $script:record = { param([string] $CheckId, [string] $Status, [System.Collections.IDictionary] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message ('{0} {1}' -f $CheckId, $Status) -Evidence $Evidence }
+        $script:placed = @(& $script:record 'CONTROL.FABRIC.NOTEBOOK' 'Pass')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            & $script:record 'FABRIC.APP.DEPLOY' 'Pass' ([ordered]@{ nonBlocking = 'insightsApp' })
+            & $script:record 'FABRIC.APP.ACTIONS' 'Pass' ([ordered]@{ controlNotebookId = $script:notebookId; nonBlocking = 'insightsApp' })
+        }
+        $script:stateValues = [System.Collections.Generic.List[hashtable]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:stateValues.Add(@{} + $Value) }
+        $script:results = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in @(
+                (& $script:record 'FABRIC.APP.DEPLOY' 'Pass' ([ordered]@{ nonBlocking = 'insightsApp' }))
+                (& $script:record 'FABRIC.APP.ACTIONS' 'Warning' ([ordered]@{ controlNotebookId = ''; nonBlocking = 'insightsApp' }))
+                (& $script:record 'FABRIC.APP.TOKEN' 'Warning' ([ordered]@{ nonBlocking = 'insightsApp' }))
+                (& $script:record 'HUB.ESTATE.T1' 'Pass')
+            )) {
+            $script:results.Add($item)
+        }
+        $script:complete = { param($Control) & (Get-Module -Name DbHubDemo) { param($c, $r, $k) Complete-DemoInsightsAppManage -Config $c -Results $r -ControlResult $k } $config $script:results $Control }
+    }
+
+    It 'replaces the earlier step''s records that have the same check IDs, keeps the others, and records the notebook its Manage has now' {
+        $records = @(& $script:complete $script:placed)
+        $records.Count | Should -Be 2
+        @($script:results | ForEach-Object { '{0} {1}' -f $_.checkId, $_.status }) | Should -Be @('FABRIC.APP.TOKEN Warning', 'HUB.ESTATE.T1 Pass', 'FABRIC.APP.DEPLOY Pass', 'FABRIC.APP.ACTIONS Pass')
+        @($script:stateValues) | ForEach-Object { $_['AppControlNotebookId'] } | Should -Be $script:notebookId
+        @($script:logged | Where-Object { $_ -like '*: This run deployed the Insights app before NB_DatabaseHub_Control was in Fabric*' }).Count | Should -Be 1
+
+        # Its Manage has the notebook now, so a second call does nothing.
+        @(& $script:complete $script:placed).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 1 -Exactly
+    }
+
+    It 'leaves an app that this run didn''t deploy, or a notebook that isn''t in Fabric, to their own records, and never throws when the state can''t be recorded' {
+        @(& $script:complete @(& $script:record 'CONTROL.FABRIC.NOTEBOOK' 'Warning')).Count | Should -Be 0
+        $script:results[0].status = 'Manual action required'
+        @(& $script:complete $script:placed).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 0 -Exactly
+
+        $script:results[0].status = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'Recording the deployment state failed: (AuthorizationFailed)' }
+        @(& $script:complete $script:placed).Count | Should -Be 2
+        @($script:logged | Where-Object { $_ -like 'Warning: The Insights app was deployed once more, but what its Manage has wasn''t recorded: *AuthorizationFailed*' }).Count | Should -Be 1
+    }
+}
+
 Describe 'Invoke-DemoFabricNotebookRun' {
     BeforeEach {
         $config = New-TestConfig

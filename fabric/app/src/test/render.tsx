@@ -231,6 +231,8 @@ export interface RenderOptions {
     metaEmpty?: boolean;
     /** Database Hub's live answers: the sample's, none (the app's function isn't deployed; the default), or a reader's. */
     live?: "sample" | "off" | EstateReader;
+    /** What dbhub-app.json adds to the runtime, such as t2Migration. */
+    runtime?: Partial<AppRuntime>;
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
@@ -244,7 +246,7 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
     const notify = vi.fn();
     const view: ViewState = { ...DEFAULT_VIEW, ...options.view };
     const context: AppContextValue = {
-        runtime: RUNTIME,
+        runtime: { ...RUNTIME, ...options.runtime },
         embedded: options.embedded ?? true,
         view,
         setView,

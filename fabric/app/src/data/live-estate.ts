@@ -29,12 +29,39 @@ export type FlagCategory = "security" | "performance" | "optimization";
 export type FlagGroups = NonNullable<InventoryResource["issues"]>;
 
 /**
- * The answer's data, or null when there's none: the function answers with empty data when it has no scope (the
- * deploy didn't write one), with the reason in errors.
+ * The answer's data, or null when there's none: the function answers with empty data when it read nothing (Database
+ * Hub refused the app or didn't answer, or the deploy wrote no scope), with one plain sentence in unavailable.
  */
 export function liveDataOf<V extends EstateView>(answer: EstateAnswer<V> | null | undefined): EstateDataByView[V] | null {
     const data = answer?.data;
     return data && typeof data === "object" && Object.keys(data).length > 0 ? (data as EstateDataByView[V]) : null;
+}
+
+const ROUTE = /^(GET|POST) \/[\w/.-]+(?=:)/;
+
+/** What a page says when Database Hub didn't answer the app for a reason a later read may not meet (an outage, a timeout). */
+export const LIVE_NO_ANSWER = "Database Hub's live view didn't answer the app just now";
+
+/**
+ * The Database Hub routes behind one or more answers, and the ones that didn't answer, by route only: each failure's
+ * detail (its HTTP status and Database Hub's message) stays in the function's log, never on a page (R924).
+ */
+export function liveRoutes(source: readonly string[], errors: readonly string[]): { called: string[]; failed: string[] } {
+    const called = new Set(source);
+    const failed = new Set<string>();
+    for (const e of errors) {
+        const route = ROUTE.exec(e)?.[0];
+        if (!route) continue;
+        failed.add(route);
+        called.add(route);
+    }
+    return { called: [...called], failed: [...failed] };
+}
+
+/** The routes as the "Database Hub API" panel lists them: each one, and "didn't answer" after a failed one. */
+export function liveRouteLines(source: readonly string[], errors: readonly string[]): string {
+    const { called, failed } = liveRoutes(source, errors);
+    return called.map((route) => (failed.includes(route) ? `${route}  (didn't answer)` : route)).join("\n");
 }
 
 export type EstateReader = <V extends EstateView>(view: V, options?: { force?: boolean }) => Promise<EstateAnswer<V>>;
@@ -56,7 +83,7 @@ export async function readLiveEstate<V extends EstateView>(view: V, options?: { 
 export interface LiveState<V extends EstateView> {
     answer: EstateAnswer<V> | null;
     loading: boolean;
-    /** Why there's no live answer: the app's function isn't deployed, or this build has none. */
+    /** Why there's no live answer, in one plain sentence: Database Hub refused the app or didn't answer, or the app's function isn't deployed. */
     unavailable: string | null;
     refresh: () => void;
 }
@@ -71,8 +98,9 @@ export function useLiveEstate<V extends EstateView>(view: V, enabled = true): Li
         readLiveEstate(view, nonce > 0 ? { force: true } : undefined).then(
             (answer) => {
                 if (!alive) return;
-                // No data at all (the function has no scope): the page says why, as when the function isn't deployed.
-                if (liveDataOf(answer) === null) setSettled({ view, n: nonce, answer: null, unavailable: answer.errors[0] ?? "Database Hub returned no data for this view." });
+                // No data at all: the page says why in the function's one plain sentence, or that Database Hub didn't
+                // answer just now, never a route's error (R924).
+                if (liveDataOf(answer) === null) setSettled({ view, n: nonce, answer: null, unavailable: answer.unavailable ?? LIVE_NO_ANSWER });
                 else setSettled({ view, n: nonce, answer, unavailable: null });
             },
             (error: unknown) => {

@@ -84,6 +84,10 @@ function Get-DemoDeploymentStateTagName {
         # notebooks, the history model and report, the dashboard, and the Insights app, so a resume publishes them again
         # when this copy of the scripts has other ones (Get-DemoFabricContentReopen). Empty before 2026-11-16.
         FabricSha256      = 'DbHubFabricSha256'
+        # 2026-11-19 (ADR 0029): the NB_DatabaseHub_Control item ID that the Insights app's Manage was last deployed with,
+        # empty when the app was deployed before the notebook was in Fabric, so a resume deploys the app once more after the
+        # control's Fabric part (Get-DemoInsightsAppManageGap). Empty before 2026-11-19.
+        AppControlNotebookId = 'DbHubAppControlNotebook'
         T2Source          = 'DbHubT2Source'
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
@@ -1224,6 +1228,138 @@ function Invoke-DemoInsightsAppStep {
             throw
         }
         Write-DemoLog -Level Warning -Message ('The Insights app''s outcome couldn''t be shown on the status page: {0}' -f (Get-DemoExceptionText -Exception $_.Exception))
+    }
+    return $records
+}
+
+function Get-DemoInsightsAppManageRecord {
+    <#
+    .SYNOPSIS
+    What the deployment state records about the Insights app's Manage after one of deploy.ps1's app steps (2026-11-19,
+    ADR 0029): @{ AppControlNotebookId = <NB_DatabaseHub_Control's item ID in Manage's settings, or ''> } when the step
+    deployed the app (FABRIC.APP.DEPLOY Pass) and wrote Manage's settings (FABRIC.APP.ACTIONS), and an empty hashtable,
+    which records nothing, otherwise. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $deploy = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    $actions = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.ACTIONS' }) | Select-Object -Last 1
+    if ($null -eq $deploy -or [string]$deploy.status -ne 'Pass' -or $null -eq $actions) {
+        return @{}
+    }
+    $notebook = ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $actions -Name 'evidence') -Name 'controlNotebookId')).ToLowerInvariant()
+    return @{ AppControlNotebookId = $(if ($notebook -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $notebook } else { '' }) }
+}
+
+function Get-DemoInsightsAppManageGap {
+    <#
+    .SYNOPSIS
+    Why the Insights app's step runs once more after the session control's Fabric part, or '' when it doesn't
+    (2026-11-19): the control's notebook is in Fabric now, and the app's Manage was deployed without it. Pure. Internal.
+
+    .DESCRIPTION
+    The app's step reads NB_DatabaseHub_Control's IDs when it stages the app (Resolve-DemoFabricAppItem), and the parallel
+    path puts the notebook in Fabric only after its tracks, so a first deployment's Manage had none and copied each request
+    for Run all (FABRIC.APP.ACTIONS: "missing NB_DatabaseHub_Control"; the final tests' net-new run, 2026-11-19). The step
+    runs once more when the control's Fabric part put the notebook in Fabric in this run (CONTROL.FABRIC.NOTEBOOK Pass),
+    and:
+    - this run deployed the app without the notebook in Manage's settings (Get-DemoInsightsAppManageRecord); or
+    - this run didn't run the app's step (a resume after its Fabric step), an earlier run published the app in full (the
+      state's FabricSha256), and the state records no notebook for its Manage (AppControlNotebookId, which an environment
+      deployed before 2026-11-19 doesn't have).
+    A run whose app wasn't deployed, or whose control notebook isn't in Fabric, says why in those records instead.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowEmptyCollection()]
+        [object[]] $ControlResult = @(),
+
+        [AllowNull()]
+        [object] $State = $null
+    )
+
+    $placed = @($ControlResult | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'CONTROL.FABRIC.NOTEBOOK' }) | Select-Object -Last 1
+    if ($null -eq $placed -or [string]$placed.status -ne 'Pass') {
+        return ''
+    }
+    $app = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    if (@($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }).Count -gt 0) {
+        $record = Get-DemoInsightsAppManageRecord -Result $app
+        if (-not $record.Contains('AppControlNotebookId') -or $record['AppControlNotebookId']) {
+            return ''
+        }
+        return 'This run deployed the Insights app before NB_DatabaseHub_Control was in Fabric, so its Manage copies each request for Run all; the notebook is there now, so the app is deployed once more with its IDs.'
+    }
+    if (-not [string](Get-DemoMemberValue -InputObject $State -Name 'FabricSha256') -or [string](Get-DemoMemberValue -InputObject $State -Name 'AppControlNotebookId')) {
+        return ''
+    }
+    return 'No record says the Insights app''s Manage has NB_DatabaseHub_Control (an earlier run deployed the app before the notebook was in Fabric, or before 2026-11-19), so the app is deployed once more with its IDs.'
+}
+
+function Complete-DemoInsightsAppManage {
+    <#
+    .SYNOPSIS
+    The Insights app's step once more, after the session control's Fabric part, when the app's Manage was deployed without
+    NB_DatabaseHub_Control (Get-DemoInsightsAppManageGap, 2026-11-19), so a first deployment's Manage sends its actions
+    from the app. Internal.
+
+    .DESCRIPTION
+    Its records replace the earlier step's records with the same check IDs in -Results (so DONE and the status page show
+    FABRIC.APP.ACTIONS as it is now), and the state records the notebook the app's Manage now has (AppControlNotebookId).
+    Returns its records, or nothing when the step isn't needed. Never a Fail and never in DONE's way: the app's records
+    are non-blocking (ConvertTo-DemoInsightsAppRecord), and a state that can't be recorded is a log Warning only.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]] $Results,
+
+        [AllowEmptyCollection()]
+        [object[]] $ControlResult = @(),
+
+        [AllowNull()]
+        [object] $State = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $reason = Get-DemoInsightsAppManageGap -Result $Results.ToArray() -ControlResult $ControlResult -State $State
+    if (-not $reason) {
+        return @()
+    }
+    Write-DemoLog -Message $reason
+    $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Results.ToArray() -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    $ids = @($records | ForEach-Object { [string]$_.checkId } | Select-Object -Unique)
+    foreach ($item in @($Results | Where-Object { $null -ne $_ -and [string]$_.checkId -in $ids -and (Test-DemoInsightsAppRecord -Result $_) })) {
+        $null = $Results.Remove($item)
+    }
+    $Results.AddRange([object[]]$records)
+    $record = Get-DemoInsightsAppManageRecord -Result $records
+    if ($record.Count -gt 0) {
+        try {
+            Set-DemoDeploymentState -Config $Config -Value $record -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The Insights app was deployed once more, but what its Manage has wasn''t recorded: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
     }
     return $records
 }

@@ -13,6 +13,12 @@ function Invoke-DemoArcOnboarding {
        With -Force it first waits, up to -PassWaitMinutes, while the host's bootstrap pass runs (#65 follow-up).
     2. Probes the guest through vm/bootstrap/Invoke-DemoArcOnboard.ps1 -Action Probe (read-only): PowerShell
        Direct reachability, isolation from IMDS and the wire server (ADR 0004), DNS, and 'azcmagent show -j'.
+       Since 2026-11-19 (dbhubfx: the probe ran inside the host's own bootstrap pass and gave up), the probe and the
+       onboarding first wait for that pass and hold its lock (bootstrap.lock, at most 30 minutes; fail closed), and a
+       probe that finds the guest unreachable tries again after pauses of 10, 30, and 60 seconds. A guest that still
+       doesn't answer is a Fail whose fix is to run ./scripts/deploy.ps1 again, with PowerShell Direct's own error, and
+       configuration waits for it; with an Azure machine that's already Connected it's a Warning, and configuration goes
+       on.
     3. Reads Microsoft.HybridCompute/machines/arcsql01 and applies the decision table
        (Get-DemoArcOnboardingDecision):
        - already Connected to the expected machine: skip, and write the marker again;
@@ -80,7 +86,8 @@ function Invoke-DemoArcOnboarding {
     being repaired.
 
     .PARAMETER TimeoutSeconds
-    The onboarding Run Command's script timeout: download, copy, install, and connect.
+    The onboarding Run Command's script timeout: download, copy, install, and connect. The Run Command gets 35 minutes
+    more, for the wait for the host's bootstrap pass and the tries while the guest doesn't answer (at most 7200 seconds).
 
     .PARAMETER ConnectWaitMinutes
     How long to wait for the Azure machine to report Connected afterward.
@@ -334,14 +341,20 @@ function Invoke-DemoArcOnboarding {
 
     # 2. Probe the guest (read-only), and 3. read the Azure machine.
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
-    $probeParameters = @{ Action = 'Probe'; MachineName = $target.MachineName; Mode = $target.T2Mode }
+    # dbhubfx (2026-11-19): the probe's PowerShell Direct sessions ran inside the host's own bootstrap pass and found the guest
+    # unreachable, and onboarding never started. Each action on the host now waits for that pass first and holds its lock
+    # (bootstrap.lock, at most ArcLockMinutes), and one that finds the guest unreachable runs again after pauses of 10, 30,
+    # and 60 seconds; the Run Commands' timeouts leave room for both.
+    $arcLockMinutes = 30
+    $probeParameters = @{ Action = 'Probe'; MachineName = $target.MachineName; Mode = $target.T2Mode; LockMinutes = [string]$arcLockMinutes }
     if ($recoveryKey) {
         $probeParameters['RecoveryKey'] = $recoveryKey
     }
     try {
-        # 25 minutes: a probe takes about a minute, but one that finds the channel broken restarts the guest and waits for
-        # it (issue #65), and Run Command ends a script at its timeout.
-        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter $probeParameters -TimeoutSeconds 1500 -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
+        # 60 minutes: a probe takes about a minute, but it first waits for the host's bootstrap pass (at most 30 minutes),
+        # runs again while the guest doesn't answer (about 2 minutes more), and one that finds the channel broken restarts
+        # the guest and waits for it (issue #65); Run Command ends a script at its timeout.
+        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter $probeParameters -TimeoutSeconds (1500 + $arcLockMinutes * 60 + 300) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The guest could not be probed: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 again; a conflict with an extension that a policy installs clears within minutes.')
@@ -357,7 +370,7 @@ function Invoke-DemoArcOnboarding {
         $evidence['probeError'] = if ($probeRun.Error) { $probeRun.Error } else { $probeRun.Output }
     }
     if ($null -ne $probe) {
-        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus', 'guestRecovery') {
+        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus', 'guestRecovery', 'guestError', 'probeTries', 'lockSeconds') {
             $evidence[$name] = Get-DemoMemberValue -InputObject $probe -Name $name
         }
         # Get-DemoMemberValue returns an array whole, so @() around the call would nest it: [[...]] in the evidence.
@@ -376,6 +389,30 @@ function Invoke-DemoArcOnboarding {
     $decision = Get-DemoArcOnboardingDecision -HostState $hostState -Force:$Force -Probe $probe -Machine $machine -MachineName $target.MachineName -ResourceGroupName $target.ResourceGroupName -SubscriptionId $target.SubscriptionId -EvaluationOnly:$target.EvaluationOnly
     $evidence['decision'] = $decision.Action
     Write-DemoLog -Message ('Arc onboarding decision for {0}: {1}. {2}' -f $target.MachineName, $decision.Action, $decision.Reason)
+    if ($decision.Action -eq 'GuestUnreachable') {
+        # dbhubfx (2026-11-19): a Warning here let configuration go on against an Arc machine that didn't exist, so NOT DONE
+        # led with its consequence (T2.ARC.SQLEXTENSION) and named configure-arc.ps1. The guest didn't answer even after the
+        # host's own pass, the pauses, and issue #65's recovery: a Fail whose fix is a plain rerun, and configuration waits
+        # for it (Invoke-DemoArcConfiguration). With an Azure machine that's already Connected (an update), it stays a
+        # Warning, and configuration, which goes through Azure, goes on.
+        $azureNow = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $machine -Name 'properties') -Name 'status')
+        $detail = [string](Get-DemoMemberValue -InputObject $probe -Name 'guestError')
+        if (-not $detail -and $evidence.Contains('probeError')) {
+            $detail = [string]$evidence['probeError']
+        }
+        $detail = (Protect-DemoText -Text $detail).Trim().TrimEnd('.')
+        if ($detail.Length -gt 300) {
+            $detail = $detail.Substring(0, 297) + '...'
+        }
+        $tries = [int](Get-DemoMemberValue -InputObject $probe -Name 'probeTries')
+        $what = if ($target.EvaluationOnly) { 'The probe on {0} failed' -f $target.HostVmName } elseif ($null -eq $probe) { 'The probe of {0} on {1} failed' -f $target.MachineName, $target.HostVmName } else { '{0} didn''t answer over PowerShell Direct on {1}' -f $target.MachineName, $target.HostVmName }
+        $what = '{0}{1}{2}.' -f $what, $(if ($tries -gt 1) { ' after {0} tries' -f $tries } else { '' }), $(if ($detail) { ': {0}' -f $detail } else { '' })
+        $unreachableFix = 'Run ./scripts/deploy.ps1 again: it probes {0} again, after {1}''s own bootstrap pass, and onboards it once it answers.' -f $target.MachineName, $target.HostVmName
+        if ($azureNow -eq 'Connected') {
+            return (& $newResult 'Warning' ('{0} Its Azure Arc machine is Connected, so its configuration goes on.' -f $what) $unreachableFix)
+        }
+        return (& $newResult 'Fail' ('{0} It isn''t onboarded to Azure Arc, so its configuration waits for it.' -f $what) $unreachableFix)
+    }
     if ($decision.Action -notin 'AlreadyConnected', 'CleanupStaleThenOnboard', 'DisconnectLocalThenOnboard', 'Onboard') {
         return (& $newResult $decision.Status $decision.Reason)
     }
@@ -403,6 +440,7 @@ function Invoke-DemoArcOnboarding {
     $parameters['Cloud'] = $setting.Cloud
     $parameters['CorrelationId'] = [guid]::NewGuid().ToString()
     $parameters['TokenSource'] = 'Parameter'
+    $parameters['LockMinutes'] = [string]$arcLockMinutes
     if ($recoveryKey) {
         $parameters['RecoveryKey'] = $recoveryKey
     }
@@ -455,7 +493,8 @@ function Invoke-DemoArcOnboarding {
         $null = Set-DemoArcSweepOwed -Config $Config -Value $sweepOwed -Confirm:$false
     }
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcOnboard' -Script $script -Parameter $parameters -ProtectedParameter $protected -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
+        # The onboarding's own work, plus the wait for the host's bootstrap pass and the tries while the guest doesn't answer.
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcOnboard' -Script $script -Parameter $parameters -ProtectedParameter $protected -TimeoutSeconds ([System.Math]::Min(7200, $TimeoutSeconds + $arcLockMinutes * 60 + 300)) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The onboarding Run Command could not run: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 again; a conflict with an extension that a policy installs clears within minutes.')
@@ -474,12 +513,16 @@ function Invoke-DemoArcOnboarding {
         if ($detail -match 'AZCM0044') {
             $remediation = 'An Arc machine with this name already exists (AZCM0044). Run configure-arc.ps1 again: it deletes a stale machine before onboarding.'
         }
+        elseif ($detail -match 'bootstrap\.lock|did not answer over PowerShell Direct') {
+            # Nothing was changed (dbhubfx, 2026-11-19): the host's own pass held its lock, or the guest didn't answer.
+            $remediation = 'Run ./scripts/deploy.ps1 again: it onboards {0} after {1}''s own bootstrap pass, once {0} answers.' -f $target.MachineName, $target.HostVmName
+        }
         elseif ($parameters['TokenSource'] -eq 'HostIdentity') {
             $remediation = 'The host identity''s token was used. Check that id-<prefix>-<env>-arc-onboard still has Azure Connected Machine Onboarding on the resource group, then run configure-arc.ps1 again; or onboard with your own token: configure-arc.ps1 -UseCallerToken.'
         }
         return (& $newResult 'Fail' ('Onboarding {0} failed (execution state {1}, exit code {2}): {3}' -f $target.MachineName, $run.ExecutionState, $run.ExitCode, $detail) $remediation)
     }
-    foreach ($name in 'outcome', 'resourceId', 'agentVersion', 'agentStatus', 'guestVmId', 'taskStarted', 'tokenPassedBy', 'connectAttempts', 'authorizationWaitSeconds') {
+    foreach ($name in 'outcome', 'resourceId', 'agentVersion', 'agentStatus', 'guestVmId', 'taskStarted', 'tokenPassedBy', 'connectAttempts', 'authorizationWaitSeconds', 'lockSeconds') {
         $evidence[$name] = Get-DemoMemberValue -InputObject $outcome -Name $name
     }
     # A restart the action made; one the probe made stays when the action made none.

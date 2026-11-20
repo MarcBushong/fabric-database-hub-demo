@@ -43,7 +43,9 @@ context, and never pauses, resumes, or scales the capacity.
 5b. Manage (ADR 0029): Resolve-DemoFabricAppOperator reads the operators, the deployer and the users of the demo's admin
    group (FABRIC.APP.OPERATORS), and Set-DemoFabricAppManageSetting writes them, NB_DatabaseHub_Control's IDs, and the
    app's API into the stage for the app's Manage function (FABRIC.APP.ACTIONS). A first deploy records the app's API
-   only in step 6, so it writes them again and deploys once more.
+   only in step 6, so it writes them again and deploys once more, when that completes them. NB_DatabaseHub_Control's
+   IDs come from step 3: when the notebook isn't in Fabric yet (deploy.ps1 puts it there after its tracks), deploy.ps1
+   runs this script once more after it has (Complete-DemoInsightsAppManage, 2026-11-19).
 6. Deploy: Invoke-DemoFabricAppDeployment runs 'rayfin up --yes --json' and 'rayfin up status'
    (FABRIC.APP.DEPLOY, FABRIC.APP.STATUS); when Fabric refuses the Azure CLI's token, FABRIC.APP.TOKEN says why and the
    Rayfin CLI's own sign-in deploys instead.
@@ -382,6 +384,28 @@ $deployFile = [ordered]@{
     resourceGroup    = $resourceGroupName
     links            = $links
 }
+# T2's migration assessment as Azure has it now (R924): words, numbers, and times only. The app's migration card shows it,
+# with this time, while Database Hub's live view isn't available to the app; every deploy reads it again. The record's
+# evidence went through JSON (New-DemoResult), which makes its times DateTime values, so they're ISO 8601 in UTC again.
+$isoUtc = {
+    param([object] $Value)
+    if ($Value -is [datetime]) {
+        $utc = if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc) } else { $Value.ToUniversalTime() }
+        return $utc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+$savedMigration = $itemsResult.evidence['t2Migration']
+if ($null -ne $savedMigration) {
+    $deployFile['t2Migration'] = [ordered]@{
+        resource    = [string]$savedMigration['resource']
+        readAt      = & $isoUtc $savedMigration['readAt']
+        enabled     = [bool]$savedMigration['enabled']
+        uploadedAt  = & $isoUtc $savedMigration['uploadedAt']
+        targets     = $savedMigration['targets']
+        recommended = $savedMigration['recommended']
+    }
+}
 # The Copilot dock (Ask, ADR 0028): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
 # gets the relay's address, and the live estate function's scope. -DryRun and -CheckOnly only look for the relay.
 $functionScope = $null
@@ -488,10 +512,13 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
     }
     if ($deployed -and -not $DryRun -and $null -ne $manage) {
         # A first deploy: rayfin up recorded the app's API only now, so Manage's settings get it, and the app deploys once
-        # more, so that its function checks callers there (about a minute, once). Later deploys find it in the record.
+        # more, so that its function checks callers there (about a minute, once). Later deploys find it in the record. Only
+        # when that lets Manage send (2026-11-19): while something else is missing, such as NB_DatabaseHub_Control before
+        # deploy.ps1 puts it in Fabric, Manage copies each request either way, and the next deploy, which deploy.ps1 runs
+        # once the notebook is there (Complete-DemoInsightsAppManage), reads the API from the record.
         $after = Set-DemoFabricAppManageSetting @manage -Confirm:$false
         $api = [string]$after.evidence['apiUrl']
-        if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written']) {
+        if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written'] -and [string]$after.status -eq 'Pass') {
             $again = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
             $againResult = $again | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' } | Select-Object -First 1
             if ($null -eq $againResult -or $againResult.status -ne 'Pass') {
@@ -509,6 +536,29 @@ else {
 }
 if ($deployed -and $null -ne $manageResult) {
     $results.Add($manageResult)
+}
+# The live estate (R924, found live 2026-11-19): Database Hub answers HTTP 401 "Authentication failed for all
+# authenticators" to the token Fabric gives the app's functions, so the estate function reads nothing, and the app's
+# pages and Ask say so in one sentence. No setting or role fixes that, and a script can't call the function to check it
+# (Fabric runs it only for a person signed in to the app), so this says what still works: Not supported, never a Fail.
+if ($deployed -and -not $DryRun) {
+    $estateDoc = 'https://learn.microsoft.com/fabric/apps/functions-connect-external-resources'
+    $saved = $deployFile['t2Migration']
+    $readiness = if ($null -ne $saved) {
+        'T2''s migration readiness as Azure had it at this deploy ({0})' -f $saved['readAt']
+    }
+    else {
+        'T2''s Azure portal path to its migration assessment (Azure had no assessment result for T2 at this deploy; the next ./scripts/deploy.ps1 reads it again)'
+    }
+    $estateEvidence = [ordered]@{ functionDeployed = ($null -ne $functionScope); invoked = $false; finding = 'R924'; t2MigrationReadAt = $(if ($null -ne $saved) { [string]$saved['readAt'] } else { '' }) }
+    if ($null -eq $functionScope) {
+        $estateMessage = 'The live estate function has no scope in this run (no configuration, or no subscription guard), so it reads nothing. The app shows the saved history and {0}; Database Hub shows the live estate.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message $estateMessage -Evidence $estateEvidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 with the configuration, which writes the function''s scope.' -DocUrl $estateDoc))
+    }
+    else {
+        $estateMessage = 'The app''s live views aren''t supported yet: Database Hub refuses the sign-in that Fabric gives the app''s functions (HTTP 401, found live 2026-11-19, R924), so the app''s pages and Ask say in one sentence that its live view isn''t available. What works: the app shows the saved history and {0}, and Database Hub''s own pages show the live estate. Nothing to fix here: the function asks Database Hub on every read, so Overview''s Live now shows tiles once Database Hub accepts that sign-in. A script can''t call the function to check it, because Fabric runs it only for a person signed in to the app.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message $estateMessage -Evidence $estateEvidence -DocUrl $estateDoc))
+    }
 }
 #endregion Step 6: deploy
 
