@@ -1,0 +1,166 @@
+/// One replay sample from one side of T4's replication: the read replica's replay state and conflicts, or the primary's view of the standby. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Replica'
+
+    /// The longest the read replica went without replaying a transaction, in seconds.
+    measure 'Replica Replay Stall (s)' = CALCULATE ( MAX ( 'RCA Replica'[Since Last Replayed (s)] ), 'RCA Replica'[Side] = "replica" )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the sample was taken.
+    column 'At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: at_utc
+
+    /// T4-replica for the replica's side, T4 for the primary's.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// replica or primary.
+    column Side
+        dataType: string
+        sourceColumn: side
+
+    /// The primary's name for the standby (pg_stat_replication.application_name).
+    column Standby
+        dataType: string
+        sourceColumn: standby_name
+
+    /// now() minus pg_last_xact_replay_timestamp() on the replica.
+    column 'Since Last Replayed (s)'
+        dataType: double
+        formatString: #,0.0
+        summarizeBy: none
+        sourceColumn: since_last_replayed_s
+
+    /// pg_last_wal_receive_lsn() minus pg_last_wal_replay_lsn() on the replica.
+    column 'Received Not Replayed (bytes)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: received_not_replayed_bytes
+
+    /// pg_stat_replication.replay_lag on the primary.
+    column 'Replay Lag (s)'
+        dataType: double
+        formatString: #,0.0
+        summarizeBy: none
+        sourceColumn: replay_lag_s
+
+    /// pg_stat_replication.write_lag on the primary.
+    column 'Write Lag (s)'
+        dataType: double
+        formatString: #,0.000
+        summarizeBy: none
+        sourceColumn: write_lag_s
+
+    /// pg_stat_replication.flush_lag on the primary.
+    column 'Flush Lag (s)'
+        dataType: double
+        formatString: #,0.000
+        summarizeBy: none
+        sourceColumn: flush_lag_s
+
+    /// The primary's current WAL position minus what it sent.
+    column 'Send Gap (bytes)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: send_gap_bytes
+
+    /// WAL the primary generated per second since the previous sample (pg_stat_wal).
+    column 'WAL Bytes/s'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: wal_bytes_per_s
+
+    /// The replica's startup (replay) process wait, wait_event_type:wait_event.
+    column 'Startup Wait'
+        dataType: string
+        sourceColumn: startup_wait
+
+    /// The table whose lock replay waits for, from pg_locks.
+    column 'Conflict Relation'
+        dataType: string
+        sourceColumn: conflict_relation
+
+    /// The lock mode replay waits for (AccessExclusiveLock).
+    column 'Conflict Wanted Mode'
+        dataType: string
+        sourceColumn: conflict_wanted_mode
+
+    /// When replay started to wait (pg_locks.waitstart).
+    column 'Conflict Wait Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: conflict_wait_start_utc
+
+    /// The replica query's pid that holds the conflicting lock.
+    column 'Conflict Holder Session'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: conflict_holder_session
+
+    /// The holder's lock mode.
+    column 'Conflict Holder Mode'
+        dataType: string
+        sourceColumn: conflict_holder_mode
+
+    /// The holder's application name, as program_name in RCA Sessions.
+    column 'Conflict Holder Program'
+        dataType: string
+        sourceColumn: conflict_holder_program
+
+    /// As run_token in RCA Sessions.
+    column 'Conflict Holder Run Token'
+        dataType: string
+        isHidden
+        sourceColumn: conflict_holder_run_token
+
+    /// The holder's statement, normalized.
+    column 'Conflict Holder Statement'
+        dataType: string
+        sourceColumn: conflict_holder_statement
+
+    /// Queries the replica cancelled for conflicts since the previous sample (pg_stat_database_conflicts).
+    column 'Conflicts Cancelled'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: conflicts_cancelled
+
+    /// The replica's max_standby_streaming_delay.
+    column 'Max Standby Streaming Delay (s)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: max_standby_streaming_delay_s
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Replica' = entity
+        mode: directLake
+        source
+            entityName: rca_replica
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

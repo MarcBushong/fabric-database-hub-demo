@@ -1,4 +1,4 @@
-/// History of the Fabric Database Hub demo from the lakehouse snapshots that the notebooks write: telemetry bins, findings, validation checks, scenario requests, and incident windows. All times are UTC. The live view is Database Hub and the Real-Time Dashboard.
+/// History of the Fabric Database Hub demo from the lakehouse snapshots that the notebooks write: telemetry bins, findings, validation checks, scenario requests, incident windows, and the Incident RCA's evidence (ADR 0031), with its answer key apart. All times are UTC. The live view is Database Hub and the Real-Time Dashboard.
 model Model
     culture: en-US
     defaultPowerBIDataSourceVersion: powerBI_V3
@@ -10,6 +10,14 @@ ref table 'Scenario Runs'
 ref table 'Telemetry Snapshots'
 ref table 'Analysis Findings'
 ref table 'Incident Windows'
+ref table 'RCA Sessions'
+ref table 'RCA Waits'
+ref table 'RCA Events'
+ref table 'RCA Queries'
+ref table 'RCA Resource'
+ref table 'RCA Replica'
+ref table 'RCA Coverage'
+ref table 'RCA Answer Key'
 ref table Target
 ref table Status
 ref table Analysis

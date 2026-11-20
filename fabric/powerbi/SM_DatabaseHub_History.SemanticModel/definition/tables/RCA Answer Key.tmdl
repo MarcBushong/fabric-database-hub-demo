@@ -1,0 +1,87 @@
+/// One fault the workload injected (kind run) or one event it reported about its own fault (kind run-event): the answer key, which only the scoreboard and the tests read. The Incident RCA's answer key (ADR 0031): NB_DatabaseHub_LiveActivity writes it from each evidence document's own answer-key section, apart from the detection tables; the Insights app's detection, investigation tools, and chat never read it (rca/blind-detection.json).
+table 'RCA Answer Key'
+
+    /// Faults the workload injected (the scoreboard and the tests only).
+    measure 'Injected Faults' = CALCULATE ( COUNTROWS ( 'RCA Answer Key' ), 'RCA Answer Key'[Kind] = "run" )
+        formatString: #,0
+        displayFolder: Answer key
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// run (one injected fault, start to end) or run-event (an event the workload reported about it).
+    column Kind
+        dataType: string
+        sourceColumn: kind
+
+    /// T1 to T5, or T4-replica.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The run's start, or the event's time.
+    column 'Event Time UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: event_time_utc
+
+    /// The run's end.
+    column 'End Time UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: end_time_utc
+
+    /// The scenario ID (scenarios/<id>).
+    column Scenario
+        dataType: string
+        sourceColumn: scenario
+
+    /// The runner's run ID.
+    column 'Scenario Run ID'
+        dataType: string
+        sourceColumn: scenario_run_id
+
+    /// The run's opaque token, which the detection tables carry, so grading can check that a blind finding names the injected run's sessions.
+    column 'Run Token'
+        dataType: string
+        isHidden
+        sourceColumn: run_token
+
+    /// For run-event: the event's name (demo.scenario_run_events).
+    column 'Event Name'
+        dataType: string
+        sourceColumn: event_name
+
+    /// For run: Completed, Stopped, TimedOut, or Failed.
+    column Outcome
+        dataType: string
+        sourceColumn: outcome
+
+    /// The run's parameters, or the event's detail.
+    column Detail
+        dataType: string
+        sourceColumn: detail
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Answer Key' = entity
+        mode: directLake
+        source
+            entityName: rca_answer_key
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'
