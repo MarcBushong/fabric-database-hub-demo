@@ -10,7 +10,7 @@ import { serviceOf } from "@/lib/business";
 import { formatDayUtc, formatTimeUtc } from "@/lib/format";
 import { minutesText, summarize } from "@/lib/scoreboard";
 import { CinematicReplay, type CinematicReplayProps } from "@/mission/CinematicReplay";
-import { enterFullscreen, exitFullscreen, fullscreenAllowed, KIOSK_SCENES, KIOSK_START, kioskReducer, SCENE_LABEL, SCENE_SECONDS } from "@/mission/kiosk";
+import { enterFullscreen, exitFullscreen, fullscreenAllowed, KIOSK_SCENES, KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_LABEL, SCENE_SECONDS } from "@/mission/kiosk";
 import { mapNodes } from "@/mission/nodes";
 import { BigStat } from "@/mission/parts";
 import { ServiceMap } from "@/mission/ServiceMap";
@@ -27,7 +27,7 @@ export default function KioskPage() {
     const [fullscreen, setFullscreen] = useState(() => typeof document !== "undefined" && Boolean(document.fullscreenElement));
     const { plan, scores, episodes, health } = data;
     const summary = useMemo(() => summarize(scores), [scores]);
-    const nodes = useMemo(() => mapNodes(health, scores, episodes), [health, scores, episodes]);
+    const nodes = useMemo(() => mapNodes(health, scores, episodes, data.postgres), [health, scores, episodes, data.postgres]);
 
     useEffect(() => {
         const timer = window.setInterval(() => dispatch({ type: "tick", seconds: 1 }), 1000);
@@ -48,6 +48,14 @@ export default function KioskPage() {
             document.removeEventListener("fullscreenchange", onFullscreen);
         };
     }, []);
+    // A booth screen runs unattended: when any of its history fails to load or refresh, it keeps what it shows and asks again.
+    const failing = Boolean(data.error || data.loadError || data.scoreError);
+    const { refetch } = data;
+    useEffect(() => {
+        if (!failing) return;
+        const timer = window.setInterval(refetch, RETRY_SECONDS * 1000);
+        return () => window.clearInterval(timer);
+    }, [failing, refetch]);
     useEffect(() => {
         if (!state.exit) return;
         exitFullscreen();
@@ -69,9 +77,12 @@ export default function KioskPage() {
                         </li>
                     ))}
                 </ol>
-                <span className="kiosk-status" aria-live="polite">
-                    {state.paused ? "Paused" : `Next scene in ${left} s`}
+                <span className="kiosk-status">{state.paused ? "Paused" : `Next scene in ${left} s`}</span>
+                {/* What a screen reader hears: the scene, and whether the kiosk is paused; never the countdown. */}
+                <span className="sr-only" aria-live="polite">
+                    {`${SCENE_LABEL[scene]}${state.paused ? ", paused" : ""}`}
                 </span>
+                {failing && plan ? <span className="kiosk-hint">{`Some of the history didn't load: trying again every ${RETRY_SECONDS} s`}</span> : null}
                 <Button size="small" appearance="subtle" icon={state.paused ? <Play16Filled /> : <Pause16Filled />} aria-pressed={state.paused} onClick={() => dispatch({ type: "toggle" })}>
                     {state.paused ? "Play" : "Pause"}
                 </Button>
@@ -90,7 +101,15 @@ export default function KioskPage() {
                 <span style={{ width: `${Math.min(100, (state.elapsed / SCENE_SECONDS[scene]) * 100)}%` }} />
             </div>
             <main className={`kiosk-scene kiosk-scene-${scene}`} aria-label={SCENE_LABEL[scene]}>
-                {!plan && !data.loading ? <p className="kiosk-empty">No session in this period yet: Run all in NB_DatabaseHub_Control runs one.</p> : null}
+                {!plan && !data.loading ? (
+                    <p className="kiosk-empty">
+                        {data.missingSession
+                            ? "The session this kiosk was opened for isn't in this period: Esc goes back to Mission Control."
+                            : data.error
+                              ? `The history didn't load (${data.error.message.replace(/\.$/, "")}): the kiosk tries again every ${RETRY_SECONDS} s.`
+                              : "No session in this period yet: Run all in NB_DatabaseHub_Control runs one."}
+                    </p>
+                ) : null}
                 {scene === "mission" ? (
                     <div className="kiosk-mission">
                         <ServiceMap nodes={nodes} lens="business" motion={!reducedMotion} title="ContosoCare's services, in business words" hubLine={plan ? `${plan.label}` : "care network"} />

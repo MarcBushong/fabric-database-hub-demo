@@ -23,7 +23,7 @@ import type { EstateTarget } from "@/lib/view-state";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { enterFullscreen } from "@/mission/kiosk";
 import { mapNodes } from "@/mission/nodes";
-import { BigStat, LensSwitch, PlanPicker } from "@/mission/parts";
+import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import { ServiceMap, type Lens } from "@/mission/ServiceMap";
 import { SessionRibbon } from "@/mission/SessionRibbon";
@@ -49,7 +49,7 @@ export default function MissionControlPage() {
     const [postmortem, setPostmortem] = useState<PostmortemInput | null>(null);
     const { plan, scores, episodes, health } = data;
     const summary = useMemo(() => summarize(scores), [scores]);
-    const nodes = useMemo(() => mapNodes(health, scores, episodes), [health, scores, episodes]);
+    const nodes = useMemo(() => mapNodes(health, scores, episodes, data.postgres), [health, scores, episodes, data.postgres]);
     const shockKeys = useMemo(() => Object.fromEntries(nodes.filter((n) => n.events > 0).map((n) => [n.target, "arrive"])) as Partial<Record<EstateTarget, string>>, [nodes]);
     const hubUrl = hubUrlOf(runtime);
     const t5 = episodes.filter((e) => e.target === "T5");
@@ -131,6 +131,7 @@ export default function MissionControlPage() {
                         </MessageBarBody>
                     </MessageBar>
                 ) : null}
+                <LoadNotice error={data.loadError} onRetry={data.refetch} />
                 <div className="mc-main">
                     <div className="mc-map-wrap">
                         <ServiceMap
@@ -144,11 +145,11 @@ export default function MissionControlPage() {
                         />
                     </div>
                     <aside className="mc-side" aria-label="The session in numbers">
-                        <BigStat label="Faults injected" value={plan ? String(summary.faults) : "–"} sub={plan ? "by the session's plan (Scenario Runs)" : "no session in this period"} />
+                        <BigStat label="Faults injected" value={plan ? String(plan.faults.length) : "–"} sub={plan ? "by the session's plan (Scenario Runs)" : "no session in this period"} />
                         <BigStat
                             label="Signal visible in telemetry"
                             value={plan && summary.faults ? `${summary.visible} of ${summary.faults}` : "–"}
-                            sub={summary.notVisible ? `${summary.notVisible} not visible: see the scoreboard` : "by the telemetry's sample time"}
+                            sub={data.scoreError ? "The telemetry didn't load, so nothing is measured" : summary.notVisible ? `${summary.notVisible} not visible: see the scoreboard` : "by the telemetry's sample time"}
                             tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined}
                         />
                         <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
@@ -168,6 +169,8 @@ export default function MissionControlPage() {
                 </div>
                 {plan ? (
                     <SessionRibbon plan={plan} scores={scores} episodes={episodes} onSelect={() => navigate("scoreboard", { session: plan.key })} />
+                ) : data.missingSession ? (
+                    <MissingSession session={data.missingSession} onAllHistory={() => setView({ window: "all" })} onLatest={() => setView({ session: null, replay: null })} />
                 ) : !data.loading ? (
                     <EmptyState title={data.error ? "The sessions couldn't load" : "No session in this period"}>
                         <p>{data.error ? data.error.message : "Run all in NB_DatabaseHub_Control runs a session; its plan lands here when it ends. Or pick All history above."}</p>

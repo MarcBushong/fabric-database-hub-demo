@@ -10,6 +10,8 @@ export const SCENE_LABEL: Record<KioskScene, string> = { mission: "Mission Contr
 
 /** How long each scene shows, in seconds: the replay plays the session through. */
 export const SCENE_SECONDS: Record<KioskScene, number> = { mission: 20, scoreboard: 20, replay: 45 };
+/** How often a kiosk whose history didn't load (or didn't refresh) asks again, while it keeps showing what it had. */
+export const RETRY_SECONDS = 30;
 
 export interface KioskState {
     scene: KioskScene;

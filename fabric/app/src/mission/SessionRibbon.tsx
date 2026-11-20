@@ -103,7 +103,7 @@ export function SessionRibbon(props: RibbonProps) {
     return (
         <div className="rb" role="group" aria-label={`The plan of ${props.plan.label}, ${formatTimeUtc(props.plan.start)} to ${formatTimeUtc(props.plan.end)} UTC`}>
             {now ? (
-                <p className="rb-countdown" aria-live="polite">
+                <p className="rb-countdown">
                     <span className="rb-now">{formatTimeUtc(now)} UTC</span>
                     {next ? (
                         <span>

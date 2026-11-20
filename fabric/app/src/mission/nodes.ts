@@ -1,7 +1,10 @@
 // The service map's nodes from the history: each target's health (the same as Overview's), its key number for the
 // technical lens, and, for the business lens, the session's most lasting measured impact on its service.
 
+import { POSTGRES_METRICS, postgresPeak, postgresSeries, replicaCatchUp, type PostgresCapture } from "@/data/model";
 import type { TargetHealth } from "@/lib/health";
+import { REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
+import type { StatusName } from "@/lib/status";
 import { stateAt, type FaultScore, type MeasuredEpisode } from "@/lib/scoreboard";
 import type { Impact } from "@/lib/business";
 import type { EstateTarget } from "@/lib/view-state";
@@ -28,7 +31,16 @@ export function impactLine(impact: Impact | null): string | null {
     return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-export function mapNodes(health: readonly TargetHealth[], scores: readonly FaultScore[], episodes: readonly MeasuredEpisode[], at: Date | null = null): MapNode[] {
+/** The DR copy's status from the capture: its read replica lag's peak (its catch-up after a restart left out) against 60 s; null, No data, without a lag series. */
+export function replicaStatus(capture: PostgresCapture | null): StatusName | null {
+    const lag = capture ? postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag) : [];
+    const caught = new Set(replicaCatchUp(capture, lag));
+    const peak = postgresPeak(lag.filter((p) => !caught.has(p)));
+    if (!peak) return null;
+    return peak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass";
+}
+
+export function mapNodes(health: readonly TargetHealth[], scores: readonly FaultScore[], episodes: readonly MeasuredEpisode[], postgres: PostgresCapture | null, at: Date | null = null): MapNode[] {
     const nodes: MapNode[] = [];
     for (const h of health) {
         const target = h.key;
@@ -49,7 +61,7 @@ export function mapNodes(health: readonly TargetHealth[], scores: readonly Fault
             const lagMetric = h.metrics.find((m) => m.label === "Replica lag");
             nodes.push({
                 target: "T4-replica",
-                status: replicaEpisodes.length > 0 ? "Warning" : "Pass",
+                status: replicaStatus(postgres),
                 state: at ? stateAt(scores, episodes, "T4-replica", at) : undefined,
                 metric: lagMetric ? `Replica lag ${lagMetric.value}` : "Replica lag",
                 impact: impactLine(lag),

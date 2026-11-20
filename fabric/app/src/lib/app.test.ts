@@ -14,7 +14,7 @@ import { describeRequest, notebookParameters, validateRequest } from "@/lib/cont
 import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
-import { DEFAULT_VIEW, mergeView, parseHash, toHash } from "@/lib/view-state";
+import { DEFAULT_VIEW, mergeView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
 import { APP_TOKENS, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
 import { APP_BRAND, CONTOSOCARE_BRAND } from "@/theme/identity";
 import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
@@ -119,6 +119,23 @@ describe("view state", () => {
         expect(mergeView(parseHash(toHash(moment)))).toEqual(moment);
         expect(parseHash("#/kiosk")).toEqual({ page: "kiosk" });
         expect(parseHash("#/scoreboard?s=<script>").session).toBeUndefined();
+    });
+
+    it("keeps the view in memory when the browser refuses another address change (WebKit, past 100 in 10 seconds)", () => {
+        const refusing = {
+            location: { hash: "#/replay?r=1" },
+            history: {
+                replaceState: vi.fn(() => {
+                    throw new DOMException("Attempt to use history.replaceState() more than 100 times per 10 seconds", "SecurityError");
+                }),
+            },
+        };
+        expect(() => replaceAddress("#/replay?r=2", refusing as unknown as Pick<Window, "location" | "history">)).not.toThrow();
+        const browser = { location: { hash: "#/replay?r=1" }, history: { replaceState: vi.fn() } };
+        replaceAddress("#/replay?r=2", browser as unknown as Pick<Window, "location" | "history">);
+        replaceAddress("#/replay?r=1", browser as unknown as Pick<Window, "location" | "history">);
+        expect(browser.history.replaceState).toHaveBeenCalledTimes(1);
+        expect(browser.history.replaceState).toHaveBeenCalledWith(null, "", "#/replay?r=2");
     });
 
     it("opens a Findings category from the address, and drops an unknown one", () => {

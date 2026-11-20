@@ -20,7 +20,7 @@ import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/
 import { aggregate, boundText, minutesText, RECOVERED_BINS, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { ChartView } from "@/visuals/ChartView";
-import { BigStat, LensSwitch, PlanPicker } from "@/mission/parts";
+import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import type { Lens } from "@/mission/ServiceMap";
 import { SessionRibbon } from "@/mission/SessionRibbon";
@@ -161,11 +161,12 @@ export default function ScoreboardPage() {
                     <PlanPicker id="sb-plan" plans={data.plans} value={plan?.key ?? null} onChange={(key) => setView({ session: key, replay: null })} />
                     <GlobalFilter />
                 </div>
+                <LoadNotice error={data.loadError} onRetry={data.refetch} />
                 {plan ? (
                     <>
                         <div className="sb-stats" aria-label="The session in numbers">
-                            <BigStat label="Faults injected" value={String(summary.faults)} sub="by the plan (Scenario Runs)" />
-                            <BigStat label="Caught: signal visible" value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"} sub="in the telemetry, by sample time" tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined} />
+                            <BigStat label="Faults injected" value={String(plan.faults.length)} sub="by the plan (Scenario Runs)" />
+                            <BigStat label="Caught: signal visible" value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"} sub={data.scoreError ? "the telemetry didn't load, so nothing is measured" : "in the telemetry, by sample time"} tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined} />
                             <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
                             <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} sub="injected → back under its bound" />
                             <BigStat label="Answered" value={String(summary.answered)} sub={summary.answered ? "a response step: the Database Agent loop, or a reset" : "every fault ended at its time limit"} />
@@ -179,6 +180,8 @@ export default function ScoreboardPage() {
                             </p>
                         ) : null}
                     </>
+                ) : data.missingSession ? (
+                    <MissingSession session={data.missingSession} onAllHistory={() => setView({ window: "all" })} onLatest={() => setView({ session: null, replay: null })} />
                 ) : !data.loading ? (
                     <EmptyState title={data.error ? "The sessions couldn't load" : "Nothing injected in this period"}>
                         <p>{data.error ? data.error.message : "Run all in NB_DatabaseHub_Control runs a session; its plan, the faults it injects, lands in the history when it ends. Or pick All history."}</p>
@@ -194,6 +197,8 @@ export default function ScoreboardPage() {
                     subtitle={`${plan.label}: what was injected, when its signal showed, the response, and the recovery. ${lens === "business" ? "The business lens says what each service felt, next to the measured signal." : "Each row says how its signal was measured."}`}
                     specs={data.specs}
                     loading={data.loading && rows.length === 0}
+                    error={data.scoreError}
+                    onRefresh={data.refetch}
                     empty={!data.loading && rows.length === 0}
                     emptyText="This session injected no fault on the targets in the filter."
                     table={{ columns: POSTMORTEM_COLUMNS, rows: csvRows, caption: "Every injected fault" }}

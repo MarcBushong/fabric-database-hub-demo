@@ -7,6 +7,7 @@ import type { AgentBeat, Bin, CosmosCapture, PostgresCapture, SessionRun } from 
 import type { Row } from "@/data/query-client";
 import { sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
+import { postgresHealth } from "@/lib/health";
 import { buildPostmortem, postmortemAsk, postmortemFileName } from "@/lib/postmortem";
 import {
     aggregate,
@@ -23,6 +24,7 @@ import {
     type FaultScore,
 } from "@/lib/scoreboard";
 import { ESTATE_TARGETS } from "@/lib/view-state";
+import { mapNodes } from "@/mission/nodes";
 
 const T0 = Date.UTC(2026, 10, 17, 13, 30);
 const at = (minute: number) => new Date(T0 + minute * 60000);
@@ -310,6 +312,25 @@ describe("the scoreboard", () => {
     });
 });
 
+describe("the service map's nodes", () => {
+    it("gives the DR copy its status from the capture's read replica lag, and No data without a lag series", () => {
+        const capture = (lag: number[]): PostgresCapture => ({
+            capturedAt: at(40),
+            windowStart: at(0),
+            windowEnd: at(25),
+            intervalMinutes: 5,
+            servers: {},
+            points: [
+                ...[30, 40, 35, 30, 30].map((value, i) => ({ at: at(i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value })),
+                ...lag.map((value, i) => ({ at: at(i * 5), target: "T4-replica" as const, server: "pgreplica01-test", metric: "physical_replication_delay_in_seconds", value })),
+            ],
+        });
+        const dr = (pg: PostgresCapture) => mapNodes([postgresHealth(pg, [])], [], [], pg).find((n) => n.target === "T4-replica");
+        expect(dr(capture([]))?.status).toBeNull();
+        expect(dr(capture([6, 241.4, 80, 30, 2]))?.status).toBe("Warning");
+        expect(dr(capture([2, 3, 4, 3, 2]))?.status).toBe("Pass");
+    });
+});
 describe("the postmortem", () => {
     const plan = toPlans(RUNS)[0];
     const input = {

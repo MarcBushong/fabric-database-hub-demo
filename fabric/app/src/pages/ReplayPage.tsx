@@ -1,7 +1,7 @@
 // Session replay (ADR 0030): play a whole session back across every engine, with the service map, the five engines'
 // charts, and the event ribbon on one scrubber. The moment is kept in the app's address (#/replay?s=<session>&r=<minute>).
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@fluentui/react-components";
 import { DocumentText16Regular, HeartPulse20Regular, Trophy20Regular } from "@fluentui/react-icons";
 
@@ -14,11 +14,11 @@ import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { copyText } from "@/lib/clipboard";
 import { formatTimeUtc } from "@/lib/format";
-import { isEmbedded } from "@/lib/view-state";
+import { isEmbedded, toHash } from "@/lib/view-state";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { EVENT_LABEL, planEvents } from "@/lib/scoreboard";
 import { CinematicReplay } from "@/mission/CinematicReplay";
-import { LensSwitch, PlanPicker } from "@/mission/parts";
+import { LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import type { Lens } from "@/mission/ServiceMap";
 import { Stage } from "@/mission/Stage";
@@ -30,6 +30,12 @@ import "@/mission/mission.css";
 // Inside Fabric's frame the address is the app's hosted URL, which opens only from the app's item (a preview limit), so
 // the toast says how the moment comes back instead of promising the link opens it.
 const COPIED_IN_FABRIC = "Copied this moment's address. In Fabric, the app opens from its item, and this browser reopens it where you leave it.";
+
+/**
+ * How long the replay's moment holds before the address takes it. Playback (a step every 700 ms or less) and a drag never
+ * write it, a pause or a seek writes it once: WebKit refuses more than 100 address changes in 10 seconds.
+ */
+const ADDRESS_DELAY_MS = 1000;
 
 interface EventRow extends Record<string, unknown> {
     at: Date;
@@ -58,7 +64,23 @@ export default function ReplayPage() {
     const [lens, setLens] = useState<Lens>("technical");
     const [postmortem, setPostmortem] = useState<PostmortemInput | null>(null);
     const { plan, scores, episodes } = data;
-    const onMinute = useCallback((minute: number) => setView({ replay: minute, session: plan?.key ?? null }), [setView, plan]);
+    const planKey = plan?.key ?? null;
+    // The moment the viewer moved the replay to, for this session; until then, the address's (a session without one starts at its start).
+    const [moment, setMoment] = useState<{ key: string | null; minute: number } | null>(null);
+    const minute = moment && moment.key === planKey ? moment.minute : view.session === null || view.session === planKey ? view.replay : null;
+    const onMinute = useCallback((next: number) => setMoment({ key: planKey, minute: next }), [planKey]);
+    useEffect(() => {
+        if (!moment || moment.key !== planKey || (moment.minute === view.replay && view.session === planKey)) return;
+        const timer = window.setTimeout(() => setView({ replay: moment.minute, session: planKey }), ADDRESS_DELAY_MS);
+        return () => window.clearTimeout(timer);
+    }, [moment, planKey, view.replay, view.session, setView]);
+    const copyLink = async () => {
+        // The address takes the moment now, and the copied link carries it, whatever the delay above.
+        setView({ replay: minute, session: planKey });
+        const url = new URL(window.location.href);
+        url.hash = toHash({ ...view, replay: minute, session: planKey });
+        notify((await copyText(url.toString())) ? (isEmbedded() ? COPIED_IN_FABRIC : "Copied the link to this moment: it opens the replay here") : "Copy is blocked here: the moment is in this app's address", "info");
+    };
     const rows: EventRow[] = useMemo(() => planEvents(scores, episodes).map((e) => ({ at: e.at, target: e.target, event: EVENT_LABEL[e.kind], detail: e.label })), [scores, episodes]);
     const rangeFrom = useMemo(() => (plan ? ribbonRange(plan, scores, episodes)[0] : 0), [plan, scores, episodes]);
 
@@ -95,6 +117,7 @@ export default function ReplayPage() {
                 <div className="mc-filter">
                     <PlanPicker id="replay-plan" plans={data.plans} value={plan?.key ?? null} onChange={(key) => setView({ session: key, replay: null })} />
                 </div>
+                <LoadNotice error={data.loadError} onRetry={data.refetch} />
                 {plan ? (
                     <CinematicReplay
                         plan={plan}
@@ -104,12 +127,14 @@ export default function ReplayPage() {
                         cosmos={data.cosmos}
                         postgres={data.postgres}
                         health={data.health}
-                        minute={view.replay}
+                        minute={minute}
                         onMinute={onMinute}
                         lens={lens}
                         motion={!reducedMotion}
-                        onCopyLink={async () => notify((await copyText(window.location.href)) ? (isEmbedded() ? COPIED_IN_FABRIC : "Copied the link to this moment: it opens the replay here") : "Copy is blocked here: the moment is in this app's address", "info")}
+                        onCopyLink={copyLink}
                     />
+                ) : data.missingSession ? (
+                    <MissingSession session={data.missingSession} onAllHistory={() => setView({ window: "all" })} onLatest={() => setView({ session: null, replay: null })} />
                 ) : !data.loading ? (
                     <EmptyState title={data.error ? "The sessions couldn't load" : "No session to replay in this period"}>
                         <p>{data.error ? data.error.message : "Run all in NB_DatabaseHub_Control runs a session; its plan lands in the history when it ends."}</p>
@@ -124,6 +149,8 @@ export default function ReplayPage() {
                 subtitle="Injected, signal visible in telemetry, answered, and recovered, in time order. Select one to move the replay there."
                 specs={data.specs}
                 loading={data.loading && rows.length === 0}
+                error={data.scoreError}
+                onRefresh={data.refetch}
                 empty={!data.loading && rows.length === 0}
                 emptyText="No moment in this session."
                 table={{ columns: EVENT_SPEC_COLUMNS, rows, caption: "The session's moments" }}

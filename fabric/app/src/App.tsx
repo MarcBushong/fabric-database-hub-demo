@@ -11,7 +11,7 @@ import { useAuth } from "./hooks/auth.context";
 import { sqlTargets } from "./lib/estate";
 import { useMediaQuery } from "./lib/hooks";
 import type { AppRuntime } from "./lib/runtime-config";
-import { isEmbedded, loadSavedView, mergeView, parseHash, saveView, toHash, windowRange, type PageId, type ViewState } from "./lib/view-state";
+import { isEmbedded, loadSavedView, mergeView, parseHash, replaceAddress, saveView, toHash, windowRange, type PageId, type ViewState } from "./lib/view-state";
 import { AppShell } from "./shell/AppShell";
 
 const MissionControlPage = lazy(() => import("./pages/MissionControlPage"));
@@ -118,8 +118,7 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
     useEffect(() => {
         // Keep the view in the frame's hash (it survives a reload) and remember it per browser; never add history
         // entries, because inside the portal the frame shares the portal's back button.
-        const hash = toHash(view);
-        if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
+        replaceAddress(toHash(view));
         saveView(window.localStorage, view);
     }, [view]);
 

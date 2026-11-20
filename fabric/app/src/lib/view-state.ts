@@ -184,3 +184,15 @@ export function isEmbedded(win: Window = window): boolean {
         return true;
     }
 }
+
+/**
+ * Puts the view in the frame's address without a history entry. A browser can refuse: WebKit throws a SecurityError
+ * after 100 calls in 10 seconds. The view then stays in memory and in storage, and the next change writes it again.
+ */
+export function replaceAddress(hash: string, win: Pick<Window, "location" | "history"> = window): void {
+    try {
+        if (win.location.hash !== hash) win.history.replaceState(null, "", hash);
+    } catch {
+        // Kept in memory; never an error for the viewer.
+    }
+}

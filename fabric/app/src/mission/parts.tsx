@@ -1,9 +1,10 @@
-// Small parts the Wave 1 pages share: the broadcast-style numbers, the lens switch, the session picker, and a preview of
-// the postmortem's own Markdown.
+// Small parts the Wave 1 pages share: the broadcast-style numbers, the lens switch, the session picker, a preview of the
+// postmortem's own Markdown, and what a page says when part of its history didn't load or its session isn't in the period.
 
 import { Fragment, type ReactNode } from "react";
-import { Select, ToggleButton } from "@fluentui/react-components";
+import { Button, MessageBar, MessageBarActions, MessageBarBody, Select, ToggleButton } from "@fluentui/react-components";
 
+import { EmptyState } from "@/components/EmptyState";
 import type { Plan } from "@/lib/scoreboard";
 import type { Lens } from "./ServiceMap";
 import { planOption } from "./timeline";
@@ -133,4 +134,41 @@ export function MarkdownView({ markdown }: { markdown: string }) {
         }
     }
     return <div className="pm-view">{out}</div>;
+}
+
+/** Part of the page's history didn't load: which queries, and why, beside what the page still shows. */
+export function LoadNotice({ error, onRetry }: { error: Error | null; onRetry: () => void }) {
+    if (!error) return null;
+    return (
+        <MessageBar intent="warning" className="mc-notice" layout="multiline">
+            <MessageBarBody>{error.message}</MessageBarBody>
+            <MessageBarActions>
+                <Button size="small" onClick={onRetry}>
+                    Retry
+                </Button>
+            </MessageBarActions>
+        </MessageBar>
+    );
+}
+
+/** The address asks for a session the period's history doesn't have: say so, rather than show another session in its place. */
+export function MissingSession({ session, onAllHistory, onLatest }: { session: string; onAllHistory: () => void; onLatest: () => void }) {
+    const id = session.startsWith("session:") ? session.slice("session:".length, "session:".length + 8) : session.slice(0, 24);
+    return (
+        <EmptyState
+            title={`Session ${id} isn't in this period`}
+            actions={
+                <>
+                    <Button size="small" appearance="primary" onClick={onAllHistory}>
+                        Show all history
+                    </Button>
+                    <Button size="small" onClick={onLatest}>
+                        Show the latest session
+                    </Button>
+                </>
+            }
+        >
+            <p>The link asks for a session that the history doesn't have in the period picked: pick All history, or show the latest session.</p>
+        </EmptyState>
+    );
 }

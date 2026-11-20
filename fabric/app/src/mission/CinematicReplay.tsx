@@ -156,6 +156,9 @@ function EngineLane({ lane, from, to, now, width }: { lane: Lane; from: number; 
     );
 }
 
+/** Each moment's mark and word, as the ribbon draws it. */
+const EVENT_WORD = { injected: "▼ Injected", visible: "● Signal visible", answered: "◆ Answered", recovered: "✓ Recovered" } as const;
+
 export interface CinematicReplayProps {
     plan: Plan;
     scores: readonly FaultScore[];
@@ -190,7 +193,7 @@ export function CinematicReplay(props: CinematicReplayProps) {
     const [ref, size] = useElementSize<HTMLDivElement>(700);
     const events = useMemo(() => planEvents(scores, episodes), [scores, episodes]);
     const lanes = useMemo(() => lanesOf(props.bins, scores, episodes, props.cosmos, props.postgres, from, to), [props.bins, scores, episodes, props.cosmos, props.postgres, from, to]);
-    const nodes = useMemo(() => mapNodes(props.health, scores, episodes, new Date(now)), [props.health, scores, episodes, now]);
+    const nodes = useMemo(() => mapNodes(props.health, scores, episodes, props.postgres, new Date(now)), [props.health, scores, episodes, props.postgres, now]);
     // A shockwave on each target whose signal showed in the last 4 minutes of the replay, keyed by that moment, so crossing
     // a new one plays it again.
     const shockKeys = useMemo(() => {
@@ -212,6 +215,16 @@ export function CinematicReplay(props: CinematicReplayProps) {
         return () => window.clearTimeout(timer);
     }, [playing, props.paused, position, total, speed, onMinute, props.loop]);
 
+    // What a screen reader hears: play, pause, and each seek to a moment, never each step of the playback.
+    const [said, setSaid] = useState("");
+    const momentText = (t: number) => {
+        const e = [...events].reverse().find((x) => x.at.getTime() <= t);
+        return e ? `${EVENT_WORD[e.kind]} at ${formatTimeUtc(e.at)}: ${e.label}` : "Before the first fault";
+    };
+    const seek = (minute: number) => {
+        onMinute(minute);
+        setSaid(`${formatTimeUtc(new Date(from + minute * MIN))} UTC. ${momentText(from + minute * MIN)}`);
+    };
     const nextEvent = events.find((e) => e.at.getTime() > now + 1);
     const previousEvent = [...events].reverse().find((e) => e.at.getTime() < now - 1);
     const toMinute = (t: number) => Math.min(total, Math.max(0, Math.round((t - from) / MIN)));
@@ -224,12 +237,13 @@ export function CinematicReplay(props: CinematicReplayProps) {
                     <span className="cr-time">{formatTimeUtc(new Date(now))}</span>
                     <span className="cr-utc">UTC</span>
                 </div>
-                <p className="cr-moment" aria-live="polite">
-                    {current ? `${current.kind === "injected" ? "▼ Injected" : current.kind === "visible" ? "● Signal visible" : current.kind === "answered" ? "◆ Answered" : "✓ Recovered"} at ${formatTimeUtc(current.at)}: ${current.label}` : "Before the first fault"}
+                <p className="cr-moment">{momentText(now)}</p>
+                <p className="sr-only" aria-live="polite">
+                    {said}
                 </p>
                 <div className="cr-controls" role="group" aria-label="Replay">
                     <Tooltip content="The previous moment" relationship="label">
-                        <Button size="small" appearance="subtle" icon={<Previous16Regular />} disabled={!previousEvent} onClick={() => previousEvent && onMinute(toMinute(previousEvent.at.getTime()))} />
+                        <Button size="small" appearance="subtle" icon={<Previous16Regular />} disabled={!previousEvent} onClick={() => previousEvent && seek(toMinute(previousEvent.at.getTime()))} />
                     </Tooltip>
                     <Button
                         size="small"
@@ -238,13 +252,14 @@ export function CinematicReplay(props: CinematicReplayProps) {
                         aria-pressed={playing}
                         onClick={() => {
                             if (!playing && position >= total) onMinute(0);
+                            setSaid(playing ? `Paused at ${formatTimeUtc(new Date(now))} UTC.` : `Playing at ${speed}×.`);
                             setPlaying((p) => !p);
                         }}
                     >
                         {playing ? "Pause" : "Play"}
                     </Button>
                     <Tooltip content="The next moment" relationship="label">
-                        <Button size="small" appearance="subtle" icon={<Next16Regular />} disabled={!nextEvent} onClick={() => nextEvent && onMinute(toMinute(nextEvent.at.getTime()))} />
+                        <Button size="small" appearance="subtle" icon={<Next16Regular />} disabled={!nextEvent} onClick={() => nextEvent && seek(toMinute(nextEvent.at.getTime()))} />
                     </Tooltip>
                     <span className="period" role="group" aria-label="Speed">
                         {SPEEDS.map((s) => (
@@ -286,8 +301,8 @@ export function CinematicReplay(props: CinematicReplayProps) {
             </div>
             <SessionRibbon plan={plan} scores={scores} episodes={episodes} now={new Date(now)} onSelect={(ref) => {
                 const e = events.find((x) => x.ref === ref);
-                if (e) onMinute(toMinute(e.at.getTime()));
-            }} onSeek={(at) => onMinute(toMinute(at.getTime()))} />
+                if (e) seek(toMinute(e.at.getTime()));
+            }} onSeek={(at) => seek(toMinute(at.getTime()))} />
         </div>
     );
 }

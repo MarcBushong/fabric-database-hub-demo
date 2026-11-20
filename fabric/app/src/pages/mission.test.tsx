@@ -5,8 +5,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it, vi } from "vitest";
 
 import type { QuerySpec } from "@/data/queries";
-import type { QueryResult } from "@/data/query-client";
-import { KIOSK_START, kioskReducer, SCENE_SECONDS } from "@/mission/kiosk";
+import { createSourceClient, type QueryResult } from "@/data/query-client";
+import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/mission/kiosk";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
 import { sampleRows } from "@/preview/sample-data";
 import { SESSION_KEY } from "@/preview/sample-session";
@@ -18,8 +18,8 @@ import ScoreboardPage from "./ScoreboardPage";
 
 const SLOW = 30000;
 
-/** The preview's sample, with its latest session, answering every query by its ID and parameters. */
-function sampleClient(): FakeQueryClient {
+/** The preview's sample, with its latest session, answering every query by its ID and parameters; `failing` queries throw. */
+function sampleClient(failing: Record<string, string> = {}): FakeQueryClient {
     const ran: string[] = [];
     return {
         ran,
@@ -27,6 +27,7 @@ function sampleClient(): FakeQueryClient {
         clear: () => undefined,
         run: vi.fn(async (spec: QuerySpec): Promise<QueryResult> => {
             ran.push(spec.id);
+            if (failing[spec.id]) throw new Error(failing[spec.id]);
             return { spec, columns: spec.columns, rows: sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
         }),
     };
@@ -90,6 +91,46 @@ describe("Mission Control", () => {
         },
         SLOW,
     );
+
+    it(
+        "names the history that didn't load, and measures nothing rather than reading every fault as not visible",
+        async () => {
+            const client = sampleClient({
+                "signals-per-bin": "The query returned more rows than the app allows: pick a shorter period.",
+                "spotlight-T1": "The model didn't answer.",
+                "agent-loop": "The model didn't answer.",
+            });
+            renderWithApp(<MissionControlPage />, { client });
+            await screen.findByRole("heading", { level: 1, name: /^Session 7f3a9c21/ });
+            const numbers = await screen.findByRole("complementary", { name: "The session in numbers" });
+            await waitFor(() => expect(within(numbers).getByText("The telemetry didn't load, so nothing is measured")).toBeInTheDocument());
+            // The plan is in Scenario Runs: its 35 faults stand; what wasn't measured isn't "0 of 35".
+            expect(within(numbers).getByText("35")).toBeInTheDocument();
+            expect(within(numbers).queryByText(/^\d+ of 35$/)).toBeNull();
+            const notice = await screen.findByText(/^Some of the history didn't load, so this view may be incomplete: /);
+            expect(notice.textContent).toContain("Signals per bin and target (The query returned more rows than the app allows: pick a shorter period)");
+            expect(notice.textContent).toContain("Waits before and during: T1 (The model didn't answer)");
+            expect(notice.textContent).toContain("Database Agent loop on T3 (The model didn't answer)");
+            const runs = vi.mocked(client.run).mock.calls.length;
+            fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+            await waitFor(() => expect(vi.mocked(client.run).mock.calls.length).toBeGreaterThanOrEqual(runs + 3));
+        },
+        SLOW,
+    );
+
+    it(
+        "says when the session the address asks for isn't in this period, rather than showing another in its place",
+        async () => {
+            const { setView } = renderWithApp(<MissionControlPage />, { client: sampleClient(), view: { session: "session:gone" } });
+            expect(await screen.findByText("Session gone isn't in this period")).toBeInTheDocument();
+            expect(screen.queryByRole("heading", { level: 1, name: /^Session 7f3a9c21/ })).toBeNull();
+            fireEvent.click(screen.getByRole("button", { name: "Show the latest session" }));
+            expect(setView).toHaveBeenCalledWith({ session: null, replay: null });
+            fireEvent.click(screen.getByRole("button", { name: "Show all history" }));
+            expect(setView).toHaveBeenCalledWith({ window: "all" });
+        },
+        SLOW,
+    );
 });
 
 describe("the service map", () => {
@@ -130,6 +171,18 @@ describe("Scoreboard", () => {
         },
         SLOW,
     );
+
+    it(
+        "shows the telemetry's failure in its faults card, not a count of faults it couldn't read",
+        async () => {
+            renderWithApp(<ScoreboardPage />, { client: sampleClient({ "signals-per-bin": "The query returned more rows than the app allows: pick a shorter period." }) });
+            expect(await screen.findByRole("heading", { level: 1, name: "Did we catch it?" }, { timeout: 15000 })).toBeInTheDocument();
+            const alert = await screen.findByText("The query returned more rows than the app allows: pick a shorter period.", { selector: ".vcard-error span" });
+            expect(alert.closest('[role="alert"]')).not.toBeNull();
+            expect(screen.queryByRole("table", { name: "Every injected fault" })).toBeNull();
+        },
+        SLOW,
+    );
 });
 
 describe("Session replay", () => {
@@ -141,8 +194,30 @@ describe("Session replay", () => {
             expect(await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 })).toBeInTheDocument();
             await waitFor(() => expect(screen.getByText("T1 Deep blocking chain and lock escalation", { selector: "strong" }).parentElement?.textContent).toBe("Next: T1 Deep blocking chain and lock escalation in 5 min"));
             expect(screen.getByRole("img", { name: /^Scheduling, T3 Azure SQL Database: Signal visible\./ })).toBeInTheDocument();
+            // The countdown changes with every step of the playback, so it isn't a live region.
+            expect(screen.getByText("T1 Deep blocking chain and lock escalation", { selector: "strong" }).closest("[aria-live]")).toBeNull();
             fireEvent.change(screen.getByRole("slider", { name: "Replay position" }), { target: { value: "36" } });
-            expect(setView).toHaveBeenCalledWith({ replay: 36, session: SESSION_KEY });
+            // The address takes the moment once it holds still, not at every step of a drag.
+            await waitFor(() => expect(setView).toHaveBeenCalledWith({ replay: 36, session: SESSION_KEY }), { timeout: 3000 });
+        },
+        SLOW,
+    );
+
+    it(
+        "plays back without writing the address at each step, writes the moment once paused, and says play and pause to a screen reader",
+        async () => {
+            const { setView, container } = renderWithApp(<ReplayPage />, { client: sampleClient(), view: { page: "replay", replay: 28 } });
+            await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 });
+            const writes = () => setView.mock.calls.filter(([patch]) => "replay" in patch).length;
+            fireEvent.click(screen.getByRole("button", { name: "8×" }));
+            fireEvent.click(screen.getByRole("button", { name: "Play" }));
+            expect(screen.getByText("Playing at 8×.")).toBeInTheDocument();
+            // 10 steps of 87.5 ms each: WebKit refuses more than 100 address changes in 10 seconds.
+            await waitFor(() => expect((container.querySelector(".cr-time")?.textContent ?? "") >= "14:05").toBe(true), { timeout: 5000 });
+            expect(writes()).toBe(0);
+            fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+            expect(screen.getByText(/^Paused at \d\d:\d\d UTC\.$/)).toBeInTheDocument();
+            await waitFor(() => expect(writes()).toBe(1), { timeout: 3000 });
         },
         SLOW,
     );
@@ -173,6 +248,72 @@ describe("Kiosk", () => {
             expect(screen.getByRole("button", { name: "Did we catch it?" })).toHaveAttribute("aria-current", "step");
             fireEvent.keyDown(window, { key: "Escape" });
             await waitFor(() => expect(navigate).toHaveBeenCalledWith("mission", { session: null }));
+        },
+        SLOW,
+    );
+
+    it(
+        "tells a screen reader the scene and whether it's paused, never the countdown",
+        async () => {
+            const { container } = renderWithApp(<KioskPage />, { client: sampleClient(), view: { page: "kiosk" } });
+            const countdown = await screen.findByText(/^Next scene in \d+ s$/);
+            expect(countdown.closest("[aria-live]")).toBeNull();
+            const live = container.querySelector('.kiosk [aria-live="polite"]');
+            expect(live?.textContent).toBe("Mission Control");
+            fireEvent.keyDown(window, { key: "ArrowRight" });
+            expect(live?.textContent).toBe("Did we catch it?");
+            fireEvent.keyDown(window, { key: " " });
+            expect(live?.textContent).toBe("Did we catch it?, paused");
+        },
+        SLOW,
+    );
+
+    it(
+        "keeps its session on screen when its history expires and a refresh fails, and asks again on its own",
+        async () => {
+            vi.useFakeTimers({ shouldAdvanceTime: true });
+            try {
+                let now = Date.UTC(2026, 10, 17, 21);
+                let refusing = false;
+                let gate: Promise<void> | null = null;
+                let openGate: () => void = () => undefined;
+                const fetch = vi.fn(async (spec: QuerySpec) => {
+                    if (gate) await gate;
+                    if (refusing) throw new Error("The semantic model didn't answer.");
+                    return { rows: sampleRows(spec), requestId: "sample" };
+                });
+                const client = Object.assign(createSourceClient([{ provenance: "sample", answers: () => true, fetch }], { now: () => now }), { ran: [] as string[] });
+                const first = renderWithApp(<KioskPage />, { client, view: { page: "kiosk" } });
+                expect(await screen.findByText("34 of 35", {}, { timeout: 15000 })).toBeInTheDocument();
+                first.unmount();
+                // A kiosk opened later reads the same history from the cache, as one opened from Mission Control does.
+                renderWithApp(<KioskPage />, { client, view: { page: "kiosk" } });
+                expect(await screen.findByText("34 of 35", {}, { timeout: 15000 })).toBeInTheDocument();
+                // The cache's five minutes pass: the kiosk's next tick refreshes its history, which takes a while, then fails.
+                refusing = true;
+                gate = new Promise<void>((resolve) => {
+                    openGate = () => resolve();
+                });
+                now += 6 * 60000;
+                const before = fetch.mock.calls.length;
+                await vi.advanceTimersByTimeAsync(1000);
+                await waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThan(before));
+                // While the refresh runs, the kiosk keeps what it had, on whichever scene it's on.
+                expect(screen.getByText(/34 of 35$/)).toBeInTheDocument();
+                openGate();
+                gate = null;
+                expect(await screen.findByText(`Some of the history didn't load: trying again every ${RETRY_SECONDS} s`)).toBeInTheDocument();
+                // That note shows only with a session on screen: the kiosk kept its last history, rather than going blank.
+                expect(screen.queryByText(/^No session in this period yet/)).toBeNull();
+                // The model answers again: the kiosk's own retry brings it back, with no one at the screen.
+                refusing = false;
+                const failed = fetch.mock.calls.length;
+                await vi.advanceTimersByTimeAsync(RETRY_SECONDS * 1000);
+                await waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThan(failed));
+                await waitFor(() => expect(screen.queryByText(/trying again every/)).toBeNull());
+            } finally {
+                vi.useRealTimers();
+            }
         },
         SLOW,
     );
