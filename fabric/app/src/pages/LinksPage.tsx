@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 
 import { useApp } from "@/app-context";
 import { VisualCard } from "@/components/VisualCard";
+import { liveOffText, useLiveOff } from "@/data/live-estate";
 import { probeQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
@@ -27,6 +28,8 @@ export default function LinksPage() {
     const probeSpec = useMemo(() => probeQuery(), []);
     const probe = useQuery(probeSpec);
     const row = probe.data?.rows[0];
+    // While Database Hub refuses the app as a whole (R924), the pages hide their live parts and this line says why.
+    const liveOff = useLiveOff();
     const itemUrl = appItemUrl(runtime.portalUrl, runtime.workspaceId, runtime.itemId, runtime.tenantId);
     const hub = hubUrlOf(runtime);
     const cards: LinkCard[] = [
@@ -75,6 +78,7 @@ export default function LinksPage() {
     return (
         <div className="page">
             <PageHeader title="Live views" description="This app is the estate's history; the live view is Database Hub and the real-time dashboards. Each link opens in a new tab." filter={false} />
+            {liveOff ? <p className="live-off muted">{liveOffText(liveOff)}</p> : null}
 
             <section className="link-cards span-12" aria-label="Live views">
                 {cards.map((c) => (
