@@ -831,7 +831,9 @@ print(json.dumps(out))
         $out.whole.regress | Should -Be 33
         $out.whole.respond | Should -Be 55.5
         $text = $out.whole.lines -join "`n"
-        $text | Should -Match 'Once per deployment, if it isn''t done yet: Database Hub > Manage agents > Database agent settings: Enabled on, select azuresql01-abc123/ContosoCare, Agent policy: Flag long-running queries, Force last known good plans, and Flag high CPU'
+        $text | Should -Match 'Once per deployment, if it isn''t done yet: Database Hub > Manage agents > Database agent settings: Enabled on, clear the selection, select azuresql01-abc123/ContosoCare, Agent policy: Flag long-running queries, Force last known good plans, and Flag high CPU'
+        # Since 2026-11-20 (live): Database Hub keeps a deleted T3 selected, and a Save fails while any selected database fails its check.
+        $text | Should -Match '\(the account that deployed the demo has it\)\. If Save says "Database agent changes couldn''t be saved", uncheck the databases that no longer exist, are paused, have one vCore, or are outside your Fabric home region, then Save again\.'
         $text | Should -Match '14:33  T3''s lookup regresses to a scanning plan'
         $text | Should -Match '14:48  From about now, the agent''s issue on azuresql01-abc123/ContosoCare, a new one each session'
         $text | Should -Match 'Explain why, then Analyze slow query'
@@ -962,7 +964,7 @@ print(json.dumps(out))
         $report.printed | Should -Match '\[Investigate\] Investigate what happened on sqlvm01 between 14:04 and 14:14 UTC\.'
         $report.printed | Should -Match 'Now: T4 Read replica lag'
         # The Database Agent loop (2026-11-18): the one-time selection in the guide, the response, and the summary's line.
-        $report.printed | Should -Match 'Database Hub > Manage agents > Database agent settings: Enabled on, select azuresql01-abc123/ContosoCare'
+        $report.printed | Should -Match 'Database Hub > Manage agents > Database agent settings: Enabled on, clear the selection, select azuresql01-abc123/ContosoCare'
         $report.printed | Should -Match 'Now: T3 Respond, the Database Agent loop''s manual response'
         $report.printed | Should -Match 'The Database Agent loop: T3''s response ran at 14:59 '
         $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped'
