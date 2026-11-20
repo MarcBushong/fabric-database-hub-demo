@@ -499,6 +499,8 @@ class Files:
         self.removed = []
     def exists(self, path):
         return True
+    def ls(self, path):
+        return []
     def rm(self, path, recurse=False):
         self.removed.append((path, recurse))
         return True
@@ -517,10 +519,11 @@ assert ns["CONFIRM"] is True and ns["PURGE_DEMO_TABLES"] is False, (ns["CONFIRM"
 assert dropped == [] and removed == [], (dropped, removed)
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True)
 assert len(dropped) == 13 and all(text.startswith("DROP TABLE IF EXISTS ") for text in dropped), dropped
-assert removed == [("Files/rca", True)], removed
+assert removed == [("Files/rca/inbox", True), ("Files/rca", False)], removed
 workspace, lakehouse = "-".join(("1" * 8, "2" * 4, "3" * 4, "4" * 4, "5" * 12)), "-".join(("6" * 8, "7" * 4, "8" * 4, "9" * 4, "a" * 12))
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True, WORKSPACE_ID=workspace, LAKEHOUSE_ID=lakehouse)
-assert removed == [("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca" % (workspace, lakehouse), True)], removed
+assert removed == [("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca/inbox" % (workspace, lakehouse), True),
+                   ("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca" % (workspace, lakehouse), False)], removed
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True, CONFIRM=False)
 assert dropped == [] and removed == [], (dropped, removed)
 print("ok")
@@ -1969,6 +1972,12 @@ print(json.dumps(report, default=str))
 
     It 'has one helpers cell for it, which makes no network call and reads no secret' {
         $part4.Count | Should -Be 1
+        # RCA_EVIDENCE_FILE as rca/transport.schema.json's evidenceFile says, read with notebookutils.fs.head and 262144 bytes.
+        $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') -Raw | ConvertFrom-Json -AsHashtable
+        $pattern = $schema['$defs']['evidenceFile']['pattern']
+        $part4[0].Source | Should -Match ('(?m)^RCA_EVIDENCE_FILE_PATTERN = re\.compile\(r"{0}"\)$' -f [regex]::Escape($pattern.TrimStart('^').TrimEnd('$')))
+        $part4[0].Source | Should -Match '"fileBytes": 262144'
+        $part4[0].Source | Should -Match 'utils\.fs\.head\(_rca_path\(RCA_EVIDENCE_FILE\), RCA_LIMITS\["fileBytes"\]\)'
         $part4[0].Source | Should -Not -Match 'requests\.|get_token\(|getToken\(|getSecret\(|KEY_VAULT|vault\.azure\.net'
         foreach ($url in [regex]::Matches($part4[0].Source, 'https://[^\s)"]+')) {
             $url.Value | Should -Match '^https://learn\.microsoft\.com/'
@@ -2285,7 +2294,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         $tables = @([regex]::Matches([regex]::Match($cleanup, '(?s)DEMO_TABLES = \((.*?)\)\n').Groups[1].Value, '"(\w+)"') | ForEach-Object { $_.Groups[1].Value })
         $purge = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purge
         $tables | Should -Be (@('validation_results', 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows') + @($purge))
-        $cleanup | Should -Match 'DEMO_FOLDERS = \("Files/rca",\)'
+        $cleanup | Should -Match ('DEMO_FOLDERS = \("{0}",\)' -f [regex]::Escape(@((Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purgeFiles)[0]))
         $cleanup | Should -Match 'SM_DatabaseHub_History'
         $cleanup | Should -Match 'NB_DatabaseHub_LiveActivity runs with SAVE_RESULTS = True and recreates the tables'
     }

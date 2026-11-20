@@ -249,7 +249,7 @@ Describe 'Get-DemoRcaModelTablePlan (ADR 0031)' {
 
     It 'asks the Azure CLI for a Storage token only, and requests or assigns no role (no new grant)' {
         Set-WebMock @(@{ Method = 'Get'; Match = $script:oneLakeList; Responses = @(New-TableListing $script:rcaNames) })
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoAccessToken -MockWith { [pscustomobject]@{ Token = (ConvertTo-SecureString -String ('tok' + ('s' * 40)) -AsPlainText -Force); Claims = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoAccessToken -MockWith { [pscustomobject]@{ Token = ([System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword); Claims = $null; Error = '' } }
         $config = Get-HubTestConfig
         $plan = Get-DemoRcaModelTablePlan -Config $config -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId
         $plan.Result.status | Should -Be 'Pass'
@@ -515,7 +515,7 @@ Describe 'configure-powerbi.ps1' {
         $pages = $script:pages
         # The lakehouse's tables, which decide whether the model reads the Incident RCA's (ADR 0031): all thirteen here.
         $tables = @{ paths = @(foreach ($table in 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results', 'rca_sessions', 'rca_waits', 'rca_events', 'rca_queries', 'rca_resource', 'rca_replica', 'rca_coverage', 'rca_answer_key') { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { ConvertTo-SecureString -String ('tok' + ('s' * 40)) -AsPlainText -Force }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword }
         # Static, ordered responses only: while configure-powerbi.ps1 runs, "$script:" in a responder would be its scope.
         Set-WebMock @(
             @{ Method = 'Get'; Match = '^https://onelake\.dfs\.fabric\.microsoft\.com/'; Responses = @(New-WebResponse 200 $tables) }
@@ -554,7 +554,7 @@ Describe 'configure-powerbi.ps1' {
         $pages = $script:pages
         # The current release's lakehouse: its five history tables, none of the RCA's. Its model and report exist already.
         $tables = @{ paths = @(foreach ($table in 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results') { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { ConvertTo-SecureString -String ('tok' + ('s' * 40)) -AsPlainText -Force }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword }
         Set-WebMock @(
             @{ Method = 'Get'; Match = '^https://onelake\.dfs\.fabric\.microsoft\.com/'; Responses = @(New-WebResponse 200 $tables) }
             @{ Method = 'Get'; Match = $modelList; Responses = @(New-WebResponse 200 @{ value = @(@{ id = $script:modelId; displayName = 'SM_DatabaseHub_History'; type = 'SemanticModel' }) }) }
