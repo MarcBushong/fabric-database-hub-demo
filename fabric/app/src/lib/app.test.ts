@@ -73,6 +73,15 @@ describe("themes", () => {
         expect(value(rule('.nav-item[aria-current="page"]::before'), "background")).toBe("HighlightText");
     });
 
+    it("marks the kiosk's current scene with the system's selection colors under Windows forced colors, as the current page (F22)", () => {
+        const css = readFileSync(join(process.cwd(), "src", "mission", "mission.css"), "utf8");
+        const forced = css.match(/@media \(forced-colors: active\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+        const body = forced.match(/^\s*\.kiosk-scenes button\[aria-current="step"\]\s*\{([^}]*)\}/m)?.[1] ?? "";
+        const value = (property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`))?.[1]?.trim() ?? "missing";
+        // Its marks on the stage, a border's color and an inset shadow, give way in forced colors: the system's selection colors don't.
+        expect([value("background"), value("color")]).toEqual(["Highlight", "HighlightText"]);
+    });
+
     it("uses Fluent 2's Microsoft blue as the brand, not Fabric's teal, from one set of tokens (ADR 0030, the owner's choice)", () => {
         expect(APP_BRAND).toBe(MICROSOFT_BRAND);
         // The same ramp Fluent's own web themes are made from: their brand tokens come out the same.
