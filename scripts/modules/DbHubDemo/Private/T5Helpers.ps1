@@ -1321,6 +1321,112 @@ function Get-DemoT5LifecycleResult {
     return (New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $said.Status -Message $said.Text -Evidence $evidence -Remediation $said.Fix -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['provisionThroughput']))
 }
 
+function Invoke-DemoT5LifecycleRecheck {
+    <#
+    .SYNOPSIS
+    DEPLOY.T5.LIFECYCLE once more at a deploy.ps1 run's end (2026-11-19, F14), when its first check didn't see the session
+    control's role that this run's grant reports in place. Returns the new result, or $null when it isn't checked again.
+    Internal.
+
+    .DESCRIPTION
+    The run checks T5's container lifecycle right after the session control's Azure part (Update-DemoT5ContainerLifecycle),
+    whose last step grants the control's roles, and a role assignment that was just created can be missing from a read for
+    a while. So on a new environment the status page's T5.Lifecycle row said the session control had no role yet and Run all
+    couldn't start a session, while the Control row said Run all was ready (live, 2026-11-19, two new environments). Once
+    the control is done, when this run's CONTROL.ROLE.A1 is a Pass (the role is assigned at the demo resource group) and the
+    first check found no role (NoRole), couldn't read it (Unknown, or no mode), or found it without the container's actions
+    although this run's CONTROL.ROLE.DEFINITION is a Pass (Lacking), it checks again with Update-DemoT5ContainerLifecycle,
+    which rewrites the row, and the new result replaces the first in -Results, so the console, the status page, and DONE
+    say what holds at the run's end. A first check that found the role (Control), T5 off, or a run that couldn't grant the
+    role (a Contributor's) isn't checked again. deploy.ps1 calls it at a full run's end, and after -StopAfter Infrastructure's
+    wait for the policy inventory. While the new check still contradicts the grant (the review of f213a47: a run that ends
+    soon after the grant, such as -Sequential -StopAfter Infrastructure, or a slow replication), it reads again up to
+    -Retries more times, -RetrySeconds apart: at most a minute by default.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        # The run's results, changed in place: the new DEPLOY.T5.LIFECYCLE replaces the first.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]] $Results,
+
+        [ValidateRange(0, 10)]
+        [int] $Retries = 3,
+
+        [ValidateRange(0, 300)]
+        [int] $RetrySeconds = 20
+    )
+
+    $index = -1
+    for ($i = $Results.Count - 1; $i -ge 0; $i--) {
+        if ($null -ne $Results[$i] -and [string](Get-DemoMemberValue -InputObject $Results[$i] -Name 'checkId') -eq 'DEPLOY.T5.LIFECYCLE') {
+            $index = $i
+            break
+        }
+    }
+    if ($index -lt 0) {
+        return $null
+    }
+    $first = $Results[$index]
+    $modeOf = { param([object] $Answer) [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Answer -Name 'evidence') -Name 'mode') }
+    $mode = & $modeOf $first
+    if ([string]$first.status -eq 'Not selected') {
+        return $null
+    }
+    $last = { param([string] $CheckId) @($Results | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $CheckId }) | Select-Object -Last 1 }
+    $assigned = & $last 'CONTROL.ROLE.A1'
+    if ($null -eq $assigned -or [string]$assigned.status -ne 'Pass') {
+        return $null
+    }
+    $definition = & $last 'CONTROL.ROLE.DEFINITION'
+    $defined = $null -ne $definition -and [string]$definition.status -eq 'Pass'
+    # What contradicts this run's grant: the role not seen (NoRole), not read (Unknown, or no mode), or seen without the
+    # container's actions although this run wrote them (Lacking).
+    $missed = { param([string] $Seen) $Seen -in 'NoRole', 'Unknown', '' -or ($Seen -eq 'Lacking' -and $defined) }
+    if (-not (& $missed $mode)) {
+        return $null
+    }
+    $prior = @(for ($i = 0; $i -lt $Results.Count; $i++) { if ($i -ne $index) { $Results[$i] } })
+    $again = $null
+    $reads = 0
+    while ($true) {
+        $answer = @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $prior -Confirm:$false) | Select-Object -Last 1
+        if ($null -eq $answer) {
+            break
+        }
+        $again = $answer
+        $reads++
+        if (-not (& $missed (& $modeOf $answer)) -or $reads -gt $Retries) {
+            break
+        }
+        Write-DemoLog -Message ('The session control''s role doesn''t show in T5''s check yet ({0}); reading it again in {1} seconds ({2} of {3}).' -f $(if (& $modeOf $answer) { & $modeOf $answer } else { 'unread' }), $RetrySeconds, $reads, $Retries)
+        Start-Sleep -Seconds $RetrySeconds
+    }
+    if ($null -eq $again) {
+        return $null
+    }
+    $evidence = Get-DemoMemberValue -InputObject $again -Name 'evidence'
+    if ($evidence -is [System.Collections.IDictionary]) {
+        $evidence['checkedAgain'] = $true
+        $evidence['firstMode'] = $mode
+        $evidence['reads'] = $reads
+    }
+    $Results[$index] = $again
+    if ([string](Get-DemoMemberValue -InputObject $evidence -Name 'mode') -ne $mode -or [string]$again.status -ne [string]$first.status) {
+        Write-DemoLog -Message ('T5''s container lifecycle, checked again at the run''s end, once the session control''s role showed: {0}' -f [string]$again.message)
+    }
+    return $again
+}
+
 function Invoke-DemoT5ContainerStop {
     <#
     .SYNOPSIS

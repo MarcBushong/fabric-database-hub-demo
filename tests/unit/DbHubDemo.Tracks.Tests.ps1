@@ -2366,6 +2366,32 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
     }
 
+    It 'checks T5''s container lifecycle again after -StopAfter Infrastructure''s wait for the policy inventory, before its summary (2026-11-19, F14, the review of f213a47)' {
+        # The branch grants the control's roles and checks T5's lifecycle at once, as a full run does, then ends.
+        $withT5 = New-TestConfig -WithT4 -WithT5
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith {
+            $script:calls.Add(('control {0}' -f $Part))
+            New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'The custom role "DbHub Demo Activity Operator" has exactly its approved actions.'
+            New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'A1: DbHub Demo Activity Operator for id-dbhub-automation at rg-dbhub-demo is assigned.'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        $script:reads = [System.Collections.Generic.Queue[string]]::new()
+        $script:reads.Enqueue('NoRole')
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith {
+            $mode = if ($script:reads.Count -gt 0) { $script:reads.Dequeue() } else { 'Control' }
+            $script:calls.Add(('lifecycle {0}' -f $mode))
+            [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = 'id-dbhub-automation holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = $mode; AutoDelete = $true; Price = 'Session' }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT5 } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
+        @($script:calls | Where-Object { $_ -like 'lifecycle *' }) | Should -Be @('lifecycle NoRole', 'lifecycle Control')
+        $lifecycle = @($results | Where-Object { $_.checkId -eq 'DEPLOY.T5.LIFECYCLE' })
+        $lifecycle.Count | Should -Be 1
+        $lifecycle[0].evidence['mode'] | Should -Be 'Control'
+        $lifecycle[0].evidence['checkedAgain'] | Should -BeTrue
+        $results[$results.Count - 1].checkId | Should -Be 'DEPLOY.SUMMARY'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+    }
+
     It 'sets up the nightly safety stop once, after the template''s handoff and before the tracks (ADR 0024)' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
@@ -2978,6 +3004,73 @@ Describe 'Invoke-DemoParallelDeployment' {
             $row['status'] | Should -Be 'Warning'
             $row['message'] | Should -Match 'high demand in West US 3'
         }
+    }
+
+    It 'checks T5''s container lifecycle again once the session control is done, when its first check missed the role this run granted, so T5''s row agrees with Control''s (2026-11-19, F14)' {
+        # Live (2026-11-19, two new environments): the T5 row said the session control had no role yet, so Run all couldn't
+        # start a session, while the Control row said Run all was ready. T5's check had read the role assignments right after
+        # the control's Azure part assigned A1, and didn't see it yet.
+        $withT5 = New-TestConfig -WithT4 -WithT5
+        $script:a1 = 'Pass'
+        $script:reads = [System.Collections.Generic.Queue[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith {
+            $script:calls.Add(('control {0}' -f $Part))
+            if ($Part -eq 'Azure') {
+                New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'The custom role "DbHub Demo Activity Operator" has exactly its approved actions.'
+                New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status $script:a1 -Message ('A1: DbHub Demo Activity Operator for id-dbhub-automation at rg-dbhub-demo: {0}.' -f $script:a1)
+            }
+            else {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control is in Fabric.'
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5Name -MockWith { [pscustomobject]@{ Enabled = $true; AccountId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123'; AccountName = 'cosmos01-abc123'; DeploymentId = 'abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5MetricFlow -MockWith { New-TestResult 'METRICS.T5' }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoInsightsAppManage -MockWith { }
+        # What the reads of the session control's role show, one check at a time: right after the grant, then at the end.
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith {
+            $mode = if ($script:reads.Count -gt 0) { $script:reads.Dequeue() } else { 'Control' }
+            $script:calls.Add(('lifecycle {0}' -f $mode))
+            [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = $(if ($mode -eq 'NoRole') { 'id-dbhub-automation holds no role at rg-dbhub-demo yet' } else { '' }); RoleName = 'DbHub Demo Activity Operator'; Mode = $mode; AutoDelete = $true; Price = 'Session' }
+        }
+        $run = {
+            $script:calls.Clear()
+            $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T5Enabled)) -Confirm:$false }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT5; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+            $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'T5.Lifecycle') { $item } } })[0]
+            [pscustomobject]@{ Lifecycle = @($results | Where-Object { $_.checkId -eq 'DEPLOY.T5.LIFECYCLE' }); Row = $row; Reads = @($script:calls | Where-Object { $_ -like 'lifecycle *' }); Calls = @($script:calls) }
+        }
+
+        # This run assigned A1, and the first read didn't see it yet: checked again once the control is done.
+        $script:reads.Enqueue('NoRole')
+        $granted = & $run
+        $granted.Reads | Should -Be @('lifecycle NoRole', 'lifecycle Control')
+        [array]::IndexOf($granted.Calls, 'lifecycle Control') | Should -BeGreaterThan ([array]::IndexOf($granted.Calls, 'control Fabric')) -Because 'it checks again once the control is done'
+        $granted.Lifecycle.Count | Should -Be 1 -Because 'the end''s result replaces the first'
+        $granted.Lifecycle[0].status | Should -Be 'Pass'
+        $granted.Lifecycle[0].evidence['mode'] | Should -Be 'Control'
+        $granted.Lifecycle[0].evidence['checkedAgain'] | Should -BeTrue
+        $granted.Lifecycle[0].evidence['firstMode'] | Should -Be 'NoRole'
+        $granted.Row['status'] | Should -Be 'Pass'
+        $granted.Row['message'] | Should -Match '^T5''s container exists only during a session: start-demo\.ps1 and Run all create it, .*The session control''s role \("DbHub Demo Activity Operator"\) can create it again'
+        $granted.Row['message'] | Should -Not -Match 'no role yet'
+
+        # A Contributor's run, which couldn't assign A1: no role is what holds, so it isn't checked again.
+        $script:a1 = 'Warning'
+        $script:reads.Enqueue('NoRole')
+        $contributor = & $run
+        $contributor.Reads | Should -Be @('lifecycle NoRole')
+        $contributor.Lifecycle[0].evidence['mode'] | Should -Be 'NoRole'
+        $contributor.Row['message'] | Should -Match 'The session control has no role yet \(id-dbhub-automation holds no role at rg-dbhub-demo yet\), so Run all can''t start a session'
+
+        # A first check that found the role: nothing to check again.
+        $script:a1 = 'Pass'
+        $script:reads.Enqueue('Control')
+        $found = & $run
+        $found.Reads | Should -Be @('lifecycle Control')
+        $found.Lifecycle[0].evidence.Contains('checkedAgain') | Should -BeFalse
     }
 
     It 'stops the clock only when T4''s estate and metrics passed too, when T4 is on (ADR 0018 as amended)' {
