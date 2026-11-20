@@ -280,13 +280,37 @@ export interface ScoreContext {
     incidents?: readonly Incident[];
 }
 
-function binMinutesOf(bins: readonly Bin[]): number | null {
-    let best: number | null = null;
-    for (let i = 1; i < bins.length; i++) {
-        const gap = (bins[i].at.getTime() - bins[i - 1].at.getTime()) / MIN;
-        if (gap > 0 && (best === null || gap < best)) best = gap;
-    }
-    return best;
+/**
+ * The bin size around a fault, in minutes: the median gap between the target's bins in the fault's own window, or, when
+ * that holds fewer than two, in the hour around it. The history mixes bin sizes (the notebook bins a window of 120 minutes
+ * or less by the minute, 720 by 5, and longer by 15: a session of about 110 minutes or more, `stop-demo -SaveHistory`, and
+ * deploy's snapshot), so a fault is read in its own bins' step, never the smallest step anywhere in the period.
+ */
+function stepAround(bins: readonly Bin[], from: number, to: number): number | null {
+    const gapsIn = (start: number, end: number) => {
+        const gaps: number[] = [];
+        let previous: number | null = null;
+        for (const b of bins) {
+            const t = b.at.getTime();
+            if (t < start || t >= end) continue;
+            if (previous !== null && t > previous) gaps.push((t - previous) / MIN);
+            previous = t;
+        }
+        return gaps;
+    };
+    const own = gapsIn(from, to);
+    const gaps = own.length ? own : gapsIn(from - 60 * MIN, to + 60 * MIN);
+    return gaps.length ? median(gaps) : null;
+}
+
+/** Bins spaced like `step` (their nearer neighbor within half to one and a half steps): a different bin size sums its waits over a different time. */
+function spacedLike(bins: readonly Bin[], step: number): Bin[] {
+    return bins.filter((b, i) => {
+        const before = i > 0 ? (b.at.getTime() - bins[i - 1].at.getTime()) / MIN : Number.POSITIVE_INFINITY;
+        const after = i < bins.length - 1 ? (bins[i + 1].at.getTime() - b.at.getTime()) / MIN : Number.POSITIVE_INFINITY;
+        const nearer = Math.min(before, after);
+        return nearer >= step * 0.5 && nearer <= step * 1.5;
+    });
 }
 
 function median(values: readonly number[]): number | null {
@@ -437,8 +461,9 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     if (target !== "T1" && target !== "T2" && target !== "T3") return unmeasured("Not supported", `${target}'s beats show in its Azure Monitor metrics, which the history keeps per capture, not per request.`);
 
     const targetBins = ctx.bins.filter((b) => b.target === target).sort((a, b) => a.at.getTime() - b.at.getTime());
-    const step = binMinutesOf(targetBins);
+    const step = stepAround(targetBins, injectedAt.getTime(), injectedEnd.getTime());
     const stepMs = (step ?? 1) * MIN;
+    const baselineBins = step === null ? targetBins : spacedLike(targetBins, step);
     const lagMs = TELEMETRY_LAG_MINUTES * MIN;
     const covered = targetBins.filter((b) => b.at.getTime() + stepMs > injectedAt.getTime() && b.at.getTime() < injectedEnd.getTime() + lagMs);
     if (covered.length === 0) {
@@ -463,7 +488,7 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
         if (!signal || !covered.some((b) => signal.read(b) !== null)) continue;
         measurable.push(family);
         const hot = faultsHere.filter((r) => raises(r, family)).map((r) => ({ from: (r.windowStart as Date).getTime(), to: (r.windowEnd as Date).getTime() + lagMs }));
-        const baseline = baselineOf(signal, targetBins, hot, near);
+        const baseline = baselineOf(signal, baselineBins, hot, near);
         const bound = detectionBound(family, baseline);
         if (!bound) continue;
         const next = successorOf(family);
@@ -620,7 +645,8 @@ export function cosmosEpisodes(capture: CosmosCapture | null, findingRows: reado
         if (!start) continue;
         const end = toDate(r.WindowEnd);
         const evidence = evidenceOf(r.Evidence);
-        const recovered = toDate(evidence.recoveredAtUtc) ?? (evidence.stopped === true ? end : null);
+        // Only the notebook's measured recovery counts: "stopped" says the 429s stopped, not that the account recovered.
+        const recovered = toDate(evidence.recoveredAtUtc);
         const ongoing = !recovered && evidence.stopped !== true;
         const throttled = num(evidence.throttled);
         const requests = num(evidence.requests);
@@ -682,21 +708,35 @@ export function cosmosEpisodes(capture: CosmosCapture | null, findingRows: reado
     return out;
 }
 
-/** Runs of points at or above a level (one interval apart at most), each with the first point after it, or null when the capture ends or breaks off first. */
-function runsAtOrAbove(points: ReadonlyArray<{ at: Date; value: number }>, level: number, minPoints: number, stepMs: number): Array<{ from: Date; to: Date | null; peak: number }> {
-    const out: Array<{ from: Date; to: Date | null; peak: number }> = [];
+interface LevelRun {
+    from: Date;
+    /** The first point back under the level: its recovery; null when the capture ends or breaks off first. */
+    to: Date | null;
+    /** Its last point at the level, plus one interval: where the run is known to end. */
+    end: Date;
+    /** True only when the capture ends while it's at the level; a run the metrics break off from has no known recovery. */
+    ongoing: boolean;
+    peak: number;
+}
+
+/** Runs of points at or above a level (one interval apart at most). */
+function runsAtOrAbove(points: ReadonlyArray<{ at: Date; value: number }>, level: number, minPoints: number, stepMs: number): LevelRun[] {
+    const out: LevelRun[] = [];
     let run: Array<{ at: Date; value: number }> = [];
-    const close = (next: { at: Date } | null) => {
-        if (run.length >= minPoints) out.push({ from: run[0].at, to: next ? next.at : null, peak: Math.max(...run.map((p) => p.value)) });
+    const close = (next: { at: Date } | null, ongoing: boolean) => {
+        if (run.length >= minPoints) {
+            const last = run[run.length - 1].at.getTime();
+            out.push({ from: run[0].at, to: next ? next.at : null, end: next ? next.at : new Date(last + stepMs), ongoing, peak: Math.max(...run.map((p) => p.value)) });
+        }
         run = [];
     };
     for (const p of points) {
         const gap = run.length > 0 && p.at.getTime() - run[run.length - 1].at.getTime() > stepMs * 1.5;
-        if (gap) close(null);
+        if (gap) close(null, false);
         if (p.value >= level) run.push(p);
-        else close(p);
+        else close(p, false);
     }
-    close(null);
+    close(null, true);
     return out;
 }
 
@@ -705,9 +745,9 @@ export function postgresEpisodes(capture: PostgresCapture | null): MeasuredEpiso
     if (!capture) return [];
     const stepMs = (capture.intervalMinutes ?? 5) * MIN;
     const out: MeasuredEpisode[] = [];
-    const episode = (target: EstateTarget, family: string, signal: string, kind: NumberKind, level: string, run: { from: Date; to: Date | null; peak: number }, last: Date | null): MeasuredEpisode => {
-        const ongoing = run.to === null;
-        const visibleMin = minutesBetween(run.from, run.to ?? (last ? new Date(last.getTime() + stepMs) : null));
+    const episode = (target: EstateTarget, family: string, signal: string, kind: NumberKind, level: string, run: LevelRun): MeasuredEpisode => {
+        const visibleMin = minutesBetween(run.from, run.to ?? run.end);
+        const brokeOff = `Its metrics break off after ${formatTimeUtc(new Date(run.end.getTime() - stepMs))} UTC, so its recovery isn't in the capture.`;
         return {
             key: `postgres:${family}:${run.from.toISOString()}`,
             target,
@@ -715,23 +755,23 @@ export function postgresEpisodes(capture: PostgresCapture | null): MeasuredEpiso
             signal,
             kind,
             visibleAt: run.from,
-            endAt: run.to,
+            endAt: run.to ?? (run.ongoing ? null : run.end),
             recoveredAt: run.to,
-            ongoing,
+            ongoing: run.ongoing,
             peak: run.peak,
             throttled: null,
             requests: null,
             visibleMin,
-            note: run.to ? `Back under ${level} at ${formatTimeUtc(run.to)} UTC.` : `Still at ${level} or more at the capture's end.`,
-            impact: impactOf({ target, family, durationMin: visibleMin, ongoing, peak: run.peak }),
+            note: run.to ? `Back under ${level} at ${formatTimeUtc(run.to)} UTC.` : run.ongoing ? `Still at ${level} or more at the capture's end.` : brokeOff,
+            impact: impactOf({ target, family, durationMin: visibleMin, ongoing: run.ongoing, peak: run.peak }),
         };
     };
     const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
     const caught = new Set(replicaCatchUp(capture, lag));
     const replayed = lag.filter((p) => !caught.has(p));
-    for (const run of runsAtOrAbove(replayed, REPLICA_LAG_WARNING_SECONDS, 1, stepMs)) out.push(episode("T4-replica", "replica_lag", "read replica lag", "seconds", `${REPLICA_LAG_WARNING_SECONDS} s`, run, replayed[replayed.length - 1]?.at ?? null));
+    for (const run of runsAtOrAbove(replayed, REPLICA_LAG_WARNING_SECONDS, 1, stepMs)) out.push(episode("T4-replica", "replica_lag", "read replica lag", "seconds", `${REPLICA_LAG_WARNING_SECONDS} s`, run));
     const cpu = postgresSeries(capture, "T4", POSTGRES_METRICS.cpu);
-    for (const run of runsAtOrAbove(cpu, 80, 2, stepMs)) out.push(episode("T4", "cpu", "CPU", "percent", "80 %", run, cpu[cpu.length - 1]?.at ?? null));
+    for (const run of runsAtOrAbove(cpu, 80, 2, stepMs)) out.push(episode("T4", "cpu", "CPU", "percent", "80 %", run));
     return out.sort((a, b) => a.visibleAt.getTime() - b.visibleAt.getTime());
 }
 

@@ -178,6 +178,32 @@ describe("the scoreboard", () => {
         expect(missing.injectedAt).toEqual(at(31));
     });
 
+    it("reads each fault in its own bins' step, beside a session the history keeps in another bin size", () => {
+        // A later session of 170 minutes, which the notebook saves in 5-minute bins, beside the 1-minute one above.
+        const LONG = "session:b2c3d4e5-1111-1111-1111-111111111111";
+        const fiveMinute: Bin[] = Array.from({ length: 37 }, (_, i) => {
+            const m = 150 + i * 5;
+            return { ...bins("T1")[0], at: at(m), cpu: m >= 210 && m <= 220 ? 95 : 20, blocked: m === 270 ? 4 : 0, bufferIoS: m === 175 || m === 180 ? 8 : 2.5 };
+        });
+        const runs = [
+            ...RUNS,
+            run(LONG, "all", "session", 155, 325),
+            run(`${LONG}:00`, "T1", "incident:io-pressure", 170, 185),
+            run(`${LONG}:01`, "T1", "incident:cpu-pressure", 210, 225),
+            run(`${LONG}:02`, "T1", "incident:blocking-chain", 270, 275),
+        ];
+        const plan = toPlans(runs).find((p) => p.key === LONG);
+        const scores = plan ? scorePlan(plan, { bins: [...BINS, ...fiveMinute], beats: [], runs }) : [];
+        const [io, cpu, blocking] = [":00", ":01", ":02"].map((n) => scores.find((s) => s.key === `${LONG}${n}`));
+        // Its baseline comes from bins of its own size (2.5 s of Buffer IO waits per 5 minutes), not the 0.5 s of 1-minute ones.
+        expect(io).toMatchObject({ status: "Pass", binMinutes: 5, baseline: 2.5 });
+        expect(io?.visibleAt).toEqual(at(175));
+        // Two 5-minute bins in a row at 95 % meet CPU's two-bin rule, and two under it make the recovery.
+        expect(cpu).toMatchObject({ status: "Pass", binMinutes: 5, ttdMin: 0, ttrMin: 15, peak: 95 });
+        // A one-bin rule recovers at the next 5-minute bin, not "still visible" for want of a 1-minute one.
+        expect(blocking).toMatchObject({ status: "Pass", ttdMin: 0, ttrMin: 5, ongoing: false, recoveryWord: "" });
+    });
+
     it("says when no telemetry covers a fault, and when its target's signal isn't measured", () => {
         const [lone] = toPlans(RUNS).slice(1);
         const [score] = scorePlan(lone, { bins: BINS, beats: [], runs: RUNS });
@@ -252,6 +278,36 @@ describe("the scoreboard", () => {
         expect(lag).toMatchObject({ target: "T4-replica", family: "replica_lag", peak: 241.4, visibleMin: 10, ongoing: false });
         expect(lag.recoveredAt).toEqual(at(15));
     });
+
+    it("calls an episode recovered only when its recovery was measured: T5's 429s that only stopped, T4's metrics that break off", () => {
+        const [stopped] = cosmosEpisodes(null, [
+            { FindingId: "cosmosdb.T5.throttle.20261117T1405", WindowStart: "2026-11-17T14:05:00", WindowEnd: "2026-11-17T14:14:00", Evidence: JSON.stringify({ throttled: 520, requests: 1000, peakNormalizedRuPercent: 100, stopped: true }) },
+        ]);
+        expect(stopped).toMatchObject({ recoveredAt: null, ongoing: false, visibleMin: 9, note: "The 429s stopped; its recovery isn't in the capture." });
+        expect(stopped.endAt).toEqual(new Date("2026-11-17T14:14:00Z"));
+        // T4's CPU at 85 to 90 % and its replica's lag at 120 s or more, then an interval missing from the capture, then calm.
+        const series = (target: "T4" | "T4-replica", server: string, metric: string, values: Array<number | null>) =>
+            values.flatMap((value, i) => (value === null ? [] : [{ at: at(i * 5), target, server, metric, value }]));
+        const pg: PostgresCapture = {
+            capturedAt: null,
+            windowStart: at(0),
+            windowEnd: at(35),
+            intervalMinutes: 5,
+            servers: {},
+            points: [
+                ...series("T4", "pg01-test", "cpu_percent", [20, 85, 90, 88, null, 20, 20]),
+                ...series("T4-replica", "pgreplica01-test", "physical_replication_delay_in_seconds", [5, 120, 130, null, 4, 3, 2]),
+            ],
+        };
+        const episodes = postgresEpisodes(pg);
+        const cpu = episodes.find((e) => e.family === "cpu");
+        const lag = episodes.find((e) => e.family === "replica_lag");
+        // Each ends at its last point plus one interval, with no recovery known: not "still at 80 % at the capture's end".
+        expect(cpu).toMatchObject({ recoveredAt: null, ongoing: false, visibleMin: 15, note: "Its metrics break off after 13:45 UTC, so its recovery isn't in the capture." });
+        expect(cpu?.endAt).toEqual(at(20));
+        expect(lag).toMatchObject({ recoveredAt: null, ongoing: false, visibleMin: 10 });
+        expect(lag?.endAt).toEqual(at(15));
+    });
 });
 
 describe("the postmortem", () => {
@@ -284,6 +340,21 @@ describe("the postmortem", () => {
         expect(markdown).toContain("```dax\n// Sessions and activity requests\nEVALUATE");
         expect(markdown).not.toMatch(/Database Hub (detected|saw it)/);
         expect(postmortemFileName({ ...plan, kind: "request", key: "r9/../x" }, input.generatedAt)).toBe("contosocare-postmortem-r9-x-20261118T0905Z.md");
+    });
+
+    it("says every signal recovered only when each one has a recovery time, and lists the ones that don't", () => {
+        const recovered = buildPostmortem({ ...input, scores: input.scores.slice(0, 2), beat: null });
+        expect(recovered.markdown).toContain("- None from the data: every signal showed and recovered.");
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:blocking-chain", 0, 10), run(`${SESSION}:01`, "T1", "incident:deadlock-storm", 11, 21)];
+        const t1 = bins("T1", (m) => ((m >= 1 && m < 11) || (m >= 12 && m < 22) ? { blocked: 5 } : {}));
+        const scores = scorePlan(toPlans(runs)[0], { bins: t1, beats: [], runs });
+        const cpu = [20, 85, 90, 88, null, 20].flatMap((value, i) => (value === null ? [] : [{ at: at(i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value }]));
+        const pg: PostgresCapture = { capturedAt: null, windowStart: at(0), windowEnd: at(30), intervalMinutes: 5, servers: {}, points: cpu };
+        const { markdown } = buildPostmortem({ ...input, scores, episodes: postgresEpisodes(pg), beat: null });
+        expect(markdown).not.toContain("every signal showed and recovered");
+        expect(markdown).toContain("- **Deep blocking chain and lock escalation on T1 has no recovery time:** The next fault with this signal began first.");
+        expect(markdown).toContain("- **Reporting (T4), CPU from 13:35 UTC, has no recovery time:** Its metrics break off after 13:45 UTC, so its recovery isn't in the capture.");
+        expect(buildPostmortem({ ...input, scores: [], episodes: [], beat: null }).markdown).toContain("- None from the data: nothing was injected or measured in this window.");
     });
 
     it("hands Copilot the template, the measured rows, and the queries through the ask contract", () => {

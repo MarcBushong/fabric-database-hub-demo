@@ -150,10 +150,15 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     const follow: string[] = [];
     for (const s of scores.filter((x) => x.status === "Warning")) follow.push(`**${s.title} on ${s.target} wasn't visible:** ${s.note} Check ${s.target}'s telemetry on Readiness, and that the request ran (What the control ran, on Manage).`);
     for (const s of scores.filter((x) => x.status === "Pass" && x.ongoing)) follow.push(`**${s.title} on ${s.target} hadn't recovered when the telemetry ends:** check ${s.target} in Database Hub now.`);
+    for (const s of scores.filter((x) => x.status === "Pass" && !x.ongoing && !x.recoveredAt)) follow.push(`**${s.title} on ${s.target} has no recovery time:** ${s.recoveryNote || s.note}`);
+    for (const s of scores.filter((x) => x.status === "Not supported")) follow.push(`**${s.title} on ${s.target} wasn't measured:** ${s.note}`);
+    for (const e of episodes.filter((x) => !x.recoveredAt)) follow.push(`**${serviceName(e.target)} (${e.target}), ${e.signal} from ${time(e.visibleAt)} UTC, has no recovery time:** ${e.note}`);
     if (beat?.respondAt) follow.push(`**Keep automatic plan correction on ${beat.target}:** the run put \`FORCE_LAST_GOOD_PLAN\` back as it found it; Database Hub's Database Agent closes its issue once the condition clears.`);
     if (episodes.some((e) => e.target === "T5")) follow.push("**Patient events (T5):** the story's fix is in the data model, a partition key that spreads the writes, not more throughput.");
     if (episodes.some((e) => e.target === "T4-replica")) follow.push("**Reports' DR copy (T4's read replica):** long reports on the replica hold back its replay; run them elsewhere, or accept the lag.");
-    if (follow.length === 0) follow.push("None from the data: every signal showed and recovered.");
+    // Said only when it's so: every fault and every episode has a measured recovery (each one that hasn't is listed above).
+    const everyRecovered = scores.length + episodes.length > 0 && scores.every((s) => s.recoveredAt) && episodes.every((e) => e.recoveredAt);
+    if (follow.length === 0) follow.push(everyRecovered ? "None from the data: every signal showed and recovered." : "None from the data: nothing was injected or measured in this window.");
     lines.push(...follow.map((f) => `- ${f}`), "");
 
     lines.push("## How this was measured", "");
