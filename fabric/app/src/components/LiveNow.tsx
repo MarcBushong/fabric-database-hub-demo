@@ -6,7 +6,7 @@ import { ArrowClockwise16Regular, Code16Regular, Sparkle16Filled } from "@fluent
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
-import { liveDataOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
+import { liveDataOf, liveOffOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
 import { formatNumber, sentence } from "@/lib/format";
 import { inventoryMix, isDown, liveSecurityRows, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
@@ -25,6 +25,11 @@ function usageText(name: string, u: HighUsage | null | undefined): string | null
     return parts.length > 0 ? `${name}: ${parts.join(", ")}` : null;
 }
 
+/** A tile's line for a view without data: reading, or that it didn't answer, never a number (R924). */
+function notRead(state: { loading: boolean; off: string | null }): string {
+    return state.loading ? "Reading\u2026" : state.off ? "Not available to the app" : "Didn't answer just now";
+}
+
 export function LiveNow() {
     const { navigate } = useApp();
     const copilot = useCopilot();
@@ -34,6 +39,8 @@ export function LiveNow() {
     const answers: Array<EstateAnswer<EstateView>> = [inventory.answer, health.answer, security.answer].filter((a) => a !== null);
     const loading = inventory.loading || health.loading || security.loading;
 
+    // While Database Hub refuses the app as a whole (R924), Overview has no live section; Live views says why.
+    if (answers.length === 0 && liveOffOf([inventory, health, security])) return null;
     if (answers.length === 0 && !loading) {
         const reason = inventory.unavailable ?? health.unavailable ?? security.unavailable;
         return (
@@ -49,21 +56,24 @@ export function LiveNow() {
     const inv = invData ? uniqueInventory(invData) : undefined;
     const h = liveDataOf(health.answer) ?? undefined;
     const down = (inv?.resources ?? []).filter((r) => isDown(r.status));
-    const warnings = security.answer || inventory.answer ? liveSecurityRows(liveDataOf(security.answer), inv).filter((r) => r.attention === "Needs attention") : null;
+    // Only with the security view's own answer: without it, the resources' flags alone would read as nothing to fix.
+    const warnings = security.answer ? liveSecurityRows(liveDataOf(security.answer), inv).filter((r) => r.attention === "Needs attention") : null;
     const high = h ? usage(h.microsoftSql?.highUsage) + usage(h.postgreSql?.highUsage) : null;
     // Database Hub may leave out the account count while it still reports RU; either one means T5 is there.
     const cosmos = h?.cosmosDb && ((h.cosmosDb.totalAccounts ?? 0) > 0 || h.cosmosDb.maximumNormalizedRu !== null) ? h.cosmosDb : null;
     const at = answers.map((a) => a.at).sort()[0];
+    // A view that came back without data counts its routes among the calls that didn't answer (R924).
+    const read = [...answers, ...[inventory.missed, health.missed, security.missed].filter((m) => m !== null)];
     const { called: routes, failed } = liveRoutes(
-        answers.flatMap((a) => a.source),
-        answers.flatMap((a) => a.errors),
+        read.flatMap((a) => a.source),
+        read.flatMap((a) => a.errors),
     );
 
     const rows = [
-        { signal: "Resources", value: inv?.totalCount ?? null, detail: inventoryMix(inv, true) },
+        { signal: "Resources", value: inv?.totalCount ?? null, detail: inv ? inventoryMix(inv, true) : notRead(inventory) },
         ...down.map((r) => ({ signal: "Not up", value: r.status ?? "", detail: `${r.name} (${targetOfResource(r) || r.databaseType})` })),
-        { signal: "High-usage signals, last 24 hours", value: high, detail: [usageText("Microsoft SQL", h?.microsoftSql?.highUsage), usageText("PostgreSQL", h?.postgreSql?.highUsage)].filter(Boolean).join("; ") },
-        { signal: "Security warnings", value: warnings?.length ?? null, detail: (warnings ?? []).map((w) => `${w.resource}: ${w.check}`).join("; ") },
+        { signal: "High-usage signals, last 24 hours", value: high, detail: h ? [usageText("Microsoft SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join("; ") : notRead(health) },
+        { signal: "Security warnings", value: warnings?.length ?? null, detail: warnings ? warnings.map((w) => `${w.resource}: ${w.check}`).join("; ") : notRead(security) },
         ...(cosmos ? [{ signal: "Cosmos DB, peak normalized RU (%)", value: cosmos.maximumNormalizedRu, detail: `lowest availability ${cosmos.minimumServiceAvailability ?? "n/a"} %` }] : []),
     ];
 
@@ -110,7 +120,7 @@ export function LiveNow() {
                 <KpiTile
                     label="Resources in Database Hub"
                     value={inv ? String(inv.totalCount) : "\u2013"}
-                    sub={inv ? (down.length > 0 ? `${down.length} not up: ${down.map((r) => `${r.name} ${r.status}`).join(", ")}` : inventoryMix(inv)) : "Reading\u2026"}
+                    sub={inv ? (down.length > 0 ? `${down.length} not up: ${down.map((r) => `${r.name} ${r.status}`).join(", ")}` : inventoryMix(inv)) : notRead(inventory)}
                     status={inv ? (down.length > 0 ? "Warning" : "Pass") : null}
                     onOpen={() => navigate("estate")}
                     openLabel="Open the estate"
@@ -118,7 +128,7 @@ export function LiveNow() {
                 <KpiTile
                     label="High usage, last 24 hours"
                     value={high === null ? "\u2013" : String(high)}
-                    sub={h ? [usageText("SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join(" \u00b7 ") || "None on SQL or PostgreSQL" : "Reading\u2026"}
+                    sub={h ? [usageText("SQL", h.microsoftSql?.highUsage), usageText("PostgreSQL", h.postgreSql?.highUsage)].filter(Boolean).join(" \u00b7 ") || "None on SQL or PostgreSQL" : notRead(health)}
                     status={high === null ? null : high > 0 ? "Warning" : "Pass"}
                     onOpen={() => navigate("performance")}
                     openLabel="Open performance"
@@ -126,7 +136,7 @@ export function LiveNow() {
                 <KpiTile
                     label="Security warnings"
                     value={warnings === null ? "\u2013" : String(warnings.length)}
-                    sub={warnings === null ? "Reading\u2026" : warnings.length > 0 ? warnings.slice(0, 2).map((w) => `${w.resource.split("/").pop()}: ${w.check}`).join(" \u00b7 ") : "Authentication, auditing, and keys pass"}
+                    sub={warnings === null ? notRead(security) : warnings.length > 0 ? warnings.slice(0, 2).map((w) => `${w.resource.split("/").pop()}: ${w.check}`).join(" \u00b7 ") : "Authentication, auditing, and keys pass"}
                     status={warnings === null ? null : warnings.length > 0 ? "Warning" : "Pass"}
                     onOpen={() => navigate("findings", { category: "security" })}
                     openLabel="Show the live security checks"
