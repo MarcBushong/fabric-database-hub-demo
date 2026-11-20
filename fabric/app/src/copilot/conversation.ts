@@ -61,6 +61,7 @@ export type ConversationAction =
     | { type: "followups"; questions: string[] }
     | { type: "model"; model: string | null }
     | { type: "idle" }
+    | { type: "resume" }
     | { type: "error"; message: string }
     | { type: "reset" }
     | { type: "restore"; turns: Turn[] };
@@ -110,9 +111,37 @@ export function reduceConversation(turns: Turn[], action: ConversationAction): T
             return updateCurrent(turns, (t) => ({ ...t, model: action.model }));
         case "idle":
             return updateCurrent(turns, (t) => ({ ...t, streaming: false }));
+        case "resume":
+            return updateCurrent(turns, (t) => ({ ...t, streaming: true, error: undefined }));
         case "error":
             return updateCurrent(turns, (t) => ({ ...t, streaming: false, error: action.message }));
     }
+}
+
+/** The dock's words for a turn that ended without an answer (R925): plain, for an audience. */
+export const NO_ANSWER = "Copilot didn't write an answer";
+
+/**
+ * Whether Copilot wrote an answer: text after the turn's last query (its DAX or Database Hub source), or any text in a
+ * turn with no query. Text before a query is Copilot saying what it will check, not the answer (R925).
+ */
+export function hasAnswer(turn: AssistantTurn): boolean {
+    let lastSource = -1;
+    turn.parts.forEach((p, i) => {
+        if (p.type === "dax" || p.type === "estate") lastSource = i;
+    });
+    return turn.parts.slice(lastSource + 1).some((p) => p.type === "text" && p.text.trim().length > 0);
+}
+
+/** A finished turn that ended without an answer (and without an error that already says why): the dock offers Retry. */
+export function endedWithoutAnswer(turn: AssistantTurn): boolean {
+    return !turn.streaming && !turn.error && !hasAnswer(turn);
+}
+
+/** What the dock sends when the viewer selects Retry: the same conversation, asked to write the answer it didn't. */
+export function retryPrompt(question: string): string {
+    const q = question.trim().slice(0, 500);
+    return `You didn't write an answer to my last question${q ? `: "${q}"` : ""}. Write the answer now as text, from the results you already have in this conversation; run a new query only if you need data you don't have. Then call suggest_followups.`;
 }
 
 const MAX_CONTEXT_CHARS = 5600;
@@ -173,7 +202,7 @@ function partToMarkdown(p: Part): string {
         case "chart":
             return `_Chart: ${p.chart.title}${p.chart.subtitle ? ` (${p.chart.subtitle})` : ""}_`;
         case "estate":
-            return `_Live estate (${p.call.view}) from Database Hub: ${p.call.source.join(", ") || "no route answered"}_`;
+            return p.call.error ? `_Live estate (${p.call.view}): ${p.call.error}_` : `_Live estate (${p.call.view}) from Database Hub: ${p.call.source.join(", ")}_`;
     }
 }
 
@@ -187,6 +216,7 @@ export function toMarkdown(turns: Turn[], title = "Database Hub Insights: Copilo
             out.push(`## Copilot${t.model ? ` (${t.model})` : ""}`, "");
             for (const p of t.parts) out.push(partToMarkdown(p), "");
             if (t.error) out.push(`> ${t.error}`, "");
+            else if (endedWithoutAnswer(t)) out.push(`> ${NO_ANSWER}.`, "");
         }
     }
     return out.join("\n");

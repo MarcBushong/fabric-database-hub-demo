@@ -8,8 +8,12 @@ The relay holds no Azure, Fabric, or GitHub credential and runs no tool. The pag
 
 1. **Sign-in, once per browser:** the dock asks the relay to start GitHub's [device flow](https://docs.github.com/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow) (`POST /auth/device`); the viewer enters the code on github.com and selects **Authorize**; the dock polls through the relay (`POST /auth/token`) and keeps the tokens in the browser's storage. GitHub's endpoints don't allow calls from a browser, so the relay makes them. There's no client secret: the OAuth App's client ID is public by design.
 2. **A conversation:** the dock opens a WebSocket (`/chat`) and sends `start` with the viewer's token, the system message (the history model's guide), and its tool declarations. The relay starts a Copilot session for that token and answers `ready`.
-3. **A question:** each `user` message streams back as `delta` and `message` events. When Copilot calls a tool, the relay sends `tool_call` to the page, waits for its `tool_result` (at most 150 seconds), and passes it to Copilot. `idle` ends the turn.
+3. **A question:** each `user` message streams back as `delta` and `message` events. When Copilot calls a tool, the relay sends `tool_call` to the page, waits for its `tool_result` (at most 150 seconds), and passes it to Copilot. `idle` ends the turn: before it, the relay reads the turn's assistant messages back from the session's history (`getEvents`, at most 5 seconds) and sends any text the live events didn't, so the page ends every turn with all of Copilot's text (R925, 2026-11-19).
 4. **Renewal:** GitHub's tokens expire after 8 hours; the dock renews them through the relay (`POST /auth/refresh`) with the 6-month refresh token.
+
+## Logs
+
+One JSON line per event on the container's console (`az containerapp logs show`), with counts, statuses, and codes, never a token, a question, or an answer: `relay.listening`; `auth.poll` and `auth.refresh` with their status; `chat.open`, `chat.turn` (a question arrived), and `chat.close`, with the open sockets and sessions; and `chat.turn.end` for each turn: `ms`, how it `ended` (`idle`, `error` with its `error` code, or `closed`), `aborted`, `tools` and `failedTools`, `messages`, `textChars`, `finalTextChars` (the text of the final answer: in and after Copilot's last message that asked for tools; 0 means it wrote none), `rounds` (each message's text length and tool requests, `"57/1 0/1 0/0"`), and `fromHistory` (messages whose text reached the page only from the history read at the turn's end).
 
 ## Routes
 

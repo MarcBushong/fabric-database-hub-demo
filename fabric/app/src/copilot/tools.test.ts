@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { checkDax, createToolRunner, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
+import { checkDax, createToolRunner, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
 
 const rows = [
     { "Bucket UTC": "2026-11-17T10:00:00.000Z", "Target Key": "T1", CpuPct: 41.23456 },
@@ -76,6 +76,62 @@ describe("the tool runner", () => {
         expect(estate).toHaveBeenCalledWith("inventory");
         expect(JSON.parse(out.text)).toMatchObject({ view: "inventory", data: { totalDatabases: 3 } });
         expect(onEstate.mock.calls[0][0].source[0]).toMatch(/filtered-summary/);
+    });
+
+    // R925: Copilot repeated "401" from the route errors it was given. It gets plain words now; the routes stay in the function's log.
+    it("gives Copilot one plain sentence when the live view isn't available, and doesn't call the function again", async () => {
+        let off: string | null = null;
+        const onEstate = vi.fn();
+        const estate = vi.fn().mockResolvedValue({
+            source: [],
+            data: {},
+            errors: ["POST /health/v2/filtered-summary: HTTP 401 Unauthorized", "POST /cosmosDb/health/summary: HTTP 401 Unauthorized"],
+            unavailable: "Database Hub's live view isn't available to the app",
+        });
+        const runner = createToolRunner({ runDax: vi.fn(), estate, onEstate, liveOff: () => off, onLiveUnavailable: (r) => (off = r) });
+        const first = await runner.run("estate_overview", { view: "health" });
+        expect(first.ok).toBe(false);
+        expect(first.text).toMatch(/^Database Hub's live view isn't available to the app\. Don't call estate_overview again/);
+        expect(first.text).not.toMatch(/HTTP|401|\/health|cosmosDb/);
+        expect(off).toBe("Database Hub's live view isn't available to the app.");
+        expect(onEstate.mock.calls[0][0]).toMatchObject({ view: "health", source: [], error: "Database Hub's live view isn't available to the app." });
+        const second = await runner.run("estate_overview", { view: "security" });
+        expect(second).toMatchObject({ ok: false });
+        expect(estate).toHaveBeenCalledTimes(1);
+        // A sentence that carries a code or a route is replaced by the dock's own.
+        const noisy = createToolRunner({ runDax: vi.fn(), estate: vi.fn().mockResolvedValue({ source: [], data: {}, unavailable: "HTTP 401 from /auth/warnings" }) });
+        expect((await noisy.run("estate_overview", { view: "security" })).text).toMatch(new RegExp(`^${LIVE_UNAVAILABLE.replace(/\./g, "\\.")}`));
+    });
+
+    it("says in plain words when no route answered for another reason, without making it last the conversation", async () => {
+        const onLiveUnavailable = vi.fn();
+        const estate = vi.fn().mockResolvedValue({ source: [], data: {}, errors: ["GET /auth/warnings: HTTP 503 Service Unavailable"] });
+        const runner = createToolRunner({ runDax: vi.fn(), estate, onLiveUnavailable });
+        const out = await runner.run("estate_overview", { view: "security" });
+        expect(out).toMatchObject({ ok: false });
+        expect(out.text).toContain(LIVE_NO_ANSWER);
+        expect(out.text).not.toMatch(/HTTP|503|\/auth/);
+        expect(onLiveUnavailable).not.toHaveBeenCalled();
+        const thrown = createToolRunner({ runDax: vi.fn(), estate: vi.fn().mockRejectedValue(new Error("Function invoke failed: HTTP 500")) });
+        const failed = await thrown.run("estate_overview", { view: "inventory" });
+        expect(failed.text).toContain(LIVE_NO_ANSWER);
+        expect(failed.text).not.toMatch(/HTTP|500/);
+    });
+
+    it("names a live answer's missing parts in plain words, with the data that came back", async () => {
+        const estate = vi.fn().mockResolvedValue({ source: ["POST /health/v2/filtered-summary"], data: { sql: { highCpu: 1 } }, errors: ["POST /postgreSql/health/v2/summary: HTTP 502 Bad Gateway"] });
+        const out = await createToolRunner({ runDax: vi.fn(), estate }).run("estate_overview", { view: "health" });
+        const body = JSON.parse(out.text);
+        expect(body).toMatchObject({ view: "health", data: { sql: { highCpu: 1 } }, missing: ["the PostgreSQL health"] });
+        expect(JSON.stringify(body.missing) + String(body.note)).not.toMatch(/HTTP|502|postgreSql/);
+    });
+
+    it("reminds Copilot to write the answer when it suggests follow-ups without one (R925)", async () => {
+        let answered = false;
+        const runner = createToolRunner({ runDax: vi.fn(), answered: () => answered });
+        expect((await runner.run("suggest_followups", { questions: ["Why T2?"] })).text).toMatch(/haven't written the answer itself yet: write it now/);
+        answered = true;
+        expect((await runner.run("suggest_followups", { questions: ["Why T2?"] })).text).toBe("Shown under your answer.");
     });
 });
 

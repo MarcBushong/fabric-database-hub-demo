@@ -13,9 +13,34 @@ export interface SessionLike {
     send(options: { prompt: string }): Promise<string>;
     abort(): Promise<void>;
     disconnect(): Promise<void>;
+    /** The session's persisted history (CopilotSession.getEvents): read when a turn ends, so none of its text is lost. */
+    getEvents?(): Promise<Array<{ type: string; data?: Record<string, unknown>; agentId?: string }>>;
     /** The session's GitHub account, as the runtime resolved it (experimental in the SDK). */
     readonly rpc?: { gitHubAuth?: { getStatus?: () => Promise<{ login?: string; copilotPlan?: string }> } };
 }
+
+/** What the relay logs when a turn ends (chat.turn.end): counts and lengths only, never content or tokens. */
+export interface TurnSummary {
+    ms: number;
+    ended: "idle" | "error" | "closed";
+    aborted: boolean;
+    /** Tool calls passed to the page, and how many of them failed or timed out. */
+    tools: number;
+    failedTools: number;
+    /** Assistant messages, and the characters of text they hold. */
+    messages: number;
+    textChars: number;
+    /** The text of the model's final answer: in and after its last message that asked for tools (all text when none did). */
+    finalTextChars: number;
+    /** Per assistant message, in order, "<text characters>/<tool requests>" (the last 30). */
+    rounds: string;
+    /** Messages whose full text the page got from the session's history at the turn's end, not from the live events. */
+    fromHistory: number;
+    error?: string;
+}
+
+/** How long the end of a turn waits for the session's history; the page gets idle either way. */
+export const HISTORY_READ_MS = 5000;
 
 /** Who a token belongs to and its Copilot plan, as Copilot itself resolves them. */
 export interface CopilotIdentity {
@@ -65,12 +90,32 @@ interface PendingCall {
     timer: NodeJS.Timeout;
 }
 
+interface Round {
+    text: number;
+    streamed: number;
+    tools: number;
+}
+
+interface TurnState {
+    started: number;
+    userMessageId: string | null;
+    rounds: Map<string, Round>;
+    tools: number;
+    failedTools: number;
+    aborted: boolean;
+    fromHistory: number;
+    ending: boolean;
+}
+
 export type BridgeState = "new" | "starting" | "ready" | "closed";
 
 export class AskBridge {
     private session: SessionLike | null = null;
     private readonly pending = new Map<string, PendingCall>();
     private readonly unsubscribe: Array<() => void> = [];
+    /** Each assistant message's text as the page last got it, so no text is sent twice. */
+    private readonly forwarded = new Map<string, number>();
+    private turn: TurnState | null = null;
     private turns = 0;
     private busy = false;
     private expiry: NodeJS.Timeout | null = null;
@@ -82,6 +127,7 @@ export class AskBridge {
         private readonly send: (message: ServerMessage) => void,
         private readonly newId: () => string,
         private readonly onExpire: () => void = () => undefined,
+        private readonly onTurnEnd: (summary: TurnSummary) => void = () => undefined,
     ) {}
 
     async handle(message: ClientMessage): Promise<void> {
@@ -138,11 +184,14 @@ export class AskBridge {
     private subscribe(session: SessionLike): void {
         const on = (type: string, handler: (data: Record<string, unknown>) => void) => this.unsubscribe.push(session.on(type, (event) => handler(event.data ?? {})));
         on("assistant.message_delta", (d) => {
-            if (typeof d.deltaContent === "string" && d.deltaContent) this.send({ type: "delta", messageId: String(d.messageId ?? ""), text: d.deltaContent });
+            if (typeof d.deltaContent === "string" && d.deltaContent) {
+                const messageId = String(d.messageId ?? "");
+                const round = this.round(messageId);
+                if (round) round.streamed += d.deltaContent.length;
+                this.send({ type: "delta", messageId, text: d.deltaContent });
+            }
         });
-        on("assistant.message", (d) => {
-            if (typeof d.content === "string" && d.content.trim()) this.send({ type: "message", messageId: String(d.messageId ?? ""), text: d.content });
-        });
+        on("assistant.message", (d) => this.message(d));
         on("tool.execution_complete", (d) => {
             if (typeof d.toolCallId === "string") this.send({ type: "tool_done", callId: d.toolCallId });
         });
@@ -154,14 +203,131 @@ export class AskBridge {
                 outputTokens: typeof d.outputTokens === "number" ? d.outputTokens : null,
             });
         });
+        on("assistant.idle", (d) => {
+            if (this.turn && d.aborted === true) this.turn.aborted = true;
+        });
         on("session.error", (d) => {
+            const code = typeof d.errorType === "string" ? d.errorType : "copilot_error";
+            this.finishTurn("error", code);
             this.busy = false;
-            this.send({ type: "error", code: typeof d.errorType === "string" ? d.errorType : "copilot_error", message: describeCopilotError(d), fatal: false });
+            this.send({ type: "error", code, message: describeCopilotError(d), fatal: false });
         });
         on("session.idle", () => {
-            this.busy = false;
-            this.send({ type: "idle" });
+            void this.endTurn();
         });
+    }
+
+    /** One assistant message: counted for the turn, and its text sent to the page unless the page has it already. */
+    private message(d: Record<string, unknown>): boolean {
+        const messageId = String(d.messageId ?? "");
+        const content = typeof d.content === "string" ? d.content : "";
+        const round = this.round(messageId);
+        if (round) {
+            round.text = content.trim().length;
+            round.tools = Array.isArray(d.toolRequests) ? d.toolRequests.length : 0;
+        }
+        if (!content.trim() || this.forwarded.get(messageId) === content.length) return false;
+        this.forwarded.set(messageId, content.length);
+        this.send({ type: "message", messageId, text: content });
+        return true;
+    }
+
+    private round(messageId: string): Round | null {
+        const turn = this.turn;
+        if (!turn) return null;
+        let round = turn.rounds.get(messageId);
+        if (!round) {
+            round = { text: 0, streamed: 0, tools: 0 };
+            turn.rounds.set(messageId, round);
+        }
+        return round;
+    }
+
+    /**
+     * The end of a turn (session.idle). Before the page hears it, every assistant message of the turn is read back from
+     * the session's history and any text the live events didn't deliver (a message that came only as deltas, or after
+     * idle) is sent, so the page always ends a turn with all of the model's text. Bounded: idle follows either way.
+     */
+    private async endTurn(): Promise<void> {
+        const turn = this.turn;
+        if (turn?.ending) return;
+        if (turn && this.session?.getEvents) {
+            turn.ending = true;
+            turn.fromHistory = await this.fromHistory(turn, this.session);
+        }
+        if (this.state === "closed") return;
+        if (turn && this.turn === turn) this.finishTurn("idle");
+        this.busy = false;
+        this.send({ type: "idle" });
+    }
+
+    private async fromHistory(turn: TurnState, session: SessionLike): Promise<number> {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            const events = await Promise.race([
+                session.getEvents!(),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("history timeout")), HISTORY_READ_MS);
+                    timer.unref?.();
+                }),
+            ]);
+            if (this.state === "closed" || this.turn !== turn) return 0;
+            // This turn starts at the user message that asked it (the last one, when the runtime doesn't say which).
+            let from = -1;
+            for (let i = events.length - 1; i >= 0; i--) {
+                if (events[i].type !== "user.message") continue;
+                if (from < 0) from = i;
+                if (turn.userMessageId && events[i].data?.messageId === turn.userMessageId) {
+                    from = i;
+                    break;
+                }
+            }
+            let sent = 0;
+            for (const event of events.slice(from + 1)) {
+                const d = event.data ?? {};
+                if (event.type !== "assistant.message" || event.agentId) continue;
+                if (turn.userMessageId && typeof d.originatingMessageId === "string" && d.originatingMessageId !== turn.userMessageId) continue;
+                if (this.message(d)) sent += 1;
+            }
+            return sent;
+        } catch {
+            return 0;
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    private finishTurn(ended: TurnSummary["ended"], error?: string): void {
+        const turn = this.turn;
+        if (!turn) return;
+        this.turn = null;
+        const rounds = [...turn.rounds.values()];
+        const chars = (r: Round) => r.text || r.streamed;
+        let lastAsk = -1;
+        rounds.forEach((r, i) => {
+            if (r.tools > 0) lastAsk = i;
+        });
+        const summary: TurnSummary = {
+            ms: Date.now() - turn.started,
+            ended,
+            aborted: turn.aborted,
+            tools: turn.tools,
+            failedTools: turn.failedTools,
+            messages: rounds.length,
+            textChars: rounds.reduce((n, r) => n + chars(r), 0),
+            finalTextChars: rounds.slice(Math.max(lastAsk, 0)).reduce((n, r) => n + chars(r), 0),
+            rounds: rounds
+                .slice(-30)
+                .map((r) => `${chars(r)}/${r.tools}`)
+                .join(" "),
+            fromHistory: turn.fromHistory,
+            ...(error ? { error } : {}),
+        };
+        try {
+            this.onTurnEnd(summary);
+        } catch {
+            // Logging never breaks a conversation.
+        }
     }
 
     private async ask(text: string): Promise<void> {
@@ -170,9 +336,13 @@ export class AskBridge {
         if (this.turns >= this.config.maxTurns) throw new ProtocolError("turn_limit", `This conversation reached its ${this.config.maxTurns}-question limit. Start a new one.`);
         this.turns += 1;
         this.busy = true;
+        const turn: TurnState = { started: Date.now(), userMessageId: null, rounds: new Map(), tools: 0, failedTools: 0, aborted: false, fromHistory: 0, ending: false };
+        this.turn = turn;
         try {
-            await this.session.send({ prompt: text });
+            const messageId = await this.session.send({ prompt: text });
+            if (typeof messageId === "string" && messageId) turn.userMessageId = messageId;
         } catch (err) {
+            this.finishTurn("error", "send_failed");
             this.busy = false;
             throw new ProtocolError("send_failed", describeSessionError(err));
         }
@@ -181,12 +351,21 @@ export class AskBridge {
     /** Passes one tool call to the page and waits for its answer, its timeout, or the end of the conversation. */
     private callPage(name: string, args: unknown, invocation: ToolHandlerInvocation): Promise<ToolAnswer> {
         const callId = invocation.toolCallId || this.newId();
+        const turn = this.turn;
+        if (turn) turn.tools += 1;
         return new Promise<ToolAnswer>((resolve) => {
             const timer = setTimeout(() => {
                 this.pending.delete(callId);
+                if (turn) turn.failedTools += 1;
                 resolve({ textResultForLlm: `The ${name} tool didn't answer within ${this.config.toolTimeoutSeconds} seconds.`, resultType: "timeout" });
             }, this.config.toolTimeoutSeconds * 1000);
-            this.pending.set(callId, { resolve, timer });
+            this.pending.set(callId, {
+                resolve: (answer) => {
+                    if (turn && answer.resultType !== "success") turn.failedTools += 1;
+                    resolve(answer);
+                },
+                timer,
+            });
             invocation.signal?.addEventListener("abort", () => this.settle(callId, { textResultForLlm: "The tool call was cancelled.", resultType: "failure" }), { once: true });
             this.send({ type: "tool_call", callId, name, arguments: args ?? {} });
         });
@@ -214,6 +393,7 @@ export class AskBridge {
         if (this.state === "closed") return;
         this.state = "closed";
         if (this.expiry) clearTimeout(this.expiry);
+        this.finishTurn("closed");
         for (const id of [...this.pending.keys()]) this.settle(id, { textResultForLlm: "The page closed the conversation.", resultType: "failure" });
         for (const off of this.unsubscribe.splice(0)) off();
         const session = this.session;

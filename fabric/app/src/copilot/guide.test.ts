@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { buildGuideSource, OUTPUT } from "../../scripts/build-model-guide";
-import { contextPrompt, recap, reduceConversation, toMarkdown, type Turn } from "./conversation";
+import { contextPrompt, endedWithoutAnswer, hasAnswer, NO_ANSWER, recap, reduceConversation, retryPrompt, toMarkdown, type AssistantTurn, type Turn } from "./conversation";
 import { buildSystemMessage } from "./guide";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
@@ -64,6 +64,19 @@ describe("the model guide", () => {
         expect(buildSystemMessage({ estate: false })).toMatch(/LIVE estate: not available/);
     });
 
+    // R925: the model ended a turn with suggest_followups and no answer, and said "401" to the audience.
+    it("tells Copilot to finish with a written answer, never with codes or routes, and what to do when the live view isn't available", () => {
+        const message = buildSystemMessage({ estate: true });
+        expect(message).toContain("Always finish with a written answer");
+        expect(message).toContain("never replaces the answer");
+        expect(message).toContain("Never show HTTP status codes, error codes, route names, or raw error text");
+        expect(message).not.toContain("End every answer by calling suggest_followups");
+        const off = buildSystemMessage({ estate: true, liveUnavailable: "Database Hub's live view isn't available to the app" });
+        expect(off).toContain("- LIVE estate: Database Hub's live view isn't available to the app. For questions about right now, answer from the history model");
+        expect(off).toContain("Database Hub's own pages in the Fabric portal");
+        expect(off).not.toContain("the estate_overview tool reads");
+    });
+
     it("teaches T5 (Azure Cosmos DB) from its latest capture, with columns and measures the model has", () => {
         const message = buildSystemMessage({ estate: false });
         const rules = message.slice(0, message.indexOf("# The history model"));
@@ -103,6 +116,33 @@ describe("the conversation", () => {
         const md = toMarkdown(turns);
         expect(md).toContain("```dax\nEVALUATE ROW(\"a\", 1)\n```");
         expect(md).toContain("> Copilot stopped.");
+    });
+
+    it("knows an answer from text before a query, and resumes a turn that ended without one (R925)", () => {
+        const run = { id: "r1", query: "EVALUATE x", purpose: "Peak CPU", columns: ["a"], rows: [{ a: 1 }], rowCount: 1, ms: 5, at: new Date(0) };
+        let turns: Turn[] = [{ role: "user", id: "u", text: "How is my estate?", at: 0 }];
+        turns = reduceConversation(turns, { type: "assistant-start", id: "a", at: 1 });
+        turns = reduceConversation(turns, { type: "message", messageId: "m1", text: "I'll check the history." });
+        turns = reduceConversation(turns, { type: "dax", run });
+        turns = reduceConversation(turns, { type: "followups", questions: ["Why T2?"] });
+        turns = reduceConversation(turns, { type: "idle" });
+        const ended = turns[1] as AssistantTurn;
+        expect(hasAnswer(ended)).toBe(false);
+        expect(endedWithoutAnswer(ended)).toBe(true);
+        expect(toMarkdown(turns)).toContain(`> ${NO_ANSWER}.`);
+        expect(retryPrompt("How is my estate?")).toContain('You didn\'t write an answer to my last question: "How is my estate?"');
+        turns = reduceConversation(turns, { type: "resume" });
+        expect(turns[1]).toMatchObject({ streaming: true });
+        expect(endedWithoutAnswer(turns[1] as AssistantTurn)).toBe(false);
+        turns = reduceConversation(turns, { type: "message", messageId: "m2", text: "T2 needs attention first." });
+        turns = reduceConversation(turns, { type: "idle" });
+        expect(hasAnswer(turns[1] as AssistantTurn)).toBe(true);
+        expect(toMarkdown(turns)).not.toContain(NO_ANSWER);
+        // A chart after the explanation is still an answer; a turn with no query needs only its text.
+        const charted = { ...(turns[1] as AssistantTurn), parts: [{ type: "dax", run }, { type: "text", messageId: "m", text: "T2 peaked." }, { type: "chart", chart: { kind: "kpi", title: "t", rows: [] }, runId: "r1" }] } as AssistantTurn;
+        expect(hasAnswer(charted)).toBe(true);
+        expect(hasAnswer({ ...charted, parts: [{ type: "text", messageId: "m", text: "Hello." }] })).toBe(true);
+        expect(hasAnswer({ ...charted, parts: [] })).toBe(false);
     });
 
     it("puts a visual's context in the prompt: source, filters, anomaly, DAX, and trimmed rows", () => {

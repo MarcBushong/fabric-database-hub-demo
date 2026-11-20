@@ -49,7 +49,7 @@ import { downloadText } from "@/lib/csv";
 import { ChartView } from "@/visuals/ChartView";
 import type { ChatController } from "./chat-types";
 import type { CopilotDockProps } from "./contract";
-import type { AssistantTurn, Part, UserTurn } from "./conversation";
+import { endedWithoutAnswer, NO_ANSWER, type AssistantTurn, type Part, type UserTurn } from "./conversation";
 import { Markdown } from "./markdown";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
@@ -362,6 +362,21 @@ function Answer({ turn, chat, isLast }: { turn: AssistantTurn; chat: ChatControl
             {turn.error ? (
                 <MessageBar intent="error" layout="multiline">
                     <MessageBarBody>{turn.error}</MessageBarBody>
+                </MessageBar>
+            ) : null}
+            {endedWithoutAnswer(turn) ? (
+                <MessageBar intent="warning" layout="multiline" className="copilot-no-answer">
+                    <MessageBarBody>
+                        <MessageBarTitle>{NO_ANSWER}</MessageBarTitle>
+                        {isLast ? "It finished this turn without writing text. Retry asks it to write the answer from what it found." : "It finished this turn without writing text."}
+                    </MessageBarBody>
+                    {isLast ? (
+                        <MessageBarActions>
+                            <Button size="small" icon={<ArrowClockwise16Regular />} onClick={chat.retry} disabled={chat.state.busy || chat.state.plan.ok === false}>
+                                Retry
+                            </Button>
+                        </MessageBarActions>
+                    ) : null}
                 </MessageBar>
             ) : null}
             {!turn.streaming ? (
