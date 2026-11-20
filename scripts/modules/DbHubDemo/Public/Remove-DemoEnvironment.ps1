@@ -47,10 +47,12 @@ function Remove-DemoEnvironment {
     Azure CLI.
 
     The golden group rg-<prefix>-golden (ADR 0018) belongs to the prefix, not to the environment: it stays
-    unless -IncludeGolden (DESTROY.GOLDEN). Until 2026-11-09, an environment whose nested T2 host held a PaygWizard
-    install needed a boot-verified golden snapshot first (DESTROY.GOLDEN.GUARD), unless -WithoutGolden or
-    -IncludeGolden accepted losing that state; Get-DemoConfig runs a configuration's PaygWizard as JumpstartImage since
-    then, so the guard no longer refuses anything.
+    unless -IncludeGolden (DESTROY.GOLDEN). Whether it exists is read before the confirmation (2026-11-19): one that
+    doesn't exist is left out of what stays, a line says so, and DESTROY.GOLDEN is a Pass that says so, as with
+    -IncludeGolden; a read that fails keeps the wording for a group that exists. Until 2026-11-09, an environment
+    whose nested T2 host held a PaygWizard install needed a boot-verified golden snapshot first (DESTROY.GOLDEN.GUARD),
+    unless -WithoutGolden or -IncludeGolden accepted losing that state; Get-DemoConfig runs a configuration's
+    PaygWizard as JumpstartImage since then, so the guard no longer refuses anything.
 
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.FABRIC.CONTROL, DESTROY.FABRIC.WORKSPACE, DESTROY.CONTROL (with DESTROY.CONTROL.ROLES
@@ -225,21 +227,32 @@ function Remove-DemoEnvironment {
         $unread = [pscustomobject]@{ State = 'Unknown'; Reason = ('it couldn''t be read: {0}' -f $why) }
         $extra = [pscustomobject]@{ Control = [pscustomobject]@{ Name = (Get-DemoActivityControlName -Config $Config); State = 'Unknown'; ServedGroup = ''; Resources = @(); Reason = $unread.Reason }; Fabric = [pscustomobject]@{ Read = $false; Token = $null; Plan = $null; Reason = $unread.Reason }; Group = [pscustomobject]@{ Id = [string]$Config['t3AdminGroupObjectId']; Name = ''; State = 'Unknown'; Reason = $unread.Reason }; Delete = @(); Keep = @(('the session control, the Fabric workspaces, and the security group: {0}' -f $unread.Reason)) }
     }
+    # The golden group, read before the list (2026-11-19): one that doesn't exist was listed as kept, and DESTROY.GOLDEN
+    # said it stayed "with 0 golden snapshot(s)". A read that fails keeps the wording for a group that exists.
+    $goldenGroup = Get-DemoGoldenResourceGroupName -Config $Config
+    $goldenMissing = $false
+    if (-not $IncludeGolden) {
+        $goldenRead = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $goldenGroup) -AllowFailure
+        $goldenMissing = $goldenRead.ExitCode -eq 0 -and ([string]$goldenRead.StdOut).Trim() -ne 'true'
+    }
+    $goldenNote = '{0} doesn''t exist, so there''s no golden snapshot.' -f $goldenGroup
     $deleteText = @(('the Arc resources, {0} and everything in it, the subscription deployment record, and the budget' -f $resourceGroupName)) + @($extra.Delete)
-    $keepText = @($extra.Keep) + @($(if ($IncludeGolden) { @() } else { @(('{0} and its golden snapshots (-IncludeGolden deletes them)' -f (Get-DemoGoldenResourceGroupName -Config $Config))) }))
+    $keepText = @($extra.Keep) + @($(if ($IncludeGolden -or $goldenMissing) { @() } else { @(('{0} and its golden snapshots (-IncludeGolden deletes them)' -f $goldenGroup)) }))
     foreach ($line in $deleteText) {
         Write-DemoLog -Message ('destroy.ps1 deletes {0}.' -f $line)
     }
     foreach ($line in $keepText) {
         Write-DemoLog -Message ('destroy.ps1 keeps {0}.' -f $line)
     }
+    if ($goldenMissing) {
+        Write-DemoLog -Message $goldenNote
+    }
     if (-not $PSCmdlet.ShouldProcess($resourceGroupName, ('Delete {0}. Keep {1}' -f ($deleteText -join '; '), ($keepText -join '; ')))) {
-        $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted, and nothing else was. destroy.ps1 would delete {1}; and keep {2}.' -f $resourceGroupName, ($deleteText -join '; '), ($keepText -join '; '))))
+        $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted, and nothing else was. destroy.ps1 would delete {1}; and keep {2}.{3}' -f $resourceGroupName, ($deleteText -join '; '), ($keepText -join '; '), $(if ($goldenMissing) { ' ' + $goldenNote } else { '' }))))
         return $results.ToArray()
     }
 
     # A PaygWizard install holds the setup-wizard step, which no script can redo: keep it in a golden snapshot first.
-    $goldenGroup = Get-DemoGoldenResourceGroupName -Config $Config
     $goldenDoc = 'https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots'
     $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     if ($groupExists -and $installMode -eq 'PaygWizard' -and (Get-DemoHostVmName -Config $Config) -eq 'archost01') {
@@ -438,13 +451,19 @@ function Remove-DemoEnvironment {
 
     # The golden group belongs to the prefix, not to this environment (ADR 0018): it stays unless -IncludeGolden.
     $goldenSnapshots = @()
-    try {
-        $goldenSnapshots = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc)
+    if (-not $goldenMissing) {
+        try {
+            $goldenSnapshots = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc)
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The golden snapshots couldn''t be listed: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
     }
-    catch {
-        Write-DemoLog -Level Warning -Message ('The golden snapshots couldn''t be listed: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    if ($goldenMissing) {
+        # A group that doesn't exist never stays: a Pass that says so, as with -IncludeGolden (2026-11-19).
+        $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message $goldenNote -DocUrl $goldenDoc))
     }
-    if (-not $IncludeGolden) {
+    elseif (-not $IncludeGolden) {
         $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('{0} stays with {1} golden snapshot(s); destroy.ps1 -IncludeGolden deletes it.' -f $goldenGroup, $goldenSnapshots.Count) -Evidence ([ordered]@{ snapshots = @($goldenSnapshots | ForEach-Object { $_.Name }) }) -DocUrl $goldenDoc))
     }
     else {

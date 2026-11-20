@@ -472,7 +472,14 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
             [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @('the Fabric workspace "Database Hub Demo" (everything in it is the demo''s (9 item(s)))'); Keep = @('the Fabric capacity and your licenses, which you manage') }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { throw 'nothing is deleted in a what-if' }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'nothing is deleted in a what-if' }
+        # Whether the golden group exists is read before the list (2026-11-19); nothing else reaches the Azure CLI first.
+        $script:goldenAnswer = "true`n"
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            if (($ArgumentList -join ' ') -match '^group exists --name rg-dbhub-golden ') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = $script:goldenAnswer; StdErr = '' }
+            }
+            throw 'nothing is deleted in a what-if'
+        }
     }
 
     It 'names each in a what-if, deletes nothing, and passes -KeepFabric on' {
@@ -482,6 +489,14 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         $result[-1].message | Should -Match 'and keep the Fabric capacity and your licenses, which you manage; rg-dbhub-golden and its golden snapshots \(-IncludeGolden deletes them\)\.$'
         $script:keepFabric | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'destroy.ps1 keeps the Fabric capacity and your licenses, which you manage.' } -Times 1 -Exactly
+    }
+
+    It 'leaves a golden group that doesn''t exist out of what it keeps, and says it doesn''t exist (2026-11-19)' {
+        $script:goldenAnswer = "false`n"
+        $result = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        $result[-1].message | Should -Match 'and keep the Fabric capacity and your licenses, which you manage\. rg-dbhub-golden doesn''t exist, so there''s no golden snapshot\.$'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'rg-dbhub-golden doesn''t exist, so there''s no golden snapshot.' } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like '*keeps rg-dbhub-golden*' } -Times 0 -Exactly
     }
 
     It 'pauses a capacity it resumed (fabric.manageCapacity) only after the Fabric workspaces, whose deletes need it, and before the group' {
