@@ -1,0 +1,312 @@
+# ADR 0031: Incident RCA from saved history, blind, with the chat as the first-line investigator
+
+- **Status:** Proposed (2026-11-20). The owner approved the design on 2026-11-20 and asked for it to be built. Phase 1 is being built against the evidence contract in [`rca/`](../../rca/README.md), which this ADR's pull request adds first. Nothing in it is live yet.
+- **Date:** 2026-11-20
+- **Decision source:** User-directed. The owner asked for the root cause of blocking, waits, and errors, down to the statement, the procedure, and who ran it, "displaying the query blocking chain and what was the first one and some recommendation analysis and next steps". Then: "I want the chat to be the first base investigation and extended DBA assistant. Full with specific detailed information and RCA and suggestions", across waits, errors, and "why lag times increased for the replicas at certain times". On the look: "I also like the theme options for it". On grading: "Real demo and DBA would not know what the scenarios are and we should be able to see these items." The owner also asked how long Database Hub keeps its data, who must keep it longer, and where its telemetry lives ([below](#where-the-data-lives-how-long-its-kept-and-who-keeps-it)). The coordinator's decisions, recorded for the owner to change by number: [the five design decisions](#decisions-and-open-items), errors (INV-12, INV-13) in Phase 1, and blind detection with the answer key in exactly two places. The first item of the Insights app's Wave 2.
+- **Related:** [ADR 0008](0008-identity-rbac-abac.md) (identity), [ADR 0009](0009-secrets-handling.md) (secrets), [ADR 0010](0010-workload-generator-technology.md) (the runner and its bounds; [amended](0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20) for the observer's event session), [ADR 0012](0012-validation-model.md) (statuses), [ADR 0016](0016-cost-profiles.md) (cost), [ADR 0025](0025-t4-read-replica.md) (T4's replica), [ADR 0026](0026-one-run-all-session.md) (Run all), [ADR 0027](0027-t5-cosmos-db.md) (T5), [ADR 0028](0028-ask-copilot-in-the-insights-app.md) (the chat), [ADR 0030](0030-insights-app-mission-control.md) (Mission Control, the scoreboard, the postmortem), [the evidence contract](../../rca/README.md)
+
+## Context
+
+Verified on `ignite-updates` at a8d51ac:
+
+- **The history is metrics only.** `NB_DatabaseHub_LiveActivity` writes `telemetry_snapshots`, `incident_windows`, `scenario_runs`, `analysis_findings`, and `validation_results`, which `SM_DatabaseHub_History` reads (Direct Lake). For T1 to T3 it reads Database Hub's telemetry with KQL; for T4, its replica, and T5, the Azure Monitor metrics the control runbook or the operator's scripts saved. It never connects to a target.
+- **Not in it:** who blocked whom, the head blocker, statement or procedure text, login, host, or program, lock resources, errors, deadlock graphs, Query Store plans, or the replica's replay state.
+- **Database Hub's telemetry can't fill it:** it's resource-level. Its documented tables have no waits or blockers per session, and its sessions have no program name ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#tables)); "Query-level detail, such as query text, plans, and per-query statistics, isn't in the telemetry" ([limitations](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#limitations)).
+- **Only the runner can read the evidence.** T1, T2, T4, its replica, and T5 are private, and T3 accepts only T1's subnet. A Fabric notebook has no documented token audience for SQL ([NotebookUtils credentials](https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-credentials#get-token): storage, pbi, keyvault, kusto) and no route. The runner already signs in to every SQL target ([permissions](#10-permissions-cost-and-volume)).
+- **The channels into the history are narrow.** A managed Run Command keeps the last 4 KB of output ([managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed)), and the control's metrics secret holds 24,000 bytes per version (`Save-DbHubSessionMetric`).
+- **Wave 1 measures against the plan.** The scoreboard, the postmortem, and the incident list read what the demo injected (`scenario_runs`) and look for each fault's expected signal in its own window. That's verification against an answer key, not detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)).
+
+## Decision
+
+### Blind detection, and the answer key in exactly two places
+
+**The product is blind.** It finds and explains incidents with only what a real DBA's tools would show: the observer's capture (DMVs, Extended Events, `pg_stat` views), Azure Monitor's metrics, and Database Hub's telemetry. Grading against what the demo injected exists for the tests and for the presenter's trust moment, nowhere else.
+
+- **Blind:** the rules, the shared detector, the investigation tools (`triage_window`, `find_incidents`, `explain_*`), the RCA view, and the chat. They never read `scenario_runs`, injected or planned incident windows, the runner's plan, `demo.scenario_run_events` or any other event the workload reports about itself, the scenario catalog, or a scenario's name.
+- **The answer key lives in two places:**
+  1. **The tests and the evaluation set,** which grade every blind RCA offline against what was injected. A viewer never sees them.
+  2. **The "Did we catch it?" scoreboard,** the presenter's trust moment, which the presenter can show or skip: for example "the demo sent 19 faults, and the blind detector caught 17 without being told, at these times; here are the 2 it missed, and 1 false alarm". In Wave 2 the shared blind detector powers it. It may link a caught fault to its RCA; the RCA never links back to the key or shows it.
+- **No "Injected" header, no "the evidence agrees" badge, no answer-key strip** in the RCA view, and **no answer-key tool in the chat,** not even a labeled one.
+- **Enforced by tests:** [`rca/blind-detection.json`](../../rca/blind-detection.json) lists what detection may read, the answer key's tables and objects, and the identifiers detection code must never contain, every scenario ID among them. `tests/unit/Rca.Contract.Tests.ps1` fails when the app's detection code (`fabric/app/src/rca/`) or the runner's observer names one; the dock's `run_dax` refuses DAX that names an answer-key table.
+- **The capture is blind too:** the observer never reads the plan, and its detail capture starts from what its sentinel sees, not from a schedule ([triggers](../../rca/README.md#capture-triggers)).
+
+### The shared blind detector
+
+One detector in the app (`fabric/app/src/rca/detector.ts`) finds incidents for the RCA view, the chat's `find_incidents` and `triage_window`, the postmortem's Cause, and in Wave 2 the scoreboard.
+
+- **It reads** only what [`blind-detection.json`](../../rca/blind-detection.json) allows: Telemetry Snapshots' bins (Database Hub's telemetry for T1 to T3; Azure Monitor's for T4, its replica, and T5) and the seven RCA tables.
+- **Its families and levels** are the notebook's `EPISODE_RULES` (blocking and deadlocks above 0; CPU at 80 %, or at 1.5 times and 10 points above its baseline; the wait families), so its numbers stay comparable with Wave 1's. The RCA adds errors (10 a minute and 3 times the median of the 10 minutes before), the replica's stalled replay, T4's connections near the limit, and T5's 429s and 100 % normalized RU.
+- **Its baselines are blind:** the median of the signal's valued bins over the 30 minutes before, at least 5 of them, leaving out the bins of episodes it already found. Never a planned or injected window, which Wave 1's baselines leave out ([audit](#wave-1-audit-where-it-reads-the-answer-key)). With fewer than 5, it uses the family's absolute level and says so.
+- **A bin without a value is unknown, never "under the level".** Wave 1 counts it as under and breaks the run: on dbhubfn's session 81446b84, T3's plan regression peaked at 65.95 % in bins with empty bins between them, and never counted, because CPU's rule wants 2 bins in a row at the level (10 %, with a baseline near 0 %). The release's fix F23 (f9f953d) says what was measured; the rule is unchanged. Here, a run continues across up to 2 unknown bins between bins at the level; a valued bin under the level ends it.
+- **Persistence by magnitude:** an episode needs 2 valued bins at the level in one run, as Wave 1's rule does, **or** one valued bin at twice the level and at least 30 points above the baseline (for a percentage; a count opens on one bin above 0, as today). A one-bin episode is a **single sample** with low confidence, unless another source shows it too.
+- **The densest source first:** T3's CPU from RCA-AZ-01's 15-second rows (`sys.dm_db_resource_stats`, read for the whole session in Phase 1 and kept without a deadband, so a missing row is a missing sample), which sees a regression where Database Hub's bins are sparse; blocking from the sentinel's 30-second `processes_blocked` before Database Hub's 1-minute bins. Each episode names its source.
+- **What it says:** each episode carries its start, its end (the first 2 valued bins in a row under the level; "not known" when the telemetry ends or breaks off first), its peak and when, its valued and unknown bins, its source, and its support (**sustained**, **sparse**, or **single sample**). The view and the chat use those words, for example "CPU at 10 % or more in 4 bins from 14:00 to 14:09 UTC, peak 65.95 % at 14:00; 6 of its 10 bins had no value".
+- **Tested** with the live shape from session 81446b84 (bins at 65.95 % every third minute, empty bins between, a baseline near 0 %), which must open a sparse episode; a lone 66 % bin, which opens a single-sample one; a lone 12 % bin, which opens none; and dense series, which give Wave 1's times.
+- **The scoreboard in Wave 2:** the only place the key meets detection. An injected fault is **caught** when a blind episode of one of its expected families starts on its target between its injection and `TELEMETRY_LAG_MINUTES` after its window (time to detect: the episode's start minus the injection); **missed** otherwise, with what the detector measured; a blind episode that no fault explains is a **false alarm**, said as one.
+
+### 1. Capture: the runner's observer lane
+
+A new lane in the runner's `profile run`: on T1's VM for T1, T3, T4, and T4's replica; in T2's guest for T2. T5 has no observer: its 429s and normalized RU are Azure Monitor metrics the history saves already. The lane only reads, and it's bounded like the scenarios ([ADR 0010](0010-workload-generator-technology.md#bounds-enforced-in-three-layers)).
+
+- **Sign-in:** the runner's existing connections, with no new login, role, secret, or role assignment ([permissions](#10-permissions-cost-and-volume)).
+- **Its sessions:** Application Name `ContosoCare.Demo/control/rca`, so `demo.fn_demo_sessions` and the kill tools never list or end them; `READ UNCOMMITTED` and `LOCK_TIMEOUT 1000` (SQL), `lock_timeout` and `statement_timeout` (PostgreSQL); one statement at a time per target. A sample that takes over 2 seconds halves the lane's cadence, and three in a row stop its detail capture with an `RCA.CAPTURE.<target>` **Warning**.
+- **The sentinel,** every 30 seconds for the whole session: counters only (RCA-SQL-09, RCA-PG-10, the replica's RCA-PG-06), a few milliseconds per target.
+- **Episodes from what it sees:** a blocked process, a lock waiter on T4, the replica's replay stalled, T4's connections near the limit, or an error rate's jump starts 5- or 10-second detail capture, which ends when the signal stays clear ([the triggers](../../rca/README.md#capture-triggers)). Phase 2 adds a wait category's rate and CPU.
+- **For the whole session:** the event session below, and T3's resource rows (RCA-AZ-01).
+- **What it captures, by target** (the exact SQL, each block's permission and Learn page: [the capture catalog](../../rca/capture/README.md)):
+
+  | Target | Blocking and locks | Errors, deadlocks, escalations | Waits and plans (Phase 2) | Other |
+  |---|---|---|---|---|
+  | T1, T2 (SQL Server 2022) | RCA-SQL-01 (requests, sessions, connections, SQL text, the input buffer of an idle head, transactions), RCA-SQL-02 (`sys.dm_tran_locks` with objects and indexes) | RCA-XE-01, 02 (`error_reported`, `attention`, `lock_escalation`, `xml_deadlock_report`), RCA-SQL-12 (system_health's deadlocks, the fallback) | RCA-SQL-03, 04 (waiting tasks, wait-stats deltas), 10, 11 (Query Store), 13 (missing indexes) | RCA-SQL-05 to 09 (grants, schedulers, file IO, the sentinel's counters) |
+  | T3 (Azure SQL Database) | RCA-SQL-01, 02, with optimized locking's XACT resources and `LCK_M_S_XACT_*` | RCA-XE-03, 04 (database-scoped; `database_xml_deadlock_report`) | RCA-AZ-02 (`sys.dm_db_wait_stats`), RCA-SQL-10, 11, 13, RCA-AZ-03, 04 (automatic tuning) | RCA-AZ-01 (`sys.dm_db_resource_stats`, Phase 1), RCA-AZ-05 |
+  | T4 and its replica (PostgreSQL) | RCA-PG-01 (`pg_stat_activity`, `pg_blocking_pids()`), RCA-PG-02 (both sides of each `pg_locks` wait), RCA-PG-11 (the head's tables) | RCA-PG-03 (deadlocks, conflicts) | RCA-PG-12 (scans per table) | RCA-PG-04 to 09 (WAL and replication on the primary; the replica's replay, conflicts, receiver, settings), RCA-PG-10 (connections) |
+
+- **Found by testing, and designed in:** on a hot standby, `pg_blocking_pids()` returns nothing for the waiting startup process while `pg_locks` shows the wait and its holder, so replay conflicts are read from `pg_locks`. Azure SQL Database has no system_health, and Learn says not to read its built-in `dl` session, so T3's deadlocks come from a database-scoped session. Learn has no field reference for `error_reported`, so the observer reads the fields from `sys.dm_xe_object_columns` first (RCA-XE-00) and records a missing one as not captured. A `transactionid` wait names no table, so RCA-PG-11 reads the head's relation locks.
+- **The event session is the one object the observer creates:** `ContosoCare_RCA`, in memory only, filtered to ContosoCare, created at the observer's start and dropped at the session's end. On T1 and T2 it's server-scoped, outside ADR 0010's "nothing outside ContosoCare": [the amendment](0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20) allows it, with its limits.
+- **Kept on the VM until the export:** `C:\ProgramData\DbHubDemo\rca\<session>\` (SYSTEM and Administrators only), at most 20 MB per target, deleted 7 days after its export.
+
+### 2. Names
+
+**What the observer records** ([Names](../../rca/README.md#names)):
+
+- A workload session's application name today is `ContosoCare.Demo/<scenario>/<run>`, which names the fault. The observer keeps only `ContosoCare.Demo`, plus `run_token`: an opaque hash of the run segment that groups a run's sessions and names nothing. A scenario ID never reaches the evidence.
+- Modules and statements are recorded as the DMVs return them, because a DBA sees them too and the owner asked for them. Rules never branch on a name, and a test checks that detection code contains no procedure-name pattern.
+- The procedures' own names (`demo.usp_scenario_chain_acquire`) still show the demo's script to a viewer who reads them.
+
+**More realistic names, assessed:**
+
+| Option | What changes | Effort | Risk |
+|---|---|---|---|
+| (a) Per-service application names (`ContosoCare.Scheduling`), with the runner tracking its sessions another way | The runner's endpoint (`Sql/TargetEndpoint.cs`, lines 108 to 114); `demo.fn_demo_sessions`, the kill tools, and reset on both engines (`database/common/110-demo-control.sql`, lines 282 to 305 and 826 to 844; `database/postgresql/110-demo-control.sql`, lines 166 to 201 and 386 to 405); validate's bounds; the agent prompts that read the tags | 8 to 15 days | High: ADR 0010's three-layer bounds and the watchdog key on the prefix |
+| (a′) `ContosoCare.Demo/<service>/<token>` | The scenario segment becomes a service and the run a token that `demo.scenario_runs` maps back; the prefix, and so every bound, stays | 4 to 7 days | Medium: the prompts and docs that read the scenario from the name |
+| (b) The observer strips names (above) | Only the observer | Part of step 1.1 | Low |
+| (c) Realistic procedure names (`scheduling.usp_book_slot`) | 22 T-SQL procedures and 14 PostgreSQL functions, their callers, the scenario schema's procedure pattern, and `SqlScriptTests`' allow-lists | 5 to 10 days | Medium |
+
+**Decided for Phase 1: (b),** with rules that never use names. **Recommended as a Wave 2 follow-up, for the owner to approve: (a′) and (c),** which change what a viewer reads without touching the bounds. They're not in Phase 1 because they change ADR 0010's tagging and the agent prompts, and the fixtures and evaluation set would change twice.
+
+### 3. Redaction and privacy
+
+- **Only the demo's own sessions keep text, login, and host** (`is_demo`). Any other session in a chain keeps its ID, status, waits, and locks only.
+- **Text is normalized before it's stored:** string, number, date, binary, and GUID literals become `?`, IPv4 and IPv6 addresses `<ip>`; at most 2,000 characters for a statement and 1,000 for a detail. The runner's calls are parameterized, so their text is already literal-free.
+- **Then the existing redaction:** the runner's own, and the notebook's `redact()`. A value that still looks like a secret is dropped, not stored. Tests build their fake secrets at run time.
+- **Never captured:** passwords, connection strings, tokens, Key Vault values, or anything outside ContosoCare's own sessions and objects.
+
+### 4. Transport into the history
+
+Through the control channel that exists, with no new resource or grant ([transport](../../rca/README.md#transport)):
+
+- **Export:** `ContosoCare.Workload rca export` reduces the capture into evidence documents: columnar JSON with string dictionaries ([schema](../../rca/evidence.schema.json)), gzipped and printed as part lines under a managed Run Command's 4 KB.
+- **Into the control vault:** the control runbook writes the parts as earlier versions of its existing `dbhub-session-metrics` secret and lists them in that secret's final version, the metrics document the control notebook already reads. The deployer's existing grant on the secret covers its versions.
+- **Into the history:** the control notebook passes the parts to `NB_DatabaseHub_LiveActivity` as `RCA_EVIDENCE`, which writes the tables. `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot run the same export with the operator's role and pass `RCA_EVIDENCE` straight to the notebook.
+- **A session the nightly stop ended** keeps its evidence on the VM's disk, and the next start exports it.
+- **Not chosen for the default:**
+
+  | Option | Why not |
+  |---|---|
+  | The runner writes to OneLake with T1's managed identity | A Fabric workspace role for T1's identity (a new role assignment) and a tenant setting. The best opt-in later: no size budget |
+  | A storage account | A new resource, and a SAS (a secret) or a new role assignment |
+  | Diagnostic settings to Log Analytics | New resources with ingestion cost, no T1 or T2, and the notebook still can't read it without a grant |
+  | A new control-vault secret | Its grant needs an Owner again (per-secret RBAC): not one click for existing environments |
+
+### 5. The history: eight tables and the model
+
+`NB_DatabaseHub_LiveActivity` writes them as it writes the others (delete the run's rows, append with `mergeSchema`), and backfills nothing. Columns, types, keys, model names, relationships, and measures: [`rca/history-tables.json`](../../rca/history-tables.json), which the notebook's, the model's, and the app's tests read.
+
+| Lakehouse table | Model table | Grain | Phase |
+|---|---|---|---|
+| `rca_sessions` | RCA Sessions | A session in a blocking or activity sample | 1 |
+| `rca_events` | RCA Events | An error, attention, deadlock, escalation, tuning change, or capture episode's start or end | 1 |
+| `rca_resource` | RCA Resource | A counter or resource sample (long format) | 1 |
+| `rca_replica` | RCA Replica | A replay sample on either side of T4's replication | 1 |
+| `rca_coverage` | RCA Coverage | What was captured for a target and window, and why not | 1 |
+| `rca_waits` | RCA Waits | A wait type in an episode or its baseline | 2 |
+| `rca_queries` | RCA Queries | A Query Store plan in an episode or its baseline | 2 |
+| `rca_answer_key` | RCA Answer Key | The runner's own runs and their events, on every target, T4 and T5 included | 1 |
+
+- **Detection tables carry no scenario, run ID, or incident key.** The answer key is its own table, in the model's Answer key folder, read only by the scoreboard and the tests.
+- **The model:** the eight tables in Direct Lake, related to Target and Date only, with measures such as Blocked Sessions (captured), Head Blocker Idle (s), Deadlocks (captured), Errors (captured), Lock Escalations (captured), Replica Replay Stall (s), and Injected Faults (Answer key). `npm run guide:build` regenerates the chat's model guide from the TMDL, without the answer key ([§8](#8-the-chat-as-the-first-line-investigator)).
+- **T4's and T5's beats join the answer key,** which closes ADR 0030's gap: Wave 2's scoreboard can grade them.
+- **The deployment notebook's purge** (`PURGE_DEMO_TABLES` and `CONFIRM`) drops the eight tables too.
+
+### 6. Investigations, rules, and recommendations
+
+One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RCA view, the postmortem, and the chat's tools: the same rows always give the same answer. Each finding cites its evidence rows, and each root cause carries its confidence: **high** when two independent kinds of evidence agree, **medium** when one carries it, **low** when only a metric's shape is left, which the answer says.
+
+| ID | Investigation | Rules | Phase |
+|---|---|---|---|
+| INV-00 | Triage: what was abnormal, where, and when | The detector's episodes, ranked; "nothing abnormal" with the quiet targets | 1 |
+| INV-01 | Blocking and lock waits: the chain, head blocker first, its statement or procedure, who ran it | `BLK-IDLE-HEAD`, `BLK-PG-IDLE-IN-TRANSACTION`, `BLK-LONG-RUNNING`, `BLK-CLIENT-NOT-FETCHING`, `BLK-ESCALATION` | 1 |
+| INV-02 | Deadlocks: the victim, the resources, both statements | `DLK-ORDER`, `DLK-CONVERSION`, `DLK-MIXED`, `DLK-PG` | 1 |
+| INV-12 | Errors by class: deadlock victims, lock timeouts, attentions, resource governance, PostgreSQL's classes, T5's 429s | `ERR-<class>` | 1 |
+| INV-13 | Connection capacity on T4 | `ERR-CONNECTION-REFUSED` | 1 |
+| INV-15 | Read replica lag: why it rose at a certain time | `REPL-REPLAY-CONFLICT`, `REPL-REPLAY-SLOW`, `REPL-SHIPPING`, `REPL-IDLE-PRIMARY`, `REPL-CATCHUP`, `REPL-REPLAY-STALLED` | 1 |
+| INV-03 to 11, INV-14 | CPU and plans; governance and capacity; IO; log and the log rate governor; memory grants; latch and tempdb; parallelism; workers; the client not reading; Cosmos DB RU pressure | `WAIT-*`, `RU-*` | 2 |
+
+- **The head blocker's kind** follows Learn's blocking scenarios ([understand and resolve blocking](https://learn.microsoft.com/troubleshoot/sql/database-engine/performance/understand-resolve-blocking)): idle with an open transaction, long-running, a client not fetching, or a rollback; then depth, width, blocked count and time, and its formations.
+- **The replica's lag** separates a restart's catch-up (`replicaCatchUp`, ADR 0025) from a replay conflict (the startup process waiting on a lock a replica query holds), slow replay, slow shipping (write and flush lag), and an idle primary, with the WAL rate beside it.
+- **Every demo scenario is covered** by an evaluation case that names its real cause from blind evidence. No scenario exhausts workers yet, so INV-10's rule is tested with fixtures only.
+- **The recommendation catalog:** 39 entries, each with why, its risk, who approves it (the application owner for code, the DBA for settings, both where a setting changes what the application sees, the service owner for cost), and its Microsoft Learn page (the PostgreSQL documentation for core PostgreSQL behavior). Rules pick entries by ID. Neither the app nor Copilot writes or applies a fix.
+
+### 7. The RCA view
+
+- **Where:** an incident on the Incidents page, an episode on Mission Control's ribbon, or a fault the scoreboard caught opens its **Root cause** view.
+- **What it shows:** the episode and its window, in the viewer's time and UTC, with its source and support; the root cause with its confidence; **the blocking chain as a tree, head blocker first** (its module or statement, program, login, host, status, idle time, open transaction, and lock); the timeline (blocked sessions, CPU or lag, the capture's episodes, errors); the errors by class; recommendations with their Learn links and who approves each; next steps; what wasn't captured; **Explain this incident** (Copilot) and **Show the DAX**.
+- **When causes share a target's minutes,** the view ranks them by confidence, then impact: the first is the root cause, and the others show under "Also in these minutes". It never picks one because it was planned.
+- **The look:** ADR 0030's stage, with Microsoft's palette and Fluent 2, in every theme the app offers: **Light**, **Dark**, **High contrast**, and **Use the system setting** (`fabric/app/src/theme/`), and Windows forced colors. Colors come from the stage tokens, never hard-coded, so each theme's contrast holds; the tests check it where the app tests themes today.
+
+### 8. The chat as the first-line investigator
+
+- **Tools, not raw DAX:** six deterministic tools in Phase 1, beside the dock's four (`run_dax`, `show_chart`, `suggest_followups`, `estate_overview`), within the relay's 16: `triage_window`, `find_incidents`, `explain_incident` (by a blind episode's key), `explain_locking`, `explain_errors`, and `explain_replica_lag`. Phase 2 adds `explain_waits`. Like `run_dax`, they run in the app with the viewer's own Fabric token, with at most one DAX query per RCA table, bounded results, and every query under "Show the sources"; the relay still runs nothing ([ADR 0028](0028-ask-copilot-in-the-insights-app.md#tools-that-run-in-the-page-as-the-viewer)).
+- **The playbook,** in the system message: scope the time window, triage, explain the top hypotheses with the tools, then answer with the root cause and its evidence and times, the recommendations with their Learn links and who approves each, the next steps, and what wasn't captured.
+- **The grounding rules:** every claim cites captured rows and their times; it says "not captured" rather than guess; it never names a scenario or says what was injected, which it can't know.
+- **The dock is blind too:** `run_dax` refuses DAX that names an answer-key table, and the model guide leaves them out. A page's Ask context never carries answer-key rows, so the scoreboard's three Ask entries that hand over its grading go ([open item 7](#decisions-and-open-items)).
+- **Sample questions,** with the owner's live session of 2026-11-20 (ET):
+  - "Why was ContosoCare slow at 11:56?" T3's CPU at 100 % from 11:56 to 12:17, and T5 at 100 % normalized RU with about 1,300 to 2,100 429s a minute. In Phase 2 also the cause: Query Store's regressed plan, `FORCE_LAST_GOOD_PLAN` off from 11:52, and the last good plan forced at 12:18:00, after which CPU averaged 42.5 % at 12:18 and 7 % at 12:19 to 12:20.
+  - "Who blocked whom at 12:05, and what should we do?" The chain, head blocker first, with its procedure, program, login, idle time, open transaction, and lock; its depth and width; the escalation; the recommendations.
+  - "Why did the replica's lag spike at 12:14?" Lag at 45, 106, then 166 s from 12:12, back to 1 s at 12:15. The replay waited on a lock a long query held on the replica, while the primary's WAL was small and shipped at once (write and flush lag near 0): a replay conflict, not WAL volume or the network.
+  - "What errors did the app hit during the incident?" The errors by class and minute, with their modules; T5's 429s from Azure Monitor.
+- **The evaluation set:** 30 cases, 4 of them from that live session, each with the facts a blind answer must contain and what it must not say (a scenario's name, "injected"). They're graded offline against the answer key, and later builds run them against the real model (Phase 3).
+- **Capture now:** not in v1. The sentinel and the episodes make the history specific enough for every scenario the demo injects, and the app stays the analysis product, working from saved history.
+
+### 9. The postmortem's Cause
+
+Today the Cause section lists what was injected ([`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163). In Phase 1 it comes from the blind RCA: for each episode, `explain_incident`'s root cause, confidence, and cited rows, or "not captured" and why (RCA Coverage). The injected list moves to a section of its own, "What the demo injected (answer key)", with the scoreboard's measurements. The Copilot draft writes only the blind sections, and the app appends that one itself.
+
+### 10. Permissions, cost, and volume
+
+| Target | Identity (existing) | What it has | What the capture needs (documented) | New grant |
+|---|---|---|---|---|
+| T1 | the runner as SYSTEM | sysadmin (BUILTIN\Administrators) | VIEW SERVER PERFORMANCE STATE; CREATE ANY or ALTER ANY EVENT SESSION | None |
+| T2, from Arc Jumpstart's image | SYSTEM in the guest | sysadmin | the same | None |
+| T2, a kept PaygWizard guest | SYSTEM | `contosocare_runner` only | the same | None: not captured, an `RCA.CAPTURE.T2` **Warning** with the fix (`./scripts/deploy.ps1` rebuilds T2 from the image) |
+| T3 | T1's managed identity, dbo through the P6 group | CONTROL on the database | VIEW DATABASE STATE; CREATE ANY DATABASE EVENT SESSION | None. The hardened option needs both granted to `contosocare_runner` in `030-configure.sql`: database permissions, not role assignments |
+| T4 and its replica | T1's managed identity as `contosocare_runner` | `pg_read_all_stats` (T4's setup grants it) | The role sees every demo session; `pg_read_all_stats` adds the startup process's wait and `pg_stat_replication`'s details; `pg_locks` and the replay functions need nothing | None |
+| Azure Monitor, Run Command, the control vault | the control runbook's identity; the operator's Contributor | what they use today | more Run Commands, versions of the metrics secret | None |
+
+- **No new role assignment,** no new resource, and nothing for the person running the demo.
+- **Cost:** no new Azure or Fabric resource. The capture's queries took 1 to 5 ms on average locally (33 ms at most); the export adds 1 to 2 minutes to a stop; the notebook writes small tables in seconds; tool results are 5 to 30 KB per call on the viewer's own Copilot. Nothing in the cost estimate changes ([ADR 0016](0016-cost-profiles.md)).
+- **Volume, with sentinel-triggered capture:** the always-on parts are the sentinel's counters (about 7,000 rows and 8 to 12 KB of gzip per 90 minutes; the fixtures measure 150 rows in 248 bytes) and RCA-AZ-01 (about 1,800 rows, 4.6 KB). Detail costs about 3 KB per 15 minutes of 10-second blocking on one target, and 0.8 KB per replica stall. A 90-minute showcase comes to about 30 to 45 KB in transit, under the reducer's 64 KiB aim and the 96 KiB limit ([limits](../../rca/README.md#limits)), and 1 to 2 MB of Delta. Cuts, if any, are recorded as coverage gaps, which the chat says.
+
+### 11. Existing environments, and one click
+
+- **`./scripts/deploy.ps1` updates everything,** as today: the runner, the runbooks, the notebooks, the semantic model, and the app. No new grant, so no Owner step.
+- **Anything older degrades and says so,** with ADR 0012's statuses: an older runner can't export (`RCA.EXPORT` **Warning**, fixed by `./scripts/deploy.ps1`); a target the observer can't read is an `RCA.CAPTURE.<target>` **Warning** with its reason; an older notebook ignores `RCA_EVIDENCE`; the app hides the RCA view and the tools when the model has no RCA tables, and says why; a session saved before the feature says "no RCA capture recorded", and the chat falls back to the telemetry it has.
+- **Nothing changes for the person running the demo:** Run all, stop, and the history save work as today.
+
+### Decisions and open items
+
+**Decided, recorded by the coordinator on 2026-11-20 as the owner's approval of the spike's recommendations, which the owner can change by number:**
+
+1. **The event session,** with the [ADR 0010 amendment](0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20).
+2. **Transport through the control vault's secret versions,** with no new grant.
+3. **No capture now** for the chat in v1.
+4. **The 30-second sentinel** for the whole session, with detail capture in the episodes it sees.
+5. **The runner's existing sign-in** for the observer.
+
+Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answer key in exactly two places (the coordinator, 2026-11-20, settled by the owner's question about grading).
+
+**Open for the owner, numbered after the decisions:**
+
+- **6. Names** ([§2](#2-names)): **recommended,** (a′) and (c) as a Wave 2 follow-up; Phase 1 does (b).
+- **7. The scoreboard's Ask entries** that hand its grading to Copilot (`ScoreboardPage.tsx`, lines 203, 220, and 233): **recommended,** remove them in Phase 1, so the chat never sees the answer key, and keep the one about T4's and T5's metrics (line 250), which reads metrics only. The alternative keeps them, each in a conversation of its own labeled "Answer key", without the investigation tools.
+- **8. The release's wording** that reads as blind detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)): one-line fixes, for the release's owner. Wave 2's detector then makes "caught" true as written.
+
+## Where the data lives, how long it's kept, and who keeps it
+
+| Data | Where it lives | How long | Configurable | Who keeps it longer |
+|---|---|---|---|---|
+| **Database Hub's SQL telemetry** (T1, T2, T3) | A Microsoft-managed Azure Data Explorer cluster: the `ArcSqlTelemetry` database at `https://adx.centralus.arcdataservices.com/kusto/` ([connect](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#connect-to-the-telemetry)). Not in the customer's Fabric workspace, capacity, or Azure subscription | Up to 7 days; Learn's Query 2 shows the window a tenant actually has ([query 2](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#query-2-estate-summary-and-available-time-range)) | No: no retention, size, or location setting, and it's a preview. What the customer controls is which resources send it | The customer: "You can't change retention or add tables. To keep data longer, export query results to your own store" ([limitations](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#limitations)) |
+| **T4's, its replica's, and T5's metrics** | Azure Monitor platform metrics, Microsoft-managed | 93 days ([retention of metrics](https://learn.microsoft.com/azure/azure-monitor/metrics/data-platform-metrics#retention-of-metrics)); a deleted replica's metrics go with it ([ADR 0025](0025-t4-read-replica.md)) | No | The customer |
+| **The RCA's own capture** | On T1's VM and in T2's guest (`C:\ProgramData\DbHubDemo\rca\`) until its export | Deleted 7 days after its export | No | It goes into the demo's history |
+| **The demo's history** | `LH_DatabaseHub`'s Delta tables, in the demo's Fabric workspace, in OneLake: the customer's own store | Until `./scripts/destroy.ps1` without `-KeepFabric`, or the deployment notebook's purge (`PURGE_DEMO_TABLES` and `CONFIRM`) | Yes: it's the customer's lakehouse | The demo does it for them |
+
+- **Database Hub's telemetry costs nothing and needs nothing deployed:** "Enabling performance monitoring doesn't incur an extra cost", and "the data isn't stored at rest outside the geography of the monitored SQL resource" ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)). The Database Hub "is free". Reading it takes the Reader role, or higher, on each subscription, and "The endpoint returns rows only for resources your account can access" ([prerequisites](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#prerequisites)).
+- **The store always exists, but each resource is off until its monitoring is on** ([enable performance monitoring](https://learn.microsoft.com/fabric/database/hub/add-sql)). `deploy.ps1` turns it on for every SQL target and checks it:
+  - **T1 (SQL Server on an Azure VM):** the SQL IaaS Agent extension's `DatabaseWatcheronAzureVM` flag ([Learn](https://learn.microsoft.com/fabric/database/hub/add-sql#enable-performance-monitoring-for-sql-server-on-azure-vms)), by `Enable-DemoSqlVmMonitoring`, checked as `T1.SQLVM.MONITORING`.
+  - **T2 (SQL Server enabled by Azure Arc):** Arc's monitoring setting, `properties.monitoring.enabled` ([Learn](https://learn.microsoft.com/fabric/database/hub/add-sql#enable-performance-monitoring-for-sql-server-enabled-by-azure-arc)), by `Set-DemoArcSqlConfiguration`, checked as `T2.ARC.MONITORING`. In `t2SqlInstallMode` `Developer` it's **Not supported**: the Developer edition gets no Arc monitoring, so T2 shows in the Estate view only ([ADR 0006](0006-sql-editions-and-licensing.md)); the default, `JumpstartImage`, has it.
+  - **T3 (Azure SQL Database):** the `MS_EnablePerformanceMonitoringPreview` extended property ([Learn](https://learn.microsoft.com/fabric/database/hub/add-sql#enable-performance-monitoring-for-azure-sql-database)), by `database/azuresql/040-performance-monitoring.sql`, checked as `T3.PROPERTY`.
+  - **The `Microsoft.Sql` resource provider,** registered on the subscription ([Learn](https://learn.microsoft.com/fabric/database/hub/add-sql#register-the-sql-resource-provider)) by preflight, checked as `PREFLIGHT.P2.PROVIDERS`.
+- **The demo's history is loaded by `NB_DatabaseHub_LiveActivity`,** which Run all runs at each session's end, as do `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot. The semantic model reads it, and the app and the report query the model. **The app stores nothing.**
+- **The RCA's part:** its own capture from the targets, because Database Hub's telemetry is resource-level and doesn't record who blocked whom. It flows through the same notebook into the same lakehouse, kept the same way: 1 to 2 MB per session.
+
+```mermaid
+flowchart LR
+    subgraph ms["Kept by Microsoft"]
+        adx["Database Hub's SQL telemetry<br/>ArcSqlTelemetry, Azure Data Explorer<br/>T1, T2, T3: up to 7 days"]
+        am["Azure Monitor platform metrics<br/>T4, its replica, T5: 93 days"]
+    end
+    subgraph vms["On the demo's VMs"]
+        obs["The RCA observer's capture<br/>T1 to T4 and the replica<br/>deleted 7 days after its export"]
+    end
+    vault["The control vault<br/>dbhub-session-metrics versions"]
+    nb["NB_DatabaseHub_LiveActivity<br/>at each session's end"]
+    lh["LH_DatabaseHub Delta tables, OneLake<br/>until destroy.ps1 or the purge"]
+    sm["SM_DatabaseHub_History<br/>Direct Lake"]
+    app["The Insights app and the report<br/>store nothing"]
+    adx -- "KQL" --> nb
+    am -- "the control runbook" --> vault
+    obs -- "rca export, Run Command" --> vault
+    vault -- "the control notebook" --> nb
+    am -. "stop-demo.ps1 -SaveHistory" .-> nb
+    obs -. "stop-demo.ps1 -SaveHistory" .-> nb
+    nb --> lh --> sm --> app
+```
+
+## Wave 1 audit: where it reads the answer key
+
+Wave 1 is built as verification against the plan, by design ([ADR 0030](0030-insights-app-mission-control.md#2-did-we-catch-it-the-scoreboard)). Where it reads the key, and how (line numbers at a8d51ac):
+
+| Where | What it reads | How |
+|---|---|---|
+| [`lib/scoreboard.ts`](../../fabric/app/src/lib/scoreboard.ts), lines 1 to 8, 147 to 200 (`isFault`, `toPlans`) | Scenario Runs: each injected fault and its window | Looks for each fault's expected signal from its injection to `TELEMETRY_LAG_MINUTES` after its window |
+| `lib/scoreboard.ts`, lines 343 to 350 (`baselineOf`) | Every injected window that raises the signal | Leaves those windows out of the baseline: it knows where not to look |
+| `lib/scoreboard.ts`, lines 361 to 384 (`firstRun`); the notebook's `signal_episodes` (`NB_DatabaseHub_LiveActivity.ipynb`, JSON lines 686 to 709) | Telemetry bins | Blind in itself, but a bin without a value breaks a run: the 65.95 % miss on session 81446b84 |
+| The notebook's `incident_window_rows` (JSON lines 1670 to 1700) and `expected_signals` (677 to 684) | Scenario Runs | Turns an episode that overlaps a planned window and matches its expected signal into that window's evidence; an incident outside every window is a **Warning** |
+| [`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163 | Scenario Runs | The Cause is what was injected |
+| [`pages/IncidentsPage.tsx`](../../fabric/app/src/pages/IncidentsPage.tsx), lines 50 and 290; the agent loop, lines 112 to 168 | Incident Windows' scenario; the beat's run events | Shows the scenario; Respond and Verify read the workload's own events |
+
+**Release wording that reads as blind detection,** with one-line fixes:
+
+| Where | Today | Fix |
+|---|---|---|
+| `pages/ScoreboardPage.tsx`, line 57 | Column "Caught?" | "Signal seen?" |
+| `pages/ScoreboardPage.tsx`, lines 137 and 166; `pages/KioskPage.tsx`, line 132 | "Did we catch it? 17 of 19"; "Caught: signal visible" | Keep the title, and add the subtitle "Verified against the injected faults: each one's expected signal, in its own window" |
+| `pages/ScoreboardPage.tsx`, lines 64 and 167; `pages/MissionControlPage.tsx`, line 153; `pages/KioskPage.tsx`, line 125; `lib/postmortem.ts`, lines 121 and 180 | "Time to detect", "Median time to detect" | "Time to signal", "Median time to signal" (the sub-line "injected → signal visible" already says what it is) |
+| `lib/view-state.ts`, line 47 | "Every injected fault, detected and recovered" | "Every injected fault: its signal in its window, and its recovery" |
+| `pages/IncidentsPage.tsx`, line 290 | "detected in the telemetry" beside "scenario …" | Unchanged; label recorded rows "Injected (answer key)" when Wave 2 adds blind episodes beside them |
+
+Wave 2's shared detector ([above](#the-shared-blind-detector)) replaces the scoreboard's per-fault search, so "caught" then means what it says.
+
+## Phase 1
+
+Built in parallel against [the contract](../../rca/README.md), each part with its own tests against the shared fixtures:
+
+| Step | Who | What |
+|---|---|---|
+| The contract | This ADR's first commit | The schemas, the tables' spec, the capture catalog, the blind-detection lists, the fixtures, and their tests |
+| 1.1, 1.2 Capture | A session of its own | The observer lane, its triggers, names, and normalization, the local store, `rca export` and `rca part` |
+| 1.3 to 1.5 Transport and history | A session of its own | The runbook's export and bundles; the scripts' `RCA_EVIDENCE`; the notebook's decoder and eight tables; the purge; the model |
+| 1.6, 1.7 The app and its docs | This ADR's session | The blind detector and rules, the DAX loader, the six tools, the playbook, the RCA view in every theme, the postmortem's Cause, the chat's blindness, the gating; the docs |
+| 1.8 Live validation | After the three merge | A full Run all on a test environment; the evaluation set's Phase 1 cases; real fixtures recorded from it |
+
+Phase 2 (waits by class, `explain_waits`, the view's waits and plans) and Phase 3 (the chat proven with the real model) follow, one pull request each. The estimate: 30 to 43 engineer-days for all three, Phase 1 the longest.
+
+## Consequences
+
+- The chat answers "who blocked whom", "why slow", "what errors", and "why did the replica lag" from saved evidence, blind, with the procedure, the program and login, the lock, the times, the cause's confidence, Learn-backed recommendations, and what wasn't captured.
+- One rules implementation serves the RCA view, the postmortem, the chat, and in Wave 2 the scoreboard.
+- The scoreboard can say "caught without being told" truthfully once Wave 2's detector powers it, including the faults it missed and its false alarms.
+- The runner grows an observer lane, an export command, and a reducer; the runbook an export step; the notebook eight tables; the model eight tables; the app a detector, a view, and six tools.
+- The evidence is a sample, not a trace: an event between samples shows only through counters and the event session. The chat says "not captured" for the rest.
+- The export budget caps the detail per session; cuts are recorded and said.
+- ADR 0028's dock changes: `run_dax` refuses the answer-key tables, and the model guide leaves them out.
+
+## Validation
+
+- **The spike (2026-11-20):** every T4 capture query ran on a local PostgreSQL 18.6 primary and hot standby while the repository's own runner ran its locking, idle-in-transaction, and replica-lag scenarios; all 24 T-SQL blocks parse with the SQL Server 2022 grammar (`TSql160Parser`, as `SqlScriptTests`), and their column references are on their objects' Learn pages; 101 Vitest tests in the app's harness checked the rules, the tools, and the evaluation set.
+- **The contract:** after the blind changes, all 24 T-SQL blocks parse again and all 12 PostgreSQL blocks run again on the local primary and standby. `tests/unit/Rca.Contract.Tests.ps1` (29 tests) checks the schemas against the tables' spec, the fixtures against the schemas, their parts' decoding and SHA-256, the transport's sizes, the blind-detection lists, and the capture catalog; a probe file that named a scenario in `fabric/app/src/rca/` made it fail.
+- **What needs a live target:** the SQL Server and Azure SQL Database blocks (T3's `sys.dm_exec_requests` scope and its XACT resources, the event sessions), Azure PostgreSQL's `pg_read_all_stats`, and the chat's prose with the real model. Step 1.8 checks the first three; Phase 3 the last.
+
+## Sources
+
+The documentation behind each capture block and rule is listed with it: [the capture catalog](../../rca/capture/README.md) and the recommendation catalog in the app. Database Hub's telemetry: [query performance monitoring telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry) and [enable performance monitoring](https://learn.microsoft.com/fabric/database/hub/add-sql). Metric retention: [Azure Monitor Metrics](https://learn.microsoft.com/azure/azure-monitor/metrics/data-platform-metrics#retention-of-metrics). Run Command's output: [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed). Notebook token audiences: [NotebookUtils credentials](https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-credentials#get-token). Blocking: [understand and resolve blocking](https://learn.microsoft.com/troubleshoot/sql/database-engine/performance/understand-resolve-blocking).

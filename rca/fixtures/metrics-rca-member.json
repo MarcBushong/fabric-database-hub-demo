@@ -1,0 +1,20 @@
+{
+  "kind": "ContosoCare.RcaBundleIndex",
+  "version": 1,
+  "sessionId": "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21",
+  "bundles": ["6b7ae2f7dd09836a2f374c9f743efc0c"],
+  "documents": [
+    {
+      "documentId": "20261120T165000Z-sqlvm01-0001",
+      "parts": 2,
+      "sha256": "7e42591cefe5d42017ff3f0f318ba5934f49ad9a7bea669a3c02360269a4b555"
+    },
+    {
+      "documentId": "20261120T170000Z-sqlvm01-0002",
+      "parts": 2,
+      "sha256": "9079b2bf824cead969b9c1899f61567c4bcb3da3bad6a88d1f213c275d3a38b1"
+    }
+  ],
+  "status": "Pass",
+  "message": "2 evidence documents in 4 parts, in 1 earlier version(s) of dbhub-session-metrics."
+}

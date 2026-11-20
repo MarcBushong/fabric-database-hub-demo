@@ -1,0 +1,866 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/evidence.schema.json",
+  "title": "Incident RCA evidence document, version 1 (ADR 0031)",
+  "description": "What the runner's observer exports for one host and one slice of a session: the detection tables (what a DBA's tools would see), in columns, with one string dictionary, and the answer key (what the workload injected) in its own section with its own dictionary. Generated from rca/history-tables.json; rca/README.md explains every rule this schema can't express (equal column lengths, dictionary indexes in range, time offsets, and the limits).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "version",
+    "documentId",
+    "sessionId",
+    "producer",
+    "exportedUtc",
+    "sequence",
+    "final",
+    "windowStartUtc",
+    "windowEndUtc",
+    "targets",
+    "epochUtc",
+    "strings",
+    "tables",
+    "answerKey"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "ContosoCare.RcaEvidence"
+    },
+    "version": {
+      "const": 1
+    },
+    "documentId": {
+      "$ref": "#/$defs/documentId"
+    },
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "The control's session ID (DbHubSessionId), or null when the runner ran outside a control session."
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "host",
+        "lane"
+      ],
+      "properties": {
+        "name": {
+          "const": "ContosoCare.Workload"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "host": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,39}$",
+          "description": "The host that ran the observer, lowercase: sqlvm01 (T1's VM) or arcsql01 (T2's guest)."
+        },
+        "lane": {
+          "const": "observer"
+        }
+      }
+    },
+    "exportedUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9999,
+      "description": "The export's number for this host and session, from 1."
+    },
+    "final": {
+      "type": "boolean",
+      "description": "True for the export at the session's end."
+    },
+    "windowStartUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "windowEndUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/target"
+      },
+      "description": "The targets this document covers, each with an RCA Coverage row."
+    },
+    "epochUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "strings": {
+      "$ref": "#/$defs/strings"
+    },
+    "tables": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rca_coverage"
+      ],
+      "description": "The detection tables. A table with no rows is left out; rca_coverage never is.",
+      "properties": {
+        "rca_sessions": {
+          "description": "RCA Sessions (rca_sessions): One session in one sample of a blocking chain: every session that waits on another, and every session another waits on.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "captured_at_utc",
+                "target",
+                "session_id",
+                "is_demo"
+              ],
+              "properties": {
+                "captured_at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "session_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "blocked_by": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "status": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "wait_type": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "wait_ms": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "wait_resource": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_resource_type": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_object": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_index": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_mode_wanted": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_mode_held": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "open_transactions": {
+                  "$ref": "#/$defs/integerColumn"
+                },
+                "transaction_age_ms": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "idle_ms": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "login_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "host_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "program_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "run_token": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "module_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "statement_text": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "input_buffer": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "backend_type": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "is_demo": {
+                  "$ref": "#/$defs/booleanRequiredColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_waits": {
+          "description": "RCA Waits (rca_waits): One wait type's delta over one phase of a capture episode: the episode itself, or the baseline just before it.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target",
+                "phase",
+                "window_start_utc",
+                "window_end_utc",
+                "wait_type",
+                "wait_ms"
+              ],
+              "properties": {
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "episode_id": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "phase": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "window_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "window_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "wait_type": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "wait_category": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "wait_ms": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "waiting_tasks": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "signal_ms": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "max_wait_ms": {
+                  "$ref": "#/$defs/longColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_events": {
+          "description": "RCA Events (rca_events): One server-side event, or one count of identical events per minute: an error, an attention, a deadlock, a lock escalation, a tuning change, or the observer's own capture escalation.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "event_time_utc",
+                "target",
+                "kind",
+                "event_count",
+                "detail"
+              ],
+              "properties": {
+                "event_time_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "kind": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "event_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "session_id": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "program_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "run_token": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "login_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "host_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "module_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "code": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "severity": {
+                  "$ref": "#/$defs/integerColumn"
+                },
+                "intercepted": {
+                  "$ref": "#/$defs/booleanColumn"
+                },
+                "event_count": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "object_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "lock_mode": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "detail": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "deadlock_json": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_queries": {
+          "description": "RCA Queries (rca_queries): One Query Store plan over one phase of a capture episode.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target",
+                "phase",
+                "interval_start_utc",
+                "interval_end_utc",
+                "query_id",
+                "plan_id",
+                "executions"
+              ],
+              "properties": {
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "episode_id": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "phase": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "interval_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "interval_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "query_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "plan_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "query_hash": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "module_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "statement_text": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "executions": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "cpu_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "duration_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "logical_reads": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "physical_reads": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "log_bytes": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "max_used_memory_kb": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "max_dop": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "plans_for_query": {
+                  "$ref": "#/$defs/integerColumn"
+                },
+                "is_forced_plan": {
+                  "$ref": "#/$defs/booleanColumn"
+                },
+                "plan_forcing_type": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_resource": {
+          "description": "RCA Resource (rca_resource): One counter or resource sample, in long format: the sentinel's counters, and the resource samples of capture episodes.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at_utc",
+                "target",
+                "source",
+                "metric",
+                "value"
+              ],
+              "properties": {
+                "at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "source": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "metric": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "value": {
+                  "$ref": "#/$defs/doubleRequiredColumn"
+                },
+                "unit": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_replica": {
+          "description": "RCA Replica (rca_replica): One replay sample from one side of T4's replication: the read replica's replay state and conflicts, or the primary's view of the standby.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at_utc",
+                "target",
+                "side"
+              ],
+              "properties": {
+                "at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "side": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "standby_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "since_last_replayed_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "received_not_replayed_bytes": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "replay_lag_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "write_lag_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "flush_lag_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "send_gap_bytes": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "wal_bytes_per_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "startup_wait": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_relation": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_wanted_mode": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_wait_start_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "conflict_holder_session": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "conflict_holder_mode": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_holder_program": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_holder_run_token": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflict_holder_statement": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "conflicts_cancelled": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "max_standby_streaming_delay_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_coverage": {
+          "description": "RCA Coverage (rca_coverage): What the observer captured for one target over one document's window, and what it didn't, with why.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target",
+                "window_start_utc",
+                "window_end_utc",
+                "captured"
+              ],
+              "properties": {
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "window_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "window_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "captured": {
+                  "$ref": "#/$defs/booleanRequiredColumn"
+                },
+                "sources": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "gaps": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "answerKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strings",
+        "tables"
+      ],
+      "description": "What the workload injected: for the scoreboard and the tests only. Its own string dictionary, so it never shares a string with the detection tables.",
+      "properties": {
+        "strings": {
+          "$ref": "#/$defs/strings"
+        },
+        "tables": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rca_answer_key": {
+              "description": "RCA Answer Key (rca_answer_key): One fault the workload injected (kind run) or one event it reported about its own fault (kind run-event): the answer key, which only the scoreboard and the tests read.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "rows",
+                "columns"
+              ],
+              "properties": {
+                "rows": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 20000
+                },
+                "columns": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "target",
+                    "event_time_utc",
+                    "scenario",
+                    "scenario_run_id",
+                    "run_token"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "$ref": "#/$defs/stringRequiredColumn"
+                    },
+                    "target": {
+                      "$ref": "#/$defs/stringRequiredColumn"
+                    },
+                    "event_time_utc": {
+                      "$ref": "#/$defs/timestampRequiredColumn"
+                    },
+                    "end_time_utc": {
+                      "$ref": "#/$defs/timestampColumn"
+                    },
+                    "scenario": {
+                      "$ref": "#/$defs/stringRequiredColumn"
+                    },
+                    "scenario_run_id": {
+                      "$ref": "#/$defs/stringRequiredColumn"
+                    },
+                    "run_token": {
+                      "$ref": "#/$defs/stringRequiredColumn"
+                    },
+                    "event_name": {
+                      "$ref": "#/$defs/stringColumn"
+                    },
+                    "outcome": {
+                      "$ref": "#/$defs/stringColumn"
+                    },
+                    "detail": {
+                      "$ref": "#/$defs/stringColumn"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,7})?Z$"
+    },
+    "documentId": {
+      "type": "string",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$",
+      "maxLength": 80,
+      "description": "<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>."
+    },
+    "target": {
+      "enum": [
+        "T1",
+        "T2",
+        "T3",
+        "T4",
+        "T4-replica",
+        "T5"
+      ]
+    },
+    "strings": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "string",
+        "maxLength": 4000
+      }
+    },
+    "stringColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      }
+    },
+    "stringRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "timestampColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "timestampRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer"
+      }
+    },
+    "longColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "longRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer"
+      }
+    },
+    "integerColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": -2147483648,
+        "maximum": 2147483647
+      }
+    },
+    "integerRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer",
+        "minimum": -2147483648,
+        "maximum": 2147483647
+      }
+    },
+    "doubleColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "doubleRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "number"
+      }
+    },
+    "booleanColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "booleanRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "boolean"
+      }
+    }
+  }
+}
