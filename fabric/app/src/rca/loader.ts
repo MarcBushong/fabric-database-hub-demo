@@ -32,18 +32,20 @@ export interface DaxLog {
 const daxTime = (d: Date) =>
     `DATE ( ${d.getUTCFullYear()}, ${d.getUTCMonth() + 1}, ${d.getUTCDate()} ) + TIME ( ${d.getUTCHours()}, ${d.getUTCMinutes()}, ${d.getUTCSeconds()} )`;
 
-/** One table's rows for the window and targets, oldest first. */
+/** One table's rows for the window and targets, oldest first. A table of intervals (RCA Coverage, RCA Waits) keeps every
+ *  interval that overlaps the window: a session exported once has one coverage row from its start to its end. */
 export function rcaDax(key: RcaTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
     const spec = RCA_SPEC[key];
     const fields = spec.fields as Record<string, { model: string }>;
     const time = fields[spec.time].model;
     const t = `'${spec.model}'[${time}]`;
+    const end = spec.time === "from" && fields.to ? `'${spec.model}'[${fields.to.model}]` : null;
     const list = targets.map((target) => `"${target}"`).join(", ");
     return [
         "EVALUATE",
         "CALCULATETABLE (",
         `    '${spec.model}',`,
-        `    ${t} >= ${daxTime(from)},`,
+        end ? `    ${end} >= ${daxTime(from)},` : `    ${t} >= ${daxTime(from)},`,
         `    ${t} <= ${daxTime(to)},`,
         `    TREATAS ( { ${list} }, '${TARGET_KEY.table}'[${TARGET_KEY.column}] )`,
         ")",

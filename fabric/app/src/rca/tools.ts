@@ -204,6 +204,9 @@ function bounded(result: InvestigationResult): string {
 
 const RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
 
+/** The episodes Phase 1 explains with a cause from the capture or the metrics; the others are telemetry-only for now. */
+export const EXPLAINED_FAMILIES: readonly string[] = ["blocking", "deadlock", "replica_lag", "errors", "connections", "throttling", "ru"];
+
 /** One session of a chain, head first, with what a DBA reads off it: what it ran, who ran it, its wait, and its lock. */
 export interface ChainNodeView {
     session: number;
@@ -381,7 +384,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         }
         const parts = (await Promise.all(chosen.map(explainEpisode))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
         // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and its cause isn't captured.
-        const telemetryOnly = chosen.filter((e) => !["blocking", "deadlock", "replica_lag", "errors", "connections", "throttling", "ru"].includes(e.family));
+        const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
         const causes = [
             ...parts.filter((p) => p.rootCause).map((p) => p.rootCause!),
             ...telemetryOnly.map((e) => ({

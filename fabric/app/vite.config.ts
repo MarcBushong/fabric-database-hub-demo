@@ -2,7 +2,7 @@
 // React with SWC, the dev-only Local Network Access headers for running inside the Fabric portal's frame,
 // and THIRD_PARTY_NOTICES.txt for every bundled dependency.
 import react from "@vitejs/plugin-react-swc";
-import { defineConfig, type PluginOption } from "vite";
+import { defineConfig, searchForWorkspaceRoot, type PluginOption } from "vite";
 import license from "rollup-plugin-license";
 import { resolve } from "path";
 
@@ -33,6 +33,10 @@ export default defineConfig({
     plugins: [react(), localNetworkAccessPlugin],
     resolve: {
         alias: { "@": resolve(projectRoot, "src") },
+    },
+    // The local preview (preview.html, dev only) reads the Incident RCA's contract fixtures where they live (rca/fixtures).
+    server: {
+        fs: { allow: [searchForWorkspaceRoot(projectRoot), resolve(projectRoot, "../../rca/fixtures")] },
     },
     build: {
         sourcemap: false,

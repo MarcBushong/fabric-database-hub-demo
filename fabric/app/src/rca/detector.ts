@@ -468,5 +468,5 @@ export function describeEpisode(e: Episode): string {
             : e.support === "sparse"
               ? `in ${e.atLevel} samples, ${e.unknown} of the samples between them without a value`
               : `in ${e.atLevel} samples in a row`;
-    return `${e.target}: ${e.signal} over ${round(e.level)}${unit} ${span}, peak ${round(e.peak)}${unit} at ${t(e.peakAt)} UTC, ${how} (${e.source}).`;
+    return `${e.target}: ${e.signal} ${e.level === 0 ? "above zero" : `over ${round(e.level)}${unit}`} ${span}, peak ${round(e.peak)}${unit} at ${t(e.peakAt)} UTC, ${how} (${e.source}).`;
 }

@@ -132,9 +132,11 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
             $section.Contains($table.name) | Should -BeTrue -Because $table.name
             $columns = $section[$table.name].properties.columns
             @($columns.properties.Keys | Sort-Object) | Should -Be @($table.columns.name | Sort-Object) -Because $table.name
-            @($columns.required | Sort-Object) | Should -Be @($table.columns | Where-Object { $_.required } | ForEach-Object { $_.name } | Sort-Object) -Because $table.name
+            # Under the static validation's Set-StrictMode -Version Latest, a column without 'required' has no such key or property.
+            $isRequired = { param($c) if ($c -is [System.Collections.IDictionary]) { [bool]($c.Contains('required') -and $c['required']) } else { [bool]($c.PSObject.Properties['required'] -and $c.PSObject.Properties['required'].Value) } }
+            @($columns.required | Sort-Object) | Should -Be @($table.columns | Where-Object { & $isRequired $_ } | ForEach-Object { $_.name } | Sort-Object) -Because $table.name
             foreach ($column in $table.columns) {
-                $expected = '#/$defs/{0}{1}Column' -f $column.type, $(if ($column.required) { 'Required' } else { '' })
+                $expected = '#/$defs/{0}{1}Column' -f $column.type, $(if (& $isRequired $column) { 'Required' } else { '' })
                 $columns.properties[$column.name]['$ref'] | Should -Be $expected -Because "$($table.name).$($column.name)"
             }
         }

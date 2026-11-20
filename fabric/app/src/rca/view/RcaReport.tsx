@@ -112,7 +112,16 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
     const lag = (replica?.lag as Array<{ at: string; seconds: number }> | undefined) ?? [];
     const classes = (errors?.details?.classes as ErrorClass[] | undefined) ?? [];
     const also = (incident.details?.alsoInTheseMinutes as string[] | undefined) ?? [];
-    const notCaptured = [...new Set([...incident.notCaptured, ...(errors?.notCaptured ?? [])])];
+    // The errors' window and an incident's parts each say "no RCA capture recorded" for their own minutes: one per target is enough.
+    const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA capture recorded/.exec(s)?.[1];
+    const said = new Set<string>();
+    const notCaptured = [...new Set([...incident.notCaptured, ...(errors?.notCaptured ?? [])])].filter((s) => {
+        const target = noCapture(s);
+        if (!target) return true;
+        if (said.has(target)) return false;
+        said.add(target);
+        return true;
+    });
     const recommendations = [...new Map([...incident.recommendations, ...(errors?.recommendations ?? [])].map((r) => [r.id, r])).values()];
     const cause = incident.rootCause;
     const confidence = cause ? (cause.confidence === "high" ? "accent" : cause.confidence === "low" ? "alert" : "") : "";

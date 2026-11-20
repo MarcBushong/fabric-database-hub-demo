@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ANSWER_KEY_TABLES } from "@/copilot/answer-key";
 import type { QuerySpec } from "@/data/queries";
-import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, rcaMonitorDax, rcaRowLimit } from "./loader";
+import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
 import { createRcaSources, newestCapturePerBin } from "./sources";
 import { createInvestigationTools } from "./tools";
 
@@ -26,6 +26,14 @@ describe("the investigations' sources", () => {
         expect(dax).toContain(`'Telemetry Snapshots'[Target Key] IN { "T4-replica", "T5" }`);
         expect(dax).toContain("'Telemetry Snapshots'[Bucket UTC] >= DATE ( 2026, 11, 20 ) + TIME ( 17, 0, 0 )");
         for (const table of ANSWER_KEY_TABLES) expect(dax).not.toContain(table);
+    });
+
+    // A session exported once has one coverage row from its start to its end: a window late in it must still find that row.
+    it("find a coverage interval that overlaps the window, not only one that starts in it", () => {
+        const dax = rcaDax("coverage", at("17:00"), at("17:20"), ["T1"]);
+        expect(dax).toContain("'RCA Coverage'[Window End UTC] >= DATE ( 2026, 11, 20 ) + TIME ( 17, 0, 0 )");
+        expect(dax).toContain("'RCA Coverage'[Window Start UTC] <= DATE ( 2026, 11, 20 ) + TIME ( 17, 20, 0 )");
+        expect(rcaDax("sessions", at("17:00"), at("17:20"), ["T1"])).toContain("'RCA Sessions'[Captured At UTC] >= DATE ( 2026, 11, 20 ) + TIME ( 17, 0, 0 )");
     });
 
     it("keep the newest capture of each bin, as the model's measures do", () => {
