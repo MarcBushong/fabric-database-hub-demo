@@ -12,6 +12,7 @@ import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc } from "./
 import {
     boundText,
     EVENT_LABEL,
+    comparePlanEvents,
     minutesText,
     planEvents,
     RECOVERED_BINS,
@@ -23,6 +24,7 @@ import {
     type FaultScore,
     type MeasuredEpisode,
     type Plan,
+    type PlanEvent,
 } from "./scoreboard";
 
 export interface PostmortemInput {
@@ -133,11 +135,11 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("");
 
     lines.push("## Timeline (UTC)", "");
-    const timeline = [
-        ...planEvents(scores, episodes).map((e) => ({ at: e.at, row: [time(e.at), e.target, EVENT_LABEL[e.kind], e.label] })),
+    const timeline: Array<{ event: Pick<PlanEvent, "at" | "kind" | "orderAt">; row: string[] }> = [
+        ...planEvents(scores, episodes).map((e) => ({ event: e, row: [time(e.at), e.target, EVENT_LABEL[e.kind], e.label] })),
         // A fault that isn't measured still has its injection, from Scenario Runs.
-        ...unscored.map((r) => ({ at: r.windowStart ?? plan.start, row: [time(r.windowStart), r.target, EVENT_LABEL.injected, `${faultTitle(r)} on ${r.target} (not measured)`] })),
-    ].sort((a, b) => a.at.getTime() - b.at.getTime());
+        ...unscored.map((r) => ({ event: { at: r.windowStart ?? plan.start, kind: "injected" as const }, row: [time(r.windowStart), r.target, EVENT_LABEL.injected, `${faultTitle(r)} on ${r.target} (not measured)`] })),
+    ].sort((a, b) => comparePlanEvents(a.event, b.event));
     if (timeline.length === 0) lines.push("No event in this window.");
     else lines.push(...table(["Time", "Target", "Event", "Detail"], timeline.map((t) => t.row)));
     lines.push("");
@@ -205,7 +207,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## How this was measured", "");
     lines.push(
         "- **What was injected:** Scenario Runs, which the analysis notebook writes at the session's end from the control's plan.",
-        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them.`,
+        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to detect is 0, written as at most one bin, and the timeline tells the injection first.`,
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
         "",

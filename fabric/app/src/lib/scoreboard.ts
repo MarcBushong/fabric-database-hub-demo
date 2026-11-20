@@ -851,25 +851,39 @@ export interface PlanEvent {
     /** The fault's or episode's key. */
     ref: string;
     label: string;
+    /** When it's told, if not at `at`: a signal shows at its bin's start, which can be before its fault's injection in that bin. */
+    orderAt?: Date;
 }
 
 export const EVENT_LABEL: Record<PlanEventKind, string> = { injected: "Injected", visible: "Signal visible", answered: "Answered", recovered: "Recovered" };
 
-/** Every fault's and episode's moments, in time order. */
+const KIND_ORDER: Record<PlanEventKind, number> = { injected: 0, visible: 1, answered: 2, recovered: 3 };
+
+/**
+ * The order moments are told in: by the minute, and within a minute as they happen to a fault: injected, signal visible,
+ * answered, recovered. A fault's later moments are never told before its injection (`orderAt`).
+ */
+export function comparePlanEvents(a: Pick<PlanEvent, "at" | "kind" | "orderAt">, b: Pick<PlanEvent, "at" | "kind" | "orderAt">): number {
+    const ta = (a.orderAt ?? a.at).getTime();
+    const tb = (b.orderAt ?? b.at).getTime();
+    return Math.floor(ta / MIN) - Math.floor(tb / MIN) || KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || ta - tb;
+}
+
+/** Every fault's and episode's moments, in the order they happened (comparePlanEvents). */
 export function planEvents(scores: readonly FaultScore[], episodes: readonly MeasuredEpisode[] = []): PlanEvent[] {
     const out: PlanEvent[] = [];
     for (const s of scores) {
+        const after = (at: Date) => (at.getTime() < s.injectedAt.getTime() ? { orderAt: s.injectedAt } : {});
         out.push({ at: s.injectedAt, kind: "injected", target: s.target, ref: s.key, label: `${s.title} on ${s.target}` });
-        if (s.visibleAt) out.push({ at: s.visibleAt, kind: "visible", target: s.target, ref: s.key, label: `${s.target} ${s.signal}` });
-        if (s.answeredAt) out.push({ at: s.answeredAt, kind: "answered", target: s.target, ref: s.key, label: s.answer });
-        if (s.recoveredAt) out.push({ at: s.recoveredAt, kind: "recovered", target: s.target, ref: s.key, label: `${s.target} back under its bound` });
+        if (s.visibleAt) out.push({ at: s.visibleAt, kind: "visible", target: s.target, ref: s.key, label: `${s.target} ${s.signal}`, ...after(s.visibleAt) });
+        if (s.answeredAt) out.push({ at: s.answeredAt, kind: "answered", target: s.target, ref: s.key, label: s.answer, ...after(s.answeredAt) });
+        if (s.recoveredAt) out.push({ at: s.recoveredAt, kind: "recovered", target: s.target, ref: s.key, label: `${s.target} back under its bound`, ...after(s.recoveredAt) });
     }
     for (const e of episodes) {
         out.push({ at: e.visibleAt, kind: "visible", target: e.target, ref: e.key, label: `${e.target} ${e.signal}` });
         if (e.recoveredAt) out.push({ at: e.recoveredAt, kind: "recovered", target: e.target, ref: e.key, label: `${e.target} recovered` });
     }
-    const order: Record<PlanEventKind, number> = { injected: 0, visible: 1, answered: 2, recovered: 3 };
-    return out.sort((a, b) => a.at.getTime() - b.at.getTime() || order[a.kind] - order[b.kind]);
+    return out.sort(comparePlanEvents);
 }
 
 /** The next fault to be injected after `at`, and in how many minutes: the replay's countdown. */

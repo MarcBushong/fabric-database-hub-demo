@@ -400,4 +400,21 @@ describe("the postmortem", () => {
         expect(ctx.rows?.[2]).toMatchObject({ target: "T3", service: "Scheduling", injected: "2026-11-17T14:03:00.000Z", ttdMin: 1, ttrMin: 24, status: "Pass" });
         expect(ctx.dax).toMatch(/^\/\/ Sessions and activity requests\nEVALUATE/);
     });
+
+    it("tells a fault's injection before its signal, though the signal's bin starts before the injection (F17)", () => {
+        // The control injected at 13:30:20, and the signal shows in the bin that starts at 13:30:00.
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:blocking-chain", 20 / 60, 10)];
+        const sessionPlan = toPlans(runs)[0];
+        const [score] = scorePlan(sessionPlan, { bins: bins("T1", (m) => (m < 10 ? { blocked: 5 } : {})), beats: [], runs });
+        expect(score.visibleAt).toEqual(at(0));
+        // Never a negative time to detect: 0, written as at most one bin.
+        expect(score.ttdMin).toBe(0);
+        expect(planEvents([score]).map((e) => e.kind)).toEqual(["injected", "visible", "recovered"]);
+        const { markdown } = buildPostmortem({ ...input, plan: sessionPlan, scores: [score], episodes: [], beat: null });
+        expect(markdown.split("\n").filter((l) => l.startsWith("| 13:30 | T1 |")).map((l) => l.split(" | ")[2])).toEqual(["Injected", "Signal visible"]);
+        expect(markdown).toContain("| Deep blocking chain and lock escalation | T1 | 13:30 | 13:30 | ≤ 1 min |");
+        // In a 5-minute bin, the signal's time can be minutes before the injection: it's still told after it.
+        const late = { ...score, injectedAt: new Date(T0 + 140000), visibleAt: at(0), recoveredAt: at(15) };
+        expect(planEvents([late]).map((e) => `${e.kind} ${e.at.toISOString().slice(11, 16)}`)).toEqual(["injected 13:32", "visible 13:30", "recovered 13:45"]);
+    });
 });
