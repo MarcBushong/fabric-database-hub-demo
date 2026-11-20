@@ -1,13 +1,38 @@
-// Small parts the Wave 1 pages share: the broadcast-style numbers, the lens switch, the session picker, a preview of the
-// postmortem's own Markdown, and what a page says when part of its history didn't load or its session isn't in the period.
+// Small parts the Wave 1 pages share: the broadcast-style numbers, the lens switch, the session picker, the postmortem's
+// button and a preview of its own Markdown, and what a page says when part of its history didn't load or its session
+// isn't in the period.
 
 import { Fragment, type ReactNode } from "react";
-import { Button, MessageBar, MessageBarActions, MessageBarBody, Select, ToggleButton } from "@fluentui/react-components";
+import { Button, MessageBar, MessageBarActions, MessageBarBody, Select, ToggleButton, Tooltip } from "@fluentui/react-components";
+import { DocumentText16Regular } from "@fluentui/react-icons";
 
 import { EmptyState } from "@/components/EmptyState";
 import type { Plan } from "@/lib/scoreboard";
 import type { Lens } from "./ServiceMap";
 import { planOption } from "./timeline";
+
+/** Why the postmortem waits while the telemetry hasn't loaded. */
+export const POSTMORTEM_WAITS = "The telemetry didn't load, so no fault is measured yet: select Retry, then write the postmortem.";
+
+/**
+ * "Write the postmortem", once the session's faults are scored: not while they load, and not while the telemetry they're
+ * scored from has failed, when the page names the failure with Retry (a postmortem then would have no measured fault).
+ */
+export function PostmortemButton({ ready, scoreError, onClick }: { ready: boolean; scoreError: Error | null; onClick: () => void }) {
+    const waits = ready && scoreError !== null;
+    const button = (
+        <Button size="small" icon={<DocumentText16Regular />} disabled={!ready} disabledFocusable={waits} onClick={onClick}>
+            Write the postmortem
+        </Button>
+    );
+    return waits ? (
+        <Tooltip content={POSTMORTEM_WAITS} relationship="description">
+            {button}
+        </Tooltip>
+    ) : (
+        button
+    );
+}
 
 /** A big number with its label and what it rests on. */
 export function BigStat({ label, value, sub, tone }: { label: string; value: string; sub?: ReactNode; tone?: "alert" | "good" | "quiet" }) {

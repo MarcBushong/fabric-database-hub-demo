@@ -114,8 +114,14 @@ export default function KioskPage() {
                     <div className="kiosk-mission">
                         <ServiceMap nodes={nodes} lens="business" motion={!reducedMotion} title="ContosoCare's services, in business words" hubLine={plan ? `${plan.label}` : "care network"} />
                         <div className="kiosk-stats">
-                            <BigStat label="Faults injected" value={plan ? String(summary.faults) : "–"} sub={plan ? `${formatDayUtc(plan.start)} ${formatTimeUtc(plan.start)}–${formatTimeUtc(plan.end)} UTC` : undefined} />
-                            <BigStat label="Seen in telemetry" value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"} tone={summary.notVisible ? "alert" : "good"} />
+                            {/* What was injected is the plan's; what showed, the scores', which a telemetry failure leaves empty. */}
+                            <BigStat label="Faults injected" value={plan ? String(plan.faults.length) : "–"} sub={plan ? `${formatDayUtc(plan.start)} ${formatTimeUtc(plan.start)}–${formatTimeUtc(plan.end)} UTC` : undefined} />
+                            <BigStat
+                                label="Seen in telemetry"
+                                value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"}
+                                sub={data.scoreError ? "The telemetry didn't load, so nothing is measured" : undefined}
+                                tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined}
+                            />
                             <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} />
                             <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} />
                         </div>
@@ -123,7 +129,8 @@ export default function KioskPage() {
                 ) : null}
                 {scene === "scoreboard" && plan ? (
                     <div className="kiosk-score">
-                        <h2>{`Did we catch it? ${summary.visible} of ${summary.faults}`}</h2>
+                        <h2>{summary.faults ? `Did we catch it? ${summary.visible} of ${summary.faults}` : "Did we catch it?"}</h2>
+                        {data.scoreError ? <p className="kiosk-empty">{`The telemetry didn't load, so none of the ${plan.faults.length} faults is measured yet: the kiosk tries again every ${RETRY_SECONDS} s.`}</p> : null}
                         <SessionRibbon plan={plan} scores={scores} episodes={episodes} />
                         <ul className="kiosk-impacts">
                             {[...scores.filter((s) => s.impact).map((s) => s.impact!), ...episodes.map((e) => e.impact)].slice(0, 6).map((impact, i) => (

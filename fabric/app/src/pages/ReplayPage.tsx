@@ -1,9 +1,10 @@
 // Session replay (ADR 0030): play a whole session back across every engine, with the service map, the five engines'
-// charts, and the event ribbon on one scrubber. The moment is kept in the app's address (#/replay?s=<session>&r=<minute>).
+// charts, and the event ribbon on one scrubber. The moment is kept in the app's address (#/replay?r=<minute>, and
+// s=<session> once the viewer picked one or copied a link to the moment).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@fluentui/react-components";
-import { DocumentText16Regular, HeartPulse20Regular, Trophy20Regular } from "@fluentui/react-icons";
+import { HeartPulse20Regular, Trophy20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
@@ -18,7 +19,7 @@ import { isEmbedded, toHash } from "@/lib/view-state";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { EVENT_LABEL, planEvents } from "@/lib/scoreboard";
 import { CinematicReplay } from "@/mission/CinematicReplay";
-import { LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
+import { LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import type { Lens } from "@/mission/ServiceMap";
 import { Stage } from "@/mission/Stage";
@@ -69,13 +70,16 @@ export default function ReplayPage() {
     const [moment, setMoment] = useState<{ key: string | null; minute: number } | null>(null);
     const minute = moment && moment.key === planKey ? moment.minute : view.session === null || view.session === planKey ? view.replay : null;
     const onMinute = useCallback((next: number) => setMoment({ key: planKey, minute: next }), [planKey]);
+    // The address takes the moment, not the session: that stays the viewer's pick, or none to follow the latest, so a later
+    // visit never opens on a session nobody chose.
     useEffect(() => {
-        if (!moment || moment.key !== planKey || (moment.minute === view.replay && view.session === planKey)) return;
-        const timer = window.setTimeout(() => setView({ replay: moment.minute, session: planKey }), ADDRESS_DELAY_MS);
+        if (!moment || moment.key !== planKey || moment.minute === view.replay) return;
+        const timer = window.setTimeout(() => setView({ replay: moment.minute }), ADDRESS_DELAY_MS);
         return () => window.clearTimeout(timer);
-    }, [moment, planKey, view.replay, view.session, setView]);
+    }, [moment, planKey, view.replay, setView]);
     const copyLink = async () => {
-        // The address takes the moment now, and the copied link carries it, whatever the delay above.
+        // Copying the link is a pick: the address takes the moment and its session now, and the copied link carries both,
+        // whatever the delay above.
         setView({ replay: minute, session: planKey });
         const url = new URL(window.location.href);
         url.hash = toHash({ ...view, replay: minute, session: planKey });
@@ -98,20 +102,17 @@ export default function ReplayPage() {
                     </div>
                     <div className="mc-actions">
                         <LensSwitch lens={lens} onChange={setLens} />
-                        <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: plan?.key ?? null })}>
+                        <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: view.session })}>
                             Mission Control
                         </Button>
-                        <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: plan?.key ?? null })}>
+                        <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: view.session })}>
                             Scoreboard
                         </Button>
-                        <Button
-                            size="small"
-                            icon={<DocumentText16Regular />}
-                            disabled={!plan || data.loading}
+                        <PostmortemButton
+                            ready={Boolean(plan) && !data.loading}
+                            scoreError={data.scoreError}
                             onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, generatedAt: new Date() })}
-                        >
-                            Write the postmortem
-                        </Button>
+                        />
                     </div>
                 </header>
                 <div className="mc-filter">

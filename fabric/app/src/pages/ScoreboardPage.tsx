@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import { Button } from "@fluentui/react-components";
-import { DocumentText16Regular, Replay20Regular, HeartPulse20Regular } from "@fluentui/react-icons";
+import { Replay20Regular, HeartPulse20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
@@ -20,7 +20,7 @@ import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/
 import { aggregate, boundText, minutesText, RECOVERED_BINS, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { ChartView } from "@/visuals/ChartView";
-import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker } from "@/mission/parts";
+import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import type { Lens } from "@/mission/ServiceMap";
 import { SessionRibbon } from "@/mission/SessionRibbon";
@@ -91,7 +91,7 @@ function aggChart(rows: readonly Aggregate[], title: string) {
 }
 
 export default function ScoreboardPage() {
-    const { setView, navigate, provenance, meta } = useApp();
+    const { view, setView, navigate, provenance, meta } = useApp();
     const data = useMission(ACROSS);
     const [lens, setLens] = useState<Lens>("technical");
     const [selected, setSelected] = useState<string | null>(null);
@@ -141,18 +141,15 @@ export default function ScoreboardPage() {
                     </div>
                     <div className="mc-actions">
                         <LensSwitch lens={lens} onChange={setLens} />
-                        <Button size="small" appearance="primary" icon={<Replay20Regular />} disabled={!plan} onClick={() => navigate("replay", { session: plan?.key ?? null })}>
+                        <Button size="small" appearance="primary" icon={<Replay20Regular />} disabled={!plan} onClick={() => navigate("replay", { session: view.session })}>
                             Replay
                         </Button>
-                        <Button
-                            size="small"
-                            icon={<DocumentText16Regular />}
-                            disabled={!plan || data.loading}
+                        <PostmortemButton
+                            ready={Boolean(plan) && !data.loading}
+                            scoreError={data.scoreError}
                             onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, generatedAt: new Date() })}
-                        >
-                            Write the postmortem
-                        </Button>
-                        <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: plan?.key ?? null })}>
+                        />
+                        <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: view.session })}>
                             Mission Control
                         </Button>
                     </div>
