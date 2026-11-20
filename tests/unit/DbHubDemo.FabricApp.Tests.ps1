@@ -1770,6 +1770,27 @@ Describe 'configure-fabric-app.ps1' {
             $message | Should -Not -Match 'again|twice'
         }
 
+        It 'promises no sign-in at the next run when an expiry wasn''t retried on a PC with no Rayfin sign-in, and records no refusal (F16 re-review)' {
+            # A token the caller passed: no new one to take, so rayfin up doesn't run again. The module's own deploy, whose
+            # rayfin up says the token expired; Pester mocks the module-qualified name too, so the mock runs its script block.
+            $real = (Get-Module -Name DbHubDemo).ExportedFunctions['Invoke-DemoFabricAppDeployment'].ScriptBlock
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith { & $real @PesterBoundParameters }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'error'; error = 'Request failed with status code 401: Access token has expired, resubmit with a new access token' } -ExitCode 1 }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -MockWith { }
+            $ownSignIn = 'Manual action required'
+            $output = Join-Path -Path $TestDrive -ChildPath 'expired-once-no-signin.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token 6>&1
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 1 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -Times 0 -Exactly -Because 'an expiry isn''t a refusal'
+            $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+            $tokenRecord = $records | Where-Object checkId -EQ 'FABRIC.APP.TOKEN'
+            $tokenRecord.message | Should -Match '^The Azure CLI''s token expired during rayfin up, and no new one was available, and the Rayfin CLI isn''t signed in'
+            $tokenRecord.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it tries again with a fresh token from the Azure CLI\.'
+            $tokenRecord.remediation | Should -Not -Match 'starts that sign-in'
+            ($records | Where-Object checkId -EQ 'FABRIC.APP.DEPLOY').status | Should -Be 'Not selected'
+        }
+
         It 'says no new one was available, and doesn''t run rayfin up again, when the Azure CLI gives no new token after an expiry (F16 review)' {
             $pass = $script:passResult
             Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }

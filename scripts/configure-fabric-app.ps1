@@ -532,7 +532,17 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
             $own.message = '{0} (FABRIC.APP.TOKEN), and {1}{2}' -f $short, $own.message.Substring(0, 1).ToLowerInvariant(), $own.message.Substring(1)
         }
         $tokenMessage = if ($signedIn) { '{0}, so the Rayfin CLI''s own sign-in deploys the app: {1}' -f $lead, $refusal } else { '{0}, and the Rayfin CLI isn''t signed in to the demo''s tenant, so the app wasn''t deployed: {1}' -f $lead, $refusal }
-        $tokenFix = if ($signedIn) { '' } else { 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app. The next ./scripts/deploy.ps1 starts that sign-in at its start too.' }
+        # An expiry with no new token to take (F16) isn't a refusal, and nothing recorded one, so the next run takes a fresh
+        # token instead of starting a sign-in.
+        $tokenFix = if ($signedIn) {
+            ''
+        }
+        elseif ($expiredKind -eq 'once') {
+            'Run ./scripts/deploy.ps1 again: it tries again with a fresh token from the Azure CLI. Or run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app.'
+        }
+        else {
+            'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app. The next ./scripts/deploy.ps1 starts that sign-in at its start too.'
+        }
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.TOKEN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message $tokenMessage -Evidence ([ordered]@{ refusal = $refusal; fallback = $(if ($signedIn) { 'rayfinSignIn' } else { 'none' }); signInNeeded = (-not $signedIn) }) -Remediation $tokenFix -DocUrl 'https://learn.microsoft.com/fabric/apps/cli-reference'))
         $deploy = if ($signedIn) {
             @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$DryRun -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
