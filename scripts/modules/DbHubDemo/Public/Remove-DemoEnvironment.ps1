@@ -60,13 +60,15 @@ function Remove-DemoEnvironment {
     there and Save, and why, and DESTROY.HUB.AGENT.T3, a Manual action required once the group is gone, gives the steps
     (Get-DemoT3AgentRemovalItem). Database Hub keeps a deleted database selected, and a Save fails as a whole while one
     is, so every later Save, the next deployment's T3 included, fails until it's removed. It changes nothing else, and
-    the exit code doesn't count it.
+    the exit code doesn't count it. The golden boot test's group (purpose t2-golden-boot-test, test-t2-golden.ps1) has a
+    deploymentId tag but never a T3, so it gets neither the line nor DESTROY.HUB.AGENT.T3 (Get-DemoDestroyExtraPlan's
+    NoT3; review of 5d1f4b0).
 
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.FABRIC.CONTROL, DESTROY.FABRIC.WORKSPACE, DESTROY.CONTROL (with DESTROY.CONTROL.ROLES
     and DESTROY.CONTROL.RESOURCES when it went), DESTROY.ENTRA.GROUP, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES,
-    DESTROY.RESOURCEGROUP, DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.HUB.AGENT.T3 (when T3's name is known),
-    DESTROY.DEPLOYMENT, DESTROY.BUDGET,
+    DESTROY.RESOURCEGROUP, DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.HUB.AGENT.T3 (when T3's name is known, and
+    the group isn't the golden boot test's), DESTROY.DEPLOYMENT, DESTROY.BUDGET,
     DESTROY.SAFETYSTOP.ROLE (the nightly safety stop's custom role, deleted once no assignment holds it, ADR 0024; its
     identity, account, schedules, and assignment go with the group), DESTROY.GOLDEN, the
     TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL. With -ResidueOnly it deletes nothing and asks nothing: it runs
@@ -258,8 +260,9 @@ function Remove-DemoEnvironment {
         Write-DemoLog -Message $goldenNote
     }
     # T3's selection in Database agent settings (2026-11-20), which no API removes: what to do, and why, before anything
-    # goes, and again at the end (DESTROY.HUB.AGENT.T3).
+    # goes, and again at the end (DESTROY.HUB.AGENT.T3). Neither for the golden boot test's group, which has no T3 (NoT3).
     $agentServer = [string](Get-DemoMemberValue -InputObject $extra -Name 'T3Agent')
+    $agentNone = [bool](Get-DemoMemberValue -InputObject $extra -Name 'NoT3')
     $agentNote = Get-DemoT3AgentRemovalItem -Config $Config -ServerName $agentServer
     if ($null -ne $agentNote) {
         Write-DemoLog -Level Warning -Message ('{0} DESTROY.HUB.AGENT.T3 at the end says how ({1}).' -f $agentNote.message, $agentNote.docUrl)
@@ -404,10 +407,13 @@ function Remove-DemoEnvironment {
     }
 
     # T3 is gone, but not its selection in Database agent settings (2026-11-20), which no API removes: a Manual action
-    # required that changes nothing else. The manifest names T3 on a run after the group is gone too.
-    $agentItem = Get-DemoT3AgentRemovalItem -Config $Config -ServerName $(if ($manifestId -match '^[a-z0-9]{6}$') { 'azuresql01-{0}' -f $manifestId } else { $agentServer })
-    if ($null -ne $agentItem) {
-        $results.Add($agentItem)
+    # required that changes nothing else. The manifest names T3 on a run after the group is gone too. The golden boot
+    # test's group has a deploymentId but never a T3, so it gets none (review of 5d1f4b0).
+    if (-not $agentNone) {
+        $agentItem = Get-DemoT3AgentRemovalItem -Config $Config -ServerName $(if ($manifestId -match '^[a-z0-9]{6}$') { 'azuresql01-{0}' -f $manifestId } else { $agentServer })
+        if ($null -ne $agentItem) {
+            $results.Add($agentItem)
+        }
     }
 
     # The subscription-scope deployment record outlives the group (history only, but it holds the parameters).

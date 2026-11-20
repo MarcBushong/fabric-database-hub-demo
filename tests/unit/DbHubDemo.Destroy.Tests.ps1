@@ -597,6 +597,7 @@ Describe 'Get-DemoDestroyExtraPlan keeps T3''s selection in Database agent setti
         Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { $script:tags }
         $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
         $plan.T3Agent | Should -Be $Server
+        $plan.NoT3 | Should -BeFalse -Because 'only the golden boot test''s group is known to have no T3'
         $line = @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' })
         if ($Server) {
             $line | Should -Be @('T3''s selection in Database Hub''s Database agent settings (azuresql01-abc123/ContosoCare), if you made it: no API removes it')
@@ -604,6 +605,17 @@ Describe 'Get-DemoDestroyExtraPlan keeps T3''s selection in Database agent setti
         else {
             $line.Count | Should -Be 0
         }
+    }
+
+    It 'names no T3 for the golden boot test''s group, which has a deploymentId tag but never a T3, and says so in NoT3 (review of 5d1f4b0)' {
+        # test-t2-golden.ps1 deletes rg-<prefix>-gtest through this path. Its group has a random deploymentId tag, but
+        # infra/golden-test.bicep deploys only the network and archost01, so every run, -CleanupOnly too, ended with "1 item(s)
+        # need you: ... uncheck azuresql01-<random>/ContosoCare" for a database that never existed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'k3x9q2'; purpose = 't2-golden-boot-test'; environment = 'gtest' } }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be ''
+        $plan.NoT3 | Should -BeTrue
+        @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' }).Count | Should -Be 0
     }
 
     It 'goes on without T3''s name when the tag can''t be read' {
