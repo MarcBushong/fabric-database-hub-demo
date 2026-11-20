@@ -38,7 +38,7 @@ export interface EstateCall {
 
 /** One view of the live estate, as the app's estate function answers it (EstateAnswer in rayfin/functions). */
 export interface EstateToolAnswer {
-    /** The Database Hub routes that answered. */
+    /** The Database Hub routes the function called: one that failed is listed too, with its reason in errors. */
     source: string[];
     data: unknown;
     /** One plain sentence when the live view isn't available to the app: no route answered, for an authentication reason. */
@@ -296,19 +296,25 @@ export function createToolRunner(deps: AskToolDeps) {
         }
         const source = Array.isArray(answer?.source) ? answer.source.filter((s): s is string => typeof s === "string") : [];
         const errors = Array.isArray(answer?.errors) ? answer.errors.map(String) : [];
+        // The function lists a route in source before it calls it, so a route answered only when none of its calls failed.
+        const answered = source.filter((route) => !errors.some((e) => e.startsWith(`${route}:`)));
+        // An answer without data has nothing to read, whatever its source says (R924's shape for a total failure: data {}).
+        const data = answer?.data;
+        const noData = typeof data !== "object" || data === null || Object.keys(data).length === 0;
         const unavailable = typeof answer?.unavailable === "string" && answer.unavailable.trim() ? plainReason(answer.unavailable) : null;
         // No route answered: Copilot gets one plain sentence, never the per-route reasons (they're for the function's log).
-        if (unavailable || source.length === 0) {
+        // Only unavailable turns the live view off for the conversation; after any other failure the next question tries again.
+        if (unavailable || answered.length === 0 || noData) {
             const reason = unavailable ?? LIVE_NO_ANSWER;
             if (unavailable) deps.onLiveUnavailable?.(unavailable);
             deps.onEstate?.({ id, view, source: [], error: reason, ms: now() - started, at: new Date(started) });
             return { ok: false, text: unavailable ? liveOffText(reason) : `${reason} ${FROM_HISTORY}` };
         }
-        deps.onEstate?.({ id, view, source, result: answer.data, ms: now() - started, at: new Date(started) });
+        // The routes are the row's source, like a query's DAX; Copilot gets the data, never route names it could repeat.
+        deps.onEstate?.({ id, view, source: answered, result: answer.data, ms: now() - started, at: new Date(started) });
         const missing = errors.length > 0 ? missingParts(errors) : [];
         const text = JSON.stringify({
             view,
-            source,
             at: answer.at,
             data: answer.data,
             ...(missing.length > 0 ? { missing, note: `These parts of the live view didn't answer: ${missing.join("; ")}. Say which, in plain words.` } : {}),

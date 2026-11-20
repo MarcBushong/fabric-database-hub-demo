@@ -30,7 +30,7 @@ export interface TurnSummary {
     /** Assistant messages, and the characters of text they hold. */
     messages: number;
     textChars: number;
-    /** The text of the model's final answer: in and after its last message that asked for tools (all text when none did). */
+    /** The text of the model's final answer, as the dock counts it: after its last message that asked for a query (all text when none did). */
     finalTextChars: number;
     /** Per assistant message, in order, "<text characters>/<tool requests>" (the last 30). */
     rounds: string;
@@ -41,6 +41,12 @@ export interface TurnSummary {
 
 /** How long the end of a turn waits for the session's history; the page gets idle either way. */
 export const HISTORY_READ_MS = 5000;
+
+/**
+ * The page's tools that add to an answer instead of querying: any other tool request is a query. The dock counts as the
+ * answer only the text after a turn's last query, and text in the message that asks for a query comes before its rows.
+ */
+const ANSWER_TOOLS = new Set(["suggest_followups", "show_chart"]);
 
 /** Who a token belongs to and its Copilot plan, as Copilot itself resolves them. */
 export interface CopilotIdentity {
@@ -94,6 +100,8 @@ interface Round {
     text: number;
     streamed: number;
     tools: number;
+    /** Tool requests that query (any tool but ANSWER_TOOLS). */
+    queries: number;
 }
 
 interface TurnState {
@@ -223,8 +231,10 @@ export class AskBridge {
         const content = typeof d.content === "string" ? d.content : "";
         const round = this.round(messageId);
         if (round) {
+            const requests: unknown[] = Array.isArray(d.toolRequests) ? d.toolRequests : [];
             round.text = content.trim().length;
-            round.tools = Array.isArray(d.toolRequests) ? d.toolRequests.length : 0;
+            round.tools = requests.length;
+            round.queries = requests.filter((r) => !ANSWER_TOOLS.has(String((r as { name?: unknown } | null)?.name ?? ""))).length;
         }
         if (!content.trim() || this.forwarded.get(messageId) === content.length) return false;
         this.forwarded.set(messageId, content.length);
@@ -237,7 +247,7 @@ export class AskBridge {
         if (!turn) return null;
         let round = turn.rounds.get(messageId);
         if (!round) {
-            round = { text: 0, streamed: 0, tools: 0 };
+            round = { text: 0, streamed: 0, tools: 0, queries: 0 };
             turn.rounds.set(messageId, round);
         }
         return round;
@@ -303,9 +313,10 @@ export class AskBridge {
         this.turn = null;
         const rounds = [...turn.rounds.values()];
         const chars = (r: Round) => r.text || r.streamed;
-        let lastAsk = -1;
+        // The answer is the text after the last message that asked for a query, as the dock counts it (ANSWER_TOOLS).
+        let lastQuery = -1;
         rounds.forEach((r, i) => {
-            if (r.tools > 0) lastAsk = i;
+            if (r.queries > 0) lastQuery = i;
         });
         const summary: TurnSummary = {
             ms: Date.now() - turn.started,
@@ -315,7 +326,7 @@ export class AskBridge {
             failedTools: turn.failedTools,
             messages: rounds.length,
             textChars: rounds.reduce((n, r) => n + chars(r), 0),
-            finalTextChars: rounds.slice(Math.max(lastAsk, 0)).reduce((n, r) => n + chars(r), 0),
+            finalTextChars: rounds.slice(lastQuery + 1).reduce((n, r) => n + chars(r), 0),
             rounds: rounds
                 .slice(-30)
                 .map((r) => `${chars(r)}/${r.tools}`)

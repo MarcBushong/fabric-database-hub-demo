@@ -213,6 +213,34 @@ describe("AskBridge: the end of a turn (R925)", () => {
         expect(logged).not.toContain(start.token);
     });
 
+    // The review of cd58cd2: finalTextChars counts the answer as the dock does, so the live check can trust it.
+    it("counts the final answer as the dock does: the text after the last query, whatever follow-ups and charts come after it", async () => {
+        const s = scripted([{ type: "user.message", data: { messageId: "m1" } }]);
+        await s.bridge.handle(start);
+        await s.bridge.handle({ type: "user", text: "q" });
+        s.emit("assistant.message", { messageId: "a1", content: "", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c1");
+        s.emit("assistant.message", { messageId: "a2", content: ANSWER, toolRequests: [{ name: "suggest_followups" }] });
+        await s.callTool("c2");
+        s.emit("assistant.message", { messageId: "a3", content: "", toolRequests: [{ name: "show_chart" }] });
+        await s.callTool("c3");
+        s.emit("assistant.message", { messageId: "a4", content: "" });
+        s.emit("session.idle", {});
+        await s.idle();
+        expect(s.ends[0]).toMatchObject({ messages: 4, finalTextChars: ANSWER.length, rounds: `0/1 ${ANSWER.length}/1 0/1 0/0` });
+
+        // The reverse: text in the message that asks for a query says what Copilot will check; the dock shows no answer.
+        await s.bridge.handle({ type: "user", text: "And the live view?" });
+        s.emit("assistant.message", { messageId: "b1", content: "", toolRequests: [{ name: "run_dax" }] });
+        await s.callTool("c4");
+        s.emit("assistant.message", { messageId: "b2", content: "Let me also check the live view.", toolRequests: [{ name: "estate_overview" }] });
+        await s.callTool("c5");
+        s.emit("assistant.message", { messageId: "b3", content: "" });
+        s.emit("session.idle", {});
+        await vi.waitFor(() => expect(s.ends).toHaveLength(2));
+        expect(s.ends[1]).toMatchObject({ messages: 3, textChars: 32, finalTextChars: 0, rounds: "0/1 32/1 0/0" });
+    });
+
     it("still sends idle when the history can't be read, or doesn't answer in time", async () => {
         const failing = scripted(async () => {
             throw new Error("runtime gone");
