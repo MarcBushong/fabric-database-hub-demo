@@ -576,7 +576,11 @@ Describe 'configure-fabric.ps1' {
         $azCalls[0] | Should -Match '^account show'
         @($azCalls | Where-Object { $_ -match '--tenant' }) | Should -BeNullOrEmpty
         @($azCalls | Where-Object { $_ -notmatch "--subscription $subscriptionId" }) | Should -BeNullOrEmpty
-        $azCalls[$azCalls.Count - 1] | Should -BeExactly "account get-access-token --resource https://api.fabric.microsoft.com --output json --subscription $subscriptionId"
+        # The import's Fabric token; after it, for an update, at most a Storage token for the lakehouse's table list
+        # (2026-11-20, ADR 0031: the notebook runs once when the lakehouse lacks a table the history model reads).
+        $fabricCall = "account get-access-token --resource https://api.fabric.microsoft.com --output json --subscription $subscriptionId"
+        $azCalls | Should -Contain $fabricCall
+        @($azCalls[($azCalls.LastIndexOf($fabricCall) + 1)..($azCalls.Count - 1)] | Where-Object { $_ -and $_ -ne $fabricCall -and $_ -ne "account get-access-token --resource https://storage.azure.com/ --output json --subscription $subscriptionId" }) | Should -BeNullOrEmpty
         $update = @($requests | Where-Object { $_.Uri -like '*/updateDefinition' })
         [System.Net.NetworkCredential]::new('', $update[0].Token).Password | Should -BeExactly $importTokenForTest
         $output | Should -Not -Match ([regex]::Escape($importTokenForTest))
