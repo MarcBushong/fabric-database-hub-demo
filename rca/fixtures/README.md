@@ -22,7 +22,7 @@ The app's tests assert these facts from the detection tables alone, and the grad
 
 **T1 (t1-blocking-chain):**
 
-- 38 blocking samples (capture times with a waiter) from 16:52:30 to 17:00:40; the peak is 7 blocked sessions at 16:52:30; the chain formed 5 times.
+- 42 blocking samples (capture times with a waiter) from 16:52:30 to 17:00:40; the peak is 7 blocked sessions at 16:52:30; the chain formed 5 times.
 - The head blocker is session 63, sleeping with 1 open transaction, idle up to 79 s, holding X on a KEY of `[care].[work_queues]` (`pk_work_queues`); last call `demo.usp_scenario_chain_acquire;1`; login `NT AUTHORITY\SYSTEM`, host `SQLVM01`, program `ContosoCare.Demo`.
 - Two branches, 4 levels deep (63, then 64 and 65, then 66 and 67, then 68 and 69), waiting `LCK_M_U`; the longest single wait is 58 s.
 - Session 71 held an X lock on OBJECT `[care].[appointments]` at 16:52:30, 16:54:30, 16:56:30, and 16:58:30, with session 74 waiting `LCK_M_IS` behind it; `lock_escalation` events at 16:52:20, 16:54:20, 16:56:20, and 16:58:20 (6,248 locks to an X table lock).
