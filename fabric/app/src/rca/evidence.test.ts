@@ -10,9 +10,11 @@ const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 describe("the evidence documents (the contract's fixtures)", () => {
     it("reads T1's chain: the samples, the head blocker, the escalations, the lock timeouts, and the capture's episode", () => {
         const e = fixtureEvidence("t1");
-        expect(e.sessions).toHaveLength(284);
+        expect(e.sessions).toHaveLength(280);
+        // A blocking sample is a capture time with at least one waiter: RCA-SQL-01 returns only sessions in a blocking edge.
         const times = [...new Set(e.sessions.map((s) => s.capturedAt.getTime()))].sort((a, b) => a - b);
-        expect(times).toHaveLength(42);
+        expect(times).toHaveLength(38);
+        for (const t of times) expect(e.sessions.some((s) => s.capturedAt.getTime() === t && s.blockedBy.length > 0)).toBe(true);
         expect(new Date(times[0])).toEqual(at("16:52:30"));
         expect(new Date(times[times.length - 1])).toEqual(at("17:00:40"));
         const head = e.sessions.filter((s) => s.session === 63);

@@ -46,6 +46,15 @@ The sentinel runs on every target every 30 s for the whole session. A signal ove
 
 T5 has no sentinel in the observer: its 429s and normalized RU are Azure Monitor metrics that the history saves already, which detection reads from Telemetry Snapshots.
 
+**What a sample holds:** the columns of the queries that ran at that moment.
+
+- **The replica's sentinel** reads RCA-PG-06, 07, and 08 every 30 s: `since_last_replayed_s`, `received_not_replayed_bytes`, and `conflicts_cancelled`. RCA-PG-08's receiver status only adds coverage gaps. Replay detail adds RCA-PG-01 and 02: `startup_wait` and the conflict's columns, on a sample that found the startup process waiting on a lock. RCA-PG-09 runs once when an episode starts, and its `max_standby_streaming_delay_s` stays on later samples.
+- **T4's sentinel** also reads the primary's side (RCA-PG-04 and 05) every 30 s while T4 has a standby, and every 5 s during a replay episode.
+- **Rates and deltas** between samples (`wal_bytes_per_s`, `conflicts_cancelled`) are null on a target's first sample, which has nothing before it.
+- **A blocking sample** is a capture time with at least one waiting session. RCA-SQL-01, and RCA-PG-01 and 02, return only the sessions in a blocking edge (the waiters and those they wait on), so a chain's samples stop while nothing waits, and a formation ends where its samples stop for more than 1.5 sample intervals.
+- **An escalation's login and host:** RCA-XE-01's `lock_escalation` event has no username or hostname action, so the observer takes them from the same session's blocking sample in the episode (the same session ID and run token), else leaves them null.
+- **`rca_coverage.sources`** names every capture query that returned rows for the target in the window, sentinel and detail alike.
+
 ## Names
 
 What the observer records about who ran a session, so the evidence names nothing the workload planned:
@@ -66,7 +75,7 @@ One JSON document per host and export, UTF-8, no byte order mark. The schema say
 | `documentId` | `<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>`, for example `20261120T165000Z-sqlvm01-0001`. Unique; the notebook writes a document once |
 | `sessionId` | The control's session ID (32 lowercase hex, the resource group's `DbHubSessionId`), or null outside a control session |
 | `producer` | `ContosoCare.Workload`, its version, the host (`sqlvm01` or `arcsql01`), lane `observer` |
-| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended |
+| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended. Like `epochUtc`, ISO 8601 UTC with milliseconds: `2026-11-20T16:50:00.000Z` |
 | `sequence`, `final` | The export's number for the host and session, from 1; `final` on the session's last |
 | `targets` | The targets covered; each has an `rca_coverage` row |
 | `epochUtc` | The base of every time in the document |
