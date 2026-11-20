@@ -12,7 +12,7 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replica
 import type { Row } from "@/data/query-client";
 import { impactOf, type Impact } from "./business";
 import { engineOf } from "./estate";
-import { formatLevel, formatNumber, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
+import { formatLevel, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
 import { FAMILY_SIGNAL, REPLICA_LAG_WARNING_SECONDS, signalValue } from "./insights";
 import { SCENARIOS } from "./scenarios";
 import { quantile } from "./stats";
@@ -461,12 +461,13 @@ function notVisibleNote(signal: Signal, bound: Bound, seen: LevelSeen, until: st
     const at = `at ${formatTimeUtc(seen.peakAt)} UTC`;
     if (seen.atBound === 0) {
         // A strict bound (the floor of 0) reads "at or under", which its peak may equal; "under" never sits beside an equal peak.
-        if (bound.strict) return `${lead}: ${signal.label} stayed at or under ${level} ${until}; its peak was ${formatNumber(seen.peak, signal.kind)} ${at}.`;
+        if (bound.strict) return `${lead}: ${signal.label} stayed at or under ${level} ${until}; its peak was ${formatLevel(seen.peak, signal.kind)} ${at}.`;
         const apart = levelAndPeak(bound.value, seen.peak, signal.kind);
         if (!apart) return `${lead}: ${signal.label} stayed under ${level} ${until}; its peak, ${at}, was just under it.`;
         return `${lead}: ${signal.label} stayed under ${apart.level} ${until}; its peak was ${apart.peak} ${at}.`;
     }
-    const peak = `its peak was ${formatNumber(seen.peak, signal.kind)} ${at}`;
+    // The peak as its level is written (formatLevel), so a bin at 23.33 % never reads 23.3 % beside a level of 23.32 %.
+    const peak = `its peak was ${formatLevel(seen.peak, signal.kind)} ${at}`;
     const reached = bound.strict ? `went above ${level}` : `reached ${level} or more`;
     const blank = seen.bins - seen.valued;
     return `${lead} by its rule: ${signal.label} ${reached} in ${seen.atBound} bin${seen.atBound === 1 ? "" : "s"}, never ${bound.minBins} in a row${blank > 0 ? ` (${blank} of its ${seen.bins} bins had no value)` : ""}, ${until}; ${peak}.`;

@@ -204,7 +204,7 @@ describe("the scoreboard", () => {
         // As found live: a baseline near 0 % (a level of 10 %), bins at 65.95 %, and bins without a CPU value between them.
         const sparse = bins("T1", (m) => ({ cpu: m >= 30 && m < 40 ? (m % 3 === 0 ? 65.95 : null) : 0 }));
         expect(note(sparse)).toBe(
-            "Not visible by its rule: CPU reached 10.0 % or more in 4 bins, never 2 in a row (6 of its 25 bins had no value), until 14:25 UTC, 15 minutes after its window; its peak was 66.0 % at 14:00 UTC.",
+            "Not visible by its rule: CPU reached 10.0 % or more in 4 bins, never 2 in a row (6 of its 25 bins had no value), until 14:25 UTC, 15 minutes after its window; its peak was 65.95 % at 14:00 UTC.",
         );
     });
 
@@ -259,6 +259,26 @@ describe("the scoreboard", () => {
         expect(under.status).toBe("Warning");
         expect(howMeasured(under)).toBe("at least 0.45 (baseline 0.3). Not visible: blocked processes stayed under 0.45 until 14:25 UTC, 15 minutes after its window; its peak was 0.4 at 14:01 UTC.");
         expect([visible.note, howMeasured(visible), markdown, howMeasured(under)].join("\n")).not.toMatch(/at least 0(?![.\d])|under 0(?![.\d])/);
+    });
+
+    it("writes a peak with the decimals of the level it reached, never lower than it: in the note, the impact, and the postmortem (the re-review of 2056a53)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:cpu-pressure", 30, 40)];
+        const plan = toPlans(runs)[0];
+        // CPU's baseline is 13.32 %, so its level is 10 points above it, 23.32 %; bins at 23.33 %, one, or two in a row.
+        const score = (hot: (m: number) => boolean) => scorePlan(plan, { bins: bins("T1", (m) => ({ cpu: hot(m) ? 23.33 : 13.32 })), beats: [], runs })[0];
+        const once = score((m) => m === 33);
+        expect(once.status).toBe("Warning");
+        expect(once.note).toBe("Not visible by its rule: CPU reached 23.32 % or more in 1 bin, never 2 in a row, until 14:25 UTC, 15 minutes after its window; its peak was 23.33 % at 14:03 UTC.");
+        const twice = score((m) => m === 33 || m === 34);
+        expect(twice.status).toBe("Pass");
+        expect(howMeasured(twice)).toBe("at least 23.32 % (baseline 13.32 %), 2 bins");
+        expect(twice.impact?.evidence).toBe("CPU peak 23.33 %, 1.8 times its baseline");
+        const { markdown } = buildPostmortem({ plan, scores: [twice], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: at(130) });
+        expect(markdown).toContain("| CPU peak 23.33 %, 1.8 times its baseline |");
+        expect(markdown).toContain("at least 23.32 %");
+        expect([once.note, markdown].join("\n")).not.toMatch(/23\.3 %/);
+        // A wait in seconds the same way: a level of 1.5 times a baseline of 0.8933 s is 1.34 s, and its peak never reads 1.3 s.
+        expect(impactOf({ target: "T1", family: "io", durationMin: 5, peak: 1.344, baseline: 0.8933 }).evidence).toBe("Buffer IO waits peak 1.34 s per bin, 1.5 times its baseline");
     });
 
     it("says the telemetry breaks off, never that it ends, when a hole follows a signal's last bin at its level, and ends its visible time there (the review of F23)", () => {

@@ -5,7 +5,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it, vi } from "vitest";
 
 import type { QuerySpec } from "@/data/queries";
-import { createSourceClient, type QueryResult } from "@/data/query-client";
+import { createSourceClient, type QueryResult, type Row } from "@/data/query-client";
 import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/mission/kiosk";
 import { SCOREBOARD_SUBTITLE } from "@/lib/scoreboard";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
@@ -19,8 +19,8 @@ import ScoreboardPage from "./ScoreboardPage";
 
 const SLOW = 30000;
 
-/** The preview's sample, with its latest session, answering every query by its ID and parameters; `failing` queries throw. */
-function sampleClient(failing: Record<string, string> = {}): FakeQueryClient {
+/** The preview's sample, with its latest session, answering every query by its ID and parameters; `failing` queries throw, and `rows` replace a query's answer. */
+function sampleClient(failing: Record<string, string> = {}, rows: Record<string, Row[]> = {}): FakeQueryClient {
     const ran: string[] = [];
     return {
         ran,
@@ -29,7 +29,7 @@ function sampleClient(failing: Record<string, string> = {}): FakeQueryClient {
         run: vi.fn(async (spec: QuerySpec): Promise<QueryResult> => {
             ran.push(spec.id);
             if (failing[spec.id]) throw new Error(failing[spec.id]);
-            return { spec, columns: spec.columns, rows: sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
+            return { spec, columns: spec.columns, rows: rows[spec.id] ?? sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
         }),
     };
 }
@@ -67,6 +67,30 @@ describe("Mission Control", () => {
             expect(events).toBeInTheDocument();
             expect(screen.getByRole("button", { name: /^Scheduling, T3 Azure SQL Database: .+Under heavy load for \d+ min \(CPU peak [\d.]+ %, [\d.]+ times its baseline\)\.$/ })).toBeInTheDocument();
             expect(screen.getAllByText(/^Reports' DR copy$/).length).toBeGreaterThan(0);
+        },
+        SLOW,
+    );
+
+    it(
+        "never rounds T5's throttled share to none in its numbers: 3 of 1,000 requests are less than 1 %, as on the map (the re-review of 2056a53)",
+        async () => {
+            const throttle: Row = {
+                FindingId: "cosmosdb.T5.throttle.20261117T1400",
+                TargetKey: "T5",
+                Status: "Warning",
+                StatusSort: 3,
+                Finding: "Normalized RU consumption on T5 reached 100% with 3 throttled requests (429s) of 1,000 requests between 14:00 and 14:05 UTC.",
+                Evidence: JSON.stringify({ throttled: 3, requests: 1000, peakNormalizedRuPercent: 100, stopped: true, recoveredAtUtc: "2026-11-17T14:05:00Z" }),
+                WindowStart: "2026-11-17T14:00:00",
+                WindowEnd: "2026-11-17T14:05:00",
+                CapturedAt: "2026-11-17T15:06:00",
+            };
+            renderWithApp(<MissionControlPage />, { client: sampleClient({}, { "cosmos-findings": [throttle] }) });
+            const numbers = await screen.findByRole("complementary", { name: "The session in numbers" }, { timeout: 15000 });
+            await waitFor(() => expect(within(numbers).getByText("less than 1 % throttled")).toBeInTheDocument(), { timeout: 15000 });
+            expect(within(numbers).getByText("3 of 1,000 requests answered 429 in 1 episode")).toBeInTheDocument();
+            fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
+            expect(await screen.findByRole("button", { name: /^Patient events, T5 Azure Cosmos DB: .*less than 1 % of requests throttled for 5 min/i })).toBeInTheDocument();
         },
         SLOW,
     );

@@ -84,7 +84,7 @@ const WORDING: Record<string, Wording> = {
 };
 
 /** A share in whole percent that never rounds some to none, or nearly all to all: "less than 1 %", "more than 99 %". */
-function percent(share: number): string {
+export function percent(share: number): string {
     const p = share * 100;
     if (p > 0 && p < 0.5) return "less than 1 %";
     if (p >= 99.5 && p < 100) return "more than 99 %";
@@ -119,13 +119,14 @@ export function impactOf(input: ImpactInput): Impact {
         const wording = WORDING[input.family] ?? { what: "a signal above its baseline", signal: input.family.replace(/_/g, " "), kind: "decimal" as NumberKind };
         headline = `${service}: ${wording.what}${span}`;
         const ratio = input.peak !== null && input.baseline ? input.peak / input.baseline : null;
-        // A bin's blocked processes are its highest sample; a fraction is written as it is, never rounded to a whole count.
+        // A peak is written as its level is (formatLevel), so it never reads lower than a level it reached; a bin's blocked
+        // processes are its highest sample, and a fraction of them is never rounded to a whole count.
         const peak =
             input.peak === null
                 ? wording.signal
                 : input.family === "blocking"
                   ? `up to ${formatLevel(input.peak, "int")} ${input.peak === 1 ? "blocked process" : wording.signal}`
-                  : `${wording.signal} peak ${formatNumber(input.peak, wording.kind)}${wording.kind === "seconds" ? " per bin" : ""}`;
+                  : `${wording.signal} peak ${formatLevel(input.peak, wording.kind)}${wording.kind === "seconds" ? " per bin" : ""}`;
         evidence = ratio !== null && Number.isFinite(ratio) && ratio >= 1.05 ? `${peak}, ${timesText(ratio)} its baseline` : peak;
     }
     return { service, headline, evidence, sentence: `${headline} (${evidence})` };

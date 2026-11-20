@@ -14,7 +14,7 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { hubUrlOf } from "@/lib/agent-prompts";
-import { serviceOf } from "@/lib/business";
+import { percent, serviceOf } from "@/lib/business";
 import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc } from "@/lib/format";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { minutesText, summarize } from "@/lib/scoreboard";
@@ -158,7 +158,7 @@ export default function MissionControlPage() {
                         {t5.length > 0 ? (
                             <BigStat
                                 label="Patient events, T5"
-                                value={t5Requests ? `${Math.round((t5Throttled / t5Requests) * 100)} % throttled` : `${t5.length} episode${t5.length === 1 ? "" : "s"}`}
+                                value={t5Requests ? `${percent(t5Throttled / t5Requests)} throttled` : `${t5.length} episode${t5.length === 1 ? "" : "s"}`}
                                 sub={t5Requests ? `${formatNumber(t5Throttled, "int")} of ${formatNumber(t5Requests, "int")} requests answered 429 in ${t5.length} episode${t5.length === 1 ? "" : "s"}` : "throttling in its Azure Monitor metrics"}
                                 tone="alert"
                             />
