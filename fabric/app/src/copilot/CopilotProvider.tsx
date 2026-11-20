@@ -2,9 +2,9 @@
 // time on the viewer's own GitHub Copilot, the page tools that answer Copilot's tool calls, and the transcript,
 // kept for the browser session. It implements the contract (contract.ts) through use-copilot.ts's context.
 
-import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
-import { useLiveOff } from "@/data/live-estate";
+import { liveOffNow, onLiveOffChange, useLiveOff } from "@/data/live-estate";
 import { QueryClientContext } from "@/data/use-query";
 import type { ChatController, ChatState, CopilotPlan, RelayStatus, SignInMode } from "./chat-types";
 import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } from "./contract";
@@ -21,6 +21,8 @@ const IDLE_CLOSE_MS = 5 * 60_000;
 const NO_PLAN: CopilotPlan = { label: null, ok: null };
 const local = () => (typeof window !== "undefined" ? window.localStorage : undefined);
 const perTab = () => (typeof window !== "undefined" ? window.sessionStorage : undefined);
+/** A session start or a question that New chat overtook: dropped quietly, never shown to the viewer. */
+const newChatStarted = () => new RelayError("New chat started another conversation.", 0, "cancelled");
 
 let idCounter = 0;
 const newId = (prefix: string) => `${prefix}${Date.now().toString(36)}${(++idCounter).toString(36)}`;
@@ -132,15 +134,11 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     // Whether the history holds T5's (Azure Cosmos DB) metrics, asked once when the dock first opens, so T5's starter
     // shows only when it has an answer. A failure (the local preview's sample, a model without T5's measures) leaves it out.
     const [cosmosHistory, setCosmosHistory] = useState(false);
-    // Whether Database Hub refuses the app as a whole, as the pages read it (useLiveOff, R924): while it does, a new
-    // conversation starts without the live view, and the live starters hide. LiveOffWatch reads it while the dock is open,
-    // and again for each new conversation.
-    const [liveOff, setLiveOff] = useState<string | null>(null);
-    const liveOffRef = useRef<string | null>(null);
-    const reportLiveOff = useCallback((off: string | null) => {
-        liveOffRef.current = off;
-        setLiveOff(off);
-    }, []);
+    // Whether Database Hub refuses the app as a whole, as the pages read it (R924): by the latest read of each view in this
+    // browser, whichever page or the dock read it (liveOffNow), so it follows reads while the dock stays open. While it
+    // does, a new conversation starts without the live view, and the live starters hide. LiveOffWatch reads the three
+    // views while the dock is open, and again for each new conversation.
+    const liveOff = useSyncExternalStore(onLiveOffChange, liveOffNow);
     const [liveWatch, setLiveWatch] = useState(0);
     const cosmosProbed = useRef(false);
     useEffect(() => {
@@ -308,23 +306,25 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     );
 
     const ensureConnection = useCallback(
-        async (accessToken: string): Promise<ChatConnection> => {
+        async (accessToken: string, no: number): Promise<ChatConnection> => {
             if (connection.current && connectionToken.current === accessToken) return connection.current;
             // A renewed token (here or in another tab) starts a new conversation on it; Copilot gets a recap.
             if (connection.current) disconnect();
             if (!relay || !settings) throw new RelayError("Ask isn't deployed in this environment.", 0, "off");
+            // The conversation this session serves (no): once New chat starts another, nothing of this one is kept.
+            const stale = () => conversationNo.current !== no;
             setConnecting(true);
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }] = await loadChatModules();
+                if (stale()) throw newChatStarted();
                 // A conversation that learned the live view isn't available doesn't offer it again, even on a new session;
-                // nor does one that starts while Database Hub refuses the app as a whole (useLiveOff).
-                const live = liveUnavailable.current ?? liveOffRef.current;
-                // The conversation this runner serves: once New chat starts another, what its calls return is dropped.
-                const servedNo = conversationNo.current;
+                // nor does one that starts while Database Hub refuses the app as a whole, by the latest reads (liveOffNow).
+                const live = liveUnavailable.current ?? (settings.estate ? liveOffNow() : null);
+                // Once New chat starts another conversation, what this session's calls return is dropped.
                 const dispatchHere = (action: ConversationAction) => {
-                    if (conversationNo.current === servedNo) dispatch(action);
+                    if (!stale()) dispatch(action);
                 };
-                runner.current = createToolRunner({
+                const run = createToolRunner({
                     runDax: async (query, rowLimit) => {
                         if (!queryClient) throw new Error("The history connector isn't ready yet.");
                         const result = await queryClient.run({ id: `copilot-${hash(query)}`, title: "Copilot query", dax: query, rowLimit, columns: [] });
@@ -340,7 +340,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                         : undefined,
                     liveOff: () => liveUnavailable.current,
                     onLiveUnavailable: (reason) => {
-                        if (conversationNo.current === servedNo) liveUnavailable.current = reason;
+                        if (!stale()) liveUnavailable.current = reason;
                     },
                     answered: () => [...answerText.current.values()].some((chars) => chars > 0),
                     onDax: (run) => dispatchHere({ type: "dax", run }),
@@ -360,11 +360,19 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                     conn.close();
                     throw err;
                 }
+                // New chat while the session started: it belongs to the conversation that's gone, so it isn't kept, and the
+                // new conversation's first question starts its own (the review of 6125812).
+                if (stale()) {
+                    conn.close();
+                    throw newChatStarted();
+                }
+                runner.current = run;
                 connection.current = conn;
                 connectionToken.current = accessToken;
                 return conn;
             } finally {
-                setConnecting(false);
+                // New chat cleared it already, and a start of the new conversation may have set it again.
+                if (!stale()) setConnecting(false);
             }
         },
         [disconnect, handleEvent, queryClient, relay, settings],
@@ -373,26 +381,34 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     /** Sends one prompt on the conversation, starting a session when there's none; the current assistant turn gets the answer. */
     const deliver = useCallback(
         (prompt: string) => {
+            // The conversation this question belongs to: when New chat starts another before it's sent, it's dropped quietly,
+            // with no message and nothing closed, as the new conversation may be starting already.
+            const no = conversationNo.current;
+            const stale = () => conversationNo.current !== no;
             setBusy(true);
             answerText.current.clear();
             if (idleTimer.current) clearTimeout(idleTimer.current);
             void (async () => {
                 try {
                     let accessToken = await freshToken();
+                    if (stale()) return;
                     if (!accessToken) throw new RelayError("Sign in with GitHub first.", 401, "signin");
                     let conn: ChatConnection;
                     try {
-                        conn = await ensureConnection(accessToken);
+                        conn = await ensureConnection(accessToken, no);
                     } catch (err) {
                         // Copilot refused the token (revoked, or expired early): renew it once and start again. Only GitHub
                         // refusing the refresh token ends the sign-in (freshToken).
                         if (!(err instanceof RelayError) || !/sign in to github again/i.test(err.message)) throw err;
                         accessToken = await freshToken(true);
+                        if (stale()) return;
                         if (!accessToken) throw new RelayError("Your GitHub sign-in expired. Sign in with GitHub again.", 401, "signin");
-                        conn = await ensureConnection(accessToken);
+                        conn = await ensureConnection(accessToken, no);
                     }
+                    if (stale()) return;
                     if (!conn.ask(prompt)) throw new RelayError("The conversation's connection isn't open. Ask again.", 0, "closed");
                 } catch (err) {
+                    if (stale()) return;
                     dispatch({ type: "error", message: describeAskError(err) });
                     setBusy(false);
                     disconnect();
@@ -434,6 +450,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         conversationNo.current += 1;
         disconnect();
         setBusy(false);
+        // A session the last conversation was starting closes when it's ready (ensureConnection), so nothing waits for it.
+        setConnecting(false);
         dispatch({ type: "reset" });
         clearConversation(perTab());
         setAttached(null);
@@ -614,16 +632,16 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     return (
         <CopilotContext.Provider value={value}>
             {children}
-            {isOpen && settings?.estate ? <LiveOffWatch key={liveWatch} onChange={reportLiveOff} /> : null}
+            {isOpen && settings?.estate ? <LiveOffWatch key={liveWatch} /> : null}
         </CopilotContext.Provider>
     );
 }
 
-/** The pages' own answer to whether Database Hub refuses the app as a whole (useLiveOff), so the dock and the pages agree. */
-function LiveOffWatch({ onChange }: { onChange: (off: string | null) => void }) {
-    const off = useLiveOff();
-    useEffect(() => {
-        onChange(off);
-    }, [off, onChange]);
+/**
+ * Reads the three live views as the pages do (useLiveOff), while the dock is open, so this browser learns whether
+ * Database Hub refuses the app even when no page has read them; the provider follows the result through liveOffNow.
+ */
+function LiveOffWatch() {
+    useLiveOff();
     return null;
 }
