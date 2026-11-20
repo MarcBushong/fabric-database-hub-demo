@@ -16,7 +16,7 @@ What's marked "observed" was seen in the owner's tenant on 2026-11-20; the rest 
 
 ## Step by step
 
-1. **Open the settings:** Database Hub, from the link `HUB.AGENT.T3` gives, then **Agent (preview)**, then **Manage agents** (upper left), then **Database agent settings**.
+1. **Open the settings:** Database Hub, from the link `HUB.AGENT.T3` gives, then **Agent (preview)** (observed), then **Manage agents** (upper left), then **Database agent settings**.
 2. **Turn Enabled on.** The panel says "All databases are included by default" and "Your saved configuration is reflected in the table" (observed): every database you can see starts selected, and the table shows what's saved for the tenant. Its rows show only each database's name, `ContosoCare` for every environment's T3, with no server and an empty **Owner** column (observed).
 3. **Select T3, for your tenant's case:**
    - **Only you use Database Agents in this tenant** (a demo or lab tenant):
@@ -24,7 +24,7 @@ What's marked "observed" was seen in the owner's tenant on 2026-11-20; the rest 
      2. **One `ContosoCare` row:** that's T3. Check it and select **Save**.
      3. **Several `ContosoCare` rows:** check one and select **Save**; keep it when the save succeeds, and uncheck it again when it fails. Do the same with the next row. A row whose database no longer exists fails, and one that exists saves: 3 of 19 saved, the 3 that still existed (observed). Every `ContosoCare` database that exists stays selected, another environment's included; Database Agents doesn't change a database without your action, so there it only raises issues ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents#4-track-issue-status)).
    - **Others use Database Agents in your tenant:** don't clear or uncheck their databases: unchecking one stops the agent watching it for whoever selected it. Check T3 in addition, and select **Save**. If the save fails because of a database you can't write to, ask whoever manages Database Agents in your tenant to add T3, rather than removing theirs.
-4. **Agent policy:** open **Agent policy** for T3 (the gear on its row), and under **Enabled** turn on **Flag long-running queries** and **Force last known good plans** (Query performance) and **Flag high CPU** (Resource pressure and contention). Select **Apply**, then **Save**. In a demo or lab tenant, give each `ContosoCare` row you kept the same policy. These are UI labels: turning one on doesn't authorize or run a database change ([enable and activate](https://learn.microsoft.com/fabric/database/hub/enable-database-agents#enable-and-activate-database-agents)).
+4. **Agent policy:** open **Agent policy** for T3 (the gear on its row, observed), and under **Enabled** turn on **Flag long-running queries** and **Force last known good plans** (Query performance) and **Flag high CPU** (Resource pressure and contention). Select **Apply**, then **Save**. In a demo or lab tenant, give each `ContosoCare` row you kept the same policy. These are UI labels: turning one on doesn't authorize or run a database change ([enable and activate](https://learn.microsoft.com/fabric/database/hub/enable-database-agents#enable-and-activate-database-agents)).
 
 ## Check it
 
@@ -41,8 +41,9 @@ What's marked "observed" was seen in the owner's tenant on 2026-11-20; the rest 
 ## When to do it again
 
 - **Once per deployment:** the selection stays through sessions, stops, starts, and updates (`./scripts/deploy.ps1` on an existing environment).
-- **After T3 is recreated:** `./scripts/stop-demo.ps1 -RemoveT3`, then `./scripts/start-demo.ps1`, which creates T3 again; or a new deployment after `./scripts/destroy.ps1`, whose T3 has a new name. `HUB.AGENT.T3` names it.
-- **When you delete the demo:** uncheck only your T3 and select **Save**, before or after `./scripts/destroy.ps1`, which reminds you before it asks and at its end (`DESTROY.HUB.AGENT.T3`). Deleted databases can stay in the list for a while (observed: 19 `ContosoCare` rows, of which 3 still existed), and while one is selected, every save there fails, anyone's in your tenant ([cleanup](cleanup.md#what-stays-and-how-to-remove-it)).
+- **After T3 is recreated:** `./scripts/stop-demo.ps1 -RemoveT3`, then `./scripts/start-demo.ps1`, which creates T3 again; or a new deployment after `./scripts/destroy.ps1`, which recreates T3: it keeps its name, `azuresql01-<deploymentId>`, unless the prefix, the environment, or the subscription changes, because `deploymentId` comes from those three. `HUB.AGENT.T3` names it.
+- **When you delete the demo:** uncheck only your T3 and select **Save**, before or after `./scripts/destroy.ps1`, which reminds you before it asks and at its end (`DESTROY.HUB.AGENT.T3`). While a deleted database is selected, every save there fails, anyone's in your tenant ([cleanup](cleanup.md#what-stays-and-how-to-remove-it)).
+- **Why deleted databases stay in the list** (observed): the list shows the Azure SQL databases that sent Database Hub telemetry recently, deleted ones included, so a deleted database drops off once its telemetry ages out, up to about 7 days after it stopped reporting; the telemetry's retention is 7 days or less ([query performance monitoring telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)). On 2026-11-20, the list's 19 `ContosoCare` rows were the 19 Azure SQL databases with CPU samples in Database Hub's telemetry endpoint over the last 14 days: the 3 that existed, and 16 T3s of deleted test environments, whose last samples ran from 2026-11-17 to 2026-11-20; the oldest sample was from 2026-11-13. That's inferred from the matching count and dates; Learn doesn't say how the list is built.
 
 ## When something goes wrong
 

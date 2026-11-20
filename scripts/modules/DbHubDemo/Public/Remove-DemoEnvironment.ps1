@@ -59,8 +59,8 @@ function Remove-DemoEnvironment {
     what stays names T3 (Get-DemoDestroyExtraPlan's T3Agent), a Warning line before the confirmation says to remove it
     there and Save, and why, and DESTROY.HUB.AGENT.T3, a Manual action required once the group is gone, gives the steps
     (Get-DemoT3AgentRemovalItem). Deleted databases can stay in that list, selected, for a while (live, 2026-11-20), and a
-    Save fails as a whole while one is, so every later Save, the next deployment's T3 included, fails meanwhile. It changes
-    nothing else, and the exit code doesn't count it (docs/database-agents.md). The golden boot test's group (purpose
+    Save fails as a whole while one is, so every later Save fails meanwhile. It changes nothing else, and the exit code
+    doesn't count it (docs/database-agents.md). The golden boot test's group (purpose
     t2-golden-boot-test, test-t2-golden.ps1) has a deploymentId tag but never a T3, so it gets neither the line nor
     DESTROY.HUB.AGENT.T3 (Get-DemoDestroyExtraPlan's NoT3; review of 5d1f4b0).
 

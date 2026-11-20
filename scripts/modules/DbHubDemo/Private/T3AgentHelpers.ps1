@@ -458,10 +458,12 @@ function Get-DemoT3AgentRemovalItem {
     selection is the tenant's, deleted databases can stay in it for a while (live, 2026-11-20), and a Save checks every
     selected database and fails as a whole when any fails ("If any selected database fails that permission check, the
     entire save fails", Learn, enable Database Agents), so while the deleted T3 stays selected, every Save fails, anyone's
-    in the tenant, as when the next deployment's T3 is selected (live, 2026-11-20). It says to uncheck only T3 and leave
-    every other database as it is, and how to find T3's row among other environments' ContosoCare rows without clearing the
-    selection, which would stop the agent for whoever selected them (the coordinator's decision, 2026-11-20); its steps
-    point to docs/database-agents.md. Returns $null without T3's server name. Pure. Internal.
+    in the tenant (live, 2026-11-20). A new deployment of the same configuration recreates T3 under the same name, and
+    what that does to the old entry wasn't observed, so the message says nothing about it (review of 6d34f1a). It says to
+    uncheck only T3 and leave every other database as it is, and how to find T3's row among other environments'
+    ContosoCare rows without clearing the selection, which would stop the agent for whoever selected them (the
+    coordinator's decision, 2026-11-20); its steps point to docs/database-agents.md. Returns $null without T3's server
+    name. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -479,7 +481,7 @@ function Get-DemoT3AgentRemovalItem {
     }
     $link = Get-DemoDatabaseHubLink -Config $Config
     $database = '{0}/ContosoCare' -f $ServerName
-    $message = 'If you selected T3 for Database Agents, uncheck only it, {0}, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while, and a Save checks every selected database, so while the deleted T3 stays selected, every Save there, by anyone in your tenant, fails ("{1}"), as when you select the next deployment''s T3.' -f $database, $script:DemoAgentSaveError
+    $message = 'If you selected T3 for Database Agents, uncheck only it, {0}, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while, and a Save checks every selected database, so while the deleted T3 stays selected, every Save there, by anyone in your tenant, fails ("{1}").' -f $database, $script:DemoAgentSaveError
     $remediation = 'Open {0}, then Agent (preview), Manage agents, Database agent settings; uncheck {1}, then Save, and leave every other database as it is: the selection is your tenant''s. The list shows no server: with several ContosoCare rows, do it after destroy.ps1, when T3''s row fails every Save: uncheck one row at a time and Save, check it again if Save still fails, and stop when a Save succeeds. Nothing to do if you never selected it. Step by step: {2}. Why: {3}' -f $link, $database, $script:DemoAgentGuide, $script:DemoAgentDocUrl
     return (New-DemoResult -CheckId 'DESTROY.HUB.AGENT.T3' -Area 'teardown' -Target 'T3' -Status 'Manual action required' -Message $message -Evidence ([ordered]@{ link = $link; database = $database }) -Remediation $remediation -DocUrl $script:DemoAgentDocUrl)
 }

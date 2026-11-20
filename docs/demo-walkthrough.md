@@ -13,7 +13,7 @@ One **Run all** in the control notebook runs a whole session, and both scripts b
 **Once per deployment:**
 
 1. **Deploy:** `./scripts/deploy.ps1`, until it ends **DONE** ([demo it yourself](../README.md#demo-it-yourself)).
-2. **Optional, about 30 seconds:** select T3 in Database Hub's **Manage agents** for [the Database Agent loop](#the-database-agent-loop-on-t3). Everything else runs without it.
+2. **Required once for the Database Agent beat, a minute or two:** select T3 for Database Agents in Database Hub ([step by step](database-agents.md)), for [the Database Agent loop](#the-database-agent-loop-on-t3). Everything else works without it.
 3. **For Ask, the Copilot chat in the Insights app:** each viewer signs in with GitHub once per browser, on their own GitHub Copilot plan ([the Copilot chat](../README.md#the-copilot-chat-in-the-insights-app)).
 
 **Each session:**
@@ -53,7 +53,7 @@ To show the Database Agent loop live, start Run all about 50 to 60 minutes befor
 
 ## The DBA moments in a Run all session
 
-**Run all** in `NB_DatabaseHub_Control` carries four moments a DBA audience remembers. They need nothing beyond the session (the Database Agent loop also needs T3's optional selection), and the guide gives each one's time.
+**Run all** in `NB_DatabaseHub_Control` carries four moments a DBA audience remembers. They need nothing beyond the session (the Database Agent loop also needs T3 selected for Database Agents, required once for the Database Agent beat: [step by step](database-agents.md)), and the guide gives each one's time.
 
 ### Open at Overview
 

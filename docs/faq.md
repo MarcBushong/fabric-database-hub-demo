@@ -17,7 +17,7 @@ No: every call names the configured subscription, and the scripts never sign in 
 About 1.5 hours in the default mode, with nobody needed: 91 minutes, measured on 2026-11-06, before T4's read replica, T5, and Ask joined ([expected duration](deployment.md#expected-duration)).
 
 **Can an AI assistant run it?**
-Yes, as [AGENTS.md](../AGENTS.md) says ([deployment](deployment.md#running-it-with-an-ai-assistant)). People keep `az login`, the optional Database Agents selection, each viewer's GitHub sign-in, an Owner's grant, and, only if Fabric refuses the Azure CLI's token, `./scripts/configure-fabric-app.ps1 -SignIn`.
+Yes, as [AGENTS.md](../AGENTS.md) says ([deployment](deployment.md#running-it-with-an-ai-assistant)). People keep `az login`, the Database Agents selection (required once for the Database Agent beat; [step by step](database-agents.md)), each viewer's GitHub sign-in, an Owner's grant, and, only if Fabric refuses the Azure CLI's token, `./scripts/configure-fabric-app.ps1 -SignIn`.
 
 ## During a demo
 
