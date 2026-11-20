@@ -10,9 +10,11 @@ function Get-DemoFabricWorkspaceClaim {
     .SYNOPSIS
     The other demo environments that Azure Resource Graph lists across every subscription the caller can read, with the
     Fabric workspaces each records, in one read-only query. Returns Ok, Error, Others: each other demo resource
-    group's Name, SubscriptionId, Label, Tagged (it records the workspace it uses), and Claims (the workspace IDs it
-    records, lowercase), and Own: this environment's own group (Found, FabricWorkspaceId, Claims, and UsedFabric: an
-    earlier run finished a Fabric step, by DbHubTrackFabric or DbHubDeployStage; 2026-11-19). Internal.
+    group's Name, SubscriptionId, Label, Tagged (it records the workspace it uses), Deployment (Running while a
+    deploy.ps1 run's busy marker is active, Unfinished when its recorded stage is before Validation, otherwise empty;
+    2026-11-19), and Claims (the workspace IDs it records, lowercase), and Own: this environment's own group (Found,
+    FabricWorkspaceId, Claims, and UsedFabric: an earlier run finished a Fabric step, by DbHubTrackFabric or
+    DbHubDeployStage; 2026-11-19). Internal.
 
     .DESCRIPTION
     A demo environment is a resource group with the deploymentId tag (the template's) or the DbHubDeployStage tag
@@ -28,7 +30,9 @@ function Get-DemoFabricWorkspaceClaim {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config
+        [System.Collections.IDictionary] $Config,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -98,7 +102,12 @@ function Get-DemoFabricWorkspaceClaim {
             continue
         }
         $label = if ($rowSubscription -ieq $subscriptionId) { $name } else { '{0} (subscription {1})' -f $name, $rowSubscription }
-        $others.Add([pscustomobject]@{ Name = $name; SubscriptionId = $rowSubscription; Label = $label; Tagged = $tagged; Claims = @($claims | Select-Object -Unique) })
+        # Whether a run of this code is still recording what it uses (the final tests' F15, 2026-11-19): a deploy.ps1 run
+        # that's going (its busy marker, as the nightly stop reads it), or one whose recorded stage is before Validation.
+        $busy = ConvertTo-DemoBusyMarker -Tags $tags -NowUtc $NowUtc
+        $otherStage = if ($tags.ContainsKey($names['Stage'])) { $tags[$names['Stage']].Trim() } else { '' }
+        $deployment = if ($busy.Active -and $busy.By -eq 'deploy') { 'Running' } elseif ($otherStage -in @(Get-DemoDeploymentStageName) -and -not (Test-DemoDeploymentStageReached -Recorded $otherStage -Stage 'Validation')) { 'Unfinished' } else { '' }
+        $others.Add([pscustomobject]@{ Name = $name; SubscriptionId = $rowSubscription; Label = $label; Tagged = $tagged; Deployment = $deployment; Claims = @($claims | Select-Object -Unique) })
     }
     if (-not $canary) {
         $answer.Error = ('Resource Graph didn''t list the subscription {0}, so its answer can''t show what else uses the workspace' -f $subscriptionId)
@@ -115,7 +124,9 @@ function Get-DemoFabricWorkspaceGuard {
     .SYNOPSIS
     Whether destroy.ps1 may delete a Fabric workspace that its own checks found to be this environment's: only when
     Resource Graph answered (Get-DemoFabricWorkspaceClaim), no other demo environment records it (DbHubFabricWorkspaceId
-    or DbHubControlWorkspaceId), and none was deployed by a version that doesn't record its workspaces, so might use it.
+    or DbHubControlWorkspaceId), and none that records no workspace might use it. The reason says why each might: it's
+    being deployed, or its deployment hasn't finished, so it hasn't recorded its workspaces yet (Deployment, 2026-11-19);
+    otherwise it was deployed by a version that doesn't record them.
     Returns Free, Guard ('' when free, Unreadable, Claimed, or Untagged), ClaimedBy and Untagged (the other environments'
     labels), Reason, and Remediation. Internal.
     #>
@@ -153,7 +164,23 @@ function Get-DemoFabricWorkspaceGuard {
             $answer.Guard = 'Untagged'
             $answer.Remediation = ('Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of {0}, which records the workspaces {1}, or after {2} destroy; or {3}.' -f (& $join $answer.Untagged), $(if ($answer.Untagged.Count -eq 1) { 'it uses' } else { 'each uses' }), $(if ($answer.Untagged.Count -eq 1) { 'its' } else { 'their' }), $remove)
         }
-        $reasons.Add(('{0} {1} deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so {2} might use it' -f (& $join $answer.Untagged), $(if ($answer.Untagged.Count -eq 1) { 'was' } else { 'were' }), $(if ($answer.Untagged.Count -eq 1) { 'it' } else { 'they' })))
+        # Why each might use it (the final tests' F15, 2026-11-19): one being deployed by this code, or whose deployment
+        # hasn't finished, hasn't recorded its workspaces yet; only the others were deployed by an earlier version.
+        $untaggedOthers = @(@($Claim.Others) | Where-Object { -not [bool]$_.Tagged })
+        $state = { param($Other) [string](Get-DemoMemberValue -InputObject $Other -Name 'Deployment') }
+        $one = { param([string[]] $Items, [string] $Single, [string] $Plural) if ($Items.Count -eq 1) { $Single } else { $Plural } }
+        $running = @($untaggedOthers | Where-Object { (& $state $_) -eq 'Running' } | ForEach-Object { [string]$_.Label })
+        $unfinished = @($untaggedOthers | Where-Object { (& $state $_) -eq 'Unfinished' } | ForEach-Object { [string]$_.Label })
+        $earlier = @($untaggedOthers | Where-Object { (& $state $_) -notin 'Running', 'Unfinished' } | ForEach-Object { [string]$_.Label })
+        if ($running.Count -gt 0) {
+            $reasons.Add(('{0} {1} being deployed and {2} recorded {3} workspaces yet, so {4} might use it' -f (& $join $running), (& $one $running 'is' 'are'), (& $one $running 'hasn''t' 'haven''t'), (& $one $running 'its' 'their'), (& $one $running 'it' 'they')))
+        }
+        if ($unfinished.Count -gt 0) {
+            $reasons.Add(('{0} {1} finished deploying and {1} recorded {2} workspaces yet, so {3} might use it' -f (& $join $unfinished), (& $one $unfinished 'hasn''t' 'haven''t'), (& $one $unfinished 'its' 'their'), (& $one $unfinished 'it' 'they')))
+        }
+        if ($earlier.Count -gt 0) {
+            $reasons.Add(('{0} {1} deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so {2} might use it' -f (& $join $earlier), (& $one $earlier 'was' 'were'), (& $one $earlier 'it' 'they')))
+        }
     }
     if ($reasons.Count -eq 0) {
         $answer.Free = $true
