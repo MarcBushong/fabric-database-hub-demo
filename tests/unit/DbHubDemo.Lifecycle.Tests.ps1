@@ -3245,8 +3245,9 @@ Describe 'Remove-DemoEnvironment' {
         # T4's read replica (ADR 0025) goes before the group, named from the manifest's deploymentId.
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('Replica'); $null }
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        # The session control, the Fabric workspaces, and the security group go first (2026-11-17).
-        $script:order | Should -Be @('Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'az group exists', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        # The session control, the Fabric workspaces, and the security group go first (2026-11-17), after the read of whether
+        # the golden group exists, for the list of what goes and what stays (2026-11-19).
+        $script:order | Should -Be @('az group exists', 'Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'DESTROY' -and $DeploymentId -eq 'abc123' -and $Quiet }
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'
