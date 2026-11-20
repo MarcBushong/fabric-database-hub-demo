@@ -731,10 +731,25 @@ Describe 'Invoke-DemoArcOnboarding' {
         foreach ($run in @($script:runs | Where-Object { $_.Name -in 'DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard' })) {
             $run.Parameter['RecoveryKey'] | Should -Be 'deploy-aaaaaaaaaaaa' -Because $run.Name
         }
-        # Outside a deploy.ps1 run, the host uses its own hourly key.
+    }
+
+    It 'outside a deploy.ps1 run, gives its probe, its onboarding, and its sign-in data check one key of its own, so they share one guest restart (review of e617f34)' {
+        # configure-arc.ps1 sets no run key: the host's own hourly keys differ by caller (arc- for the probe and the onboarding,
+        # signin- for the check), so the probe and the check could each restart arcsql01 in one call.
+        $script:machine = New-TestMachine -Status 'Disconnected'
+        $first = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $first.status | Should -Be 'Pass'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $key = [string]$script:runs[0].Parameter['RecoveryKey']
+        $key | Should -Match '^arc-[0-9a-f]{12}$'
+        foreach ($run in $script:runs) {
+            $run.Parameter['RecoveryKey'] | Should -Be $key -Because $run.Name
+        }
+        # Each call has its own, as each deploy.ps1 run does.
         $script:runs.Clear()
         $null = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
-        $script:runs[0].Parameter.ContainsKey('RecoveryKey') | Should -BeFalse
+        $script:runs[0].Parameter['RecoveryKey'] | Should -Match '^arc-[0-9a-f]{12}$'
+        $script:runs[0].Parameter['RecoveryKey'] | Should -Not -Be $key
     }
 
     It 'rewrites the marker without a token when the guest is already Connected' {
@@ -1002,6 +1017,39 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:runs.Clear()
         (Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1).message | Should -Not -Match 'passed now'
         $script:runs.Count | Should -Be 0
+    }
+
+    It 'in the evaluation-only mode, never reads or writes the record of an owed check, nor runs one later (review of e617f34)' {
+        # That VM turns its Azure guest agent off at least 15 minutes after its Arc marker, so Run Command never reaches it again
+        # and configure-arc.ps1 reads it as Ready from its Arc machine: an owed check there failed on every later run.
+        $evaluation = New-TestConfig -Override @{ t2Mode = 'EvaluationOnlyAzureVm' }
+        $script:sweepOwed = 'unknown'
+        $ready = Invoke-DemoArcOnboarding -Config $evaluation -Health ([pscustomobject]@{ state = 'Ready'; message = 'Read from Azure Arc; the Azure guest agent is disabled.' }) -PollIntervalSeconds 1
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Not -Match 'passed now'
+        $script:runs.Count | Should -Be 0 -Because 'no Run Command reaches the VM once its agent is off'
+        # Already Connected while its bootstrap goes on: the same.
+        $script:machine = New-TestMachine
+        $connected = Invoke-DemoArcOnboarding -Config $evaluation -Health ([pscustomobject]@{ state = 'InProgress' }) -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Pass'
+        $script:runs.Count | Should -Be 0
+
+        # The check right after its onboarding still runs, on the VM itself, as before; when it fails, nothing is recorded, and
+        # its fix is what works there.
+        $script:machine = $null
+        $script:sweepPart.pass = $false
+        $script:sweepPart.remaining.logUser = 2
+        $failed = Invoke-DemoArcOnboarding -Config $evaluation -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match '^EVALUATION ONLY: arcsql01 is onboarded, but the onboarding token''s traces couldn''t be removed and verified'
+        $sweep = @($script:runs | Where-Object Name -EQ 'DbHubDemo-SignInData')
+        $sweep.Count | Should -Be 1
+        $sweep[0].VmName | Should -Be 'arcsql01'
+        $sweep[0].Parameter['ResidueScope'] | Should -Be 'Local'
+        $failed.remediation | Should -Match ([regex]::Escape('Run ./scripts/check-sign-in-data.ps1 -VmName arcsql01 -Clean -Force while Run Command still works on arcsql01'))
+        $failed.remediation | Should -Not -Match 'by itself'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArcSweepOwed -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSweepOwed -Times 0 -Exactly
     }
 }
 

@@ -264,6 +264,11 @@ function Invoke-DemoDeployment {
     }
 
     $state = Get-DemoDeploymentState -Config $Config
+    # Issue #65: this run's key for the T2 host's guest restart, as the parallel path has (Invoke-DemoParallelDeployment), so
+    # T2's onboarding, its sign-in data check, and its profile restart the guest at most once for this run, and a rerun gets
+    # its own (review of e617f34: -Sequential had none, so the host's hourly keys, which differ by caller, each allowed one).
+    $recoveryModel = Read-DemoProgress -Path $ProgressPath
+    Set-DemoRunRecoveryKey -Key (New-DemoRunRecoveryKey -RunId $(if ($null -ne $recoveryModel) { [string]$recoveryModel['runId'] } else { '' }))
     $startIndex = 0
     if ($FromStage) {
         $startIndex = [array]::IndexOf($stages, $FromStage)

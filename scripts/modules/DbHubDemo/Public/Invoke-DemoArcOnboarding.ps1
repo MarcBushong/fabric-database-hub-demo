@@ -43,19 +43,22 @@ function Invoke-DemoArcOnboarding {
        host's own sign-in cleanup checked it), it first waits for the host's bootstrap pass and holds its lock
        (bootstrap.lock, at most 30 minutes), so the two never sweep the guest at the same time, and a guest part that
        fails runs again up to three more times, 10, 30, and 60 seconds apart, with issue #65's bounded recovery first
-       (DEPLOY.T2.GUESTRETRY or DEPLOY.T2.GUESTRESTART). The onboarding records on the resource group that its sweep is
-       owed (DbHubArcSweepUtc) until it passes, so every later run sweeps and verifies again, whatever the host's state;
-       a Fail's fix is to run ./scripts/deploy.ps1 again.
+       (DEPLOY.T2.GUESTRETRY or DEPLOY.T2.GUESTRESTART). In the nested mode, the onboarding records on the resource group
+       that its sweep is owed (DbHubArcSweepUtc) until it passes, so every later run sweeps and verifies again, whatever
+       the host's state; a Fail's fix is to run ./scripts/deploy.ps1 again.
     5. Waits up to -ConnectWaitMinutes for the Azure machine to report Connected.
 
     PowerShell Direct into the guest that breaks while the guest runs with a healthy heartbeat (issue #65, 2026-11-18: an
     update's WriteMarker failed with "The Hyper-V socket target process has ended") is cleared on the host: it restarts
-    the guest once for this run (deploy.ps1's recovery key, Get-DemoRunRecoveryKey) and runs the action again once
+    the guest once for this run (deploy.ps1's recovery key, Get-DemoRunRecoveryKey, or outside a deploy.ps1 run that set
+    one, this call's own, which its probe, its onboarding, and its sign-in data sweep share) and runs the action again once
     (Invoke-DemoArcOnboardWithRecovery). The evidence then has guestRecovery, which deploy.ps1 reports as
     DEPLOY.T2.GUESTRESTART.
 
     In the opt-in evaluation-only mode (t2Mode EvaluationOnlyAzureVm, ADR 0006) the same steps run on the Azure
-    VM arcsql01 itself, and the result is labeled EVALUATION ONLY. Under -WhatIf nothing runs.
+    VM arcsql01 itself, and the result is labeled EVALUATION ONLY. That VM turns its Azure guest agent off at least 15
+    minutes after its Arc marker, which ends Run Command there, so no sweep is recorded as owed or run again later: its own
+    SignInCleanup step checks first. Under -WhatIf nothing runs.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -148,17 +151,32 @@ function Invoke-DemoArcOnboarding {
         return (& $newResult 'Not selected' 'What if: nothing ran. Onboarding reads the host''s health, probes the guest, and onboards it while the host waits for it.')
     }
 
-    # Issue #65: the host restarts the guest at most once for this run to clear a broken PowerShell Direct channel.
+    # Issue #65: the host restarts the guest at most once for this run to clear a broken PowerShell Direct channel. Outside a
+    # deploy.ps1 run that set its key (configure-arc.ps1), this call makes its own, so its probe, its onboarding, and its
+    # sign-in data check share that one restart (review of e617f34): the host's own hourly keys differ by caller (arc- and
+    # signin-), so each of them allowed one.
     $recoveryKey = Get-DemoRunRecoveryKey
+    if (-not $recoveryKey) {
+        $recoveryKey = New-DemoRunRecoveryKey -Prefix 'arc'
+    }
     # The sign-in data sweep after an onboarding (ADR 0009). 2026-11-19 (dbhubfn): a first onboarding's sweep failed while
     # the host's own sign-in cleanup swept the guest beside it, and a rerun never swept again, because the host was past
     # onboarding. Now the sweep waits for the host's bootstrap pass and holds its lock (at most SweepLockMinutes), so the two
     # never sweep the guest at the same time; a guest that doesn't answer gets issue #65's bounded recovery; and the
     # onboarding leaves a record on the resource group (DbHubArcSweepUtc) until its sweep passes, so a plain rerun of
     # deploy.ps1 sweeps and verifies again by itself, whatever the host's state.
+    # Not in the evaluation-only mode (review of e617f34): that VM turns its Azure guest agent off at least 15 minutes after
+    # its Arc marker (DisableAzureGuestAgent), so Run Command never reaches it again, and a check owed there could never run
+    # nor clear; its own SignInCleanup step cleans it and checks it first, and stops its build when anything is left. There,
+    # the record is neither read nor written, and only the sweep right after the onboarding runs, as before.
     $sweepLockMinutes = 30
-    $sweepOwed = Get-DemoArcSweepOwed -Target $target
-    $sweepFix = 'Run ./scripts/deploy.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself, and T2 goes on once it passes.'
+    $sweepOwed = if ($target.EvaluationOnly) { '' } else { Get-DemoArcSweepOwed -Target $target }
+    $sweepFix = if ($target.EvaluationOnly) {
+        'Run ./scripts/check-sign-in-data.ps1 -VmName {0} -Clean -Force while Run Command still works on {0}, before its bootstrap turns the Azure guest agent off (at least 15 minutes after the onboarding), then run ./scripts/deploy.ps1.' -f $target.HostVmName
+    }
+    else {
+        'Run ./scripts/deploy.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself, and T2 goes on once it passes.'
+    }
     $runSweep = {
         $withGuest = -not $target.EvaluationOnly
         if ($withGuest) {
@@ -185,7 +203,7 @@ function Invoke-DemoArcOnboarding {
                 $null = Set-DemoArcSweepOwed -Config $Config -Value '' -Confirm:$false
             }
         }
-        elseif ($sweepResult.status -eq 'Fail') {
+        elseif ($sweepResult.status -eq 'Fail' -and -not $target.EvaluationOnly) {
             # Recorded again, in case the record before the onboarding wasn't written: the next run must sweep again.
             $null = Set-DemoArcSweepOwed -Config $Config -Value $(if ($sweepOwed -and $sweepOwed -ne 'unknown') { $sweepOwed } else { [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
         }
@@ -430,9 +448,9 @@ function Invoke-DemoArcOnboarding {
         }
     }
 
-    if ($parameters['Action'] -eq 'Onboard') {
+    if ($parameters['Action'] -eq 'Onboard' -and -not $target.EvaluationOnly) {
         # Owed until it passes (2026-11-19): written before the token goes to the host, so a run that stops during the
-        # onboarding or its sweep leaves the next run to sweep again.
+        # onboarding or its sweep leaves the next run to sweep again. Not in the evaluation-only mode (see above).
         $sweepOwed = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
         $null = Set-DemoArcSweepOwed -Config $Config -Value $sweepOwed -Confirm:$false
     }
