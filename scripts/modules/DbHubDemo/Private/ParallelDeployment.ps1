@@ -1197,6 +1197,11 @@ function Invoke-DemoParallelDeployment {
                 & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             & $applyPolicy 15
+            # T5's container lifecycle once more (2026-11-19, F14), as at a full run's end: its first check ran right after the
+            # control's roles were granted. Only when this run granted the role and that check didn't see it.
+            if (-not $whatIf) {
+                $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
+            }
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
         }
@@ -1470,6 +1475,12 @@ function Invoke-DemoParallelDeployment {
         else {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'
         }
+    }
+    # Then T5's container lifecycle once more (2026-11-19, F14): its first check ran right after the control's roles were
+    # granted, which a read can miss for a while, so the status page's T5 row said Run all couldn't start a session while
+    # the Control row said it was ready. Only when this run granted the role and that check didn't see it. Never a Fail.
+    if (-not $whatIf) {
+        $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
     }
     # 10. T4's read replica (2026-11-16): DONE's checks and the history snapshot have read it, so it's deleted, and the run
     # leaves nothing new billing between sessions, unless a session uses it now; start-demo.ps1 and Run all create it for

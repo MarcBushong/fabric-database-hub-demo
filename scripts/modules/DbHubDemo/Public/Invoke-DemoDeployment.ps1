@@ -1016,6 +1016,11 @@ function Invoke-DemoDeployment {
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
     }
+    # T5's container lifecycle once more, now that the session control is done (2026-11-19, F14), as in the parallel path:
+    # only when this run granted the control's role and the first check, right after the grant, didn't see it.
+    if (-not $whatIf) {
+        $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
+    }
     # T4's read replica (2026-11-16), as in the parallel path: DONE's checks and the history snapshot have read it, so it's
     # deleted unless a session uses it now. Never a Fail.
     if (-not $whatIf) {
