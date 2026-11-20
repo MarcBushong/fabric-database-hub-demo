@@ -1768,6 +1768,9 @@ class Lake:
             self.tables[name][:] = kept
         elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
             self.tables.setdefault(statement.split()[5], [])
+        elif statement.startswith("SELECT DISTINCT document_id FROM rca_coverage WHERE document_id IN ("):
+            wanted = set(re.findall(r"'([^']*)'", statement))
+            result = [{"document_id": value} for value in sorted({row["document_id"] for row in self.tables["rca_coverage"]} & wanted)]
         elif statement.startswith("SELECT COUNT(*) AS n FROM "):
             result = [{"n": 0}]
         elif statement.startswith("DESCRIBE DETAIL "):
@@ -1886,10 +1889,21 @@ first.update(mismatches=mismatches, otherRunIds=sorted(set(others)), badDates=da
              expectedCounts={name: sum(len(expected(document).get(name, [])) for document in DOCUMENTS.values()) for name in spec})
 report["fixtures"] = first
 
-# The same evidence again, inline: each document once, its earlier rows deleted first.
+# The same evidence again, inline: its coverage rows say it's written, so nothing is written twice or deleted.
+before = len(lake.log)
 again, _ = run(lake, files, evidence=json.dumps(PARAMETER))
-again["deleted"] = sum(int(entry.split()[-1]) for entry in lake.log if entry.startswith("delete rca_"))
+again["writes"] = [entry for entry in lake.log[before:] if entry.split()[1].startswith("rca_")]
 report["again"] = again
+
+# A write cut off before a document's coverage rows: the next save deletes what it left and writes the document whole.
+lake, files = Lake(), Files()
+t1 = "20261120T165000Z-sqlvm01-0001"
+run(lake, files, evidence=evidence([part for part in PARAMETER["parts"] if t1 in part]))
+lake.tables["rca_coverage"][:] = [row for row in lake.tables["rca_coverage"] if row["document_id"] != t1]
+before = len(lake.log)
+resumed, _ = run(lake, files, evidence=json.dumps(PARAMETER))
+resumed["deleted"] = sum(int(entry.split()[-1]) for entry in lake.log[before:] if entry.startswith("delete rca_"))
+report["resumed"] = resumed
 
 # A document with a missing part, one whose SHA-256 doesn't match, and a newer version's, beside one that's whole.
 parts = list(PARAMETER["parts"])
@@ -1935,10 +1949,11 @@ for name in (old, recent, "Files/rca/inbox/notes.txt"):
 report["sweep"] = run(Lake(), files)[0]
 report["sweep"]["old"], report["sweep"]["recent"] = old, recent
 
-# RCA_ONLY: an earlier session's evidence alone, under its session's run ID; nothing else is written, and the run ends.
+# RCA_ONLY: an earlier session's evidence alone, under its session's run ID, with SAVE_RESULTS False as the control passes
+# it (so a copy from before the Incident RCA saves nothing); nothing else is written, and the run ends.
 lake, files = Lake(), Files()
 files.add(staged, json.dumps(PARAMETER))
-only, _ = run(lake, files, evidence_file=staged, rca_only=True)
+only, _ = run(lake, files, evidence_file=staged, rca_only=True, save=False)
 only["runIds"] = sorted({row["run_id"] for name in spec for row in lake.tables.get(name, [])})
 report["rcaOnly"] = only
 print(json.dumps(report, default=str))
@@ -2010,17 +2025,26 @@ print(json.dumps(report, default=str))
         @($fixtures['left']) | Should -BeNullOrEmpty
     }
 
-    It 'writes each document once: a second save of the same evidence deletes its earlier rows first' {
+    It 'writes each document once: a second save finds it written, and a document cut off before its coverage rows is written again whole' {
         if ($rcaSkip) {
             Set-ItResult -Skipped -Because $rcaSkip
             return
         }
         $again = $rcaReport['again']
         $again['status'] | Should -Be 'Pass'
+        $again['message'] | Should -Match '^The 2 evidence document\(s\) from sqlvm01 \(T1, T4, T4-replica; 2026-11-20 16:50 to 17:20 UTC\) were in the history already: each is written once\.$'
         foreach ($name in $rcaReport['fixtures']['counts'].Keys) {
             $again['counts'][$name] | Should -Be $rcaReport['fixtures']['counts'][$name] -Because $name
         }
-        $again['deleted'] | Should -Be (($rcaReport['fixtures']['counts'].Values | Measure-Object -Sum).Sum)
+        @($again['writes']) | Should -BeNullOrEmpty
+        # rca_coverage goes last, so a document without its coverage rows was cut off: its other rows go, then it's written whole.
+        $resumed = $rcaReport['resumed']
+        $resumed['status'] | Should -Be 'Pass'
+        $resumed['message'] | Should -Match '^Wrote 2 evidence document\(s\) '
+        foreach ($name in $rcaReport['fixtures']['expectedCounts'].Keys) {
+            [int]$resumed['counts'][$name] | Should -Be ([int]$rcaReport['fixtures']['expectedCounts'][$name]) -Because $name
+        }
+        $resumed['deleted'] | Should -BeGreaterThan 0
     }
 
     It 'skips a document with a missing part, a bad SHA-256, a newer version, or another session, and says why' -ForEach @(
