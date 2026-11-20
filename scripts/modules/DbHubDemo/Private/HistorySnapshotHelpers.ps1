@@ -9,6 +9,9 @@
 # - Direct Lake framing and automatic updates: https://learn.microsoft.com/fabric/fundamentals/direct-lake-how-it-works
 # - Refresh Dataset In Group: https://learn.microsoft.com/rest/api/power-bi/datasets/refresh-dataset-in-group
 # - Pause and resume a Fabric capacity: https://learn.microsoft.com/fabric/enterprise/pause-resume
+# - The Incident RCA's evidence (2026-11-20, ADR 0031): managed Run Command
+#   (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed) and OneLake's ADLS Gen2 API
+#   (https://learn.microsoft.com/fabric/onelake/onelake-access-api); see RcaExportHelpers.ps1.
 
 $script:HistorySnapshotCheckId = 'DEPLOY.FABRIC.HISTORY'
 $script:HistorySnapshotRowId = 'Fabric.History'
@@ -125,7 +128,11 @@ function Invoke-DemoHistorySnapshotRun {
        resumes, pauses, or scales it.
     3. The run (Invoke-DemoFabricNotebookRun with -Parameter, at most -TimeoutMinutes): Completed goes on to the refresh;
        a job still running then is a Warning (StillRunning), and it keeps running in Fabric; a deduplicated one too
-       (Deduped); a failure is a Warning with Fabric's reason (Failed).
+       (Deduped); a failure is a Warning with Fabric's reason (Failed). Before it, the Incident RCA's evidence (2026-11-20,
+       ADR 0031): the runners' export (Invoke-DemoRcaScriptExport, not a session's last), staged for the run as
+       RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun); the record's evidence rca and its message say what it did, the
+       documents the run didn't take stay listed for the next save (Save-DemoRcaPending), and an export or a save that
+       didn't work makes a Pass a Warning (ConvertTo-DemoRcaSnapshotNote).
     4. The refresh (Find-DemoSemanticModel, Invoke-DemoSemanticModelRefresh with -TableRetryMinutes 0, at most
        -RefreshTimeoutSeconds): Direct Lake framing, so the report shows the new rows now. Pass (Saved) when it passed;
        otherwise a Warning (SavedNotRefreshed): the snapshots are saved, and Direct Lake picks them up by itself (Keep
@@ -164,8 +171,24 @@ function Invoke-DemoHistorySnapshotRun {
     $again = $script:HistorySnapshotRunAgain
     $window = [int]$Parameter['WINDOW_MINUTES']
     $evidence = [ordered]@{ windowMinutes = $window; timeoutMinutes = $TimeoutMinutes }
+    # The Incident RCA's evidence (2026-11-20), once the run took it (ConvertTo-DemoRcaSnapshotNote): its sentence goes into
+    # the record, and an export or a save that didn't work makes a Pass a Warning, never a Fail.
+    $rca = $null
     $answer = {
         param([string] $Status, [string] $Outcome, [string] $Message, [string] $Remediation = '', [string] $ReportedStatus = '')
+        if ($null -ne $rca) {
+            $evidence['rca'] = $rca.Evidence
+            if ($rca.Note) {
+                $Message = '{0} {1}' -f $Message.TrimEnd(), $rca.Note
+            }
+            if ($rca.Warning -and $Status -eq 'Pass') {
+                $Status = 'Warning'
+                $Remediation = $rca.Fix
+            }
+            elseif ($rca.Warning -and $rca.Fix) {
+                $Remediation = ('{0} {1}' -f $Remediation, $rca.Fix).Trim()
+            }
+        }
         [pscustomobject]@{ Status = $Status; Outcome = $Outcome; Message = $Message; Remediation = $Remediation; ReportedStatus = $ReportedStatus; Evidence = $evidence }
     }
     # A paused capacity, as Fabric and Power BI answer it (Invoke-DemoSemanticModelRefresh reads it the same way).
@@ -221,7 +244,20 @@ function Invoke-DemoHistorySnapshotRun {
         return (& $answer 'Not selected' 'NotSelected' ('The Fabric track didn''t import {0}: it isn''t in the workspace "{1}", so the history report got no snapshot.' -f $notebook, $workspaceName) ('./scripts/deploy.ps1 imports it (its Fabric track), then runs it at its end; or run ./scripts/configure-fabric.ps1 -SkipHubChecks, then {0}.' -f $again))
     }
 
-    $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name $notebook -Parameter $Parameter -Token $token -TimeoutMinutes $TimeoutMinutes -PollSeconds $PollSeconds
+    # The Incident RCA's evidence (2026-11-20, ADR 0031): the runners' export, not a session's last (the activity goes on),
+    # staged for the run as RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun); what the run doesn't take stays listed for the
+    # next save (Save-DemoRcaPending).
+    $export = Invoke-DemoRcaScriptExport -Config $Config -CheckPrefix DEPLOY
+    $rcaRun = $null
+    try {
+        $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $Parameter -Token $token -Evidence ([string]$export.Evidence) -TimeoutMinutes $TimeoutMinutes -RunOption @{ PollSeconds = $PollSeconds }
+    }
+    finally {
+        $why = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the history run didn''t complete' }
+        $pending = Save-DemoRcaPending -Config $Config -CheckPrefix DEPLOY -Export $export -Saved:($null -ne $rcaRun -and [bool]$rcaRun.RcaSaved) -Why $why -Confirm:$false
+        $rca = ConvertTo-DemoRcaSnapshotNote -Config $Config -Export $export -Run $rcaRun -Pending $pending
+    }
+    $run = $rcaRun.Run
     $runEvidence = Get-DemoMemberValue -InputObject $run -Name 'evidence'
     $jobStatus = [string](Get-DemoMemberValue -InputObject $runEvidence -Name 'status')
     $seconds = Get-DemoMemberValue -InputObject $runEvidence -Name 'seconds'
@@ -288,6 +324,69 @@ function Invoke-DemoHistorySnapshotRun {
     }
     $checkedNote = if ($ModelCheckedBefore) { ' This run''s FABRIC.SEMANTICMODEL.* checks ran before this snapshot; ./scripts/configure-powerbi.ps1 -CheckModelData checks the measures again.' } else { '' }
     return (& $answer 'Pass' 'Saved' ('Saved the history report''s snapshots: {0}, and the history model was refreshed, so the report shows them. {1}{2}' -f $saved, $partial, $checkedNote))
+}
+
+function ConvertTo-DemoRcaSnapshotNote {
+    <#
+    .SYNOPSIS
+    What deploy.ps1's history snapshot says about the Incident RCA's evidence (2026-11-20, ADR 0031), from its export
+    (Invoke-DemoRcaScriptExport), its run (Invoke-DemoRcaNotebookRun), and the pending list (Save-DemoRcaPending): Evidence
+    (DEPLOY.FABRIC.HISTORY's evidence rca: the export's status, the documents, whether they were sent and saved, how many
+    are pending, and each target's capture), Note (a sentence for its message: the export's own, and the pending list's;
+    '' when nothing was exported and nothing is pending), Warning (the export, or the save of what it exported, didn't
+    work), and Fix. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Export,
+
+        [AllowNull()]
+        [object] $Run,
+
+        [AllowNull()]
+        [object] $Pending
+    )
+
+    $resultList = Get-DemoMemberValue -InputObject $Export -Name 'Results'
+    $exportResult = @(@($resultList) | Where-Object { $null -ne $_ -and [string]$_.checkId -like '*.RCA.EXPORT' }) | Select-Object -First 1
+    $captured = @(@($resultList) | Where-Object { $null -ne $_ -and [string]$_.checkId -like '*.RCA.CAPTURE.*' })
+    $documentList = Get-DemoMemberValue -InputObject $Export -Name 'Documents'
+    $pendingList = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Pending -Name 'evidence') -Name 'documents'
+    $exportStatus = [string](Get-DemoMemberValue -InputObject $exportResult -Name 'status')
+    $evidence = [ordered]@{
+        export    = $exportStatus
+        documents = @(@($documentList) | Where-Object { $null -ne $_ }).Count
+        sent      = [bool](Get-DemoMemberValue -InputObject $Run -Name 'RcaSent')
+        saved     = [bool](Get-DemoMemberValue -InputObject $Run -Name 'RcaSaved')
+        pending   = @(@($pendingList) | Where-Object { $_ }).Count
+        capture   = @($captured | ForEach-Object { '{0}: {1}' -f ([string]$_.checkId -replace '^.*\.RCA\.CAPTURE\.', ''), [string]$_.status })
+    }
+    $notes = [System.Collections.Generic.List[string]]::new()
+    $warning = $false
+    $fix = ''
+    if ($exportStatus -in 'Pass', 'Warning') {
+        $notes.Add((ConvertTo-DemoPlainText -Value $exportResult.message))
+    }
+    if ($exportStatus -eq 'Warning') {
+        $warning = $true
+        $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $exportResult -Name 'remediation')
+    }
+    if ($null -ne $Pending) {
+        $notes.Add((ConvertTo-DemoPlainText -Value $Pending.message))
+        $warning = $true
+        if (-not $fix) {
+            $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Pending -Name 'remediation')
+            if ([string](Get-DemoMemberValue -InputObject $Run -Name 'RcaNote') -match 'from before the Incident RCA') {
+                $fix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1 again, which updates the notebook; the next history save then adds them.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); the next history save then adds them.' }
+            }
+        }
+    }
+    return [pscustomobject]@{ Evidence = $evidence; Note = ($notes -join ' '); Warning = $warning; Fix = $fix }
 }
 
 function Invoke-DemoHistorySnapshotStep {
@@ -423,6 +522,8 @@ function Invoke-DemoHistorySnapshotStep {
         }
     }
     $answer.Evidence['parameters'] = $sent
+    # Staged by the run itself (Invoke-DemoRcaNotebookRun, 2026-11-20), which adds it to the same parameters.
+    $sent['RCA_EVIDENCE_FILE'] = if ($parameters.Contains('RCA_EVIDENCE_FILE')) { 'sent' } else { '' }
     $item = & $record $answer
     $state = switch ([string]$item.status) {
         'Pass' { 'Done' }

@@ -53,6 +53,10 @@ function Stop-DemoEnvironment {
       the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending). T5's Azure Monitor metrics
       (2026-11-18, ADR 0027) are read right before the run (STOP.T5.HISTORY, Get-DemoCosmosHistoryCapture) and sent as
       COSMOS_METRICS; its account stays, so a run that doesn't save them leaves them in Azure Monitor for a later one.
+      The Incident RCA's evidence (2026-11-20, ADR 0031) is exported from the runners before T2's guest and the VMs stop
+      (Invoke-DemoRcaScriptExport: STOP.RCA.EXPORT and STOP.RCA.CAPTURE.<target>), staged in the lakehouse, and passed
+      with that run as RCA_EVIDENCE_FILE; the documents the run didn't take stay listed in out/history-pending for the next
+      save, which fetches them again from the runner (STOP.RCA.PENDING, Save-DemoRcaPending).
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -325,6 +329,17 @@ function Stop-DemoEnvironment {
             return $results.ToArray()
         }
     }
+    # The Incident RCA's evidence (2026-11-20, ADR 0031), for the history save: the runners' export, now that the activity is
+    # off and before T2's guest and the VMs stop, since it runs on them (Invoke-DemoRcaScriptExport, STOP.RCA.EXPORT and
+    # STOP.RCA.CAPTURE.<target>). Without a save, nothing is exported: what the observers captured stays on the VMs for the
+    # next export.
+    $rcaExport = $null
+    if (-not $ParkT2 -and -not $SkipFabric -and ($SaveHistory -or (Get-DemoFabricCapacitySetting -Config $Config).SaveHistoryOnStop)) {
+        $rcaExport = Invoke-DemoRcaScriptExport -Config $Config -CheckPrefix STOP -Final -State $state -Power $power
+        foreach ($item in @($rcaExport.Results)) {
+            $results.Add($item)
+        }
+    }
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
         # action (ShutDown) shuts it down when the host deallocates otherwise.
@@ -391,6 +406,8 @@ function Stop-DemoEnvironment {
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
             $historySaved = $false
+            $rcaSaved = $false
+            $rcaWhy = ''
             # T5's Azure Monitor metrics (2026-11-18, ADR 0027), for the notebook's COSMOS_METRICS: its account stays, so
             # they're read now, right before the run (Get-DemoCosmosHistoryCapture never throws).
             $cosmosHistory = $null
@@ -401,14 +418,23 @@ function Stop-DemoEnvironment {
                 }
             }
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' })
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
                 # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.
                 $historySaved = ([string]$saved.Result.status -eq 'Pass' -or $historyRunning) -and -not [bool](Get-DemoMemberValue -InputObject $saved -Name 'PostgresDropped')
+                $rcaSaved = [bool](Get-DemoMemberValue -InputObject $saved -Name 'RcaSaved')
+                $rcaWhy = [string](Get-DemoMemberValue -InputObject $saved -Name 'RcaNote')
             }
             catch {
                 $results.Add((New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The session''s history wasn''t saved: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'In Fabric, run NB_DatabaseHub_LiveActivity in the demo''s workspace (Run all).'))
+            }
+            # The RCA evidence that the run didn't take, or didn't confirm, stays listed in out/history-pending, and the
+            # runner keeps it for 7 days, so the next save fetches it again (STOP.RCA.PENDING).
+            $rcaReason = if ($rcaSaved) { '' } elseif ($rcaWhy) { $rcaWhy } else { 'the session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why)' }
+            $rcaPending = Save-DemoRcaPending -Config $Config -CheckPrefix STOP -Export $rcaExport -Saved:$rcaSaved -Why $rcaReason -Confirm:$false
+            if ($null -ne $rcaPending) {
+                $results.Add($rcaPending)
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command
