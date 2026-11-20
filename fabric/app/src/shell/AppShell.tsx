@@ -24,6 +24,8 @@ import {
     TopSpeed20Regular,
     Warning20Filled,
     Warning20Regular,
+    TextBulletListTree20Filled,
+    TextBulletListTree20Regular,
     bundleIcon,
 } from "@fluentui/react-icons";
 
@@ -56,6 +58,7 @@ const ICONS: Record<NavPageId, ComponentType<{ className?: string }>> = {
     estate: bundleIcon(Database20Filled, Database20Regular),
     performance: bundleIcon(TopSpeed20Filled, TopSpeed20Regular),
     incidents: bundleIcon(Warning20Filled, Warning20Regular),
+    rca: bundleIcon(TextBulletListTree20Filled, TextBulletListTree20Regular),
     findings: bundleIcon(ShieldCheckmark20Filled, ShieldCheckmark20Regular),
     readiness: bundleIcon(ClipboardTaskListLtr20Filled, ClipboardTaskListLtr20Regular),
     trends: bundleIcon(ArrowTrending20Filled, ArrowTrending20Regular),
@@ -101,7 +104,7 @@ function ThemeMenu() {
 }
 
 export function AppShell({ email, onSignOut, banner, children }: { email: string | null; onSignOut: () => void; banner?: ReactNode; children: ReactNode }) {
-    const { view, navigate, runtime } = useApp();
+    const { view, navigate, runtime, rca } = useApp();
     const dock = useCopilotDock();
     const wide = useMediaQuery("(min-width: 1180px)");
     const [navPref, setNavPref] = useState<boolean | null>(loadNav);
@@ -143,7 +146,7 @@ export function AppShell({ email, onSignOut, banner, children }: { email: string
 
             <nav id="app-nav" className="nav" aria-label="Pages">
                 <ul>
-                    {PAGES.map((p) => {
+                    {PAGES.filter((p) => p.id !== "rca" || rca === true).map((p) => {
                         const Icon = ICONS[p.id];
                         const current = view.page === p.id;
                         const button = (

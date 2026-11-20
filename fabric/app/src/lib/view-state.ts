@@ -4,7 +4,7 @@
 
 import type { DateWindow } from "./dax";
 
-export type PageId = "mission" | "overview" | "estate" | "performance" | "incidents" | "scoreboard" | "replay" | "findings" | "readiness" | "trends" | "manage" | "links" | "kiosk";
+export type PageId = "mission" | "overview" | "estate" | "performance" | "incidents" | "rca" | "scoreboard" | "replay" | "findings" | "readiness" | "trends" | "manage" | "links" | "kiosk";
 /** The pages in the navigation: every page but the kiosk, which runs without the app's frame. */
 export type NavPageId = Exclude<PageId, "kiosk">;
 export type WindowId = "day" | "7d" | "30d" | "all";
@@ -50,6 +50,8 @@ export const PAGES: readonly PageInfo[] = [
     { id: "estate", label: "Estate", description: "Every engine and target" },
     { id: "performance", label: "Performance", description: "CPU, waits, and throughput per target" },
     { id: "incidents", label: "Incidents", description: "Timeline, replay, and cause" },
+    // Shown only when the history model has the Incident RCA's tables (ADR 0031): AppShell asks the app context.
+    { id: "rca", label: "Root cause", description: "Why it happened: the blind investigation of an incident, head blocker first" },
     { id: "findings", label: "Findings", description: "Health, security, and optimization" },
     { id: "readiness", label: "Readiness", description: "Is the demo ready" },
     { id: "trends", label: "Trends", description: "History past the telemetry's 7 days" },
@@ -114,7 +116,7 @@ export function parseHash(hash: string): Partial<ViewState> {
     const page = pick(head || null, PAGE_IDS);
     if (page) out.page = page;
     if (page === "estate" && isEstateTarget(sub)) out.target = sub;
-    if (page === "incidents" && INCIDENT_KEY.test(sub)) out.incident = sub;
+    if ((page === "incidents" || page === "rca") && INCIDENT_KEY.test(sub)) out.incident = sub;
     if (page === "findings" && (FINDINGS_TABS as readonly string[]).includes(sub)) out.category = sub as FindingsTab;
     const targets = (params.get("t") ?? "").split(",").filter(isFilterTarget);
     if (targets.length > 0) out.targets = FILTER_TARGETS.filter((t) => targets.includes(t));
@@ -135,7 +137,7 @@ export function toHash(state: ViewState): string {
     if (state.window !== DEFAULT_VIEW.window) params.set("w", state.window);
     let path: string = state.page;
     if (state.page === "estate" && state.target) path += `/${encodeURIComponent(state.target)}`;
-    else if (state.page === "incidents" && state.incident) path += `/${encodeURIComponent(state.incident)}`;
+    else if ((state.page === "incidents" || state.page === "rca") && state.incident) path += `/${encodeURIComponent(state.incident)}`;
     else if (state.page === "findings" && state.category) path += `/${state.category}`;
     else if (state.incident) params.set("i", state.incident);
     if (state.session) params.set("s", state.session);

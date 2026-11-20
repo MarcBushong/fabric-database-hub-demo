@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ComponentType } from "react";
+import { lazy, Suspense, useCallback, useContext, useEffect, useMemo, useState, type ComponentType } from "react";
 import { MessageBar, MessageBarBody, Spinner, Toast, ToastTitle, Toaster, useId, useToastController } from "@fluentui/react-components";
 
 import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess, type NotifyIntent } from "./app-context";
@@ -6,7 +6,7 @@ import { manageAccessOf, type ManageApi } from "./lib/manage-client";
 import type { DataProvenance } from "./copilot/contract";
 import { toMeta } from "./data/model";
 import { metaQuery, type Filters } from "./data/queries";
-import { useQuery } from "./data/use-query";
+import { QueryClientContext, useQuery } from "./data/use-query";
 import { useAuth } from "./hooks/auth.context";
 import { sqlTargets } from "./lib/estate";
 import { useMediaQuery } from "./lib/hooks";
@@ -19,6 +19,7 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const EstatePage = lazy(() => import("./pages/EstatePage"));
 const PerformancePage = lazy(() => import("./pages/PerformancePage"));
 const IncidentsPage = lazy(() => import("./pages/IncidentsPage"));
+const RcaPage = lazy(() => import("./pages/RcaPage"));
 const ScoreboardPage = lazy(() => import("./pages/ScoreboardPage"));
 const ReplayPage = lazy(() => import("./pages/ReplayPage"));
 const FindingsPage = lazy(() => import("./pages/FindingsPage"));
@@ -34,6 +35,7 @@ const PAGE_COMPONENTS: Record<PageId, ComponentType> = {
     estate: EstatePage,
     performance: PerformancePage,
     incidents: IncidentsPage,
+    rca: RcaPage,
     scoreboard: ScoreboardPage,
     replay: ReplayPage,
     findings: FindingsPage,
@@ -112,6 +114,24 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
     const metaState = useQuery(metaSpec);
     const meta = useMemo(() => toMeta(metaState.data?.rows ?? []), [metaState.data]);
 
+    // Whether the history model has the Incident RCA's tables (ADR 0031), asked once: without them the app behaves as the
+    // release before it did, with no Root cause view or links. Its code loads only when it's asked.
+    const queryClient = useContext(QueryClientContext);
+    const [rca, setRca] = useState<boolean | null>(null);
+    useEffect(() => {
+        if (!queryClient) return;
+        let alive = true;
+        import("./rca/client")
+            .then((m) => m.hasRcaTables(queryClient))
+            .then(
+                (has) => alive && setRca(has),
+                () => alive && setRca(false),
+            );
+        return () => {
+            alive = false;
+        };
+    }, [queryClient]);
+
     useEffect(() => {
         document.documentElement.dataset.motion = reducedMotion ? "reduced" : "full";
     }, [reducedMotion]);
@@ -158,8 +178,9 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
             reducedMotion,
             notify,
             manage,
+            rca,
         }),
-        [runtime, embedded, view, setView, navigate, filters, meta, metaState.loading, metaState.error, provenance, reducedMotion, notify, manage],
+        [runtime, embedded, view, setView, navigate, filters, meta, metaState.loading, metaState.error, provenance, reducedMotion, notify, manage, rca],
     );
 
     const Page = PAGE_COMPONENTS[view.page];

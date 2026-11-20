@@ -63,6 +63,8 @@ export interface AppContextValue {
     reducedMotion: boolean;
     notify: (message: string, intent?: NotifyIntent) => void;
     manage: ManageAccess;
+    /** Whether the history model has the Incident RCA's tables (ADR 0031): true or false once known, null or absent before. */
+    rca?: boolean | null;
 }
 
 export const AppContext = createContext<AppContextValue | null>(null);

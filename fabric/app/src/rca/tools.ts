@@ -7,11 +7,11 @@
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { describeEpisode, findEpisodes } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
-import { analyzeLocking } from "./locking";
+import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget } from "./types";
+import { emptyEvidence, hhmmss, iso, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -203,6 +203,64 @@ function bounded(result: InvestigationResult): string {
 }
 
 const RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
+
+/** One session of a chain, head first, with what a DBA reads off it: what it ran, who ran it, its wait, and its lock. */
+export interface ChainNodeView {
+    session: number;
+    level: number;
+    status?: string;
+    module?: string;
+    statement?: string;
+    inputBuffer?: string;
+    program?: string;
+    login?: string;
+    host?: string;
+    waitType?: string;
+    waitS?: number;
+    idleS?: number;
+    openTransactions?: number;
+    lock?: { type?: string; object?: string; index?: string; held?: string; wanted?: string };
+    children: ChainNodeView[];
+}
+
+/** Blocked sessions per capture sample and target, oldest first: the view's timeline. */
+function blockedSeries(sessions: readonly SessionSample[]): Array<{ target: RcaTarget; at: string; blocked: number }> {
+    const out = new Map<string, { target: RcaTarget; at: string; blocked: number }>();
+    for (const s of sessions) {
+        const key = `${s.target}|${s.capturedAt.getTime()}`;
+        const point = out.get(key) ?? { target: s.target, at: iso(s.capturedAt), blocked: 0 };
+        if (s.blockedBy.length > 0) point.blocked += 1;
+        out.set(key, point);
+    }
+    return [...out.values()].sort((a, b) => a.at.localeCompare(b.at) || a.target.localeCompare(b.target));
+}
+
+function nodeView(node: ChainNode): ChainNodeView {
+    const r = node.row;
+    const s = (ms: number | undefined) => (ms === undefined ? undefined : Math.round(ms / 100) / 10);
+    const lock = r && (r.lockObject || r.lockResourceType) ? { type: r.lockResourceType, object: r.lockObject, index: r.lockIndex, held: r.lockModeHeld, wanted: r.lockModeWanted } : undefined;
+    return {
+        session: node.session,
+        level: node.level,
+        ...(r
+            ? {
+                  status: r.status,
+                  module: r.module,
+                  statement: r.statement,
+                  inputBuffer: r.inputBuffer,
+                  program: r.program,
+                  login: r.login,
+                  host: r.host,
+                  waitType: r.waitType,
+                  waitS: s(r.waitMs),
+                  idleS: s(r.idleMs),
+                  openTransactions: r.openTransactions,
+              }
+            : {}),
+        ...(lock ? { lock } : {}),
+        children: node.children.map(nodeView),
+    };
+}
 const KEY = /^(T1|T2|T3|T4|T4-replica|T5)-([a-z_]+)-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
 
 export function createInvestigationTools(deps: InvestigationDeps) {
@@ -234,6 +292,8 @@ export function createInvestigationTools(deps: InvestigationDeps) {
                 chain: a.chainLines,
                 chains: a.episodes.map((e) => ({ target: e.target, head: e.headSession, kind: e.headKind, blocked: e.peak.blocked, depth: e.peak.depth, width: e.peak.width, formations: e.cycles, first: iso(e.first), last: iso(e.last), activeAtAskedTime: !!w.at && e.first.getTime() - 15000 <= w.at.getTime() && w.at.getTime() <= e.last.getTime() + 15000 })),
                 deadlocks: a.deadlocks.map((d) => ({ target: d.findings[0]?.target, count: d.count, byPattern: d.byPattern, victims: d.victims })),
+                trees: a.episodes.map((e) => ({ target: e.target, kind: e.headKind, at: iso(e.peak.at), blocked: e.peak.blocked, depth: e.peak.depth, width: e.peak.width, root: nodeView(e.peak.head) })),
+                series: blockedSeries(sessions),
             },
         };
     }
