@@ -961,12 +961,17 @@
 }
 
 /* Windows forced colors replace the stage's colors and drop its shadows, so the current scene would look like every
-   other: mark it with the system's selection colors, as the navigation marks the current page (F22). */
+   other: mark it with the system's selection colors, as the navigation marks the current page (F22), with
+   forced-color-adjust: none, so Edge paints no Canvas backplate behind its HighlightText label; no shadow, and a
+   CanvasText focus ring, as forced colors paint them. */
 @media (forced-colors: active) {
     .kiosk-scenes button[aria-current="step"] {
+        forced-color-adjust: none;
         border-color: Highlight;
         background: Highlight;
         color: HighlightText;
+        box-shadow: none;
+        outline-color: CanvasText;
     }
 }
 

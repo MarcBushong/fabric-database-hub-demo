@@ -267,11 +267,15 @@ body {
 }
 
 /* Windows forced colors replace the theme's colors with the system's, so the current page would look like every other:
-   mark it as Windows marks a selected item, with the system's selection colors (F22). */
+   mark it as Windows marks a selected item, with the system's selection colors (F22). forced-color-adjust: none keeps
+   them as they are, without the readability backplate (Canvas) that Edge paints behind text otherwise, which hid the
+   HighlightText label (black on black); its focus ring is CanvasText, as forced colors paint one. */
 @media (forced-colors: active) {
     .nav-item[aria-current="page"] {
+        forced-color-adjust: none;
         background: Highlight;
         color: HighlightText;
+        outline-color: CanvasText;
     }
 
     .nav-item[aria-current="page"] .nav-icon {
