@@ -229,10 +229,36 @@ Describe 'The one-time agent selection deploy.ps1 lists under "Please confirm" (
         $item = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoT3AgentSetupItem -Config $C -ServerName 'azuresql01-abc123' -Region 'westus3' }
         $item.checkId | Should -Be 'HUB.AGENT.T3'
         $item.status | Should -Be 'Manual action required'
-        $item.message | Should -Match '^Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment \(it stays selected across sessions and upgrades, unless T3 is recreated\)\. Open https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=66666666-7777-8888-9999-000000000000, select Manage agents, then Database agent settings; turn Enabled on, select azuresql01-abc123/ContosoCare, and under Agent policy turn on Flag long-running queries, Force last known good plans, Flag high CPU; select Apply, then Save'
-        $item.message | Should -Match 'T3''s region \(westus3\)'
+        $item.message | Should -Match '^Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment \(it stays selected across sessions and upgrades, unless T3 is recreated\)\. Open https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=66666666-7777-8888-9999-000000000000, select Manage agents, then Database agent settings; turn Enabled on, clear the selection, select azuresql01-abc123/ContosoCare, and under Agent policy turn on Flag long-running queries, Force last known good plans, Flag high CPU; select Apply, then Save'
+        $item.message | Should -Match 'T3''s region \(westus3\) must be your Fabric tenant''s home region'
         $item.evidence.database | Should -Be 'azuresql01-abc123/ContosoCare'
         InModuleScope DbHubDemo { Test-DemoConfirmOnlyResult -Result $args[0] } -ArgumentList $item | Should -BeTrue
         InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoT3AgentSetupItem -Config $C -ServerName '' } | Should -BeNullOrEmpty
+    }
+
+    It 'selects T3 alone, says how to tell look-alike ContosoCare rows apart and what to uncheck when a Save fails, within the status page''s 1,200 characters (2026-11-20)' {
+        # Live, 2026-11-20: the owner's Save failed while T3s that earlier destroys had deleted stayed selected, and the list
+        # showed every environment's T3 as a row named ContosoCare, with no server.
+        $item = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoT3AgentSetupItem -Config $C -ServerName 'azuresql01-abc123' -Region 'germanywestcentral' }
+        $item.message | Should -Match 'The list names databases without their server: when several are named ContosoCare, clear the selection, then check one ContosoCare row at a time and Save, and uncheck any whose Save fails\.'
+        $item.message | Should -Match 'If Save says "Database agent changes couldn''t be saved", uncheck any database that''s deleted, paused, one-vCore serverless, in another region, or without your Azure write access, and Save again\.$'
+        $item.remediation | Should -Match '^In Database Hub, Manage agents > Database agent settings: Enabled, clear the selection, select azuresql01-abc123/ContosoCare, Apply, Save\. If Save says "Database agent changes couldn''t be saved", uncheck any database that''s deleted'
+        $item.message.Length | Should -BeLessOrEqual 1200 -Because 'the status page keeps 1,200 characters of each "Please confirm" line (Set-DemoProgressValue), and germanywestcentral is among the longest region names'
+    }
+}
+
+Describe 'What destroy.ps1 says about T3''s selection in Database agent settings (Get-DemoT3AgentRemovalItem, 2026-11-20)' {
+    It 'is a Manual action required with what to remove and why, the steps for look-alike rows, and Learn''s page; nothing without T3''s name' {
+        $item = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoT3AgentRemovalItem -Config $C -ServerName 'azuresql01-abc123' }
+        $item.checkId | Should -Be 'DESTROY.HUB.AGENT.T3'
+        $item.status | Should -Be 'Manual action required'
+        $item.area | Should -Be 'teardown'
+        $item.message | Should -Match '^If you selected T3 for Database Agents, remove azuresql01-abc123/ContosoCare from Database Hub''s Database agent settings and Save, before or after destroy\.ps1; no API can\. Database Hub keeps a deleted database selected, and a Save checks every selected database, so every later Save there fails \("Database agent changes couldn''t be saved"\) until it''s removed'
+        $item.remediation | Should -Match '^Open https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=66666666-7777-8888-9999-000000000000, select Manage agents, then Database agent settings; uncheck azuresql01-abc123/ContosoCare, then Save\. The list names databases without their server: when several are named ContosoCare, clear the selection, then check one ContosoCare row at a time and Save, and uncheck any whose Save fails; after destroy\.ps1, T3''s row is one that fails\.'
+        $item.remediation | Should -Match 'Why: https://learn\.microsoft\.com/fabric/database/hub/enable-database-agents$'
+        $item.evidence.database | Should -Be 'azuresql01-abc123/ContosoCare'
+        foreach ($name in '', 'azuresql01-', 'sqlvm01') {
+            InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); N = $name } { Get-DemoT3AgentRemovalItem -Config $C -ServerName $N } | Should -BeNullOrEmpty -Because "'$name' isn't T3's server"
+        }
     }
 }

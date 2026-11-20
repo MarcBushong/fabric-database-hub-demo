@@ -408,8 +408,10 @@ function Get-DemoDestroyExtraPlan {
     .SYNOPSIS
     What destroy.ps1 deletes, and keeps, beyond the resource group, read before the confirmation: Control
     (Get-DemoDestroyControlPlan), Fabric (Get-DemoDestroyFabricPlan, or why it wasn't read), Group
-    (Get-DemoDestroyGroupPlan), and Delete and Keep, the lines the confirmation lists. A part that can't be read is kept
-    and says why. Internal.
+    (Get-DemoDestroyGroupPlan), T3Agent (T3's server name, from the group's deploymentId tag, while the group exists: no
+    API removes T3 from Database Hub's Database agent settings, so it's kept, and DESTROY.HUB.AGENT.T3 says how to remove
+    it, 2026-11-20), and Delete and Keep, the lines the confirmation lists. A part that can't be read is kept and says why.
+    Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -482,7 +484,23 @@ function Get-DemoDestroyExtraPlan {
     }
     $delete.Add(('the custom role "{0}" once no role assignment holds it' -f $script:SafetyStopRoleName))
     $keep.Add('the Fabric capacity and your licenses, which you manage')
-    return [pscustomobject]@{ Control = $control; Fabric = $fabric; Group = $group; Delete = $delete.ToArray(); Keep = $keep.ToArray() }
+    # T3's selection in Database agent settings (2026-11-20): Database Hub keeps a deleted database selected, and a Save
+    # fails while one is. Its name comes from the group's tag, which is empty once the group is gone; a read that fails
+    # leaves the line out, and DESTROY.HUB.AGENT.T3 still names it from the manifest.
+    $t3Agent = ''
+    try {
+        $id = [string](Get-DemoResourceGroupTag -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config))['deploymentId']
+        if ($id -match '^[a-z0-9]{6}$') {
+            $t3Agent = 'azuresql01-{0}' -f $id
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('T3''s name for Database agent settings wasn''t read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if ($t3Agent) {
+        $keep.Add(('T3''s selection in Database Hub''s Database agent settings ({0}/ContosoCare), if you made it: no API removes it' -f $t3Agent))
+    }
+    return [pscustomobject]@{ Control = $control; Fabric = $fabric; Group = $group; T3Agent = $t3Agent; Delete = $delete.ToArray(); Keep = $keep.ToArray() }
 }
 
 function Remove-DemoUnassignedRoleDefinition {

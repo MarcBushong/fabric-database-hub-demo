@@ -615,6 +615,39 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
     }
 
+    It 'says once T3 is gone to remove it from Database agent settings (DESTROY.HUB.AGENT.T3), and changes nothing else, the exit code included (2026-11-20)' {
+        # Live, 2026-11-20: Database Hub kept the T3s earlier destroys had deleted selected, and every later Save failed.
+        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        $ids = @($results | ForEach-Object { $_.checkId })
+        $agent = @($results | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' })
+        $agent.Count | Should -Be 1
+        $agent[0].status | Should -Be 'Manual action required'
+        $agent[0].evidence.database | Should -Be 'azuresql01-abc123/ContosoCare' -Because 'the manifest''s deploymentId names T3'
+        [array]::IndexOf($ids, 'DESTROY.HUB.AGENT.T3') | Should -Be ([array]::IndexOf($ids, 'DESTROY.RESOURCEGROUP') + 1)
+        Get-DemoExitCode -Result $results | Should -Be 0
+
+        # A run after the group is gone still names T3, from the manifest.
+        $script:groupExists = $false
+        @(Remove-DemoEnvironment -Config $config -Confirm:$false | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' }).Count | Should -Be 1
+    }
+
+    It 'says nothing about Database agent settings without T3''s name, or while T3 <Case>' -ForEach @(
+        @{ Case = 'has no name (no deploymentId)'; NoId = $true; DeleteFails = $false }
+        @{ Case = 'is still there (the group''s delete failed)'; NoId = $false; DeleteFails = $true }
+    ) {
+        if ($NoId) {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { [pscustomobject]@{ ResourceGroupName = 'rg-dbhub-demo'; DeploymentId = ''; Principals = @() } }
+        }
+        if ($DeleteFails) {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -ParameterFilter { ($ArgumentList -join ' ') -like 'group delete --name rg-dbhub-demo *' } -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (ScopeLocked) The scope is locked.' } }
+        }
+        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        @($results | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' }).Count | Should -Be 0
+        if ($DeleteFails) {
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Fail'
+        }
+    }
+
     It 'says that a golden group that doesn''t exist doesn''t exist, on the console and in DESTROY.GOLDEN, and never that it stays (2026-11-19)' {
         # Live while destroying dbhubask: with no rg-dbhubask-golden, the console said "destroy.ps1 keeps rg-dbhubask-golden
         # and its golden snapshots", and DESTROY.GOLDEN that it "stays with 0 golden snapshot(s)".

@@ -55,10 +55,18 @@ function Remove-DemoEnvironment {
     unless -WithoutGolden or -IncludeGolden accepted losing that state; Get-DemoConfig runs a configuration's
     PaygWizard as JumpstartImage since then, so the guard no longer refuses anything.
 
+    T3's selection in Database Hub's Database agent settings (2026-11-20) stays, because no API removes it: the list of
+    what stays names T3 (Get-DemoDestroyExtraPlan's T3Agent), a Warning line before the confirmation says to remove it
+    there and Save, and why, and DESTROY.HUB.AGENT.T3, a Manual action required once the group is gone, gives the steps
+    (Get-DemoT3AgentRemovalItem). Database Hub keeps a deleted database selected, and a Save fails as a whole while one
+    is, so every later Save, the next deployment's T3 included, fails until it's removed. It changes nothing else, and
+    the exit code doesn't count it.
+
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.FABRIC.CONTROL, DESTROY.FABRIC.WORKSPACE, DESTROY.CONTROL (with DESTROY.CONTROL.ROLES
     and DESTROY.CONTROL.RESOURCES when it went), DESTROY.ENTRA.GROUP, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES,
-    DESTROY.RESOURCEGROUP, DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET,
+    DESTROY.RESOURCEGROUP, DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.HUB.AGENT.T3 (when T3's name is known),
+    DESTROY.DEPLOYMENT, DESTROY.BUDGET,
     DESTROY.SAFETYSTOP.ROLE (the nightly safety stop's custom role, deleted once no assignment holds it, ADR 0024; its
     identity, account, schedules, and assignment go with the group), DESTROY.GOLDEN, the
     TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL. With -ResidueOnly it deletes nothing and asks nothing: it runs
@@ -249,6 +257,13 @@ function Remove-DemoEnvironment {
     if ($goldenMissing) {
         Write-DemoLog -Message $goldenNote
     }
+    # T3's selection in Database agent settings (2026-11-20), which no API removes: what to do, and why, before anything
+    # goes, and again at the end (DESTROY.HUB.AGENT.T3).
+    $agentServer = [string](Get-DemoMemberValue -InputObject $extra -Name 'T3Agent')
+    $agentNote = Get-DemoT3AgentRemovalItem -Config $Config -ServerName $agentServer
+    if ($null -ne $agentNote) {
+        Write-DemoLog -Level Warning -Message ('{0} DESTROY.HUB.AGENT.T3 at the end says how ({1}).' -f $agentNote.message, $agentNote.docUrl)
+    }
     if (-not $PSCmdlet.ShouldProcess($resourceGroupName, ('Delete {0}. Keep {1}' -f ($deleteText -join '; '), ($keepText -join '; ')))) {
         $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted, and nothing else was. destroy.ps1 would delete {1}; and keep {2}.{3}' -f $resourceGroupName, ($deleteText -join '; '), ($keepText -join '; '), $(if ($goldenMissing) { ' ' + $goldenNote } else { '' }))))
         return $results.ToArray()
@@ -283,6 +298,7 @@ function Remove-DemoEnvironment {
     catch {
         Write-DemoLog -Level Warning -Message ('The manifest for the residual check couldn''t be recorded; the check runs without it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
+    $manifestId = [string](Get-DemoMemberValue -InputObject $manifest -Name 'DeploymentId')
 
     # The Fabric workspaces, the session control, and the security group (2026-11-17), before the group: the control's
     # schedules then can't start anything in it while it goes. Each part reports itself; one that fails doesn't stop the
@@ -351,7 +367,6 @@ function Remove-DemoEnvironment {
         # T4's read replica (2026-11-13, ADR 0025) goes before the group: "If a server has read replicas, delete the read
         # replicas first before deleting the primary server" (Learn, read replicas, checked 2026-11-13). Nothing when a
         # session's replica isn't there. The manifest's deploymentId names it, so the group isn't read again for it.
-        $manifestId = [string](Get-DemoMemberValue -InputObject $manifest -Name 'DeploymentId')
         if ($manifestId -match '^[a-z0-9]{6}$') {
             $replicaGone = Remove-DemoT4Replica -Config $Config -CheckPrefix DESTROY -DeploymentId $manifestId -Quiet -Confirm:$false
             if ($null -ne $replicaGone) {
@@ -386,6 +401,13 @@ function Remove-DemoEnvironment {
     }
     else {
         $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('{0} doesn''t exist; nothing to delete.' -f $resourceGroupName)))
+    }
+
+    # T3 is gone, but not its selection in Database agent settings (2026-11-20), which no API removes: a Manual action
+    # required that changes nothing else. The manifest names T3 on a run after the group is gone too.
+    $agentItem = Get-DemoT3AgentRemovalItem -Config $Config -ServerName $(if ($manifestId -match '^[a-z0-9]{6}$') { 'azuresql01-{0}' -f $manifestId } else { $agentServer })
+    if ($null -ne $agentItem) {
+        $results.Add($agentItem)
     }
 
     # The subscription-scope deployment record outlives the group (history only, but it holds the parameters).
