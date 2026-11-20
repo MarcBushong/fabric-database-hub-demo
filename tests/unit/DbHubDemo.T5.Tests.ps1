@@ -986,10 +986,14 @@ Describe 'Invoke-DemoT5LifecycleRecheck: T5''s container lifecycle once more at 
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         $script:prior = $null
+        # What each check again reads, in order: Control once the queue is empty.
+        $script:modes = [System.Collections.Generic.Queue[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Update-DemoT5ContainerLifecycle -MockWith {
             $script:prior = @($PriorResult)
-            New-DemoResult -CheckId 'DEPLOY.T5.LIFECYCLE' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'Checked again.' -Evidence ([ordered]@{ lifecycle = 'Session'; mode = 'Control' })
+            $seen = if ($script:modes.Count -gt 0) { $script:modes.Dequeue() } else { 'Control' }
+            New-DemoResult -CheckId 'DEPLOY.T5.LIFECYCLE' -Area 't5' -Target 'T5' -Status $(if ($seen -eq 'Control') { 'Pass' } else { 'Warning' }) -Message ('Checked again: {0}.' -f $seen) -Evidence ([ordered]@{ lifecycle = 'Session'; mode = $seen })
         }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         # The run's results so far: preflight's monthly check, the control's grant (CONTROL.ROLE.*), T5's first check, and
         # the control's Fabric part. A mode of '-' is a first check that wasn't made, which has no evidence.
         function Invoke-Recheck([string] $Mode, [string] $Status, [string] $A1, [string] $Definition) {
@@ -1029,19 +1033,43 @@ Describe 'Invoke-DemoT5LifecycleRecheck: T5''s container lifecycle once more at 
         $outcome.List[$outcome.List.Count - 1].checkId | Should -Be 'DEPLOY.CONTROL' -Because 'the new result takes the first one''s place'
         if ($Again) {
             Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoT5ContainerLifecycle -Times 1 -Exactly
-            $lifecycle[0].message | Should -Be 'Checked again.'
+            $lifecycle[0].message | Should -Be 'Checked again: Control.'
             [object]::ReferenceEquals($lifecycle[0], $outcome.Again) | Should -BeTrue
             $lifecycle[0].evidence['checkedAgain'] | Should -BeTrue
             $lifecycle[0].evidence['firstMode'] | Should -Be ($Mode -replace '^-$', '')
             @($script:prior | Where-Object { $_.checkId -eq 'DEPLOY.T5.LIFECYCLE' }) | Should -BeNullOrEmpty -Because 'the first check isn''t a prior result of its own'
             @($script:prior | ForEach-Object { $_.checkId }) | Should -Contain 'PREFLIGHT.COST.MONTHLY'
-            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container lifecycle, checked again at the run''s end, once the session control''s role showed: Checked again.' }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s container lifecycle, checked again at the run''s end, once the session control''s role showed: Checked again: Control.' }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -Because 'the role showed at once'
         }
         else {
             Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoT5ContainerLifecycle -Times 0 -Exactly
             $outcome.Again | Should -BeNullOrEmpty
             $lifecycle[0].message | Should -Be 'First check.'
         }
+    }
+
+    It 'reads again, at most 3 more times 20 seconds apart, while the check still contradicts the grant, and stops when it doesn''t: <Case> (the review of f213a47)' -ForEach @(
+        @{ Case = 'the role shows at the third read'; Modes = @('NoRole', 'NoRole'); Definition = 'Pass'; Reads = 3; Final = 'Control' }
+        @{ Case = 'the role never shows'; Modes = @('NoRole', 'NoRole', 'Unknown', 'NoRole', 'NoRole'); Definition = 'Pass'; Reads = 4; Final = 'NoRole' }
+        @{ Case = 'the container''s actions missing, although the definition was written'; Modes = @('Lacking'); Definition = 'Pass'; Reads = 2; Final = 'Control' }
+        @{ Case = 'the container''s actions missing, and the definition not written: what holds'; Modes = @('Lacking'); Definition = 'Warning'; Reads = 1; Final = 'Lacking' }
+    ) {
+        # A run that ends seconds after the grant (-Sequential -StopAfter Infrastructure), or a slow replication.
+        foreach ($item in $Modes) {
+            $script:modes.Enqueue($item)
+        }
+        $outcome = Invoke-Recheck -Mode 'NoRole' -Status 'Pass' -A1 'Pass' -Definition $Definition
+        Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoT5ContainerLifecycle -Times $Reads -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times ($Reads - 1) -Exactly -ParameterFilter { $Seconds -eq 20 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times ($Reads - 1) -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times ($Reads - 1) -Exactly -ParameterFilter { $Message -like 'The session control''s role doesn''t show in T5''s check yet (*); reading it again in 20 seconds (* of 3).' }
+        $lifecycle = @($outcome.List | Where-Object { $_.checkId -eq 'DEPLOY.T5.LIFECYCLE' })
+        $lifecycle.Count | Should -Be 1
+        [object]::ReferenceEquals($lifecycle[0], $outcome.Again) | Should -BeTrue
+        $lifecycle[0].evidence['mode'] | Should -Be $Final
+        $lifecycle[0].evidence['reads'] | Should -Be $Reads
+        $lifecycle[0].evidence['firstMode'] | Should -Be 'NoRole'
     }
 }
 

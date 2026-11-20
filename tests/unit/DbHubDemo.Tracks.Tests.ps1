@@ -2366,6 +2366,32 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
     }
 
+    It 'checks T5''s container lifecycle again after -StopAfter Infrastructure''s wait for the policy inventory, before its summary (2026-11-19, F14, the review of f213a47)' {
+        # The branch grants the control's roles and checks T5's lifecycle at once, as a full run does, then ends.
+        $withT5 = New-TestConfig -WithT4 -WithT5
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith {
+            $script:calls.Add(('control {0}' -f $Part))
+            New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'The custom role "DbHub Demo Activity Operator" has exactly its approved actions.'
+            New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'A1: DbHub Demo Activity Operator for id-dbhub-automation at rg-dbhub-demo is assigned.'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = $null; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        $script:reads = [System.Collections.Generic.Queue[string]]::new()
+        $script:reads.Enqueue('NoRole')
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith {
+            $mode = if ($script:reads.Count -gt 0) { $script:reads.Dequeue() } else { 'Control' }
+            $script:calls.Add(('lifecycle {0}' -f $mode))
+            [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = 'id-dbhub-automation holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; Mode = $mode; AutoDelete = $true; Price = 'Session' }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT5 } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
+        @($script:calls | Where-Object { $_ -like 'lifecycle *' }) | Should -Be @('lifecycle NoRole', 'lifecycle Control')
+        $lifecycle = @($results | Where-Object { $_.checkId -eq 'DEPLOY.T5.LIFECYCLE' })
+        $lifecycle.Count | Should -Be 1
+        $lifecycle[0].evidence['mode'] | Should -Be 'Control'
+        $lifecycle[0].evidence['checkedAgain'] | Should -BeTrue
+        $results[$results.Count - 1].checkId | Should -Be 'DEPLOY.SUMMARY'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+    }
+
     It 'sets up the nightly safety stop once, after the template''s handoff and before the tracks (ADR 0024)' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly

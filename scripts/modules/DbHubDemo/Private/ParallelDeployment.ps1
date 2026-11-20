@@ -1197,6 +1197,11 @@ function Invoke-DemoParallelDeployment {
                 & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             & $applyPolicy 15
+            # T5's container lifecycle once more (2026-11-19, F14), as at a full run's end: its first check ran right after the
+            # control's roles were granted. Only when this run granted the role and that check didn't see it.
+            if (-not $whatIf) {
+                $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
+            }
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
         }
