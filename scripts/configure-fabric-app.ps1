@@ -360,19 +360,43 @@ if ($modelId -notmatch $guidPattern) {
 # everything deployed"): the Fabric API for 'rayfin up' and 'rayfin up status', the Power BI API for the app's queries,
 # each as RAYFIN_TOKEN in that command's process only (Get-DemoRayfinTokenAudience), and the Power BI one for Execute
 # Queries too when the connector's direct route refuses it (2026-11-09 live finding). -RayfinSignIn uses the CLI's own
-# sign-in instead. The Power BI token needs the subscription guard this script ran; with a -FabricToken the caller passed,
-# there's none, and the app's queries are checked only with -RayfinSignIn (Test-DemoFabricApp warns).
+# sign-in instead. The Power BI token is taken right before the app's checks (Step 7).
 $rayfinToken = @{ Fabric = $null; PowerBI = $null }
 if (-not $RayfinSignIn) {
     $rayfinToken.Fabric = $FabricToken
-    if ($config -and $guarded) {
-        try {
-            $rayfinToken.PowerBI = Get-DemoPowerBIToken -SubscriptionId ([string]$config['subscriptionId'])
-        }
-        catch {
-            Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries can''t be checked (FABRIC.APP.CONNECTOR says so; -RayfinSignIn checks them with the Rayfin CLI''s own sign-in): {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+}
+# Each token is taken right before the Rayfin CLI command that uses it (F16, live 2026-11-20): the Azure CLI hands out a
+# cached token until about 5 minutes before it expires, and one taken at the start of a run ran out during rayfin up.
+# True when it got a new one; with a -FabricToken the caller passed (no guard here), there's none to take, and that one
+# is used.
+$newFabricToken = {
+    if (-not $guarded -or $null -eq $rayfinToken.Fabric) {
+        return $false
+    }
+    try {
+        $rayfinToken.Fabric = Get-DemoFabricToken -SubscriptionId $config['subscriptionId']
+        return $true
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The Azure CLI gave no new Fabric token, so rayfin up uses the one it has: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $false
+    }
+}
+# rayfin up with a token taken right before it, and once more with a new one when the token expired during the command:
+# an expiry isn't a refusal (F16). A second expiry, or a refusal, keeps its record, which the caller handles as before.
+$upWithToken = {
+    param([switch] $Dry)
+    $null = & $newFabricToken
+    $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+    $expired = @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] -and $_.evidence['tokenExpired'] }).Count -gt 0
+    if ($expired -and (& $newFabricToken)) {
+        Write-DemoLog -Level Warning -Message 'The Azure CLI''s token expired during rayfin up, so rayfin up runs once more with a new one.'
+        $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+        foreach ($record in @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] })) {
+            $record.evidence['retriedAfterExpiry'] = $true
         }
     }
+    $records
 }
 
 #region Step 4-5: stage and prerequisites
@@ -472,12 +496,15 @@ elseif (-not $capacityReady) {
     & $skip 'FABRIC.APP.DEPLOY' 'Not deployed: the workspace isn''t on an Active Fabric capacity (FABRIC.P5.CAPACITY), and rayfin up would try to start a trial or assign one.'
 }
 elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $targetWorkspaceId", $(if ($DryRun) { 'Validate with rayfin up --dry-run' } else { 'Deploy with rayfin up' }))) {
-    $deploy = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$DryRun -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+    $deploy = @(& $upWithToken -Dry:$DryRun)
     $refused = @($deploy | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] -and $_.evidence['tokenRefused'] }) | Select-Object -First 1
     if ($refused) {
         # Fabric refused the Azure CLI's token: the Rayfin CLI's own sign-in deploys instead (2026-11-09). Without one,
         # -SignIn opens its browser sign-in here; deploy.ps1 starts it at the start of its next run (out/fabric-app-auth.json).
+        # A token that expired again, with a new one, comes here too (F16).
         $refusal = [string]$refused.evidence['refusal']
+        $lead = if ($refused.evidence['tokenExpired']) { 'The Azure CLI''s token expired during rayfin up, and again with a new one' } else { 'Fabric refused the Azure CLI''s token for rayfin up' }
+        $short = if ($refused.evidence['tokenExpired']) { 'The Azure CLI''s token expired twice' } else { 'Fabric refused the Azure CLI''s token' }
         $rayfinToken.Fabric = $null
         $own = @(Test-DemoFabricAppPrerequisite -Config $config -StagePath $stage -Token $FabricToken | Where-Object { $_.checkId -eq 'FABRIC.APP.SIGNIN' }) | Select-Object -First 1
         if ($SignIn -and $config -and ($null -eq $own -or $own.status -ne 'Pass')) {
@@ -491,16 +518,16 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
         $signedIn = $null -ne $own -and $own.status -eq 'Pass'
         if (-not $signedIn -and $null -ne $own -and [string]$own.message) {
             # The app's summary on the status page leads with this record, so it names the refusal first.
-            $own.message = 'Fabric refused the Azure CLI''s token (FABRIC.APP.TOKEN), and {0}{1}' -f $own.message.Substring(0, 1).ToLowerInvariant(), $own.message.Substring(1)
+            $own.message = '{0} (FABRIC.APP.TOKEN), and {1}{2}' -f $short, $own.message.Substring(0, 1).ToLowerInvariant(), $own.message.Substring(1)
         }
-        $tokenMessage = if ($signedIn) { 'Fabric refused the Azure CLI''s token for rayfin up, so the Rayfin CLI''s own sign-in deploys the app: {0}' -f $refusal } else { 'Fabric refused the Azure CLI''s token for rayfin up, and the Rayfin CLI isn''t signed in to the demo''s tenant, so the app wasn''t deployed: {0}' -f $refusal }
+        $tokenMessage = if ($signedIn) { '{0}, so the Rayfin CLI''s own sign-in deploys the app: {1}' -f $lead, $refusal } else { '{0}, and the Rayfin CLI isn''t signed in to the demo''s tenant, so the app wasn''t deployed: {1}' -f $lead, $refusal }
         $tokenFix = if ($signedIn) { '' } else { 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app. The next ./scripts/deploy.ps1 starts that sign-in at its start too.' }
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.TOKEN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message $tokenMessage -Evidence ([ordered]@{ refusal = $refusal; fallback = $(if ($signedIn) { 'rayfinSignIn' } else { 'none' }); signInNeeded = (-not $signedIn) }) -Remediation $tokenFix -DocUrl 'https://learn.microsoft.com/fabric/apps/cli-reference'))
         $deploy = if ($signedIn) {
             @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$DryRun -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
         }
         else {
-            @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: Fabric refused the Azure CLI''s token (FABRIC.APP.TOKEN), and the Rayfin CLI isn''t signed in to the demo''s tenant (FABRIC.APP.SIGNIN).' -Evidence ([ordered]@{ tokenRefused = $true; signInNeeded = $true }) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in, then deploys the app.' -DocUrl 'https://learn.microsoft.com/fabric/apps/deploy-app')
+            @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message ('Not deployed: {0} (FABRIC.APP.TOKEN), and the Rayfin CLI isn''t signed in to the demo''s tenant (FABRIC.APP.SIGNIN).' -f $short) -Evidence ([ordered]@{ tokenRefused = $true; signInNeeded = $true }) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in, then deploys the app.' -DocUrl 'https://learn.microsoft.com/fabric/apps/deploy-app')
         }
     }
     $results.AddRange([object[]]$deploy)
@@ -519,7 +546,7 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
         $after = Set-DemoFabricAppManageSetting @manage -Confirm:$false
         $api = [string]$after.evidence['apiUrl']
         if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written'] -and [string]$after.status -eq 'Pass') {
-            $again = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+            $again = @(& $upWithToken)
             $againResult = $again | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' } | Select-Object -First 1
             if ($null -eq $againResult -or $againResult.status -ne 'Pass') {
                 $after = New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The app''s second deploy, with Manage''s settings, didn''t pass ({0}), so the app copies each request for Run all in NB_DatabaseHub_Control until its next deploy.' -f $(if ($againResult) { $againResult.message } else { 'no result' })) -Evidence $after.evidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 again.' -DocUrl 'https://learn.microsoft.com/fabric/apps/functions'
@@ -572,6 +599,17 @@ elseif ($deployed -or $CheckOnly) {
     }
     else {
         # The workspace and model for Execute Queries, and whether this run deployed the app, for the browser check's note.
+        # The Azure CLI's Power BI token for the app's queries, taken right before them (F16). It needs the subscription guard
+        # this script ran; with a -FabricToken the caller passed, there's none, and the app's queries are checked only with
+        # -RayfinSignIn (Test-DemoFabricApp warns).
+        if (-not $RayfinSignIn -and $config -and $guarded) {
+            try {
+                $rayfinToken.PowerBI = Get-DemoPowerBIToken -SubscriptionId ([string]$config['subscriptionId'])
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries can''t be checked (FABRIC.APP.CONNECTOR says so; -RayfinSignIn checks them with the Rayfin CLI''s own sign-in): {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+            }
+        }
         $check = @{ StagePath = $stage; HostingUrl = $hostingUrl; ItemUrl = $itemUrl; Queries = $Queries; Token = $rayfinToken.PowerBI; WorkspaceId = $targetWorkspaceId; SemanticModelId = $modelId; Deployed = $deployed; RayfinSignIn = [bool]$RayfinSignIn }
         $results.AddRange([object[]]@(Test-DemoFabricApp @check))
     }

@@ -104,11 +104,17 @@ function Invoke-DemoFabricAppDeployment {
     # The Azure CLI's token refused: the caller deploys again with the CLI's own sign-in (2026-11-09).
     $refusal = if ($null -ne $Token) { Get-DemoRayfinTokenRefusal -Run $up } else { '' }
     if ($refusal) {
-        if (-not $DryRun) {
+        # A token that expired during the command isn't refused (F16, live 2026-11-20): the caller takes a new one and runs
+        # rayfin up once more (tokenExpired), and nothing records a refusal. tokenRefused stays, so a caller that doesn't
+        # take a new token handles it as before.
+        $expired = Test-DemoRayfinTokenExpiry -Reason $refusal
+        if (-not $DryRun -and -not $expired) {
             Set-DemoRayfinAuthRecord -Outcome 'Refused' -Reason $refusal -TenantId $TenantId
         }
-        $refused = [ordered]@{ tokenRefused = $true; refusal = $refusal; exitCode = $up.ExitCode; seconds = $seconds; dryRun = [bool]$DryRun }
-        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Fabric refused the Azure CLI''s token for rayfin up{0}: {1}' -f $(if ($DryRun) { ' --dry-run' } else { '' }), $refusal) -Evidence $refused -Remediation ('The Rayfin CLI''s own sign-in deploys the app instead: {0}' -f $signInHint) -DocUrl $cliReference))
+        $refused = [ordered]@{ tokenRefused = $true; tokenExpired = $expired; refusal = $refusal; exitCode = $up.ExitCode; seconds = $seconds; dryRun = [bool]$DryRun }
+        $what = if ($expired) { 'The Azure CLI''s token expired during rayfin up{0}: {1}' } else { 'Fabric refused the Azure CLI''s token for rayfin up{0}: {1}' }
+        $fix = if ($expired) { 'configure-fabric-app.ps1 takes a new token from the Azure CLI and runs rayfin up once more; otherwise the Rayfin CLI''s own sign-in deploys the app: {0}' } else { 'The Rayfin CLI''s own sign-in deploys the app instead: {0}' }
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ($what -f $(if ($DryRun) { ' --dry-run' } else { '' }), $refusal) -Evidence $refused -Remediation ($fix -f $signInHint) -DocUrl $cliReference))
         return $results.ToArray()
     }
 

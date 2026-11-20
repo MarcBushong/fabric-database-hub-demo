@@ -72,6 +72,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - `check-sign-in-data.ps1 -Clean` waited on its question where no one could answer; it now stops at once, changing nothing, and gives the same command with `-Force` (`SECURITY.SIGNIN.CONFIRM`).
 - `destroy.ps1` said it kept a golden group that doesn't exist; it now says the group doesn't exist (`DESTROY.GOLDEN`).
 - A new environment's Insights app copied every Manage request for Run all; its first `deploy.ps1` now gives Manage the control notebook (`FABRIC.APP.ACTIONS`).
+- A `rayfin up` whose Azure CLI token expired during the command was taken for Fabric refusing the token, so the Insights app fell back to the PC's own Rayfin sign-in, which a new PC doesn't have. `configure-fabric-app.ps1` now takes a new token right before each `rayfin up`, and runs it once more with a new one when the token expired (F16).
 - `destroy.ps1` called an environment that was still being deployed one "deployed by an earlier version of the demo"; it now says it hasn't recorded its workspaces yet.
 
 ### Security
