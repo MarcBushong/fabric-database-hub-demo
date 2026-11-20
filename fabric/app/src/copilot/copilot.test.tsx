@@ -9,9 +9,9 @@ import { CopilotProvider } from "./CopilotProvider";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
-// These tests play conversations through several scripted hops, which take longer than the defaults on a busy machine.
+// These tests play conversations through several scripted hops, which can take longer than Testing Library's 1-second
+// wait on a busy machine (the test timeout is the app's, in vitest.config.ts).
 configure({ asyncUtilTimeout: 4000 });
-vi.setConfig({ testTimeout: 15_000 });
 
 // Built at run time so secret scanners never see a token-shaped literal.
 const fakeToken = () => ["gho", "D".repeat(36)].join("_");
