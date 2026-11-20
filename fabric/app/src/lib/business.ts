@@ -8,7 +8,7 @@
 // integration's events (docs/architecture.md). Which of T1 and T2 is billing and which the front desk is this file's
 // choice: change it here, in one place.
 
-import { formatDuration, formatNumber, type NumberKind } from "./format";
+import { formatDuration, formatLevel, formatNumber, type NumberKind } from "./format";
 import { timesText } from "./insights";
 import type { EstateTarget } from "./view-state";
 
@@ -113,11 +113,12 @@ export function impactOf(input: ImpactInput): Impact {
         const wording = WORDING[input.family] ?? { what: "a signal above its baseline", signal: input.family.replace(/_/g, " "), kind: "decimal" as NumberKind };
         headline = `${service}: ${wording.what}${span}`;
         const ratio = input.peak !== null && input.baseline ? input.peak / input.baseline : null;
+        // A bin's blocked processes are its highest sample; a fraction is written as it is, never rounded to a whole count.
         const peak =
             input.peak === null
                 ? wording.signal
                 : input.family === "blocking"
-                  ? `up to ${formatNumber(input.peak, "int")} ${wording.signal}`
+                  ? `up to ${formatLevel(input.peak, "int")} ${input.peak === 1 ? "blocked process" : wording.signal}`
                   : `${wording.signal} peak ${formatNumber(input.peak, wording.kind)}${wording.kind === "seconds" ? " per bin" : ""}`;
         evidence = ratio !== null && Number.isFinite(ratio) && ratio >= 1.05 ? `${peak}, ${timesText(ratio)} its baseline` : peak;
     }

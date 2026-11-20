@@ -118,6 +118,21 @@ describe("the business lens", () => {
         expect(bare.sentence).toBe("Front desk: waiting on storage (Buffer IO waits)");
         expect(bare.sentence).not.toMatch(/\d|latency|slow/i);
     });
+
+    it("writes a blocked-process peak that isn't whole with its decimals, never rounded to a whole count", () => {
+        // A bin's value is its highest sample: never "up to 7" for 6.6, or "up to 0" for 0.4.
+        expect(impactOf({ target: "T1", family: "blocking", durationMin: 8, peak: 6.6, baseline: 0 }).evidence).toBe("up to 6.6 blocked processes");
+        expect(impactOf({ target: "T1", family: "blocking", durationMin: 8, peak: 0.4, baseline: 0.3 }).sentence).toBe("Billing: work blocked behind other work for 8 min (up to 0.4 blocked processes, 1.3 times its baseline)");
+        expect(impactOf({ target: "T1", family: "blocking", durationMin: 3, peak: 1, baseline: 0 }).evidence).toBe("up to 1 blocked process");
+        // Through the scoreboard: a fault whose bins reach 0.6 blocked processes, over a baseline of 0.3, and its postmortem.
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T1", "incident:blocking-chain", 30, 40)];
+        const plan = toPlans(runs)[0];
+        const [score] = scorePlan(plan, { bins: bins("T1", (m) => ({ blocked: m >= 31 && m <= 38 ? 0.6 : 0.3 })), beats: [], runs });
+        expect(score.status).toBe("Pass");
+        expect(score.impact?.evidence).toBe("up to 0.6 blocked processes, 2.0 times its baseline");
+        const { markdown } = buildPostmortem({ plan, scores: [score], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: at(130) });
+        expect(markdown).toContain("| up to 0.6 blocked processes, 2.0 times its baseline |");
+    });
 });
 
 describe("the scoreboard", () => {
