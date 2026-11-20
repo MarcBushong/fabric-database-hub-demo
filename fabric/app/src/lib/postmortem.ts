@@ -136,7 +136,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         lines.push(
             ...table(
                 ["Fault", "Target", "Injected", "Signal visible", "Time to detect", "Answered", "Recovered", "Time to recover", "Status"],
-                scores.map((s) => [s.title, s.target, time(s.injectedAt), time(s.visibleAt), minutesText(s.ttdMin, s.binMinutes), time(s.answeredAt), time(s.recoveredAt), minutesText(s.ttrMin), s.status]),
+                scores.map((s) => [s.title, s.target, time(s.injectedAt), time(s.visibleAt), minutesText(s.ttdMin, s.binMinutes), time(s.answeredAt), s.recoveredAt ? time(s.recoveredAt) : s.recoveryWord || "–", minutesText(s.ttrMin), s.status]),
             ),
             "",
         );

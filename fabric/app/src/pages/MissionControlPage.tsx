@@ -9,7 +9,6 @@ import { DocumentText16Regular, Replay20Regular, Open16Regular, Trophy20Regular,
 
 import { useApp } from "@/app-context";
 import { EmptyState } from "@/components/EmptyState";
-import { ProvenanceBadge } from "@/components/ProvenanceBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
@@ -81,7 +80,6 @@ export default function MissionControlPage() {
                         <p className="mc-kicker">ContosoCare · Mission Control</p>
                         <h1>{plan ? `${plan.label} · ${windowText}` : "ContosoCare's services"}</h1>
                         <p className="mc-asof">
-                            <ProvenanceBadge provenance={provenance} asOf={meta?.latestCapture} />
                             <span>
                                 {plan
                                     ? `The ${plan.kind === "session" ? "session's plan" : "request"} as recorded at its end, as of ${formatDateTimeUtc(meta?.latestCapture ?? plan.end)}. For the live view, open Database Hub.`

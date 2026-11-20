@@ -10,7 +10,6 @@ import { DocumentText16Regular, Replay20Regular, HeartPulse20Regular } from "@fl
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
 import { EmptyState } from "@/components/EmptyState";
-import { ProvenanceBadge } from "@/components/ProvenanceBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
@@ -64,7 +63,7 @@ function columns(lens: Lens): GridColumn<FaultRow>[] {
         { key: "visible", label: "Signal visible", render: (r) => time(r.visible), sortValue: (r) => r.visible?.getTime() ?? null },
         { key: "ttd", label: "Time to detect", render: (r) => minutesText(r.ttd, r.score.binMinutes), sortValue: (r) => r.ttd, numeric: true },
         { key: "answered", label: "Answered", render: (r) => time(r.answered), sortValue: (r) => r.answered?.getTime() ?? null },
-        { key: "recovered", label: "Recovered", render: (r) => time(r.recovered), sortValue: (r) => r.recovered?.getTime() ?? null },
+        { key: "recovered", label: "Recovered", render: (r) => (r.recovered ? time(r.recovered) : r.score.recoveryWord || "–"), sortValue: (r) => r.recovered?.getTime() ?? null },
         { key: "ttr", label: "Time to recover", render: (r) => minutesText(r.ttr), sortValue: (r) => r.ttr, numeric: true },
         lens === "business" ? { key: "impact", label: "Business impact (measured)" } : { key: "how", label: "How it was measured" },
     ];
@@ -118,7 +117,9 @@ export default function ScoreboardPage() {
                 recovered: s.recoveredAt,
                 ttr: s.ttrMin,
                 impact: s.impact?.sentence ?? (s.status === "Pass" ? "" : s.note),
-                how: s.bound ? `${s.signal} ${boundText(s.bound, s.kind)} (${s.bound.basis}). ${s.note.replace(/^Visible: [^.]+\.\s*/, "")}`.trim() : s.note,
+                how: s.bound
+                    ? `${boundText(s.bound, s.kind)} (${s.bound.short})${s.bound.minBins > 1 ? `, ${s.bound.minBins} bins` : ""}${s.status === "Pass" ? "" : `. ${s.note}`}`
+                    : s.note,
                 score: s,
             })),
         [scores],
@@ -135,7 +136,6 @@ export default function ScoreboardPage() {
                         <p className="mc-kicker">ContosoCare · Scoreboard</p>
                         <h1>{plan && summary.faults ? `Did we catch it? ${summary.visible} of ${summary.faults}` : "Did we catch it?"}</h1>
                         <p className="mc-asof">
-                            <ProvenanceBadge provenance={provenance} asOf={meta?.latestCapture} />
                             <span>The app knows what was injected; Database Hub sees the symptoms. "Signal visible" is measured from the telemetry, by its sample time.</span>
                         </p>
                     </div>

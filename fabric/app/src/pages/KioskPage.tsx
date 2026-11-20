@@ -89,7 +89,7 @@ export default function KioskPage() {
             <div className="kiosk-progress" aria-hidden="true">
                 <span style={{ width: `${Math.min(100, (state.elapsed / SCENE_SECONDS[scene]) * 100)}%` }} />
             </div>
-            <main className={`kiosk-scene kiosk-${scene}`} aria-label={SCENE_LABEL[scene]}>
+            <main className={`kiosk-scene kiosk-scene-${scene}`} aria-label={SCENE_LABEL[scene]}>
                 {!plan && !data.loading ? <p className="kiosk-empty">No session in this period yet: Run all in NB_DatabaseHub_Control runs one.</p> : null}
                 {scene === "mission" ? (
                     <div className="kiosk-mission">

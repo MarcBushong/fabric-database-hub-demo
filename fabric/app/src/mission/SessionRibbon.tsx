@@ -71,6 +71,24 @@ export interface RibbonProps {
     onSeek?: (at: Date) => void;
 }
 
+const ROW = 15;
+
+/** Puts a lane's items on rows so none overlaps another: faults that run at once on one target stack. */
+function pack(items: readonly Item[]): { rowOf: Map<string, number>; rows: number } {
+    const ends: number[] = [];
+    const rowOf = new Map<string, number>();
+    for (const item of [...items].sort((a, b) => a.from - b.from)) {
+        let row = ends.findIndex((end) => end <= item.from);
+        if (row < 0) {
+            row = ends.length;
+            ends.push(0);
+        }
+        ends[row] = Math.max(item.to, item.visibleEnd ?? 0, item.recovered ?? 0) + MIN;
+        rowOf.set(item.ref, row);
+    }
+    return { rowOf, rows: Math.max(1, ends.length) };
+}
+
 export function SessionRibbon(props: RibbonProps) {
     const items = itemsOf(props.scores, props.episodes);
     const [from, to] = ribbonRange(props.plan, props.scores, props.episodes);
@@ -99,21 +117,23 @@ export function SessionRibbon(props: RibbonProps) {
                 </p>
             ) : null}
             <div className="rb-lanes">
-                {lanes.map((lane) => (
-                    <div key={lane} className="rb-lane">
-                        <div className="rb-lane-label">
-                            <TargetChip target={lane} />
-                            <span>{serviceOf(lane)?.service}</span>
-                        </div>
-                        <div className="rb-track">
-                            {items
-                                .filter((i) => i.target === lane)
-                                .map((i) => (
+                {lanes.map((lane) => {
+                    const mine = items.filter((i) => i.target === lane);
+                    const { rowOf, rows } = pack(mine);
+                    const top = (i: Item) => 4 + (rowOf.get(i.ref) ?? 0) * ROW;
+                    return (
+                        <div key={lane} className="rb-lane">
+                            <div className="rb-lane-label">
+                                <TargetChip target={lane} />
+                                <span>{serviceOf(lane)?.service}</span>
+                            </div>
+                            <div className="rb-track" style={{ height: rows * ROW + 6 }}>
+                                {mine.map((i) => (
                                     <button
                                         key={i.ref}
                                         type="button"
                                         className={`rb-item${i.injected === null ? " rb-measured" : ""}${props.selected === i.ref ? " rb-selected" : ""}`}
-                                        style={{ left: x(i.from), width: `max(${((i.to - i.from) / span) * 100}%, 6px)` }}
+                                        style={{ left: x(i.from), top: top(i), width: `max(${((i.to - i.from) / span) * 100}%, 6px)` }}
                                         aria-label={i.label}
                                         title={i.label}
                                         aria-pressed={props.onSelect ? props.selected === i.ref : undefined}
@@ -123,14 +143,17 @@ export function SessionRibbon(props: RibbonProps) {
                                         <span className="sr-only">{i.title}</span>
                                     </button>
                                 ))}
-                            {items
-                                .filter((i) => i.target === lane && i.visible !== null && i.visibleEnd !== null)
-                                .map((i) => (
-                                    <span key={`v-${i.ref}`} className="rb-visible" style={{ left: x(i.visible as number), width: `max(${(((i.visibleEnd as number) - (i.visible as number)) / span) * 100}%, 3px)` }} aria-hidden="true" />
-                                ))}
-                            {items
-                                .filter((i) => i.target === lane)
-                                .flatMap((i) =>
+                                {mine
+                                    .filter((i) => i.visible !== null && i.visibleEnd !== null)
+                                    .map((i) => (
+                                        <span
+                                            key={`v-${i.ref}`}
+                                            className="rb-visible"
+                                            style={{ left: x(i.visible as number), top: top(i) + 4, width: `max(${(((i.visibleEnd as number) - (i.visible as number)) / span) * 100}%, 3px)` }}
+                                            aria-hidden="true"
+                                        />
+                                    ))}
+                                {mine.flatMap((i) =>
                                     (
                                         [
                                             ["injected", i.injected],
@@ -141,14 +164,15 @@ export function SessionRibbon(props: RibbonProps) {
                                     )
                                         .filter(([, t]) => t !== null)
                                         .map(([kind, t]) => (
-                                            <span key={`${i.ref}-${kind}`} className={`rb-mark rb-m-${kind}`} style={{ left: x(t as number) }} aria-hidden="true">
+                                            <span key={`${i.ref}-${kind}`} className={`rb-mark rb-m-${kind}`} style={{ left: x(t as number), top: top(i) - 1 }} aria-hidden="true">
                                                 {MARKS[kind]}
                                             </span>
                                         )),
                                 )}
+                            </div>
                         </div>
-                    </div>
-                ))}
+                    );
+                })}
                 {now ? <span className="rb-playhead" style={{ left: `calc(var(--rb-label) + (100% - var(--rb-label)) * ${(now.getTime() - from) / span})` }} aria-hidden="true" /> : null}
             </div>
             <div className="rb-axis" aria-hidden="true">

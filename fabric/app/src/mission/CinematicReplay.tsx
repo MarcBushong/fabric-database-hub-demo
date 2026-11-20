@@ -276,7 +276,7 @@ export function CinematicReplay(props: CinematicReplayProps) {
             </div>
             <div className="cr-body">
                 <div className="cr-map">
-                    <ServiceMap nodes={nodes} lens={props.lens} motion={props.motion} shockKeys={shockKeys} title={`ContosoCare's services at ${formatTimeUtc(new Date(now))} UTC`} hubLine={formatTimeUtc(new Date(now)) + " UTC"} />
+                    <ServiceMap nodes={nodes} lens={props.lens} motion={props.motion} shockKeys={shockKeys} title={`ContosoCare's services at ${formatTimeUtc(new Date(now))} UTC`} hubLine={formatTimeUtc(new Date(now)) + " UTC"} dense />
                 </div>
                 <div className="cr-lanes" ref={ref}>
                     {lanes.map((lane) => (

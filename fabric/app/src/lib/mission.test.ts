@@ -166,7 +166,9 @@ describe("the scoreboard", () => {
         const [blocking, deadlock, plan, missing] = scorePlan(toPlans(runs)[0], { bins: bins3, beats: [BEAT], runs });
         // Back to back on the same signal: the chain's recovery can't be told apart from the storm that follows it.
         expect(blocking).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: false });
-        expect(blocking.note).toMatch(/The next fault that raises it on T1 began before it recovered\.$/);
+        expect(blocking.note).toMatch(/The next fault with this signal began first\.$/);
+        expect(blocking.recoveryNote).toBe("The next fault with this signal began first.");
+        expect(blocking.recoveryWord).toBe("Next fault first");
         // The storm reads blocked processes, and recovers once nothing raises them.
         expect(deadlock).toMatchObject({ status: "Pass", signal: "blocked processes (deadlocks)", ttdMin: 1, ttrMin: 11 });
         // The missing index runs inside the agent's beat: both see T3's CPU, but only the beat has the agent's response.

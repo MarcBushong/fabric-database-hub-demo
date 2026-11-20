@@ -23,6 +23,12 @@ import { isEstateTarget, type EstateTarget } from "./view-state";
 export const TELEMETRY_LAG_MINUTES = 15;
 /** How long after a fault's window its recovery is looked for. */
 export const RECOVERY_SLACK_MINUTES = 30;
+/** Why a visible signal has no recovery, in a sentence and in a table's few words. */
+const NO_RECOVERY = {
+    ongoing: { note: "Still visible when the telemetry ends.", word: "Still visible" },
+    next: { note: "The next fault with this signal began first.", word: "Next fault first" },
+    late: { note: `Not back under its bound ${RECOVERY_SLACK_MINUTES} min after its window.`, word: `Not in ${RECOVERY_SLACK_MINUTES} min` },
+} as const;
 /** Bins under the detection bound, in a row, that make a recovery. */
 export const RECOVERED_BINS = 2;
 /** Bins outside every window that expects the signal, at the least, for a baseline; with fewer, the notebook's floor alone. */
@@ -91,6 +97,8 @@ export interface Bound {
     minBins: number;
     /** How the bound was set, in words. */
     basis: string;
+    /** The same, short, for a table cell: "its baseline of 24.2 %" or "episode level". */
+    short: string;
 }
 
 /**
@@ -101,15 +109,16 @@ export interface Bound {
 export function detectionBound(family: string, baseline: number | null): Bound | null {
     const rule = RULES[family];
     if (!rule) return null;
+    const episode = { basis: "the notebook's episode level", short: "episode level" };
     if (family === "cpu") {
         const relative = baseline === null ? null : Math.max(baseline * 1.5, baseline + 10);
         return relative !== null && relative < rule.floor
-            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatNumber(baseline, "percent")}` }
-            : { value: rule.floor, strict: false, minBins: rule.minBins, basis: "the notebook's episode level" };
+            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatNumber(baseline, "percent")}`, short: `baseline ${formatNumber(baseline, "percent")}` }
+            : { value: rule.floor, strict: false, minBins: rule.minBins, ...episode };
     }
     const relative = baseline === null ? 0 : baseline * 1.5;
-    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatNumber(baseline)}` };
-    return { value: rule.floor, strict: rule.strict, minBins: rule.minBins, basis: "the notebook's episode level" };
+    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatNumber(baseline)}`, short: `baseline ${formatNumber(baseline)}` };
+    return { value: rule.floor, strict: rule.strict, minBins: rule.minBins, ...episode };
 }
 
 function meets(value: number | null, bound: Bound): boolean {
@@ -250,6 +259,10 @@ export interface FaultScore {
     status: StatusName;
     /** One line: how it was measured, or why it wasn't. */
     note: string;
+    /** Why a visible signal has no recovery: still visible at the telemetry's end, or the next fault came first; empty otherwise. */
+    recoveryNote: string;
+    /** The same reason in two or three words, for a table's Recovered column; empty when it recovered or wasn't visible. */
+    recoveryWord: string;
     binMinutes: number | null;
     /** The incident window the notebook recorded for it (Incidents' drill-down), when there is one. */
     incidentKey: string | null;
@@ -416,6 +429,8 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
         incidentKey: incident?.key ?? null,
         notebookVerdict: incident?.verdict ?? "",
         impact: null,
+        recoveryNote: "",
+        recoveryWord: "",
     };
     const first = signalOf(families[0] ?? "");
     const unmeasured = (status: StatusName, note: string): FaultScore => ({ ...base, family: families[0] ?? "", signal: first?.label ?? scenario, kind: first?.kind ?? "decimal", status, note });
@@ -527,13 +542,13 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     const telemetryEnd = contiguousEnd(targetBins, found.at.getTime(), stepMs);
     const visibleMin = recovery.at ? minutesBetween(found.at, recovery.at) : recovery.ongoing ? minutesBetween(found.at, new Date(telemetryEnd)) : null;
     const how = `${signal.label} ${boundText(bound, signal.kind)} (${bound.basis})${bound.minBins > 1 ? ` for ${bound.minBins} bins in a row` : ""}`;
-    const after = recovery.at
-        ? ""
+    const why: keyof typeof NO_RECOVERY | null = recovery.at
+        ? null
         : recovery.ongoing
-          ? " It was still visible when the telemetry ends."
+          ? "ongoing"
           : nextRaising !== undefined && nextRaising < injectedEnd.getTime() + RECOVERY_SLACK_MINUTES * MIN
-            ? ` The next fault that raises it on ${target} began before it recovered.`
-            : ` It hadn't recovered ${RECOVERY_SLACK_MINUTES} minutes after its window.`;
+            ? "next"
+            : "late";
     return {
         ...common,
         visibleAt: found.at,
@@ -543,7 +558,9 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
         ttrMin: recovery.at ? minutesBetween(injectedAt, recovery.at) : null,
         visibleMin,
         status: "Pass",
-        note: `Visible: ${how}.${after}`,
+        note: `Visible: ${how}.${why ? ` ${NO_RECOVERY[why].note}` : ""}`,
+        recoveryNote: why ? NO_RECOVERY[why].note : "",
+        recoveryWord: why ? NO_RECOVERY[why].word : "",
         impact: impactOf({ target, family: chosen.family === "deadlock" ? "blocking" : chosen.family, durationMin: visibleMin, ongoing: recovery.ongoing, peak, baseline }),
     };
 }

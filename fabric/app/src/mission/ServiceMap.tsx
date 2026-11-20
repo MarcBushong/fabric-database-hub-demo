@@ -40,7 +40,7 @@ const PLACES: Record<EstateTarget, Place> = {
     T1: { x: 190, y: 380 },
     T5: { x: 810, y: 146 },
     T4: { x: 810, y: 380 },
-    "T4-replica": { x: 945, y: 292 },
+    "T4-replica": { x: 920, y: 292 },
 };
 
 const STATE_WORD: Record<TargetState, string> = { calm: "Calm", injected: "Fault running", visible: "Signal visible", answered: "Answered" };
@@ -65,8 +65,18 @@ function clip(text: string, max: number): string {
     return `${cut.slice(0, Math.max(cut.lastIndexOf(" "), max - 12))}…`;
 }
 
-export function ServiceMap(props: { nodes: MapNode[]; lens: Lens; motion: boolean; shockKeys?: Partial<Record<EstateTarget, string>>; onOpen?: (target: EstateTarget) => void; title: string; hubLine?: string }) {
-    const { nodes, lens, motion, onOpen } = props;
+export function ServiceMap(props: {
+    nodes: MapNode[];
+    lens: Lens;
+    motion: boolean;
+    shockKeys?: Partial<Record<EstateTarget, string>>;
+    onOpen?: (target: EstateTarget) => void;
+    title: string;
+    hubLine?: string;
+    /** Fewer, larger words: the service and its state, for the replay's smaller map. */
+    dense?: boolean;
+}) {
+    const { nodes, lens, motion, onOpen, dense } = props;
     const shown = new Set(nodes.map((n) => n.target));
     const open = (target: EstateTarget) => (event: KeyboardEvent<SVGGElement>) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -75,7 +85,7 @@ export function ServiceMap(props: { nodes: MapNode[]; lens: Lens; motion: boolea
         }
     };
     return (
-        <svg className={`mc-map${motion ? " mc-motion" : ""}`} viewBox="0 0 1000 520" role="group" aria-label={props.title} preserveAspectRatio="xMidYMid meet">
+        <svg className={`mc-map${motion ? " mc-motion" : ""}${dense ? " mc-dense" : ""}`} viewBox="0 0 1000 520" role="group" aria-label={props.title} preserveAspectRatio="xMidYMid meet">
             <defs>
                 <radialGradient id="mc-hub-fill" cx="50%" cy="45%" r="60%">
                     <stop offset="0%" stopColor="var(--stage-cyan)" stopOpacity="0.35" />
@@ -141,9 +151,13 @@ export function ServiceMap(props: { nodes: MapNode[]; lens: Lens; motion: boolea
                             </g>
                         ) : null}
                         <text className="mc-service" y={satellite ? -r - 10 : r + 24} textAnchor="middle">
-                            {satellite ? "Reports' DR copy" : service}
+                            {satellite ? (dense ? "DR copy" : "Reports' DR copy") : service}
                         </text>
-                        {satellite ? null : (
+                        {satellite ? null : dense ? (
+                            <text className="mc-word" y={r + 48} textAnchor="middle">
+                                {`${glyph} ${word}`}
+                            </text>
+                        ) : (
                             <>
                                 <text className="mc-word" y={r + 42} textAnchor="middle">
                                     {`${glyph} ${word} · ${n.target} ${TARGETS[n.target].name}`}

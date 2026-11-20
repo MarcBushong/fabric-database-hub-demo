@@ -164,8 +164,32 @@
     display: block;
     width: 100%;
     height: auto;
-    max-height: 560px;
+    max-height: 600px;
     overflow: visible;
+}
+
+/* A halo in the stage's own color keeps the labels under the nodes readable over the links behind them. */
+.mc-map .mc-service,
+.mc-map .mc-word,
+.mc-map .mc-line {
+    paint-order: stroke;
+    stroke: var(--stage-bg);
+    stroke-width: 4px;
+    stroke-linejoin: round;
+}
+
+.mc-dense .mc-service {
+    font-size: 22px;
+}
+
+.mc-dense .mc-word {
+    font-size: 17px;
+    font-weight: 600;
+    fill: var(--stage-ink);
+}
+
+.mc-dense .mc-key {
+    font-size: 22px;
 }
 
 .mc-link {
@@ -426,13 +450,13 @@
 .mc-side {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
 }
 
 .mc-stat {
     display: grid;
-    gap: 2px;
-    padding: 12px 14px;
+    gap: 1px;
+    padding: 9px 13px;
     border-radius: 12px;
     background: var(--stage-panel);
     border: 1px solid var(--stage-line);
@@ -447,8 +471,8 @@
 }
 
 .mc-stat-value {
-    font-size: 30px;
-    line-height: 38px;
+    font-size: 27px;
+    line-height: 34px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     color: var(--stage-ink);
@@ -511,7 +535,7 @@
     display: grid;
     grid-template-columns: var(--rb-label) minmax(0, 1fr);
     align-items: center;
-    min-height: 26px;
+    min-height: 22px;
 }
 
 .rb-lane-label {
@@ -526,17 +550,16 @@
 
 .rb-track {
     position: relative;
-    height: 26px;
+    min-height: 21px;
     border-radius: 6px;
     background: var(--stage-panel-2);
 }
 
 .rb-item {
     position: absolute;
-    top: 5px;
-    height: 16px;
+    height: 12px;
     padding: 0;
-    border-radius: 4px;
+    border-radius: 3px;
     border: 1px solid var(--stage-line);
     background: color-mix(in srgb, var(--stage-cyan) 20%, transparent);
     cursor: pointer;
@@ -562,19 +585,17 @@
 
 .rb-visible {
     position: absolute;
-    top: 10px;
-    height: 6px;
-    border-radius: 3px;
+    height: 4px;
+    border-radius: 2px;
     background: var(--stage-magenta);
     pointer-events: none;
 }
 
 .rb-mark {
     position: absolute;
-    top: 3px;
     transform: translateX(-50%);
-    font-size: 12px;
-    line-height: 20px;
+    font-size: 10px;
+    line-height: 14px;
     font-weight: 700;
     pointer-events: none;
     text-shadow: 0 0 3px var(--stage-panel-2);
@@ -963,6 +984,11 @@
     grid-template-columns: minmax(0, 1fr) 300px;
     gap: 20px;
     align-items: center;
+    min-height: 100%;
+}
+
+.kiosk-mission .mc-map {
+    max-height: calc(100vh - 110px);
 }
 
 .kiosk-stats {
