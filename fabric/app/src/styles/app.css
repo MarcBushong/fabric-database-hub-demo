@@ -235,12 +235,14 @@ body {
 
 .nav-item:hover {
     background: var(--colorSubtleBackgroundHover);
-    color: var(--colorNeutralForeground1);
+    color: var(--colorNeutralForeground1Hover);
 }
 
+/* Fluent's Hover and Selected foregrounds pair with the subtle fills: the same colors in light and dark, and black on
+   high contrast's cyan, where the plain foreground and brand tokens are white and cyan. */
 .nav-item[aria-current="page"] {
     background: var(--colorSubtleBackgroundSelected);
-    color: var(--colorNeutralForeground1);
+    color: var(--colorNeutralForeground1Selected);
     font-weight: var(--fontWeightSemibold);
 }
 
@@ -252,7 +254,7 @@ body {
     bottom: 8px;
     width: 3px;
     border-radius: 2px;
-    background: var(--colorCompoundBrandStroke);
+    background: var(--colorNeutralForeground2BrandSelected);
 }
 
 .nav-icon {
@@ -261,7 +263,7 @@ body {
 }
 
 .nav-item[aria-current="page"] .nav-icon {
-    color: var(--colorCompoundBrandForeground1);
+    color: var(--colorNeutralForeground2BrandSelected);
 }
 
 .nav-foot {

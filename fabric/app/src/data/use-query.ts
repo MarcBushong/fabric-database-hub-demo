@@ -10,6 +10,8 @@ export interface QueryState {
     error: Error | undefined;
     loading: boolean;
     refetch: () => void;
+    /** After a refresh failed: the last result that loaded, for a view that keeps showing it (the kiosk). `data` stays empty, so a card shows the error. */
+    stale?: QueryResult;
 }
 
 interface Settled {
@@ -27,6 +29,8 @@ export function useQuery(spec: QuerySpec | null): QueryState {
     const [settled, setSettled] = useState<Settled | null>(null);
     const forced = force.key === key ? force.n : 0;
     const cached = spec && client && forced === 0 ? client.peek(spec) : undefined;
+    // The last result that loaded, even past the cache's freshness: what a view keeps showing while it refreshes.
+    const last = spec && client ? client.peekStale?.(spec) : undefined;
 
     useEffect(() => {
         if (!spec || !client || cached) return;
@@ -51,9 +55,9 @@ export function useQuery(spec: QuerySpec | null): QueryState {
     if (!spec) return { data: undefined, error: undefined, loading: false, refetch };
     if (cached) return { data: cached, error: undefined, loading: false, refetch };
     if (settled && settled.key === key && settled.n === forced) {
-        return { data: settled.data, error: settled.error, loading: false, refetch };
+        return { data: settled.data, error: settled.error, loading: false, refetch, stale: settled.error ? last : undefined };
     }
-    // While a refresh runs, keep showing what the visual already had.
-    const stale = settled && settled.key === key ? settled.data : undefined;
+    // While a refresh runs (the cache's entry expired, or a refetch), keep showing what the visual already had.
+    const stale = (settled && settled.key === key ? settled.data : undefined) ?? last;
     return { data: stale, error: undefined, loading: true, refetch };
 }

@@ -137,7 +137,7 @@ One hot partition uses up T5's 400 RU/s, Database Hub shows normalized RU at 100
 
 Anyone who deploys the demo shows the Insights app themselves, with nothing to set up in it ([the app's guide](../fabric/app/README.md#demo-it-yourself)). It's a Fabric Apps item, a preview. Open it after a session's end, when the session's history is saved.
 
-1. **Open it:** in the Fabric portal, open the demo's workspace and select `APP_DatabaseHub_Insights`. It signs you in with your Fabric account and opens on **Overview**. Before the first session it says **No history yet**: Run all in `NB_DatabaseHub_Control`, and come back after the session's end.
+1. **Open it:** in the Fabric portal, open the demo's workspace and select `APP_DatabaseHub_Insights`. It signs you in with your Fabric account and opens on **Mission Control** ([the 3-minute WOW](#the-3-minute-wow-what-only-the-app-shows)); **Overview** is in the navigation. Before the first session it says **No session in this period**: Run all in `NB_DatabaseHub_Control`, and come back after the session's end.
 2. **Show:** Overview: what needs attention, from the history. Overview shows **Live now** when the app reads Database Hub live; since 2026-11-19 it doesn't (R924), and **Live views** says so in one line, so open **Database Hub** from there for what's live this minute. **Say:** "One console for the estate: what the history kept, and Database Hub beside it for what's live right now."
 3. **Drill down:** a target's health tile opens its page; on T3, **Ask why** on the CPU peak asks Copilot about it, with the rows and the DAX behind them.
 4. **The incident and the agent loop:** on **Incidents**, select T3's plan-regression window: its replay, then **From signal to fix**: detect, the evidence, the response (the last good plan forced at the beat's 85%), and T3's CPU before and after it. **Say:** "The agent detected and investigated, a person decided, the runbook responded, and here's the proof it worked."
@@ -148,6 +148,19 @@ Anyone who deploys the demo shows the Insights app themselves, with nothing to s
 
 - **If it isn't there:** no **Live now** and no live checks on Findings mean Database Hub refuses the app (R924, 2026-11-19), which **Live views** says in one line; **Live · unavailable** says why when the app's live function isn't deployed or Database Hub didn't answer just now. The pages show the history, and Database Hub has the live view. No T5 means the deployment has no Cosmos DB. **Ready to migrate** links `arcsql01` in the Azure portal, where the assessment is under **Migration**, **Assessments**, until Azure has an assessment result at a deploy: run `./scripts/deploy.ps1` again once `T2.ARC.MIGRATIONASSESSMENT` is **Pass**. An empty agent loop means the session's history isn't saved yet: it's saved about 15 minutes after the session's end. An empty **Readiness** means no session has run yet: each Run all runs `NB_DatabaseHub_Deployment`'s read-only checks once its session runs, which fill it.
 - **Repeat:** every session adds to the history, and Reset and the next Run all work the same way each time.
+
+### The 3-minute WOW: what only the app shows
+
+The app knows what the session injected; Database Hub sees the symptoms. Open it after a session's end, with Database Hub in the next tab ([ADR 0030](adr/0030-insights-app-mission-control.md)). Your numbers are your session's.
+
+1. **Mission Control (0:00–0:30):** ContosoCare's map, each database as the service it runs (Billing, Front desk, Scheduling, Reporting and its DR copy, Patient events), with the session's plan as recorded at its end and its big numbers. **Say:** "This is ContosoCare. The app knows the plan: what we injected, where, and when."
+2. **Database Hub beside it (0:30–1:00):** **Database Hub, live** opens it: the same target's symptom in its charts, or its issue while it's open (Database Hub keeps 7 days). **Say:** "Database Hub sees the symptom."
+3. **The scoreboard (1:00–1:45):** **Scoreboard**, "Did we catch it?": each fault, when its signal was visible in the telemetry, the response (T3's Database Agent loop), and the recovery, with the times to detect and recover. **Say:** "The app knows what really happened." "Signal visible" is measured in the telemetry; don't say Database Hub detected it at that time.
+4. **The business lens (1:45–2:00):** **Business impact**: for example "Patient events: 35 % of requests throttled for 9 min", next to the measured normalized RU and 429s behind it.
+5. **The postmortem (2:00–2:30):** **Write the postmortem**: the timeline, impact, cause, response, and times to detect and recover, with every query. **Download Markdown** needs no sign-in; **Draft with Copilot** drafts it on your own GitHub Copilot.
+6. **Replay (2:30–3:00):** **Replay**: drag the scrubber, and the map's shockwave plays again with every engine's chart; the ribbon says what's next. **Say:** "Database Hub watches your estate. A Fabric app turns it into your team's own operations product."
+
+- **At a booth:** **Kiosk** on Mission Control rotates the map, the scoreboard, and the replay without the app's chrome: Space pauses, Esc leaves, and F11 goes full screen where the frame doesn't allow it.
 
 ## Plan the session
 

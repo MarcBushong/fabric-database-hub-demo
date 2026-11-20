@@ -14,8 +14,10 @@ import { describeRequest, notebookParameters, validateRequest } from "@/lib/cont
 import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
-import { DEFAULT_VIEW, mergeView, parseHash, toHash } from "@/lib/view-state";
-import { APP_TOKENS, contrastRatio, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
+import { DEFAULT_VIEW, mergeView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
+import { APP_TOKENS, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
+import { APP_BRAND, CONTOSOCARE_BRAND } from "@/theme/identity";
+import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
 
 describe("themes", () => {
     it("keeps every status color readable (4.5:1) and every target and chart color visible (3:1) on each surface", () => {
@@ -27,9 +29,64 @@ describe("themes", () => {
         }
     });
 
-    it("keeps Fabric teal links readable on the light and dark themes' surfaces", () => {
+    it("keeps the brand's links readable on the light and dark themes' surfaces", () => {
         expect(contrastRatio(FLUENT_THEMES.light.colorBrandForeground1, "#FFFFFF")).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio(FLUENT_THEMES.light.colorBrandForegroundLink, "#FFFFFF")).toBeGreaterThanOrEqual(4.5);
         expect(contrastRatio(FLUENT_THEMES.dark.colorBrandForeground1, "#292929")).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio(FLUENT_THEMES.dark.colorBrandForegroundLink, "#292929")).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio("#FFFFFF", FLUENT_THEMES.light.colorBrandBackground)).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio("#FFFFFF", FLUENT_THEMES.dark.colorBrandBackground)).toBeGreaterThanOrEqual(4.5);
+    });
+
+    it("keeps the navigation's hovered and selected page readable in every theme, high contrast included", () => {
+        // The token pairs styles/app.css applies, read from its rules: high contrast's selected and hover fill is cyan.
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8");
+        const rule = (selector: string) => {
+            const body = css.match(new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m"))?.[1] ?? "";
+            const token = (property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*var\\(--(\\w+)\\)`))?.[1] ?? "missing";
+            return { color: token("color"), background: token("background") };
+        };
+        const hover = rule(".nav-item:hover");
+        const selected = rule('.nav-item[aria-current="page"]');
+        const bar = rule('.nav-item[aria-current="page"]::before');
+        const icon = rule('.nav-item[aria-current="page"] .nav-icon');
+        for (const [id, theme] of Object.entries(FLUENT_THEMES)) {
+            const value = (token: string) => (theme as unknown as Record<string, string>)[token] ?? `no ${token}`;
+            expect(contrastRatio(value(hover.color), value(hover.background)), `${id}: hovered page`).toBeGreaterThanOrEqual(4.5);
+            expect(contrastRatio(value(selected.color), value(selected.background)), `${id}: selected page`).toBeGreaterThanOrEqual(4.5);
+            expect(contrastRatio(value(icon.color), value(selected.background)), `${id}: selected page's icon`).toBeGreaterThanOrEqual(3);
+            expect(contrastRatio(value(bar.background), value(selected.background)), `${id}: selected page's bar`).toBeGreaterThanOrEqual(3);
+        }
+    });
+
+    it("uses ContosoCare's own brand ramp, not Fabric's teal, from one set of tokens (ADR 0030)", () => {
+        expect(APP_BRAND).toBe(CONTOSOCARE_BRAND);
+        expect(FLUENT_THEMES.light.colorBrandBackground).toBe(CONTOSOCARE_BRAND[80]);
+        expect(FLUENT_THEMES.light.colorBrandBackground).not.toBe(FABRIC_BRAND[80]);
+    });
+
+    it("keeps the stage's text readable (4.5:1) and its marks visible (3:1), with the app's own tokens on it, in every theme", () => {
+        for (const id of ["light", "dark", "contrast"] as const) {
+            const stage = STAGE_TOKENS[id];
+            const text = { ...stage.text, ...APP_TOKENS[id].text };
+            const graphic = { ...stage.graphic, ...APP_TOKENS[id].graphic };
+            for (const surface of Object.values(stage.surfaces)) {
+                for (const [name, color] of Object.entries(text)) expect(contrastRatio(color, surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+                for (const [name, color] of Object.entries(graphic)) expect(contrastRatio(color, surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
+            }
+        }
+    });
+
+    it("makes the stage dark until the viewer picks a theme, and keeps a picked theme and high contrast", () => {
+        expect(stageTheme("system", "light")).toBe("dark");
+        expect(stageTheme("system", "dark")).toBe("dark");
+        expect(stageTheme("system", "contrast")).toBe("contrast");
+        expect(stageTheme("light", "light")).toBe("light");
+        expect(stageTheme("dark", "dark")).toBe("dark");
+        expect(stageTheme("contrast", "contrast")).toBe("contrast");
+        const style = stageStyle("dark", APP_TOKENS.dark) as Record<string, string>;
+        expect(style["--stage-bg"]).toBe(STAGE_TOKENS.dark.surfaces["--stage-bg"]);
+        expect(style["--status-fail"]).toBe(APP_TOKENS.dark.text["--status-fail"]);
     });
 
     it("follows the system until the viewer picks, and carries over the older app's choice", () => {
@@ -53,7 +110,32 @@ describe("view state", () => {
         const incident = mergeView({ page: "incidents", incident: "scenario:T3:cpu:7", replay: 4 });
         expect(toHash(incident)).toBe("#/incidents/scenario%3AT3%3Acpu%3A7?r=4");
         expect(mergeView(parseHash(toHash(incident)))).toEqual(incident);
-        expect(toHash(DEFAULT_VIEW)).toBe("#/overview");
+        expect(toHash(DEFAULT_VIEW)).toBe("#/mission");
+    });
+
+    it("keeps the session in focus and the replay's moment in the address, and opens the kiosk from it", () => {
+        const moment = mergeView({ page: "replay", session: "session:7f3a9c21", replay: 33 });
+        expect(toHash(moment)).toBe("#/replay?s=session%3A7f3a9c21&r=33");
+        expect(mergeView(parseHash(toHash(moment)))).toEqual(moment);
+        expect(parseHash("#/kiosk")).toEqual({ page: "kiosk" });
+        expect(parseHash("#/scoreboard?s=<script>").session).toBeUndefined();
+    });
+
+    it("keeps the view in memory when the browser refuses another address change (WebKit, past 100 in 10 seconds)", () => {
+        const refusing = {
+            location: { hash: "#/replay?r=1" },
+            history: {
+                replaceState: vi.fn(() => {
+                    throw new DOMException("Attempt to use history.replaceState() more than 100 times per 10 seconds", "SecurityError");
+                }),
+            },
+        };
+        expect(() => replaceAddress("#/replay?r=2", refusing as unknown as Pick<Window, "location" | "history">)).not.toThrow();
+        const browser = { location: { hash: "#/replay?r=1" }, history: { replaceState: vi.fn() } };
+        replaceAddress("#/replay?r=2", browser as unknown as Pick<Window, "location" | "history">);
+        replaceAddress("#/replay?r=1", browser as unknown as Pick<Window, "location" | "history">);
+        expect(browser.history.replaceState).toHaveBeenCalledTimes(1);
+        expect(browser.history.replaceState).toHaveBeenCalledWith(null, "", "#/replay?r=2");
     });
 
     it("opens a Findings category from the address, and drops an unknown one", () => {

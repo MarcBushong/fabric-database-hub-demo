@@ -4,7 +4,9 @@
 
 import type { DateWindow } from "./dax";
 
-export type PageId = "overview" | "estate" | "performance" | "incidents" | "findings" | "readiness" | "trends" | "manage" | "links";
+export type PageId = "mission" | "overview" | "estate" | "performance" | "incidents" | "scoreboard" | "replay" | "findings" | "readiness" | "trends" | "manage" | "links" | "kiosk";
+/** The pages in the navigation: every page but the kiosk, which runs without the app's frame. */
+export type NavPageId = Exclude<PageId, "kiosk">;
 export type WindowId = "day" | "7d" | "30d" | "all";
 
 /** The global filter's targets: the SQL targets, T4 (with its read replica), and T5 when the estate has one. */
@@ -29,16 +31,21 @@ export interface ViewState {
     replay: number | null;
     /** The Findings page's category, or null for all of them. */
     category: FindingsTab | null;
+    /** The session (or lone incident request) Mission Control, the scoreboard, the replay, and the kiosk are about, by its Scenario Runs request ID; null for the latest. */
+    session: string | null;
 }
 
 export interface PageInfo {
-    id: PageId;
+    id: NavPageId;
     label: string;
     /** What the page answers, for its header and the navigation's tooltip. */
     description: string;
 }
 
 export const PAGES: readonly PageInfo[] = [
+    { id: "mission", label: "Mission Control", description: "ContosoCare's services, the latest session, and what happened" },
+    { id: "scoreboard", label: "Scoreboard", description: "Did we catch it? Every injected fault, detected and recovered" },
+    { id: "replay", label: "Session replay", description: "Play a session back across every engine" },
     { id: "overview", label: "Overview", description: "What needs attention now" },
     { id: "estate", label: "Estate", description: "Every engine and target" },
     { id: "performance", label: "Performance", description: "CPU, waits, and throughput per target" },
@@ -58,16 +65,17 @@ export const WINDOWS: ReadonlyArray<{ id: WindowId; label: string; days: number 
 ];
 
 export const DEFAULT_VIEW: ViewState = {
-    page: "overview",
+    page: "mission",
     targets: [...FILTER_TARGETS],
     window: "7d",
     target: null,
     incident: null,
     replay: null,
     category: null,
+    session: null,
 };
 
-const PAGE_IDS = new Set<PageId>(PAGES.map((p) => p.id));
+const PAGE_IDS = new Set<PageId>([...PAGES.map((p) => p.id), "kiosk"]);
 const WINDOW_IDS = new Set<WindowId>(["day", "7d", "30d", "all"]);
 const INCIDENT_KEY = /^[A-Za-z0-9:._-]{1,120}$/;
 /** Hashes from the app before 2026-11-18: their pages and their drill-downs. */
@@ -114,6 +122,8 @@ export function parseHash(hash: string): Partial<ViewState> {
     if (window) out.window = window;
     const incident = params.get("i");
     if (incident && INCIDENT_KEY.test(incident)) out.incident = incident;
+    const session = params.get("s");
+    if (session && INCIDENT_KEY.test(session)) out.session = session;
     const replay = Number(params.get("r"));
     if (params.has("r") && Number.isInteger(replay) && replay >= 0 && replay < 10000) out.replay = replay;
     return out;
@@ -128,6 +138,7 @@ export function toHash(state: ViewState): string {
     else if (state.page === "incidents" && state.incident) path += `/${encodeURIComponent(state.incident)}`;
     else if (state.page === "findings" && state.category) path += `/${state.category}`;
     else if (state.incident) params.set("i", state.incident);
+    if (state.session) params.set("s", state.session);
     if (state.replay !== null) params.set("r", String(state.replay));
     const query = params.toString();
     return `#/${path}${query ? `?${query}` : ""}`;
@@ -171,5 +182,17 @@ export function isEmbedded(win: Window = window): boolean {
         return win.self !== win.top;
     } catch {
         return true;
+    }
+}
+
+/**
+ * Puts the view in the frame's address without a history entry. A browser can refuse: WebKit throws a SecurityError
+ * after 100 calls in 10 seconds. The view then stays in memory and in storage, and the next change writes it again.
+ */
+export function replaceAddress(hash: string, win: Pick<Window, "location" | "history"> = window): void {
+    try {
+        if (win.location.hash !== hash) win.history.replaceState(null, "", hash);
+    } catch {
+        // Kept in memory; never an error for the viewer.
     }
 }
