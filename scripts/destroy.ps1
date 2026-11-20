@@ -60,7 +60,8 @@ Fail), so give each environment its own path to keep both.
 
 .PARAMETER IncludeGolden
 Also delete rg-<prefix>-golden and its T2 golden snapshots (ADR 0018). Without it, the golden group stays, so
-the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so).
+the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so). A golden group that doesn't exist is never listed
+as kept: DESTROY.GOLDEN is then a Pass that says it doesn't exist, with or without -IncludeGolden.
 
 .PARAMETER WithoutGolden
 Changes nothing now. Until 2026-11-09 it let destroy.ps1 delete a PaygWizard environment that no boot-verified golden
