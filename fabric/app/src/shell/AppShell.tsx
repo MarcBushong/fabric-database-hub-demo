@@ -1,6 +1,6 @@
 // The app's frame: the top bar, the left navigation, the page, and the Copilot dock on the right.
 
-import { useState, type ComponentType, type ReactNode } from "react";
+import { lazy, Suspense, useState, type ComponentType, type ReactNode } from "react";
 import { Button, Menu, MenuItemRadio, MenuList, MenuPopover, MenuTrigger, Tooltip, type MenuProps } from "@fluentui/react-components";
 import {
     ArrowTrending20Filled,
@@ -30,13 +30,28 @@ import {
 import { useApp } from "@/app-context";
 import { useCopilotDock } from "@/copilot/use-copilot";
 import { useMediaQuery } from "@/lib/hooks";
-import { PAGES, type PageId } from "@/lib/view-state";
+import { PAGES, type NavPageId } from "@/lib/view-state";
 import { THEME_LABELS, type ThemeChoice } from "@/theme/fluent";
 import { useTheme } from "@/theme/theme-context";
 import { AccountChips } from "./AccountChips";
 import { DockRegion } from "./DockRegion";
+import type { WavePage } from "./WaveIcon";
 
-const ICONS: Record<PageId, ComponentType<{ className?: string }>> = {
+// The app's own pages' icons load with those pages, so the main chunk doesn't grow (ADR 0030).
+const WaveIcon = lazy(() => import("./WaveIcon"));
+const waveIcon = (page: WavePage) =>
+    function NavWaveIcon({ className }: { className?: string }) {
+        return (
+            <Suspense fallback={<span className={className} style={{ width: 20, height: 20 }} />}>
+                <WaveIcon page={page} className={className} />
+            </Suspense>
+        );
+    };
+
+const ICONS: Record<NavPageId, ComponentType<{ className?: string }>> = {
+    mission: waveIcon("mission"),
+    scoreboard: waveIcon("scoreboard"),
+    replay: waveIcon("replay"),
     overview: bundleIcon(Home20Filled, Home20Regular),
     estate: bundleIcon(Database20Filled, Database20Regular),
     performance: bundleIcon(TopSpeed20Filled, TopSpeed20Regular),
@@ -138,7 +153,7 @@ export function AppShell({ email, onSignOut, banner, children }: { email: string
                             </button>
                         );
                         return (
-                            <li key={p.id} className={p.id === "manage" ? "nav-gap" : undefined}>
+                            <li key={p.id} className={p.id === "manage" || p.id === "overview" ? "nav-gap" : undefined}>
                                 {navOpen ? (
                                     button
                                 ) : (

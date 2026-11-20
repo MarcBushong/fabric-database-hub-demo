@@ -1,0 +1,1097 @@
+/* Wave 1 (ADR 0030): the app's own stage, ContosoCare's navy with cyan and magenta, for Mission Control, the scoreboard,
+   the replay, and the kiosk. Colors come only from the stage's tokens and the app's (src/theme/identity.ts, fluent.ts);
+   motion carries meaning (health pulses, an incident's shockwave) and stops with reduced motion. */
+
+/* ---------- The stage ---------- */
+
+.stage.stage {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 18px 22px 20px;
+    color: var(--stage-ink);
+    background:
+        radial-gradient(1100px 520px at 50% -12%, var(--stage-glow), transparent 62%),
+        linear-gradient(var(--stage-grid) 1px, transparent 1px) 0 0 / 44px 44px,
+        linear-gradient(90deg, var(--stage-grid) 1px, transparent 1px) 0 0 / 44px 44px,
+        var(--stage-bg);
+    min-width: 0;
+}
+
+.mission-page > .mc-stage,
+.scoreboard-page > .mc-stage,
+.replay-page > .mc-stage {
+    margin: -16px -20px 0;
+    border-bottom: 1px solid var(--stage-line);
+    border-radius: 0 0 18px 18px;
+}
+
+.stage-contrast.stage {
+    border: 1px solid var(--stage-line);
+}
+
+.mc-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px 20px;
+    flex-wrap: wrap;
+}
+
+.mc-titles {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.mc-kicker {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--stage-cyan-ink);
+}
+
+.mc-titles h1 {
+    margin: 0;
+    font-size: 26px;
+    line-height: 34px;
+    font-weight: 650;
+    color: var(--stage-ink);
+}
+
+.mc-asof {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin: 4px 0 0;
+    font-size: 13px;
+    color: var(--stage-ink-2);
+}
+
+.stage .provenance {
+    background: var(--stage-panel);
+    border-color: var(--stage-line);
+    color: var(--stage-ink-2);
+}
+
+.mc-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.mc-lens {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 999px;
+    border: 1px solid var(--stage-line);
+    background: var(--stage-panel);
+}
+
+.mc-hub-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 600;
+}
+
+.stage .mc-hub-link,
+.stage a {
+    color: var(--stage-cyan-ink);
+}
+
+.mc-filter {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+}
+
+.mc-filter .global-filter {
+    flex: 1 1 520px;
+    background: var(--stage-panel);
+    border-color: var(--stage-line);
+}
+
+.mc-filter .utc-note {
+    color: var(--stage-ink-2);
+}
+
+.mc-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--stage-ink-2);
+}
+
+.mc-running {
+    border: 1px solid var(--stage-cyan);
+}
+
+.mc-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 290px;
+    gap: 18px;
+    align-items: center;
+}
+
+@container main (max-width: 1040px) {
+    .mc-main {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .mc-side {
+        display: grid !important;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    }
+}
+
+.mc-map-wrap {
+    min-width: 0;
+}
+
+/* ---------- The service map ---------- */
+
+.mc-map {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 600px;
+    overflow: visible;
+}
+
+/* A halo in the stage's own color keeps the labels under the nodes readable over the links behind them. */
+.mc-map .mc-service,
+.mc-map .mc-word,
+.mc-map .mc-line {
+    paint-order: stroke;
+    stroke: var(--stage-bg);
+    stroke-width: 4px;
+    stroke-linejoin: round;
+}
+
+.mc-dense .mc-service {
+    font-size: 22px;
+}
+
+.mc-dense .mc-word {
+    font-size: 17px;
+    font-weight: 600;
+    fill: var(--stage-ink);
+}
+
+.mc-dense .mc-key {
+    font-size: 22px;
+}
+
+.mc-link {
+    stroke: var(--stage-line);
+    stroke-width: 2;
+    stroke-dasharray: 6 10;
+}
+
+.mc-link-alert {
+    stroke: var(--stage-magenta);
+    stroke-width: 2.5;
+}
+
+.mc-motion .mc-link {
+    animation: mc-flow 1.8s linear infinite;
+}
+
+.mc-hub-ring {
+    fill: none;
+    stroke: var(--stage-cyan);
+    stroke-width: 2;
+}
+
+.mc-hub-name {
+    fill: var(--stage-ink);
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.mc-hub-sub {
+    fill: var(--stage-ink-2);
+    font-size: 13px;
+}
+
+.mc-node {
+    outline: none;
+}
+
+.mc-node[role="button"] {
+    cursor: pointer;
+}
+
+.mc-halo {
+    fill: var(--stage-glow);
+}
+
+.mc-core {
+    fill: var(--stage-panel);
+    stroke-width: 3;
+}
+
+.mc-node[role="button"]:hover .mc-core {
+    fill: var(--stage-panel-2);
+}
+
+.mc-node:focus-visible .mc-halo {
+    stroke: var(--stage-ink);
+    stroke-width: 2.5;
+    stroke-dasharray: 5 4;
+}
+
+.mc-key {
+    fill: var(--stage-ink);
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.mc-glyph {
+    font-size: 14px;
+    font-weight: 700;
+    fill: var(--stage-ink-2);
+}
+
+.mc-service {
+    fill: var(--stage-ink);
+    font-size: 17px;
+    font-weight: 650;
+}
+
+.mc-word {
+    fill: var(--stage-ink-2);
+    font-size: 12px;
+}
+
+.mc-line {
+    fill: var(--stage-cyan-ink);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.mc-line-business {
+    fill: var(--stage-ink);
+}
+
+.mc-badge circle {
+    fill: var(--stage-magenta);
+}
+
+.mc-badge text {
+    fill: var(--stage-bg);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.mc-pulse,
+.mc-shock {
+    fill: none;
+    transform-box: fill-box;
+    transform-origin: center;
+    pointer-events: none;
+}
+
+.mc-pulse {
+    stroke-width: 3;
+    stroke: var(--stage-cyan);
+    animation: mc-pulse 3.2s ease-out infinite;
+}
+
+.mc-shock {
+    stroke: var(--stage-magenta);
+    stroke-width: 4;
+    opacity: 0;
+    animation: mc-shock 1.8s ease-out 1;
+}
+
+.mc-tone-pass .mc-glyph {
+    fill: var(--status-pass);
+}
+
+.mc-tone-warning .mc-glyph {
+    fill: var(--status-warning);
+}
+
+.mc-tone-fail .mc-glyph {
+    fill: var(--status-fail);
+}
+
+.mc-tone-manual .mc-glyph {
+    fill: var(--status-manual);
+}
+
+.mc-tone-warning .mc-pulse {
+    stroke: var(--status-warning);
+    animation-duration: 1.7s;
+}
+
+.mc-tone-fail .mc-pulse {
+    stroke: var(--status-fail);
+    animation-duration: 1s;
+}
+
+.mc-tone-manual .mc-pulse {
+    stroke: var(--status-manual);
+    animation-duration: 2.2s;
+}
+
+.mc-tone-none .mc-core,
+.mc-tone-muted .mc-core {
+    stroke-dasharray: 5 4;
+}
+
+.mc-state-calm .mc-pulse {
+    display: none;
+}
+
+.mc-state-injected .mc-pulse {
+    stroke: var(--status-warning);
+    stroke-dasharray: 4 4;
+    animation-duration: 1.4s;
+}
+
+.mc-state-injected .mc-glyph {
+    fill: var(--status-warning);
+}
+
+.mc-state-visible .mc-pulse {
+    stroke: var(--stage-magenta);
+    animation-duration: 0.9s;
+}
+
+.mc-state-visible .mc-halo {
+    fill: var(--stage-glow-alert);
+}
+
+.mc-state-visible .mc-glyph {
+    fill: var(--stage-magenta-ink);
+}
+
+.mc-state-answered .mc-pulse {
+    stroke: var(--stage-cyan);
+    animation-duration: 1.6s;
+}
+
+.mc-state-answered .mc-glyph {
+    fill: var(--stage-cyan-ink);
+}
+
+.mc-satellite .mc-key {
+    font-size: 12px;
+}
+
+@keyframes mc-pulse {
+    0% {
+        transform: scale(1);
+        opacity: 0.7;
+    }
+
+    70% {
+        transform: scale(1.75);
+        opacity: 0;
+    }
+
+    100% {
+        transform: scale(1.75);
+        opacity: 0;
+    }
+}
+
+@keyframes mc-shock {
+    0% {
+        transform: scale(1);
+        opacity: 0.95;
+    }
+
+    100% {
+        transform: scale(4.2);
+        opacity: 0;
+    }
+}
+
+@keyframes mc-flow {
+    to {
+        stroke-dashoffset: -32;
+    }
+}
+
+/* Reduced motion: no pulse, no shockwave, no flow; the status glyph and word still say everything. */
+@media (prefers-reduced-motion: reduce) {
+    .mc-pulse,
+    .mc-shock,
+    .mc-link {
+        animation: none !important;
+    }
+
+    .mc-shock {
+        display: none;
+    }
+}
+
+[data-motion="reduced"] .mc-pulse,
+[data-motion="reduced"] .mc-shock {
+    display: none;
+}
+
+/* ---------- Big numbers ---------- */
+
+.mc-side {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mc-stat {
+    display: grid;
+    gap: 1px;
+    padding: 9px 13px;
+    border-radius: 12px;
+    background: var(--stage-panel);
+    border: 1px solid var(--stage-line);
+}
+
+.mc-stat-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--stage-ink-2);
+}
+
+.mc-stat-value {
+    font-size: 27px;
+    line-height: 34px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--stage-ink);
+}
+
+.mc-stat-sub {
+    font-size: 12px;
+    color: var(--stage-ink-2);
+}
+
+.mc-stat-good .mc-stat-value {
+    color: var(--stage-cyan-ink);
+}
+
+.mc-stat-alert .mc-stat-value {
+    color: var(--stage-magenta-ink);
+}
+
+/* ---------- The session ribbon ---------- */
+
+.rb {
+    --rb-label: 170px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--stage-panel);
+    border: 1px solid var(--stage-line);
+    min-width: 0;
+}
+
+.rb-countdown {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 0 0 2px;
+    font-size: 15px;
+}
+
+.rb-now {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--stage-cyan-ink);
+}
+
+.rb-countdown strong {
+    color: var(--stage-magenta-ink);
+}
+
+.rb-lanes {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.rb-lane {
+    display: grid;
+    grid-template-columns: var(--rb-label) minmax(0, 1fr);
+    align-items: center;
+    min-height: 22px;
+}
+
+.rb-lane-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--stage-ink-2);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.rb-track {
+    position: relative;
+    min-height: 21px;
+    border-radius: 6px;
+    background: var(--stage-panel-2);
+}
+
+.rb-item {
+    position: absolute;
+    height: 12px;
+    padding: 0;
+    border-radius: 3px;
+    border: 1px solid var(--stage-line);
+    background: color-mix(in srgb, var(--stage-cyan) 20%, transparent);
+    cursor: pointer;
+}
+
+.rb-item[tabindex="-1"] {
+    cursor: default;
+}
+
+.rb-item:focus-visible {
+    outline: 2px solid var(--stage-ink);
+    outline-offset: 1px;
+}
+
+.rb-measured {
+    border-style: dashed;
+    background: transparent;
+}
+
+.rb-selected {
+    box-shadow: 0 0 0 2px var(--stage-ink);
+}
+
+.rb-visible {
+    position: absolute;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--stage-magenta);
+    pointer-events: none;
+}
+
+.rb-mark {
+    position: absolute;
+    transform: translateX(-50%);
+    font-size: 10px;
+    line-height: 14px;
+    font-weight: 700;
+    pointer-events: none;
+    text-shadow: 0 0 3px var(--stage-panel-2);
+}
+
+.rb-m-injected {
+    color: var(--stage-ink);
+}
+
+.rb-m-visible {
+    color: var(--stage-magenta-ink);
+}
+
+.rb-m-answered {
+    color: var(--stage-cyan-ink);
+}
+
+.rb-m-recovered {
+    color: var(--status-pass);
+}
+
+.rb-playhead {
+    position: absolute;
+    top: -4px;
+    bottom: -4px;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--stage-ink);
+    box-shadow: 0 0 8px var(--stage-cyan);
+    pointer-events: none;
+}
+
+.rb-axis {
+    display: grid;
+    grid-template-columns: var(--rb-label) minmax(0, 1fr);
+}
+
+.rb-axis-track {
+    position: relative;
+    height: 16px;
+}
+
+.rb-axis-track span {
+    position: absolute;
+    transform: translateX(-50%);
+    font-size: 11px;
+    color: var(--stage-ink-2);
+    font-variant-numeric: tabular-nums;
+}
+
+.rb-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 0;
+    font-size: 12px;
+    color: var(--stage-ink-2);
+}
+
+.rb-legend b {
+    margin-right: 2px;
+}
+
+@container main (max-width: 640px) {
+    .rb {
+        --rb-label: 64px;
+    }
+
+    .rb-lane-label span:last-child {
+        display: none;
+    }
+}
+
+/* ---------- The cinematic replay ---------- */
+
+.cr {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+
+.cr-top {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+        "clock moment controls"
+        "scrub scrub scrub";
+    align-items: center;
+    gap: 6px 16px;
+}
+
+.cr-clock {
+    grid-area: clock;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.cr-time {
+    font-size: 40px;
+    line-height: 44px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+    color: var(--stage-cyan-ink);
+}
+
+.cr-utc {
+    color: var(--stage-ink-2);
+}
+
+.cr-moment {
+    grid-area: moment;
+    margin: 0;
+    font-size: 15px;
+}
+
+.cr-controls {
+    grid-area: controls;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.cr-scrubber {
+    grid-area: scrub;
+    width: 100%;
+    accent-color: var(--stage-cyan);
+}
+
+.cr-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+}
+
+@container main (max-width: 1100px) {
+    .cr-top {
+        grid-template-columns: auto minmax(0, 1fr);
+        grid-template-areas:
+            "clock moment"
+            "controls controls"
+            "scrub scrub";
+    }
+
+    .cr-body {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.cr-map {
+    min-width: 0;
+}
+
+.cr-lanes {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.cr-lane {
+    display: grid;
+    grid-template-columns: 170px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border-radius: 10px;
+    background: var(--stage-panel);
+    border: 1px solid var(--stage-line);
+}
+
+.cr-lane-label strong {
+    display: block;
+    font-size: 14px;
+}
+
+.cr-lane-label span {
+    font-size: 11px;
+    color: var(--stage-ink-2);
+}
+
+.cr-lane-track {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.cr-lane-track svg {
+    display: block;
+    width: 100%;
+    height: 58px;
+}
+
+.cr-readout {
+    font-size: 12px;
+    color: var(--stage-ink-2);
+    font-variant-numeric: tabular-nums;
+}
+
+.cr-band {
+    fill: var(--stage-cyan);
+    opacity: 0.1;
+}
+
+.cr-band-hot {
+    fill: var(--stage-magenta);
+    opacity: 0.24;
+}
+
+.cr-area {
+    opacity: 0.6;
+}
+
+.cr-line,
+.cr-playhead {
+    fill: none;
+    vector-effect: non-scaling-stroke;
+}
+
+.cr-line {
+    stroke: var(--stage-ink);
+    stroke-width: 1.5;
+    opacity: 0.85;
+}
+
+.cr-playhead {
+    stroke: var(--stage-ink);
+    stroke-width: 2;
+}
+
+.cr-compact .cr-time {
+    font-size: 34px;
+}
+
+/* ---------- The scoreboard ---------- */
+
+.sb-stats {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+}
+
+@container main (max-width: 1040px) {
+    .sb-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+.sb-picked {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--stage-panel);
+    border: 1px solid var(--stage-line);
+}
+
+.sb-episodes,
+.mc-services {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.sb-episodes li,
+.mc-services li {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--colorNeutralStroke2);
+}
+
+.sb-episodes li:last-child,
+.mc-services li:last-child {
+    border-bottom: none;
+}
+
+.sb-ep-time {
+    font-variant-numeric: tabular-nums;
+    color: var(--colorNeutralForeground3);
+}
+
+.sb-how ul {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 6px;
+}
+
+/* ---------- The kiosk ---------- */
+
+.stage.kiosk {
+    height: 100%;
+    display: grid;
+    grid-template-rows: auto 3px minmax(0, 1fr);
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+.kiosk-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--stage-line);
+}
+
+.kiosk-brand {
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--stage-cyan-ink);
+}
+
+.kiosk-scenes {
+    display: flex;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.kiosk-scenes button {
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--stage-line);
+    background: transparent;
+    color: var(--stage-ink-2);
+    font: inherit;
+    cursor: pointer;
+}
+
+.kiosk-scenes button[aria-current="step"] {
+    color: var(--stage-ink);
+    border-color: var(--stage-cyan);
+    box-shadow: inset 0 0 0 1px var(--stage-cyan);
+}
+
+.kiosk-status {
+    margin-left: auto;
+    color: var(--stage-ink-2);
+    font-variant-numeric: tabular-nums;
+}
+
+.kiosk-hint {
+    font-size: 12px;
+    color: var(--stage-ink-2);
+}
+
+.kiosk-progress {
+    background: var(--stage-panel-2);
+}
+
+.kiosk-progress span {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, var(--stage-cyan), var(--stage-magenta));
+    transition: width 1s linear;
+}
+
+.kiosk-scene {
+    overflow: auto;
+    padding: 16px 22px 22px;
+    min-height: 0;
+}
+
+.kiosk-empty {
+    color: var(--stage-ink-2);
+}
+
+.kiosk-mission {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 20px;
+    align-items: center;
+    min-height: 100%;
+}
+
+.kiosk-mission .mc-map {
+    max-height: calc(100vh - 110px);
+}
+
+.kiosk-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.kiosk-score h2 {
+    margin: 0 0 12px;
+    font-size: 34px;
+    line-height: 42px;
+}
+
+.kiosk-impacts {
+    list-style: none;
+    margin: 14px 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 10px;
+}
+
+.kiosk-impacts li {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--stage-panel);
+    border: 1px solid var(--stage-line);
+}
+
+.kiosk-impacts strong {
+    font-size: 18px;
+}
+
+.kiosk-impacts span,
+.kiosk-foot {
+    color: var(--stage-ink-2);
+}
+
+/* ---------- The postmortem ---------- */
+
+.pm-surface.pm-surface {
+    width: min(1100px, 96vw);
+    max-width: min(1100px, 96vw);
+}
+
+.pm-lead {
+    margin: 0 0 10px;
+    color: var(--colorNeutralForeground2);
+}
+
+.pm-view {
+    max-height: 58vh;
+    overflow: auto;
+    padding: 8px 16px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--colorNeutralStroke2);
+    background: var(--colorNeutralBackground2);
+}
+
+.pm-view h3 {
+    margin: 8px 0 4px;
+    font-size: 18px;
+}
+
+.pm-view h4 {
+    margin: 14px 0 4px;
+    font-size: 14px;
+}
+
+.pm-view p,
+.pm-view ul {
+    margin: 4px 0;
+}
+
+.pm-table {
+    overflow-x: auto;
+}
+
+.pm-view table {
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.pm-view th,
+.pm-view td {
+    padding: 4px 6px;
+    border: 1px solid var(--colorNeutralStroke2);
+    text-align: left;
+    vertical-align: top;
+}
+
+.pm-code {
+    max-height: 220px;
+    overflow: auto;
+    margin: 6px 0;
+    padding: 8px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 11px;
+    background: var(--colorNeutralBackground3);
+}
