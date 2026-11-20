@@ -370,9 +370,12 @@ function Invoke-DemoArcOnboarding {
         $evidence['probeError'] = if ($probeRun.Error) { $probeRun.Error } else { $probeRun.Output }
     }
     if ($null -ne $probe) {
-        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus', 'guestRecovery', 'guestError', 'probeTries', 'lockSeconds') {
+        foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus', 'guestRecovery', 'guestError', 'probeTries') {
             $evidence[$name] = Get-DemoMemberValue -InputObject $probe -Name $name
         }
+        # The probe's own wait for the host's bootstrap pass, kept apart from the onboarding's (lockSeconds), which comes
+        # later and replaced it (live, 2026-11-19, dbhubfy: the row said 0, the onboarding's).
+        $evidence['probeLockSeconds'] = Get-DemoMemberValue -InputObject $probe -Name 'lockSeconds'
         # Get-DemoMemberValue returns an array whole, so @() around the call would nest it: [[...]] in the evidence.
         $agentKeys = Get-DemoMemberValue -InputObject $probe -Name 'agentKeys'
         $evidence['agentKeys'] = @($agentKeys)
@@ -522,6 +525,7 @@ function Invoke-DemoArcOnboarding {
         }
         return (& $newResult 'Fail' ('Onboarding {0} failed (execution state {1}, exit code {2}): {3}' -f $target.MachineName, $run.ExecutionState, $run.ExitCode, $detail) $remediation)
     }
+    # lockSeconds is the onboarding's own wait for the host's bootstrap pass; the probe's is probeLockSeconds.
     foreach ($name in 'outcome', 'resourceId', 'agentVersion', 'agentStatus', 'guestVmId', 'taskStarted', 'tokenPassedBy', 'connectAttempts', 'authorizationWaitSeconds', 'lockSeconds') {
         $evidence[$name] = Get-DemoMemberValue -InputObject $outcome -Name $name
     }

@@ -110,6 +110,8 @@ export function historySource(execute: Execute): DataSource {
 export interface QueryClient {
     run(spec: QuerySpec, options?: { force?: boolean }): Promise<QueryResult>;
     peek(spec: QuerySpec): QueryResult | undefined;
+    /** The last result for a query even when it's older than the cache keeps fresh, for a view that keeps showing it while a refresh runs or after one fails. */
+    peekStale?(spec: QuerySpec): QueryResult | undefined;
     clear(): void;
 }
 
@@ -130,11 +132,9 @@ export function createSourceClient(sources: readonly DataSource[], options: Clie
 
     function fresh(key: string): QueryResult | undefined {
         const hit = cache.get(key);
-        if (!hit) return undefined;
-        if (now() - hit.at > ttl) {
-            cache.delete(key);
-            return undefined;
-        }
+        // An expired entry isn't fresh, but it stays as the query's last result (peekStale) until a refresh replaces it or
+        // the least recently used order drops it.
+        if (!hit || now() - hit.at > ttl) return undefined;
         // Refresh recency for the LRU order.
         cache.delete(key);
         cache.set(key, hit);
@@ -143,6 +143,7 @@ export function createSourceClient(sources: readonly DataSource[], options: Clie
 
     return {
         peek: (spec) => fresh(keyOf(spec)),
+        peekStale: (spec) => cache.get(keyOf(spec))?.result,
         clear: () => cache.clear(),
         run(spec, runOptions) {
             const key = keyOf(spec);
@@ -158,6 +159,7 @@ export function createSourceClient(sources: readonly DataSource[], options: Clie
                 .fetch(spec)
                 .then(({ rows, requestId }) => {
                     const value: QueryResult = { spec, columns: spec.columns, rows, requestId, fetchedAt: new Date(now()), provenance: source.provenance };
+                    cache.delete(key);
                     cache.set(key, { at: now(), result: value });
                     while (cache.size > max) {
                         const oldest = cache.keys().next().value;
