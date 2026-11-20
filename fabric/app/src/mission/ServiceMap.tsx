@@ -33,15 +33,44 @@ interface Place {
     y: number;
 }
 
-const HUB: Place = { x: 500, y: 262 };
+const HUB: Place = { x: 500, y: 280 };
+const HUB_RADIUS = 70;
+const NODE_RADIUS = 36;
+const SATELLITE_RADIUS = 22;
 const PLACES: Record<EstateTarget, Place> = {
-    T3: { x: 500, y: 74 },
+    T3: { x: 500, y: 68 },
     T2: { x: 190, y: 146 },
     T1: { x: 190, y: 380 },
     T5: { x: 810, y: 146 },
     T4: { x: 810, y: 380 },
-    "T4-replica": { x: 920, y: 292 },
+    "T4-replica": { x: 920, y: 316 },
 };
+
+/** How far below a node's center its labels reach: the service, its status, and its line (dense: the first two, larger). */
+const labelsBelow = (r: number, dense: boolean) => r + (dense ? 54 : 65);
+/** Half the width of a node's labels, at the widest. */
+const LABELS_HALF_WIDTH = 150;
+
+/**
+ * A link from the hub's ring (or from T4's center, for its replica) to a node's center. A link that would run up through
+ * the node's labels, as T3's does straight above the hub, stops under them, so no line crosses a word.
+ */
+function linkOf(from: Place, fromRadius: number, at: Place, labels: number | null) {
+    const dx = at.x - from.x;
+    const dy = at.y - from.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const x1 = from.x + (dx / length) * fromRadius;
+    const y1 = from.y + (dy / length) * fromRadius;
+    if (labels !== null && dy < 0) {
+        const bottom = at.y + labels;
+        const xAtBottom = from.x + (dx * (bottom - from.y)) / dy;
+        if (y1 > bottom && Math.abs(xAtBottom - at.x) < LABELS_HALF_WIDTH) {
+            const stop = bottom + 6;
+            return { x1, y1, x2: from.x + (dx * (stop - from.y)) / dy, y2: stop };
+        }
+    }
+    return { x1, y1, x2: at.x, y2: at.y };
+}
 
 const STATE_WORD: Record<TargetState, string> = { calm: "Calm", injected: "Fault running", visible: "Signal visible", answered: "Answered" };
 const STATE_GLYPH: Record<TargetState, string> = { calm: "○", injected: "▼", visible: "●", answered: "◆" };
@@ -94,13 +123,15 @@ export function ServiceMap(props: {
             </defs>
             {nodes.map((n) => {
                 const at = PLACES[n.target];
-                const from = n.target === "T4-replica" && shown.has("T4") ? PLACES.T4 : HUB;
+                const satellite = n.target === "T4-replica";
+                const fromT4 = satellite && shown.has("T4");
                 const hot = n.state === "visible" || n.state === "injected" || (!n.state && (n.status === "Fail" || n.status === "Warning"));
-                return <line key={`link-${n.target}`} className={`mc-link${hot ? " mc-link-alert" : ""}`} x1={from.x} y1={from.y} x2={at.x} y2={at.y} />;
+                const link = linkOf(fromT4 ? PLACES.T4 : HUB, fromT4 ? 0 : HUB_RADIUS, at, satellite ? null : labelsBelow(NODE_RADIUS, Boolean(dense)));
+                return <line key={`link-${n.target}`} className={`mc-link${hot ? " mc-link-alert" : ""}`} {...link} />;
             })}
             <g className="mc-hub" aria-hidden="true">
-                <circle cx={HUB.x} cy={HUB.y} r={70} fill="url(#mc-hub-fill)" />
-                <circle cx={HUB.x} cy={HUB.y} r={70} className="mc-hub-ring" />
+                <circle cx={HUB.x} cy={HUB.y} r={HUB_RADIUS} fill="url(#mc-hub-fill)" />
+                <circle cx={HUB.x} cy={HUB.y} r={HUB_RADIUS} className="mc-hub-ring" />
                 <text x={HUB.x} y={HUB.y - 4} className="mc-hub-name" textAnchor="middle">
                     ContosoCare
                 </text>
@@ -111,7 +142,7 @@ export function ServiceMap(props: {
             {nodes.map((n) => {
                 const at = PLACES[n.target];
                 const satellite = n.target === "T4-replica";
-                const r = satellite ? 22 : 36;
+                const r = satellite ? SATELLITE_RADIUS : NODE_RADIUS;
                 const service = serviceOf(n.target)?.service ?? n.target;
                 const tone = n.state ? `state-${n.state}` : `tone-${statusTone(n.status ?? "")}`;
                 const glyph = n.state ? STATE_GLYPH[n.state] : n.status ? statusMeta(n.status).glyph : "–";

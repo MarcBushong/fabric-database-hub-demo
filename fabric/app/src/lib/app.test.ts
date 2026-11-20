@@ -36,6 +36,27 @@ describe("themes", () => {
         expect(contrastRatio("#FFFFFF", FLUENT_THEMES.dark.colorBrandBackground)).toBeGreaterThanOrEqual(4.5);
     });
 
+    it("keeps the navigation's hovered and selected page readable in every theme, high contrast included", () => {
+        // The token pairs styles/app.css applies, read from its rules: high contrast's selected and hover fill is cyan.
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8");
+        const rule = (selector: string) => {
+            const body = css.match(new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m"))?.[1] ?? "";
+            const token = (property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*var\\(--(\\w+)\\)`))?.[1] ?? "missing";
+            return { color: token("color"), background: token("background") };
+        };
+        const hover = rule(".nav-item:hover");
+        const selected = rule('.nav-item[aria-current="page"]');
+        const bar = rule('.nav-item[aria-current="page"]::before');
+        const icon = rule('.nav-item[aria-current="page"] .nav-icon');
+        for (const [id, theme] of Object.entries(FLUENT_THEMES)) {
+            const value = (token: string) => (theme as unknown as Record<string, string>)[token] ?? `no ${token}`;
+            expect(contrastRatio(value(hover.color), value(hover.background)), `${id}: hovered page`).toBeGreaterThanOrEqual(4.5);
+            expect(contrastRatio(value(selected.color), value(selected.background)), `${id}: selected page`).toBeGreaterThanOrEqual(4.5);
+            expect(contrastRatio(value(icon.color), value(selected.background)), `${id}: selected page's icon`).toBeGreaterThanOrEqual(3);
+            expect(contrastRatio(value(bar.background), value(selected.background)), `${id}: selected page's bar`).toBeGreaterThanOrEqual(3);
+        }
+    });
+
     it("uses ContosoCare's own brand ramp, not Fabric's teal, from one set of tokens (ADR 0030)", () => {
         expect(APP_BRAND).toBe(CONTOSOCARE_BRAND);
         expect(FLUENT_THEMES.light.colorBrandBackground).toBe(CONTOSOCARE_BRAND[80]);
