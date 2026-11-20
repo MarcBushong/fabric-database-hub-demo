@@ -169,7 +169,84 @@ public sealed class RcaIntegrationTests : IDisposable
         Assert.Contains(key, r => (string?)r["scenario"] == "replica-lag" && (string?)r["run_token"] == lagToken);
     }
 
-    private sealed class Gate : IObservationGate
+    /// <summary>
+    /// Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER, Windows authentication, as SqlIntegrationTests):
+    /// a blocking chain with its lock escalations and lock timeouts, and a deadlock storm, captured blind as T2. The event
+    /// session exists only while the observer does. CI doesn't set it.
+    /// </summary>
+    [Fact]
+    public async Task OnSqlServerTheBlindCaptureFindsTheChainItsErrorsAndTheDeadlocks()
+    {
+        await SqlIntegrationTests.PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        var endpoint = SqlIntegrationTests.Endpoint;
+        var options = new ObserverOptions { Sentinel = TimeSpan.FromSeconds(5), BlockingDetail = TimeSpan.FromSeconds(2), QuietFor = TimeSpan.FromSeconds(10), ErrorQuietFor = TimeSpan.FromSeconds(30), EventLatency = TimeSpan.FromSeconds(6), SlowSample = TimeSpan.FromSeconds(5) };
+        var store = new EvidenceStore(root, TimeProvider.System, host: "arcsql01");
+        var gate = new Gate(DemoTarget.T2);
+        var lane = new ObserverLane([new SqlTargetObserver("T2", DemoTarget.T2, new SqlCaptureConnector(endpoint, RunnerLog.Null), options, RunnerLog.Null)], [], gate, store, RunnerLog.Null, TimeProvider.System, options);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var observing = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        await Task.Delay(TimeSpan.FromSeconds(8), token);
+        Assert.True(await EventSessionExistsAsync(endpoint, token), "The observer didn't create ContosoCare_RCA.");
+
+        var runner = new ScenarioRunner(new SqlConnectionOpener(endpoint, RunnerLog.Null), RunnerLog.Null, TimeProvider.System);
+        var chain = ScenarioCatalog.Default.Get("blocking-chain");
+        var storm = ScenarioCatalog.Default.Get("deadlock-storm");
+        var results = await Task.WhenAll(
+            runner.RunAsync(RunBounds.Plan(chain, new RunRequest { ScenarioId = chain.Id, Target = DemoTarget.T2, Duration = TimeSpan.FromSeconds(90), Concurrency = 2, Parameters = new Dictionary<string, string>(StringComparer.Ordinal) { ["depth"] = "3", ["holdSeconds"] = "70", ["pauseSeconds"] = "0", ["escalationEverySeconds"] = "30", ["escalationHoldSeconds"] = "5", ["normalWorkers"] = "0" } }, DateTimeOffset.UtcNow), token),
+            runner.RunAsync(RunBounds.Plan(storm, new RunRequest { ScenarioId = storm.Id, Target = DemoTarget.T2, Duration = TimeSpan.FromSeconds(40), Concurrency = 1, Parameters = new Dictionary<string, string>(StringComparer.Ordinal) { ["maxRounds"] = "3" } }, DateTimeOffset.UtcNow), token));
+        var (chainRun, stormRun) = (results[0], results[1]);
+        Assert.True(chainRun.Status == "Completed", chainRun.Outcome);
+        Assert.True(stormRun.Status == "Completed", stormRun.Outcome);
+
+        await Task.Delay(TimeSpan.FromSeconds(12), token);
+        gate.Active = false;
+        await Task.Delay(TimeSpan.FromSeconds(5), token);
+        await stop.CancelAsync();
+        await observing.WaitAsync(TimeSpan.FromSeconds(60), token);
+        Assert.False(await EventSessionExistsAsync(endpoint, token), "The observer left ContosoCare_RCA behind.");
+
+        var export = new Exporter(store, RunnerLog.Null, "1.0.0").Export(null, final: true, TimeSpan.FromSeconds(10));
+        var document = Assert.Single(export.Documents);
+        var view = new EvidenceView(System.Text.Encoding.UTF8.GetString(PartCodec.Gunzip(store.ReadDocument(document.DocumentId)!)));
+        Assert.Empty(RcaSchemas.Errors(RcaSchemas.Evidence, view.Json));
+        foreach (var text in view.Strings)
+        {
+            Assert.DoesNotContain(chainRun.RunId, text, StringComparison.Ordinal);
+            Assert.DoesNotContain(stormRun.RunId, text, StringComparison.Ordinal);
+            Assert.DoesNotContain("blocking-chain", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("deadlock-storm", text, StringComparison.Ordinal);
+        }
+
+        var chainToken = ApplicationNames.RunToken(chainRun.RunId);
+        var stormToken = ApplicationNames.RunToken(stormRun.RunId);
+        var sessions = view.Table("rca_sessions");
+        var waiting = sessions.Where(r => r.GetValueOrDefault("blocked_by") is not null && (string?)r.GetValueOrDefault("run_token") == chainToken).ToList();
+        Assert.NotEmpty(waiting);
+        var blockers = waiting.Select(r => (string)r["blocked_by"]!).ToHashSet(StringComparer.Ordinal);
+        Assert.Contains(sessions, h => h.GetValueOrDefault("blocked_by") is null && blockers.Contains(h["session_id"]!.ToString()!) && (string?)h.GetValueOrDefault("run_token") == chainToken && h.GetValueOrDefault("module_name") is string && h.GetValueOrDefault("login_name") is string);
+        Assert.Contains(waiting, w => ((string?)w.GetValueOrDefault("wait_type") ?? string.Empty).StartsWith("LCK_M_", StringComparison.Ordinal) && w.GetValueOrDefault("statement_text") is string);
+
+        var events = view.Table("rca_events");
+        Assert.Contains(events, e => (string?)e["kind"] == "capture" && (string?)e["event_name"] == "escalated");
+        Assert.Contains(events, e => (string?)e["kind"] == "escalation" && (string?)e.GetValueOrDefault("run_token") == chainToken && (string?)e.GetValueOrDefault("object_name") == "[care].[appointments]");
+        Assert.Contains(events, e => (string?)e["kind"] == "error" && (string?)e.GetValueOrDefault("code") == "1222" && (string?)e.GetValueOrDefault("run_token") == chainToken);
+        var deadlocks = events.Where(e => (string?)e["kind"] == "deadlock").ToList();
+        Assert.NotEmpty(deadlocks);
+        Assert.Contains(deadlocks, d => (string?)d.GetValueOrDefault("run_token") == stormToken);
+        Assert.Contains(events, e => (string?)e["kind"] == "error" && (string?)e.GetValueOrDefault("code") == "1205");
+        Assert.True(view.Table("rca_coverage").Single()["captured"] is true, view.Table("rca_coverage").Single().GetValueOrDefault("gaps") as string);
+    }
+
+    private static async Task<bool> EventSessionExistsAsync(TargetEndpoint endpoint, CancellationToken token)
+    {
+        await using var connection = await new SqlConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test"), token);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA';";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(token), System.Globalization.CultureInfo.InvariantCulture) > 0;
+    }
+
+    private sealed class Gate(DemoTarget target = DemoTarget.T4) : IObservationGate
     {
         private volatile bool active = true;
 
@@ -179,6 +256,6 @@ public sealed class RcaIntegrationTests : IDisposable
             set => active = value;
         }
 
-        public bool IsActive(DemoTarget target) => target == DemoTarget.T4 && active;
+        public bool IsActive(DemoTarget asked) => asked == target && active;
     }
 }
