@@ -9,7 +9,7 @@ import { Open16Regular, Sparkle16Filled } from "@fluentui/react-icons";
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import type { ColumnSpec } from "@/data/queries";
-import { liveDataOf, useLiveEstate } from "@/data/live-estate";
+import { liveDataOf, liveOffOf, useLiveEstate } from "@/data/live-estate";
 import { buildAskContext } from "@/lib/ask";
 import { formatDateTimeUtc, sentence } from "@/lib/format";
 import { liveMigrations, migrationSentence, savedMigration, type MigrationTargetRow } from "@/lib/live-findings";
@@ -39,8 +39,13 @@ export function MigrationCard({ className = "span-12", resourceName = "arcsql01"
     const liveM = all.find((x) => x.target === "T2") ?? all[0] ?? null;
     const deployed = runtime.t2Migration;
     const saved = deployed ? savedMigration(deployed) : null;
+    // While Database Hub refuses the app as a whole (R924), the card has no live line, and doesn't wait for a read.
+    // That takes every view (cached and shared); inventory alone not answering keeps the card's line.
+    const health = useLiveEstate("health");
+    const security = useLiveEstate("security");
+    const off = !answer && liveOffOf([inventory, health, security]) !== null;
     // The assessment saved at deploy, when Database Hub has none to give: no live answer, or one without T2's results.
-    const fromSaved = !inventory.loading && saved !== null && saved.hasResults && !liveM?.hasResults;
+    const fromSaved = (!inventory.loading || off) && saved !== null && saved.hasResults && !liveM?.hasResults;
     const m = fromSaved ? saved : liveM;
     const name = m?.resource ?? resourceName;
     const portalUrl = runtime.links.t2MigrationAssessment;
@@ -51,14 +56,18 @@ export function MigrationCard({ className = "span-12", resourceName = "arcsql01"
         </Button>
     ) : null;
 
-    if (!answer && !inventory.loading && !fromSaved) {
+    if (!answer && (!inventory.loading || off) && !fromSaved) {
         return (
             <section className={`panel ${className} live-panel`} aria-label="T2's migration assessment">
                 <h3>{`T2's migration assessment: ${name}`}</h3>
-                <p className="muted live-off">
-                    <ProvenanceBadge provenance="live" liveState="unavailable" />
-                    {` ${sentence(inventory.unavailable ?? "this app has no live source")} ${path}`}
-                </p>
+                {off ? (
+                    <p className="muted">{path}</p>
+                ) : (
+                    <p className="muted live-off">
+                        <ProvenanceBadge provenance="live" liveState="unavailable" />
+                        {` ${sentence(inventory.unavailable ?? "this app has no live source")} ${path}`}
+                    </p>
+                )}
                 <p className="panel-sub">
                     {`Azure Arc assesses ${name} every week for Azure SQL Managed Instance, SQL Server on Azure Virtual Machines, and Azure SQL Database: its readiness for each, the recommended target and size, and a monthly estimate. The status page's T2.ARC.MIGRATIONASSESSMENT says when it last uploaded.`}
                 </p>
@@ -114,7 +123,7 @@ export function MigrationCard({ className = "span-12", resourceName = "arcsql01"
         >
             {m ? (
                 <div className="migration">
-                    {savedAt ? (
+                    {savedAt && !off ? (
                         <p className="muted live-off">
                             <ProvenanceBadge provenance="live" liveState="unavailable" />
                             {` ${answer ? `Database Hub's inventory has no migration assessment for ${name} yet.` : sentence(inventory.unavailable ?? "this app has no live source")} This is the assessment as Azure had it when the app was deployed; the Azure portal has the newest one.`}

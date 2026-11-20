@@ -20,7 +20,7 @@ Actions:
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
 - Runner (sqlvm01 for T1, T3, T4, and T5; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey }: runs one runner command. The token
+  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey, lockSeconds }: runs one runner command. The token
   {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, T4
   commands the flexible server's FQDN, the runner's role, and T4's read replica when it's known (--replica-server, from
   the request's optional replicaServerFqdn or else workload-install.json; ADR 0025), and T5 commands the Cosmos DB
@@ -37,7 +37,11 @@ Actions:
   hour without it; Invoke-DemoGuestRecovery): before a command that starts activity when a probe finds it broken, or
   after any command failed with it, which then runs again once. A command that ran after such a restart is a Warning
   that says what broke and that the restart cleared it; one that still fails says that the run's restart didn't help,
-  or why there was none.
+  or why there was none. Since 2026-11-19 (dbhubfx: the Arc probe's PowerShell Direct sessions ran inside the host's own
+  bootstrap pass and failed), T2's command waits for that pass and holds its lock (bootstrap.lock) while it runs in the
+  guest, at most the request's optional lockSeconds (120 by default; 0 doesn't take it). When the lock isn't free by
+  then, the command runs as before, and the evidence says so (lockTimedOut), so a long pass never fails a command that
+  the readiness wait and the recovery above already cover.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
 
@@ -1198,8 +1202,12 @@ function Invoke-DemoControlRunner {
         . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
         $requestKey = if ($Request.Contains('recoveryKey')) { [string]$Request['recoveryKey'] } else { '' }
         $recoveryKey = Get-DemoGuestRecoveryKey -Key $requestKey -Prefix 'control'
+        $lockSeconds = 120
+        if ($Request.Contains('lockSeconds') -and $null -ne $Request['lockSeconds']) {
+            $lockSeconds = [int][System.Math]::Max(0, [System.Math]::Min(600, [int]$Request['lockSeconds']))
+        }
         $full = @($arguments) + @('--target', 'T2')
-        $t2 = @{ StateRoot = $StateRoot; GuestName = $guestName; Guest = $guest; Arguments = $full; TimeoutSeconds = $timeout; Activity = $activity; ReadySeconds = $readySeconds }
+        $t2 = @{ StateRoot = $StateRoot; GuestName = $guestName; Guest = $guest; Arguments = $full; TimeoutSeconds = $timeout; Activity = $activity; ReadySeconds = $readySeconds; LockSeconds = $lockSeconds }
         # Only activity probes first; a read, a stop, or a reset just runs, and a broken channel it meets is cleared after it.
         $recovery = $null
         if ($activity) {
@@ -1315,7 +1323,10 @@ function Invoke-DemoControlT2Attempt {
 
         [bool] $Activity,
 
-        [int] $ReadySeconds = 0
+        [int] $ReadySeconds = 0,
+
+        [ValidateRange(0, 600)]
+        [int] $LockSeconds = 120
     )
 
     $readyNote = [ordered]@{}
@@ -1336,22 +1347,73 @@ function Invoke-DemoControlT2Attempt {
     else {
         $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $Guest.AdministratorName
     }
-    $run = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ArgumentList @($Guest.ToolsFolder, $Arguments, $TimeoutSeconds) -ScriptBlock {
-        param($Folder, $Arguments, $TimeoutSeconds)
-        $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
-        if (-not (Test-Path -LiteralPath $modulePath)) {
-            # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
-            # Not selected, not a Warning.
-            throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+    # dbhubfx (2026-11-19): PowerShell Direct sessions that ran beside the host's own bootstrap pass failed. The command
+    # waits for that pass and holds its lock while it runs in the guest, at most LockSeconds; when the lock isn't free by
+    # then, it runs as before, and the evidence says so. Taken after the readiness wait, which takes the same lock itself
+    # to release or start the guest.
+    $lock = $null
+    if ($LockSeconds -gt 0) {
+        $lock = Enter-DemoControlBootstrapLock -StateRoot $StateRoot -Seconds $LockSeconds
+    }
+    if ($null -ne $lock) {
+        $readyNote['lockSeconds'] = [int]$lock.Seconds
+        if ([bool]$lock.TimedOut) {
+            $readyNote['lockTimedOut'] = $true
         }
-        Import-Module -Name $modulePath -Force
-        $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
-        if ($null -eq $install) {
-            throw 'The workload runner is not installed in the guest yet.'
+    }
+    try {
+        $run = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ArgumentList @($Guest.ToolsFolder, $Arguments, $TimeoutSeconds) -ScriptBlock {
+            param($Folder, $Arguments, $TimeoutSeconds)
+            $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            if (-not (Test-Path -LiteralPath $modulePath)) {
+                # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
+                # Not selected, not a Warning.
+                throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+            }
+            Import-Module -Name $modulePath -Force
+            $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
+            if ($null -eq $install) {
+                throw 'The workload runner is not installed in the guest yet.'
+            }
+            Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
         }
-        Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
+    }
+    finally {
+        if ($null -ne $lock -and $null -ne $lock.Stream) {
+            $lock.Stream.Dispose()
+        }
     }
     return [pscustomobject]@{ Run = $run; ReadyNote = $readyNote; Failure = $null }
+}
+
+function Enter-DemoControlBootstrapLock {
+    <#
+    .SYNOPSIS
+    Takes the host bootstrap's own lock (bootstrap.lock in StateRoot) with the sign-in data check's helper,
+    Enter-DemoSignInBootstrapLock from this bundle's Invoke-DemoSignInResidue.ps1, as the Arc onboarding does: it waits up
+    to Seconds while a bootstrap run holds it, and a run that starts meanwhile exits and runs again 5 minutes later.
+    Returns that helper's Stream, Seconds, and TimedOut, or $null when this bundle has no such helper.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [ValidateRange(1, 7200)]
+        [int] $Seconds = 120
+    )
+
+    $path = [System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'bootstrap', 'Invoke-DemoSignInResidue.ps1')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    # Dot-sourced in this function's scope, so the script's own parameters stay here; it only defines its functions.
+    . $path
+    if (-not (Get-Command -Name 'Enter-DemoSignInBootstrapLock' -CommandType Function -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    return (Enter-DemoSignInBootstrapLock -Root $StateRoot -Seconds $Seconds)
 }
 
 function Invoke-DemoControlT2Recovery {
