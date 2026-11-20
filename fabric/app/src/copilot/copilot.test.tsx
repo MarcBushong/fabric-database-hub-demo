@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClientContext } from "@/data/use-query";
 import type { QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
+import { AccountChips } from "@/shell/AccountChips";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -110,6 +111,17 @@ function Harness() {
 function PageRead() {
     const inventory = useLiveEstate("inventory");
     return <span>{inventory.answer ? "page: data" : inventory.loading ? "page: reading" : "page: none"}</span>;
+}
+
+/** The app's header (its account chips) and the dock, as the shell places them. */
+function ShellHarness() {
+    const dock = useCopilotDock();
+    return (
+        <>
+            <AccountChips email={null} onSignOut={() => undefined} />
+            {dock.isOpen ? <CopilotDock mode="docked" onModeChange={() => undefined} onClose={() => dock.setOpen(false)} headingId="dock-title" /> : null}
+        </>
+    );
 }
 
 type Route = unknown | ((init?: RequestInit) => Response);
@@ -700,5 +712,80 @@ describe("the end of a turn (R925)", () => {
         expect(second.sent.filter((m) => m.type === "user").map((m) => m.text)).toEqual([QUESTION]);
         expect(screen.queryByText(/New chat started another conversation/)).not.toBeInTheDocument();
         expect(document.querySelectorAll(".copilot-answer")).toHaveLength(1);
+    });
+});
+
+// The owner's report, 2026-11-20: the header's GitHub sign-in opened an empty page inside Fabric, while the chat worked.
+describe("the header's GitHub chip", () => {
+    const device = { deviceCode: "d", userCode: "WDJB-MJHT", verificationUri: "https://github.com/login/device", expiresIn: 900, interval: 5 };
+
+    function renderShell() {
+        return render(
+            <QueryClientContext.Provider value={queryClient}>
+                <CopilotProvider settings={{ relayUrl: RELAY, estate: false }}>
+                    <ShellHarness />
+                </CopilotProvider>
+            </QueryClientContext.Provider>,
+        );
+    }
+
+    it("opens the Copilot panel's own sign-in, with GitHub's code and link there, and opens no blank tab", async () => {
+        vi.stubGlobal("fetch", fetchStub({ "/healthz": { ok: true, version: "t", signIn: "device" }, "/auth/device": device }));
+        const open = vi.fn(() => null);
+        vi.stubGlobal("open", open);
+        renderShell();
+        expect(document.querySelector(".copilot-dock")).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        expect(document.querySelector(".copilot-dock")).toHaveTextContent("Open github.com/login/device in a new tab");
+        expect(open).not.toHaveBeenCalled();
+        // GitHub opens from the panel's button, in its own click.
+        fireEvent.click(screen.getByRole("button", { name: "Copy the code and open GitHub" }));
+        await waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+        expect(open).toHaveBeenCalledWith("https://github.com/login/device", "_blank", "noopener,noreferrer");
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    it("follows the panel's sign-in: while GitHub's code is on its way, once it's there, and after a cancel", async () => {
+        let release: () => void = () => undefined;
+        const codeReady = new Promise<void>((resolve) => (release = resolve));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/device": async () => {
+                    await codeReady;
+                    return json(device);
+                },
+            }),
+        );
+        vi.stubGlobal("open", vi.fn(() => null));
+        renderShell();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        // While the relay gets the code, the chip says it's signing in, as the panel does, and doesn't offer a second sign-in.
+        expect(await screen.findByRole("button", { name: "GitHub: signing in" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Sign in to GitHub" })).not.toBeInTheDocument();
+        await waitFor(() => expect(document.querySelector(".copilot-dock")).toHaveTextContent("Getting a sign-in code from GitHub"));
+        await act(async () => release());
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "GitHub: signing in" })).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+        expect(await screen.findByRole("button", { name: "Sign in to GitHub" })).toBeInTheDocument();
+    });
+
+    it("says why a sign-in from the header didn't finish, on the chip and in the panel", async () => {
+        const reason = "GitHub didn't answer the sign-in request. Try again.";
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/device": () => json({ error: "github_error", message: reason }, 502),
+            }),
+        );
+        vi.stubGlobal("open", vi.fn(() => null));
+        renderShell();
+        fireEvent.click(screen.getByRole("button", { name: "Sign in to GitHub" }));
+        await waitFor(() => expect(document.querySelector(".copilot-dock")).toHaveTextContent(reason));
+        expect(await screen.findByRole("button", { name: /Sign in to GitHub\s*Didn't finish/ })).toBeInTheDocument();
     });
 });

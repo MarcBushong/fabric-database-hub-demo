@@ -287,9 +287,13 @@ function SignIn({ chat }: { chat: ChatController }) {
         <div className="copilot-card copilot-signin">
             <h3>Ask about your estate, on your own GitHub Copilot</h3>
             <p>Sign in to GitHub once in this browser. Copilot answers with your Copilot license, from the live estate and the demo's history, and draws its answers as charts.</p>
-            <Button appearance="primary" icon={<Key20Regular />} onClick={chat.signInWithGitHub}>
-                Sign in with GitHub
-            </Button>
+            {state.signInStarting ? (
+                <Spinner size="tiny" labelPosition="after" label="Getting a sign-in code from GitHub. It takes a few seconds more when the chat relay wakes up." />
+            ) : (
+                <Button appearance="primary" icon={<Key20Regular />} onClick={chat.signInWithGitHub}>
+                    Sign in with GitHub
+                </Button>
+            )}
             {state.authError ? (
                 <p role="alert" className="copilot-error">
                     {state.authError}

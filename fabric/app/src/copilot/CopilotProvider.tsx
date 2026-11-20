@@ -61,6 +61,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const [identity, setIdentity] = useState<Identity | null>(null);
     const [device, setDevice] = useState<ChatState["device"]>(null);
     const [authError, setAuthError] = useState<string | null>(null);
+    /** From a sign-in's click until GitHub's code arrives (a cold relay takes a few seconds): the dock and the header's chip say so. */
+    const [signInStarting, setSignInStarting] = useState(false);
     const [turns, dispatch] = useReducer(reduceConversation, undefined, () => loadConversation(perTab()));
     const [busy, setBusy] = useState(false);
     const [connecting, setConnecting] = useState(false);
@@ -463,43 +465,40 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const cancelSignIn = useCallback(() => {
         if (signInRun.current) signInRun.current.cancelled = true;
         signInRun.current = null;
+        setSignInStarting(false);
         setDevice(null);
     }, []);
 
-    /** GitHub's device flow through the relay: opens github.com/login/device, copies the code, and waits for it. */
+    /**
+     * GitHub's device flow through the relay: gets a code, shows it in the dock with "Copy the code and open GitHub", and
+     * waits for it. It opens no tab of its own: one opened in the click, before the code arrives, can stay blank inside
+     * Fabric's frame, where the browser may open it but give the app no handle to send it to GitHub (the owner's report,
+     * 2026-11-20). The dock's button opens GitHub in its own click, which works there.
+     */
     const signInWithGitHub = useCallback(() => {
         if (!relay) return;
         setAuthError(null);
-        // Opened in the click itself, so the browser allows the new tab; it goes to GitHub once the code arrives.
-        const tab = typeof window !== "undefined" ? window.open("about:blank", "_blank") : null;
         const run = { cancelled: false };
         if (signInRun.current) signInRun.current.cancelled = true;
         signInRun.current = run;
+        setDevice(null);
+        setSignInStarting(true);
         void (async () => {
             let start;
             try {
                 start = await relay.startDeviceFlow();
             } catch (err) {
-                tab?.close();
-                if (!run.cancelled) setAuthError(describeAskError(err));
-                return;
-            }
-            if (run.cancelled) {
-                tab?.close();
-                return;
-            }
-            const copied = await (navigator.clipboard?.writeText(start.userCode).then(() => true, () => false) ?? Promise.resolve(false));
-            let opened = false;
-            if (tab) {
-                try {
-                    tab.opener = null;
-                    tab.location.href = start.verificationUri;
-                    opened = !tab.closed;
-                } catch {
-                    tab.close();
+                if (!run.cancelled) {
+                    setSignInStarting(false);
+                    setAuthError(describeAskError(err));
                 }
+                return;
             }
-            setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened });
+            if (run.cancelled) return;
+            setSignInStarting(false);
+            const copied = await (navigator.clipboard?.writeText(start.userCode).then(() => true, () => false) ?? Promise.resolve(false));
+            if (run.cancelled) return;
+            setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened: false });
             const code = start.deviceCode;
             const outcome = await waitForDeviceToken({
                 poll: () => relay.pollDeviceFlow(code),
@@ -574,16 +573,19 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
     const signInMode = health.signIn;
     const account = useMemo<CopilotAccountState>(() => {
         const base = {
+            // The header's chip: it opens the dock, where the sign-in runs with its code, GitHub's link, and any error. It
+            // starts one only when none is running and the relay can sign viewers in; it never opens a tab itself.
             signIn: () => {
                 setIsOpen(true);
                 warmUp();
-                if (!session) signInWithGitHub();
+                if (!session && !device && !signInStarting && relay && signInMode !== "off") signInWithGitHub();
             },
             signOut,
         };
         if (settings && !relay) return { ...base, status: "unavailable", detail: "Ask isn't deployed in this environment." };
         if (signInMode === "off") return { ...base, status: "unavailable", detail: "GitHub sign-in isn't set up on the chat relay." };
-        if (device) return { ...base, status: "signing-in", detail: `Enter ${device.userCode} at github.com/login/device` };
+        if (device) return { ...base, status: "signing-in", detail: `Enter ${device.userCode} at ${device.verificationUri.replace(/^https:\/\//, "")}: the Copilot panel has the code and the link.` };
+        if (signInStarting) return { ...base, status: "signing-in", detail: "Getting a sign-in code from GitHub. The Copilot panel shows it." };
         if (session) {
             return {
                 ...base,
@@ -595,7 +597,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             };
         }
         return { ...base, status: "signed-out", detail: authError ?? undefined };
-    }, [authError, device, plan, relay, session, settings, signInMode, signInWithGitHub, signOut, user, warmUp]);
+    }, [authError, device, plan, relay, session, settings, signInMode, signInStarting, signInWithGitHub, signOut, user, warmUp]);
 
     const chatState: ChatState = {
         settings,
@@ -613,6 +615,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         pending: attached?.ctx ?? null,
         cosmosHistory,
         liveOff,
+        signInStarting,
     };
     const chat: ChatController = {
         state: chatState,

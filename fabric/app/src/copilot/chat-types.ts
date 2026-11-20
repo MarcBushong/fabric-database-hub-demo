@@ -49,6 +49,8 @@ export interface ChatState {
     cosmosHistory: boolean;
     /** The function's sentence while Database Hub refuses the app as a whole, by the latest reads in this browser (liveOffNow): new conversations start without the live view. */
     liveOff: string | null;
+    /** From a sign-in's click until GitHub's code arrives: the dock shows that it's getting the code. */
+    signInStarting: boolean;
 }
 
 export interface ChatController {
