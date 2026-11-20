@@ -14,6 +14,7 @@ import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { copyText } from "@/lib/clipboard";
 import { formatTimeUtc } from "@/lib/format";
+import { isEmbedded } from "@/lib/view-state";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { EVENT_LABEL, planEvents } from "@/lib/scoreboard";
 import { CinematicReplay } from "@/mission/CinematicReplay";
@@ -25,6 +26,10 @@ import { ribbonRange } from "@/mission/timeline";
 import { useMission } from "@/mission/use-mission";
 
 import "@/mission/mission.css";
+
+// Inside Fabric's frame the address is the app's hosted URL, which opens only from the app's item (a preview limit), so
+// the toast says how the moment comes back instead of promising the link opens it.
+const COPIED_IN_FABRIC = "Copied this moment's address. In Fabric, the app opens from its item, and this browser reopens it where you leave it.";
 
 interface EventRow extends Record<string, unknown> {
     at: Date;
@@ -103,7 +108,7 @@ export default function ReplayPage() {
                         onMinute={onMinute}
                         lens={lens}
                         motion={!reducedMotion}
-                        onCopyLink={async () => notify((await copyText(window.location.href)) ? "Copied the link to this moment: it opens the replay here" : "Copy is blocked here: the moment is in this app's address", "info")}
+                        onCopyLink={async () => notify((await copyText(window.location.href)) ? (isEmbedded() ? COPIED_IN_FABRIC : "Copied the link to this moment: it opens the replay here") : "Copy is blocked here: the moment is in this app's address", "info")}
                     />
                 ) : !data.loading ? (
                     <EmptyState title={data.error ? "The sessions couldn't load" : "No session to replay in this period"}>

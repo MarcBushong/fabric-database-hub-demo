@@ -8,7 +8,7 @@ import type { QuerySpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
 
 const MIN = 60000;
-export const SESSION_ID = "7f3a9c21-5d4e-4b2a-9c61-0a1b2c3d4e5f";
+export const SESSION_ID = "7f3a9c21-1111-1111-1111-111111111111";
 export const SESSION_KEY = `session:${SESSION_ID}`;
 /** 17 Nov 2026, 13:30 to 15:00 UTC: three of the showcase's 30-minute cycles. */
 export const SESSION_START = Date.UTC(2026, 10, 17, 13, 30);

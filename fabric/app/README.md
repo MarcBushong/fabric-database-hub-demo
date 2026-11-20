@@ -12,8 +12,8 @@ It reads two sources and says which one every visual shows:
 Anyone who deploys the demo demos it themselves, with nothing to set up in the app:
 
 1. **Deploy:** `./scripts/deploy.ps1` deploys the app with everything else, and updates it in place on every run ([Deploy](#deploy)).
-2. **Open it:** in the Fabric portal, open the demo's workspace and select `APP_DatabaseHub_Insights`. It signs you in with your Fabric account and opens on **Overview**.
-3. **The first time,** before any session, Overview says **No history yet** and names the one action that fills it: **Run all** in `NB_DatabaseHub_Control`. Live now (Database Hub's own view) shows already.
+2. **Open it:** in the Fabric portal, open the demo's workspace and select `APP_DatabaseHub_Insights`. It signs you in with your Fabric account and opens on **Mission Control**.
+3. **The first time,** before any session, Mission Control says **No session in this period** and Overview **No history yet**; both name the one action that fills them: **Run all** in `NB_DatabaseHub_Control`. Live now (Database Hub's own view) shows already.
 4. **After a session,** every page shows it: the incidents, T3's Database Agent loop, T4's read replica lag, T5's throttling and recovery, the findings, and **Readiness**, which every Run all fills by running `NB_DatabaseHub_Deployment`'s read-only checks once its session runs. Each session adds to the history; reset (in Manage, or `RESET_NOW` in the control notebook) and the next Run all work the same way every time.
 5. **Copilot:** select **Copilot** in the top bar, or **Ask Copilot** on any visual. The dock signs in to GitHub with your Copilot license the first time; its chip in the top bar shows your GitHub login and Copilot plan, next to your Fabric account.
 
@@ -33,10 +33,13 @@ Viewers need:
 
 ## What's in it
 
-A left navigation (it folds into a rail), a global filter (targets T1 to T5, and the period: latest day, 7 days, 30 days, all history, anchored to the newest telemetry day), and nine pages. All times are UTC.
+A left navigation (it folds into a rail), a global filter (targets T1 to T5, and the period: latest day, 7 days, 30 days, all history, anchored to the newest telemetry day), twelve pages, and a kiosk view. All times are UTC.
 
 | Page | What it answers | What's on it |
 |---|---|---|
+| **Mission Control** (the home page, [ADR 0030](../../docs/adr/0030-insights-app-mission-control.md)) | What happened in the latest session, for ContosoCare | ContosoCare's service map: each target as the service it serves (T1 Billing, T2 Front desk, T3 Scheduling, T4 Reporting and its read replica, the reports' DR copy, T5 Patient events), with its health from the history; a node opens its target. The latest session's plan (or the one picked) as recorded at its end, **as of** the newest capture, never live: **Database Hub, live** opens Database Hub. The session ribbon, the big numbers, **Technical** or **Business impact**, and **Write the postmortem** |
+| **Scoreboard** | Did we catch it? | Each fault the session injected (`Scenario Runs`): when its signal was visible in the telemetry, the response (T3's Database Agent loop, or a reset), and the recovery, with the times to detect and recover per engine and per fault type across the newest sessions, and T4's and T5's measured episodes. "Signal visible" is measured from the telemetry by its sample time, with each row's rule; it never says what Database Hub detected |
+| **Session replay** | The session again, beat by beat | One scrubber drives the service map, all five engines' charts, and the event ribbon (injected, signal visible, answered, recovered), with "Next: … in N min" from the plan; **Link to this moment** copies the address with the moment in it |
 | **Overview** | What needs attention now | **Live now** from Database Hub: resources and any not up, high usage in the last 24 hours, security warnings, Cosmos DB's peak normalized RU and lowest availability. Then from the history: targets needing attention, incidents, findings, readiness, the newest snapshot and the last session, each target's health with its CPU sparkline, the newest incidents, and the worst findings |
 | **Estate** | Every engine and target | Health tiles by engine, the inventory (sort, filter, CSV), and each target's page: T1 to T3 (CPU with incident bands and **Ask why** on its peak, waits, sessions, findings; on T2, **Ready to migrate**), T4 and its read replica (Read replica lag, CPU, connections), and T5 (normalized RU with the throttled intervals shaded and the 100 % line, requests and 429s, gateway latency, the recovery) |
 | **Performance** | Where the time goes | A signal per target (CPU, waits, sessions, IO), wait categories, each target's distribution, and a heatmap of the UTC hours |
@@ -46,6 +49,10 @@ A left navigation (it folds into a rail), a global filter (targets T1 to T5, and
 | **Trends** | What changed past 7 days | The history per UTC day and target, week over week |
 | **Manage** | Act on the demo | Start a session, run an incident on a target, stop now, reset: each bounded and confirmed ([Manage](#manage-bounded-confirmed-actions)) |
 | **Live views** | Where the live view is | Database Hub, the real-time dashboards, and the history report, in new tabs; the connector check |
+
+**Kiosk** (`#/kiosk`, **Kiosk** on Mission Control): Mission Control, the scoreboard, and the replay in turn, without the app's chrome, for a booth screen. Space pauses it, the arrows change scenes, and Esc leaves; **Full screen** works where the frame allows it, otherwise it says to press F11.
+
+**The postmortem** (**Write the postmortem** on Mission Control, the scoreboard, and the replay): **Download Markdown** writes it from the data alone (summary, timeline, impact, cause, response, times to detect and recover, follow-ups, and the queries), with no GitHub sign-in; **Draft with Copilot** hands the same rows and queries to the viewer's own Copilot with a template.
 
 **T4's and T5's history:** the notebook can't read Azure Monitor, so `./scripts/stop-demo.ps1 -SaveHistory`, `./scripts/deploy.ps1` at its end, and Run all's session end pass their metrics to `NB_DatabaseHub_LiveActivity` (analyses `postgresql` and `cosmosdb`). Their pages read the latest capture, whatever the filters, and say how a capture gets there when there's none. A deployment without Cosmos DB (`t5Enabled` off) shows no T5.
 
@@ -66,7 +73,7 @@ The Copilot chat sits in a dock on the right: it resizes, goes full screen, and 
 
 ### Look and feel
 
-- **Fluent 2** (`@fluentui/react-components`), Fabric's design language, in Fabric teal: **light**, **dark**, and **high contrast**. The app follows the system until you pick one in the top bar. Every status, target, and chart color keeps its contrast on each surface (`src/lib/app.test.ts`).
+- **Fluent 2** (`@fluentui/react-components`), Fabric's design language, in ContosoCare's own palette, deep navy with cyan and magenta, from one set of tokens (`src/theme/identity.ts` and `src/theme/stage.ts`, [ADR 0030](../../docs/adr/0030-insights-app-mission-control.md)): **light**, **dark**, and **high contrast**. The app follows the system until you pick one in the top bar; Mission Control, the scoreboard, the replay, and the kiosk are dark until you pick. Their pulses and shockwaves stop with reduced motion. Every status, target, and chart color keeps its contrast on each surface (`src/lib/app.test.ts`).
 - Keyboard and screen readers: every control, tile, row, and chart is reachable with Tab and Enter; charts read their values with the arrow keys and announce them; status is never shown by color alone (each status has a shape and a word, ADR 0012).
 - It fits Fabric's frame on a laptop screen: cards stack and tables scroll sideways when the dock takes room, and chart labels rotate or shorten (with the full name as a tooltip).
 
@@ -109,7 +116,7 @@ Every action says what it does and what bounds it, shows the control request, an
 |---|---|
 | Template | The Fabric Apps data app template, `microsoft/fabric-apps-analytic-templates` at commit `239b2c7` (MIT), recorded in `config/versions.json` (`fabricApp.template`) |
 | Runtime | React 19 and Vite, the Rayfin SDK 1.36.2 (`@microsoft/rayfin-client`, `-auth-provider-fabric`, `-connector-fabric-semanticmodel`) |
-| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's Fabric-teal light, dark, and high-contrast themes ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md)) |
+| Design system | Fluent UI React v9 (`@fluentui/react-components` 9.75.2, `@fluentui/react-icons` 2.0.346, MIT), with the app's ContosoCare light, dark, and high-contrast themes ([ADR 0029](../../docs/adr/0029-insights-app-dba-console.md), [ADR 0030](../../docs/adr/0030-insights-app-mission-control.md)) |
 | Charts | One chart component, `ChartView`: hand-built SVG with d3-scale and d3-shape (line, area, bar, stacked bar, scatter, table, and KPI, with incident bands, thresholds, and markers), which the Copilot dock's charts use too; the incident replay, a heatmap, and sparklines. No charting library and no CDN |
 | Fonts | Segoe UI from the system, like Fabric; no web fonts |
 | Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)). Live data from the app's function (`src/copilot/estate.ts`), through `src/data/live-estate.ts` |
@@ -124,7 +131,9 @@ fabric/app/
   rayfin/rayfin.yml            backend config: placeholders only (${DBHUB_FABRIC_WORKSPACE_ID}, ${DBHUB_SEMANTIC_MODEL_ID})
   rayfin/connectors/history/   the connector's generated schema (no IDs)
   src/shell/                   the top bar, the left navigation, the global filter, the account chips, and the dock's region
-  src/pages/                   Overview, Estate, Performance, Incidents, Findings, Readiness, Trends, Manage, and Live views
+  src/pages/                   Mission Control, Scoreboard, Session replay, and Kiosk (lazy), Overview, Estate, Performance, Incidents,
+                               Findings, Readiness, Trends, Manage, and Live views
+  src/mission/                 the new pages' parts: the service map, the session ribbon, the replay, the postmortem dialog, and the kiosk
   src/components/              the visual card (Ask Copilot, the data, the DAX, focus), the data grid, KPI and health tiles, and badges
   src/visuals/                 ChartView and its chart kit, the incident replay, the heatmap, and sparklines
   src/data/                    the DAX catalog, the query client (sources, cache, bounds), typed parsers, and the live estate's loader
@@ -132,7 +141,7 @@ fabric/app/
                                requests, the Manage client, the live findings, and the Database Agent prompts
   src/copilot/                 Ask: the Copilot dock and provider, its page-run tools, the relay client, and the model guide (the chat's code)
   rayfin/functions/            the functions: the live estate (estate.ts, estate-core.ts) and Manage (manage.ts, manage-core.ts); function_app.ts registers each feature's
-  src/theme/                   the Fluent themes and their tokens
+  src/theme/                   the Fluent themes and their tokens, ContosoCare's brand ramp (identity.ts), and the stage's tokens (stage.ts)
   src/preview/                 the local preview's sample data (npm run dev:sample); never built into the app
   src/test/                    the test setup and fixtures, and the tests of the npm overrides with Rayfin's code
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
@@ -230,7 +239,7 @@ npm run dev:sample   # the local preview with sample data: no Fabric, no sign-in
 
 `./tests/Invoke-StaticValidation.ps1 -Check FabricApp` runs the same in the repository's static validation, and the `Fabric App` CI job runs it on Node.js 24. The tests use fixture rows shaped like the connector's results; no test reaches Fabric.
 
-**The preview** (`npm run dev:sample`, then `/preview.html`) runs the whole app on made-up history and live answers, labeled **Sample data**, for design work and screenshots. Its query parameters: `theme=light|dark|contrast`, `copilot=open`, `manage=operator|viewer|running` (without it, Manage's copy mode), `empty=1` (no history: the first run), and `live=off` (no live source). Vite builds only `index.html`, so none of it ships.
+**The preview** (`npm run dev:sample`, then `/preview.html`) runs the whole app on made-up history and live answers, labeled **Sample data**, for design work and screenshots. Its addresses include `#/mission`, `#/scoreboard`, `#/replay?r=36` (a moment), and `#/kiosk`; its query parameters: `theme=light|dark|contrast`, `copilot=open`, `manage=operator|viewer|running` (without it, Manage's copy mode), `empty=1` (no history: the first run), and `live=off` (no live source). Vite builds only `index.html`, so none of it ships.
 
 To run the app locally against the deployed backend, work in the stage (`out/fabric-app`, after a deploy): `npm run dev` writes `.env.local` from the deployment record and serves on `http://localhost:5173`, which `rayfin.yml` allows as a redirect URI. Local sign-in wasn't verified in this phase.
 
