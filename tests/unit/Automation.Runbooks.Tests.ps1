@@ -2803,6 +2803,80 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         @(Get-DbHubDispatchSetTime -Output '') | Should -BeNullOrEmpty
     }
 
+    It 'follows T2''s Run Command that hadn''t ended when the session started, and moves T2''s times to when it set T2''s activity (2026-11-20)' {
+        # After a cold start, T2's guest can keep its Run Command going for minutes after the session's start wrote
+        # "running", so T2's planned times came early: the start says T2 is pending, follows the Run Command, and writes
+        # the time it set T2's activity once it has.
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = {
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+            if ($script:clock -lt $put.At.AddMinutes(20)) {
+                return @{ executionState = 'Running' }
+            }
+            $set = [ordered]@{ T2 = $put.At.AddMinutes(20).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
+        $result.status | Should -Be 'Started' -Because 'a target that''s still being set is no problem'
+        $writes = @($script:secrets['dbhub-session-status'] | ForEach-Object { $_.Value | ConvertFrom-Json })
+        $running = @($writes | Where-Object phase -EQ 'running')
+        $running.Count | Should -BeGreaterThan 1
+        @($running[0].dispatchPending) | Should -Be @('T2') -Because 'the notebook holds T2''s beats until its activity is set'
+        @($running[0].steps | Where-Object step -EQ 'Times' | ForEach-Object message) | Should -Be @('T2: its activity isn''t set on archost01 yet (a VM or guest that has just started can take minutes), so T2''s times count from when it is; the live view says when.')
+        $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+        $text = { param($Value) ConvertTo-DbHubTimeText -Value (ConvertTo-DbHubUtc -Value $Value) }
+        (& $text $running[0].dispatchUtc.T2) | Should -Not -Be (& $text $put.At.AddMinutes(20))
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        @($status.dispatchPending) | Should -BeNullOrEmpty
+        (& $text $status.dispatchUtc.T2) | Should -Be (& $text $put.At.AddMinutes(20))
+        (& $text $status.dispatchUtc.T1) | Should -Be (& $text $running[0].dispatchUtc.T1) -Because 'only T2 moved'
+        @($status.steps | Where-Object step -EQ 'Times' | ForEach-Object message)[-1] | Should -Match '^T2: its activity was set on archost01 \d+ minutes after Azure accepted the Run Command that sends it, so T2''s times count from then\.$'
+        @(Get-HostStep) | Should -BeNullOrEmpty
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        @($context.Log | Where-Object { $_ -match 'Following DbHubControl-archost01-20261027150000, which hadn''t ended when the session started' }).Count | Should -Be 1
+    }
+
+    It 'leaves the start''s status as it was when every Run Command had ended, and DbHub-Monitor moves a time the start stopped following (2026-11-20)' {
+        $script:t2Done = $false
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = {
+            if (-not $script:t2Done) {
+                return @{ executionState = 'Running' }
+            }
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+            $set = [ordered]@{ T2 = $put.At.AddMinutes(55).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        # A session longer than the start's 51 minutes of following.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter'; durationMinutes = 120 }) -Context $context
+        (Get-SessionStatus).durationMinutes | Should -Be 120
+        @($context.Log | Where-Object { $_ -match 'DbHubControl-archost01-20261027150000 hadn''t ended by \d\d:\d\d UTC; DbHub-Monitor''s re-checks look again\.$' }).Count | Should -Be 1
+        @((Get-SessionStatus).dispatchPending) | Should -Be @('T2')
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $script:t2Done = $true
+        $script:clock = $script:clock.AddMinutes(5)
+        $result = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $result.session | Should -Be 'Moved'
+        $result.status | Should -Be 'Checked' -Because 'a time that moved is no problem'
+        $result.message | Should -Match 'The session''s times for T2 now count from when its activity was set\.$'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+        $status = Get-SessionStatus
+        @($status.dispatchPending) | Should -BeNullOrEmpty
+        @(Get-HostStep) | Should -BeNullOrEmpty
+        # The next check finds nothing new to write.
+        (Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(30))).session | Should -Be 'Healthy'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+
+        # A session whose Run Commands had all ended by its start: no dispatchPending, no Times step, and no follow-up.
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $quiet = New-TestContext
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $quiet
+        (Get-SessionStatus).PSObject.Properties.Name | Should -Not -Contain 'dispatchPending'
+        @((Get-SessionStatus).steps | Where-Object step -EQ 'Times') | Should -BeNullOrEmpty
+        @($quiet.Log | Where-Object { $_ -match 'Following ' }) | Should -BeNullOrEmpty
+    }
     It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
         $null = Start-TestSession
         $before = Get-SessionStatus

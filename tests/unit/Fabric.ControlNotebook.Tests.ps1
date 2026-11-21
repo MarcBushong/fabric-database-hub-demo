@@ -330,7 +330,20 @@ def vault_read(name):
             status = running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"])
             if scenario == "sessioncosmos":
                 status = with_t5(status, RUNBOOK["accepted"] + real_dt.timedelta(minutes=4))
+            if scenario == "t2late":
+                # T2's Run Command hadn't ended when the session started (2026-11-20): a guest after a cold start.
+                status["dispatchPending"] = ["T2"]
+                status["steps"].append({"step": "Times", "state": "Info", "atUtc": iso(Clock.now), "fix": "",
+                                        "message": "T2: its activity isn't set on archost01 yet (a VM or guest that has just started can take minutes), so T2's times count from when it is; the live view says when."})
             VAULT[name] = json.dumps(status)
+        elif scenario == "t2late" and current.get("phase") == "running" and current.get("dispatchPending") \
+                and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=22):
+            # The start's follow-up (Wait-DbHubSessionDispatch): T2's activity was set 12 minutes after its dispatch.
+            current["dispatchUtc"]["T2"] = iso(RUNBOOK["accepted"] + real_dt.timedelta(minutes=22))
+            current["dispatchPending"] = []
+            current["steps"].append({"step": "Times", "state": "Info", "atUtc": iso(Clock.now), "fix": "",
+                                     "message": "T2: its activity was set on archost01 12 minutes after Azure accepted the Run Command that sends it, so T2's times count from then."})
+            VAULT[name] = json.dumps(current)
         elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
                 and not any(step.get("step") == "Host" for step in current.get("steps") or []):
             # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
@@ -1880,6 +1893,30 @@ print(json.dumps({"plan": flow(), "oldRunbook": flow(old_runbook=True), "whole":
         $old.printed | Should -Not -Match 'archost01 is deallocated'
         ($report.statusReads - $old.statusReads) | Should -BeLessOrEqual 19 -Because 'a 90-minute live view reads the status at most every 5 minutes'
         ($report.statusReads - $old.statusReads) | Should -BeGreaterThan 10
+    }
+
+    It 'holds T2''s beats while its activity isn''t set, then counts them, and the history''s, from when it was (2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 't2late' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Match 'T2: its activity isn''t set on its VM yet \(a guest that has just started can take minutes\), so its times above come later by as much; the live view prints them once it''s set\.'
+        $report.printed | Should -Match 'Times\s+Info\s+T2: its activity was set on archost01 12 minutes after Azure accepted the Run Command that sends it'
+        $moved = $report.printed.IndexOf('T2''s beats count from when its activity was set: ')
+        $moved | Should -BeGreaterThan 0
+        $firstT2 = [regex]::Match($report.printed, 'Now: T2 ')
+        $firstT2.Success | Should -BeTrue
+        $firstT2.Index | Should -BeGreaterThan $moved -Because 'no T2 beat is announced before its activity is set'
+        $report.printed | Should -Match 'Pass: the history is saved'
+        $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+        $accepted = ([datetime]$plan.startUtc).ToUniversalTime()
+        $t2 = @($plan.beats | Where-Object target -EQ 'T2')
+        $t2.Count | Should -BeGreaterThan 0
+        (([datetime]$t2[0].startUtc).ToUniversalTime() - $accepted).TotalMinutes | Should -Be 24 -Because 'T2''s first beat starts 2 minutes into its showcase, set 22 minutes after the session was accepted'
+        $t1 = @($plan.beats | Where-Object target -EQ 'T1')
+        (([datetime]$t1[0].startUtc).ToUniversalTime() - $accepted).TotalMinutes | Should -Be 4 -Because 'T1''s times didn''t move'
     }
 
     It 'shows nothing new from a status that runbooks from before 2026-11-16 wrote, which has no host steps and no runCommands' {
