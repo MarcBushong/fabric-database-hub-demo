@@ -456,6 +456,138 @@ Describe 'Invoke-DemoVmRunCommand' {
         }
     }
 
+    Context 'an action under a fresh name (the review of F31: the handler skips a name it ran before, whatever the script does)' {
+        BeforeEach {
+            InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+            # The handler keeps the fixed names' last sequence numbers, so a Run Command of either would never start.
+            foreach ($name in 'DbHubDemo-HostPassword', 'DbHubDemo-Bootstrap') {
+                $null = $script:skipped.Add($name)
+            }
+            $script:stampOf = { param([string] $Name, [int] $Minutes) '{0}-{1}' -f $Name, [DateTime]::UtcNow.AddMinutes($Minutes).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        }
+
+        It 'runs it under a fresh name, deletes the fixed name an earlier version left first and waits for that, and waits for its own delete, as before' {
+            $script:runCommands['DbHubDemo-HostPassword'] = $true
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'Write-Output 1' -ProtectedParameter @{ PasswordBase64 = $script:fakeToken } -PollIntervalSeconds 0 -FreshAction
+
+            $result.Succeeded | Should -BeTrue
+            $result.UsedName | Should -Match '^DbHubDemo-HostPassword-\d{14}$'
+            @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name) | Should -Be @($result.UsedName) -Because 'nothing runs under the name the handler skips'
+            $steps = @($script:calls | ForEach-Object { '{0} {1}' -f $_.Method, $_.Name })
+            $fixedDelete = [array]::IndexOf($steps, 'delete DbHubDemo-HostPassword')
+            $put = [array]::IndexOf($steps, ('put {0}' -f $result.UsedName))
+            $fixedDelete | Should -BeGreaterOrEqual 0
+            $fixedDelete | Should -BeLessThan $put -Because 'the earlier version''s Run Command goes before this one runs'
+            @($steps[($fixedDelete + 1)..($put - 1)]) | Should -Contain 'get DbHubDemo-HostPassword' -Because 'that delete is waited for, as before'
+            $ownDelete = [array]::LastIndexOf($steps, ('delete {0}' -f $result.UsedName))
+            $ownDelete | Should -BeGreaterThan $put
+            @($steps | Select-Object -Skip ($ownDelete + 1)) | Should -Contain ('get {0}' -f $result.UsedName) -Because 'an action''s own delete is waited for, so its copies never pile up'
+            $result.Removed | Should -BeTrue
+            $script:runCommands.Count | Should -Be 0
+            @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult -Clear }) | Should -BeNullOrEmpty
+        }
+
+        It 'asks copies whose owner stopped waiting to go, and leaves a run in progress alone' {
+            $old = & $script:stampOf 'DbHubDemo-HostPassword' -180
+            $young = & $script:stampOf 'DbHubDemo-HostPassword' -1
+            foreach ($name in $old, $young) {
+                $script:runCommands[$name] = $true
+            }
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshAction
+
+            $result.Succeeded | Should -BeTrue
+            $deleted = @($script:calls | Where-Object Method -eq 'delete' | ForEach-Object Name)
+            $deleted | Should -Contain $old
+            $deleted | Should -Not -Contain $young -Because 'a younger copy is another run in progress'
+            $script:runCommands.Keys | Should -Contain $young
+        }
+
+        It 'never sends an action twice: -PendingRetrySeconds is only for a read, and a read is no action' {
+            { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'x' -PollIntervalSeconds 0 -FreshAction -PendingRetrySeconds 90 } | Should -Throw '*only for a read-only script (-FreshName): a script that changes something, sent again, could run twice*'
+            { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'x' -PollIntervalSeconds 0 -PendingRetrySeconds 90 } | Should -Throw '*only for a read-only script*'
+            { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'x' -PollIntervalSeconds 0 -FreshName -FreshAction } | Should -Throw '*pass one of them*'
+            $script:calls | Should -BeNullOrEmpty -Because 'nothing reached Azure'
+        }
+
+        Context 'its callers, while the handler skips their fixed names' {
+            BeforeEach {
+                # What the handler's skip looks like to the caller: Pending, never started, until the whole wait ends.
+                $script:actionOutput = ''
+                Mock -ModuleName DbHubDemo -CommandName Wait-DemoRunCommand -MockWith {
+                    $name = if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
+                    if ($script:skipped.Contains($name)) {
+                        return [pscustomobject]@{ Found = $true; NotFound = $false; ProvisioningState = 'Succeeded'; ExecutionState = 'Pending'; ExitCode = $null; StartTime = $null; Output = ''; Error = ''; WaitTimedOut = $true; Stale = $false; NotStarted = $false }
+                    }
+                    [pscustomobject]@{ Found = $true; NotFound = $false; ProvisioningState = 'Succeeded'; ExecutionState = 'Succeeded'; ExitCode = 0; StartTime = $null; Output = $script:actionOutput; Error = ''; WaitTimedOut = $false; Stale = $false; NotStarted = $false }
+                }
+                Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { $ArgumentList[0] -eq 'vm' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = "demoadmin`n"; StdErr = '' } }
+                Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { 'PowerState/running' }
+                Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
+            }
+
+            It 'rotates the T2 host''s one-time password at a stop (DbHubDemo-HostPassword: a skipped set waited 600 seconds, then failed, and the last session''s password stayed valid)' {
+                $script:actionOutput = "DBHUBDEMO-PASSWORD set for demoadmin`nDBHUBDEMO-LOG found=0 cleared=False error="
+                $result = Set-DemoVmLocalPassword -Config $config -VmName archost01 -Rotate -Confirm:$false
+
+                $result.checkId | Should -Be 'STOP.HOSTPASSWORD'
+                $result.status | Should -Be 'Pass'
+                $result.message | Should -Match 'rotated to a value nobody keeps'
+                @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name) | Should -Match '^DbHubDemo-HostPassword-\d{14}$'
+            }
+
+            It 'runs the bootstrap loader of deploy.ps1''s parallel tracks (DbHubDemo-Bootstrap: its retry recreated the name it had just deleted)' {
+                $script:actionOutput = 'DbHubDemo loader finished: role SqlVm'
+                $result = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'sqlvm01' -BundleSha256 ('a' * 64) -ChunkCount 1 -Settings @{ role = 'SqlVm'; workload = @{} } }
+
+                $result.checkId | Should -Be 'INFRA.BOOTSTRAP.LOADER_SQLVM01'
+                $result.status | Should -Be 'Pass'
+                @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name) | Should -Match '^DbHubDemo-Bootstrap-\d{14}$'
+            }
+        }
+
+        It 'runs every Run Command the scripts create and delete under a fresh name: the reads with -FreshName, the rest with -FreshAction' {
+            # A new caller must be added here on purpose. DbHubDemo-Profile and the template's DbHubDemo-Bootstrap aren't
+            # Invoke-DemoVmRunCommand's: both are updated in place, never deleted, and keep their names.
+            $expected = @{
+                'DbHubDemo-HealthRead'        = 'FreshName'
+                'DbHubDemo-SqlModeRead'       = 'FreshName'
+                'DbHubDemo-ValidateProbe'     = 'FreshName'
+                'DbHubDemo-Bootstrap'         = 'FreshAction'
+                'DbHubDemo-HostPassword'      = 'FreshAction'
+                'DbHubDemo-ArcProbe'          = 'FreshAction'
+                'DbHubDemo-ArcOnboard'        = 'FreshAction'
+                'DbHubDemo-MonitoringRestart' = 'FreshAction'
+                'DbHubDemo-DiskWipe'          = 'FreshAction'
+                'DbHubDemo-SignInData'        = 'FreshAction'
+                'DbHubDemo-Golden'            = 'FreshAction'
+                'DbHubDemo-GuidedSetup'       = 'FreshAction'
+                'DbHubDemo-SqlProductKey'     = 'FreshAction'
+                'DbHubDemo-GuestRebuild'      = 'FreshAction'
+            }
+            $found = [System.Collections.Generic.List[string]]::new()
+            $moduleRoot = Join-Path -Path $PSScriptRoot -ChildPath '../../scripts/modules/DbHubDemo'
+            foreach ($file in Get-ChildItem -LiteralPath $moduleRoot -Recurse -Filter '*.ps1') {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+                $calls = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Invoke-DemoVmRunCommand' }, $true)
+                foreach ($call in $calls) {
+                    # Its own parameters, or the hashtable its function splats into it.
+                    $text = $call.Extent.Text
+                    if ($text -notmatch '-RunCommandName ') {
+                        $owner = $call
+                        while ($null -ne $owner -and $owner -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                            $owner = $owner.Parent
+                        }
+                        $text = $owner.Extent.Text
+                    }
+                    $name = if ($text -match "RunCommandName\s*=?\s*'(DbHubDemo-[A-Za-z]+)'") { $Matches[1] } else { '(no name: {0})' -f $file.Name }
+                    $mode = if ($text -match '-FreshAction\b|\bFreshAction\s*=\s*\$true') { 'FreshAction' } elseif ($text -match '-FreshName\b|\bFreshName\s*=\s*\$true') { 'FreshName' } else { 'fixed' }
+                    $found.Add(('{0}={1}' -f $name, $mode))
+                }
+            }
+            @($found | Sort-Object -Unique) | Should -Be @($expected.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $expected[$_] })
+        }
+    }
+
     It 'refuses a public value that would not survive the command line, before calling Azure' {
         { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-ArcOnboard' -Script 'x' -Parameter @{ Tags = 'owner=a b' } } | Should -Throw '*Base64-encode it*'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly

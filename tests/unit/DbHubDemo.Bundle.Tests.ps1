@@ -690,6 +690,26 @@ Describe 'Wait-DemoBootstrapLoader' {
         $result.message | Should -Match 'no bootstrap loader Run Command'
     }
 
+    It 'reads the newest copy deploy.ps1''s parallel tracks left under a fresh name when DbHubDemo-Bootstrap isn''t there (the review of F31)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $url = $ArgumentList[[array]::IndexOf($ArgumentList, '--url') + 1]
+            $script:loaderUrls.Add($url)
+            if ($url -match '/runCommands\?') {
+                $listed = @('DbHubDemo-Bootstrap-20261122010000', 'DbHubDemo-Bootstrap-20261122020000', 'DbHubDemo-HealthRead-20261122030000', 'DbHubDemo-Bootstrapper-20261122040000') | ForEach-Object { @{ name = $_; properties = @{ provisioningState = 'Deleting' } } }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ value = @($listed) } | ConvertTo-Json -Depth 5); StdErr = '' }
+            }
+            if ($url -match '/runCommands/DbHubDemo-Bootstrap-20261122020000\?') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ name = 'DbHubDemo-Bootstrap-20261122020000'; properties = @{ provisioningState = 'Deleting'; instanceView = @{ executionState = 'Failed'; exitCode = 1; output = ''; error = 'DbHubDemo loader failed: The bundle is incomplete: missing chunk(s) 1.' } } } | ConvertTo-Json -Depth 5); StdErr = '' }
+            }
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: Not Found({"error":{"code":"NotFound"}})' }
+        }
+        $result = Wait-DemoBootstrapLoader -Config $config -VmName 'archost01'
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'missing chunk\(s\) 1'
+        $result.evidence.runCommand | Should -Be 'DbHubDemo-Bootstrap-20261122020000'
+        @($script:loaderUrls | Where-Object { $_ -match '/runCommands/DbHubDemo-Bootstrap-20261122010000\?' }) | Should -BeNullOrEmpty -Because 'the newest copy is the one read'
+    }
+
     It 'warns when the loader is still running at the end of the wait' {
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoRunCommand -MockWith {
             [pscustomobject]@{ Found = $true; NotFound = $false; ProvisioningState = 'Succeeded'; ExecutionState = 'Running'; ExitCode = $null; Output = ''; Error = ''; WaitTimedOut = $true }

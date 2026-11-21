@@ -582,6 +582,8 @@ function Invoke-DemoGoldenGuestAction {
         Parameter           = $values
         TimeoutSeconds      = $TimeoutSeconds
         PollIntervalSeconds = 15
+        # A fresh name each time: the VM's Run Command handler can skip a name it ran before (the review of F31).
+        FreshAction         = $true
         Confirm             = $false
     }
     if ($ResourceGroupName) {

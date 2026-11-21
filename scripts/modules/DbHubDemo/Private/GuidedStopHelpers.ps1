@@ -114,7 +114,7 @@ function Set-DemoGuidedStopRequest {
     }
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Set-DemoGuidedSetupRequest.ps1') -Raw
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuidedSetup' -Script $script -Parameter @{ Action = $Action } -TimeoutSeconds 300 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuidedSetup' -Script $script -Parameter @{ Action = $Action } -TimeoutSeconds 300 -FreshAction -Confirm:$false
     }
     catch {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The guided stop''s request couldn''t be cleared on archost01: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')

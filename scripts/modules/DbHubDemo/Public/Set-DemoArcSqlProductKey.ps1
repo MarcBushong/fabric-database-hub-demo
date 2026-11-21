@@ -64,7 +64,7 @@ function Set-DemoArcSqlProductKey {
         return (& $newResult 'Not selected' 'What if: the product key was not sent.')
     }
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-SqlProductKey' -Script $script -ProtectedParameter @{ ProductKey = $key } -TimeoutSeconds $TimeoutSeconds -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-SqlProductKey' -Script $script -ProtectedParameter @{ ProductKey = $key } -TimeoutSeconds $TimeoutSeconds -FreshAction -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The product key Run Command could not run: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 -ProductKey again.')

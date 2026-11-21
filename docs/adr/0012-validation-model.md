@@ -301,6 +301,29 @@ Live on `dbhubfn` (a8d51ac), `dbhubrb`, and `dbhubra`, `archost01`'s health read
 
 Nothing reads `DbHubDemo-HealthRead` by its name: `status.ps1`, `deploy.ps1`, and `validate.ps1` read health through `Get-DemoVmHealth`, the session control's runbooks clean only their own `DbHubControl-` Run Commands, and `STATUS.RUNCOMMANDS` lists every `DbHubDemo-` one by its prefix. On the T2 host, where it also lists the ones Azure is deleting (R871), it leaves out a time-stamped one (`-yyyyMMddHHmmss`) whose time is less than 15 minutes old: a delete in flight, such as `status.ps1`'s own health read seconds after it, which the review of F31 found reported as a stuck Run Command with a host rebuild as the fix. Only the result's evidence names those (`deletingRecently`); older ones, and names without a time such as the chunks', still warn. Unit-tested in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; not run live.
 
+### 2026-11-22: fresh names for actions too (the review of F31)
+
+The handler's skip comes from reusing a name whose last delete never reached it as a disable, whatever the script does, and a Run Command that changes something, created right after its own delete, is the live pattern. The review of F31 found it exposed, as the owner's coordinator approved fixing:
+
+- **`DbHubDemo-HostPassword`,** at least twice a session: a skipped set waited 600 seconds and failed. At a stop, `STOP.HOSTPASSWORD` then reported that the last session's password was still valid, so the guardrail missed; at a start, the presenter got no working password.
+- **The parallel tracks' bootstrap loader, `DbHubDemo-Bootstrap`:** a retry created the name again seconds after deleting the one the handler skipped, which ended in a stuck **Fail** and **NOT DONE**.
+- `DbHubDemo-ArcProbe` and `DbHubDemo-ArcOnboard` on every T2 onboarding, and the occasional `DbHubDemo-MonitoringRestart`, `DiskWipe`, `SignInData`, `Golden`, `GuidedSetup`, `SqlProductKey`, and `GuestRebuild`.
+
+**Decision:** every `Invoke-DemoVmRunCommand` call runs under a fresh name, `<name>-yyyyMMddHHmmss`: the reads with `-FreshName`, as above, and every other call with `-FreshAction`. An action otherwise behaves as before:
+
+- **Its fixed name's leftover goes first, and that delete is waited for** (at most `-LeftoverWaitSeconds`, 300 seconds), so an earlier version's run, or the template's loader `DbHubDemo-Bootstrap`, never runs beside it. When Azure doesn't finish that delete, the action runs anyway, since it doesn't need the name, and the log says so.
+- **Its own delete is waited for,** so its copies never pile up toward Azure's 25 a VM; copies whose run stopped waiting for them (an hour or more after their time) go with the next run of the same action.
+- **It's never sent twice:** `-PendingRetrySeconds` is refused for it, because a script that changes something, sent again, could run twice; for the host's password, the late run would set one that nobody was given.
+- At 24 Run Commands on the VM, it runs under its fixed name, as before.
+
+`DbHubDemo-Profile` and the template's `DbHubDemo-Bootstrap` keep their names: both are updated in place, never deleted. A check that looked for an action's fixed name finds its fresh copies by prefix: `Wait-DemoBootstrapLoader` (`INFRA.BOOTSTRAP.LOADER_<vm>`, validation's loader read, and the `-Sequential` Bootstraps stage) reads the newest `DbHubDemo-Bootstrap-<time>` when `DbHubDemo-Bootstrap` isn't there, and `STATUS.RUNCOMMANDS` lists every `DbHubDemo-` copy by its prefix. Nothing else reads an action by its name: `destroy.ps1` deletes the resource group, `stop-demo.ps1` and `deploy.ps1` clean only the chunks, by their prefix, and `start-demo.ps1` and the session control's runbooks only the control's `DbHubControl-` ones.
+
+**Existing deployments:** an update from bf010ed changes nothing on the VMs until an action runs. Its first run under the new code deletes its fixed-name leftover, waited for, before it runs under its fresh name, and a leftover of an action that doesn't run stays in `STATUS.RUNCOMMANDS`, with its delete command, as before.
+
+**Not this:** `DEPLOY.ARTIFACTS.STALL_SQLVM01` (fz, fn, fu, rb twice, and ra). Five were on a new `sqlvm01`, and the sixth, rb's update at 73149836, sent a new bundle and runner, so in each the VM had never run those chunks' names. Each came while Azure installed or finished `sqlvm01`'s SQL IaaS Agent and Defender for SQL extensions, and a chunk set never deletes and creates a chunk's name again. Chunk names repeat only when the same content goes to the same VM again (a loader that found its chunks missing, or a rebuilt host), which this change leaves as it is.
+
+A test pins each call's kind, so a new caller has to choose. Unit-tested in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`. **Not run live: it needs a live proof before it ships.**
+
 ## Consequences
 
 - **Positive:** a presenter can trust a green result. Every manual step is explicit and actionable. Results are machine-readable for the notebooks and CI.

@@ -477,7 +477,7 @@ Restart-Service -Name '$service' -Force
     Write-DemoLog -Message ('{0}''s monitoring plugin reports {1}; restarting the SQL IaaS Agent service so it starts again; no action needed.' -f $VmName, $before)
     Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message 'Restarting T1''s monitoring plugin, which stopped after a restart; no action needed.'
     $restartUtc = Get-DemoUtcNow
-    $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-MonitoringRestart' -Script $script -TimeoutSeconds 300
+    $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-MonitoringRestart' -Script $script -TimeoutSeconds 300 -FreshAction
     $evidence['restarted'] = [bool]$run.Succeeded
     if (-not $run.Succeeded) {
         return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin {1} ({2}), and the SQL IaaS Agent service couldn''t be restarted.' -f $VmName, $stateText, $before) -Remediation ('Restart the {0} service on {1}, or run ./scripts/configure-monitoring.ps1.' -f $service, $VmName) -Evidence $evidence -DocUrl $docUrl)

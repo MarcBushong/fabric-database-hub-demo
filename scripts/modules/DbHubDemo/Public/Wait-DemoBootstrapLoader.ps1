@@ -9,7 +9,9 @@ function Wait-DemoBootstrapLoader {
     true and treatFailureAsDeploymentFailure false, so the deployment succeeds as soon as the loader starts,
     whatever the loader does next. This reads the Run Command's instance view (az rest GET
     ...?$expand=instanceView, through Invoke-DemoAz) until the script finishes, so a failed loader is never
-    hidden behind a successful deployment:
+    hidden behind a successful deployment. Without DbHubDemo-Bootstrap, it reads the newest copy deploy.ps1's
+    parallel tracks left under a fresh name, DbHubDemo-Bootstrap-yyyyMMddHHmmss (Get-DemoRunCommandCopyName; the review
+    of F31), when there is one:
     - Pass: execution state Succeeded and exit code 0. The loader verified and installed the bundle and
       started the scheduled task; the state machine's own progress is in health.json.
     - Fail: any other terminal state or exit code, with the last 4 KB of the script's error output, or no
@@ -56,10 +58,22 @@ function Wait-DemoBootstrapLoader {
     $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
     $remediation = 'Read C:\ProgramData\DbHubDemo\logs\loader.log on the VM (Bastion), then run deploy.ps1 -Resume, which sends the bundle again and re-runs the loader (ADR 0003).'
 
-    $url = '{0}/DbHubDemo-Bootstrap?api-version={1}' -f (Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName), (Get-DemoRunCommandApiVersion)
-    $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10
+    $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
+    $apiVersion = Get-DemoRunCommandApiVersion
+    $loaderName = 'DbHubDemo-Bootstrap'
+    $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url ('{0}/{1}?api-version={2}' -f $baseUrl, $loaderName, $apiVersion) -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10
+    if (-not $state.Found) {
+        # deploy.ps1's parallel tracks run the loader under a fresh name, DbHubDemo-Bootstrap-yyyyMMddHHmmss, and delete it
+        # afterward (the review of F31): one that's still listed, the newest, is read instead.
+        $copy = Get-DemoRunCommandCopyName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -RunCommandName $loaderName
+        if ($copy) {
+            $loaderName = $copy
+            $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url ('{0}/{1}?api-version={2}' -f $baseUrl, $copy, $apiVersion) -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10
+        }
+    }
     $evidence = @{
         vmName            = $VmName
+        runCommand        = $loaderName
         executionState    = $state.ExecutionState
         provisioningState = $state.ProvisioningState
         exitCode          = $state.ExitCode

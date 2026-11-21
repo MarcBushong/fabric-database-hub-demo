@@ -314,11 +314,13 @@ function Get-DemoRunCommandFreshName {
     return ('{0}-{1}' -f $Name, $NowUtc.ToUniversalTime().ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture))
 }
 
-function Get-DemoRunCommandReadName {
+function Get-DemoRunCommandRunName {
     <#
     .SYNOPSIS
-    The name a read-only Run Command runs under (F31, 2026-11-22): a fresh one each time, -RunCommandName and
-    -yyyyMMddHHmmss (Get-DemoRunCommandFreshName), or -RunCommandName itself when the VM has no room for another. Internal.
+    The name a Run Command runs under (F31, 2026-11-22): a fresh one each time, -RunCommandName and -yyyyMMddHHmmss
+    (Get-DemoRunCommandFreshName), or -RunCommandName itself when the VM has no room for another. For a read
+    (Invoke-DemoVmRunCommand -FreshName) and, since the review of F31, a script that changes something (-FreshAction).
+    Internal.
 
     .DESCRIPTION
     Live on archost01 (2026-11-20 and 21), a health read under its one fixed name stayed Pending with no start for 444 to
@@ -326,10 +328,12 @@ function Get-DemoRunCommandReadName {
     a Run Command of that name that comes back with sequence number 0 ("Current sequence number, 0, is not greater than ...
     MostRecentSequenceNumberFinished 0"). A delete that didn't reach it as a disable, or a create seconds after a delete,
     left the name that way until the next delete. A new name has no such state (the RCA export's unique names never showed
-    it). One read of the VM's Run Commands comes first:
+    it), whatever the script does. One read of the VM's Run Commands comes first:
     - Earlier copies of the name whose owner has stopped waiting for them (their time is more than -OwnerWaitSeconds
       old), and the name itself left by an earlier version, are asked to go without waiting (Remove-DemoRunCommand -NoWait),
-      so copies whose delete Azure didn't finish never pile up. A younger copy is another read in progress, and stays.
+      so copies whose delete Azure didn't finish never pile up. A younger copy is another run in progress, and stays. With
+      -LeaveFixedName (an action), the name itself is left to the caller, which waits for its delete, as before: it can be
+      an earlier version's run, or the template's loader (DbHubDemo-Bootstrap), whose script mustn't run beside this one.
     - Azure allows 25 managed Run Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview)
       and doesn't say whether one being deleted counts, so every one listed counts: at -Limit (24) or more, it runs under
       -RunCommandName, as before. When the list can't be read, the fresh name is used, and its PUT says so if the VM is full.
@@ -358,6 +362,8 @@ function Get-DemoRunCommandReadName {
         [ValidateRange(1, 25)]
         [int] $Limit = 24,
 
+        [switch] $LeaveFixedName,
+
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
@@ -384,8 +390,8 @@ function Get-DemoRunCommandReadName {
         $abandoned = $false
         if ($itemName -ceq $RunCommandName) {
             # The fixed name an earlier version used, which nothing of this version runs under: its leftover goes, as that
-            # version's own next read deleted it first.
-            $abandoned = $provisioning -ne 'Deleting'
+            # version's own next run deleted it first. An action's caller deletes it itself, and waits (-LeaveFixedName).
+            $abandoned = -not $LeaveFixedName -and $provisioning -ne 'Deleting'
         }
         elseif ($itemName -match $copyPattern) {
             $stamp = [DateTime]::MinValue
@@ -400,6 +406,54 @@ function Get-DemoRunCommandReadName {
         return $RunCommandName
     }
     return $fresh
+}
+
+function Get-DemoRunCommandCopyName {
+    <#
+    .SYNOPSIS
+    The newest copy of a Run Command under a fresh name (-RunCommandName and -yyyyMMddHHmmss, Get-DemoRunCommandRunName)
+    that one VM lists, by the time in its name, or '' when it lists none or the list can't be read: for a check that looked
+    for the fixed name of an action that now runs under fresh names (the review of F31). One read: Virtual Machine Run
+    Commands - List By Virtual Machine
+    (https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/list-by-virtual-machine). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion,
+
+        [Parameter(Mandatory)]
+        [string] $RunCommandName
+    )
+
+    $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AllowFailure
+    if ($list.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$list.StdOut)) {
+        return ''
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+    $values = Get-DemoMemberValue -InputObject ([string]$list.StdOut | ConvertFrom-Json -Depth 32) -Name 'value'
+    $copyPattern = '^{0}-\d{{14}}$' -f [regex]::Escape($RunCommandName)
+    $newest = ''
+    $newestTime = [DateTime]::MinValue
+    foreach ($item in @($values | Where-Object { $null -ne $_ })) {
+        $itemName = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+        if ($itemName -cnotmatch $copyPattern) {
+            continue
+        }
+        $time = Get-DemoRunCommandNameTime -Name $itemName
+        if ($null -ne $time -and $time -gt $newestTime) {
+            $newest = $itemName
+            $newestTime = $time
+        }
+    }
+    return $newest
 }
 
 function Test-DemoRunCommandFullError {
@@ -1461,7 +1515,7 @@ function Get-DemoRunCommandStatus {
         $control = @($left | Where-Object { $_.Kind -eq 'Control' }).Count
         $why = @(
             if ($control) { 'start-demo.ps1 deletes the on-demand control''s finished ones (DbHubControl-*) once the VMs run, and so does the control''s next run' }
-            if ($left.Count - $control) { 'the next run of the step that made a DbHubDemo-* one deletes it first' }
+            if ($left.Count - $control) { 'the next run of the step that made a DbHubDemo-* one deletes it first (one under a fresh name, DbHubDemo-<name>-<time>, once its own run has stopped waiting for it, an hour or more after its time)' }
         ) -join '; '
         $fix = 'Nothing is needed: {0}. To delete one now, while its VM runs: {1}{2}. Azure allows 25 managed Run Commands per VM.' -f $why, $commands[0], $(if ($commands.Count -gt 1) { ' (each command is in this result''s evidence)' } else { '' })
         return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('{0} managed Run Command(s) are left on the demo VMs: {1}.{2}' -f $left.Count, ($names -join ', '), $more) -Evidence $evidence -Remediation $fix -DocUrl $doc)

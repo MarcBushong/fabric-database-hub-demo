@@ -3256,6 +3256,21 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         @($result.evidence.deletingRecently).Count | Should -Be 2
     }
 
+    It 'status.ps1 counts an action''s finished copy under a fresh name as left over, not as the loader that stays by design, and leaves one that runs (the review of F31)' {
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $loaderCopy = 'DbHubDemo-Bootstrap-{0}' -f (& $at 90)
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $loaderCopy 'Succeeded'
+            New-RunCommand ('DbHubDemo-HostPassword-{0}' -f (& $at 1)) 'Running'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $true } }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be ('1 managed Run Command(s) are left on the demo VMs: sqlvm01/{0}.' -f $loaderCopy)
+        $result.remediation | Should -Match ([regex]::Escape('the next run of the step that made a DbHubDemo-* one deletes it first (one under a fresh name, DbHubDemo-<name>-<time>, once its own run has stopped waiting for it, an hour or more after its time)'))
+    }
+
     It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
         @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Succeeded'; Finished = $true }
         @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Canceled'; Finished = $true }

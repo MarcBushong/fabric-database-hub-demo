@@ -122,7 +122,7 @@ function Invoke-DemoBootstrapLoaderRun {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -StartTimeoutSeconds $StartTimeoutSeconds -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -StartTimeoutSeconds $StartTimeoutSeconds -FreshAction -Confirm:$false
     }
     catch {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} could not run: {1}' -f $VmName, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run deploy.ps1 -Resume; a conflict with an extension that a policy installs clears within minutes.' -DocUrl $docUrl)

@@ -83,6 +83,8 @@ function Invoke-DemoSignInDataAction {
         Parameter           = $values
         TimeoutSeconds      = $TimeoutSeconds
         PollIntervalSeconds = 15
+        # A fresh name each time: the VM's Run Command handler can skip a name it ran before (the review of F31).
+        FreshAction         = $true
         Confirm             = $false
     }
     if ($ResourceGroupName) {
@@ -391,7 +393,7 @@ function Invoke-DemoDiskWipeAction {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-DiskWipe' -Script $script -Parameter $values -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 30 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-DiskWipe' -Script $script -Parameter $values -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 30 -FreshAction -Confirm:$false
     }
     catch {
         return [pscustomobject]@{ Succeeded = $false; Data = $null; Error = (Protect-DemoText -Text $_.Exception.Message); Seconds = [int]$watch.Elapsed.TotalSeconds }

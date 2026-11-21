@@ -4833,3 +4833,49 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live.**
 - **A delete that's really stuck** shows 15 minutes after its Run Command's time, not at once. `deploy.ps1`'s own watchdog doesn't use this list.
+
+### The review of F31: fresh names for actions too (2026-11-22)
+
+**Why.** The review of F31 (c603bb03) approved fresh names for every `Invoke-DemoVmRunCommand` call that deletes its Run Command, actions included. The handler's skip comes from reusing a name whose last delete never reached it as a disable, whatever the script does, and an action created again right after its delete is the live pattern:
+
+- **`DbHubDemo-HostPassword`,** at least twice a session: a skipped set waited 600 seconds, then failed. At a stop, `STOP.HOSTPASSWORD` reported that the last session's password was still valid, so the guardrail missed; at a start, the presenter got no working password.
+- **The parallel tracks' loader, `DbHubDemo-Bootstrap`:** its retry created the name again seconds after deleting the skipped one, which ended in a stuck **Fail** and **NOT DONE**.
+- `DbHubDemo-ArcProbe`, `DbHubDemo-ArcOnboard`, and the occasional ones: `MonitoringRestart`, `DiskWipe`, `SignInData`, `Golden`, `GuidedSetup`, `SqlProductKey`, and `GuestRebuild`.
+
+**Work summary.**
+
+- **`Invoke-DemoVmRunCommand -FreshAction`:** the script runs under `<name>-yyyyMMddHHmmss` (`Get-DemoRunCommandRunName`, F31's `Get-DemoRunCommandReadName` renamed, with `-LeaveFixedName`). Otherwise as before:
+  - The fixed name's leftover, an earlier version's or the template's loader, is deleted first, and that delete waited for, at most `-LeftoverWaitSeconds`. A delete Azure doesn't finish gets a log line, since the fresh name doesn't need it.
+  - Its own delete is waited for, and copies whose run stopped waiting for them (an hour or more after their time) go with the next run of the same action.
+  - It's never sent twice: `-PendingRetrySeconds` is refused without `-FreshName`, and `-FreshName` with `-FreshAction`.
+  - At 24 Run Commands on the VM, it runs under its fixed name, as before.
+- **The callers:** the twelve actions pass `-FreshAction`, two through their splats, and the three reads keep `-FreshName`. A test parses the module and pins each call's kind, so a new caller has to choose.
+- **Kept:** `DbHubDemo-Profile` and the template's `DbHubDemo-Bootstrap`, which are updated in place, never deleted.
+- **By prefix:** `Wait-DemoBootstrapLoader` reads the newest `DbHubDemo-Bootstrap-<time>` when `DbHubDemo-Bootstrap` isn't there (`Get-DemoRunCommandCopyName`). That covers `INFRA.BOOTSTRAP.LOADER_<vm>`, validation's loader read, and the `-Sequential` Bootstraps stage. `STATUS.RUNCOMMANDS` already listed every `DbHubDemo-` copy by its prefix, and its fix now says when a fresh copy goes. Nothing else reads an action by its name: `destroy.ps1` deletes the resource group, `stop-demo.ps1` and `deploy.ps1` clean only the chunks, by their prefix, and `start-demo.ps1` and the session control's runbooks only the `DbHubControl-` ones.
+- **Existing deployments:** an update from bf010ed changes nothing on the VMs until an action runs. Its first run deletes the fixed-name leftover, waited for, then runs under its fresh name; a leftover of an action that doesn't run stays in `STATUS.RUNCOMMANDS`, as before.
+- **`DEPLOY.ARTIFACTS.STALL_SQLVM01`, checked: not this.** In fz, fn, fu, rb (twice), and ra, it came on a new `sqlvm01`, or, in rb's update, with a new bundle and runner. Either way the VM had never run those chunk names, and Azure was installing or finishing its SQL IaaS Agent and Defender for SQL extensions. A chunk set never deletes and creates a name again; chunk names repeat only when the same content goes to the same VM again, which this leaves as it is.
+- **Docs:** ADR 0012's second amendment, troubleshooting (the F31 log row, a row for the new log line, and the leftover row), the CHANGELOG's F31 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/Wait-DemoBootstrapLoader.ps1`, `Public/Set-DemoVmLocalPassword.ps1`, `Public/Invoke-DemoArcOnboarding.ps1`, `Public/Set-DemoArcSqlProductKey.ps1`, `Private/RunCommandHelpers.ps1`, `Private/TrackHelpers.ps1`, `Private/SqlVmMonitoringHelpers.ps1`, `Private/SignInDataHelpers.ps1`, `Private/GoldenHelpers.ps1`, `Private/GuidedStopHelpers.ps1`, `Private/T2GuestHelpers.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Arc, Bundle, Validation, Lifecycle, Tracks, OneCommand, OneClick, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, KeyVault, Progress, and FirstRun: 1,354 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped.
+- With HEAD's 12 source files and the tests kept, all 8 new tests fail:
+  - the action's fresh name, with the fixed leftover's delete and its own delete waited for;
+  - the copies' cleanup;
+  - the refused retry and the two switches;
+  - the test that pins each call's kind;
+  - the host's password at a stop, and the parallel tracks' loader, each while the handler skips its fixed name (a **Fail** at HEAD, a **Pass** now);
+  - the loader check reading the newest fresh copy;
+  - `STATUS.RUNCOMMANDS`'s fix.
+- PSScriptAnalyzer on the 15 changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live: this needs a live proof before it ships.** A proof, on a net-new deployment and on an update from bf010ed:
+  - `./scripts/start-demo.ps1` and `./scripts/stop-demo.ps1`, twice in a row: `START.HOSTPASSWORD` and `STOP.HOSTPASSWORD` pass, with no 600-second wait;
+  - `./scripts/deploy.ps1`: `INFRA.BOOTSTRAP.LOADER_*` pass, with `DbHubDemo-Bootstrap-<time>` in the log;
+  - then `./scripts/validate.ps1` and `./scripts/status.ps1`: the loader checks pass, and no copy is left once its delete finishes.
+- **An action at 24 Run Commands on its VM** runs under its fixed name, as before, and can still meet the skip.
+- **Chunk names** repeat when the same content goes to the same VM again; unchanged here.

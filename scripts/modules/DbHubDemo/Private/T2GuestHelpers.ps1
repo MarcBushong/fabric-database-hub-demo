@@ -209,7 +209,7 @@ function Request-DemoT2GuestRebuild {
     $run = $null
     $problem = ''
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuestRebuild' -Script $script -Parameter @{ RequestId = $id } -TimeoutSeconds 300 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuestRebuild' -Script $script -Parameter @{ RequestId = $id } -TimeoutSeconds 300 -FreshAction -Confirm:$false
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
