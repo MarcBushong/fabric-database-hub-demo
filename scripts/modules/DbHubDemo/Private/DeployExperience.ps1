@@ -158,7 +158,8 @@ function Get-DemoDeploymentExpectation {
     }
     $notes = @($Note | Where-Object { $_ })
     foreach ($item in $notes) {
-        # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText).
+        # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText), and since
+        # 2026-11-18 a sessionCeilingUsd of 15 that counts as 20 (Get-DemoSessionCeilingLegacyText).
         $lines.Add(('- {0}' -f $item))
     }
     if ($InstallMode -eq 'JumpstartImage') {
@@ -247,6 +248,16 @@ function Get-DemoNonBlockingItem {
                 howTo   = 'A Fabric administrator turns on Dataset Execute Queries REST API; then run ./scripts/configure-powerbi.ps1 -CheckModelData.'
             })
     }
+    # Ask, the Copilot chat in the Insights app (ADR 0028): a Warning when its relay isn't deployed or can't be reached.
+    $ask = Get-DemoAskSummary -Result $Result
+    if ($null -ne $ask -and [bool]$ask.Warning) {
+        $items.Add([ordered]@{
+                name    = 'the Copilot chat in the Insights app (Ask)'
+                state   = 'Warning'
+                message = $ask.Reason
+                howTo   = $ask.HowTo
+            })
+    }
     # deploy.ps1's history snapshot at the end of the run, when it didn't work (2026-11-06).
     $history = Get-DemoHistorySnapshotItem -Result $Result
     if ($null -ne $history) {
@@ -270,7 +281,7 @@ function Format-DemoNonBlockingLine {
         return ''
     }
     $state = [string](Get-DemoMemberValue -InputObject $Item -Name 'state')
-    if ($state -notin 'Failed', 'Action needed') {
+    if ($state -notin 'Failed', 'Action needed', 'Warning') {
         $state = 'Failed'
     }
     $name = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Item -Name 'name')
@@ -384,6 +395,41 @@ function Get-DemoInsightsAppSummary {
     return [pscustomobject]@{ State = 'Failed'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo); Deployed = $false; ConfirmOnly = $false; Failed = $true }
 }
 
+function Get-DemoAskSummary {
+    <#
+    .SYNOPSIS
+    Ask's outcome (the Copilot chat in the Insights app, ADR 0028) from the app step's ASK.* records: State for the
+    status page's Fabric.Ask row (Done, Action needed, or Skipped), Status, Reason, HowTo, StepMessage, and Warning
+    (true when it needs attention). $null without any ASK.* record. Ask never blocks DONE: its records are Pass,
+    Warning, or Not selected. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $records = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'ASK.*' })
+    if ($records.Count -eq 0) {
+        return $null
+    }
+    $warning = @($records | Where-Object { [string]$_.status -in 'Warning', 'Fail', 'Manual action required' }) | Select-Object -First 1
+    if ($null -ne $warning) {
+        $reason = ConvertTo-DemoPlainText -Value $warning.message
+        $howTo = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $warning -Name 'remediation')
+        return [pscustomobject]@{ State = 'Action needed'; Status = 'Warning'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo).Trim(); Warning = $true }
+    }
+    $relay = @($records | Where-Object { [string]$_.checkId -eq 'ASK.RELAY' }) | Select-Object -First 1
+    if ($null -ne $relay -and [string]$relay.status -eq 'Not selected') {
+        $reason = ConvertTo-DemoPlainText -Value $relay.message
+        return [pscustomobject]@{ State = 'Skipped'; Status = 'Not selected'; Reason = $reason; HowTo = ''; StepMessage = $reason; Warning = $false }
+    }
+    $health = @($records | Where-Object { [string]$_.checkId -eq 'ASK.RELAY.HEALTH' -and [string]$_.status -eq 'Pass' }) | Select-Object -First 1
+    $message = if ($null -ne $health) { 'Ready: open the Insights app, select Ask Copilot, and sign in with GitHub once. {0}' -f (ConvertTo-DemoPlainText -Value $health.message) } else { ConvertTo-DemoPlainText -Value $relay.message }
+    return [pscustomobject]@{ State = 'Done'; Status = 'Pass'; Reason = ''; HowTo = ''; StepMessage = $message; Warning = $false }
+}
+
 function Test-DemoNonBlockingResult {
     # True for a result that never blocks DONE (2026-11-05): the Insights app's (Test-DemoInsightsAppRecord; it's part of
     # every deployment, but DONE never waits for it), the history report's data check waiting for the Execute Queries
@@ -463,6 +509,8 @@ function Test-DemoConfirmOnlyResult {
       documented).
     - HUB.PRESENTER.*: with assignRoles false (the default, ADR 0008), an administrator grants the presenters' roles.
     - FABRIC.APP.BROWSER: the Insights app, deployed and confirmed once in the browser.
+    - HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one-time selection of T3 in Database Hub's Manage agents, which
+      no API offers or reads.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -489,7 +537,7 @@ function Test-DemoConfirmOnlyResult {
         $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
         return ([string](Get-DemoMemberValue -InputObject $evidence -Name 'state') -eq 'Active' -and [bool][string](Get-DemoMemberValue -InputObject $evidence -Name 'sku'))
     }
-    return ($id -like 'HUB.PRESENTER.*' -or $id -eq 'FABRIC.APP.BROWSER')
+    return ($id -like 'HUB.PRESENTER.*' -or $id -in 'FABRIC.APP.BROWSER', 'HUB.AGENT.T3')
 }
 
 function Get-DemoConfirmItem {
@@ -534,7 +582,7 @@ function Get-DemoConfirmItem {
     }
     foreach ($item in @($all | Where-Object { [string]$_.checkId -notin 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING', 'FABRIC.APP.BROWSER' -and (Test-DemoConfirmOnlyResult -Result $_) })) {
         $id = [string]$item.checkId
-        $text = if ($id -eq 'FABRIC.P5.CAPACITY') { [string](Get-DemoMemberValue -InputObject $item -Name 'remediation') } else { '{0} The commands are in its result ({1}).' -f ([string]$item.message).TrimEnd(), $id }
+        $text = if ($id -eq 'FABRIC.P5.CAPACITY') { [string](Get-DemoMemberValue -InputObject $item -Name 'remediation') } elseif ($id -eq 'HUB.AGENT.T3') { [string]$item.message } else { '{0} The commands are in its result ({1}).' -f ([string]$item.message).TrimEnd(), $id }
         & $add $id $id $text
     }
     $app = Get-DemoInsightsAppSummary -Result $all
@@ -768,6 +816,58 @@ function Get-DemoBillingNote {
     return ('Running and billing, because this run started or created {0}: {1}. {2} stops {0} now{3}.{4}' -f $them, (& $join $names), $stop, $shutdown, $(if ($leftText) { ' ' + $leftText } else { '' }))
 }
 
+function Get-DemoOwnerGrantNote {
+    <#
+    .SYNOPSIS
+    The first note of DONE and NOT DONE when the person who ran deploy.ps1 couldn't assign the roles (2026-11-19, S7):
+    an Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once, which grants the nightly safety stop's and
+    the session control's roles together, and what waits for it, from this run's SAFETYSTOP.ROLE, CONTROL.ROLE.*, and
+    DEPLOY.T5.LIFECYCLE results. Returns Text, SessionWaits (Run all waits for the control's roles), and StopCovered (Text
+    says the safety stop's role waits for the grant, so DONE leaves the safety stop's own note out); Text is empty when
+    nothing waits for that grant. A safety stop role that's assigned but out of date (R910) isn't counted: the stop still
+    stops T4, and the safety stop's own note says what it can't do (the review of dd5aee1). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $grantPattern = '\./scripts/grant-safety-stop\.ps1(?: -ConfigPath [^\s;]+)?'
+    $needsGrant = { param($Item) [string]$Item.status -in 'Warning', 'Fail', 'Manual action required' -and [string](Get-DemoMemberValue -InputObject $Item -Name 'remediation') -match $grantPattern }
+    # Assigned but out of date (R910: another environment's older deploy.ps1 wrote the shared role back): it isn't missing.
+    $assigned = { param($Item) [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Item -Name 'evidence') -Name 'assigned') }
+    $stopRole = @($all | Where-Object { [string]$_.checkId -eq 'SAFETYSTOP.ROLE' } | Select-Object -Last 1 | Where-Object { (& $needsGrant $_) -and -not (& $assigned $_) })
+    $controlRoles = @($all | Where-Object { [string]$_.checkId -like 'CONTROL.ROLE.*' -and (& $needsGrant $_) })
+    if ($stopRole.Count -eq 0 -and $controlRoles.Count -eq 0) {
+        return [pscustomobject]@{ Text = ''; SessionWaits = $false; StopCovered = $false }
+    }
+    $command = if ($stopRole.Count) { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $stopRole[0] -Name 'evidence') -Name 'command') } else { '' }
+    if (-not $command) {
+        $source = @($stopRole) + @($controlRoles) | Select-Object -First 1
+        $command = ([regex]::Match([string](Get-DemoMemberValue -InputObject $source -Name 'remediation'), $grantPattern).Value).TrimEnd('.')
+    }
+    if (-not $command) {
+        $command = Get-DemoSafetyStopCommand
+    }
+    $waits = [System.Collections.Generic.List[string]]::new()
+    if ($controlRoles.Count) {
+        $waits.Add('Run all can''t run a whole session (from a PC, ./scripts/start-demo.ps1 works)')
+    }
+    if ($stopRole.Count) {
+        $waits.Add('nothing stops T4 when Azure starts it again 7 days after a stop')
+    }
+    $t5 = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T5.LIFECYCLE' }) | Select-Object -Last 1
+    if ($null -ne $t5 -and [string]$t5.status -eq 'Warning') {
+        $waits.Add('T5''s container stays between sessions, so its throughput bills all month')
+    }
+    $list = if ($waits.Count -le 2) { $waits -join ' and ' } else { '{0}, and {1}' -f ($waits[0..($waits.Count - 2)] -join ', '), $waits[-1] }
+    $text = 'First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, {1}.' -f $command, $list
+    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$controlRoles.Count; StopCovered = [bool]$stopRole.Count }
+}
+
 function Get-DemoT4OffReason {
     <#
     Why T4 isn't deployed, or '' when it is (brief item 16). Since 2026-11-09 (user-directed: "making sure postgres is
@@ -829,9 +929,10 @@ function Get-DemoDoneRequirement {
     <#
     .SYNOPSIS
     The checks DONE needs to pass (brief item 16; the same list stops ADR 0018's clock): Database Hub's own views of
-    every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T4's read replica in Estate and in Azure
+    every target. HUB.ESTATE.T1 to T5; TELEMETRY.T1, T2, and T3; METRICS.T4; T4's read replica in Estate and in Azure
     Monitor (HUB.ESTATE.T4.REPLICA and METRICS.T4.REPLICA, 2026-11-13, ADR 0025; Not supported meets them on a Burstable
-    T4); T2.ARC.SQLINSTANCE (Standard with PAYG or
+    T4); METRICS.T5 (2026-11-18, ADR 0027: T5's requests and normalized RU in Azure Monitor; T5's are left out when the
+    configuration turns T5 off, -SkipT5); T2.ARC.SQLINSTANCE (Standard with PAYG or
     Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
     inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
     history model and report). T4's are always in (2026-11-09, user-directed: T4 isn't optional); Developer mode (opt-in)
@@ -844,11 +945,14 @@ function Get-DemoDoneRequirement {
         [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
         [string] $InstallMode = 'JumpstartImage',
 
-        [switch] $SkipFabric
+        [switch] $SkipFabric,
+
+        # T5 turned off in the configuration (t5Enabled false; ADR 0027): its estate and metrics aren't required.
+        [switch] $SkipT5
     )
 
     $ids = [System.Collections.Generic.List[string]]::new()
-    foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+    foreach ($target in @('T1', 'T2', 'T3', 'T4') + @(if (-not $SkipT5) { 'T5' })) {
         $ids.Add(('HUB.ESTATE.{0}' -f $target))
     }
     $ids.Add('TELEMETRY.T1')
@@ -859,6 +963,10 @@ function Get-DemoDoneRequirement {
     $ids.Add('METRICS.T4')
     $ids.Add('HUB.ESTATE.T4.REPLICA')
     $ids.Add('METRICS.T4.REPLICA')
+    if (-not $SkipT5) {
+        # T5, the Cosmos DB account (2026-11-18, ADR 0027): Azure Monitor has its requests and normalized RU.
+        $ids.Add('METRICS.T5')
+    }
     if ($InstallMode -ne 'Developer') {
         $ids.Add('T2.ARC.SQLINSTANCE')
         $ids.Add('T2.ARC.MONITORING')
@@ -1330,6 +1438,13 @@ function Invoke-DemoDoneGate {
         $t4 = Get-DemoT4State -Config $Config
         $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4.Names.ServerId -State $t4.State -WaitMinutes $TelemetryWaitMinutes))
     }
+    if ('METRICS.T5' -in $missing) {
+        # T5 (ADR 0027): its metrics come while T1's activity sends it requests.
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -State 'Running' -Message 'Reading T5''s normalized RU, requests, and 429s in Azure Monitor.'
+        $t5Metrics = Test-DemoT5MetricFlow -Config $Config -AccountId ([string](Get-DemoT5Name -Config $Config).AccountId) -WaitMinutes $TelemetryWaitMinutes
+        $results.Add($t5Metrics)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -Status ([string]$t5Metrics.status) -Message ([string]$t5Metrics.message)
+    }
     if ('METRICS.T4.REPLICA' -in $missing -or 'HUB.ESTATE.T4.REPLICA' -in $missing) {
         # T4's read replica (ADR 0025) exists only during a session: a run that didn't create it (a resumed run's
         # validation, after stop-demo.ps1 deleted it) creates it now, as the T4 track does, then reads it.
@@ -1486,7 +1601,13 @@ function Get-DemoDeploymentOutcome {
 
         # The size change's notice (2026-11-09; Format-DemoT4SizeChangeText): what was tried and refused, what was deployed,
         # and both monthly estimates, which the caller made, so this stays pure.
-        [string] $T4Notice = ''
+        [string] $T4Notice = '',
+
+        # What an earlier run of this deployment found that this run didn't check again (F10, 2026-11-19;
+        # Get-DemoCarriedRunResult): listed with this run's results under "Please confirm", in what didn't work, and in
+        # DONE's mention of the Insights app, never judged.
+        [AllowEmptyCollection()]
+        [object[]] $CarriedResult = @()
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1495,12 +1616,19 @@ function Get-DemoDeploymentOutcome {
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.
     $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) })
-    $nonBlocking = @(Get-DemoNonBlockingItem -Result $all)
-    $confirm = @(Get-DemoConfirmItem -Result $all)
+    # Shown, not judged (F10): an earlier run's results first, so this run's read of the Hub tenant setting is the latest.
+    $shown = @(@($CarriedResult | Where-Object { $null -ne $_ }) + @($all))
+    $nonBlocking = @(Get-DemoNonBlockingItem -Result $shown)
+    $confirm = @(Get-DemoConfirmItem -Result $shown)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $t4Off = Get-DemoT4OffReason -Config $Config -State $State -Result $all
     $notes = [System.Collections.Generic.List[string]]::new()
+    # What waits for an Owner (2026-11-19, S7): the one thing a Contributor's run asks first, before every other note.
+    $grant = Get-DemoOwnerGrantNote -Result $all
+    if ($grant.Text) {
+        $notes.Add($grant.Text)
+    }
     if ($t4Off) {
         $notes.Add($t4Off)
     }
@@ -1516,9 +1644,13 @@ function Get-DemoDeploymentOutcome {
     if ($t4CreateCost) {
         $notes.Add($t4CreateCost)
     }
-    # The nightly safety stop (ADR 0024), said plainly when this run set it up only in part, such as without its role.
+    # The nightly safety stop (ADR 0024), said plainly when this run set it up only in part, such as without its role. Only
+    # its role waiting for the Owner's grant is the grant's note above (StopCovered), so it isn't said twice; a role that's
+    # assigned but out of date, or that waits for something else, keeps this note (the review of dd5aee1).
     $safetyStop = Get-DemoSafetyStopNote -Result $all
-    if ($safetyStop) {
+    $stopProblems = @($all | Where-Object { [string]$_.checkId -like 'SAFETYSTOP.*' -and [string]$_.status -in 'Warning', 'Fail', 'Manual action required' })
+    $onlyRole = $stopProblems.Count -eq 1 -and [string]$stopProblems[0].checkId -eq 'SAFETYSTOP.ROLE'
+    if ($safetyStop -and -not ($grant.StopCovered -and $onlyRole)) {
         $notes.Add($safetyStop)
     }
     # The busy marker (2026-11-14): the nightly stop waited for this run, and when the demo stops tonight.
@@ -1536,8 +1668,8 @@ function Get-DemoDeploymentOutcome {
     if ($controlNote) {
         $notes.Add($controlNote)
     }
-    # The session control (ADR 0026): where Run all is, or what it still needs and who does it.
-    $sessionControl = Get-DemoControlDeployNote -Result $all
+    # The session control (ADR 0026): where Run all is, or what it still needs; who grants its roles is the first note.
+    $sessionControl = Get-DemoControlDeployNote -Result $all -OmitGrant:([bool]$grant.Text)
     if ($sessionControl) {
         $notes.Add($sessionControl)
     }
@@ -1562,9 +1694,16 @@ function Get-DemoDeploymentOutcome {
         $notes.Add($guestNote)
     }
     if ($installMode -eq 'Developer') {
-        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')
+        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data. JumpstartImage (the default) or ProductKey mode gives it.')
     }
-    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
+    # Where Run all is (DEPLOY.CONTROL's place), for DONE's line about each session.
+    $controlResult = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.CONTROL' }) | Select-Object -Last 1
+    $controlEvidence = if ($null -ne $controlResult) { Get-DemoMemberValue -InputObject $controlResult -Name 'evidence' } else { $null }
+    $sessionPlace = if ([bool](Get-DemoMemberValue -InputObject $controlEvidence -Name 'ready')) { [string](Get-DemoMemberValue -InputObject $controlEvidence -Name 'place') } else { '' }
+    # Whether that line can name Run all: not when this run skipped the control's Fabric part (-SkipFabric), or when
+    # DEPLOY.CONTROL says the notebook isn't ready; then it names the scripts only (the review of dd5aee1).
+    $sessionReady = -not $SkipFabric -and ($null -eq $controlResult -or [bool](Get-DemoMemberValue -InputObject $controlEvidence -Name 'ready'))
+    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume; SessionPlace = $sessionPlace; SessionReady = $sessionReady; SessionWaitsForGrant = [bool]$grant.SessionWaits }
     if ($WhatIfRun) {
         $outcome.Kind = 'WhatIf'
         $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 0 }
@@ -1587,8 +1726,12 @@ function Get-DemoDeploymentOutcome {
     $leftover = Get-DemoGuidedStopLeftover -State $State
     $stopCommand = Get-DemoStopDemoCommand -Command $Command
     $leftoverNext = 'Run {0}: it removes Bastion and rotates the host password, and leaves the VMs running. Then run {1} again.' -f $stopCommand, $Command
-    # T4 is part of every deployment (2026-11-09): its track is always expected.
-    $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry'; T4 = 'Telemetry' }
+    # T4 is part of every deployment (2026-11-09): its track is always expected. Each track's last step from its step list
+    # (T1's is T5Telemetry since 2026-11-18, ADR 0027).
+    $expected = [ordered]@{}
+    foreach ($track in 'T1', 'T2', 'T4') {
+        $expected[$track] = [string]@((Get-DemoTrackStep -Track $track).Keys)[-1]
+    }
     if (-not $SkipFabric) {
         $expected['Fabric'] = 'Fabric'
     }
@@ -1622,19 +1765,26 @@ function Get-DemoDeploymentOutcome {
         }
     }
     $outcome.Unfinished = $unfinished.ToArray()
-    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric)
+    # T5 left out by this run because Azure didn't create its account (DEPLOY.T5; review, 2026-11-19): DONE doesn't wait
+    # for its checks, though the configuration has it on.
+    $t5On = (Test-DemoT5Enabled -Config $Config) -and -not (Test-DemoT5LeftOut -Result @($all))
+    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:(-not $t5On))
     $outcome.Missing = @($evidence.Missing)
     if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter -and -not $leftover) {
         $outcome.Kind = 'Done'
         $outcome.Done = $true
         $outcome.ExitCode = 0
         $outcome.NextCommand = ''
-        $targets = 'T1, T2, T3, and T4'
+        $targets = if ($t5On) { 'T1, T2, T3, T4, and T5' } else { 'T1, T2, T3, and T4' }
         $performance = if ($installMode -eq 'Developer') { 'performance telemetry from T1 and T3' } else { 'performance telemetry from T1, T2, and T3' }
         $metrics = if (@($core | Where-Object { [string]$_.checkId -eq 'METRICS.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) { ' and T4''s Azure Monitor metrics, with its read replica''s Read replica lag' } else { ' and T4''s Azure Monitor metrics' }
+        if ($t5On) {
+            $metrics += ', and T5''s (Azure Cosmos DB: normalized RU, requests, and throttled 429s)'
+        }
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
-        # The Insights app, part of every deployment, when this run's records show it deployed and working.
-        $app = Get-DemoInsightsAppSummary -Result $all
+        # The Insights app, part of every deployment, when this run's records, or an earlier run's that this one didn't check
+        # again (F10), show it deployed and working.
+        $app = Get-DemoInsightsAppSummary -Result $shown
         $appText = if ($null -ne $app -and [bool]$app.Deployed -and -not [bool]$app.Failed) { ' the history report, and the Insights app' } else { ' and the history report' }
         $fabricText = if ($SkipFabric) { ' Fabric was skipped (-SkipFabric).' } else { ' Fabric has the workspace, the lakehouse, the notebooks, the Real-Time Dashboard,{0}.' -f $appText }
         $outcome.Reason = 'Database Hub shows every target: {0} in Estate, with {1}{2}.{3}{4}' -f $targets, $performance, $metrics, $t2, $fabricText
@@ -1760,14 +1910,27 @@ function Get-DemoDeploymentOutcomeLine {
                     $lines.Add(('- {0}' -f (ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $item -Name 'text'))))
                 }
             }
-            $lines.Add(('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.{0}' -f $(if ($WorkspaceName) { ' The Real-Time Dashboard and the history report are in the workspace "{0}".' -f $WorkspaceName } else { '' })))
+            $lines.Add(('Where to look: open Database Hub in the Fabric portal, look at Estate and Performance, and investigate what you see with Copilot in Database Hub.{0}' -f $(if ($WorkspaceName) { ' The Real-Time Dashboard and the history report are in the workspace "{0}".' -f $WorkspaceName } else { '' })))
             # What runs now, and how to choose the other profile (2026-11-03): the incidents fill the Performance page.
             $activityLine = [string](Get-DemoMemberValue -InputObject $Outcome -Name 'Activity')
             if ($activityLine) {
                 $lines.Add($activityLine)
             }
-            $lines.Add('Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
-            $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip T2''s build.')
+            # Each session is one Run all (2026-11-19, ADR 0026); the scripts stay the way from a PC. While the session
+            # control's roles wait for an Owner (the first note), Run all waits too; while its notebook isn't ready (this run
+            # skipped Fabric, or the control's note says what it needs), only the scripts are named (the review of dd5aee1).
+            $place = [string](Get-DemoMemberValue -InputObject $Outcome -Name 'SessionPlace')
+            $runAll = 'open NB_DatabaseHub_Control{0} and select Run all: it starts everything, runs the showcase, and stops it all at the end' -f $(if ($place) { ' in ' + $place } else { '' })
+            $sessionReady = Get-DemoMemberValue -InputObject $Outcome -Name 'SessionReady'
+            if ($null -ne $sessionReady -and -not [bool]$sessionReady) {
+                $lines.Add('Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
+            }
+            elseif ([bool](Get-DemoMemberValue -InputObject $Outcome -Name 'SessionWaitsForGrant')) {
+                $lines.Add(('Each session, once that grant is done: {0}. Until then, from a PC: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.' -f $runAll))
+            }
+            else {
+                $lines.Add(('Each session: {0}. From a PC instead: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.' -f $runAll))
+            }
         }
         'WhatIf' {
             foreach ($line in (Get-DemoBannerLine -Title 'WHAT IF: NOTHING WAS DEPLOYED')) { $lines.Add($line) }

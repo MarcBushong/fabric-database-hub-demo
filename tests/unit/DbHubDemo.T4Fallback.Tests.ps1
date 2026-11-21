@@ -99,6 +99,11 @@ BeforeAll {
         $script:server = $null
         $script:cost = New-TestCost
         $script:freeOfferFails = $false
+        $script:t5FreeRefused = $false
+        # Azure's error when it refuses T5's free tier: the internal subscription's (live 2026-11-18) unless set.
+        $script:t5RefusalText = ''
+        # Azure's error when it doesn't create T5's account at all (review, 2026-11-19), for every attempt that sends T5.
+        $script:t5CreateFails = ''
         $script:createsServer = ''
         $script:elsewhere = @{}
         $script:refusesExisting = $false
@@ -182,8 +187,25 @@ BeforeAll {
                 if ($script:createsServer -and $script:currentSize -ceq $script:createsServer -and $null -eq $script:server) {
                     $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = $script:currentSize } }
                 }
-                if ($script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']) {
+                # Azure's error names every resource that failed in the attempt: T3's free offer refused (Microsoft Q&A's
+                # real text), T5's free tier refused, or both in one error.
+                $t3Refused = $script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']
+                $t5Refused = $script:t5FreeRefused -and $script:deployCalls[-1]['parameters'].Contains('t5FreeTier') -and $script:deployCalls[-1]['parameters']['t5FreeTier']['value']
+                if ($t3Refused -and $t5Refused) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]},{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]}]}}')
+                }
+                if ($t3Refused) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ProvisioningDisabled) Cannot update paid database to free database.')
+                }
+                if ($script:t5CreateFails -and $script:deployCalls[-1]['parameters'].Contains('t5Enabled') -and $script:deployCalls[-1]['parameters']['t5Enabled']['value']) {
+                    return (New-AzResult -ExitCode 1 -StdErr $script:t5CreateFails)
+                }
+                # T5's free tier refused, in the live error's shape (2026-11-18, an internal subscription).
+                if ($t5Refused) {
+                    if ($script:t5RefusalText) {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:t5RefusalText)
+                    }
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}]}}')
                 }
                 # Azure refuses a size only when it creates the server; an existing one isn't created again.
                 $code = [string]$script:codes[$script:currentSize]
@@ -249,6 +271,38 @@ Describe 'Guardrail 1: only SkuNotAvailable is a refusal' {
         else {
             $failure | Should -BeNullOrEmpty
         }
+    }
+}
+
+Describe 'The group''s tags, read again right before each attempt (the re-review of the stop at the end of an update, 2026-11-19)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+    }
+
+    It 'sends a tag that another command wrote between attempts, such as start-demo.ps1''s DbHubStartDemoUtc, and keeps the T4 record this run set' {
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
+        # Azure's tags, a new hashtable at each read, as az group show gives them: start-demo.ps1 writes its start once the
+        # first attempt is sent, and the group's T4 record lags behind what this run set.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith {
+            $read = @{}
+            foreach ($key in $script:groupTags.Keys) {
+                $read[$key] = $script:groupTags[$key]
+            }
+            if ($script:deployCalls.Count -ge 1) {
+                $read['DbHubStartDemoUtc'] = '2026-11-19T18:05:00Z'
+                $read['DbHubT4Size'] = 'Standard_D4ds_v5'
+            }
+            $read
+        }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $script:deployCalls[0].parameters.budgetTags.value.Contains('DbHubStartDemoUtc') | Should -BeFalse
+        $sent = $script:deployCalls[1].parameters.budgetTags.value
+        $sent.Contains('DbHubStartDemoUtc') | Should -BeTrue -Because 'a group''s PUT replaces all its tags, so one the template doesn''t send is lost'
+        # The parameters file goes through JSON, which reads an ISO 8601 text as a date.
+        ([datetime]$sent['DbHubStartDemoUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-11-19T18:05:00Z'
+        $sent['DbHubT4Size'] | Should -Be 'Standard_D4ads_v5'
     }
 }
 
@@ -394,7 +448,7 @@ Describe 'Guardrail 1: only SkuNotAvailable for both 4-vCore sizes moves T4 to i
 Describe 'Guardrail 2: priced from the Retail Prices API before anything is created, and created anyway over a ceiling, with a Warning (2026-11-09)' {
     It 'allows the fallback only with a compute price, the worst-case month within monthlyCeilingUsd, and a session within sessionCeilingUsd' {
         $verdict = { param($Estimate, $Config) InModuleScope DbHubDemo -Parameters @{ Estimate = $Estimate; Config = $Config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config } }
-        # Its numbers are set against a 250 USD ceiling (the default is 375 since 2026-11-04).
+        # Its numbers are set against a 250 USD ceiling (the default is 415 for a new configuration since 2026-11-19).
         function New-TestConfig { $c = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json'); $c['monthlyCeilingUsd'] = 250; $c }
         $within = & $verdict (New-TestEstimate) (New-TestConfig)
         $within.Allowed | Should -BeTrue
@@ -406,7 +460,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $within.T4MonthlyWorstCaseUsd | Should -Be (20.0 + 0.5 * 730)
         $within.SessionUsd | Should -Be 8.0
         $within.MonthlyCeilingUsd | Should -Be 250
-        $within.SessionCeilingUsd | Should -Be 15
+        $within.SessionCeilingUsd | Should -Be 20 -Because 'the default since 2026-11-18'
 
         $month = & $verdict (New-TestEstimate -LightUse 200) (New-TestConfig)
         $month.Allowed | Should -BeFalse
@@ -416,7 +470,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $raised['monthlyCeilingUsd'] = 400
         (& $verdict (New-TestEstimate -LightUse 200) $raised).Allowed | Should -BeTrue -Because 'a ceiling raised on purpose allows it'
 
-        (& $verdict (New-TestEstimate -Session 16.2) (New-TestConfig)).SkipReason | Should -Be 'SessionCeiling'
+        (& $verdict (New-TestEstimate -Session 21.2) (New-TestConfig)).SkipReason | Should -Be 'SessionCeiling'
         (& $verdict (New-TestEstimate -NoCompute) (New-TestConfig)).SkipReason | Should -Be 'Price'
         (& $verdict $null (New-TestConfig)).SkipReason | Should -Be 'Price'
     }
@@ -1831,12 +1885,290 @@ Describe 'Get-DemoT4State and its callers: a server Azure is deleting isn''t T4 
         # A stopped server keeps its text and fix.
         $stopped = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); ServerId = $serverId } { Test-DemoT4MetricFlow -Config $Config -ServerId $ServerId -State 'Stopped' }
         $stopped.message | Should -Be 'T4 is Stopped, so it sends no fresh metrics.'
-        $stopped.remediation | Should -Match '^start-demo\.ps1 starts it'
+        $stopped.remediation | Should -Match '^\./scripts/start-demo\.ps1 or the control notebook''s Run all starts it'
 
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; Enabled = $true }; Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = $null; Error = '' } }
         $enable = Enable-DemoT4Workload -Config (New-TestConfig) -DeploymentId 'abc123' -Confirm:$false
         $enable.checkId | Should -Be 'WORKLOAD.T4.ENABLE'
         $enable.status | Should -Be 'Fail'
         $enable.message | Should -Be 'T4 (pgflex01-abc123) wasn''t found: Azure is deleting it (Dropping)'
+    }
+}
+
+Describe 'T5''s free tier, refused by Azure: deployed again without it, once, with one Warning (live 2026-11-18)' {
+    # Live, in an internal subscription: "Free tier is not supported for Internal subscriptions". The template failed at
+    # cosmos01, the run deployed it again without the free tier, and both DEPLOY.T5.FREETIER results were kept, the Pass
+    # that Resolve-DemoT5FreeTier gave and the refusal's Warning, which also blamed another account.
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:t5FreeRefused = $true
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5FreeTier -MockWith {
+            [pscustomobject]@{ UseFreeTier = $true; Exists = $false; Holder = ''; Reason = 'Free'; Result = (New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'No account in the subscription has the free tier, so T5 is created with it.') }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+    }
+
+    It 'sends the template again with t5FreeTier false, and keeps one DEPLOY.T5.FREETIER, a Warning with Azure''s reason' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1 -Because 'the refusal replaces the Pass that was given before the template'
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'Free tier is not supported for Internal subscriptions'
+        $free[0].message | Should -Not -Match 'is taken'
+    }
+
+    It 'doesn''t retry a second time when the second template fails too' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:elsewhere['Standard_D4ds_v5'] = 'InternalServerError'
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeFalse
+        $script:deployCalls.Count | Should -Be 2
+    }
+}
+
+Describe 'Azure refusing T5''s free tier never moves T3 off its free offer (review, 2026-11-19)' {
+    # The independent review of T5 (2026-11-19): Resolve-DemoT3FreeOfferError's "free tier" matched Cosmos DB's refusals,
+    # and T3's check ran first, so a refused T5 moved T3 off its free offer. Every live test subscription is internal (its
+    # quotaId keeps T5 off the free tier) and no test T3 has the free offer, so these tests, with Azure's own texts and the
+    # real Resolve-DemoT5FreeTier, are what validates the path.
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:t5FreeRefused = $true
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:t5Exists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $script:t5Exists; State = $(if ($script:t5Exists) { 'Succeeded' } else { 'NotFound' }); FreeTier = $false; Account = $null; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { $script:quotaId }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5FreeTierHolder -MockWith { [pscustomobject]@{ Succeeded = $true; Accounts = @(); Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        function Invoke-FreeOfferTemplate([System.Collections.IDictionary] $Config) {
+            Invoke-DemoTemplateDeployment -Config $Config -NetworkMode private -T3UseFreeLimit $true
+        }
+        $script:alreadyApplied = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]}]}}'
+    }
+
+    It 'an update keeps an existing free T3 on its offer when Azure refuses the free tier of the T5 it adds ("Free tier has already been applied")' {
+        # The harness's environment exists (its resource group, tags, and VMs): an update from main that adds T5.
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5RefusalText = $script:alreadyApplied
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue -Because 'useFreeLimit false would move the existing free T3 to paid for good'
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'already been applied to another Azure Cosmos DB account'
+    }
+
+    It 'a new deployment creates T3 on its offer when Azure refuses T5''s free tier' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $false }
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5RefusalText = $script:alreadyApplied
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER'))[0].status | Should -Be 'Warning'
+    }
+
+    It 'an unreadable quotaId asks for T5''s free tier, and T3 keeps its offer when Azure refuses it ("Free tier is not supported for Internal subscriptions")' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:quotaId = ''
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeTrue -Because 'an unreadable quotaId still asks for it; the refusal is the backstop'
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue -Because 'Cosmos DB''s "Free tier is not supported" isn''t T3''s'
+        }
+        $deployment.T3UseFreeLimit | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER') | Should -BeNullOrEmpty
+        $free = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER')
+        $free.Count | Should -Be 1
+        $free[0].status | Should -Be 'Warning'
+        $free[0].message | Should -Match 'Free tier is not supported for Internal subscriptions'
+    }
+
+    It 'still moves T3 off its offer on Azure SQL''s own refusal, and keeps T5''s free tier then' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5FreeRefused = $false
+        $script:freeOfferFails = $true
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[1]['parameters']['t3UseFreeLimit']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeTrue
+        $deployment.T3UseFreeLimit | Should -BeFalse
+        (@($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER'))[0].message | Should -Match 'Cannot update paid database to free database'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER'))[0].status | Should -Be 'Pass'
+    }
+
+    It 'handles T5''s refusal and then T3''s own, each once, when Azure refuses both' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:freeOfferFails = $true
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 3
+        $script:deployCalls[1]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
+        $script:deployCalls[2]['parameters']['t3UseFreeLimit']['value'] | Should -BeFalse
+        @($deployment.Results | Where-Object checkId -EQ 'T3.FREEOFFER').Count | Should -Be 1
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER').Count | Should -Be 1
+    }
+
+    It 'never asks for T5''s free tier in an internal subscription, so T3 is never at risk there' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:quotaId = 'Internal_2014-09-01'
+        $deployment = Invoke-FreeOfferTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 1
+        $script:deployCalls[0]['parameters']['t5FreeTier']['value'] | Should -BeFalse
+        $script:deployCalls[0]['parameters']['t3UseFreeLimit']['value'] | Should -BeTrue
+    }
+}
+
+Describe 'A failure in T5 alone leaves T5 out of the run, once, instead of ending it NOT DONE (review, 2026-11-19)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        $script:t5Exists = $false
+        $script:failure = $null
+        $script:t5Records = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $script:t5Exists; State = $(if ($script:t5Exists) { 'Succeeded' } else { 'NotFound' }); FreeTier = $false; Account = $null; Error = '' } }
+        # An internal subscription: T5 never asks for the free tier there, as in every live test.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { 'Internal_2014-09-01' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentFailure -MockWith { $script:failure }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+            if ($Value.Contains('T5Refused')) {
+                $script:t5Records.Add([string]$Value['T5Refused'])
+            }
+            else {
+                $script:recorded.Add([string]$Value['T4Sku'])
+                $script:recordedRefused.Add([string]$Value['T4Refused'])
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $script:regionText = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed."}}'
+        function New-T5Cause([object[]] $Errors) {
+            [pscustomobject]@{ Errors = @($Errors); Text = (@($Errors | ForEach-Object { '{0} {1}: {2}: {3}' -f $_.ResourceType, $_.ResourceName, $_.Code, $_.Message }) -join '; ') }
+        }
+        $script:accountError = [pscustomobject]@{ ResourceType = 'Microsoft.DocumentDB/databaseAccounts'; ResourceName = 'cosmos01-abc123'; Code = 'ServiceUnavailable'; Message = 'Sorry, we are currently experiencing high demand in West US 3 region, and cannot fulfill your request at this time.' }
+    }
+
+    It 'deploys again once without T5, records it, and says why with the fix, when only T5''s resources failed' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5CreateFails = $script:regionText
+        $script:failure = New-T5Cause @($script:accountError, [pscustomobject]@{ ResourceType = 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups'; ResourceName = 'pe-dbhub-demo-cosmos01/default'; Code = 'Canceled'; Message = 'Operation was canceled.' })
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5Enabled']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5Enabled']['value'] | Should -BeFalse
+        $deployment.T5Enabled | Should -BeFalse
+        $deployment.T5LeftOut | Should -Match 'cosmos01-abc123: ServiceUnavailable: Sorry, we are currently experiencing high demand'
+        $leftOut = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5')
+        $leftOut.Count | Should -Be 1
+        $leftOut[0].status | Should -Be 'Warning'
+        $leftOut[0].evidence['leftOut'] | Should -BeTrue
+        $leftOut[0].message | Should -Match 'high demand in West US 3'
+        $leftOut[0].remediation | Should -Match '"t5Enabled": false'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.FREETIER') | Should -BeNullOrEmpty -Because 'T5 isn''t deployed this run'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE'))[0].status | Should -Be 'Pass'
+        $script:t5Records.Count | Should -Be 1
+        $script:t5Records[0] | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        # Read back from the parameters file, ConvertFrom-Json gives the time as a DateTime.
+        $carried = $script:deployCalls[1]['parameters']['budgetTags']['value']['DbHubT5Refused']
+        ([DateTime]$carried).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $script:t5Records[0] -Because 'the template carries the record, which it would otherwise overwrite'
+    }
+
+    It 'reads a policy''s refusal before the deployment ran, for T5''s account alone' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5CreateFails = 'ERROR: {"error":{"code":"InvalidTemplateDeployment","message":"The template deployment failed because of policy violation.","details":[{"code":"RequestDisallowedByPolicy","target":"cosmos01-abc123","message":"Resource ''cosmos01-abc123'' was disallowed by policy. Policy identifiers: ''[{\"policyAssignment\":{\"name\":\"Deny Cosmos DB\"}}]''."}]}}'
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $deployment.T5LeftOut | Should -Match 'RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123'
+    }
+
+    It 'fails as before when anything else failed too' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5CreateFails = $script:regionText
+        $script:failure = New-T5Cause @($script:accountError, [pscustomobject]@{ ResourceType = 'Microsoft.Consumption/budgets'; ResourceName = 'budget-dbhub-demo'; Code = '400'; Message = 'Start date of budgets cannot be updated.' })
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeFalse
+        $script:deployCalls.Count | Should -Be 1
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5') | Should -BeNullOrEmpty
+        $script:t5Records.Count | Should -Be 0
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE'))[0].remediation | Should -Not -Match 't5Enabled'
+    }
+
+    It 'never leaves out an account that existed before this run, and its fix says how to deploy without T5' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5Exists = $true
+        $script:t5CreateFails = $script:regionText
+        $script:failure = New-T5Cause @($script:accountError)
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeFalse
+        $script:deployCalls.Count | Should -Be 1
+        $deployment.T5Enabled | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5') | Should -BeNullOrEmpty
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE'))[0].remediation | Should -Match 'Every failed operation is T5''s \(Azure Cosmos DB\): to deploy the rest without T5, set "t5Enabled": false'
+    }
+
+    It 'clears an earlier run''s record when this run''s template creates T5' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:groupTags = @{ deploymentId = 'abc123'; DbHubT5Refused = '2026-11-19T05:00:00Z' }
+        $deployment = Invoke-TestTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T5Enabled | Should -BeTrue
+        $deployment.T5LeftOut | Should -Be ''
+        $script:t5Records | Should -Be @('')
     }
 }

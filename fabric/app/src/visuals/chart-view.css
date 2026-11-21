@@ -1,0 +1,350 @@
+/* ChartView: the app's chart language. Colors come from the theme's tokens (Fluent 2 CSS variables inside the
+   FluentProvider), with light defaults here; series and targets use the --chart-* and --target-* palette. */
+
+:root {
+    --chart-1: #0f6cbd;
+    --chart-2: #038387;
+    --chart-3: #8764b8;
+    --chart-4: #ca5010;
+    --chart-5: #498205;
+    --chart-6: #c239b3;
+    --chart-7: #986f0b;
+    --chart-8: #4f6bed;
+    --target-t1: var(--chart-1);
+    --target-t2: var(--chart-2);
+    --target-t3: var(--chart-3);
+    --target-t4: var(--chart-4);
+    --target-t4r: var(--chart-7);
+    --target-t5: var(--chart-5);
+    --chart-band: rgba(196, 49, 75, 0.1);
+    --chart-band-ink: #b10e1c;
+}
+
+[data-theme="dark"],
+[data-theme="aurora"] {
+    --chart-1: #479ef5;
+    --chart-2: #4bc5c7;
+    --chart-3: #b696e1;
+    --chart-4: #f7894a;
+    --chart-5: #8fd14f;
+    --chart-6: #e879d9;
+    --chart-7: #e8b83a;
+    --chart-8: #93a4f4;
+    --chart-band: rgba(255, 120, 120, 0.14);
+    --chart-band-ink: #ff9a9a;
+}
+
+[data-theme="contrast"] {
+    --chart-1: #ffff00;
+    --chart-2: #00ffff;
+    --chart-3: #ff99ff;
+    --chart-4: #ffb366;
+    --chart-5: #3ff23f;
+    --chart-6: #ffffff;
+    --chart-7: #c0c0ff;
+    --chart-8: #ff7b7b;
+    --chart-band: rgba(255, 255, 0, 0.18);
+    --chart-band-ink: #ffff00;
+}
+
+.chart {
+    margin: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: var(--colorNeutralForeground1, #242424);
+}
+
+.chart-head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.chart-title {
+    font-weight: 600;
+    font-size: var(--fontSizeBase300, 14px);
+}
+
+.chart-subtitle,
+.chart-note,
+.chart-empty {
+    font-size: var(--fontSizeBase200, 12px);
+    color: var(--colorNeutralForeground3, #616161);
+}
+
+.chart-empty {
+    padding: 24px 0;
+    text-align: center;
+}
+
+.chart-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.chart-plot {
+    position: relative;
+    width: 100%;
+    outline: none;
+    border-radius: var(--borderRadiusMedium, 4px);
+    touch-action: pan-y;
+}
+
+.chart-plot:focus-visible {
+    box-shadow: 0 0 0 2px var(--colorStrokeFocus2, #000000);
+}
+
+.chart-svg {
+    display: block;
+    overflow: visible;
+}
+
+.chart-svg text {
+    font-family: inherit;
+    font-size: 11px;
+    fill: var(--colorNeutralForeground3, #616161);
+}
+
+.chart-grid line {
+    stroke: var(--colorNeutralStroke2, #e0e0e0);
+    stroke-width: 1;
+}
+
+.chart-axis {
+    stroke: var(--colorNeutralStroke1, #d1d1d1);
+}
+
+.chart-line {
+    fill: none;
+    stroke-width: 2;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
+
+.chart-area {
+    fill-opacity: 0.16;
+    stroke: none;
+}
+
+.chart-dot {
+    fill-opacity: 0.75;
+}
+
+.chart-bar {
+    shape-rendering: crispEdges;
+}
+
+.chart-band rect {
+    fill: var(--chart-band);
+}
+
+.chart-band text {
+    fill: var(--chart-band-ink);
+    font-weight: 600;
+}
+
+.chart-band-neutral rect {
+    fill: var(--colorNeutralBackground3, rgba(0, 0, 0, 0.05));
+}
+
+.chart-threshold line {
+    stroke-dasharray: 4 4;
+    stroke-width: 1.5;
+}
+
+.chart-threshold-warning line {
+    stroke: var(--colorStatusWarningForeground1, #bc4b09);
+}
+
+.chart-threshold-warning text {
+    fill: var(--colorStatusWarningForeground1, #bc4b09);
+}
+
+.chart-threshold-danger line {
+    stroke: var(--colorStatusDangerForeground1, #b10e1c);
+}
+
+.chart-threshold-danger text {
+    fill: var(--colorStatusDangerForeground1, #b10e1c);
+}
+
+.chart-threshold-neutral line {
+    stroke: var(--colorNeutralStroke1, #d1d1d1);
+}
+
+.chart-marker circle {
+    fill: var(--colorNeutralBackground1, #ffffff);
+    stroke: var(--colorNeutralForeground1, #242424);
+    stroke-width: 2;
+}
+
+.chart-marker text {
+    fill: var(--colorNeutralForeground1, #242424);
+    font-weight: 600;
+}
+
+.chart-cursor line {
+    stroke: var(--colorNeutralStrokeAccessible, #616161);
+    stroke-dasharray: 2 3;
+}
+
+.chart-cursor rect {
+    fill: var(--colorSubtleBackgroundHover, rgba(0, 0, 0, 0.05));
+}
+
+.chart-cursor circle {
+    stroke: var(--colorNeutralBackground1, #ffffff);
+    stroke-width: 2;
+}
+
+.chart-tooltip {
+    position: absolute;
+    top: 6px;
+    z-index: 2;
+    display: grid;
+    gap: 3px;
+    min-width: 150px;
+    max-width: 260px;
+    padding: 8px 10px;
+    border-radius: var(--borderRadiusMedium, 4px);
+    background: var(--colorNeutralBackground1, #ffffff);
+    color: var(--colorNeutralForeground1, #242424);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    box-shadow: var(--shadow8, 0 4px 8px rgba(0, 0, 0, 0.14));
+    font-size: 12px;
+    pointer-events: none;
+}
+
+.chart-tooltip span {
+    display: grid;
+    grid-template-columns: 10px 1fr auto;
+    align-items: center;
+    gap: 6px;
+}
+
+.chart-tooltip i,
+.chart-legend i {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+}
+
+.chart-legend i.dashed {
+    height: 3px;
+    border-radius: 0;
+}
+
+.chart-tooltip b {
+    font-variant-numeric: tabular-nums;
+}
+
+.chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+}
+
+.chart-legend button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border: none;
+    border-radius: var(--borderRadiusSmall, 2px);
+    background: transparent;
+    color: var(--colorNeutralForeground2, #424242);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.chart-legend button[aria-pressed="false"] {
+    color: var(--colorNeutralForegroundDisabled, #bdbdbd);
+    text-decoration: line-through;
+}
+
+.chart-legend button[aria-pressed="false"] i {
+    opacity: 0.35;
+}
+
+.chart-legend button:focus-visible {
+    outline: 2px solid var(--colorStrokeFocus2, #000000);
+}
+
+.chart-kpis {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+    gap: 8px;
+}
+
+.chart-kpi {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    border-radius: var(--borderRadiusMedium, 4px);
+    background: var(--colorNeutralBackground2, #fafafa);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.chart-kpi-label {
+    font-size: 12px;
+    color: var(--colorNeutralForeground3, #616161);
+}
+
+.chart-kpi-value {
+    font-size: 20px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.chart-table-wrap {
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border-radius: var(--borderRadiusMedium, 4px);
+}
+
+.chart-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.chart-table th {
+    position: sticky;
+    top: 0;
+    background: var(--colorNeutralBackground2, #fafafa);
+    text-align: left;
+    padding: 0;
+    border-bottom: 1px solid var(--colorNeutralStroke1, #d1d1d1);
+}
+
+.chart-table th button {
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+}
+
+.chart-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--colorNeutralStroke3, #f0f0f0);
+}
+
+.chart-table td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}

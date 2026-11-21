@@ -112,6 +112,11 @@ $script:DemoResourceTypes = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/administrators'
     'Microsoft.DBforPostgreSQL/flexibleServers/databases'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations'
+    # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB for NoSQL account, its database and container, and T1's data-plane role.
+    'Microsoft.DocumentDB/databaseAccounts'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers'
+    'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments'
     'Microsoft.DevTestLab/schedules'
     'Microsoft.Consumption/budgets'
     'Microsoft.Authorization/locks'
@@ -129,6 +134,10 @@ $script:DemoResourceTypes = @(
     'Microsoft.Authorization/roleDefinitions'
     'Microsoft.Authorization/roleAssignments'
 )
+
+# T5's types (ADR 0027): the policy checks leave them out when t5Enabled is false (Get-DemoResourceTypeList; review,
+# 2026-11-19), so a policy that denies Azure Cosmos DB doesn't stop a configuration that turned T5 off for exactly that.
+$script:DemoT5ResourceTypes = @($script:DemoResourceTypes | Where-Object { $_ -like 'Microsoft.DocumentDB/*' })
 
 # Redaction rules, applied after exact-match replacement of registered secrets.
 $script:RedactionRules = @(

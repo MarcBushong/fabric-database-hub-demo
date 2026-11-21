@@ -90,7 +90,7 @@ Preflight reads the Azure Policy assignments that apply to the subscription, rea
 | `PREFLIGHT.POLICY.SQLPUBLIC` | A policy that turns off or denies public network access on SQL servers, and the effective `networkMode` (evidence `effectiveNetworkMode`) | Pass; Fail for an explicit `public`; Warning when the inventory is incomplete |
 | `PREFLIGHT.POLICY.SQLENTRAONLY` | A deny on SQL servers without Entra-only authentication. T3 is Entra-only by design (ADR 0009). | Pass |
 | `PREFLIGHT.POLICY.VMSIZE` | The profile's VM sizes against VM size deny rules, ignoring case, with unblocked profiles as alternatives | Pass, or Fail |
-| `PREFLIGHT.POLICY.RESOURCETYPES` | Every resource type the demo creates, including those created at run time, against type deny rules | Pass, or Fail |
+| `PREFLIGHT.POLICY.RESOURCETYPES` | Every resource type the demo creates, including those created at run time, against type deny rules; without T5's Azure Cosmos DB types when `t5Enabled` is false, and a denial of T5's types alone says to set it false (ADR 0027) | Pass, or Fail |
 | `PREFLIGHT.POLICY.DEFENDER` | Policies that deploy Defender plans; the cost estimate includes them | Warning |
 | `PREFLIGHT.POLICY.EXTENSIONS` | Policies that add VM or Arc machine extensions, and where; bootstraps must retry on Conflict | Warning |
 | `PREFLIGHT.POLICY.PUBLICIP` | Append or modify rules on public IP addresses, such as IP tags on Bastion's public IP | Warning |
@@ -190,7 +190,7 @@ Run by `scripts/configure-fabric.ps1` and, for P11, by `preflight.ps1` too. They
 | `FABRIC.DASHBOARD.TILE.<PAGE>.<TILE>` | `Test-DemoRealTimeDashboardData`, after a passing import and read-back, alone with `-CheckDashboardData`, or as a deploy step: one tile's KQL, read-only, against the telemetry endpoint for the last 24 hours, with the dashboard's parameters bound as the dashboard binds them and a Kusto token for the configured subscription's account. On an empty tile, a probe of its own source (its table, filters, and window) and the VMs' power states and T3's status | Pass with rows and every column the tile shows; Warning when the tile and its source are empty (the message names the VMs that aren't running right now, which Phase 20's end-to-end run checks again), or when the endpoint was throttled or unavailable after retries; Fail when the source has rows but the tile is empty, a shown column is missing, or the endpoint rejected the query, the token, or the access |
 | `FABRIC.DASHBOARD.DATA` | The tile check's summary: the window, the counts, and the targets' states when a tile was empty | The worst tile status; Fail without a validated Azure CLI context (nothing is sent); Not selected under `-WhatIf`, after a failed guard, or when the import or read-back didn't pass |
 
-How Fabric draws a tile isn't checked: no documented API renders one, so the checks cover the definition (the read-back) and the data (the tiles' own queries). A dark theme is **Not supported**: the dashboard schema has no theme property. Database Hub's template wizard (row 34) has no API, so nothing checks it.
+How Fabric draws a tile isn't checked: no documented API renders one, so the checks cover the definition (the read-back) and the data (the tiles' own queries). A dark theme is **Not supported**: the dashboard schema has no theme property. Database Hub's template wizard has no API ([automation support matrix](../automation-support-matrix.md)), so nothing checks it.
 
 ### Phase 20: parallel deploy and golden snapshot checks (2026-10-22)
 

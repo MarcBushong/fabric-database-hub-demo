@@ -13,6 +13,16 @@ function Resolve-DemoFabricAppItem {
     - realTimeDashboard: the dashboard's page; the Fabric portal path for a Real-Time Dashboard isn't documented on
       Learn, TODO(verify), and the workspace link is the fallback.
     - report: the report's page (the same path the Power BI REST API returns as webUrl).
+    - controlNotebook: NB_DatabaseHub_Control's page (2026-11-18), for the app's Manage page: in the demo workspace (the
+      control's folder, with a public vault) or in the control workspace, found by its name (a private vault). The
+      portal path for a notebook isn't documented on Learn, TODO(verify); without it, Manage copies requests and doesn't
+      open the notebook.
+    - t2MigrationAssessment: with -Config, T2's SQL Server instance enabled by Azure Arc in the Azure portal (2026-11-18),
+      built from the instance resource's own ID (one read-only ARM list, Get-DemoT2Migration); the app's
+      migration card links to it when Database Hub isn't read live, and names the path, Migration, Assessments.
+    With -Config, the evidence's t2Migration is that instance's migration assessment as Azure has it now, from the same
+    read (R924): its readiness per Azure SQL target and the recommended tier and size, which the app's migration card
+    shows, with its time, when Database Hub's live view isn't available to the app.
     Every link carries ?ctid=<tenant>, so it opens in the demo's tenant. The evidence goes only to the Git-ignored
     out/ folder and the stage's public/dbhub-app.json, never to Git.
     No single model with the name is Manual action required (run configure-powerbi.ps1); a missing dashboard or
@@ -26,6 +36,10 @@ function Resolve-DemoFabricAppItem {
 
     .PARAMETER Token
     A Fabric REST API token, as a SecureString.
+
+    .PARAMETER Config
+    The demo's configuration, for the control's Fabric workspace (control.fabricWorkspaceName, or its default), where a
+    private vault's control notebook is; without it, only the demo workspace is searched for the notebook.
 
     .EXAMPLE
     Resolve-DemoFabricAppItem -WorkspaceId $ws -TenantId $tenant -Token $token
@@ -42,7 +56,9 @@ function Resolve-DemoFabricAppItem {
         [string] $TenantId,
 
         [Parameter(Mandatory)]
-        [securestring] $Token
+        [securestring] $Token,
+
+        [System.Collections.IDictionary] $Config
     )
 
     $settings = Get-DemoFabricAppSetting
@@ -81,7 +97,46 @@ function Resolve-DemoFabricAppItem {
     if ($reportId) {
         $links['report'] = '{0}/groups/{1}/reports/{2}{3}' -f $portal, $workspace, $reportId.ToLowerInvariant(), $ctid
     }
-    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; links = $links }
+    # The control notebook, for Manage (2026-11-18): the demo workspace's control folder (a public vault), else the
+    # control workspace (a private vault). Not finding it changes nothing but the link.
+    $controlWorkspaceId = ''
+    $controlNotebookId = ''
+    $notebook = Find-DemoFabricItem -WorkspaceId $WorkspaceId -DisplayName 'NB_DatabaseHub_Control' -Type 'Notebook' -Token $fabricToken
+    if ($notebook.StatusCode -eq 200 -and @($notebook.Items).Count -eq 1) {
+        $controlWorkspaceId = $WorkspaceId
+        $controlNotebookId = [string](Get-DemoMemberValue -InputObject @($notebook.Items)[0] -Name 'id')
+    }
+    elseif ($Config) {
+        $ControlWorkspaceName = (Get-DemoActivityControlSetting -Config $Config).FabricWorkspaceName
+        $workspaces = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces' -f $script:FabricApiBaseUri) -Token $fabricToken
+        $control = @($workspaces.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'displayName') -ceq $ControlWorkspaceName }) | Select-Object -First 1
+        $controlId = if ($null -ne $control) { [string](Get-DemoMemberValue -InputObject $control -Name 'id') } else { '' }
+        if ($controlId -match '^[0-9a-fA-F-]{36}$') {
+            $notebook = Find-DemoFabricItem -WorkspaceId $controlId -DisplayName 'NB_DatabaseHub_Control' -Type 'Notebook' -Token $fabricToken
+            if ($notebook.StatusCode -eq 200 -and @($notebook.Items).Count -eq 1) {
+                $controlWorkspaceId = $controlId
+                $controlNotebookId = [string](Get-DemoMemberValue -InputObject @($notebook.Items)[0] -Name 'id')
+            }
+        }
+    }
+    if ($controlNotebookId -match '^[0-9a-fA-F-]{36}$') {
+        $links['controlNotebook'] = '{0}/groups/{1}/synapsenotebooks/{2}{3}' -f $portal, $controlWorkspaceId.ToLowerInvariant(), $controlNotebookId.ToLowerInvariant(), $ctid
+    }
+    # T2's migration assessment in the Azure portal (2026-11-18), for the app's migration card when Database Hub isn't
+    # read live: from the Arc SQL Server instance's own resource ID. Without it, the card names the portal path. From the
+    # same read, the assessment's verdict as Azure has it now (R924), which the card shows, with its time, instead.
+    $t2Migration = $null
+    if ($Config) {
+        $migration = Get-DemoT2Migration -Config $Config
+        if ($migration.Link) {
+            $links['t2MigrationAssessment'] = $migration.Link
+        }
+        $t2Migration = $migration.Verdict
+    }
+    $evidence = [ordered]@{ semanticModelId = $modelId; dashboardId = $dashboardId; reportId = $reportId; controlWorkspaceId = $controlWorkspaceId; controlNotebookId = $controlNotebookId; links = $links }
+    if ($null -ne $t2Migration) {
+        $evidence['t2Migration'] = $t2Migration
+    }
     if ($problems.Count -gt 0) {
         $evidence['problems'] = @($problems)
     }
@@ -91,7 +146,7 @@ function Resolve-DemoFabricAppItem {
     }
     $missing = @(@(if (-not $dashboardId) { $settings['dashboardName'] }; if (-not $reportId) { $settings['reportName'] }) | Where-Object { $_ })
     if ($missing.Count -gt 0) {
-        return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Found {0}; not found: {1}, so the app''s Live links page explains how to add them.' -f $settings['semanticModelName'], ($missing -join ', ')) -Evidence $evidence -Remediation 'Run ./scripts/configure-fabric.ps1 -ImportDashboard and ./scripts/configure-powerbi.ps1, then run this script again.' -DocUrl $docUrl
+        return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Found {0}; not found: {1}, so the app''s Live views page explains how to add them.' -f $settings['semanticModelName'], ($missing -join ', ')) -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1: its Fabric track imports the dashboard and the history model, then the app.' -DocUrl $docUrl
     }
     return New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('Found {0}, {1}, and {2}; the app links to them in a new tab.' -f $settings['semanticModelName'], $settings['dashboardName'], $settings['reportName']) -Evidence $evidence -DocUrl $docUrl
 }

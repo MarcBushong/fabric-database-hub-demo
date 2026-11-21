@@ -27,11 +27,11 @@ Exit code: 1 when a result is Fail, or Manual action required with -TreatManualA
 Demo configuration (default: config/demo.config.json).
 
 .PARAMETER Area
-Areas to run: Preflight, Infrastructure, T1, T2, T3, T4, Hub, Telemetry, Workload, Cost, Security, Teardown.
-All of them by default.
+Areas to run: Preflight, Infrastructure, T1, T2, T3, T4, T5, Hub, Telemetry, Workload, Cost, Security, Teardown.
+All of them by default. T5 (2026-11-18, ADR 0027) is the Azure Cosmos DB account.
 
 .PARAMETER Target
-Targets whose checks run: T1, T2, T3, T4 (default: all).
+Targets whose checks run: T1, T2, T3, T4, T5 (default: all).
 
 .PARAMETER WaitMinutes
 How long the telemetry checks keep polling for fresh rows (data appears 3 to 15 minutes after a target
@@ -74,11 +74,11 @@ policy assignments that apply to the subscription are unchanged (default 168; 0 
 param(
     [string] $ConfigPath = (Join-Path -Path $PSScriptRoot -ChildPath '../config/demo.config.json'),
 
-    [ValidateSet('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')]
-    [string[]] $Area = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown'),
+    [ValidateSet('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')]
+    [string[]] $Area = @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown'),
 
-    [ValidateSet('T1', 'T2', 'T3', 'T4')]
-    [string[]] $Target = @('T1', 'T2', 'T3', 'T4'),
+    [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
+    [string[]] $Target = @('T1', 'T2', 'T3', 'T4', 'T5'),
 
     [ValidateRange(0, 120)]
     [int] $WaitMinutes = 0,

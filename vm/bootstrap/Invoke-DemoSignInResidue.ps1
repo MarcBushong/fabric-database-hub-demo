@@ -4,9 +4,10 @@ Finds and removes sign-in data left on a demo VM and in the T2 guest, and verifi
 (ADR 0009). It reports counts and locations only, never a value.
 
 .DESCRIPTION
-Windows PowerShell 5.1, ASCII-only, self-contained: it uses no function from the installed bootstrap
+Windows PowerShell 5.1, ASCII-only, self-contained: it needs no function from the installed bootstrap
 bundle, so the orchestrator can send it in a managed Run Command to any VM (sqlvm01, archost01, or the
-evaluation-only arcsql01), including a host restored from a golden snapshot with an older bundle. The host
+evaluation-only arcsql01), including a host restored from a golden snapshot with an older bundle; only a
+guest sweep's recovery (below) uses the bundle's, when the bundle has it. The host
 bootstrap and the evaluation-only bootstrap dot-source it for their sign-in cleanup step; dot-sourcing only
 defines the functions.
 
@@ -55,6 +56,21 @@ PowerShell and Application logs. A managed identity's or an application's token 
 Clean, but doesn't fail the result. A token-shaped value in the Security log is counted apart
 (securityLogTokens), because only an operator clears that log.
 
+The host's own sweep (the host bootstrap's GuestSignInCleanup step, which runs right after Arc onboarding) and this
+script never sweep the guest at the same time (live, 2026-11-19: this one's guest sweep failed to connect while the
+host's GuestSignInCleanup checked the guest after a first onboarding). With ResidueLockMinutes, a Guest or Both sweep
+first takes the host bootstrap's own lock (bootstrap.lock in ResidueStateRoot, which every bootstrap run holds from its
+start to its end): it waits while a run holds it, and a run that starts meanwhile exits and runs again 5 minutes later.
+When the lock isn't free within ResidueLockMinutes, nothing is swept, and the result says so (lock.timedOut; fail closed).
+
+A guest sweep that fails while the guest runs runs again, up to three more times after pauses of 10, 30, and 60
+seconds. When the host's installed bootstrap bundle has issue #65's recovery (vm/hyperv-guest/GuestVm.ps1): a broken
+PowerShell Direct channel is probed three times, 10 seconds apart, and when it stays broken the guest is restarted once
+for the caller's run (RecoveryKey; Invoke-DemoGuestRecovery), and a guest that isn't running is waited for up to 5
+minutes, never started. The result then has guestRecovery: what broke, what was done, and how many times the sweep ran.
+A guest sweep that still fails is reported with PowerShell Direct's own error (guest.error); a file that disappears while
+the sweep runs is skipped, as it holds nothing any more.
+
 Sources (checked 2026-10-27):
 - Managed Run Command passes parameters to a Windows script as arguments:
   https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed
@@ -96,6 +112,14 @@ The T2 guest's Hyper-V name.
 
 .PARAMETER ResidueStateRoot
 The demo's state folder on the host, where the guest's administrator password is kept (DPAPI).
+
+.PARAMETER ResidueLockMinutes
+With Scope Guest or Both: how many minutes to wait for the host bootstrap's lock (bootstrap.lock in ResidueStateRoot)
+before the sweep, so it never runs beside the host's own sign-in cleanup. '0' (the default) doesn't take it.
+
+.PARAMETER RecoveryKey
+The caller's run (deploy.ps1's run), so a broken PowerShell Direct channel restarts the guest at most once for it;
+without it, at most once an hour.
 #>
 [CmdletBinding()]
 param(
@@ -105,7 +129,9 @@ param(
     [string] $ClearEventLogs = 'true',
     [string] $ClearSecurityLog = 'false',
     [string] $GuestVmName = 'arcsql01',
-    [string] $ResidueStateRoot = 'C:\ProgramData\DbHubDemo'
+    [string] $ResidueStateRoot = 'C:\ProgramData\DbHubDemo',
+    [string] $ResidueLockMinutes = '0',
+    [string] $RecoveryKey = ''
 )
 
 Set-StrictMode -Version Latest
@@ -776,9 +802,15 @@ public static class DbHubDemoSweepLsa
     }
 
     function Clear-SweepFile {
-        # Replaces the token-shaped values in one file, keeping its encoding. True when it changed.
+        # Replaces the token-shaped values in one file, keeping its encoding. True when it changed. A file that's gone by
+        # now holds nothing: it's skipped without an error, which over PowerShell Direct would end the whole sweep on the
+        # host (live, 2026-11-19); the scan after the cleanup says what's left.
         param([string] $Path)
-        $read = Read-SweepFile -File (Get-Item -LiteralPath $Path -Force)
+        $file = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $file) {
+            return $false
+        }
+        $read = Read-SweepFile -File $file
         if ($read.Status -ne 'Text') {
             return $false
         }
@@ -933,7 +965,7 @@ function ConvertTo-DemoSignInSummary {
     }
     if (-not $reachable -or -not $Sweep.PSObject.Properties['found']) {
         $unreachable = [ordered]@{ reachable = $false; pass = $false }
-        foreach ($name in 'state', 'error') {
+        foreach ($name in 'state', 'error', 'firstError') {
             if ($Sweep.PSObject.Properties[$name]) {
                 $unreachable[$name] = [string]$Sweep.$name
             }
@@ -1020,13 +1052,108 @@ function Get-DemoSignInGuestCredential {
     return $credentials
 }
 
-function Invoke-DemoSignInGuestSweep {
+function Enter-DemoSignInBootstrapLock {
     <#
     .SYNOPSIS
-    Runs Invoke-DemoSignInSweep in the guest over PowerShell Direct, with the browser and broker caches.
-    Returns the guest's result, or a result with reachable false when the guest is off or doesn't answer.
+    Takes the host bootstrap's own lock, bootstrap.lock in Root, the way its runs do (Enter-DemoVmLock: an exclusive handle
+    that the operating system closes when the process ends), waiting up to Seconds while a bootstrap run holds it. A
+    bootstrap run that starts meanwhile exits and runs again 5 minutes later, so the host's own sign-in cleanup never sweeps
+    the guest beside this one (live, 2026-11-19). Returns Stream (the handle; $null without a state folder, where no
+    bootstrap runs, or when the lock wasn't free in time), Seconds (how long it waited), and TimedOut.
     #>
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Root,
+
+        [ValidateRange(1, 7200)]
+        [int] $Seconds = 1800,
+
+        [ValidateRange(1, 60)]
+        [int] $PollSeconds = 10
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        return [pscustomobject]@{ Stream = $null; Seconds = 0; TimedOut = $false }
+    }
+    $path = [System.IO.Path]::Combine($Root, 'bootstrap.lock')
+    while ($true) {
+        try {
+            $stream = New-Object -TypeName 'System.IO.FileStream' -ArgumentList @($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $text = [System.Text.Encoding]::ASCII.GetBytes(('pid={0} runId=sign-in-data startedUtc={1}' -f $PID, [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)))
+            $stream.SetLength(0)
+            $stream.Write($text, 0, $text.Length)
+            $stream.Flush()
+            return [pscustomobject]@{ Stream = $stream; Seconds = [int]$watch.Elapsed.TotalSeconds; TimedOut = $false }
+        }
+        catch {
+            $exception = $_.Exception
+            while ($null -ne $exception.InnerException -and $exception -isnot [System.IO.IOException]) {
+                $exception = $exception.InnerException
+            }
+            if ($exception -isnot [System.IO.IOException]) {
+                throw
+            }
+        }
+        $left = $Seconds - $watch.Elapsed.TotalSeconds
+        if ($left -le 0) {
+            return [pscustomobject]@{ Stream = $null; Seconds = [int]$watch.Elapsed.TotalSeconds; TimedOut = $true }
+        }
+        Start-Sleep -Milliseconds ([int]([System.Math]::Max(100, [System.Math]::Min($PollSeconds, $left) * 1000)))
+    }
+}
+
+function Get-DemoSignInBundleRoot {
+    # The host's installed bootstrap bundle (settings.json's bundlePath, which the loader writes) when it has the module and
+    # the guest helpers, or '' when it doesn't. Never throws.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Root
+    )
+
+    try {
+        $settingsPath = [System.IO.Path]::Combine($Root, 'settings.json')
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+            return ''
+        }
+        $settings = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+        $property = $settings.PSObject.Properties['bundlePath']
+        $bundlePath = ''
+        if ($null -ne $property) {
+            $bundlePath = [string]$property.Value
+        }
+        if (-not $bundlePath -or -not (Test-Path -LiteralPath ([System.IO.Path]::Combine($bundlePath, 'vm', 'bootstrap', 'DbHubDemo.Vm.psd1')) -PathType Leaf) -or -not (Test-Path -LiteralPath ([System.IO.Path]::Combine($bundlePath, 'vm', 'hyperv-guest', 'GuestVm.ps1')) -PathType Leaf)) {
+            return ''
+        }
+        return $bundlePath
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-DemoSignInRecoveryReady {
+    # Whether issue #65's recovery is loaded: the installed bundle's GuestVm.ps1 and DbHubDemo.Vm, since issue #65. An
+    # older bundle doesn't have it, and the sweep then only runs again after a pause.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    $names = @('Test-DemoGuestChannelBroken', 'Test-DemoGuestChannel', 'Test-DemoGuestOnline', 'Invoke-DemoGuestRecovery', 'Get-DemoGuestRecoveryKey', 'Complete-DemoGuestRecoveryInterrupted', 'Get-DemoVmUtcNow')
+    return (@($names | Where-Object { -not (Get-Command -Name $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+}
+
+function Invoke-DemoSignInGuestAttempt {
+    # One run of Invoke-DemoSignInSweep in the guest over PowerShell Direct, with each credential in turn. Returns Result
+    # (the guest's result, or $null when no credential got one) and Error: PowerShell Direct's error, with its error ID,
+    # which tells a broken channel from the other failures. It's the first credential's (the current one; the other is a
+    # password rotation's pending one), so a pending one's sign-in failure doesn't hide why the current one failed.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)]
         [string] $Name,
@@ -1041,34 +1168,280 @@ function Invoke-DemoSignInGuestSweep {
         [bool] $ClearSecurityLog = $false
     )
 
+    $errors = @()
+    foreach ($candidate in $Credential) {
+        $text = ''
+        try {
+            $result = Invoke-Command -VMName $Name -Credential $candidate -ScriptBlock ${function:Invoke-DemoSignInSweep} -ArgumentList $Clean, $true, $ClearEventLogs, $ClearSecurityLog -ErrorAction Stop
+            if ($null -ne $result) {
+                return [pscustomobject]@{ Result = $result; Error = '' }
+            }
+            $text = 'PowerShell Direct returned no result.'
+        }
+        catch {
+            $text = ([string]$_.Exception.Message).Trim()
+            $id = [string]$_.FullyQualifiedErrorId
+            if ($id -and $text -notmatch [regex]::Escape($id)) {
+                $text = '{0} ({1})' -f $text, $id
+            }
+        }
+        $errors += $text
+    }
+    $chosen = @($errors | Where-Object { $_ }) | Select-Object -First 1
+    return [pscustomobject]@{ Result = $null; Error = [string]$chosen }
+}
+
+function ConvertTo-DemoSignInRecoveryEvidence {
+    <#
+    .SYNOPSIS
+    The guest sweep's recovery for the Run Command's output, in the shape the Arc onboarding's has, which deploy.ps1 reports
+    as DEPLOY.T2.GUESTRETRY or DEPLOY.T2.GUESTRESTART: action, restarted, recovered (true only when the guest then answered
+    the sweep), tries (how many times the sweep ran), ranAgain, seconds, atUtc, restartUtc, stoppedBy, by, key, reason,
+    message, and guest. Without a restart, a sweep that then got its answer is a break that was over (Healed), whatever was
+    waited for; one that didn't keeps the recovery's decision (None, Exhausted, Busy) or is a Retry, which the sweep's own
+    result reports. Pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Recovery,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Guest,
+
+        [AllowEmptyString()]
+        [string] $Reason = '',
+
+        [bool] $Succeeded = $false,
+
+        [ValidateRange(0, 10)]
+        [int] $Tries = 0
+    )
+
+    $properties = $Recovery.PSObject.Properties
+    $read = {
+        param([string] $Property)
+        $item = $properties[$Property]
+        if ($null -ne $item) { $item.Value } else { $null }
+    }
+    $restarted = [bool](& $read 'Restarted')
+    $action = [string](& $read 'Action')
+    if (-not $restarted) {
+        if ($Succeeded) {
+            $action = 'Healed'
+        }
+        elseif ($action -notin 'None', 'Exhausted', 'Busy') {
+            $action = 'Retry'
+        }
+    }
+    $short = {
+        param([string] $Text)
+        $Text = [regex]::Replace([string]$Text, 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*', '[REDACTED]').Trim()
+        $Text.Substring(0, [System.Math]::Min(200, $Text.Length))
+    }
+    $why = [string](& $read 'Reason')
+    if (-not $why) {
+        $why = $Reason
+    }
+    $at = [string](& $read 'AtUtc')
+    if (-not $at) {
+        $at = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [ordered]@{
+        action     = $action
+        restarted  = $restarted
+        recovered  = [bool](& $read 'Recovered') -and $Succeeded
+        tries      = $Tries
+        ranAgain   = $Tries -gt 1
+        seconds    = [int](& $read 'Seconds')
+        atUtc      = $at
+        restartUtc = [string](& $read 'RestartUtc')
+        stoppedBy  = [string](& $read 'StoppedBy')
+        by         = [string](& $read 'By')
+        key        = [string](& $read 'Key')
+        reason     = & $short $why
+        message    = & $short ([string](& $read 'Message'))
+        guest      = $Guest
+    }
+}
+
+function Invoke-DemoSignInGuestSweep {
+    <#
+    .SYNOPSIS
+    Runs Invoke-DemoSignInSweep in the guest over PowerShell Direct, with the browser and broker caches.
+    Returns the guest's result, or a result with reachable false when the guest is off or doesn't answer.
+
+    .DESCRIPTION
+    A sweep that fails while the guest runs runs again, up to once for each of RetryDelaySeconds (10, 30, and 60 seconds:
+    about a minute and a half of pauses), so a session that failed within a second while another process opened its own
+    doesn't fail the check (live, 2026-11-19: a first onboarding's sweep failed to connect while the host's own sign-in
+    cleanup checked the guest). With Recover, the installed bundle's GuestVm.ps1 is loaded, and issue #65's recovery comes
+    first: a broken channel goes once to Invoke-DemoGuestRecovery, which probes the guest three times, 10 seconds apart,
+    and restarts it once for RecoveryKey when it stays broken; a guest that isn't running (another recovery restarts it)
+    is waited for up to OnlineMinutes, without being started; otherwise the next try comes after its pause. A guest that
+    an interrupted restart left off is started again first (Complete-DemoGuestRecoveryInterrupted, which leaves a guest
+    that a golden capture keeps off alone); nothing else here starts a guest that's off. Without Recover (an older bundle),
+    each try comes after its pause. The result then has guestRecovery (ConvertTo-DemoSignInRecoveryEvidence); one that
+    still fails has PowerShell Direct's error (error, and firstError when the first try's differed).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.PSCredential[]] $Credential,
+
+        [bool] $Clean = $false,
+
+        [bool] $ClearEventLogs = $true,
+
+        [bool] $ClearSecurityLog = $false,
+
+        [bool] $Recover = $false,
+
+        [AllowEmptyString()]
+        [string] $RecoveryKey = '',
+
+        [string] $StateRoot = 'C:\ProgramData\DbHubDemo',
+
+        [ValidateCount(0, 5)]
+        [ValidateRange(0, 600)]
+        [int[]] $RetryDelaySeconds = @(10, 30, 60),
+
+        [ValidateRange(1, 30)]
+        [int] $OnlineMinutes = 5
+    )
+
+    $by = 'the sign-in data cleanup'
+    $recovery = $null
+    $reason = ''
+    $tries = 0
     $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
+    if ($Recover -and $null -ne $vm -and [string]$vm.State -ne 'Running') {
+        $recovery = Complete-DemoGuestRecoveryInterrupted -Name $Name -Credential $Credential[0] -StateRoot $StateRoot -Confirm:$false
+        if ($null -ne $recovery) {
+            $reason = [string]$recovery.Reason
+            $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
+        }
+    }
     if ($null -eq $vm -or [string]$vm.State -ne 'Running') {
         $state = 'Missing'
         if ($vm) {
             $state = [string]$vm.State
         }
-        return [pscustomobject]@{ reachable = $false; state = $state; pass = $false }
-    }
-    $lastError = ''
-    foreach ($candidate in $Credential) {
-        try {
-            $result = Invoke-Command -VMName $Name -Credential $candidate -ScriptBlock ${function:Invoke-DemoSignInSweep} -ArgumentList $Clean, $true, $ClearEventLogs, $ClearSecurityLog -ErrorAction Stop
-            $result | Add-Member -NotePropertyName 'reachable' -NotePropertyValue $true -Force
-            $result | Add-Member -NotePropertyName 'state' -NotePropertyValue 'Running' -Force
-            return $result
+        $off = [pscustomobject]@{ reachable = $false; state = $state; pass = $false }
+        if ($null -ne $recovery) {
+            $off | Add-Member -NotePropertyName 'guestRecovery' -NotePropertyValue (ConvertTo-DemoSignInRecoveryEvidence -Recovery $recovery -Guest $Name -Reason $reason -Succeeded $false)
         }
-        catch {
-            $lastError = [string]$_.Exception.Message
+        return $off
+    }
+    $attempt = Invoke-DemoSignInGuestAttempt -Name $Name -Credential $Credential -Clean $Clean -ClearEventLogs $ClearEventLogs -ClearSecurityLog $ClearSecurityLog
+    $tries = 1
+    $firstError = ''
+    if ($null -eq $attempt.Result) {
+        $firstError = $attempt.Error
+        $reason = $firstError
+        $failedUtc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        $key = $RecoveryKey
+        if ($Recover) {
+            $key = Get-DemoGuestRecoveryKey -Key $RecoveryKey -Prefix 'signin'
+        }
+        $restartAsked = $false
+        $paused = 0
+        $stopped = ''
+        foreach ($delay in $RetryDelaySeconds) {
+            if ($null -ne $attempt.Result) {
+                break
+            }
+            $lastError = [string]$attempt.Error
+            $again = $true
+            $probe = $null
+            $broken = $false
+            if ($Recover) {
+                $broken = Test-DemoGuestChannelBroken -Text $lastError
+                if (-not $broken) {
+                    $probe = Test-DemoGuestChannel -Name $Name -Credential $Credential[0]
+                    $broken = [bool]$probe.Broken
+                }
+            }
+            if ($broken -and -not $restartAsked) {
+                # Issue #65: a break that's over by now only waits for the guest to answer; one that stays restarts it once.
+                $restartAsked = $true
+                $recovery = Invoke-DemoGuestRecovery -Name $Name -Credential $Credential[0] -Key $key -By $by -Reason $lastError -StateRoot $StateRoot -Confirm:$false
+                $again = [bool]$recovery.Recovered
+                if (-not $again) {
+                    $stopped = [string]$recovery.Message
+                }
+            }
+            elseif ($null -ne $probe -and [string]$probe.State -ne 'Running') {
+                # Not running (another recovery restarts it, for example): a bounded wait that never starts it, so a guest
+                # that something keeps off on purpose (a golden capture) stays off.
+                $online = $false
+                for ($poll = 0; $poll -lt [int][System.Math]::Ceiling($OnlineMinutes * 3) -and -not $online; $poll++) {
+                    Start-Sleep -Seconds 20
+                    $paused += 20
+                    $online = [bool](Test-DemoGuestOnline -Name $Name -Credential $Credential[0])
+                }
+                $again = $online
+                if (-not $online) {
+                    $stopped = '{0} didn''t answer over PowerShell Direct within {1} minutes ({2}).' -f $Name, $OnlineMinutes, [string]$probe.State
+                }
+            }
+            else {
+                # It answers, or it runs: the next try after a pause, longer each time.
+                Start-Sleep -Seconds $delay
+                $paused += $delay
+            }
+            if (-not $again) {
+                break
+            }
+            $attempt = Invoke-DemoSignInGuestAttempt -Name $Name -Credential $Credential -Clean $Clean -ClearEventLogs $ClearEventLogs -ClearSecurityLog $ClearSecurityLog
+            $tries++
+        }
+        # A restart, or the recovery's reason for none, says what was done; otherwise the tries and their pauses do.
+        $keepRecovery = $null -ne $recovery -and ([bool]$recovery.Restarted -or ($null -eq $attempt.Result -and [string]$recovery.Action -in 'None', 'Exhausted', 'Busy'))
+        if (-not $keepRecovery) {
+            $message = if ($null -ne $attempt.Result) {
+                '{0} answered the sweep on try {1}, after {2} seconds of pauses.' -f $Name, $tries, $paused
+            }
+            elseif ($stopped) {
+                $stopped
+            }
+            else {
+                '{0} tries over {1} seconds of pauses all failed.' -f $tries, $paused
+            }
+            $recovery = [pscustomobject]@{ Action = 'Retry'; Restarted = $false; Recovered = ($null -ne $attempt.Result); Seconds = $paused; Reason = $firstError; By = $by; Key = $key; AtUtc = $failedUtc; RestartUtc = ''; StoppedBy = ''; Message = $message }
         }
     }
-    return [pscustomobject]@{ reachable = $false; state = 'Running'; pass = $false; error = $lastError.Substring(0, [System.Math]::Min(300, $lastError.Length)) }
+    if ($null -ne $attempt.Result) {
+        $result = $attempt.Result
+        $result | Add-Member -NotePropertyName 'reachable' -NotePropertyValue $true -Force
+        $result | Add-Member -NotePropertyName 'state' -NotePropertyValue 'Running' -Force
+        if ($null -ne $recovery) {
+            $result | Add-Member -NotePropertyName 'guestRecovery' -NotePropertyValue (ConvertTo-DemoSignInRecoveryEvidence -Recovery $recovery -Guest $Name -Reason $reason -Succeeded $true -Tries $tries) -Force
+        }
+        return $result
+    }
+    $lastError = [string]$attempt.Error
+    $endVm = Get-VM -Name $Name -ErrorAction SilentlyContinue
+    $endState = if ($endVm) { [string]$endVm.State } else { 'Missing' }
+    $failed = [pscustomobject]@{ reachable = $false; state = $endState; pass = $false; error = $lastError.Substring(0, [System.Math]::Min(300, $lastError.Length)) }
+    if ($firstError -and $firstError -ne $lastError) {
+        $failed | Add-Member -NotePropertyName 'firstError' -NotePropertyValue $firstError.Substring(0, [System.Math]::Min(300, $firstError.Length))
+    }
+    if ($null -ne $recovery) {
+        $failed | Add-Member -NotePropertyName 'guestRecovery' -NotePropertyValue (ConvertTo-DemoSignInRecoveryEvidence -Recovery $recovery -Guest $Name -Reason $reason -Succeeded $false -Tries $tries)
+    }
+    return $failed
 }
-
 # Dot-sourcing (the bootstrap scripts, tests) only defines the functions.
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
     $exitCode = 1
+    $lock = $null
     try {
         if ($ResidueAction -notin 'Scan', 'Clean') {
             throw ('Unknown action {0}.' -f $ResidueAction)
@@ -1082,22 +1455,63 @@ if ($MyInvocation.InvocationName -ne '.') {
         $clean = $ResidueAction -eq 'Clean'
         $clearLogs = $ClearEventLogs -ne 'false'
         $clearSecurity = $ClearSecurityLog -eq 'true'
+        $guestScope = $ResidueScope -in 'Guest', 'Both'
         $local = $null
         $guest = $null
         $passes = @()
-        if ($ResidueScope -in 'Local', 'Both') {
-            $local = Invoke-DemoSignInSweep -Clean $clean -IncludeBrowserCache ($IncludeBrowserCache -eq 'true') -ClearEventLogs $clearLogs -ClearSecurityLog $clearSecurity
-            $passes += [bool]$local.pass
+        # The host bootstrap's lock first, so the host's own sign-in cleanup never sweeps the guest beside this one.
+        $lockInfo = $null
+        $lockMinutes = 0.0
+        if (-not [double]::TryParse([string]$ResidueLockMinutes, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$lockMinutes)) {
+            $lockMinutes = 0.0
         }
-        if ($ResidueScope -in 'Guest', 'Both') {
-            $credentials = @(Get-DemoSignInGuestCredential -Root $ResidueStateRoot)
-            if ($credentials.Count -eq 0) {
-                $guest = [pscustomobject]@{ reachable = $false; state = 'NoCredential'; pass = $false }
+        if ($guestScope -and $lockMinutes -gt 0) {
+            $lockSeconds = [int][System.Math]::Max(1, [System.Math]::Min(7200, [System.Math]::Round($lockMinutes * 60)))
+            $lock = Enter-DemoSignInBootstrapLock -Root $ResidueStateRoot -Seconds $lockSeconds
+            $lockInfo = [ordered]@{ minutes = $lockMinutes; seconds = [int]$lock.Seconds; timedOut = [bool]$lock.TimedOut }
+        }
+        if ($null -ne $lockInfo -and [bool]$lockInfo['timedOut']) {
+            # Fail closed: nothing is swept beside the host's own sign-in cleanup, and the caller runs this again.
+            $busy = [ordered]@{ reachable = $false; state = 'Busy'; pass = $false; error = ('The host bootstrap held its lock (bootstrap.lock) for {0} seconds, so nothing was swept beside its own sign-in cleanup.' -f $lockInfo['seconds']) }
+            if ($ResidueScope -eq 'Both') {
+                $local = [pscustomobject]$busy
             }
-            else {
-                $guest = Invoke-DemoSignInGuestSweep -Name $GuestVmName -Credential $credentials -Clean $clean -ClearEventLogs $clearLogs -ClearSecurityLog $clearSecurity
+            $guest = [pscustomobject]$busy
+            $passes += $false
+        }
+        else {
+            if ($ResidueScope -in 'Local', 'Both') {
+                $local = Invoke-DemoSignInSweep -Clean $clean -IncludeBrowserCache ($IncludeBrowserCache -eq 'true') -ClearEventLogs $clearLogs -ClearSecurityLog $clearSecurity
+                $passes += [bool]$local.pass
             }
-            $passes += [bool]$guest.pass
+            if ($guestScope) {
+                $credentials = @(Get-DemoSignInGuestCredential -Root $ResidueStateRoot)
+                if ($credentials.Count -eq 0) {
+                    $guest = [pscustomobject]@{ reachable = $false; state = 'NoCredential'; pass = $false }
+                }
+                else {
+                    # Issue #65's recovery comes from the host's installed bundle when it has it (an older one doesn't).
+                    $recover = $false
+                    $bundleRoot = Get-DemoSignInBundleRoot -Root $ResidueStateRoot
+                    if ($bundleRoot) {
+                        try {
+                            Import-Module -Name ([System.IO.Path]::Combine($bundleRoot, 'vm', 'bootstrap', 'DbHubDemo.Vm.psd1')) -Force
+                            . ([System.IO.Path]::Combine($bundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+                            Initialize-DemoVmContext -Root $ResidueStateRoot -Role 'ArcHost' -BundleRoot $bundleRoot | Out-Null
+                            $recover = Test-DemoSignInRecoveryReady
+                        }
+                        catch {
+                            $recover = $false
+                        }
+                    }
+                    $guest = Invoke-DemoSignInGuestSweep -Name $GuestVmName -Credential $credentials -Clean $clean -ClearEventLogs $clearLogs -ClearSecurityLog $clearSecurity -Recover $recover -RecoveryKey $RecoveryKey -StateRoot $ResidueStateRoot
+                }
+                $passes += [bool]$guest.pass
+            }
+        }
+        $recoveryEvidence = $null
+        if ($null -ne $guest -and $null -ne $guest.PSObject.Properties['guestRecovery']) {
+            $recoveryEvidence = $guest.guestRecovery
         }
         # The instance view keeps only the last 4 KB of output, so locations are dropped until the line fits.
         $maxLocations = 6
@@ -1110,6 +1524,12 @@ if ($MyInvocation.InvocationName -ne '.') {
                 local     = ConvertTo-DemoSignInSummary -Sweep $local -MaxLocations $maxLocations
                 guest     = ConvertTo-DemoSignInSummary -Sweep $guest -MaxLocations $maxLocations
             }
+            if ($null -ne $lockInfo) {
+                $outcome['lock'] = $lockInfo
+            }
+            if ($null -ne $recoveryEvidence) {
+                $outcome['guestRecovery'] = $recoveryEvidence
+            }
             $line = ConvertTo-Json -InputObject $outcome -Compress -Depth 6
             $maxLocations--
         } while ($line.Length -gt 3800 -and $maxLocations -ge 0)
@@ -1120,6 +1540,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         $message = [regex]::Replace([string]$_.Exception.Message, 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*', '[REDACTED]')
         [Console]::Error.WriteLine('DbHubDemo sign-in data ' + $ResidueAction + ' failed: ' + $message)
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([ordered]@{ action = $ResidueAction; scope = $ResidueScope; succeeded = $false; error = $message }) -Compress))
+    }
+    finally {
+        if ($null -ne $lock -and $null -ne $lock.Stream) {
+            $lock.Stream.Dispose()
+        }
     }
     exit $exitCode
 }

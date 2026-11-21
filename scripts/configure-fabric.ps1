@@ -13,8 +13,9 @@ capacity fabric.capacityName, the lakehouse with lakehouse schemas), and every l
 (FABRIC.RESOLVE.*). fabric.workspaceId and fabric.lakehouseId, when set, are overrides used as they are. It runs
 after the subscription guard, and -WhatIf creates nothing.
 
-Step 1, the Database Hub checklist (Invoke-DemoHubReadiness; -SkipHubChecks skips it). Database Hub (preview)
-has no public API or ARM resource, so the checklist uses documented interfaces only and never calls a Hub route
+Step 1, the Database Hub checklist (Invoke-DemoHubReadiness; -SkipHubChecks skips it). Database Hub (generally
+available since 2026-11-17) has no public API or ARM resource, so the checklist uses documented interfaces only and
+never calls a Hub route
 (docs/architecture.md, "Database Hub integration"):
 - The subscription guard first: it stops the checklist with Fail unless the Azure CLI context matches the
   configured subscription and tenant and a token is available without interaction. It never signs in.
@@ -52,6 +53,9 @@ validates fabric/realtime/RealTimeDashboard.json and fills in the demo resource 
 creates the KQLDashboard item or overrides its definition, then reads the definition back with Get Item Definition
 (FABRIC.IMPORT.* and FABRIC.READBACK.*). The dashboard's data source is the documented SQL ADX proxy, queried with
 each viewer's own identity; the definition holds no credential and no ID. -WhatIf validates it and shows the plan.
+After a passing import and read-back, the presenters in presenterObjectIds get the Viewer role on the demo workspace
+when they have no role there yet, which shares the dashboard with them (Grant-DemoPresenterWorkspaceAccess,
+FABRIC.PRESENTER.VIEWER, 2026-11-18): Fabric's REST API has no operation to share one item.
 
 Step 4, the dashboard's data (Phase 18; after a passing import and read-back, or alone with -CheckDashboardData).
 Test-DemoRealTimeDashboardData runs each tile's KQL, read-only, against the telemetry endpoint for the last 24
@@ -170,7 +174,17 @@ the lakehouse tables the history report reads (incident windows, telemetry snaps
 current. It runs analyze-only, scoped to the demo's resource group
 (RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
-lakehouse gets the tables.
+lakehouse gets the tables; that first run waits up to -HistoryRunWaitMinutes, since a busy capacity can keep it queued
+for longer than 10 minutes (#68).
+
+.PARAMETER HistoryRunWaitMinutes
+How long the first history run (step 5 by itself, above) is waited for while it's queued on the capacity or runs
+(default 45; at least -TimeoutSeconds). A run still queued or running then keeps running, and its record says so with
+its location (jobLocation), which deploy.ps1 follows.
+
+.PARAMETER ProgressPath
+The status page's model (deploy-progress.json), which deploy.ps1 passes: while the first history run is queued or runs,
+its Fabric row says so, with the minutes so far and -HistoryRunWaitMinutes.
 
 .PARAMETER LiveActivityWindowMinutes
 With -RunLiveActivity: the notebook's WINDOW_MINUTES and TELEMETRY_LOOKBACK_MINUTES (default 1440, one day).
@@ -180,7 +194,8 @@ With -RunLiveActivity: a file that stop-demo.ps1 -SaveHistory kept in out/histor
 couldn't be saved (STOP.T4.HISTORY.PENDING, for example while the Fabric capacity was paused): T4's and its deleted read
 replica's metrics from that session, which the run adds to the history as the notebook's POSTGRES_METRICS (ADR 0025).
 After a run that passed, the file moves to out/history-pending/saved. Without it, the run sends T4's and a running
-replica's metrics from Azure Monitor over the window, as deploy.ps1's history snapshot does.
+replica's metrics from Azure Monitor over the window, as deploy.ps1's history snapshot does. T5's (Azure Cosmos DB,
+2026-11-18) always come from Azure Monitor over the window, as COSMOS_METRICS, when T5 is deployed.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
@@ -264,6 +279,12 @@ param(
 
     [switch] $RunLiveActivity,
 
+    [ValidateRange(5, 120)]
+    [int] $HistoryRunWaitMinutes = 45,
+
+    [AllowEmptyString()]
+    [string] $ProgressPath = '',
+
     [ValidateRange(15, 10080)]
     [int] $LiveActivityWindowMinutes = 1440,
 
@@ -290,6 +311,7 @@ $module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 $PostgresMetricsPath = Resolve-DemoUserPath -Path $PostgresMetricsPath
+$ProgressPath = Resolve-DemoUserPath -Path $ProgressPath
 if ($PostgresMetricsPath) {
     if (-not $RunLiveActivity) {
         throw '-PostgresMetricsPath goes with -RunLiveActivity: the notebook run adds the file''s metrics to the history.'
@@ -524,6 +546,11 @@ if ($ImportDashboard) {
             $imported = @(Import-DemoFabricItem -WorkspaceId $importWorkspaceId -Item $dashboard -Token $dashboardToken -TimeoutSeconds $TimeoutSeconds -ReadBack -Confirm:$false)
             $results.AddRange([object[]]$imported)
             $dashboardImported = $imported.Count -eq 2 -and @($imported | Where-Object { $_.status -ne 'Pass' }).Count -eq 0
+            if ($dashboardImported) {
+                # 2026-11-18: the dashboard shared with the presenters in presenterObjectIds, as Viewers of the demo workspace,
+                # because Fabric's REST API has no operation to share one item (FABRIC.PRESENTER.VIEWER).
+                $results.Add((Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $importWorkspaceId -Token $dashboardToken -Confirm:$false))
+            }
         }
         else {
             $results.Add((New-DemoResult -CheckId ('FABRIC.IMPORT.' + ($dashboard.DisplayName.ToUpperInvariant() -replace '[^A-Z0-9_]', '_')) `
@@ -654,6 +681,17 @@ if ($RunLiveActivity -or $firstRun) {
                 $notebookParameters['POSTGRES_METRICS'] = [string]$postgresCapture.Json
             }
         }
+        # T5 (2026-11-18, ADR 0027): its Azure Cosmos DB account stays between sessions, so its metrics come from Azure Monitor
+        # over the window, as COSMOS_METRICS, the way deploy.ps1's snapshot and stop-demo.ps1 -SaveHistory send them.
+        if ($RunLiveActivity -and $azGuarded) {
+            $cosmosCapture = & $module { param($Configuration, $Minutes) Get-DemoCosmosHistoryCapture -Config $Configuration -WindowMinutes $Minutes -CheckId 'FABRIC.T5.HISTORY' } $config $LiveActivityWindowMinutes
+            if ($null -ne $cosmosCapture -and $null -ne $cosmosCapture.Result) {
+                $results.Add($cosmosCapture.Result)
+            }
+            if ($null -ne $cosmosCapture -and [string]$cosmosCapture.Json) {
+                $notebookParameters['COSMOS_METRICS'] = [string]$cosmosCapture.Json
+            }
+        }
         # A copy of the notebook from before 2026-11-13 doesn't know POSTGRES_METRICS and would ignore them (2026-11-16): they
         # aren't sent, and a kept file stays where it is. One whose definition can't be read gets them, as before.
         $postgresWithheld = $false
@@ -665,7 +703,25 @@ if ($RunLiveActivity -or $firstRun) {
                 $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' })))
             }
         }
-        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))
+        # The same for T5's, with a copy from before 2026-11-18; Azure Monitor keeps them, so a later run adds them.
+        if ($notebookParameters.Contains('COSMOS_METRICS')) {
+            $knowsCosmos = & $module { param($Configuration, $FabricToken) Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $Configuration['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'COSMOS_METRICS' -Token $FabricToken } $config $runToken
+            if ($knowsCosmos.Known -and -not $knowsCosmos.Has) {
+                $notebookParameters.Remove('COSMOS_METRICS')
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T5.HISTORY' -Area 'fabric' -Target 'T5' -Status 'Warning' -Message 'T5''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them. Azure Monitor keeps them.' -Remediation $(if ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again adds them.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again adds them.' })))
+            }
+        }
+        $runTimeout = [Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0))
+        $runProgress = @{}
+        if (-not $RunLiveActivity) {
+            # The first history run (#68): a busy capacity keeps it queued for a while (live, 2026-11-19: about 15 minutes on
+            # a shared F4), and the history model reads the tables it creates, so it gets a longer wait, on the status page.
+            $runTimeout = [Math]::Max($runTimeout, $HistoryRunWaitMinutes)
+            if ($ProgressPath) {
+                $runProgress = @{ ProgressPath = $ProgressPath; ProgressId = 'Fabric.Items'; ProgressNote = 'It''s the first history run: the history model refreshes once it has run.' }
+            }
+        }
+        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
         $results.Add($run)
         if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.

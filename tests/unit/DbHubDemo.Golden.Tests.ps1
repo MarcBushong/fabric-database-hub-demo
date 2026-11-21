@@ -570,6 +570,21 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         $script:calls | Should -Not -Contain 'teardown gtest'
     }
 
+    It 'leaves out DESTROY.HUB.AGENT.T3, which a group that never has a T3 doesn''t need, from what the destroy path returns (review of 5d1f4b0)' {
+        # destroy.ps1 gives the boot test's group none (Get-DemoDestroyExtraPlan's NoT3); this keeps it out regardless.
+        $script:testGroupExists = 'true'
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoEnvironment -MockWith {
+            $script:calls.Add('teardown ' + $Config['environment'])
+            @((New-TestResult 'DESTROY.RESOURCEGROUP'), (New-TestResult 'DESTROY.HUB.AGENT.T3' 'Manual action required'), (New-TestResult 'DESTROY.RESIDUAL'))
+        }
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -CleanupOnly -Confirm:$false)
+        $script:calls | Should -Contain 'teardown gtest'
+        ($results | Where-Object checkId -EQ 'DESTROY.RESOURCEGROUP').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST.TEARDOWN').status | Should -Be 'Pass'
+        @($results | Where-Object checkId -EQ 'DESTROY.HUB.AGENT.T3').Count | Should -Be 0
+        @($results | Where-Object status -EQ 'Manual action required').Count | Should -Be 0
+    }
+
     It 'proves the copy in quarantine in the test group, then deletes the group through the destroy path' {
         $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
         ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
@@ -1022,12 +1037,12 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
 
     It 'is <Status> when <Case>' -ForEach @(
         @{ Case = 'the guest runs as designed'; Guest = { New-Guest }; Status = 'Pass'; Match = 'runs with its heartbeat OK, starts with the host, and its adapter is connected to DbHubDemoNat'; Fix = '' }
-        @{ Case = 'the capture left the source air-gapped'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Source' }) }; Status = 'Fail'; Match = 'still air-gapped by a golden capture'; Fix = '^Start T2 from the Fabric control.*start-demo\.ps1 releases it too \(T2\.GOLDEN\.SOURCE\) once a golden snapshot names archost01.*next \./scripts/capture-t2-golden\.ps1' }
+        @{ Case = 'the capture left the source air-gapped'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Source' }) }; Status = 'Fail'; Match = 'still air-gapped by a golden capture'; Fix = '^Run all in NB_DatabaseHub_Control: its start of T2.*start-demo\.ps1 releases it too \(T2\.GOLDEN\.SOURCE\) once a golden snapshot names archost01.*next \./scripts/capture-t2-golden\.ps1' }
         @{ Case = 'a restored copy isn''t reset'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }) }; Status = 'Fail'; Match = 'must stay air-gapped'; Fix = 'deploy\.ps1: its T2 track resets the copy.*Don''t connect it by hand' }
         @{ Case = 'a reset copy isn''t released'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $true; role = 'Copy' }) }; Status = 'Fail'; Match = 'was reset, but it isn''t released yet'; Fix = 'deploy\.ps1' }
         @{ Case = 'the host''s role can''t be read'; Guest = { New-Guest -State 'Off' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Unknown' }) }; Status = 'Fail'; Match = 'can''t tell a source from a copy'; Fix = 'Don''t connect the guest by hand' }
-        @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Fabric control.*Start-VM -Name arcsql01' }
-        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
+        @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'start of T2 \(Run all in NB_DatabaseHub_Control\), which starts an off guest.*As a last resort, run on archost01: .*Start-VM -Name arcsql01' }
+        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1; .*\./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
         @{ Case = 'a released capture''s guest is off'; Guest = { New-Guest -State 'Off' -Heartbeat '' -Golden ([pscustomobject]@{ released = $true; reset = $false; role = '' }) }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Start-VM' }
         @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
@@ -1119,6 +1134,7 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $script:jobs = @{ 'DbHub-Control' = @(); 'DbHub-Stop' = @() }
         $script:jobsFail = ''
         $script:autoStop = ''
+        $script:autoStopDescription = ''
         $script:autoStopFail = $false
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
             if ($Url -match '/jobs$') {
@@ -1129,7 +1145,7 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
             if ($Url -match '/schedules/dbhub-autostop\?') {
                 if ($script:autoStopFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'Timeout' } }
                 if (-not $script:autoStop) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
-                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ startTime = $script:autoStop } }; Error = '' }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ startTime = $script:autoStop; description = $script:autoStopDescription } }; Error = '' }
             }
             throw ('unexpected: {0}' -f $Url)
         }
@@ -1166,6 +1182,16 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'active until 2026-11-04 03:10 UTC'
         ([datetime]$result.evidence['autoStopUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm") | Should -Be '2026-11-04T03:10'
+    }
+
+    It 'says when the pending auto-stop is a start-demo.ps1 session''s, with ./scripts/stop-demo.ps1 first as the fix (the review of 2026-11-19, finding 8)' {
+        $script:autoStop = '2026-11-04T05:00:00Z'
+        $script:autoStopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-11-04T01:00:00Z. Run all, the Insights app''s Start, or a run replaces it with its own plan.'
+        $result = Get-ControlCheck
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Be 'A start-demo.ps1 session runs, and its auto-stop (dbhub-autostop) deallocates archost01 at 2026-11-04 05:00 UTC, which would cut into the capture.'
+        $result.remediation | Should -Be 'Nothing was captured. Run ./scripts/stop-demo.ps1 first: it ends the session and removes its auto-stop, and the capture starts archost01 itself. Then run capture-t2-golden.ps1 again.'
+        $result.evidence['startDemo'] | Should -BeTrue
     }
 
     It 'fails when the jobs or the auto-stop can''t be read, because a run may be active' {

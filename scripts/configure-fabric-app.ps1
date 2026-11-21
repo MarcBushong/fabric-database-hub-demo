@@ -33,11 +33,19 @@ context, and never pauses, resumes, or scales the capacity.
    name (FABRIC.APP.ITEMS). Their IDs build the app's new-tab links.
 4. Stage: Sync-DemoFabricAppStage mirrors fabric/app into the Git-ignored out/fabric-app, writes the connector's IDs
    to rayfin/.env and the links and the resource group name (for the Database Agent prompts) to
-   public/dbhub-app.json, and runs npm ci when the lock file changed (FABRIC.APP.STAGE, FABRIC.APP.DEPENDENCIES).
+   public/dbhub-app.json, drops rayfin up's records of other workspaces (a destroyed environment's, which rayfin up
+   would otherwise reuse for a new workspace with the same name), and runs npm ci when the lock file changed
+   (FABRIC.APP.STAGE, FABRIC.APP.DEPENDENCIES).
 5. Prerequisites: Test-DemoFabricAppPrerequisite checks Node.js, the sign-in the Rayfin CLI uses (the Azure CLI's
    tokens, or with -RayfinSignIn its own sign-in to the demo's tenant), and the Fabric Apps (preview) and Execute
    Queries tenant settings (FABRIC.APP.NODE, .SIGNIN, .TENANTSETTING, .EXECUTEQUERIES). With -SignIn, a missing sign-in
    is done interactively first (Connect-DemoRayfinCli).
+5b. Manage (ADR 0029): Resolve-DemoFabricAppOperator reads the operators, the deployer and the users of the demo's admin
+   group (FABRIC.APP.OPERATORS), and Set-DemoFabricAppManageSetting writes them, NB_DatabaseHub_Control's IDs, and the
+   app's API into the stage for the app's Manage function (FABRIC.APP.ACTIONS). A first deploy records the app's API
+   only in step 6, so it writes them again and deploys once more, when that completes them. NB_DatabaseHub_Control's
+   IDs come from step 3: when the notebook isn't in Fabric yet (deploy.ps1 puts it there after its tracks), deploy.ps1
+   runs this script once more after it has (Complete-DemoInsightsAppManage, 2026-11-19).
 6. Deploy: Invoke-DemoFabricAppDeployment runs 'rayfin up --yes --json' and 'rayfin up status'
    (FABRIC.APP.DEPLOY, FABRIC.APP.STATUS); when Fabric refuses the Azure CLI's token, FABRIC.APP.TOKEN says why and the
    Rayfin CLI's own sign-in deploys instead.
@@ -333,7 +341,12 @@ if ($capacity) {
     $capacityReady = $capacity.status -eq 'Pass' -or ($capacity.status -eq 'Warning' -and $capacityId -match $guidPattern -and $progress -ne 'InProgress')
 }
 
-$itemsResult = Resolve-DemoFabricAppItem -WorkspaceId $targetWorkspaceId -TenantId $tenantId -Token $FabricToken
+# With the configuration, the items include the control notebook, which the app's Manage page opens (2026-11-18).
+$itemArguments = @{ WorkspaceId = $targetWorkspaceId; TenantId = $tenantId; Token = $FabricToken }
+if ($config) {
+    $itemArguments['Config'] = $config
+}
+$itemsResult = Resolve-DemoFabricAppItem @itemArguments
 $results.Add($itemsResult)
 $modelId = [string]$itemsResult.evidence['semanticModelId']
 $links = $itemsResult.evidence['links']
@@ -347,31 +360,96 @@ if ($modelId -notmatch $guidPattern) {
 # everything deployed"): the Fabric API for 'rayfin up' and 'rayfin up status', the Power BI API for the app's queries,
 # each as RAYFIN_TOKEN in that command's process only (Get-DemoRayfinTokenAudience), and the Power BI one for Execute
 # Queries too when the connector's direct route refuses it (2026-11-09 live finding). -RayfinSignIn uses the CLI's own
-# sign-in instead. The Power BI token needs the subscription guard this script ran; with a -FabricToken the caller passed,
-# there's none, and the app's queries are checked only with -RayfinSignIn (Test-DemoFabricApp warns).
+# sign-in instead. The Power BI token is taken right before the app's checks (Step 7).
 $rayfinToken = @{ Fabric = $null; PowerBI = $null }
 if (-not $RayfinSignIn) {
     $rayfinToken.Fabric = $FabricToken
-    if ($config -and $guarded) {
-        try {
-            $rayfinToken.PowerBI = Get-DemoPowerBIToken -SubscriptionId ([string]$config['subscriptionId'])
-        }
-        catch {
-            Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries can''t be checked (FABRIC.APP.CONNECTOR says so; -RayfinSignIn checks them with the Rayfin CLI''s own sign-in): {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+}
+# Each token is taken right before the Rayfin CLI command that uses it (F16, live 2026-11-20): the Azure CLI hands out a
+# cached token until about 5 minutes before it expires, and one taken at the start of a run ran out during rayfin up.
+# True when it got a new one; with a -FabricToken the caller passed (no guard here), there's none to take, and that one
+# is used.
+$newFabricToken = {
+    if (-not $guarded -or $null -eq $rayfinToken.Fabric) {
+        return $false
+    }
+    try {
+        $rayfinToken.Fabric = Get-DemoFabricToken -SubscriptionId $config['subscriptionId']
+        return $true
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The Azure CLI gave no new Fabric token, so rayfin up keeps the one it has, or, after that one expired, doesn''t run again: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $false
+    }
+}
+# rayfin up with a token taken right before it, and once more with a new one when the token expired during the command:
+# an expiry isn't a refusal (F16). A second expiry, or a refusal, keeps its record, which the caller handles as before.
+$upWithToken = {
+    param([switch] $Dry)
+    $null = & $newFabricToken
+    $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+    $expired = @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] -and $_.evidence['tokenExpired'] }).Count -gt 0
+    if ($expired -and (& $newFabricToken)) {
+        Write-DemoLog -Level Warning -Message 'The Azure CLI''s token expired during rayfin up, so rayfin up runs once more with a new one.'
+        # A second expiry is recorded as a refusal, so the next deploy.ps1 starts the Rayfin CLI's own sign-in at its start.
+        $records = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$Dry -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -RecordExpiry -Confirm:$false)
+        foreach ($record in @($records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] })) {
+            $record.evidence['retriedAfterExpiry'] = $true
         }
     }
+    $records
 }
 
 #region Step 4-5: stage and prerequisites
+$resourceGroupName = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
 $deployFile = [ordered]@{
     expectedAccount  = $(if ($config) { [string]$config['azureAccount'] } else { '' })
     expectedTenantId = $tenantId
     # Names only, for the app's Database Agent prompts: never an ID or a secret.
-    resourceGroup    = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
+    resourceGroup    = $resourceGroupName
     links            = $links
 }
+# T2's migration assessment as Azure has it now (R924): words, numbers, and times only. The app's migration card shows it,
+# with this time, while Database Hub's live view isn't available to the app; every deploy reads it again. The record's
+# evidence went through JSON (New-DemoResult), which makes its times DateTime values, so they're ISO 8601 in UTC again.
+$isoUtc = {
+    param([object] $Value)
+    if ($Value -is [datetime]) {
+        $utc = if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc) } else { $Value.ToUniversalTime() }
+        return $utc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+$savedMigration = $itemsResult.evidence['t2Migration']
+if ($null -ne $savedMigration) {
+    $deployFile['t2Migration'] = [ordered]@{
+        resource    = [string]$savedMigration['resource']
+        readAt      = & $isoUtc $savedMigration['readAt']
+        enabled     = [bool]$savedMigration['enabled']
+        uploadedAt  = & $isoUtc $savedMigration['uploadedAt']
+        targets     = $savedMigration['targets']
+        recommended = $savedMigration['recommended']
+    }
+}
+# The Copilot dock (Ask, ADR 0028): its chat relay, set up here before the app is staged, so the app's dbhub-app.json
+# gets the relay's address, and the live estate function's scope. -DryRun and -CheckOnly only look for the relay.
+$functionScope = $null
+$ask = $null
+if ($config -and $guarded -and $resourceGroupName) {
+    $functionScope = @{ subscriptionId = [string]$config['subscriptionId']; resourceGroups = @($resourceGroupName) }
+    $askRelay = ''
+    if ($DryRun -or $CheckOnly) {
+        $askRelay = Get-DemoAskRelayEndpoint -SubscriptionId ([string]$config['subscriptionId']) -ResourceGroupName $resourceGroupName
+    }
+    else {
+        $ask = Invoke-DemoAskRelaySetup -Config $config -StagePath $stage -Confirm:$false
+        $results.AddRange([object[]]@($ask.Results))
+        $askRelay = [string]$ask.Endpoint
+    }
+    $deployFile['ask'] = [ordered]@{ relayUrl = $askRelay; estate = $true }
+}
 $envValues = [ordered]@{ DBHUB_FABRIC_WORKSPACE_ID = $targetWorkspaceId; DBHUB_SEMANTIC_MODEL_ID = $modelId }
-$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
+$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -FunctionScope $functionScope -WorkspaceId $targetWorkspaceId -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
 $results.AddRange([object[]]$stageResults)
 if (@($stageResults | Where-Object { $_.status -eq 'Fail' }).Count -gt 0) {
     & $skip 'FABRIC.APP.DEPLOY' 'The deploy stage isn''t ready, so nothing was deployed.'
@@ -390,6 +468,21 @@ $results.AddRange([object[]]@($prerequisites | Where-Object { $_.checkId -notin 
 $blocking = @($prerequisites | Where-Object { ($_.checkId -eq 'FABRIC.APP.NODE' -and $_.status -in 'Fail', 'Manual action required') -or ($_.checkId -eq 'FABRIC.APP.SIGNIN' -and $_.status -ne 'Pass') })
 #endregion Step 4-5: stage and prerequisites
 
+#region Step 5b: Manage's settings
+# The app's Manage function (ADR 0029) checks each caller with the app's own keys, at the app's API, and runs
+# NB_DatabaseHub_Control for the operators: the deployer and the users of the demo's admin group, read again on every
+# deploy (FABRIC.APP.OPERATORS). They go into the stage before rayfin up builds the function; FABRIC.APP.ACTIONS says
+# how Manage sends its actions once the app is deployed.
+$manage = $null
+$manageResult = $null
+if ($config -and $guarded -and -not $CheckOnly -and -not $DryRun -and $blocking.Count -eq 0 -and $capacityReady) {
+    $operatorResult = Resolve-DemoFabricAppOperator -Config $config
+    $results.Add($operatorResult)
+    $manage = @{ StagePath = $stage; ControlWorkspaceId = [string]$itemsResult.evidence['controlWorkspaceId']; ControlNotebookId = [string]$itemsResult.evidence['controlNotebookId']; Operator = @($operatorResult.evidence['operators']); Config = $config }
+    $manageResult = Set-DemoFabricAppManageSetting @manage -Confirm:$false
+}
+#endregion Step 5b: Manage's settings
+
 #region Step 6: deploy
 $hostingUrl = ''
 $itemUrl = ''
@@ -404,12 +497,25 @@ elseif (-not $capacityReady) {
     & $skip 'FABRIC.APP.DEPLOY' 'Not deployed: the workspace isn''t on an Active Fabric capacity (FABRIC.P5.CAPACITY), and rayfin up would try to start a trial or assign one.'
 }
 elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $targetWorkspaceId", $(if ($DryRun) { 'Validate with rayfin up --dry-run' } else { 'Deploy with rayfin up' }))) {
-    $deploy = @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$DryRun -TimeoutSeconds $TimeoutSeconds -Token $rayfinToken.Fabric -Confirm:$false)
+    $deploy = @(& $upWithToken -Dry:$DryRun)
     $refused = @($deploy | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' -and $_.evidence -is [System.Collections.IDictionary] -and $_.evidence['tokenRefused'] }) | Select-Object -First 1
     if ($refused) {
         # Fabric refused the Azure CLI's token: the Rayfin CLI's own sign-in deploys instead (2026-11-09). Without one,
         # -SignIn opens its browser sign-in here; deploy.ps1 starts it at the start of its next run (out/fabric-app-auth.json).
+        # A token that expired, and expired again with a new one, comes here too (F16); one that expired with no new one to
+        # take (a -FabricToken the caller passed, or the Azure CLI gave none) didn't run again, and says so.
         $refusal = [string]$refused.evidence['refusal']
+        $expiredKind = if (-not $refused.evidence['tokenExpired']) { '' } elseif ($refused.evidence['retriedAfterExpiry']) { 'again' } else { 'once' }
+        $lead = switch ($expiredKind) {
+            'again' { 'The Azure CLI''s token expired during rayfin up, and again with a new one' }
+            'once' { 'The Azure CLI''s token expired during rayfin up, and no new one was available' }
+            default { 'Fabric refused the Azure CLI''s token for rayfin up' }
+        }
+        $short = switch ($expiredKind) {
+            'again' { 'The Azure CLI''s token expired twice' }
+            'once' { 'The Azure CLI''s token expired' }
+            default { 'Fabric refused the Azure CLI''s token' }
+        }
         $rayfinToken.Fabric = $null
         $own = @(Test-DemoFabricAppPrerequisite -Config $config -StagePath $stage -Token $FabricToken | Where-Object { $_.checkId -eq 'FABRIC.APP.SIGNIN' }) | Select-Object -First 1
         if ($SignIn -and $config -and ($null -eq $own -or $own.status -ne 'Pass')) {
@@ -423,16 +529,26 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
         $signedIn = $null -ne $own -and $own.status -eq 'Pass'
         if (-not $signedIn -and $null -ne $own -and [string]$own.message) {
             # The app's summary on the status page leads with this record, so it names the refusal first.
-            $own.message = 'Fabric refused the Azure CLI''s token (FABRIC.APP.TOKEN), and {0}{1}' -f $own.message.Substring(0, 1).ToLowerInvariant(), $own.message.Substring(1)
+            $own.message = '{0} (FABRIC.APP.TOKEN), and {1}{2}' -f $short, $own.message.Substring(0, 1).ToLowerInvariant(), $own.message.Substring(1)
         }
-        $tokenMessage = if ($signedIn) { 'Fabric refused the Azure CLI''s token for rayfin up, so the Rayfin CLI''s own sign-in deploys the app: {0}' -f $refusal } else { 'Fabric refused the Azure CLI''s token for rayfin up, and the Rayfin CLI isn''t signed in to the demo''s tenant, so the app wasn''t deployed: {0}' -f $refusal }
-        $tokenFix = if ($signedIn) { '' } else { 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app. The next ./scripts/deploy.ps1 starts that sign-in at its start too.' }
+        $tokenMessage = if ($signedIn) { '{0}, so the Rayfin CLI''s own sign-in deploys the app: {1}' -f $lead, $refusal } else { '{0}, and the Rayfin CLI isn''t signed in to the demo''s tenant, so the app wasn''t deployed: {1}' -f $lead, $refusal }
+        # An expiry with no new token to take (F16) isn't a refusal, and nothing recorded one, so the next run takes a fresh
+        # token instead of starting a sign-in.
+        $tokenFix = if ($signedIn) {
+            ''
+        }
+        elseif ($expiredKind -eq 'once') {
+            'Run ./scripts/deploy.ps1 again: it tries again with a fresh token from the Azure CLI. Or run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app.'
+        }
+        else {
+            'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in as the demo''s Fabric user, then deploys the app. The next ./scripts/deploy.ps1 starts that sign-in at its start too.'
+        }
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.TOKEN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message $tokenMessage -Evidence ([ordered]@{ refusal = $refusal; fallback = $(if ($signedIn) { 'rayfinSignIn' } else { 'none' }); signInNeeded = (-not $signedIn) }) -Remediation $tokenFix -DocUrl 'https://learn.microsoft.com/fabric/apps/cli-reference'))
         $deploy = if ($signedIn) {
             @(Invoke-DemoFabricAppDeployment -StagePath $stage -WorkspaceId $targetWorkspaceId -TenantId $tenantId -ItemName $itemName -DryRun:$DryRun -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
         }
         else {
-            @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: Fabric refused the Azure CLI''s token (FABRIC.APP.TOKEN), and the Rayfin CLI isn''t signed in to the demo''s tenant (FABRIC.APP.SIGNIN).' -Evidence ([ordered]@{ tokenRefused = $true; signInNeeded = $true }) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in, then deploys the app.' -DocUrl 'https://learn.microsoft.com/fabric/apps/deploy-app')
+            @(New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message ('Not deployed: {0} (FABRIC.APP.TOKEN), and the Rayfin CLI isn''t signed in to the demo''s tenant (FABRIC.APP.SIGNIN).' -f $short) -Evidence ([ordered]@{ tokenRefused = $true; signInNeeded = $true }) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn: it opens a browser for your sign-in, then deploys the app.' -DocUrl 'https://learn.microsoft.com/fabric/apps/deploy-app')
         }
     }
     $results.AddRange([object[]]$deploy)
@@ -442,9 +558,55 @@ elseif ($PSCmdlet.ShouldProcess("Fabric app '$itemName' in Fabric workspace $tar
         $hostingUrl = [string]$deployResult.evidence['hostingUrl']
         $itemUrl = [string]$deployResult.evidence['itemUrl']
     }
+    if ($deployed -and -not $DryRun -and $null -ne $manage) {
+        # A first deploy: rayfin up recorded the app's API only now, so Manage's settings get it, and the app deploys once
+        # more, so that its function checks callers there (about a minute, once). Later deploys find it in the record. Only
+        # when that lets Manage send (2026-11-19): while something else is missing, such as NB_DatabaseHub_Control before
+        # deploy.ps1 puts it in Fabric, Manage copies each request either way, and the next deploy, which deploy.ps1 runs
+        # once the notebook is there (Complete-DemoInsightsAppManage), reads the API from the record.
+        $after = Set-DemoFabricAppManageSetting @manage -Confirm:$false
+        $api = [string]$after.evidence['apiUrl']
+        if ($api -and $api -ne [string]$manageResult.evidence['apiUrl'] -and $after.evidence['functionsEnabled'] -and $after.evidence['written'] -and [string]$after.status -eq 'Pass') {
+            $again = @(& $upWithToken)
+            $againResult = $again | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' } | Select-Object -First 1
+            if ($null -eq $againResult -or $againResult.status -ne 'Pass') {
+                $after = New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The app''s second deploy, with Manage''s settings, didn''t pass ({0}), so the app copies each request for Run all in NB_DatabaseHub_Control until its next deploy.' -f $(if ($againResult) { $againResult.message } else { 'no result' })) -Evidence $after.evidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 again.' -DocUrl 'https://learn.microsoft.com/fabric/apps/functions'
+            }
+            else {
+                $after.evidence['redeployed'] = $true
+            }
+        }
+        $manageResult = $after
+    }
 }
 else {
     & $skip 'FABRIC.APP.DEPLOY' 'Skipped at the confirmation prompt.'
+}
+if ($deployed -and $null -ne $manageResult) {
+    $results.Add($manageResult)
+}
+# The live estate (R924, found live 2026-11-19): Database Hub answers HTTP 401 "Authentication failed for all
+# authenticators" to the token Fabric gives the app's functions, so the estate function reads nothing, and the app's
+# pages and Ask say so in one sentence. No setting or role fixes that, and a script can't call the function to check it
+# (Fabric runs it only for a person signed in to the app), so this says what still works: Not supported, never a Fail.
+if ($deployed -and -not $DryRun) {
+    $estateDoc = 'https://learn.microsoft.com/fabric/apps/functions-connect-external-resources'
+    $saved = $deployFile['t2Migration']
+    $readiness = if ($null -ne $saved) {
+        'T2''s migration readiness as Azure had it at this deploy ({0})' -f $saved['readAt']
+    }
+    else {
+        'T2''s Azure portal path to its migration assessment (Azure had no assessment result for T2 at this deploy; the next ./scripts/deploy.ps1 reads it again)'
+    }
+    $estateEvidence = [ordered]@{ functionDeployed = ($null -ne $functionScope); invoked = $false; finding = 'R924'; t2MigrationReadAt = $(if ($null -ne $saved) { [string]$saved['readAt'] } else { '' }) }
+    if ($null -eq $functionScope) {
+        $estateMessage = 'The live estate function has no scope in this run (no configuration, or no subscription guard), so it reads nothing. The app shows the saved history and {0}; Database Hub shows the live estate.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message $estateMessage -Evidence $estateEvidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 with the configuration, which writes the function''s scope.' -DocUrl $estateDoc))
+    }
+    else {
+        $estateMessage = 'The app''s live views aren''t supported yet: Database Hub refuses the sign-in that Fabric gives the app''s functions (HTTP 401, found live 2026-11-19, R924), so the app''s pages and Ask say in one sentence that its live view isn''t available. What works: the app shows the saved history and {0}, and Database Hub''s own pages show the live estate. Nothing to fix here: the function asks Database Hub on every read, so Overview''s Live now shows tiles once Database Hub accepts that sign-in. A script can''t call the function to check it, because Fabric runs it only for a person signed in to the app.' -f $readiness
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message $estateMessage -Evidence $estateEvidence -DocUrl $estateDoc))
+    }
 }
 #endregion Step 6: deploy
 
@@ -458,6 +620,17 @@ elseif ($deployed -or $CheckOnly) {
     }
     else {
         # The workspace and model for Execute Queries, and whether this run deployed the app, for the browser check's note.
+        # The Azure CLI's Power BI token for the app's queries, taken right before them (F16). It needs the subscription guard
+        # this script ran; with a -FabricToken the caller passed, there's none, and the app's queries are checked only with
+        # -RayfinSignIn (Test-DemoFabricApp warns).
+        if (-not $RayfinSignIn -and $config -and $guarded) {
+            try {
+                $rayfinToken.PowerBI = Get-DemoPowerBIToken -SubscriptionId ([string]$config['subscriptionId'])
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries can''t be checked (FABRIC.APP.CONNECTOR says so; -RayfinSignIn checks them with the Rayfin CLI''s own sign-in): {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+            }
+        }
         $check = @{ StagePath = $stage; HostingUrl = $hostingUrl; ItemUrl = $itemUrl; Queries = $Queries; Token = $rayfinToken.PowerBI; WorkspaceId = $targetWorkspaceId; SemanticModelId = $modelId; Deployed = $deployed; RayfinSignIn = [bool]$RayfinSignIn }
         $results.AddRange([object[]]@(Test-DemoFabricApp @check))
     }
@@ -466,6 +639,38 @@ else {
     & $skip 'FABRIC.APP.CONNECTOR' 'The app wasn''t deployed in this run, so it wasn''t checked. Run with -CheckOnly to check the deployed app.'
 }
 #endregion Step 7: checks
+
+#region Step 8: Ask's relay and its origin
+# The relay serves the app's hosting origin only; rayfin up names it, so the relay is set again when it differs. Then the
+# relay is woken and checked as the app reaches it, and the tenant setting that would block it is read. Never a Fail.
+# -CheckOnly changes nothing: it checks the relay it found, with the origin of the app's last deployment.
+if ($null -ne $ask -and [string]$ask.Endpoint -and -not $DryRun) {
+    $origin = Get-DemoFabricAppOrigin -HostingUrl $hostingUrl -StagePath $stage
+    if ($origin -and $origin -ne [string]$ask.AllowedOrigins) {
+        $again = Invoke-DemoAskRelaySetup -Config $config -AllowedOrigin $origin -Confirm:$false
+        $kept = @($results | Where-Object { $_.checkId -ne 'ASK.RELAY' })
+        $results.Clear()
+        $results.AddRange([object[]]$kept)
+        $results.AddRange([object[]]@($again.Results))
+        $ask = $again
+    }
+    if ([string]$ask.Endpoint) {
+        $results.AddRange([object[]]@(Test-DemoAskRelay -Endpoint ([string]$ask.Endpoint) -Origin $origin -ClientIdSource ([string]$ask.ClientIdSource)))
+    }
+    $results.Add((Test-DemoAskCspSetting -Config $config -Token $FabricToken))
+}
+elseif ($CheckOnly -and $config -and $guarded -and $resourceGroupName) {
+    if ($askRelay) {
+        $origin = Get-DemoFabricAppOrigin -HostingUrl $hostingUrl -StagePath $stage
+        $ownClientId = $config['ask'] -is [System.Collections.IDictionary] -and ([string]$config['ask']['githubClientId']).Trim()
+        $results.AddRange([object[]]@(Test-DemoAskRelay -Endpoint $askRelay -Origin $origin -ClientIdSource $(if ($ownClientId) { 'config' } else { 'pinned' })))
+    }
+    else {
+        $results.Add((New-DemoResult -CheckId 'ASK.RELAY.HEALTH' -Area 'fabric' -Target 'subscription' -Status 'Not selected' -Message 'Ask''s chat relay isn''t deployed in this environment, so it wasn''t checked; the Copilot dock says Ask isn''t deployed.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 (or ./scripts/deploy.ps1): it deploys the relay, and ASK.RELAY says why when it can''t.' -DocUrl 'https://learn.microsoft.com/azure/container-apps/overview'))
+    }
+    $results.Add((Test-DemoAskCspSetting -Config $config -Token $FabricToken))
+}
+#endregion Step 8: Ask's relay and its origin
 
 # Without -FabricAdmin, tenant settings can't be read, but the check each one gates proves it's on for the operator:
 # creating or updating the item (Fabric Apps), and a DAX query through the connector (Execute Queries).

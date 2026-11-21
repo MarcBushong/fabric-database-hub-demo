@@ -5,7 +5,7 @@ Deploys and configures the whole demo with one command after 'az login', and con
 again (plan section 9.2, ADR 0011, Phase 28).
 
 .DESCRIPTION
-One command, one guided stop (Phase 28):
+One command, with no stop for a person (Phase 28; the PaygWizard guided stop is retired since 2026-11-09):
 - No configuration yet: it writes one first, as init.ps1 does (Initialize-DemoFirstRun: the same prompts, and the P6
   admin group created when it's missing and you may create it), then deploys. init.ps1 still works on its own. Since
   2026-11-09 neither asks how T2 gets SQL Server: a first deployment gets JumpstartImage, which needs nobody. Since
@@ -19,17 +19,19 @@ One command, one guided stop (Phase 28):
   (DEPLOY.T4.MISSING), or the run says why not (DEPLOY.T4.OFF).
 - It keeps this PC awake while it runs (Windows), writes the progress model out/deploy-progress.json and the live status
   page out/deploy-status.html, opens the page (in GitHub Codespaces it says how to preview it), and prints what to
-  expect: the timeline, and in PaygWizard mode when a person is needed and for how long. ./scripts/status.ps1 -Watch
-  shows the same view in a second terminal.
-- Without a golden snapshot it waits for T2's guest build in every install mode (up to -T2WaitMinutes, 180 by
-  default), and in PaygWizard mode it stops once for a person: Bastion opens, the browser opens archost01's page, and
-  the guest signs itself in and opens a pre-filled SQL Server setup, where you choose pay-as-you-go and Standard and
-  sign in to Azure (about 10 minutes, about 60 to 90 minutes after the start). It then finishes T2 by itself:
-  onboarding, PAYG, monitoring, and telemetry. -NoWaitForT2 opts out; GitHub Actions and other CI systems don't wait
-  unless -WaitForT2.
+  expect: the timeline. ./scripts/status.ps1 -Watch shows the same view in a second terminal.
+- Without a golden snapshot it waits for T2's guest build (up to -T2WaitMinutes, 180 by default), then finishes T2 by
+  itself: Arc onboarding, PAYG, monitoring, and telemetry. No T2 step needs a person (a configuration's PaygWizard runs
+  as JumpstartImage since 2026-11-09). -NoWaitForT2 opts out; GitHub Actions and other CI systems don't wait unless
+  -WaitForT2.
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
+- An update leaves the demo as it found it (2026-11-19): when the demo was stopped when the run began, a run that ends
+  DONE stops again what it started, through stop-demo.ps1's stop path (DEPLOY.ENDSTOP, the status page's last row), after
+  waiting for work it started that still needs the hosts (T2's first migration assessment, a bootstrap pass; at most 15
+  minutes). A new deployment, a demo that was running, a session that started meanwhile, and -KeepRunning keep it
+  running, and DONE says what it bills an hour, until when, and that ./scripts/stop-demo.ps1 stops it now.
 - The Insights app (APP_DatabaseHub_Insights) is part of every deployment. It deploys with your Azure CLI sign-in
   (az login, since 2026-11-09): each Rayfin CLI command gets a token for its own audience, so no browser opens. Only
   after Fabric refused that token in an earlier run does the Rayfin CLI's own browser sign-in (P14) start at the
@@ -174,11 +176,18 @@ deploy.ps1 starts again with the new code and the same parameters; anything else
 diverged, offline, no Git, a downloaded zip) is a Warning with the exact command, and the run goes on with the code in
 this folder (DEPLOY.SELFUPDATE, 2026-11-09). CI skips the check.
 
+.PARAMETER KeepRunning
+Leave what an update started running at its end, for a demo right after the update (2026-11-19). Without it, an update
+that found the demo stopped stops it again once it's DONE (DEPLOY.ENDSTOP). A new deployment keeps running either way.
+
 .EXAMPLE
 ./scripts/deploy.ps1
 
 .EXAMPLE
 ./scripts/deploy.ps1 -NoWaitForT2
+
+.EXAMPLE
+./scripts/deploy.ps1 -KeepRunning
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -229,7 +238,9 @@ param(
 
     [switch] $TreatManualAsError,
 
-    [switch] $NoSelfUpdate
+    [switch] $NoSelfUpdate,
+
+    [switch] $KeepRunning
 )
 
 Set-StrictMode -Version Latest
@@ -303,6 +314,8 @@ try {
     $outcome = $null
     $finished = $false
     $stopped = $false
+    # What the run's ending hands over even when Ctrl+C cuts it short (2026-11-19): its outcome, which this script reports.
+    $ending = @{}
     try {
         $parameters = @{
             Config                = $config
@@ -350,11 +363,24 @@ try {
         # Always one ending, even after Ctrl+C, and fast then: the model and the page say DONE or NOT DONE (Stopped, not
         # done, with the command to continue), and the PC may sleep again whatever happens (Phase 28 live finding).
         try {
-            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished)
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished) -KeepRunning:$KeepRunning -Ending $ending
         }
         finally {
             $null = Exit-DemoKeepAwake
             $awake = 'released'
+            # Ctrl+C during the ending's stop at the end of an update (2026-11-19): the ending finished in its own finally
+            # block, but a pipeline stop skips the rest of this one and everything after it, so its outcome is reported here:
+            # the report with what the ending added, out/deploy.jsonl, and DONE.
+            if ($null -eq $outcome -and $null -ne $ending['Outcome']) {
+                $endingOutcome = $ending['Outcome']
+                $endingResults = @($results)
+                if ($null -ne $endingOutcome.PSObject.Properties['Added']) {
+                    $endingResults = @($endingResults) + @($endingOutcome.Added | Where-Object { $null -ne $_ })
+                }
+                Write-DemoResultReport -Result $endingResults -Title 'deploy.ps1' -OutcomeDone:([string]$endingOutcome.Kind -eq 'Done') -DeployCommand ([string]$run.Command)
+                Export-DemoResult -Result $endingResults -Path $OutputPath
+                Write-DemoDeploymentOutcome -Outcome $endingOutcome -WorkspaceName $workspaceName
+            }
         }
         if (-not $finished) {
             Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName

@@ -1,20 +1,22 @@
 function Test-DemoActivityControl {
     <#
     .SYNOPSIS
-    Read-only checks of the optional on-demand activity control (ADR 0020), for validate.ps1's Workload area and
-    status.ps1.
+    Read-only checks of the session control (ADR 0020, ADR 0026), part of every deployment, for validate.ps1's Workload
+    area and status.ps1.
 
     .DESCRIPTION
-    With control.enabled false, one CONTROL.SETUP result that's Not selected. Otherwise:
+    control.enabled false no longer turns the control off (2026-11-14), so these always run:
     - CONTROL.SETUP: the Automation account, its three runbooks published (DbHub-Control, DbHub-Stop, and
       DbHub-Monitor), and the vault (its network access in the evidence). A runbook that's missing, such as
-      DbHub-Monitor before setup-activity-control.ps1 runs again after an update, is Manual action required.
+      DbHub-Monitor before ./scripts/deploy.ps1 runs again after an update, is Manual action required, with deploy.ps1 as
+      the fix.
     - CONTROL.WEBHOOK: the newest webhook and its secret: Pass with more than 14 days left, Warning within 14 days
       (setup-activity-control.ps1 -RotateWebhook), Manual action required when it has expired or is missing.
-    - CONTROL.ROLE.A1, CONTROL.ROLE.A2, CONTROL.ROLE.A3: Pass when present; Manual action required with the exact
-      -GrantRole command when missing (a redeploy deletes A1 with the demo resource group).
-    - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active); Warning for one that
-      should have run more than an hour ago.
+    - CONTROL.ROLE.A1 to CONTROL.ROLE.A4: Pass when present; a Warning with the exact grant command when missing (an
+      Owner's ./scripts/grant-safety-stop.ps1; a redeploy deletes A1 with the demo resource group).
+    - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active, or a start-demo.ps1 session
+      runs: its own auto-stop since 2026-11-19, with its time on the VMs' clock); Warning for one that should have run more
+      than an hour ago.
     - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop; Pass without it too while the
       nightly safety stop (ADR 0024), part of every deployment, is in place, because it stops T4 every night.
     Metadata only: no secret value is read.
@@ -23,7 +25,7 @@ function Test-DemoActivityControl {
     Configuration from Get-DemoConfig.
 
     .PARAMETER ConfigPath
-    The configuration file's path, for the -GrantRole command in remediations.
+    The configuration file's path, for the commands in remediations.
 
     .PARAMETER NowUtc
     For tests: the current time.
@@ -51,12 +53,15 @@ function Test-DemoActivityControl {
     $name = Get-DemoActivityControlName -Config $Config
     $setup = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
     $setup = $setup -replace ' -GrantRole$', ''
+    # The control's setup is part of every deploy.ps1 (ADR 0026); -RotateWebhook stays setup-activity-control.ps1's. Its
+    # -ConfigPath only when one was given, as T4's fixes say it: validate.ps1 and status.ps1 pass none.
+    $deploy = if ($ConfigPath) { './scripts/deploy.ps1 -ConfigPath {0}' -f $ConfigPath } else { './scripts/deploy.ps1' }
     $version = '2024-10-23'
 
     $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion $version)
     if (-not $account.Ok) {
         $status = if ($account.Missing) { 'Manual action required' } else { 'Warning' }
-        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status $status -Message ('{0} {1}.' -f $name.AutomationAccount, $(if ($account.Missing) { 'doesn''t exist: the control isn''t set up' } else { 'couldn''t be read: ' + $account.Error })) -Remediation ('Run {0}.' -f $setup) -DocUrl $doc))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status $status -Message ('{0} {1}.' -f $name.AutomationAccount, $(if ($account.Missing) { 'doesn''t exist: the control isn''t set up' } else { 'couldn''t be read: ' + $account.Error })) -Remediation ('Run {0}.' -f $deploy) -DocUrl $doc))
         return $results.ToArray()
     }
     $states = [ordered]@{}
@@ -69,7 +74,7 @@ function Test-DemoActivityControl {
     $evidence = [ordered]@{ automationAccount = $name.AutomationAccount; runbooks = $states; keyVault = $name.KeyVault; vaultPublicNetworkAccess = $access }
     $unpublished = @($states.Keys | Where-Object { $states[$_] -ne 'Published' })
     if ($unpublished.Count -gt 0 -or -not $vault.Ok) {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('The control is incomplete: {0}.' -f ((@($unpublished | ForEach-Object { '{0} is {1}' -f $_, $states[$_] }) + @(if (-not $vault.Ok) { '{0} is missing' -f $name.KeyVault })) -join '; ')) -Evidence $evidence -Remediation ('Run {0}.' -f $setup) -DocUrl $doc))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('The control is incomplete: {0}.' -f ((@($unpublished | ForEach-Object { '{0} is {1}' -f $_, $states[$_] }) + @(if (-not $vault.Ok) { '{0} is missing' -f $name.KeyVault })) -join '; ')) -Evidence $evidence -Remediation ('Run {0}.' -f $deploy) -DocUrl $doc))
     }
     else {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} has {1}, {2}, and {3} published; {4} has public network access {5}.' -f $name.AutomationAccount, $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook, $name.KeyVault, $access) -Evidence $evidence -DocUrl $doc))
@@ -101,8 +106,16 @@ function Test-DemoActivityControl {
         $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The auto-stop schedule couldn''t be read: {0}' -f $autostop.Error) -DocUrl $stopDoc))
     }
     else {
-        $start = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $autostop.Value -Name 'properties') -Name 'startTime')
-        if ($null -ne $start -and $start -gt $NowUtc) {
+        $properties = Get-DemoMemberValue -InputObject $autostop.Value -Name 'properties'
+        $start = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
+        # start-demo.ps1's own auto-stop (2026-11-19): its description begins with the marker.
+        $startDemo = ([string](Get-DemoMemberValue -InputObject $properties -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+        if ($null -ne $start -and $start -gt $NowUtc -and $startDemo) {
+            $shutdown = Get-DemoAutoShutdownSetting -Config $Config
+            $local = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($start, [System.DateTimeKind]::Utc), $shutdown.Zone)
+            $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('A start-demo.ps1 session runs; its auto-stop deallocates the VMs and stops T4 at {0:yyyy-MM-dd HH:mm} UTC ({1:HH:mm} {2}). ./scripts/stop-demo.ps1 stops the demo sooner.' -f $start, $local, $shutdown.TimeZoneId) -Evidence ([ordered]@{ autoStopUtc = $start; startDemo = $true }) -DocUrl $stopDoc))
+        }
+        elseif ($null -ne $start -and $start -gt $NowUtc) {
             $results.Add((New-DemoResult -CheckId 'CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('An on-demand run is active; its auto-stop deallocates the VMs and stops T4 at {0:yyyy-MM-dd HH:mm} UTC.' -f $start) -Evidence ([ordered]@{ autoStopUtc = $start }) -DocUrl $stopDoc))
         }
         elseif ($null -ne $start -and $start -lt $NowUtc.AddHours(-1)) {

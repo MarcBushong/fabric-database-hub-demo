@@ -21,7 +21,7 @@ The module functions are `Export-DemoRealTimeDashboard` (build), `Get-DemoFabric
 
 | Page | Tiles | Answers |
 |---|---|---|
-| **Estate pulse** | A note on the data; **Freshness per target** (multi stat); **Reporting per target**: tables, rows, instances, and the newest sample (table); **Telemetry heartbeat**: CPU samples per bin (time chart) | Is every target reporting, and how fresh is its newest sample? A target with no data in the range shows as **No data**, never as a zero. |
+| **Estate pulse** | A note on the data, with Database Hub's link for T4's and Azure Cosmos DB's real-time dashboards; **Freshness per target** (multi stat); **Reporting per target**: tables, rows, instances, and the newest sample (table); **Telemetry heartbeat**: CPU samples per bin (time chart) | Is every target reporting, and how fresh is its newest sample? A target with no data in the range shows as **No data**, never as a zero. |
 | **Incident** | **Processes blocked, latest sample** (multi stat); processes blocked; waits by category in seconds per bin (Lock means blocking); active sessions in `ContosoCare`; batch requests per second; CPU % (time charts) | What changed during the incident, side by side? |
 | **Resources** | **CPU, 95th percentile over the time range** (multi stat); CPU %; largest memory clerks; data and log IO (charts); storage IO over the range (table) | Where is the load: CPU, memory, or storage IO? |
 
@@ -96,7 +96,7 @@ The token is your Fabric token, from `-FabricToken` or the signed-in Azure CLI a
 
 ## The Database Hub template wizard, for comparison
 
-Database Hub's **Performance** page has **Create SQL monitors from template**, which builds a Real-Time Dashboard, or a page in an existing one, in a workspace you pick ([Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql)). It's UI-only, with no API ([automation support matrix](../../docs/automation-support-matrix.md), row 34). The 30-minute walkthrough runs it live, then opens this dashboard: "the same telemetry, governed and versioned" ([walkthrough, beat 5](../../docs/demo-walkthrough.md#beat-5-13001600-a-monitor-from-a-template-and-the-dashboard-as-code)). The two can live side by side. `destroy.ps1` deletes the demo's workspace, with this dashboard, only when everything in it is the demo's: a wizard's dashboard saved there as its own item keeps the workspace, and everything in it, so delete that dashboard first, or the workspace yourself ([delete everything](../../README.md#delete-everything)).
+Database Hub's **Performance** page has **Create SQL monitors from template**, which builds a Real-Time Dashboard, or a page in an existing one, in a workspace you pick ([Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql)). It's UI-only, with no API ([automation support matrix](../../docs/automation-support-matrix.md)). The 30-minute walkthrough runs it live, then opens this dashboard: "the same telemetry, governed and versioned" ([walkthrough, beat 5](../../docs/demo-walkthrough.md#beat-5-13001600-a-monitor-from-a-template-and-the-dashboard-as-code)). The two can live side by side. `destroy.ps1` deletes the demo's workspace, with this dashboard, only when everything in it is the demo's: a wizard's dashboard saved there as its own item keeps the workspace, and everything in it, so delete that dashboard first, or the workspace yourself ([delete everything](../../README.md#delete-everything)).
 
 ## Live results (2026-10-21)
 
@@ -122,6 +122,7 @@ The item ID is only in `out/`, which Git ignores. Phase 20's end-to-end run repe
 - **One instance per target:** the shared counter-delta body adds up the series of a target, so the batch-request rate is exact for one SQL Server instance per target, which is the demo's layout.
 - **T3 storage latency** is empty: per-file IO latency from the telemetry isn't supported for Azure SQL Database.
 - **Pass-through only:** a viewer without Reader on the subscription sees empty tiles, not an error; the Estate pulse page shows **No data**.
+- **SQL only, T1 to T3 (2026-11-18):** the telemetry endpoint covers Microsoft SQL, so T4 (PostgreSQL) and Azure Cosmos DB aren't tiles here. The note on **Estate pulse** points to Database Hub's own real-time dashboards for PostgreSQL and Azure Cosmos DB on **Performance**, generally available since 2026-11-17, rather than a Log Analytics workspace or a second data source (ADR 0019's follow-up, the coordinator's decision of 2026-11-18). Database Hub has no API to link one of its dashboards directly, so the note opens Database Hub.
 
 ## Sources (checked 2026-10-21)
 

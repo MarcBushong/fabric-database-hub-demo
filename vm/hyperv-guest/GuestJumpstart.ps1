@@ -284,7 +284,7 @@ function Save-DemoJumpstartImage {
     )
 
     if (Get-VM -Name $Context.GuestName -ErrorAction SilentlyContinue) {
-        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} exists, but its Jumpstart image record (jumpstart-image.json) is missing, so its disk is never replaced. Rebuild T2: ./scripts/destroy.ps1, then ./scripts/deploy.ps1 (docs/troubleshooting.md).' -f $Context.GuestName))
+        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} exists, but its Jumpstart image record (jumpstart-image.json) is missing, so its disk is never replaced. Rebuild T2: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1 (docs/troubleshooting.md).' -f $Context.GuestName))
     }
     $pin = Get-DemoJumpstartPin -Context $Context
     $settings = $Context.Host.JumpstartImage

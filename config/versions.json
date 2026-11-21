@@ -46,6 +46,21 @@
     },
     "itemName": "APP_DatabaseHub_Insights",
     "itemType": "AppBackend",
+    "backendItems": {
+      "note": "2026-11-19: what the app's backend creates in the demo's workspace beside the app item (itemType, itemName), by type and display name; {itemName} is itemName. It creates a user data function for the app's connectors when rayfin up applies their configuration ({itemName}_connector, seen live on 2026-11-17), and one for its functions when rayfin up deploys services.functions ({itemName}, the app's own name: the live estate and Manage, since 2026-11-18). Seen live on 2026-11-19: the probe app APP_InsightsProbe's workspace held AppBackend and UserDataFunction APP_InsightsProbe, and dbhubc6's destroy kept its workspace for UserDataFunction APP_DatabaseHub_Insights. destroy.ps1 deletes the demo's workspace only when everything in it is the demo's (Get-DemoFabricDemoItem reads this list), so a backend item missing here keeps every workspace. The pinned CLI (Rayfin CLI 1.36.2) creates nothing else: no Fabric connection, Microsoft Entra app, or service principal, and a lakehouse or SQL database only for services.data or services.storage, which rayfin.yml leaves off; a Pester test holds this list to rayfin.yml.",
+      "items": [
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}_connector",
+          "for": "connectors"
+        },
+        {
+          "type": "UserDataFunction",
+          "name": "{itemName}",
+          "for": "functions"
+        }
+      ]
+    },
     "connectorName": "history",
     "assetAccess": "protected",
     "semanticModelName": "SM_DatabaseHub_History",
@@ -76,9 +91,10 @@
     "avm/res/network/network-security-group": "0.5.4"
   },
   "apiVersions": {
-    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
+    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference; 2026-11-18: Microsoft.Sql/servers/databases/automaticTuning, which status.ps1 and stop-demo.ps1 read for T3's FORCE_LAST_GOOD_PLAN (read-only since the 2026-11-18 review: stop-demo.ps1 puts a demo hold back through T3 itself), from the Database Automatic Tuning REST reference, and Microsoft.Authorization/permissions, which reads whether the signed-in account can save T3 in Database agent settings, from the Permissions - List For Resource reference, both checked 2026-11-18; and Microsoft.DocumentDB/databaseAccounts and its sqlDatabases, containers, and sqlRoleAssignments for T5 in infra/modules/cosmos01.bicep and cosmos01-access.bicep, the newest generally available version Bicep 0.47.16 has types for (2026-01-01 has none), checked 2026-11-18; and Microsoft.App/managedEnvironments and containerApps for Ask's chat relay in infra/ask (ADR 0028), the newest stable version Bicep 0.47.16 has types for, from the Container Apps template reference). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
     "Microsoft.Authorization/denyAssignments": "2022-04-01",
     "Microsoft.Authorization/locks": "2020-05-01",
+    "Microsoft.Authorization/permissions": "2022-04-01",
     "Microsoft.Authorization/roleAssignments": "2022-04-01",
     "Microsoft.AzureArcData/sqlServerInstances": "2026-01-01",
     "Microsoft.Compute/disks": "2025-01-02",
@@ -102,6 +118,7 @@
     "Microsoft.SqlVirtualMachine/sqlVirtualMachines": "2023-10-01",
     "Microsoft.Sql/servers": "2025-01-01",
     "Microsoft.Sql/servers/databases": "2025-01-01",
+    "Microsoft.Sql/servers/databases/automaticTuning": "2025-01-01",
     "Microsoft.Sql/servers/virtualNetworkRules": "2025-01-01",
     "Microsoft.Network/privateEndpoints": "2025-09-01",
     "Microsoft.Network/privateEndpoints/privateDnsZoneGroups": "2025-09-01",
@@ -116,7 +133,13 @@
     "Microsoft.Automation/automationAccounts/webhooks": "2024-10-23",
     "Microsoft.Automation/automationAccounts/variables": "2024-10-23",
     "Microsoft.KeyVault/vaults/secrets": "2026-02-01",
-    "Microsoft.Fabric/capacities": "2023-11-01"
+    "Microsoft.Fabric/capacities": "2023-11-01",
+    "Microsoft.App/managedEnvironments": "2025-07-01",
+    "Microsoft.App/containerApps": "2025-07-01",
+    "Microsoft.DocumentDB/databaseAccounts": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlDatabases": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers": "2025-10-15",
+    "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments": "2025-10-15"
   },
   "arc": {
     "note": "Azure Arc onboarding of the T2 guest and SQL Server enabled by Azure Arc (Phase 7, ADR 0005, ADR 0006). Checked on Microsoft Learn on 2026-10-20; the source of each value is in docUrls.",
@@ -141,6 +164,10 @@
       "licenseType": "PAYG"
     },
     "monitoringApiVersion": "2023-09-01-preview",
+    "migrationAssessment": {
+      "description": "Migration assessment of SQL Server enabled by Azure Arc (2026-11-18, for Database Hub's Optimization insights, generally available 2026-11-17): free for every edition, run weekly on Sundays at 23:00 on the machine's clock and on demand, and it needs the Azure extension for SQL Server at minimumExtensionVersion or later (migration-assessment, checked 2026-11-18). configure-arc.ps1 turns it on through Sql Server Instances - Update (properties.migration.assessment.enabled) and starts a run through Sql Server Instances - Run Migration Assessment until the first assessment is uploaded, both with the sqlServerInstances API version in apiVersions.",
+      "minimumExtensionVersion": "1.1.2594.118"
+    },
     "billing": {
       "description": "Pay-as-you-go SQL Server on a virtual machine is metered on the virtual cores available to the operating system environment, with a minimum of four cores per OSE (manage-license-billing, Metering section, checked 2026-10-20). configure-arc.ps1 records the instance's vCore and cores properties as evidence.",
       "minimumCoresPerOse": 4
@@ -157,6 +184,9 @@
       "configuration": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-configuration",
       "licenseBilling": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing",
       "monitoring": "https://learn.microsoft.com/sql/sql-server/azure-arc/sql-monitoring",
+      "migrationAssessment": "https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment",
+      "sqlInstancesUpdate": "https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/update",
+      "runMigrationAssessment": "https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/run-migration-assessment",
       "deleteFromArc": "https://learn.microsoft.com/sql/sql-server/azure-arc/delete-from-azure-arc",
       "evaluateOnAzureVm": "https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine"
     }
@@ -244,6 +274,67 @@
       "verifiedOn": "2026-11-13"
     },
     "verifiedOn": "2026-10-23"
+  },
+  "cosmosdb": {
+    "note": "T5 (2026-11-18, ADR 0027): an Azure Cosmos DB for NoSQL account, cosmos01-<deploymentId>, with local (key) authentication off, so Microsoft Entra only; a private endpoint in snet-pe in both network modes, with public network access off; the database contosocare and the container patient-events (partition key /patientId) at 400 RU/s of manual throughput, the minimum for a container; the subscription's one free-tier account when it's free, which Azure sets only at creation (enableFreeTier) and which covers 1,000 RU/s and 25 GB. T1's managed identity has the Cosmos DB Built-in Data Contributor data-plane role on the account (a sqlRoleAssignment, which Contributor can create: it isn't an Azure role assignment). The runner reaches it through the documented REST API over HTTPS 443 (gateway), with a Microsoft Entra token. Database Hub reads it from Azure Monitor platform metrics, with no setup. An account has no stop, so since 2026-11-19 the container, the only part whose throughput bills by the hour, exists only during a session once the session control's role can create it (the resource group's DbHubT5Container tag is Session): start-demo.ps1 and Run all create it, and stop-demo.ps1, the session's end, and the nightly safety stop delete it; the account, the database (no throughput of its own), the private endpoint, and the DNS zone stay (ADR 0027).",
+    "accountNamePrefix": "cosmos01",
+    "databaseName": "contosocare",
+    "containerName": "patient-events",
+    "partitionKeyPath": "/patientId",
+    "throughputRUs": 400,
+    "freeTierRUs": 1000,
+    "freeTierStorageGB": 25,
+    "estimatedStorageGB": 1,
+    "dataContributorRoleDefinitionId": "00000000-0000-0000-0000-000000000002",
+    "privateDnsZoneName": "privatelink.documents.azure.com",
+    "privateEndpointGroupId": "Sql",
+    "containerNote": "The container's definition, in one place (2026-11-19, ADR 0027): infra/modules/cosmos01.bicep creates it from these values, and since the container exists only during a session, the scripts (New-DemoT5Container) and the session control's runbooks (New-DbHubT5Container) create it again through Azure Resource Manager with the same body (Sql Resources - Create Update Sql Container). Hash partitioning, version 2; every path indexed except the documents' payload filler and _etag.",
+    "partitionKeyVersion": 2,
+    "indexingPolicy": {
+      "indexingMode": "consistent",
+      "automatic": true,
+      "includedPaths": [
+        {
+          "path": "/*"
+        }
+      ],
+      "excludedPaths": [
+        {
+          "path": "/payload/?"
+        },
+        {
+          "path": "/\"_etag\"/?"
+        }
+      ]
+    },
+    "metrics": {
+      "note": "The Azure Monitor metrics Database Hub's Cosmos DB views chart (monitor-cosmos-db, checked 2026-11-18): Normalized RU Consumption (Maximum), Total Request Units (Total), Throttled Requests (TotalRequests filtered to StatusCode 429, Count), Provisioned throughput (Maximum), Avg Latency (ServerSideLatencyDirect, Average: direct mode only, so the runner's gateway requests leave it empty), and Availability (ServiceAvailability, Average, hourly). Read by status.ps1, validate.ps1, and the history snapshot with az monitor metrics list.",
+      "hub": [
+        "NormalizedRUConsumption",
+        "TotalRequestUnits",
+        "TotalRequests",
+        "ProvisionedThroughput",
+        "ServiceAvailability"
+      ],
+      "throttledDimension": "StatusCode",
+      "throttledStatusCode": "429"
+    },
+    "docUrls": {
+      "hubMonitor": "https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db",
+      "dataPlaneRbac": "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
+      "disableLocalAuth": "https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control",
+      "privateEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints",
+      "freeTier": "https://learn.microsoft.com/azure/cosmos-db/free-tier",
+      "normalizedRu": "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
+      "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
+      "metrics": "https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-documentdb-databaseaccounts-metrics",
+      "restAuthorization": "https://learn.microsoft.com/rest/api/cosmos-db/access-control-on-cosmosdb-resources",
+    "createContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/create-update-sql-container",
+    "deleteContainer": "https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/delete-sql-container",
+    "provisionThroughput": "https://learn.microsoft.com/azure/cosmos-db/set-throughput",
+      "pricing": "https://azure.microsoft.com/pricing/details/cosmos-db/autoscale-provisioned/"
+    },
+    "verifiedOn": "2026-11-18"
   },
   "vmImages": {
     "note": "Marketplace images; 'latest' is resolved by Azure at creation. Preflight reads t1 to resolve securityType.t1 = Auto (ADR 0003).",
@@ -352,7 +443,7 @@
     }
   },
   "databaseHub": {
-    "note": "Database Hub (preview) validation settings (Phase 9). Hub has no public API or ARM resource, so the validators use only these documented interfaces; the repo never calls private Hub routes. The telemetry endpoint and schema can change during the preview: re-read docUrl before you change a value. KQL templates live in scripts/modules/DbHubDemo/Kql.",
+    "note": "Database Hub validation settings (Phase 9; Database Hub is generally available since 2026-11-17, and Learn still labels its telemetry endpoint a preview). Hub has no public API or ARM resource, so the validators use only these documented interfaces; the repo never calls private Hub routes, except the Insights app's estate function, under ADR 0013's narrow exception (8 read-only routes, the demo's own resource group; tests/unit/DbHubDemo.HubKql.Tests.ps1 pins them). The telemetry endpoint and schema can change during the preview: re-read docUrl before you change a value. KQL templates live in scripts/modules/DbHubDemo/Kql.",
     "telemetry": {
       "queryUrl": "https://adx.centralus.arcdataservices.com/kusto/v1/rest/query",
       "connectionUri": "https://adx.centralus.arcdataservices.com/kusto/",
@@ -421,27 +512,45 @@
     "localTestPostgresImage": "postgres:18.6-bookworm"
   },
   "agentPlugins": {
-    "note": "Agent plugins for the skills fallback (ADR 0013, fabric/agent/README.md). Copilot CLI ('copilot plugin marketplace add owner/repo#ref') and VS Code ('chat.plugins.marketplaces' with 'owner/repo#<commit>') install from the marketplace repository at 'marketplace.commit', so both hosts get the versions below. Move the pin only after re-running the prompt pack; a Pester test keeps the install guide on this commit. The Learn MCP server is a remote endpoint and has no version; 'learnMcp.plugin*' records the optional microsoft-docs plugin.",
-    "verifiedOn": "2026-10-20",
-    "marketplace": {
-      "name": "microsoft-sql",
-      "repository": "microsoft/microsoft-sql",
-      "url": "https://github.com/microsoft/microsoft-sql",
-      "commit": "eeb1c6867c2d128763516a1aad41671c593cc189",
-      "version": "1.0.0"
+    "note": "Agent plugins for the presenter's local fallback (ADR 0013, fabric/agent/README.md): GitHub Copilot CLI or VS Code. The Database Hub skill is the GA databasehub-cli from Microsoft's skills-for-fabric marketplace (fabric-collection, bundle fabric-skills); the SQL diagnostics stay on the microsoft-sql marketplace. Copilot CLI ('copilot plugin marketplace add owner/repo#ref') and VS Code ('chat.plugins.marketplaces' with 'owner/repo#<commit>') install from each marketplace at its 'commit', so both hosts get the versions below. The Insights app's Copilot dock (ADR 0028) doesn't use the skill: its estate function reads the same Database Hub routes itself. Move a pin only after re-running the prompt pack; a Pester test keeps the install guide on these commits. The Learn MCP server is a remote endpoint and has no version; 'learnMcp.plugin*' records the optional microsoft-docs plugin.",
+    "verifiedOn": "2026-11-18",
+    "marketplaces": {
+      "fabric-collection": {
+        "repository": "microsoft/skills-for-fabric",
+        "url": "https://github.com/microsoft/skills-for-fabric",
+        "commit": "e31422e7d1045ef3a0906df9ff5991f2338af010",
+        "version": "0.3.22"
+      },
+      "microsoft-sql": {
+        "repository": "microsoft/microsoft-sql",
+        "url": "https://github.com/microsoft/microsoft-sql",
+        "commit": "eeb1c6867c2d128763516a1aad41671c593cc189",
+        "version": "1.0.0"
+      }
     },
     "plugins": {
-      "microsoft-sql-fdh": {
-        "version": "1.0.0",
+      "fabric-skills": {
+        "marketplace": "fabric-collection",
+        "version": "0.3.22",
         "skillsUsed": [ "databasehub-cli" ]
       },
       "microsoft-sql": {
+        "marketplace": "microsoft-sql",
         "version": "1.0.0",
         "skillsUsed": [ "diagnose-blocking-and-deadlocks", "diagnose-resource-pressure", "diagnose-slow-query", "read-execution-plan" ]
       },
       "microsoft-sql-vscode": {
+        "marketplace": "microsoft-sql",
         "version": "1.0.0",
         "note": "Instead of microsoft-sql in VS Code with the MSSQL extension; install one of the two, never both."
+      }
+    },
+    "skills": {
+      "databasehub-cli": {
+        "note": "The GA Database Hub skill (2026-11-17), in the fabric-skills bundle. Its content last changed in commit (release 0.3.21), the commit this pin names; APM installs it alone: apm install microsoft/skills-for-fabric --skill databasehub-cli --target copilot -g --only apm.",
+        "repository": "microsoft/skills-for-fabric",
+        "path": "skills/databasehub-cli",
+        "commit": "c13604ae6f4fb727ac7bc74784eeff4332433c63"
       }
     },
     "learnMcp": {
@@ -450,6 +559,22 @@
       "pluginRepository": "MicrosoftDocs/mcp",
       "pluginVersion": "0.3.1",
       "pluginCommit": "f8ffde185dfd232dbf5d187c22ce299eadc3d583"
+    }
+  },
+  "askRelay": {
+    "note": "The Insights app's Copilot dock (Ask, ADR 0028). 'image' is the chat relay's container image, built by .github/workflows/ask-relay-image.yml from ask-relay/ and pinned here by digest (the first publish from this public repository made its package public, and a public package can't be made private again, only deleted; a fork's or a private copy's package can start private, GitHub's default for a new package: https://docs.github.com/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility; an anonymous pull of the pinned digest worked on 2026-11-19); deploy.ps1 runs exactly this digest, and while it's empty or can't be pulled Ask isn't deployed (a Warning, never a Fail). 'githubClientId' is the public client ID of the GitHub OAuth App 'Database Hub Insights Ask' (owned by MarcBushong; device flow, no client secret), so a deployer registers nothing. demo.config.json overrides both: 'ask.image' (an image Container Apps can pull without credentials) and 'ask.githubClientId'. 'buildImage' and 'runtimeImage' are ask-relay/Dockerfile's MCR bases (the runtime is distroless and non-root), and 'copilotSdk' its @microsoft/copilot-sdk; a Pester test keeps them in step.",
+    "verifiedOn": "2026-11-19",
+    "image": "ghcr.io/marcbushong/fabric-database-hub-demo/ask-relay@sha256:85fdef25f31dae17ad7b381857d47db67cec79d51dca04363d004654aaaea487",
+    "imageRepository": "ghcr.io/marcbushong/fabric-database-hub-demo/ask-relay",
+    "githubClientId": "Ov23li4Z8nL4XtaoR4s8",
+    "copilotSdk": "2.0.0",
+    "buildImage": "mcr.microsoft.com/azurelinux/base/nodejs:24.22.3-1-azl3.0.20261116@sha256:1c87a74ac10b0ad7711bcc862fa6a2b13e6a4db96d3a026dbb7fcf8486d57ba3",
+    "runtimeImage": "mcr.microsoft.com/azurelinux/distroless/nodejs:24.22.3-1-nonroot-azl3.0.20261116@sha256:64653c45a2fe9899f744e00716b140a3ea7d2202deb3a9d6307ddf62732e3e3c",
+    "containerApp": {
+      "cpu": 1.0,
+      "memory": "2Gi",
+      "minReplicas": 0,
+      "maxReplicas": 1
     }
   }
 }

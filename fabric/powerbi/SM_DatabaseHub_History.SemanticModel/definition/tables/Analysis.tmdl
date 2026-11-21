@@ -15,13 +15,13 @@ table Analysis
         sourceColumn: [Analysis]
         sortByColumn: 'Analysis Sort'
 
-    /// The signal area: Estate, CPU, Locks and blocking, Throughput, Waits, IO, Memory, Storage, Readiness, Incidents, or PostgreSQL.
+    /// The signal area: Estate, CPU, Locks and blocking, Throughput, Waits, IO, Memory, Storage, Readiness, Incidents, PostgreSQL, or Cosmos DB.
     column 'Analysis Group'
         dataType: string
         isNameInferred
         sourceColumn: [Analysis Group]
 
-    /// What one row means: per bin, per analysis window, latest sample, per incident, or per run.
+    /// What one row means: per bin, per analysis window, latest sample, per incident, per agent beat, or per run.
     column Grain
         dataType: string
         isNameInferred
@@ -56,6 +56,8 @@ table Analysis
                         { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
                         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
                         { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
-                        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 }
+                        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
+                        { "database_agent", "Database Agent loop", "Incidents", "Per agent beat", 18 },
+                        { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 19 }
                     }
                 )

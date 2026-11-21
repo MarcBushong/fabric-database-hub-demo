@@ -12,7 +12,7 @@
     "applicable": ["T1", "T2", "T3"],
     "default": ["T2"],
     "notes": {
-      "T3": "Azure SQL Database honors MIN_GRANT_PERCENT within the service objective's memory, so the queue forms sooner at 1 vCore."
+      "T3": "Azure SQL Database honors MIN_GRANT_PERCENT within the service objective's memory, at most 6 GB at 2 vCores, so the queue forms sooner than on T1 and T2."
     }
   },
   "parameters": {

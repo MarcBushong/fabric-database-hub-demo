@@ -57,7 +57,8 @@ function Initialize-DemoFirstRun {
     $existing = Get-DemoMemberValue -InputObject $init -Name 'Existing'
     $note = @([string](Get-DemoMemberValue -InputObject $existing -Name 'Note') | Where-Object { $_ })
     $open = @($results | Where-Object { [string]$_.status -in 'Fail', 'Manual action required' })
-    $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
+    # The run's own command, with its -ConfigPath (2026-11-19), so a copied command never deploys config/demo.config.json.
+    $resume = 'If this window closes or the PC restarts, run {0} again; it continues where it stopped.' -f $command
     if ([bool]$init.Written -and $open.Count -eq 0) {
         Write-DemoLog -Message ('The configuration is written ({0}); deploy.ps1 goes on with the deployment.' -f (Split-Path -Path $full -Leaf))
         return [pscustomobject]@{ Ran = $true; Ready = $true; Results = $results; Path = $full; NextSteps = @($init.NextSteps); Outcome = $null; Note = $note }
@@ -68,7 +69,7 @@ function Initialize-DemoFirstRun {
             Kind        = 'WhatIf'
             Done        = $false
             Reason      = $(if ($fails.Count -gt 0) { 'What if: the first-run setup found a problem ({0}), so nothing would be deployed.' -f $fails[0].checkId } else { 'What if: deploy.ps1 would write the configuration first (the results above say what it would hold), then deploy. Nothing was written or deployed.{0}' -f $(if ($note.Count -gt 0) { ' ' + $note[0] } else { '' }) })
-            Next        = 'Run ./scripts/deploy.ps1 without -WhatIf to write the configuration and deploy.'
+            Next        = ('Run {0} without -WhatIf to write the configuration and deploy.' -f $command)
             NextCommand = $command
             Notes       = @()
             Optional    = @()

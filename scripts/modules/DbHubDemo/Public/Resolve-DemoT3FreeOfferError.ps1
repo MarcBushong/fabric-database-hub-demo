@@ -13,11 +13,15 @@ function Resolve-DemoT3FreeOfferError {
     checked 2026-10-20), so the match is deliberately conservative: an error detail must name the offer
     itself - the useFreeLimit or freeLimitExhaustionBehavior property, or a phrase such as "free database",
     "free offer", "free limit", or "paid database to free database". A generic code such as
-    ProvisioningDisabled or DeploymentFailed alone never matches. A false match would be expensive: an
+    ProvisioningDisabled or DeploymentFailed alone never matches, and neither does "free tier" or an error detail
+    about Azure Cosmos DB (review, 2026-11-19): T5's account refuses its own free tier with "Free tier is not supported
+    for Internal subscriptions" or "Free tier has already been applied ...", which must never move T3 off its offer. A
+    false match would be expensive: an
     existing database can't be converted to the free offer, so T3 would stay on regular pricing until
     'stop-demo.ps1 -RemoveT3' recreates it. A missed match only fails the deployment, with Azure's own
-    error. Known example (community report, 2026-05): "ProvisioningDisabled: Cannot update paid database to
-    free database."
+    error. Known examples: "ProvisioningDisabled: Cannot update paid database to free database." (community report,
+    2026-05) and "ProvisioningDisabled: Provisioning of free limit database is not supported for provided service level
+    objective or region" (Microsoft Q&A, 2026-09). Invoke-DemoTemplateDeployment checks T5's free-tier refusal first.
 
     Returns IsFreeOfferError, Code (the closest error code, or empty), Message (redacted, at most 300
     characters), and Result (a T3.FREEOFFER Warning when IsFreeOfferError, otherwise $null).
@@ -38,7 +42,10 @@ function Resolve-DemoT3FreeOfferError {
         [string] $ErrorText
     )
 
-    $offerPattern = '(?i)\buseFreeLimit\b|\bfreeLimitExhaustionBehavior\b|\bfree[ -](?:database|db|offer|limit|tier|amount)s?\b|paid database to free database'
+    $offerPattern = '(?i)\buseFreeLimit\b|\bfreeLimitExhaustionBehavior\b|\bfree[ -](?:database|db|offer|limit|amount)s?\b|paid database to free database'
+    # An error detail about Azure Cosmos DB (T5's free tier, ADR 0027) is never T3's. Microsoft.Azure.Documents is the
+    # Cosmos DB resource provider's own suffix on its errors (live, 2026-11-18).
+    $cosmosPattern = '(?i)cosmos|documentdb|Microsoft\.Azure\.Documents|documents\.azure\.com'
     $text = [string]$ErrorText
     $verdict = [pscustomobject]@{
         PSTypeName       = 'DbHubDemo.T3FreeOfferError'
@@ -64,10 +71,14 @@ function Resolve-DemoT3FreeOfferError {
         $pairs.Add([pscustomobject]@{ Code = $match.Groups['code'].Value; Message = $match.Groups['message'].Value })
     }
 
-    $hit = $pairs | Where-Object { $_.Message -match $offerPattern -or $_.Code -match $offerPattern } | Select-Object -First 1
+    $hit = $pairs | Where-Object { ($_.Message -match $offerPattern -or $_.Code -match $offerPattern) -and $_.Message -notmatch $cosmosPattern } | Select-Object -First 1
     if (-not $hit) {
-        # The offer is named, but not inside a recognizable error detail: use the line that names it.
-        $line = @($text -split '\r?\n' | Where-Object { $_ -match $offerPattern }) | Select-Object -First 1
+        # The offer is named, but not inside a recognizable error detail: use the line that names it, unless it's about
+        # Azure Cosmos DB.
+        $line = @($text -split '\r?\n' | Where-Object { $_ -match $offerPattern -and $_ -notmatch $cosmosPattern }) | Select-Object -First 1
+        if (-not $line) {
+            return $verdict
+        }
         $hit = [pscustomobject]@{ Code = ''; Message = $line }
     }
 

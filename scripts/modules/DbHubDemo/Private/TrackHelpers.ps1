@@ -327,7 +327,9 @@ function Get-DemoTrackStep {
     # -FromStage and -StopAfter onto the tracks (ADR 0018). T1's T3Setup belongs to stage T3 but runs first:
     # T3's telemetry starts about 10 minutes after its setup (live, 2026-10-22). T4 (Phase 24, ADR 0019) has a
     # track for the server's checks and its Azure Monitor metrics; its setup is T1's T4 step, because T1's
-    # runner does it through action Run Command, one at a time on sqlvm01. Internal.
+    # runner does it through action Run Command, one at a time on sqlvm01. T5 (2026-11-18, ADR 0027) is one of T1's steps:
+    # T5 (the account's checks and the runner's warmup through T1, in stage T4, which -FromStage T4 runs); its Azure
+    # Monitor metrics (METRICS.T5) are read in the run's validation, once T1's activity has given it requests. Internal.
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
     param(
@@ -337,7 +339,7 @@ function Get-DemoTrackStep {
     )
 
     switch ($Track) {
-        'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
+        'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; T5 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
         'T2' { return [ordered]@{ Restore = 'Artifacts'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T2 = 'T2'; Telemetry = 'Validation' } }
         'T4' { return [ordered]@{ Server = 'T4'; Replica = 'T4'; Telemetry = 'Validation' } }
         default { return [ordered]@{ Fabric = 'Fabric' } }
@@ -813,9 +815,11 @@ function Invoke-DemoDeploymentTrack {
       parallel), Bootstraps (the loader; then T1's monitoring merge while the bootstrap runs; then T1 Ready),
       T3 (the T3Setup results, or the same work again when they didn't pass, then T3's workload and checks),
       T4 (Enable-DemoT4Workload: T1 sets T4 up through the P6 group; a T4 failure is reported but doesn't stop
-      T1's track), Activity (T1, T3, and T4: the activity profile's interim, baseline in place of a profile with
-      incidents, which deploy.ps1 switches at its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
-      Database Hub).
+      T1's track), T5 (2026-11-18, ADR 0027: Test-DemoT5, then the runner's warmup through T1, which proves T1's
+      data-plane access to the Cosmos DB account; a T5 failure doesn't stop T1's track either), Activity (T1, T3, T4,
+      and T5: the activity profile's interim, baseline in place of a profile with incidents, which deploy.ps1 switches at
+      its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in Database Hub). T5's metrics
+      (METRICS.T5) are read in the run's validation, after the tracks.
     - T4 (Phase 24, ADR 0019): Server (Test-DemoT4: the server, its version and size, Entra-only, the network,
       the P6 administrator, the database, the enhanced metrics), Replica (2026-11-13, ADR 0025: T4's read replica, created
       once T1's T4 step has restarted T4, with its checks, its place in Database Hub's Estate, and its Read replica lag in
@@ -887,6 +891,8 @@ function Invoke-DemoDeploymentTrack {
     $recordState = -not [bool](& $option 'NoState' $false)
     # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
     $fabricPublished = ''
+    # What the Insights app's Manage has, recorded with the Fabric step when it deployed the app (2026-11-19); @{} otherwise.
+    $appManageRecord = @{}
     $handoff = [string](& $option 'HandoffPath' '')
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
     # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
@@ -960,6 +966,13 @@ function Invoke-DemoDeploymentTrack {
                 $t4Notice = [string](Get-DemoMemberValue -InputObject $value -Name 'T4Notice')
                 if ($t4Notice) {
                     $Context['T4Notice'] = $t4Notice
+                }
+                # T5 left out of this run because Azure didn't create its account (review, 2026-11-19), for T1's T5 step and
+                # the activity.
+                $t5Value = Get-DemoMemberValue -InputObject $value -Name 'T5Enabled'
+                if ($null -ne $t5Value -and -not [bool]$t5Value -and (Test-DemoT5Enabled -Config $Config)) {
+                    $Config['t5Enabled'] = $false
+                    $Config['t5LeftOut'] = [string](Get-DemoMemberValue -InputObject $value -Name 'T5LeftOut')
                 }
             }
         }
@@ -1344,7 +1357,7 @@ function Invoke-DemoDeploymentTrack {
                         # The AutoLogonSecret step's note (ADR 0009): the lone LSA secret it deleted keeps the Pass; armed is a Warning.
                         $signInNote = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInNote')
                         $signInArmed = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInFound') -eq 'Armed'
-                        & $note 'DEPLOY.T1.READY' 'T1' $(if ($signInArmed) { 'Warning' } else { 'Pass' }) ('T1''s bootstrap is Ready: {0}{1}' -f $message, $(if ($signInNote) { ' ' + $signInNote } else { '' })) $(if ($signInArmed) { 'Nothing more to do: the cleanup turned automatic sign-in off. If it happens again, read docs/troubleshooting.md (the sign-in data sweep).' } else { '' })
+                        & $note 'DEPLOY.T1.READY' 'T1' $(if ($signInArmed) { 'Warning' } else { 'Pass' }) ('T1''s bootstrap is Ready: {0}{1}' -f $message, $(if ($signInNote) { ' ' + $signInNote } else { '' })) $(if ($signInArmed) { 'Nothing more to do: the cleanup turned automatic sign-in off. If it happens again, read docs/troubleshooting.md (T2: sign-in data and the Arc SQL extension).' } else { '' })
                     }
                     elseif ($state -eq 'Failed') {
                         & $note 'DEPLOY.T1.READY' 'T1' 'Fail' ('T1''s bootstrap failed: {0}' -f $message) 'Read C:\ProgramData\DbHubDemo\logs on sqlvm01 (Get-DemoVmHealth -View Full), fix the cause, then run deploy.ps1 -FromStage Artifacts.'
@@ -1423,10 +1436,42 @@ function Invoke-DemoDeploymentTrack {
                     }
                     $results.Add($enable)
                 }
+                'T1/T5' {
+                    # T5 (2026-11-18, ADR 0027): the Cosmos DB account's checks, then the runner's warmup through T1, which
+                    # proves T1's identity reads and writes it with the data-plane role the template assigned. A T5 failure
+                    # is reported, and keeps the run from DONE (HUB.ESTATE.T5, METRICS.T5), but doesn't stop T1's track, so
+                    # T1 to T4 still get their activity and checks.
+                    if (-not (Test-DemoT5Enabled -Config $Config)) {
+                        if ([string]$Config['t5LeftOut']) {
+                            # Left out of this run because Azure didn't create its account (review, 2026-11-19): T5's row says
+                            # why; DEPLOY.T5 has the fix.
+                            & $note 'T5.ACCOUNT' 'T5' 'Warning' ('T5 is left out of this run: Azure didn''t create its account ({0}). DEPLOY.T5 says what to do.' -f ([string]$Config['t5LeftOut']).TrimEnd('.'))
+                        }
+                        else {
+                            & $note 'T5.ACCOUNT' 'T5' 'Not selected' 'T5 is off in this configuration (t5Enabled is false).'
+                        }
+                        break
+                    }
+                    # The container exists only during a session (2026-11-19): the template creates it, but a resumed run skips
+                    # the template, and a stop since may have deleted it, so it's made sure of before the checks and the warmup.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
+                    $checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $checks
+                    if (& $hasStatus $checks 'Fail') {
+                        & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'T5''s account checks failed (above), so T1''s access to it wasn''t tried.'
+                        break
+                    }
+                    $current = Get-DemoDeploymentState -Config $Config
+                    if (-not ($current.RunnerSha256 -and 'sqlvm01' -in $current.RunnerSentTo)) {
+                        & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'No workload runner was deployed to T1 (-SkipRunner), so T1''s access to T5 wasn''t tried.'
+                        break
+                    }
+                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10))))
+                }
                 'T1/Activity' {
                     $current = Get-DemoDeploymentState -Config $Config
                     $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
-                    foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
+                    foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' })) {
                         $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
                     }
                 }
@@ -1577,7 +1622,7 @@ function Invoke-DemoDeploymentTrack {
                                 break
                             }
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'The build didn''t finish within the wait.'
-                            & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md.'
+                            & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md (A first run that''s slow or doesn''t finish).'
                             $outcome = 'Open'
                             break
                         }
@@ -1599,12 +1644,12 @@ function Invoke-DemoDeploymentTrack {
                         Update-DemoT2InstallModeRecord -Config $Config -Health $build.Health -State $sent -Confirm:$false
                         $left = [int][System.Math]::Max(30, ($t2Deadline - [DateTime]::UtcNow).TotalMinutes)
                         $arcArguments['WaitForHostMinutes'] = [System.Math]::Min(360, $left)
-                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database.'
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database; deploy.ps1''s own check after the onboarding waits for that pass, so the two never sweep arcsql01 at the same time.'
                     }
                     else {
                         $arcArguments['WaitForHostMinutes'] = 0
                     }
-                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, and monitoring.'
+                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, monitoring, and migration assessment.'
                     $plainKey = [string]$env:DBHUB_SQL_PRODUCT_KEY
                     $secureKey = $null
                     if ($plainKey) {
@@ -1630,13 +1675,25 @@ function Invoke-DemoDeploymentTrack {
                     # Its Run Commands that ran under a fresh name (2026-11-13 live finding) show on the onboarding's row.
                     $arcStuck = @(Get-DemoRunCommandStuckResult -Clear)
                     & $addAll $arcStuck
-                    # A guest restart that cleared a broken PowerShell Direct channel during onboarding (issue #65).
+                    # A guest restart that cleared a broken PowerShell Direct channel during onboarding (issue #65), its sign-in
+                    # data sweep's included (2026-11-19).
                     & $reportGuestRestart $null
                     $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
                     if ($onboarding.Count -gt 0) {
                         & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
                     }
-                    if (& $hasStatus $arc 'Fail') {
+                    # The sign-in data check after the onboarding says on its own row what failed (2026-11-19, dbhubfn: the row
+                    # kept its Running text, and the guest's error was dropped), in the build path and the golden one.
+                    $sweepRecord = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject ($arc | Where-Object { [string]$_.checkId -eq 'T2.ARC.ONBOARDING' } | Select-Object -First 1) -Name 'evidence') -Name 'signInData'
+                    $sweepStatus = [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'status')
+                    if ($sweepStatus -eq 'Fail') {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Failed' -Status 'Fail' -Message ('The sign-in data check after the Arc onboarding: {0} ./scripts/deploy.ps1 runs it again.' -f [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'message'))
+                    }
+                    elseif ($sweepStatus -eq 'Manual action required') {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Action needed' -Status 'Manual action required' -Message ('The sign-in data check after the Arc onboarding: {0}' -f [string](Get-DemoMemberValue -InputObject $sweepRecord -Name 'message'))
+                    }
+                    # The migration assessment is optional (2026-11-18 review): its result never ends T2's track.
+                    if (& $hasStatus @($arc | Where-Object { [string]$_.checkId -ne 'T2.ARC.MIGRATIONASSESSMENT' }) 'Fail') {
                         $outcome = 'Fail'
                         break
                     }
@@ -1653,7 +1710,7 @@ function Invoke-DemoDeploymentTrack {
                         }
                         break
                     }
-                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION' })
+                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION', 'T2.ARC.MIGRATIONASSESSMENT' })
                     # The guest is built, set up, onboarded, and monitored: its bootstrap generation's record goes (review follow-up).
                     & $recordT2Build ''
                     if (-not $golden) {
@@ -1682,6 +1739,20 @@ function Invoke-DemoDeploymentTrack {
                         else {
                             $why = if ([bool](Get-DemoMemberValue -InputObject $wait -Name 'Full')) { 'its health couldn''t be read for 15 minutes, because Azure keeps archost01''s Run Commands in Deleting (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01)' } else { 'state {0}: {1}' -f $state, $message }
                             & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes ({1}); its profile is set anyway.' -f $minutes, $why) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
+                        }
+                    }
+                    # T2's first migration assessment (2026-11-18 live finding): right after it's turned on, Azure refuses a
+                    # run until the Azure extension for SQL Server has the setting, and a try minutes later is taken. When
+                    # this run's row says none started, the track tries again now, every 2 minutes for at most
+                    # T2AssessmentRetryMinutes (10), and the new row replaces the old one, on the status page too.
+                    $assessmentRows = @($arc | Where-Object { Test-DemoArcMigrationAssessmentRetry -Result $_ })
+                    if ($assessmentRows.Count -gt 0) {
+                        $later = Invoke-DemoArcMigrationAssessmentRetry -Config $Config -WaitMinutes ([int](& $option 'T2AssessmentRetryMinutes' 10))
+                        $at = $results.IndexOf($assessmentRows[0])
+                        if ($null -ne $later -and $at -ge 0) {
+                            $results[$at] = $later
+                            $arc = @($arc | ForEach-Object { if ([object]::ReferenceEquals($_, $assessmentRows[0])) { $later } else { $_ } })
+                            & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION', 'T2.ARC.MIGRATIONASSESSMENT' })
                         }
                     }
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
@@ -1767,13 +1838,40 @@ function Invoke-DemoDeploymentTrack {
                     # publishes it again when the scripts have other content (Get-DemoFabricContentReopen).
                     $fabricContent = Get-DemoFabricContentSha256
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Items' -State 'Running' -Message ''
-                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
+                    # #68: a first deployment's first history run waits up to HistoryRunWaitMinutes while a busy capacity
+                    # keeps it queued, on the status page; one still queued then is followed after the history model's step.
+                    $historyWait = [int](& $option 'HistoryRunWaitMinutes' 45)
+                    $historyFollow = [int](& $option 'HistoryFollowMinutes' 45)
+                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
+                    # A first history run that didn't complete is never a Fail: the history snapshot at the run's end runs it again.
+                    $firstRun = Get-DemoHistoryFirstRun -Result $fabric
+                    Set-DemoHistoryFirstRunWarning -FirstRun $firstRun
                     & $addAll $fabric
                     & $partDone 'Fabric.Items' $fabric
                     # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
                     $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
+                    # Its refresh found no tables while the first history run hadn't completed: a Warning that says what fills
+                    # the model (#68). With the run still queued or running, it's followed now, and the model's step runs again
+                    # once it completes, before the Insights app, whose checks read the model.
+                    $refreshWaiting = Set-DemoHistoryRefreshWaiting -Result $powerBI -FirstRun $firstRun -WaitMinutes $historyWait -FollowMinutes $historyFollow
                     & $addAll $powerBI
+                    if ($null -ne $refreshWaiting -and $firstRun.Pending) {
+                        Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $refreshWaiting.message
+                        $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress)
+                        # The follow-up's model step checked the model's data again, so the first step's "Not selected" data
+                        # check, from before the model had tables, goes (the review of #68).
+                        if (@($again | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' }).Count -gt 0) {
+                            $staleData = @($powerBI | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' -and [string]$_.status -eq 'Not selected' })
+                            foreach ($item in $staleData) {
+                                $null = $results.Remove($item)
+                            }
+                            $powerBI = @($powerBI | Where-Object { $_ -notin $staleData })
+                        }
+                        & $addAll $again
+                        $powerBI = @($powerBI + $again)
+                        & $partDone 'Fabric.Items' $fabric
+                    }
                     & $partDone 'Fabric.Report' $powerBI
                     # The Insights app is part of every deployment, and nothing about it stops the track or keeps the run
                     # from DONE (2026-11-05): its records are non-blocking (ConvertTo-DemoInsightsAppRecord), an exception
@@ -1783,6 +1881,9 @@ function Invoke-DemoDeploymentTrack {
                     # when it wasn't created, and the console says so at once.
                     $appRecords = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
                     & $addAll $appRecords
+                    # Whether its Manage has NB_DatabaseHub_Control, which deploy.ps1 puts in Fabric after the tracks: a resume
+                    # deploys the app once more when it hasn't (Get-DemoInsightsAppManageGap, 2026-11-19).
+                    $appManageRecord = Get-DemoInsightsAppManageRecord -Result $appRecords
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }
@@ -1911,6 +2012,10 @@ function Invoke-DemoDeploymentTrack {
                     $record['FabricSha256'] = $fabricPublished
                     $fabricPublished = ''
                 }
+                foreach ($key in @($appManageRecord.Keys)) {
+                    $record[$key] = $appManageRecord[$key]
+                }
+                $appManageRecord = @{}
                 Set-DemoDeploymentStateLocked -Config $Config -Value $record -Confirm:$false
             }
             catch {

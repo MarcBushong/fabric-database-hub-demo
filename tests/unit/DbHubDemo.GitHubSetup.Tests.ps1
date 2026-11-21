@@ -12,6 +12,7 @@ BeforeAll {
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $config['t4Enabled'] = $false
+        $config['t5Enabled'] = $false
         return $config
     }
 

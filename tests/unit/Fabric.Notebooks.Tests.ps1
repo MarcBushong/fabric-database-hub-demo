@@ -563,7 +563,7 @@ import datetime as dt, json, re, sys, types
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
 part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
 session_cell = next(cell for cell in cells if cell.startswith("# This session"))
-functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests)\(.*?(?=^\S|\Z)", part3))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests|session_beats)\(.*?(?=^\S|\Z)", part3))
 
 def run(session_id, plan, saved=False):
     exits = []
@@ -619,12 +619,347 @@ print(json.dumps(report))
         @($report.bad.exits) | Should -BeNullOrEmpty
     }
 
+    It 'records the Database Agent beat''s times and its database_agent finding: CPU before and after the run''s response (2026-11-18)' {
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'agent.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import datetime as dt, json, re, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests|session_beats|agent_beat_finding)\(.*?(?=^\S|\Z)", part3))
+utc = dt.timezone.utc
+ns = {"json": json, "re": re, "dt": dt, "RUN_ID": "run-1", "NOTEBOOK_NAME": "NB_DatabaseHub_LiveActivity", "SELECTED_TARGETS": ["T1", "T2", "T3"],
+      "_parse_utc": lambda text: dt.datetime.fromisoformat(text.replace("Z", "+00:00")),
+      "utc_now": lambda: dt.datetime(2026, 11, 18, 16, 0, tzinfo=utc)}
+exec(functions, ns)
+sid = "fedcba9876543210fedcba9876543210"
+plan = json.dumps({"version": 1, "sessionId": sid, "startUtc": "2026-11-18T14:00:00Z", "endUtc": "2026-11-18T15:30:00Z", "beats": [
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-18T14:30:00Z", "endUtc": "2026-11-18T15:00:00Z",
+     "agent": True, "regressUtc": "2026-11-18T14:33:00Z", "respondUtc": "2026-11-18T14:55:30Z"},
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-18T15:15:00Z", "endUtc": "2026-11-18T15:25:00Z",
+     "agent": True, "regressUtc": "2026-11-18T15:20:00Z", "respondUtc": "2026-11-18T15:40:00Z"},
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-18T14:04:00Z", "endUtc": "2026-11-18T14:14:00Z"}]})
+session = ns["parse_session_plan"](sid, plan)
+beats = ns["session_beats"](session)
+agent = next(beat for _, beat in beats if beat.get("agent"))
+respond = dt.datetime(2026, 11, 18, 14, 55, 30, tzinfo=utc)
+
+def points(before, after):
+    bins = [respond.replace(second=0) + dt.timedelta(minutes=minute) for minute in range(-12, 10)]
+    return [(moment, before if moment < respond else after) for moment in bins]
+
+late = dt.datetime(2026, 11, 18, 15, 35, tzinfo=utc)
+report = {"agent": [bool(beat.get("agent")) for _, beat in beats], "ids": [request_id for request_id, _ in beats],
+          "messages": [row["message"] for row in ns["session_requests"](session)],
+          "pass": ns["agent_beat_finding"](sid, agent, points(84.0, 22.0), late),
+          "flat": ns["agent_beat_finding"](sid, agent, points(50.0, 46.0), late),
+          "early": ns["agent_beat_finding"](sid, agent, points(84.0, 22.0), dt.datetime(2026, 11, 18, 14, 58, tzinfo=utc)),
+          "none": ns["agent_beat_finding"](sid, agent, [], None),
+          "nan": ns["agent_beat_finding"](sid, agent, points(float("nan"), float("nan")), None)}
+print(json.dumps(report))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        # Only a beat whose times fall in its window, in order, is the agent beat; each beat keeps its request ID.
+        @($report.agent) | Should -Be @($false, $true, $false)
+        @($report.ids) | Should -Be @(0, 1, 2 | ForEach-Object { 'session:fedcba9876543210fedcba9876543210:{0:d2}' -f $_ })
+        $report.messages[2] | Should -BeExactly 'Session fedcba98''s Database Agent beat: the plan regresses at 14:33 UTC; the run''s response forces the last good plan at 14:55 UTC.'
+        $report.messages[3] | Should -BeExactly 'Session fedcba98''s showcase beat.'
+        # Pass: CPU fell by a quarter or 10 points, with the times and both averages as evidence.
+        $report.pass[0] | Should -Be 'Pass'
+        $report.pass[1] | Should -BeExactly 'Database Agent loop on T3: the plan regressed at 14:33 UTC and the run''s response forced the last good plan at 14:55 UTC; T3''s CPU fell from 84% to 22%.'
+        $report.pass[2].cpuBeforePercent | Should -Be 84
+        $report.pass[2].cpuAfterPercent | Should -Be 22
+        $report.pass[2].sessionId | Should -Be 'fedcba9876543210fedcba9876543210'
+        foreach ($name in 'regressUtc', 'respondUtc', 'beforeStartUtc', 'beforeEndUtc', 'afterStartUtc', 'afterEndUtc') {
+            $report.pass[2].$name | Should -Not -BeNullOrEmpty -Because $name
+        }
+        # A Warning when CPU didn't fall, when the run read its telemetry too early, or when it has none (or only NaN).
+        $report.flat[0] | Should -Be 'Warning'
+        $report.flat[1] | Should -Match 'didn''t fall \(50% before, 46% after\)'
+        foreach ($case in 'early', 'none', 'nan') {
+            $report.$case[0] | Should -Be 'Warning' -Because $case
+            $report.$case[1] | Should -Match 'isn''t in the telemetry this run read' -Because $case
+        }
+    }
+
+    It 'calls the agent finding in section 8, and keys each correlation finding by its whole request ID (2026-11-18)' {
+        $correlation = @($nb.Code | Where-Object { $_.Source -match '^# Correlation:' })[0].Source
+        # Every beat of a session starts "session:<id>", so a shortened key made one finding of a session's beats per target.
+        $correlation | Should -Match 'window\["request_id"\], evidence=evidence'
+        $correlation | Should -Not -Match 'request_id"\]\[:12\]'
+        $correlation | Should -Match 'add_finding\("database_agent", beat\["target"\]'
+        $correlation | Should -Match 'agent_beat_finding\(SESSION\["id"\], beat, points, WINDOW_END\)'
+    }
+
     It 'saves telemetry_snapshots, analysis_findings, and the report tables, then a session''s rows in scenario_runs, last' {
         $persist = @($nb.Code | Where-Object { $_.Source -match '^# Persist:' })[0].Source
         $persist | Should -Match 'write_delta\("telemetry_snapshots"'
         $persist | Should -Match 'write_delta\("analysis_findings"'
         $persist.IndexOf('prepare_report_tables()') | Should -BeLessThan $persist.IndexOf('write_delta("scenario_runs"')
-        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)'
+        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS\)'
+    }
+
+    It 'saves a demo session once: the next run completes a save that a cancel cut off, table by table, and a first save is unchanged (R907)' {
+        # The app's Stop now cancels the control's run, which may be saving a session's history; Stop now then saves that
+        # session again, without its plan. The setup, section 3, and persist cells run here against a lakehouse in memory.
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'save_once.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, re, sys, types
+import pandas as pd
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+# Spark isn't here: the schema's types as stand-ins, and the default lakehouse's tables in memory (Lake).
+spark_types = types.ModuleType("pyspark.sql.types")
+for name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, name, type(name, (), {}))
+spark_types.StructField = lambda name, kind, nullable: name
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+setup = [cell for cell in code if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+session_cell = next(cell for cell in code if cell.startswith("# This session"))
+persist = next(cell for cell in code if cell.startswith("# Persist:"))
+
+
+class Cancelled(BaseException):
+    """A cancel ends the run where it is; no except Exception in the notebook catches it."""
+
+
+class Rows:
+    def __init__(self, lake, rows):
+        self.lake, self.rows = lake, rows
+
+    def filter(self, condition):
+        column, value = re.fullmatch(r"(\w+) = '([^']*)'", condition).groups()
+        self.lake.reads.append(column)
+        return Rows(self.lake, [row for row in self.rows if row.get(column) == value])
+
+    def limit(self, count):
+        return Rows(self.lake, self.rows[:count])
+
+    def count(self):
+        return len(self.rows)
+
+
+class Lake:
+    def __init__(self):
+        self.tables, self.log, self.reads, self.cancel_at, self.columns = {}, [], [], None, {}
+        self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
+        self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+
+    def table(self, name):
+        rows = Rows(self, self.tables[name])
+        rows.schema = types.SimpleNamespace(fields=[types.SimpleNamespace(name=column) for column, _ in self.columns[name]])
+        return rows
+
+    def createDataFrame(self, data, schema):
+        lake, rows = self, [dict(zip(schema, values)) for values in data]
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                if table == lake.cancel_at:
+                    raise Cancelled(table)
+                lake.log.append("append %s %d" % (table, len(rows)))
+                lake.tables.setdefault(table, []).extend(rows)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+    def sql(self, statement):
+        result = []
+        delete = re.fullmatch(r"DELETE FROM (\w+) WHERE run_id = '([^']*)'", statement)
+        if delete:
+            table = self.tables[delete.group(1)]
+            kept = [row for row in table if row.get("run_id") != delete.group(2)]
+            self.log.append("delete %s %d" % (delete.group(1), len(table) - len(kept)))
+            table[:] = kept
+        elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
+            self.tables.setdefault(statement.split()[5], [])
+        elif statement.startswith("SELECT COUNT(*) AS n FROM "):
+            result = [{"n": 0}]
+        elif statement.startswith("DESCRIBE DETAIL "):
+            result = [{"numFiles": 1}]
+        else:
+            raise AssertionError("unexpected statement: " + statement)
+        return types.SimpleNamespace(collect=lambda: result)
+
+
+SID = "0123456789abcdef0123456789abcdef"
+PLAN = json.dumps({"version": 1, "sessionId": SID, "startUtc": "2026-11-19T14:00:00Z", "endUtc": "2026-11-19T15:30:00Z", "beats": [
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-19T14:04:00Z", "endUtc": "2026-11-19T14:14:00Z"},
+    {"target": "T3", "scenario": "plan-regression", "startUtc": "2026-11-19T14:30:00Z", "endUtc": "2026-11-19T15:00:00Z",
+     "agent": True, "regressUtc": "2026-11-19T14:33:00Z", "respondUtc": "2026-11-19T14:55:30Z"}]})
+BASE = pd.Timestamp("2026-11-19T14:00:00Z")
+
+
+def run(lake, session_id, plan, cancel_at=None, again=False):
+    """One notebook run: its setup, section 3, what sections 5 to 8 add, and the persist cell, which a cancel cuts off at
+    a table's write. Returns its run ID, whether it was cut off, its writes, and how many tables it kept."""
+    ns = {}
+    exec(setup[0], ns)
+    ns.update(SESSION_ID=session_id, SESSION_PLAN=plan)
+    for cell in setup[1:]:
+        exec(cell, ns)
+    lake.columns = ns["TABLE_COLUMNS"]
+    ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": "lakehouse"},
+              _notebookutils=lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda value: None)))
+    beat = ("session:%s:00" % SID, BASE + pd.Timedelta(minutes=4), BASE + pd.Timedelta(minutes=14))
+
+    def incident_rows():
+        if plan:
+            return [ns["_incident_row"]("request:" + beat[0], "Recorded request", "T1", "blocking", beat[1], beat[2], 3.0,
+                                        scenario="blocking-chain", request_id=beat[0])], []
+        # Without the plan, the beat's blocking has no recorded window to explain it.
+        return [], [ns["_incident_row"]("detected:T1:blocking:" + beat[1].strftime("%Y%m%dT%H%M"), "Detected signal", "T1",
+                                        "blocking", beat[1], beat[2], 3.0)]
+
+    def merge(session, recorded, detected):
+        table = lake.tables["incident_windows"]
+        for row in recorded + detected:
+            table[:] = [item for item in table if item["incident_key"] != row["incident_key"]] + [dict(row)]
+        lake.log.append("merge incident_windows %d" % len(recorded + detected))
+        return len(recorded + detected), 0
+
+    ns.update(incident_window_rows=incident_rows, merge_incident_windows=merge)
+    before, printed, cut = len(lake.log), io.StringIO(), False
+    with contextlib.redirect_stdout(printed):
+        exec(session_cell, ns)
+        cpu = pd.DataFrame({"Target": "T1", "Bucket": [BASE + pd.Timedelta(minutes=minute) for minute in range(6)],
+                            "AvgCPU": [20.0, 85.0, 90.0, 30.0, 25.0, 20.0]})
+        ns["add_snapshot"]("cpu", cpu, ns["WINDOW_START"], ns["WINDOW_END"], metrics=["AvgCPU"], units={"AvgCPU": "percent"})
+        ru = pd.DataFrame({"Target": "T5", "Bucket": [BASE + pd.Timedelta(minutes=minute) for minute in range(3)],
+                           "NormalizedRUConsumption": [40.0, 100.0, 60.0]})
+        ns["add_snapshot"]("cosmosdb", ru, ns["WINDOW_START"], ns["WINDOW_END"], metrics=["NormalizedRUConsumption"])
+        ns["add_finding"]("consumption", "T1", "Warning", "T1's CPU peaked at 90%.", "cpu")
+        ns["add_finding"]("cosmosdb", "T5", "Pass", "T5's metrics were added.", "capture")
+        if plan:
+            ns["add_finding"]("correlation", "T1", "Pass", "blocking-chain on T1: expected signal observed.", beat[0], request_id=beat[0])
+            ns["add_finding"]("database_agent", "T3", "Pass", "Database Agent loop on T3: its CPU fell.", "session:%s:01" % SID,
+                              request_id="session:%s:01" % SID)
+        lake.cancel_at = cancel_at
+        try:
+            exec(persist, ns)
+            if again:
+                exec(persist, ns)
+        except Cancelled:
+            cut = True
+    lake.cancel_at = None
+    return {"runId": ns["RUN_ID"], "cut": cut, "writes": lake.log[before:], "kept": printed.getvalue().count("so this run keeps them")}
+
+
+def state(lake):
+    rows = [row for table in lake.tables.values() for row in table]
+    return {"counts": {table: len(rows) for table, rows in lake.tables.items()},
+            "runIds": sorted({row["run_id"] for row in rows}),
+            "agentFindings": sum(1 for row in lake.tables.get("analysis_findings", []) if row["analysis"] == "database_agent"),
+            "detected": sum(1 for row in lake.tables.get("incident_windows", []) if row["source"] == "Detected signal"),
+            "deleted": sum(int(entry.split()[-1]) for entry in lake.log if entry.startswith("delete ")),
+            "runIdReads": lake.reads.count("run_id")}
+
+
+report = {}
+lake = Lake()
+first = run(lake, SID, PLAN)
+report["first"] = dict(run=first, **state(lake))
+lake = Lake()
+cutoff = run(lake, SID, PLAN, cancel_at="scenario_runs")
+report["stopNow"] = dict(cutoff=cutoff, again=run(lake, SID, ""), **state(lake))
+lake = Lake()
+cutoff = run(lake, SID, PLAN, cancel_at="analysis_findings")
+second = run(lake, SID, PLAN)
+report["resumed"] = dict(cutoff=cutoff, second=second, third=run(lake, SID, ""), **state(lake))
+lake = Lake()
+report["twice"] = dict(run=run(lake, SID, PLAN, again=True), **state(lake))
+lake = Lake()
+runs = [run(lake, "", ""), run(lake, "", "")]
+report["noSession"] = dict(runs=runs, **state(lake))
+print(json.dumps(report))
+'@
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $runId = 'session-0123456789abcdef0123456789abcdef'
+        # One copy of the session's rows: 9 telemetry rows (T1's CPU and T5's RU), 4 findings, its beat's incident window,
+        # and its scenario_runs rows when a run with its plan saved them.
+        $oneCopy = {
+            param($State, [int] $Sessions)
+            foreach ($pair in @(@('telemetry_snapshots', 9), @('analysis_findings', 4), @('incident_windows', 1), @('scenario_runs', $Sessions))) {
+                $State.counts.($pair[0]) | Should -Be $pair[1] -Because $pair[0]
+            }
+        }
+
+        # A first save: the same writes in the same order, the session's rows last, nothing deleted or kept, under the
+        # session's run ID.
+        $report.first.run.runId | Should -Be $runId
+        $report.first.run.cut | Should -BeFalse
+        @($report.first.run.writes | Where-Object { $_ -notlike 'delete *' }) | Should -Be @('append telemetry_snapshots 9', 'append analysis_findings 4', 'merge incident_windows 1', 'append scenario_runs 3')
+        $report.first.deleted | Should -Be 0
+        $report.first.run.kept | Should -Be 0
+        & $oneCopy $report.first 3
+        @($report.first.runIds) | Should -Be @($runId)
+
+        # Cut off before scenario_runs, then Stop now's run, without the plan: it keeps what the earlier run saved, one copy
+        # of each row with its database_agent finding, and records no detected twin of the beat's recorded window.
+        $report.stopNow.cutoff.cut | Should -BeTrue
+        @($report.stopNow.again.writes) | Should -BeNullOrEmpty
+        $report.stopNow.again.kept | Should -Be 3
+        & $oneCopy $report.stopNow 0
+        $report.stopNow.agentFindings | Should -Be 1
+        $report.stopNow.detected | Should -Be 0
+        @($report.stopNow.runIds) | Should -Be @($runId)
+
+        # Cut off after telemetry_snapshots: the next run saves the rest once, the session's rows last, and a run after that
+        # finds the session saved and saves nothing.
+        $report.resumed.cutoff.cut | Should -BeTrue
+        @($report.resumed.cutoff.writes) | Should -Be @('append telemetry_snapshots 9')
+        $report.resumed.second.kept | Should -Be 1
+        @($report.resumed.second.writes | Where-Object { $_ -notlike 'delete *' }) | Should -Be @('append analysis_findings 4', 'merge incident_windows 1', 'append scenario_runs 3')
+        @($report.resumed.third.writes) | Should -BeNullOrEmpty
+        & $oneCopy $report.resumed 3
+        $report.resumed.deleted | Should -Be 0
+
+        # The persist cell run twice in one run replaces that run's rows in every table.
+        & $oneCopy $report.twice 3
+        $report.twice.deleted | Should -Be 16
+        $report.twice.run.kept | Should -Be 0
+
+        # An analysis without a session: its own run ID each time, no read for an earlier run, and each run's rows, as before.
+        @($report.noSession.runIds).Count | Should -Be 2
+        foreach ($id in $report.noSession.runIds) {
+            $id | Should -Match '^\d{8}T\d{6}Z-[0-9a-f]{8}$'
+        }
+        $report.noSession.counts.telemetry_snapshots | Should -Be 18
+        $report.noSession.counts.analysis_findings | Should -Be 4
+        $report.noSession.runIdReads | Should -Be 0
+        $report.noSession.deleted | Should -Be 0
     }
 
     It 'analyzes blocking, consumption, and T3 log-rate governance with charts' {
@@ -1047,6 +1382,202 @@ print(json.dumps({
         @($result['empty']['printed']).Count | Should -Be 1
         @($result['empty']['printed'])[0] | Should -Match '^T4''s PostgreSQL metrics weren''t passed in \(POSTGRES_METRICS is empty\), so this run adds none: \./scripts/stop-demo\.ps1 -SaveHistory and \./scripts/deploy\.ps1 pass them'
     }
+
+    It 'adds T5''s Azure Monitor metrics only from COSMOS_METRICS, empty by default, after T4''s and before the persist cell, without a network call (ADR 0027)' {
+        $parameters = @($nb.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source
+        $parameters | Should -Match '(?m)^COSMOS_METRICS = ""$'
+        $nb.Code[1].Source | Should -Match '(?m)^COSMOS_METRICS = str\(COSMOS_METRICS or ""\)\.strip\(\)$'
+        $t4 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T4 \(PostgreSQL\):' })
+        $t5 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T5 \(Azure Cosmos DB\):' })
+        $persist = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# Persist:' })
+        $t5 | Should -BeGreaterThan $t4
+        $t5 | Should -BeLessThan $persist -Because 'the persist cell saves the rows it adds, with everything else'
+        $nb.Code[$t5].Source | Should -Match '(?m)^    COSMOS_CAPTURE = record_cosmos_metrics\(COSMOS_METRICS\)$'
+        $markdown | Should -Match '(?m)^### T5: Azure Cosmos DB \(Azure Monitor\)$'
+        $allCode | Should -Match '(?m)^COSMOS_ANALYSIS = "cosmosdb"$'
+        $allCode | Should -Match '(?m)^COSMOS_TARGET = "T5"$'
+        foreach ($name in 'parse_cosmos_metrics', 'cosmos_snapshot_rows', 'cosmos_throttle_episodes', 'cosmos_findings', 'record_cosmos_metrics', 'cosmos_series_frame') {
+            $body = [regex]::Match($allCode, "(?ms)^def $name\(.*?(?=^\S)").Value
+            $body | Should -Not -BeNullOrEmpty -Because $name
+            $body | Should -Not -Match 'https://|requests\.|get_token|getSecret|write_delta|_spark\(' -Because $name
+        }
+        # A session's T5 beats are kept with the session, as T4's are; T5's own metrics show them.
+        $allCode | Should -Match ([regex]::Escape('beat.get("target") not in ("T1", "T2", "T3", "T4", "T5")'))
+    }
+
+    It 'turns the document Get-DemoCosmosHistoryParameter writes into cosmosdb rows and findings, with each throttling episode and its recovery, and says so in one line without one (ADR 0027)' {
+        # Get-DemoCosmosHistoryParameter's own JSON, from a fake Azure CLI, goes through the notebook's helpers and its T5
+        # cell. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        # One-minute values from 17:02 UTC: an ru-storm wave saturates T5 from 17:05 to 17:09 and is throttled at 17:05,
+        # 17:06, and 17:08; Azure Monitor sends no point for the 429s' other minutes, and none for 18:01 yet.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $text = @($ArgumentList) -join ' '
+            if ($text -match 'databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics') {
+                $index = [array]::IndexOf([string[]]@($ArgumentList), '--url-parameters')
+                $query = Get-Content -LiteralPath ([string]$ArgumentList[$index + 1]).Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $field = ([string]$query['aggregation']).ToLowerInvariant()
+                $name = [string]$query['metricnames']
+                $hourly = $query['interval'] -eq 'PT1H'
+                $data = if ($hourly) {
+                    @([ordered]@{ timeStamp = '2026-11-13T17:00:00Z'; $field = @{ ProvisionedThroughput = 400; ServiceAvailability = 100 }[$name] }, [ordered]@{ timeStamp = '2026-11-13T18:00:00Z' })
+                }
+                else {
+                    @(for ($minute = 2; $minute -le 20; $minute++) {
+                            $value = if ($query.Contains('$filter')) { @{ 5 = 50; 6 = 40; 8 = 30 }[$minute] } else { @{ NormalizedRUConsumption = $(if ($minute -ge 5 -and $minute -le 9) { 100 } else { 20 }); TotalRequestUnits = 6000; TotalRequests = 600; ServerSideLatencyGateway = 5.5 }[$name] }
+                            $point = [ordered]@{ timeStamp = ('2026-11-13T17:{0:00}:00Z' -f $minute) }
+                            if ($null -ne $value) { $point[$field] = $value }
+                            $point
+                        })
+                }
+                $unit = @{ NormalizedRUConsumption = 'Percent'; ServiceAvailability = 'Percent'; ServerSideLatencyGateway = 'MilliSeconds' }[$name]
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ value = @(@{ name = @{ value = $name }; unit = $(if ($unit) { $unit } else { 'Count' }); timeseries = @(@{ data = @($data) }) }) } -Depth 10 -Compress); StdErr = '' }
+            }
+            if ($text -match 'databaseAccounts/cosmos01-abc123\?') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ name = 'cosmos01-abc123'; properties = @{ provisioningState = 'Succeeded' } } -Compress); StdErr = '' }
+            }
+            throw "unexpected Azure CLI call: $text"
+        }
+        $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
+        # An obviously fake ID: every group repeats one character.
+        $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
+        $capture = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoCosmosHistoryParameter -Config $Config -DeploymentId 'abc123' -WindowMinutes 60 -NowUtc ([datetime]::new(2026, 11, 13, 18, 2, 37, [System.DateTimeKind]::Utc)) }
+        $capture.Status | Should -Be 'Pass'
+        $capture.PointCount | Should -Be 81
+        $documentPath = Join-Path -Path $TestDrive -ChildPath 'cosmos-metrics.json'
+        Set-Content -LiteralPath $documentPath -Value $capture.Json -Encoding utf8NoBOM -NoNewline
+        $script = Join-Path -Path $TestDrive -ChildPath 'cosmos.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+document = open(sys.argv[2], encoding="utf-8").read()
+parameters = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+t5_cell = next(cell for cell in cells if cell.startswith("# T5 (Azure Cosmos DB):"))
+
+def t5(ns):
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        exec(compile(t5_cell, "t5", "exec"), ns)
+    return printed.getvalue()
+
+def run(metrics):
+    ns = {}
+    exec(parameters, ns)
+    ns["COSMOS_METRICS"] = metrics
+    with contextlib.redirect_stdout(io.StringIO()):
+        for index, cell in enumerate(cells):
+            if cell.startswith("# Helpers, part"):
+                exec(compile(cell, "cell-%d" % index, "exec"), ns)
+    return ns, t5(ns)
+
+def summary(ns, printed):
+    text = lambda value: value.strftime("%Y-%m-%d %H:%M") if value is not None else None
+    rows = [row for row in ns["SNAPSHOT_ROWS"] if row["analysis"] == "cosmosdb"]
+    return {
+        "printed": printed.strip().splitlines(),
+        "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
+                  "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+        "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
+                                          "start": text(item["window_start_utc"]), "end": text(item["window_end_utc"]),
+                                          "reportDate": str(ns["report_date"]("analysis_findings", item))}
+                     for item in ns["FINDINGS"] if item["analysis"] == "cosmosdb"},
+    }
+
+full, printed = run(document)
+again = t5(full)
+# Still throttled at the capture's end: the last minutes are a storm.
+stormy = json.loads(document)
+for series in stormy["series"]:
+    if series["metric"] == "ThrottledRequests":
+        series["points"].append(["2026-11-13T17:20:00Z", 10])
+    if series["metric"] == "NormalizedRUConsumption":
+        series["points"] = [[at, 100 if at >= "2026-11-13T17:18:00Z" else value] for at, value in series["points"]]
+calm = json.loads(document)
+for series in calm["series"]:
+    if series["metric"] == "ThrottledRequests":
+        series["points"] = []
+print(json.dumps({
+    "full": summary(full, printed),
+    "again": summary(full, again),
+    "stormy": summary(*run(json.dumps(stormy))),
+    "calm": summary(*run(json.dumps(calm))),
+    "invalid": summary(*run('{"version": 2, "accounts": [], "series": []}')),
+    "empty": summary(*run("")),
+}))
+'@
+        $output = & $interpreter $script $nb.Path $documentPath 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $full = $result['full']
+        # 19 points of each one-minute signal, the 429s filled with 0 in the 16 minutes with requests and none throttled,
+        # and one hourly point of each hourly signal.
+        $full['rows'].Count | Should -Be 97
+        @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T5')
+        @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('databaseAccounts')
+        @($full['rows'] | ForEach-Object { $_['resource'] } | Sort-Object -Unique) | Should -Be @('cosmos01-abc123')
+        @($full['rows'] | ForEach-Object { '{0}={1}' -f $_['metric'], $_['unit'] } | Sort-Object -Unique) | Should -Be @(
+            'NormalizedRUConsumption=percent', 'ProvisionedThroughput=RU/s', 'ServerSideLatencyGateway=ms', 'ServiceAvailability=percent',
+            'ThrottledRequests=requests', 'TotalRequests=requests', 'TotalRequestUnits=RU')
+        $throttled = @($full['rows'] | Where-Object { $_['metric'] -eq 'ThrottledRequests' })
+        $throttled.Count | Should -Be 19
+        @($throttled | Where-Object { $_['value'] -gt 0 } | ForEach-Object { '{0}={1}' -f $_['bucket'], [string]$_['value'] }) | Should -Be @('2026-11-13 17:05=50', '2026-11-13 17:06=40', '2026-11-13 17:08=30')
+        $throttled[0]['windowStart'] | Should -Be '2026-11-13 17:02'
+        $throttled[0]['windowEnd'] | Should -Be '2026-11-13 18:02'
+        $throttled[0]['reportDate'] | Should -Be '2026-11-13'
+        @($full['findings'].Keys | Sort-Object) | Should -Be @('cosmosdb.T5.capture', 'cosmosdb.T5.recovery', 'cosmosdb.T5.throttle.20261113T1705', 'cosmosdb.T5.throttling')
+        $full['findings']['cosmosdb.T5.capture']['status'] | Should -Be 'Pass'
+        $full['findings']['cosmosdb.T5.capture']['finding'] | Should -Be 'Azure Monitor metrics of T5 cosmos01-abc123 from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, every 1 minutes: 7 series, 97 points.'
+        $full['findings']['cosmosdb.T5.throttling']['status'] | Should -Be 'Warning'
+        $full['findings']['cosmosdb.T5.throttling']['finding'] | Should -Be 'Normalized RU consumption on T5 cosmos01-abc123 reached 100% with 120 throttled requests (429s) of 11,400 requests (1.1%) in 1 episode between 2026-11-13 17:05 and 2026-11-13 17:09 UTC.'
+        $episode = $full['findings']['cosmosdb.T5.throttle.20261113T1705']
+        $episode['status'] | Should -Be 'Warning'
+        $episode['finding'] | Should -Be 'Normalized RU consumption on T5 reached 100% with 120 throttled requests (429s) of 2,400 requests between 2026-11-13 17:05 and 17:09 UTC; the throttling stopped at 17:09 UTC, and normalized RU fell back to 20% from 17:10 UTC.'
+        $episode['start'] | Should -Be '2026-11-13 17:05'
+        $episode['end'] | Should -Be '2026-11-13 17:09'
+        $full['findings']['cosmosdb.T5.recovery']['status'] | Should -Be 'Pass'
+        $full['findings']['cosmosdb.T5.recovery']['finding'] | Should -Be 'T5 cosmos01-abc123 was back at its baseline before the capture''s end: its last throttling stopped at 17:09 UTC, and normalized RU consumption fell back to 20% from 17:10 UTC, with no 429s after it.'
+        $full['printed'] | Should -Contain 'T5''s metrics (cosmos01-abc123) from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, every 1 minutes:'
+
+        # Running the cell again replaces its rows and findings instead of adding to them.
+        $result['again']['rows'].Count | Should -Be 97
+        $result['again']['findings'].Count | Should -Be 4
+
+        # Still throttled at the capture's end: a second episode, and a Warning that T5 wasn't back at its baseline.
+        $result['stormy']['findings'].Contains('cosmosdb.T5.throttle.20261113T1720') | Should -BeTrue
+        $result['stormy']['findings']['cosmosdb.T5.throttle.20261113T1720']['finding'] | Should -Match '; it was still throttled at the capture''s end\.$'
+        $result['stormy']['findings']['cosmosdb.T5.recovery']['status'] | Should -Be 'Warning'
+        $result['stormy']['findings']['cosmosdb.T5.recovery']['finding'] | Should -Be 'T5 cosmos01-abc123 was still throttled (429s) at the capture''s end, 18:02 UTC: its last throttling began at 17:20 UTC.'
+
+        # No 429 at all: a Pass, the 429s all 0, and no episode or recovery to tell.
+        $calm = $result['calm']
+        @($calm['findings'].Keys | Sort-Object) | Should -Be @('cosmosdb.T5.capture', 'cosmosdb.T5.throttling')
+        $calm['findings']['cosmosdb.T5.throttling']['status'] | Should -Be 'Pass'
+        $calm['findings']['cosmosdb.T5.throttling']['finding'] | Should -Be 'No throttled requests (429s) on T5 cosmos01-abc123 from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, 11,400 requests; normalized RU consumption peaked at 100% at 2026-11-13 17:05 UTC.'
+        @($calm['rows'] | Where-Object { $_['metric'] -eq 'ThrottledRequests' -and $_['value'] -ne 0 }).Count | Should -Be 0
+
+        $result['invalid']['rows'].Count | Should -Be 0
+        @($result['invalid']['findings'].Keys) | Should -Be @('cosmosdb.T5.capture')
+        $result['invalid']['findings']['cosmosdb.T5.capture']['status'] | Should -Be 'Fail'
+        $result['invalid']['findings']['cosmosdb.T5.capture']['finding'] | Should -Be 'T5''s metrics in COSMOS_METRICS weren''t added: it isn''t a version 1 document.'
+
+        $result['empty']['rows'].Count | Should -Be 0
+        $result['empty']['findings'].Count | Should -Be 0
+        @($result['empty']['printed']).Count | Should -Be 1
+        @($result['empty']['printed'])[0] | Should -Match '^T5''s Azure Cosmos DB metrics weren''t passed in \(COSMOS_METRICS is empty\), so this run adds none'
+    }
 }
 
 Describe 'Report tables for the Power BI history report (Phase 19)' {
@@ -1124,7 +1655,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'prepares the report tables in the persist cell, after both writes and only when SAVE_RESULTS is True' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)\s+else:'
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
@@ -1173,9 +1704,10 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'knows every incident scenario in scenarios/ with its expected signal' {
         $scenarioFolder = Join-Path -Path $repoRoot -ChildPath 'scenarios'
         # T4-only scenarios (connection-surge, idle-in-transaction, replica-lag) have no scenario windows here: T4's metrics
-        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025).
+        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025). The same goes for
+        # T5-only ones (ru-storm) and COSMOS_METRICS (2026-11-18, ADR 0027).
         $scenarios = @(Get-ChildItem -LiteralPath $scenarioFolder -Directory | Where-Object {
-                $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
+                $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -notin 'T4', 'T5' }).Count -gt 0
             })
         $scenarios.Count | Should -BeGreaterThan 5
         $signals = [regex]::Match($liveCode, '(?s)SCENARIO_SIGNALS = \{(.*?)\n\}').Groups[1].Value

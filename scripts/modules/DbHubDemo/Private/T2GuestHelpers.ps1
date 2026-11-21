@@ -245,7 +245,7 @@ function Get-DemoT2ModeResult {
     }
     $mode = [string](Get-DemoMemberValue -InputObject $Health -Name 'installMode')
     $message = 'T2 keeps its existing guest as it is, in the mode it was built in, {0}: SQL Server is set up in arcsql01, so it''s never rebuilt or deleted on its own, and nothing in T2 needs a person. A new T2 guest would come from Arc Jumpstart''s image (JumpstartImage).' -f $mode
-    return (New-DemoResult -CheckId 'DEPLOY.T2.MODE' -Area 'infra' -Target 'T2' -Status 'Pass' -Message $message -Evidence ([ordered]@{ installMode = $mode; configuredMode = [string](Get-DemoMemberValue -InputObject $Health -Name 'configuredMode'); modeSource = [string](Get-DemoMemberValue -InputObject $Health -Name 'modeSource') }) -Remediation 'Nothing to do. To make T2 from Arc Jumpstart''s image instead, run ./scripts/destroy.ps1, then ./scripts/deploy.ps1.' -DocUrl 'https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc')
+    return (New-DemoResult -CheckId 'DEPLOY.T2.MODE' -Area 'infra' -Target 'T2' -Status 'Pass' -Message $message -Evidence ([ordered]@{ installMode = $mode; configuredMode = [string](Get-DemoMemberValue -InputObject $Health -Name 'configuredMode'); modeSource = [string](Get-DemoMemberValue -InputObject $Health -Name 'modeSource') }) -Remediation 'Nothing to do. To make T2 from Arc Jumpstart''s image instead, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history.' -DocUrl 'https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc')
 }
 
 function Update-DemoT2InstallModeRecord {

@@ -1,5 +1,6 @@
 // Ready-made prompts for Database Hub's built-in Database Agent (preview), and the same questions for the documented
-// fallback: the microsoft-sql-fdh and microsoft-sql plugins in GitHub Copilot CLI or VS Code (fabric/agent/README.md).
+// fallback: the GA Database Hub skill (databasehub-cli, in the fabric-skills plugin) and the microsoft-sql plugin in GitHub
+// Copilot CLI or VS Code (fabric/agent/README.md).
 // The agent is UI-only, so the app only builds text from the query results: it never sends a prompt or runs anything.
 // Every prompt ends with the prompt pack's safety sentence (fabric/agent/prompts/README.md), so a copied prompt keeps it.
 
@@ -12,7 +13,7 @@ export type AgentSurface = "hub" | "skills";
 
 export const AGENT_SURFACES: ReadonlyArray<{ id: AgentSurface; label: string; short: string }> = [
     { id: "hub", label: "The Database Agent in Database Hub", short: "Database Agent" },
-    { id: "skills", label: "GitHub Copilot CLI or VS Code with the microsoft-sql-fdh and microsoft-sql plugins", short: "Copilot CLI · VS Code" },
+    { id: "skills", label: "GitHub Copilot CLI or VS Code with the GA databasehub-cli skill (fabric-skills) and the microsoft-sql plugin", short: "Copilot CLI · VS Code" },
 ];
 
 export interface AgentPrompt {
@@ -88,6 +89,7 @@ function joinList(items: readonly string[]): string {
 
 /** "about 4 times", "about 1.8 times" */
 export function timesPhrase(ratio: number): string {
+    if (ratio >= 100) return "more than 100 times";
     return ratio >= 3 ? `about ${Math.round(ratio)} times` : `about ${ratio.toFixed(1)} times`;
 }
 
@@ -109,7 +111,7 @@ function valuePhrase(value: number, kind: NumberKind, bin: number | null | undef
 
 /** The incident's own signal in one clause: the replay's peak and baseline when its bins are loaded, else the recorded peak. */
 export function signalClause(incident: Incident, comparison: IncidentComparison | null, bin?: number | null): string {
-    const signal = familySignal(incident.family);
+    const signal = comparison ? { label: comparison.signal, kind: comparison.kind } : familySignal(incident.family);
     if (comparison && comparison.peak !== null) {
         let clause = `${signal.label} peaked at ${valuePhrase(comparison.peak, signal.kind, bin)}`;
         if (comparison.ratio !== null && comparison.baseline !== null && comparison.ratio >= 1.2) {
@@ -194,7 +196,7 @@ export function incidentPrompts(incident: Incident, comparison: IncidentComparis
     const target = describeTarget(incident.target, context.names);
     const pad = incidentPadMinutes(incident);
     const baselineStart = new Date(incident.start.getTime() - pad * 60000);
-    const signal = familySignal(incident.family);
+    const signal = comparison ? { label: comparison.signal, kind: comparison.kind } : familySignal(incident.family);
     const id = (name: string) => `${incident.key}:${surface}:${name}`;
 
     if (surface === "hub") {
@@ -317,7 +319,7 @@ export function libraryPrompts(context: LibraryContext, surface: AgentSurface): 
         {
             id: id("health"),
             title: "Estate health",
-            purpose: "The microsoft-sql-fdh plugin's Database Hub skill",
+            purpose: "The GA Database Hub skill, databasehub-cli (the fabric-skills plugin)",
             text: `Use the Database Hub skill to show the SQL resources ${scope}, grouped by engine and subscription, with CPU, storage, and memory health over the last hour: ${names}. Report coverage, partial results, and anything you couldn't read. ${NO_CHANGE}`,
         },
         {
@@ -374,4 +376,9 @@ export function databaseHubUrl(configured: string | undefined, tenantId: string 
     if (configured && /^https:\/\//i.test(configured)) return configured;
     const base = `${portalUrl.replace(/\/+$/, "")}/workloads/fdh/databaseHub`;
     return tenantId ? `${base}?ctid=${encodeURIComponent(tenantId)}` : base;
+}
+
+/** This deployment's Database Hub link, always set: the deploy-time link, or one built from the portal and the tenant. */
+export function hubUrlOf(runtime: { links: { databaseHub?: string }; expectedTenantId?: string; tenantId?: string; portalUrl?: string }): string {
+    return databaseHubUrl(runtime.links.databaseHub, runtime.expectedTenantId ?? runtime.tenantId, runtime.portalUrl);
 }

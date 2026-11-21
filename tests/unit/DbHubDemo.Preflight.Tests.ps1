@@ -139,6 +139,27 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
     }
 
+    It 'fails right after P5 when another demo environment records the workspace P5 found, and adds nothing when nobody else does (DEPLOY.FABRIC.SHARED, 2026-11-19)' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
+            [pscustomobject]@{ Result = (New-DemoResult -CheckId 'PREFLIGHT.P5.WORKSPACE' -Area 'preflight' -Target 'fabric' -Status 'Pass' -Message 'The workspace is ready.' -Evidence ([ordered]@{ workspaceName = 'Database Hub Demo'; workspaceId = 'dddddddd-0000-0000-0000-000000000001' })); Config = $Config; CapacityResult = $null }
+        }
+        $script:recorders = @([pscustomobject]@{ Name = 'rg-dbhubother-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubother-demo'; Tagged = $true; Claims = @('dddddddd-0000-0000-0000-000000000001') })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { [pscustomobject]@{ Ok = $true; Error = ''; Others = $script:recorders; Own = [pscustomobject]@{ Found = $false; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false } } }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $shared = @($results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED')
+        $shared.Count | Should -Be 1
+        $shared[0].status | Should -Be 'Fail' -Because 'a Fail in preflight stops deploy.ps1 before anything is created'
+        $shared[0].message | Should -Match 'is the one rg-dbhubother-demo records as its own, not this environment''s \(rg-dbhub-demo\)'
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.SHARED') | Should -Be ([array]::IndexOf($ids, 'PREFLIGHT.P5.WORKSPACE') + 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -ParameterFilter { $Config['prefix'] -eq 'dbhub' }
+
+        $script:recorders = @()
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        @($results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED').Count | Should -Be 0
+    }
+
     It 'says once that a configuration without activityProfile uses the new default, business-day, before the cost checks that count it (2026-11-03)' {
         Set-HappyAzMock
         $unset = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
@@ -444,9 +465,57 @@ Describe 'Invoke-DemoPreflight' {
         $capability.evidence.startSku | Should -BeNullOrEmpty
     }
 
+    It 'counts the nightly safety stop that this run sets up only when the deployer can assign its role, and prices T5 for a session''s hours, for an Owner and a Contributor (2026-11-19, the coordinator''s option 2 and fix 1)' {
+        Set-HappyAzMock
+        $script:permission = [pscustomobject]@{ CanDefine = $true; CanAssign = $true; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -MockWith { $script:permission }
+        $owner = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $restart = $owner | Where-Object checkId -EQ 'PREFLIGHT.COST.T4RESTART'
+        $restart.status | Should -Be 'Pass'
+        $restart.message | Should -Match 'and deploy\.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role, so the monthly ceiling counts each restart as about a day'
+        $restart.message | Should -Match 'If its setup then doesn''t put it in place, the run says so \(DEPLOY\.COST\.T4RESTART\)'
+        $restart.evidence['plan']['planned'] | Should -BeTrue
+        # Its own estimate and the 2-vCore fallback's both count it.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T4RestartCoverage.Counts -and $T4RestartCoverage.Planned -and $T4RestartCoverage.WithoutReason -match 'isn''t in place yet' -and $T5ContainerLifecycle -eq 'Session' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { -not $T4RestartCoverage.Counts }
+        # A Contributor, the documented minimum: the rest of the month, as before, and T5 all month (review of ab91ee5): its
+        # session control gets no role, and no nightly safety stop deletes the container, so only stop-demo.ps1 does.
+        $script:permission = [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' }
+        $contributor = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $warned = $contributor | Where-Object checkId -EQ 'PREFLIGHT.COST.T4RESTART'
+        $warned.status | Should -Be 'Warning'
+        $warned.evidence['plan']['planned'] | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { -not $T4RestartCoverage.Counts -and $T4RestartCoverage.Missing -eq 'SafetyStop' -and $T5ContainerLifecycle -eq 'AlwaysOn' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -Times 2 -Exactly -Because 'preflight reads the deployer''s permissions once a run'
+    }
+
+    It 'tells the estimate when a Contributor''s update of an environment from main, with no T5 yet, prices T5 all month only because nothing automatic deletes its container, at <Ceiling> USD (the re-review of 0590bbe)' -ForEach @(
+        @{ Ceiling = 375 }
+        @{ Ceiling = 390 }
+    ) {
+        # Deployed from main by a Contributor: no T5 and no tag yet, a nightly safety stop without its role, and a session
+        # control that never got one. Only stop-demo.ps1 would delete T5's container, so its all-month price never fails the
+        # month by itself (Get-DemoCostEstimate -T5ManualDeleteOnly, which DbHubDemo.Cost.Tests.ps1 tests).
+        Set-HappyAzMock
+        $fromMain = [ordered]@{}
+        foreach ($key in $config.Keys) { $fromMain[$key] = $config[$key] }
+        $fromMain['monthlyCeilingUsd'] = $Ceiling
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T5Container = ''; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeployerRolePermission -MockWith { [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -MockWith { [pscustomobject]@{ Counts = $false; Missing = 'Role'; Reason = 'the nightly safety stop can''t stop T4: its role isn''t assigned'; Fix = 'An Owner of the subscription runs ./scripts/grant-safety-stop.ps1 once.'; Evidence = [ordered]@{ counts = $false; missing = 'Role'; nightly = 'NoRole' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $false }
+        $null = @(Invoke-DemoPreflight -Config $fromMain -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly -and [double]$Config['monthlyCeilingUsd'] -eq $Ceiling -and -not $T4RestartCoverage.Counts }
+        $fromMain['monthlyCeilingUsd'] | Should -Be $Ceiling -Because 'preflight never changes the configured ceiling'
+        # A control that keeps a role without the container's actions: no stop deletes the container, so it's no exception.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'Lacking'; Why = 'its role doesn''t have the container''s actions'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        $null = @(Invoke-DemoPreflight -Config $fromMain -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and -not $T5ManualDeleteOnly }
+    }
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
         Set-HappyAzMock
-        # Its numbers are set against a 250 USD ceiling, kept here (the default is 375 since 2026-11-04).
+        # Its numbers are set against a 250 USD ceiling, kept here (the default is 415 for a new configuration since 2026-11-19).
         $copy = [ordered]@{}
         foreach ($key in $config.Keys) { $copy[$key] = $config[$key] }
         $copy['monthlyCeilingUsd'] = 250
@@ -541,7 +610,7 @@ Describe 'Invoke-DemoPreflight' {
         @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
         # 2026-11-09: T4 is part of every deployment, so a 2-vCore start over a ceiling is a Warning, T4 is created anyway,
         # and no estimate without T4 is made (one would throw here).
-        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'Standard_D2ds_v5'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(375\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
+        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'Standard_D2ds_v5'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 418\.00 USD, over monthlyCeilingUsd \(415\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
         @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
     ) {
         Set-HappyAzMock
@@ -554,7 +623,7 @@ Describe 'Invoke-DemoPreflight' {
             }
             $unit = if ($sku -eq 'Standard_D2ds_v5') { 0.1 } else { 0.01 }
             [pscustomobject]@{
-                LightUseMonthly               = 260.0
+                LightUseMonthly               = 280.0
                 SessionCost                   = 9.0
                 T4AutoRestartWorstCaseMonthly = $(if ($sku) { [System.Math]::Round($unit * 2 * 690, 2) } else { $null })
                 T4FixedMonthly                = $(if ($sku) { 20.0 } else { $null })
@@ -1110,6 +1179,78 @@ Describe 'Test-DemoPermission' {
 
     It 'denies everything with no assignments' {
         Test-DemoPermission -Permission @() -Action 'Microsoft.Resources/deployments/write' | Should -BeFalse
+    }
+}
+
+Describe 'Get-DemoFabricSharedResult: deploy.ps1 never puts an environment in another environment''s Fabric workspace (2026-11-19)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith {}
+        $script:ownerId = 'dddddddd-0000-0000-0000-000000000001'
+        # A second environment, rg-dbhubfn-demo, whose configuration names the owner's workspace (init.ps1 at 9a218e0, or a
+        # hand edit), which rg-dbhub-demo records.
+        $script:second = $config | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+        $script:second['prefix'] = 'dbhubfn'
+        $script:second['fabric']['workspaceName'] = 'Database Hub Demo'
+        $script:others = @([pscustomobject]@{ Name = 'rg-dbhub-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhub-demo'; Tagged = $true; Claims = @($script:ownerId) })
+        $script:own = [pscustomobject]@{ Found = $false; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false }
+        $script:claimOk = $true
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { [pscustomobject]@{ Ok = $script:claimOk; Error = $(if ($script:claimOk) { '' } else { 'AccessDenied' }); Others = $script:others; Own = $script:own } }
+        $script:check = { param([System.Collections.IDictionary] $Config, [string] $Id) InModuleScope DbHubDemo -Parameters @{ Config = $Config; Id = $Id } { Get-DemoFabricSharedResult -Config $Config -WorkspaceId $Id } }
+    }
+
+    It 'is a Fail before anything is created when another environment records the workspace and this new one doesn''t (the final tests'' F5)' {
+        $shared = & $script:check $script:second $script:ownerId
+        $shared.checkId | Should -Be 'DEPLOY.FABRIC.SHARED'
+        $shared.status | Should -Be 'Fail'
+        $shared.message | Should -Be 'The Fabric workspace "Database Hub Demo" (fabric.workspaceName) is the one rg-dbhub-demo records as its own, not this environment''s (rg-dbhubfn-demo), so deploy.ps1 stops before it creates anything: it would put this environment''s lakehouse, history model, report, notebooks, and Insights app there, over the other environment''s.'
+        $shared.remediation | Should -Be 'Give this environment its own workspace: set fabric.workspaceName in its configuration to a name no other environment uses, for example "Database Hub Demo dbhubfn", or run ./scripts/init.ps1 -Force -Prefix dbhubfn -WorkspaceName "Database Hub Demo dbhubfn"; then run ./scripts/deploy.ps1 again.'
+        $shared.evidence.outcome | Should -Be 'claimed'
+        @($shared.evidence.claimedBy) | Should -Be @('rg-dbhub-demo')
+
+        # An environment that records another workspace (its configuration edited by hand since), or none and never finished
+        # a Fabric step (a first run that stopped before it): a Fail too.
+        foreach ($own in @(
+                [pscustomobject]@{ Found = $true; FabricWorkspaceId = 'dddddddd-0000-0000-0000-000000000009'; Claims = @('dddddddd-0000-0000-0000-000000000009'); UsedFabric = $true }
+                [pscustomobject]@{ Found = $true; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false }
+            )) {
+            $script:own = $own
+            (& $script:check $script:second $script:ownerId).status | Should -Be 'Fail'
+        }
+    }
+
+    It 'keeps an environment that shares the workspace already going, with a Warning and how to move, so its update never breaks' {
+        # The existing user who updates: rg-dbhubfn-demo records the workspace too.
+        $script:own = [pscustomobject]@{ Found = $true; FabricWorkspaceId = $script:ownerId; Claims = @($script:ownerId); UsedFabric = $true }
+        $shared = & $script:check $script:second $script:ownerId
+        $shared.status | Should -Be 'Warning'
+        $shared.message | Should -Be 'The Fabric workspace "Database Hub Demo" is this environment''s (rg-dbhubfn-demo records it), and rg-dbhub-demo records it too, so the environments share it: each deploy.ps1 puts its own notebooks there, over the other''s. This run goes on with it, as before.'
+        $shared.remediation | Should -Be 'To move this environment to a workspace of its own, set fabric.workspaceName in its configuration to a name no other environment uses, for example "Database Hub Demo dbhubfn", and run ./scripts/deploy.ps1: it creates that workspace with the demo''s items and records it, and "Database Hub Demo" stays as it is for rg-dbhub-demo.'
+        $shared.evidence.outcome | Should -Be 'shared'
+
+        # One deployed before 2026-11-17 used Fabric and records nothing: it may be its own workspace, so a Warning too.
+        $script:own = [pscustomobject]@{ Found = $true; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $true }
+        $unrecorded = & $script:check $script:second $script:ownerId
+        $unrecorded.status | Should -Be 'Warning'
+        $unrecorded.evidence.outcome | Should -Be 'unrecorded'
+        $unrecorded.message | Should -Match '^The Fabric workspace "Database Hub Demo" is the one rg-dbhub-demo records as its own, and this environment \(rg-dbhubfn-demo\) records none: it was deployed before 2026-11-17'
+    }
+
+    It 'says nothing for a workspace nobody else records or one that doesn''t exist yet, and warns when Resource Graph can''t say' {
+        & $script:check $config 'dddddddd-0000-0000-0000-000000000009' | Should -BeNullOrEmpty
+        & $script:check $script:second '' | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -Because 'a workspace that doesn''t exist yet is nobody''s, so Resource Graph isn''t asked'
+        $script:claimOk = $false
+        $unread = & $script:check $script:second $script:ownerId
+        $unread.status | Should -Be 'Warning' -Because 'never a silent Pass, and never a Fail that a Resource Graph outage causes'
+        $unread.message | Should -Match '^Whether another demo environment records the Fabric workspace "Database Hub Demo" couldn''t be checked before anything is created: AccessDenied\. deploy\.ps1 goes on with it'
+    }
+
+    It 'looks the workspace up by name, read-only, for a run without preflight (-Resolve)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoHubFabricAccess -MockWith { [pscustomobject]@{ Available = $true; Token = [System.Security.SecureString]::new(); Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith { [pscustomobject]@{ WorkspaceId = 'dddddddd-0000-0000-0000-000000000001'; WorkspaceName = 'Database Hub Demo'; Results = @() } }
+        $shared = InModuleScope DbHubDemo -Parameters @{ Config = $script:second } { Get-DemoFabricSharedResult -Config $Config -Resolve }
+        $shared.status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { [bool]$SkipLakehouse -and -not $PesterBoundParameters.ContainsKey('Create') }
     }
 }
 

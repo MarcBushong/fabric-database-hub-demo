@@ -337,7 +337,9 @@ function Wait-DemoStoppedStart {
     re-review of PR 16). On the T2 host the golden source's release comes first, so the interim never waits for a guest a
     capture left off; when the release leaves it off (a capture in progress there, or a release that failed),
     DEPLOY.INTERIM_T2 is Not selected and nothing is sent or waited for there (Get-DemoGoldenHeldInterimResult, review of
-    PR 17, 2026-11-04). Internal.
+    PR 17, 2026-11-04). DEPLOY.VMSTART's evidence also says what the run found (2026-11-19): running, the VMs that ran when
+    it began, and before, each stopped VM's power state then and T4's, so the run's end stops again what it started when the
+    demo was stopped (Invoke-DemoUpdateEndStop). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -426,6 +428,17 @@ function Wait-DemoStoppedStart {
     $vms = @($Request.Vms.Keys)
     $t4Started = $null -ne $t4 -and [string]$t4.status -eq 'Pass'
     $evidence = [ordered]@{ vms = $vms; started = $issued.ToArray(); notRunning = $notRunning.ToArray(); t4 = $(if ($null -ne $t4) { [string]$t4.status } else { '' }); minutes = $minutes }
+    # What the run found (2026-11-19), for its end: a demo that was stopped is stopped again (Invoke-DemoUpdateEndStop).
+    $before = [ordered]@{}
+    foreach ($vm in $vms) {
+        $before[$vm] = ([string](Get-DemoMemberValue -InputObject $Request.Vms[$vm] -Name 'Before')).Split('/')[-1]
+    }
+    if ($null -ne $Request.T4) {
+        $before['T4'] = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Request.T4 -Name 'evidence') -Name 'stateBefore')
+    }
+    $foundRunning = Get-DemoMemberValue -InputObject $Request -Name 'Running'
+    $evidence['running'] = @(@($foundRunning) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $evidence['before'] = $before
     # Remembered for the ending's line about what bills: what this run started and now runs, and T4 when it started it.
     Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($issued | Where-Object { $_ -notin $notRunning }) + @(if ($t4Started) { 'T4' }))
     $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }
@@ -723,8 +736,8 @@ function Set-DemoTargetProfile {
 
     .DESCRIPTION
     deploy.ps1's Activity stage, start-demo.ps1, and stop-demo.ps1 use it. A profile other than off ends
-    before the next auto-shutdown (--not-after). The T3 and T4 profiles are files on T1, so setting them never
-    wakes T3 or connects to T4. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
+    before the next auto-shutdown (--not-after). The T3, T4, and T5 profiles are files on T1, so setting them never
+    wakes T3 or connects to T4 or T5. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
     Warning, not a Fail: the demo's resources are fine, the profile ends at the auto-shutdown anyway, and
     demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest that isn't set up yet (no demo module or
     workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
@@ -745,7 +758,7 @@ function Set-DemoTargetProfile {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [Parameter(Mandatory)]
@@ -915,7 +928,8 @@ function Test-DemoStartCost {
     - PREFLIGHT.COST.SESSION and PREFLIGHT.COST.MONTHLY from Get-DemoCostEstimate (Azure Retail Prices API at
       run time, with the subscription's Defender for Cloud plans when they can be read): the same checks
       preflight runs before deploy.ps1, with the run's activity profile (-ActivityProfile, else the configuration's, else
-      business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail).
+      business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail). -BastionHours counts
+      Bastion's hours in them: start-demo.ps1 -Interactive deploys it, and a default session has none (2026-11-19).
     - START.COST.T4RESTART: which worst case the monthly check counts for T4's 7-day automatic restart, about a day per
       restart where a safety stop (the nightly one, ADR 0024) is fully in place, otherwise the rest of the month, with a Warning that names
       what's missing (Get-DemoT4RestartCoverage; 2026-11-04, ADR 0016).
@@ -937,13 +951,19 @@ function Test-DemoStartCost {
         [object] $T3UseFreeLimit,
 
         [AllowEmptyString()]
-        [string] $ActivityProfile = ''
+        [string] $ActivityProfile = '',
+
+        [ValidateRange(-1, 24)]
+        [double] $BastionHours = -1
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     $docUrl = 'https://learn.microsoft.com/rest/api/cost-management/query/usage'
     # The run's activity profile, so business-day's T3 incidents are counted (2026-11-03).
     $costParameters = @{ Config = $Config; NetworkMode = $NetworkMode; ActivityProfile = $ActivityProfile }
+    if ($BastionHours -ge 0) {
+        $costParameters['BastionHours'] = $BastionHours
+    }
     if ($null -ne $T3UseFreeLimit) {
         $costParameters['T3UseFreeLimit'] = [bool]$T3UseFreeLimit
     }
@@ -963,6 +983,16 @@ function Test-DemoStartCost {
     $t4On = Test-DemoT4Enabled -Config $Config
     if ($t4On) {
         $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+    }
+    # T5's free tier (2026-11-18, ADR 0027), so a free-tier account isn't priced at list price.
+    $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # T5's container lifecycle (2026-11-19): its throughput bills only while the demo runs, unless it stays between sessions.
+    # Priced all month only because nothing automatic deletes it (the re-review of 0590bbe), it never makes the hard ceiling
+    # a Fail by itself, so start-demo.ps1 starts with a Warning.
+    $t5Cost = Get-DemoT5CostLifecycle -Config $Config -Detail
+    $costParameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+    if ($t5Cost.ManualDeleteOnly) {
+        $costParameters['T5ManualDeleteOnly'] = $true
     }
     $sessionCost = 0.0
     try {

@@ -75,7 +75,7 @@ function Test-DemoFabricHubSetting {
     $settingName = [string]$setting['settingName']
     $docUrl = [string]$setting['docUrl']
     $area = if ($CheckId -like 'PREFLIGHT.*') { 'preflight' } else { 'fabric' }
-    $steps = ('A Fabric administrator opens the Fabric admin portal, selects Tenant settings, finds "{0}", sets it to Enabled for the entire organization (or for security groups that include every presenter), and selects Apply. Every Hub user also needs at least a Fabric Free license, and My workspace must not be on a capacity in North Europe or West Europe.' -f $title)
+    $steps = ('A Fabric administrator opens the Fabric admin portal, selects Tenant settings, finds "{0}", sets it to Enabled for the entire organization (or for security groups that include every presenter), and selects Apply. Every Hub user also needs at least a Fabric Free license, and Database Hub must be available in the tenant''s region (https://learn.microsoft.com/fabric/admin/region-availability).' -f $title)
     $confirmSteps = ('Nothing to change when Database Hub opens for you and your presenters. To confirm it, a Fabric administrator opens the Fabric admin portal, selects Tenant settings, and finds "{0}"; if it''s off, they set it to Enabled for the entire organization (or for security groups that include every presenter) and select Apply. When a Fabric administrator runs deploy.ps1, this check reads the setting itself.' -f $title)
 
     function ConvertTo-HubSettingResult([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence, [string] $Remediation = '') {

@@ -237,6 +237,8 @@ Describe 'Lifecycle scripts' {
         Mock -CommandName Write-DemoDeploymentOutcome -MockWith { }
         # Stop-DemoEnvironment's rotation and start-demo.ps1's handover record never reach Azure here.
         Mock -CommandName Set-DemoDeploymentState -MockWith { $capture['state'] = $Value }
+        # start-demo.ps1 wakes Ask's chat relay (ADR 0028); the lookup and the check have their own tests (DbHubDemo.Ask.Tests.ps1).
+        Mock -CommandName Get-DemoAskRelayEndpoint -MockWith { '' }
     }
 
     It 'deploy.ps1 passes its switches and stages through, and drops an empty stage' {
@@ -351,6 +353,66 @@ Describe 'Lifecycle scripts' {
                 $lines | Should -Contain 'complete stopped=True'
                 $lines | Should -Contain 'awake released'
                 $lines | Should -Contain 'banner NotDone'
+            }
+            finally {
+                $runner.Dispose()
+            }
+        }
+
+        It 'still reports the ending''s outcome, with what it added, and DONE, when Ctrl+C cuts the stop at the end of an update short (the review of 2026-11-19, finding 2)' {
+            # A real pipeline stop during the ending, which deploy.ps1 calls from a finally block that began as usual: the
+            # ending finishes in its own finally block and hands its outcome over (-Ending); before the fix, nothing after the
+            # call ran, so neither DONE nor out/deploy.jsonl came.
+            $log = Join-Path -Path $TestDrive -ChildPath ('endstop-' + [guid]::NewGuid().ToString('N') + '.log')
+            $output = Join-Path -Path $TestDrive -ChildPath ('endstop-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            $runner = [powershell]::Create()
+            $null = $runner.AddScript({
+                    param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
+                    Import-Module -Name $ModulePath
+                    . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
+                    function global:Get-StopTestRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Start-Transcript { }
+                    function global:Stop-Transcript { }
+                    function global:Initialize-StopTestFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-StopTestDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-StopTestDeployment { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+                    # The ending, stopped while its stop at the end waits, as Complete-DemoDeploymentRun is: it finishes in
+                    # its own finally block.
+                    function global:Complete-StopTestDeploymentRun {
+                        param([System.Collections.IDictionary] $Ending)
+                        try {
+                            Write-StopTestLog 'stopping at the end'
+                            Start-Sleep -Seconds 60
+                            Write-StopTestLog 'not stopped'
+                        }
+                        finally {
+                            $Ending['Outcome'] = [pscustomobject]@{ Kind = 'Done'; ExitCode = 0; Minutes = 1; Reason = ''; Next = ''; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = ''; Added = @(New-DemoResult -CheckId 'DEPLOY.ENDSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'deploy.ps1 was stopped (Ctrl+C) while the stop at its end waited.') }
+                            Write-StopTestLog 'ending finished'
+                        }
+                    }
+                    function global:Exit-StopTestKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-StopTestDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    foreach ($name in 'Get-DemoRunEnvironment', 'Initialize-DemoFirstRun', 'Start-DemoDeploymentRun', 'Invoke-DemoDeployment', 'Complete-DemoDeploymentRun', 'Exit-DemoKeepAwake', 'Write-DemoDeploymentOutcome') {
+                        Set-Alias -Name $name -Value ($name -replace '-Demo', '-StopTest') -Scope Global
+                    }
+                    & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
+                }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($output).AddArgument($log)
+            $null = $runner.BeginInvoke()
+            try {
+                $watch = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not ((Test-Path -LiteralPath $log) -and (Get-Content -LiteralPath $log) -contains 'stopping at the end') -and $watch.Elapsed.TotalSeconds -lt 90) {
+                    Start-Sleep -Milliseconds 200
+                }
+                $runner.Stop()
+                $lines = @(Get-Content -LiteralPath $log)
+                $lines | Should -Contain 'stopping at the end'
+                $lines | Should -Not -Contain 'not stopped'
+                $lines | Should -Contain 'ending finished'
+                $lines | Should -Contain 'awake released'
+                $lines | Should -Contain 'banner Done'
+                $exported = @(Get-Content -LiteralPath $output | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+                @($exported | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' }).Count | Should -Be 1
+                @($exported | Where-Object { $_.checkId -eq 'TEST.RESULT' }).Count | Should -Be 1
             }
             finally {
                 $runner.Dispose()
@@ -579,7 +641,8 @@ Describe 'Lifecycle scripts' {
             foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = ''; Data = $null; Seconds = 1 } }
         }
         { & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -OutputPath $outputPath } | Should -Throw '*the start was stopped*'
-        $capture['order'] | Should -Be @('Switch:T1,T3,T4=business-day:0')
+        # sqlvm01 runs T1's, T3's, T4's, and T5's activity (T5 since 2026-11-18, ADR 0027).
+        $capture['order'] | Should -Be @('Switch:T1,T3,T4,T5=business-day:0')
     }
 
     It 'start-demo.ps1 with the Key Vault opt-in stores the password before it sets it, and never uses the clipboard' {
@@ -675,10 +738,11 @@ Describe 'Lifecycle scripts' {
         Should -Invoke -CommandName Invoke-DemoControl -Times 1 -Exactly -ParameterFilter { $DurationMinutes -eq 15 -and $Concurrency -eq 0 -and $ResetBefore -eq $true -and $AutoCleanup -eq $false }
     }
 
-    It 'demo-control.ps1 and Invoke-DemoControl accept every target demo-control.yml offers, T4 included (Phase 24)' {
+    It 'demo-control.ps1 and Invoke-DemoControl accept every target demo-control.yml offers, T4 (Phase 24) and T5 (ADR 0027) included' {
         $workflow = Get-WorkflowText 'demo-control.yml'
         $options = @([regex]::Match($workflow, '(?ms)^\s+target:.*?options:\s*\n((?:\s+- \S+\s*\n)+)').Groups[1].Value -split '\n' | ForEach-Object { $_.Trim().TrimStart('-').Trim() } | Where-Object { $_ })
         $options | Should -Contain 'T4'
+        $options | Should -Contain 'T5'
         $script = (Get-Command -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/demo-control.ps1')).Parameters['Target'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
         $module = (Get-Command -Name Invoke-DemoControl).Parameters['Target'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
         foreach ($option in $options) {

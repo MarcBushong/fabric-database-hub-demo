@@ -4,7 +4,7 @@ const integer = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const oneDecimal = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 
-export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "compact";
+export type NumberKind = "int" | "decimal" | "percent" | "seconds" | "minutes" | "mb" | "ms" | "compact";
 
 export function isNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
@@ -23,11 +23,57 @@ export function formatNumber(value: unknown, kind: NumberKind = "decimal"): stri
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} min`;
         case "mb":
             return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} MB`;
+        case "ms":
+            return `${value >= 100 ? integer.format(value) : oneDecimal.format(value)} ms`;
         case "compact":
             return compact.format(value);
         default:
             return Math.abs(value) >= 100 ? integer.format(value) : oneDecimal.format(value);
     }
+}
+
+/** The unit formatNumber writes after each kind's number. */
+const UNIT: Partial<Record<NumberKind, string>> = { percent: " %", seconds: " s", minutes: " min", mb: " MB", ms: " ms" };
+
+/** A value with exactly `digits` decimals and its kind's unit: to tell apart two values that formatNumber writes alike. */
+export function formatNumberDigits(value: number, kind: NumberKind, digits: number): string {
+    return `${new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+}
+
+/**
+ * A level, a baseline, or a peak beside them, as text that reads true: a whole number as formatNumber writes it, any other
+ * with its decimals (two, more under 0.1 for two significant digits, at most 4; trailing zeros dropped), whatever its
+ * kind: "at least 0.45 (1.5 times its baseline of 0.3)", never "at least 0". A percentage under 100 is never written as
+ * 100: a peak of 99.996 % gets more decimals, or reads "just under 100 %".
+ */
+export function formatLevel(value: unknown, kind: NumberKind): string {
+    if (!isNumber(value)) return "–";
+    if (Number.isInteger(value)) return formatNumber(value, kind);
+    let digits = Math.min(4, Math.max(2, 1 - Math.floor(Math.log10(Math.abs(value)))));
+    const withDigits = () => `${new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: digits }).format(value)}${UNIT[kind] ?? ""}`;
+    let text = withDigits();
+    if (kind === "percent" && value < 100) {
+        const hundred = formatNumber(100, kind);
+        while (text === hundred && digits < 4) {
+            digits++;
+            text = withDigits();
+        }
+        if (text === hundred) return "just under 100 %";
+    }
+    return text;
+}
+
+/**
+ * A share (0 to 1) in percent, whole or with `digits` decimals, that never rounds some to none, or nearly all to all:
+ * "less than 1 %" ("less than 0.1 %" with one decimal), "more than 99 %" ("more than 99.9 %").
+ */
+export function percent(share: number, digits = 0): string {
+    const p = share * 100;
+    const fixed = new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    const text = fixed.format(p);
+    if (p > 0 && text === fixed.format(0)) return `less than ${fixed.format(10 ** -digits)} %`;
+    if (p < 100 && text === fixed.format(100)) return `more than ${fixed.format(100 - 10 ** -digits)} %`;
+    return `${text} %`;
 }
 
 /** Parses the connector's DateTime values: ISO text without a zone (a UTC instant), epoch numbers, or Dates. */
@@ -85,6 +131,29 @@ export function formatAgo(date: Date | null, now: Date = new Date()): string {
     const minutes = (now.getTime() - date.getTime()) / 60000;
     if (minutes < 1) return "just now";
     return `${formatDuration(minutes)} ago`;
+}
+
+/** "26 h ago", "3 d ago": the age in its largest whole unit, for tiles. */
+export function formatAgoShort(date: Date | null, now: Date = new Date()): string {
+    if (!date) return "never";
+    const minutes = (now.getTime() - date.getTime()) / 60000;
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${Math.floor(minutes)} min ago`;
+    if (minutes < 48 * 60) return `${Math.floor(minutes / 60)} h ago`;
+    return `${Math.floor(minutes / 1440)} d ago`;
+}
+
+/** A message as a clause inside a sentence: one line, trimmed, without its closing periods. */
+export function clause(text: string): string {
+    return text.replace(/\s+/g, " ").trim().replace(/\.+$/, "");
+}
+
+/** A message as one sentence: capitalized, ending with exactly one period (or its own ? ! …). */
+export function sentence(text: string): string {
+    const body = clause(text);
+    if (!body) return "";
+    const capitalized = body.charAt(0).toUpperCase() + body.slice(1);
+    return /[!?\u2026]$/.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
 /** A table cell as the visual's data table shows it, by the column's kind. */

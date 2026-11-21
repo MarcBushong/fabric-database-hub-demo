@@ -263,7 +263,9 @@ function Invoke-DemoValidationT2 {
     $probeError = ''
     try {
         $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
-        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode } -TimeoutSeconds 300 -PollIntervalSeconds 15 -Confirm:$false
+        # The probe waits for the host's own bootstrap pass (its lock, at most 5 minutes here) and runs again while the guest
+        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both.
+        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -Confirm:$false
         if ($run.Succeeded) {
             $probe = ConvertFrom-DemoRunCommandOutput -Text $run.Output
         }
@@ -380,6 +382,44 @@ function Invoke-DemoValidationT4 {
     }
 }
 
+function Invoke-DemoValidationT5 {
+    <#
+    .SYNOPSIS
+    The T5 area (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics -IncludeLifecycle, read-only. T5's requests come from
+    the runner on sqlvm01, so METRICS.T5 without requests while sqlvm01 isn't running is a Warning that says so, never a
+    Fail. Its container exists only during a session once its lifecycle is Session (2026-11-19), so a missing container
+    then is a Pass while the demo is stopped (T5.CONTAINER). A demo deployed before T5 (no account yet) gets the upgrade's
+    command. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Context
+    )
+
+    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true; IncludeLifecycle = $true }
+    if ($Context.DeploymentId) {
+        $parameters['DeploymentId'] = $Context.DeploymentId
+    }
+    $quiet = $null
+    foreach ($item in @(Test-DemoT5 @parameters)) {
+        if ([string]$item.checkId -eq 'T5.ACCOUNT' -and [string]$item.status -eq 'Fail' -and [string](Get-DemoMemberValue -InputObject $item.evidence -Name 'account') -and $item.message -match 'doesn''t exist') {
+            # An environment deployed before T5 (2026-11-18): deploy.ps1 adds it, with one run.
+            $item = New-DemoResult -CheckId $item.checkId -Area $item.area -Target 'T5' -Status 'Fail' -Message ('{0} It''s new on 2026-11-18, so a demo deployed before then doesn''t have it yet.' -f $item.message) -Evidence $item.evidence -Remediation 'Run ./scripts/deploy.ps1: it adds T5 to an existing demo, with nothing else to do.' -DocUrl $item.docUrl
+        }
+        if ([string]$item.checkId -eq 'METRICS.T5' -and [string]$item.status -eq 'Warning') {
+            if ($null -eq $quiet) {
+                $quiet = Get-DemoValidationQuietReason -Context $Context -Target 'T5'
+            }
+            if ($quiet) {
+                $item = New-DemoResult -CheckId $item.checkId -Area $item.area -Target 'T5' -Status 'Warning' -Message ('Azure Monitor has no request metrics for T5 from the last 15 minutes, because {0}: its runner sends T5''s requests.' -f $quiet) -Evidence $item.evidence -Remediation 'Start the demo (./scripts/start-demo.ps1), then run validate.ps1 -Area T5 again in a few minutes.' -DocUrl $item.docUrl
+            }
+        }
+        $item
+    }
+}
+
 function Invoke-DemoValidationHub {
     <#
     .SYNOPSIS
@@ -448,8 +488,9 @@ function Invoke-DemoValidationTelemetry {
         $estateStatus[[string]$item.target] = [string]$item.status
     }
 
-    # T4's telemetry is Azure Monitor metrics (METRICS.T4 in the T4 area), not the Hub's SQL telemetry endpoint.
-    $sqlTargets = @($Context.Target | Where-Object { $_ -ne 'T4' })
+    # T4's and T5's telemetry is Azure Monitor metrics (METRICS.T4 and METRICS.T5 in their areas), not the Hub's SQL
+    # telemetry endpoint.
+    $sqlTargets = @($Context.Target | Where-Object { $_ -notin 'T4', 'T5' })
     foreach ($item in @(if ($sqlTargets.Count -gt 0) { Test-DemoHubTelemetry -Config $config -Target $sqlTargets -LookbackMinutes 10080 -WaitMinutes $WaitMinutes -DeploymentId $Context.DeploymentId })) {
         $rows = Get-DemoMemberValue -InputObject $item.evidence -Name 'rows'
         $noRows = $item.status -eq 'Fail' -and $null -ne $rows -and [long]$rows -eq 0
@@ -513,15 +554,15 @@ function Invoke-DemoValidationWorkload {
 
     $results = [System.Collections.Generic.List[object]]::new()
     $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command'
-    foreach ($target in @('T1', 'T2', 'T3', 'T4' | Where-Object { $_ -in $Context.Target })) {
+    foreach ($target in @('T1', 'T2', 'T3', 'T4', 'T5' | Where-Object { $_ -in $Context.Target })) {
         $checkId = 'WORKLOAD.{0}.COMMAND' -f $target
         if ($target -eq 'T2' -and $Context.Arc.EvaluationOnly) {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'The evaluation-only T2 mode has no workload runner (risk R188).' -DocUrl $docUrl -EvaluationOnly))
             continue
         }
         $vmName = if ($target -eq 'T2') { $Context.Arc.HostVmName } else { 'sqlvm01' }
-        # The load a status read goes through: the target's own, and sqlvm01's, which runs the commands for T1, T3, and T4.
-        $incidentTargets = @($target) + @(if ($target -in 'T3', 'T4') { 'T1' })
+        # The load a status read goes through: the target's own, and sqlvm01's, which runs the commands for T1, T3, T4, and T5.
+        $incidentTargets = @($target) + @(if ($target -in 'T3', 'T4', 'T5') { 'T1' })
         $state = Get-DemoValidationVmState -Context $Context -VmName $vmName
         if (-not $state.Running) {
             $results.Add((New-DemoValidationStoppedResult -CheckId $checkId -Area 'workload' -Target $target -VmState $state -Context $Context -Checks ('the {0} workload checks' -f $target)))
@@ -542,6 +583,17 @@ function Invoke-DemoValidationWorkload {
             $quiet = Get-DemoValidationQuietReason -Context $Context -Target 'T4'
             if ($quiet) {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Warning' -Message ('{0}, so it runs no workload.' -f $quiet) -Remediation 'Start the demo (./scripts/start-demo.ps1 starts T4), then run validate.ps1 -Area Workload again.' -DocUrl $docUrl))
+                continue
+            }
+        }
+        if ($target -eq 'T5') {
+            if (-not (Test-DemoT5Enabled -Config $Context.Config)) {
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T5' -Status 'Not selected' -Message 'T5 is off in this configuration (t5Enabled is false).'))
+                continue
+            }
+            $t5 = Get-DemoT5State -Config $Context.Config -DeploymentId ([string]$Context.DeploymentId)
+            if (-not $t5.Exists) {
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) isn''t deployed, so it runs no workload.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1, which adds T5, then run validate.ps1 -Area Workload again.' -DocUrl $docUrl))
                 continue
             }
         }
@@ -626,6 +678,15 @@ function Invoke-DemoValidationCost {
         }
         catch {
             Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the estimate leaves them out: {0}' -f $_.Exception.Message)
+        }
+        # T5's free tier (ADR 0027): the account's own when it exists.
+        $parameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $config -DeploymentId ([string]$Context.DeploymentId)
+        # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions, and why
+        # (the re-review of 0590bbe).
+        $t5Cost = Get-DemoT5CostLifecycle -Config $config -Detail
+        $parameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+        if ($t5Cost.ManualDeleteOnly) {
+            $parameters['T5ManualDeleteOnly'] = $true
         }
         try {
             foreach ($item in @((Get-DemoCostEstimate @parameters).Results)) {

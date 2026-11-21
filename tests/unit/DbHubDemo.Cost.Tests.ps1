@@ -95,9 +95,25 @@ BeforeAll {
             @{ productName = 'Key Vault'; skuName = 'Standard'; meterName = 'Certificate Renewal Request'; retailPrice = 3.0; unitOfMeasure = '1'; tierMinimumUnits = 0 }
             @{ productName = 'Key Vault'; skuName = 'Standard'; meterName = 'Operations'; retailPrice = 0.03; unitOfMeasure = '10K'; tierMinimumUnits = 0 }
         )
+        "serviceName eq 'Azure Container Apps'"                                               = @(
+            @{ productName = 'Azure Container Apps'; skuName = 'Standard'; meterName = 'Standard vCPU Active Usage'; retailPrice = 0.000024; unitOfMeasure = '1 Second' }
+            @{ productName = 'Azure Container Apps'; skuName = 'Standard'; meterName = 'Standard Memory Active Usage'; retailPrice = 0.000003; unitOfMeasure = '1 GiB Second' }
+        )
         "serviceName eq 'Automation'"                                                         = @(
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.002; unitOfMeasure = '1 Minute'; tierMinimumUnits = 500 }
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.0; unitOfMeasure = '1 Minute'; tierMinimumUnits = 0 }
+        )
+        # T5 (2026-11-18, ADR 0027): provisioned throughput per 100 RU/s an hour, storage, and the Free Tier meters at zero.
+        "serviceName eq 'Azure Cosmos DB'"                                                    = @(
+            @{ productName = 'Azure Cosmos DB'; skuName = 'RUs'; meterName = '100 RU/s'; retailPrice = 0.008; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'RUs'; meterName = 'Data Stored'; retailPrice = 0.25; unitOfMeasure = '1 GB/Month' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'mRUs'; meterName = '100 Multi-master RU/s'; retailPrice = 0.016; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'Free Tier'; meterName = '100 RU/s'; retailPrice = 0.0; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'Free Tier'; meterName = 'Data Stored'; retailPrice = 0.0; unitOfMeasure = '1 GB/Month' }
+        )
+        "productName eq 'Microsoft Defender for Azure Cosmos DB'"                             = @(
+            @{ productName = 'Microsoft Defender for Azure Cosmos DB'; skuName = 'Standard Trial'; meterName = 'Standard Trial 100 RU/s'; retailPrice = 0.0; unitOfMeasure = '1/Hour'; armRegionName = 'westus3' }
+            @{ productName = 'Microsoft Defender for Azure Cosmos DB'; skuName = 'Standard'; meterName = 'Standard 100 RU/s'; retailPrice = 0.0012; unitOfMeasure = '1/Hour'; armRegionName = 'westus3' }
         )
     }
 
@@ -117,8 +133,11 @@ BeforeAll {
         $config = @{}
         foreach ($key in $exampleConfig.Keys) { $config[$key] = $exampleConfig[$key] }
         $config['hybridBenefit'] = @{ windows = $false; sql = $false; entitlementAttested = $false }
-        # T4 (Phase 24) has its own tests below; the others keep their totals with T4 off.
+        # T4 (Phase 24) has its own tests below; the others keep their totals with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = $false
+        $config['t5Enabled'] = $false
+        # Ask's relay (ADR 0028) has its own test below; the others keep their totals with it off.
+        $config['ask'] = @{ enabled = $false; image = ''; githubClientId = '' }
         foreach ($key in $Override.Keys) { $config[$key] = $Override[$key] }
         return $config
     }
@@ -168,6 +187,18 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.T4RestartHours | Should -Be 720
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message | Should -Match 'OpenSourceRelationalDatabases'
         @($estimate.MissingPrices) | Should -BeNullOrEmpty
+    }
+
+    It 'prices Ask''s chat relay per active second, as running cost only (it scales to zero), from the Container Apps meters' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ ask = @{ enabled = $true; image = ''; githubClientId = '' } }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $defenderPlans
+        $ask = @($estimate.Components | Where-Object { $_.Name -like 'Ask relay*' })
+        $ask.Count | Should -Be 2
+        @($ask | Where-Object Basis -NE 'running') | Should -BeNullOrEmpty -Because 'idle, the relay has no replica and costs nothing'
+        ($ask | Where-Object Name -Like '*vCPU*').Cost | Should -Be ([System.Math]::Round(0.000024 * 3600, 4)) -Because 'one vCPU for an hour'
+        ($ask | Where-Object Name -Like '*memory*').Cost | Should -Be ([System.Math]::Round(0.000003 * 3600 * 2, 4)) -Because '2 GiB for an hour'
+        @($estimate.MissingPrices) | Should -BeNullOrEmpty
+        $off = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $defenderPlans
+        @($off.Components | Where-Object { $_.Name -like 'Ask relay*' }) | Should -BeNullOrEmpty
     }
 
     It 'prices T4''s default, General Purpose Standard_D4ds_v5, as 4 vCore-hours, and the fallback''s Standard_D4ads_v5 from its own series (2026-11-04)' {
@@ -232,6 +263,113 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Not -Match 't4SkuName'
     }
 
+    It 'says the month''s worst case it checks against the ceiling, the margin under or over it, and what it assumed (2026-11-19, the docs audit)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5'; t5Enabled = $true }
+        $counted = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is in place'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $text = { param([double] $Value) [regex]::Escape($Value.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+        $under = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $counted -T5FreeTier $false
+        $worst = [System.Math]::Round($under.LightUseMonthly + 0.18 * 96, 2)
+        $under.MonthlyWorstCase | Should -Be $worst
+        $under.MonthlyCeiling | Should -Be ([double]$config['monthlyCeilingUsd'])
+        $under.MonthlyMargin | Should -Be ([System.Math]::Round([double]$config['monthlyCeilingUsd'] - $worst, 2))
+        $under.MonthlyMargin | Should -BeGreaterThan 0
+        $monthly = $under.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Pass'
+        $monthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD under the hard ceiling of {2} USD\. It counts idle plus 10 hours of use, {3} USD; T4''s automatic restart for 96 hours, 17\.28 USD; and T5''s container for the running hours only \(Session\)\. ' -f (& $text $worst), (& $text $under.MonthlyMargin), (& $text $under.MonthlyCeiling), (& $text $under.LightUseMonthly))
+        $monthly.evidence.monthlyWorstCase | Should -Be $worst
+        $monthly.evidence.monthlyMargin | Should -Be $under.MonthlyMargin
+        $monthly.evidence.monthlyCeiling | Should -Be $under.MonthlyCeiling
+        # Over it: how far over, with T5's container all month and T4's restart for the rest of the month.
+        $config['monthlyCeilingUsd'] = 50
+        $over = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle AlwaysOn
+        $overWorst = [System.Math]::Round($over.LightUseMonthly + 0.18 * 720, 2)
+        $over.MonthlyMargin | Should -Be ([System.Math]::Round(50 - $overWorst, 2))
+        $overMonthly = $over.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $overMonthly.status | Should -Be 'Fail'
+        $overMonthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of 50\.00 USD\. It counts idle plus 10 hours of use, {2} USD; T4''s automatic restart for 720 hours, 129\.60 USD; and T5''s container all month \(AlwaysOn\)\. ' -f (& $text $overWorst), (& $text ($overWorst - 50)), (& $text $over.LightUseMonthly))
+    }
+
+    It 'warns, and never fails, when only T5''s container priced all month while nothing automatic deletes it puts the month over the ceiling, as at 375 and 390 for a Contributor''s update (the re-review of 0590bbe)' {
+        # A Contributor's environment: no nightly safety stop (T4's restart for the rest of the month), and no role to delete
+        # T5's container after a session, so only stop-demo.ps1 does (-T5ManualDeleteOnly).
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5'; t5Enabled = $true }
+        $estimate = {
+            param([double] $Ceiling, [string] $Lifecycle, [bool] $ManualOnly)
+            $config['monthlyCeilingUsd'] = $Ceiling
+            Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 0 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle $Lifecycle -T5ManualDeleteOnly:$ManualOnly
+        }
+        $money = { param([double] $Value) [regex]::Escape($Value.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+        $sessionMonth = (& $estimate 10000 'Session' $false).MonthlyWorstCase
+        $always = & $estimate 10000 'AlwaysOn' $true
+        $alwaysMonth = $always.MonthlyWorstCase
+        $extra = [double]$always.T5AlwaysOnExtraMonthly
+        $extra | Should -BeGreaterThan 1
+        # Two ceilings between the two worst cases, as 375 and 390 lie between a Contributor's 371.48 and 398.23 at the
+        # 2026-11-19 list prices (ADR 0016).
+        foreach ($share in 0.13, 0.69) {
+            $ceiling = [System.Math]::Round($sessionMonth + $extra * $share, 2)
+            $monthly = (& $estimate $ceiling 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+            $monthly.status | Should -Be 'Warning' -Because ('a ceiling of {0} fits the month with the container for the running hours only' -f $ceiling)
+            $exception = $monthly.evidence.t5CeilingException
+            [System.Math]::Abs($exception.sessionMonthlyUsd - $sessionMonth) | Should -BeLessOrEqual 0.011
+            $exception.t5AlwaysOnExtraMonthly | Should -Be $extra
+            # After an Owner's grant: T4's restart about a day each (96 hours) instead of the rest of the month (720), at 0.18 an hour.
+            [System.Math]::Abs($exception.grantMonthlyUsd - ($exception.sessionMonthlyUsd - 0.18 * 720 + 0.18 * 96)) | Should -BeLessOrEqual 0.011
+            $monthly.evidence.t4AutoRestartWorstCaseMonthly | Should -Be 129.6
+            $monthly.evidence.t4AutoRestartWithSafetyStopMonthly | Should -Be 17.28 -Because 'DEPLOY.T5.LIFECYCLE names the same month after a grant'
+            $monthly.message | Should -Match ('^lowest-cost: the month''s worst case is {0} USD, {1} USD over the hard ceiling of {2} USD\.' -f (& $money $alwaysMonth), (& $money ($alwaysMonth - $ceiling)), (& $money $ceiling))
+            $monthly.message | Should -Match 'its container exists only during a session, but only \./scripts/stop-demo\.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t'
+            $monthly.message | Should -Match ('This is a Warning, not a Fail: T5''s container is priced all month, {0} USD more than for the running hours only, because no role can delete it automatically after a session \(the session control has no role, and the nightly safety stop''s role can''t delete it\), so only \./scripts/stop-demo\.ps1 does; with it deleted after each session, the month would be {1} USD, within the ceiling\.$' -f (& $money $extra), (& $money $exception.sessionMonthlyUsd))
+            $monthly.remediation | Should -Match ('^deploy\.ps1 and start-demo\.ps1 go on\. To clear it, any one of these: an Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json, which gives the session control and the nightly safety stop their roles, so the worst case falls to about {0} USD; or raise monthlyCeilingUsd to at least {1} in your configuration' -f (& $money $exception.grantMonthlyUsd), [System.Math]::Ceiling($alwaysMonth))
+            $monthly.remediation | Should -Match 'or set t5Enabled to false, which leaves T5 out\. Until then, run \./scripts/stop-demo\.ps1 after each session: it deletes T5''s container\.$'
+            $monthly.evidence.ceilingWarning | Should -Match ('^The month''s worst case is {0} USD, {1} USD over the hard ceiling of {2} USD\. This is a Warning, not a Fail: ' -f (& $money $alwaysMonth), (& $money ($alwaysMonth - $ceiling)), (& $money $ceiling))
+            $config['monthlyCeilingUsd'] | Should -Be $ceiling -Because 'the configured ceiling never changes'
+        }
+        # Over the ceiling even with the container for the running hours only: still a Fail.
+        $over = (& $estimate ([System.Math]::Round($sessionMonth - 1, 2)) 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $over.status | Should -Be 'Fail'
+        $over.message | Should -Not -Match 'This is a Warning'
+        $over.evidence.Contains('t5CeilingException') | Should -BeFalse
+        # All month for another reason (a session-control role without the container's actions, so no stop deletes it): a Fail.
+        $kept = (& $estimate ([System.Math]::Round($sessionMonth + $extra * 0.5, 2)) 'AlwaysOn' $false).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $kept.status | Should -Be 'Fail'
+        $kept.message | Should -Match 'its container stays between sessions until the session control''s role can create it'
+        # Within the ceiling: a Pass, which says nothing of a Warning.
+        ((& $estimate ([System.Math]::Ceiling($alwaysMonth) + 1) 'AlwaysOn' $true).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
+    }
+
+    It 'counts no Bastion hour by default, since a default deployment and session have none, and -BastionHours counts it (2026-11-19, the docs audit)' {
+        # Only start-demo.ps1 -Interactive deploys Bastion, and its cost guardrail passes -BastionHours.
+        $default = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -NetworkMode public
+        $default.BastionHours | Should -Be 0
+        $default.BastionHourly | Should -BeGreaterThan 0 -Because 'its hourly price is still read and shown'
+        $with = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        [System.Math]::Abs(($with.SessionCost - $default.SessionCost) - $with.BastionHourly) | Should -BeLessOrEqual 0.011
+        [System.Math]::Abs(($with.LightUseMonthly - $default.LightUseMonthly) - $with.BastionHourly) | Should -BeLessOrEqual 0.011
+        (($default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').evidence.bastionHours) | Should -Be 0
+    }
+
+    It 'counts a nightly safety stop that this run sets up, and keeps the worst case without it for DEPLOY.COST.T4RESTART (2026-11-19, the coordinator''s option 2)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }
+        $planned = [pscustomobject]@{ Counts = $true; Planned = $true; Missing = ''; Reason = 'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'; Fix = ''; Evidence = [ordered]@{ counts = $true }; WithoutReason = 'the nightly safety stop isn''t in place yet'; WithoutFix = 'Run ./scripts/deploy.ps1.' }
+        $estimate = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $planned
+        $estimate.T4RestartHours | Should -Be 96
+        $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $without = [System.Math]::Round($estimate.LightUseMonthly + 0.18 * 720, 2)
+        $monthly.evidence.t4RestartPlanned | Should -BeTrue
+        $monthly.evidence.t4AutoRestartWorstCaseWithoutSafetyStopMonthly | Should -Be ([System.Math]::Round(0.18 * 720, 2))
+        $monthly.evidence.monthlyWorstCaseWithoutSafetyStop | Should -Be $without
+        $monthly.evidence.monthlyWorstCase | Should -Be ([System.Math]::Round($estimate.LightUseMonthly + 0.18 * 96, 2))
+        $monthly.evidence.t4RestartWithoutReason | Should -Match 'isn''t in place yet'
+        $monthly.message | Should -Match 'and deploy\.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role, so the worst case counts up to 4 restarts'
+        $monthly.message | Should -Match ('If its setup in this run doesn''t put it in place, the worst case is {0} USD a month, which the run then says \(DEPLOY\.COST\.T4RESTART\)\.' -f [regex]::Escape($without.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)))
+        # A safety stop that's already in place has no worst case without it.
+        $inPlace = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is in place'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $kept = (Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $inPlace).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $kept.evidence.t4RestartPlanned | Should -BeFalse
+        $kept.evidence.Contains('monthlyWorstCaseWithoutSafetyStop') | Should -BeFalse
+        $kept.message | Should -Not -Match 'DEPLOY\.COST\.T4RESTART'
+    }
     It 'keeps today''s monthly ceiling at <Ceiling> USD: a Warning only for init''s old 250 when only T4''s default size puts the month over it (R727, 2026-11-09)' -ForEach @(
         @{ Ceiling = 250; Legacy = $true }
         @{ Ceiling = 249; Legacy = $false }
@@ -413,16 +551,126 @@ Describe 'Get-DemoCostEstimate' {
     It 'prices the lowest-cost profile from retail prices' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         # Running: T1 0.20 + SQL 0.40 + host 0.30 + Arc 0.10 x 4 cores (the per-OSE minimum for the 2-vCPU guest)
-        # + T3 0.50 x 1 vCore = 1.80 per hour.
-        $estimate.HourlyRunning | Should -Be 1.8
+        # + T3 0.50 x 2 vCores (since 2026-11-18: Database Agents doesn't support one-vCore serverless databases) = 2.30 per hour.
+        $estimate.HourlyRunning | Should -Be 2.3
+        ($estimate.Components | Where-Object Name -EQ 'T3 compute (serverless)').Quantity | Should -Be 2
         $estimate.BastionHourly | Should -Be 0.2
         # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, and the session
         # control's vault operations, 0.03 (every deployment since 2026-11-14). There's no artifact cache.
         $estimate.IdleMonthly | Should -Be 23.23
-        $estimate.SessionCost | Should -Be 9.2
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.SessionCost | Should -Be 11.7
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
+    }
+
+    It 'prices T5''s container for the running hours only with the Session lifecycle, the default, and its private endpoint and DNS zone all month (2026-11-19, ADR 0027)' {
+        # 40 running hours a month, so the container's share differs from the 10-hour default's.
+        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $session = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $false
+        $t5 = @($session.Components | Where-Object Name -Match '^T5 ')
+        # 400 RU/s = 4 x 100 RU/s at 0.008 for each hour the container exists; about 1 GB at 0.25 a GB-month, by the hour.
+        $throughput = $t5 | Where-Object Name -Match '^T5 throughput'
+        $throughput.Basis | Should -Be 'running'
+        $throughput.Quantity | Should -Be 4
+        $throughput.Cost | Should -Be 0.032
+        $storage = $t5 | Where-Object Name -Match '^T5 storage'
+        $storage.Basis | Should -Be 'running'
+        $storage.Quantity | Should -Be (1.0 / 730)
+        # The account's private endpoint (in public mode too: 0.01 x 730) and its DNS zone stay between sessions.
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Cost | Should -Be 7.3
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Cost | Should -Be 0.5
+        $session.T5ContainerLifecycle | Should -Be 'Session'
+        $session.T5FixedMonthly | Should -Be 7.8
+        $session.T5RunningHourly | Should -Be 0.0323
+        $session.IdleMonthly | Should -Be ([System.Math]::Round($base.IdleMonthly + 7.8, 2))
+        # The light-use month bills the container for its 40 running hours only, and a 5-hour session for 5.
+        [System.Math]::Round($session.LightUseMonthly - $base.LightUseMonthly, 2) | Should -Be ([System.Math]::Round(7.8 + 0.0323 * 40, 2))
+        [System.Math]::Round($session.SessionCost - $base.SessionCost, 2) | Should -Be ([System.Math]::Round(0.0323 * 5, 2))
+        # What AlwaysOn adds: the container's month, 23.36 + 0.25, less its 40 running hours.
+        $session.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(23.61 - 0.0323 * 40, 2))
+        $monthly = $session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) costs 7\.80 USD a month whether the demo runs or not \(its private endpoint and private DNS zone\)\. Its container exists only during a session \(.+\), so its 400 RU/s of throughput and its storage add 0\.032 USD a running hour\.'
+        $monthly.message | Should -Match 'doesn''t have the free tier'
+        $monthly.message | Should -Match 'If the session control holds a role without the container''s actions \(an update by someone who isn''t an Owner, until an Owner runs \./scripts/grant-safety-stop\.ps1 once\), the container stays between sessions and adds about 22\.32 USD a month\.'
+        $monthly.evidence.monthlyWorstCase | Should -Be $session.LightUseMonthly -Because 'without T4, the worst case is the light-use month'
+        $monthly.evidence.t5ContainerLifecycle | Should -Be 'Session'
+        @($session.MissingPrices) | Should -BeNullOrEmpty
+
+        $unchecked = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $unchecked.T5RunningHourly | Should -Be 0.0323 -Because 'an unchecked free tier is priced at list price, an upper bound'
+        $unchecked.T5FreeTier | Should -BeNullOrEmpty
+        ($unchecked.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'wasn''t checked, so its throughput is at list price, an upper bound'
+    }
+
+    It 'prices T5''s container all month with the AlwaysOn lifecycle, while the session control''s role can''t create it (2026-11-19, ADR 0027)' {
+        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public
+        $alwaysOn = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $false -T5ContainerLifecycle AlwaysOn
+        $t5 = @($alwaysOn.Components | Where-Object Name -Match '^T5 ')
+        # 400 RU/s = 4 x 100 RU/s for 730 hours at 0.008; 1 GB at 0.25; the private endpoint and its DNS zone as with Session.
+        ($t5 | Where-Object Name -Match '^T5 throughput').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -Match '^T5 throughput').Cost | Should -Be 23.36
+        ($t5 | Where-Object Name -Match '^T5 storage').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -Match '^T5 storage').Cost | Should -Be 0.25
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Cost | Should -Be 7.3
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Cost | Should -Be 0.5
+        $alwaysOn.T5ContainerLifecycle | Should -Be 'AlwaysOn'
+        $alwaysOn.T5FixedMonthly | Should -Be 31.41
+        $alwaysOn.T5RunningHourly | Should -Be 0
+        $alwaysOn.HourlyRunning | Should -Be $base.HourlyRunning -Because 'nothing of T5 is a running cost while its container stays'
+        [System.Math]::Round($alwaysOn.LightUseMonthly - $base.LightUseMonthly, 2) | Should -Be 31.41 -Because 'all month, however many hours the demo runs'
+        $alwaysOn.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(23.61 - 0.0323 * 40, 2)) -Because 'what the Session lifecycle saves'
+        $monthly = $alwaysOn.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) costs 31\.41 USD a month whether the demo runs or not \(its 400 RU/s of throughput, storage, private endpoint, and private DNS zone\): its container stays between sessions until the session control''s role can create it\.'
+        $monthly.message | Should -Match 'Once \./scripts/deploy\.ps1 runs as an Owner of the subscription, or an Owner runs \./scripts/grant-safety-stop\.ps1 once, the container exists only during a session, which saves about 22\.32 USD a month\.'
+        $monthly.evidence.t5ContainerLifecycle | Should -Be 'AlwaysOn'
+    }
+
+    It 'prices T5''s throughput at zero on the free tier with the <Lifecycle> lifecycle, so its private endpoint and DNS zone are all it bills (2026-11-19, ADR 0027)' -ForEach @(
+        @{ Lifecycle = 'Session'; Basis = 'running' }
+        @{ Lifecycle = 'AlwaysOn'; Basis = 'idle' }
+    ) {
+        $free = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 40 -BastionHours 1 -NetworkMode public -T5FreeTier $true -T5ContainerLifecycle $Lifecycle
+        $throughput = $free.Components | Where-Object Name -Match '^T5 throughput'
+        $throughput.Meter | Should -Match 'Free Tier'
+        $throughput.Basis | Should -Be $Basis
+        $throughput.Cost | Should -Be 0
+        ($free.Components | Where-Object Name -EQ 'T5 private endpoint').Basis | Should -Be 'idle'
+        ($free.Components | Where-Object Name -EQ 'T5 private DNS zone').Basis | Should -Be 'idle'
+        $free.T5FixedMonthly | Should -Be 7.8 -Because 'the private endpoint and its DNS zone still bill'
+        $free.T5RunningHourly | Should -Be 0
+        $free.T5AlwaysOnExtraMonthly | Should -Be 0 -Because 'the free tier covers the container whenever it exists'
+        $monthly = ($free.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message
+        $monthly | Should -Match 'has the subscription''s free tier'
+        $monthly | Should -Not -Match 'adds about|saves about'
+    }
+
+    It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput while its container exists, and attributes the plan (2026-11-19, ADR 0027)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'CosmosDbs'; pricingTier = 'Standard'; subPlan = $null })
+        $session = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true
+        $defender = $session.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
+        $defender.Meter | Should -Match 'Standard 100 RU/s$' -Because 'the Standard meter, not the trial'
+        $defender.Basis | Should -Be 'running'
+        $defender.Cost | Should -Be 0.0048 -Because '4 x 100 RU/s at 0.0012 for each hour the container exists, free tier or not'
+        $session.T5FixedMonthly | Should -Be 7.8
+        $session.T5RunningHourly | Should -Be 0.0048
+        $session.T5AlwaysOnExtraMonthly | Should -Be ([System.Math]::Round(3.504 - 0.0048 * 10, 2))
+        ($session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'so its 400 RU/s of throughput, its storage, and Defender for Azure Cosmos DB add 0\.005 USD a running hour\.'
+        $message = ($session.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message
+        $message | Should -Match 'CosmosDbs'
+        $message | Should -Not -Match 'not attributed to the demo: [^.]*CosmosDbs'
+        @($session.Components | Where-Object { $_.Name -match 'CSPM' -and $_.Name -match 'T5' }) | Should -BeNullOrEmpty -Because 'Defender CSPM doesn''t bill Cosmos DB accounts'
+
+        $alwaysOn = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true -T5ContainerLifecycle AlwaysOn
+        $defender = $alwaysOn.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
+        $defender.Basis | Should -Be 'idle'
+        $defender.Cost | Should -Be 3.504 -Because '4 x 100 RU/s for 730 hours at 0.0012, free tier or not'
+        $alwaysOn.T5FixedMonthly | Should -Be 11.3
+        [System.Math]::Abs(($alwaysOn.DefenderMonthly - $session.DefenderMonthly) - (3.504 - 0.0048 * 10)) | Should -BeLessOrEqual 0.011
     }
 
     It 'counts business-day''s T3 incidents, which the shipped share already prices at T3''s maximum, so both ceilings hold as before (2026-11-03)' {
@@ -432,7 +680,7 @@ Describe 'Get-DemoCostEstimate' {
         $quiet = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ activityProfile = 'baseline' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $default.ActivityProfile | Should -Be 'business-day'
         $quiet.ActivityProfile | Should -Be 'baseline'
-        # T3 at its maximum, 1 vCore x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
+        # T3 at its maximum, 2 vCores x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
         $default.T3BusinessDaySession | Should -Be 0
         $default.T3BusinessDayMonthly | Should -Be 0
         $default.SessionCost | Should -Be $quiet.SessionCost
@@ -457,16 +705,16 @@ Describe 'Get-DemoCostEstimate' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoProfile -MockWith { $script:halfShare }
         $businessDay = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $baseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -ActivityProfile 'baseline'
-        # 1 vCore x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0417 an hour.
+        # 2 vCores x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0833 an hour.
         $increment = $businessDay.Components | Where-Object Name -EQ 'T3 compute, business-day incidents (10 of every 60 minutes at the maximum vCores)'
         $increment.UnitPrice | Should -Be 0.5
-        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.0833
-        $businessDay.T3BusinessDaySession | Should -Be 0.21 -Because '0.0833 x 5 hours x 0.50'
-        $businessDay.T3BusinessDayMonthly | Should -Be 0.42 -Because '0.0833 x 10 hours x 0.50'
-        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.21
-        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.42
+        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.1667
+        $businessDay.T3BusinessDaySession | Should -Be 0.42 -Because '0.1667 x 5 hours x 0.50'
+        $businessDay.T3BusinessDayMonthly | Should -Be 0.83 -Because '0.1667 x 10 hours x 0.50'
+        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.42
+        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.83
         @($baseline.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
-        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.21 USD to a session and 0\.42 USD to the light-use month before the free allowance'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.42 USD to a session and 0\.83 USD to the light-use month before the free allowance'
         ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Pass'
         ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match 'Serverless - Compute Gen5' }
@@ -521,10 +769,11 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
         # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00.
         $estimate.IdleMonthly | Should -Be 20.03
-        # The session stays at list price: 1.80 x 5 + 0.20 = 9.20.
-        $estimate.SessionCost | Should -Be 9.2
-        # Allowance: 10 vCore-hours x 0.50 = 5.00. Month: 20 + 1.80 x 10 + 0.20 - 5.00 = 33.20.
-        $estimate.T3FreeOfferCreditMonthly | Should -Be 5
+        # The session stays at list price: 2.30 x 5 + 0.20 = 11.70.
+        $estimate.SessionCost | Should -Be 11.7
+        # Allowance: 10 hours x 2 vCores = 20 vCore-hours (72,000 vCore-seconds, within the 100,000) x 0.50 = 10.00.
+        # Month: 20 + 2.30 x 10 + 0.20 - 10.00 = 33.20, as at 1 vCore: the allowance covers T3 at light use either way.
+        $estimate.T3FreeOfferCreditMonthly | Should -Be 10
         $estimate.LightUseMonthly | Should -Be 33.23
         $estimate.T3FreeOffer | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer'
@@ -538,7 +787,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless when the free offer is unavailable' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $false
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.T3FreeOffer | Should -BeFalse
         $estimate.T3FreeOfferUnchecked | Should -BeFalse
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'free offer'
@@ -546,7 +795,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless and says so when the free offer was not checked' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $estimate.LightUseMonthly | Should -Be 41.43
+        $estimate.LightUseMonthly | Should -Be 46.43
         $estimate.T3FreeOfferUnchecked | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer wasn''t checked'
     }
@@ -658,12 +907,12 @@ Describe 'Get-DemoCostEstimate' {
         @($estimate.Components | Where-Object Name -like 'Defender CSPM *').Basis | Should -Be @('running', 'running', 'idle')
         $estimate.Components.Name | Should -Not -Match 'Defender for Storage|Resource Manager|Key Vault'
 
-        # Running: 1.80 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 1.939 per hour.
-        $estimate.HourlyRunning | Should -Be 1.94
+        # Running: 2.30 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 2.439 per hour.
+        $estimate.HourlyRunning | Should -Be 2.44
         # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month.
         $estimate.IdleMonthly | Should -Be 46.59
-        $estimate.SessionCost | Should -Be 7.96
-        $estimate.LightUseMonthly | Should -Be 66.18
+        $estimate.SessionCost | Should -Be 9.96
+        $estimate.LightUseMonthly | Should -Be 71.18
         $estimate.DefenderSession | Should -Be 0.56
         $estimate.DefenderMonthly | Should -Be 24.75
     }
@@ -706,7 +955,7 @@ Describe 'Get-DemoCostEstimate' {
     }
 
     It 'checks the hard monthly ceiling against totals that include Defender' {
-        # Without Defender the light-use month is 41.40; with it, 66.15.
+        # Without Defender the light-use month is 46.43; with it, 71.18.
         $config = New-TestConfig -Override @{ monthlyCeilingUsd = 50 }
         $without = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -NetworkMode public -DefenderPlans @()
         ($without.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
@@ -724,10 +973,33 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Match 'raise monthlyCeilingUsd'
     }
 
-    It 'uses a 375 USD monthly ceiling and a 15 USD session ceiling by default (375 since 2026-11-04)' {
+    It 'uses a 415 USD monthly ceiling and a 20 USD session ceiling by default (415 since 2026-11-19, 375 before; 20 since 2026-11-18)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DefenderPlans $defenderPlans
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 375\.00 USD'
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 15\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 415\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 20\.00 USD'
+    }
+
+    It 'checks a session against 20 USD for a configuration that still says 15, the default before 2026-11-18, and against any other value as set' {
+        $legacyPath = Join-Path -Path $TestDrive -ChildPath 'legacy-session-ceiling.json'
+        $file = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable
+        $file['sessionCeilingUsd'] = 15
+        $file | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyPath -Encoding utf8NoBOM
+        $legacy = Get-DemoConfig -Path $legacyPath
+        $legacy['t4Enabled'] = $false
+        # T5's container bills by the running hour since 2026-11-19 (ADR 0027); off here, as in New-TestConfig.
+        $legacy['t5Enabled'] = $false
+        # Ask's relay is priced in its own test; this one checks the ceiling, at the figure below without it.
+        $legacy['ask'] = @{ enabled = $false; image = ''; githubClientId = '' }
+        # The fixture's lowest-cost session, 11.70 USD, is between the two ceilings: a Pass against 20, not a Warning against 15.
+        $session = (Get-DemoCostEstimate -Config $legacy -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Pass'
+        $session.message | Should -Match 'is estimated at 11\.70 USD \(of which Defender for Cloud: 0\.00 USD\) against a ceiling of 20\.00 USD'
+        $set = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ sessionCeilingUsd = 11 }) -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()
+        ($set.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Warning' -Because 'a value someone set stays'
+        # T4's cost checks (ConvertTo-DemoT4FallbackCost) read the same configuration.
+        $verdict = InModuleScope DbHubDemo -Parameters @{ Config = $legacy } { ConvertTo-DemoT4FallbackCost -Estimate ([pscustomobject]@{ LightUseMonthly = 50.0; T4AutoRestartWorstCaseMonthly = 100.0; SessionCost = 18.0; T4FixedMonthly = 5.0; DefenderIncluded = $true; MissingPrices = @(); Components = @([pscustomobject]@{ Name = 'T4 compute (Standard_D4ds_v5)'; UnitPrice = 0.09; Quantity = 4 }) }) -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $verdict.SessionCeilingUsd | Should -Be 20
+        $verdict.SkipReason | Should -Be ''
     }
 
     It 'passes when estimates are within the ceilings' {
@@ -804,8 +1076,8 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ dataDiskSku = 'E10' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         ($estimate.Components | Where-Object Name -eq 'T1 data disk (E10)').Cost | Should -Be 10
         ($estimate.Components | Where-Object Name -eq 'T2 host data disk (E10)').Cost | Should -Be 10
-        # The two data disks add 2 x 10.00 to the default 41.40.
-        $estimate.LightUseMonthly | Should -Be 61.43
+        # The two data disks add 2 x 10.00 to the default 46.43.
+        $estimate.LightUseMonthly | Should -Be 66.43
     }
 
     It 'removes the demo-day data disks when dataDiskSku is None' {

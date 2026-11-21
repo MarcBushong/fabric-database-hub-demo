@@ -11,8 +11,8 @@ profile to off unless -KeepProfile. -Reseed restores the seed data; -UndoRemedia
 missing-index remediation, so that scenario starts again from 'before'. It acts only inside ContosoCare.
 
 Resetting T3 connects to it, which resumes a paused serverless database; with its profile off it pauses
-again t3AutoPauseMinutes later. -RebuildGuest reports Not supported for now (destroy.ps1 then deploy.ps1
-rebuilds everything).
+again t3AutoPauseMinutes later. -RebuildGuest reports Not supported for now (destroy.ps1 -KeepFabric, then deploy.ps1,
+rebuilds everything and keeps the Fabric workspaces with their history).
 
 It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't need to change the Azure CLI's default subscription.
 
@@ -20,7 +20,8 @@ It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't 
 Demo configuration (default: config/demo.config.json).
 
 .PARAMETER Target
-all (default), T1, T2, T3, or T4.
+all (default), T1, T2, T3, T4, or T5 (T5, the Cosmos DB account: its runs stop and its profile goes off; there's no
+data to reseed or remediation to undo there).
 
 .PARAMETER Reseed
 Reseed the business data with the recorded seed and scale.
@@ -50,7 +51,7 @@ Exit with code 2 when a result is Manual action required.
 param(
     [string] $ConfigPath = (Join-Path -Path $PSScriptRoot -ChildPath '../config/demo.config.json'),
 
-    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4')]
+    [ValidateSet('all', 'T1', 'T2', 'T3', 'T4', 'T5')]
     [string] $Target = 'all',
 
     [switch] $Reseed,

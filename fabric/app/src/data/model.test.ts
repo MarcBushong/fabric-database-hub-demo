@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
 
+import { FIXTURES } from "@/test/render";
 import { catalogForCheck, checkIncidentRange, estateQuery, findingsQuery, incidentSeriesQuery, postgresFindingsQuery, postgresSeriesQuery, targetNamesQuery } from "./queries";
 import {
+    beatFor,
+    COSMOS_METRICS,
+    cosmosSeries,
+    throttledRuns,
+    throttleEpisodes,
+    toCosmosCapture,
     postgresPeak,
     postgresSeries,
     postgresSkus,
+    toAgentBeats,
     toBins,
     toChecks,
     toIncidents,
@@ -139,15 +147,43 @@ describe("model parsers", () => {
         expect(postgresSkus(findings)).toEqual({ T4: "Standard_D4ds_v5" });
         expect(postgresSkus([])).toEqual({});
     });
+
+    it("reads T5's latest Cosmos DB capture: its account, its 1-minute interval, its series, and its throttling episodes", () => {
+        const capture = toCosmosCapture(FIXTURES["cosmos-series"]);
+        expect(capture).toMatchObject({ account: "cosmos01-test01", intervalMinutes: 1 });
+        expect(cosmosSeries(capture, COSMOS_METRICS.throttled).map((p) => p.value)).toEqual([0, 0, 800, 760, 0, 0]);
+        expect(cosmosSeries(capture, COSMOS_METRICS.provisioned)).toHaveLength(1);
+        expect(toCosmosCapture([{ Bucket: "2026-11-13T17:00:00", Metric: "bad metric!", Value: 1 }])).toBeNull();
+        expect(throttleEpisodes(FIXTURES["cosmos-findings"]).map((e) => [e.id, e.start?.toISOString()])).toEqual([["cosmosdb.T5.throttle.20261113T1702", "2026-11-13T17:02:00.000Z"]]);
+        // Only the intervals that throttled are shaded, not the calm minutes of an episode.
+        expect(throttledRuns(capture).map((r) => [r.from.toISOString(), r.to.toISOString()])).toEqual([["2026-11-13T17:02:00.000Z", "2026-11-13T17:04:00.000Z"]]);
+        expect(throttledRuns(null)).toEqual([]);
+    });
+    it("reads each Database Agent beat's regression, response, and CPU from its evidence, and matches it to the incident it overlaps", () => {
+        const beats = toAgentBeats([
+            { FindingId: "a1", TargetKey: "T3", Status: "Pass", Finding: "Database Agent loop", Evidence: '{"regressUtc": "2026-10-21T10:03:00Z", "respondUtc": "2026-10-21T10:26:00Z", "cpuBeforePercent": 84, "cpuAfterPercent": 22.5}', RequestId: "session:abcd1234:05", WindowStart: "2026-10-21T10:00:00", WindowEnd: "2026-10-21T10:30:00" },
+            { FindingId: "a0", TargetKey: "T3", Status: "Warning", Evidence: "not json", WindowStart: "2026-10-20T10:00:00", WindowEnd: "2026-10-20T10:30:00" },
+            { FindingId: "", TargetKey: "T3" },
+        ]);
+        expect(beats.map((b) => b.id)).toEqual(["a1", "a0"]);
+        expect(beats[0]).toMatchObject({ requestId: "session:abcd1234:05", cpuBefore: 84, cpuAfter: 22.5 });
+        expect(beats[0].respondAt?.toISOString()).toBe("2026-10-21T10:26:00.000Z");
+        expect(beats[1]).toMatchObject({ regressAt: null, respondAt: null, cpuBefore: null });
+        const at = (iso: string) => new Date(`${iso}Z`);
+        expect(beatFor({ target: "T3", start: at("2026-10-21T10:10:00"), end: at("2026-10-21T11:00:00") }, beats)?.id).toBe("a1");
+        expect(beatFor({ target: "T1", start: at("2026-10-21T10:10:00"), end: at("2026-10-21T11:00:00") }, beats)).toBeNull();
+        expect(beatFor({ target: "T3", start: at("2026-10-21T10:30:00"), end: at("2026-10-21T11:00:00") }, beats)).toBeNull();
+    });
 });
 
 describe("query catalog", () => {
     const latest = new Date(Date.UTC(2026, 9, 21));
     const catalog = catalogForCheck(latest);
 
-    it("has 16 bounded, unique, read-only queries", () => {
-        expect(catalog).toHaveLength(16);
-        expect(new Set(catalog.map((q) => q.id)).size).toBe(16);
+    it("has 21 bounded, unique, read-only queries, and marks the ones a healthy new environment has no rows for", () => {
+        expect(catalog).toHaveLength(21);
+        expect(new Set(catalog.map((q) => q.id)).size).toBe(21);
+        expect(catalog.filter((q) => q.mayBeEmpty).map((q) => q.id)).toEqual(["readiness-checks", "scenario-runs", "agent-loop", "cosmos-series", "cosmos-findings"]);
         for (const q of catalog) {
             expect(q.dax.trimStart().startsWith("EVALUATE") || q.dax.trimStart().startsWith("DEFINE")).toBe(true);
             expect(q.rowLimit).toBeGreaterThan(0);
@@ -191,6 +227,11 @@ describe("query catalog", () => {
             "target-names",
             "postgres-series",
             "postgres-findings",
+            "scenario-runs",
+            "daily-trend",
+            "agent-loop",
+            "cosmos-series",
+            "cosmos-findings",
         ];
 
         it("lies in the newest telemetry day when history-meta has no anchors", () => {

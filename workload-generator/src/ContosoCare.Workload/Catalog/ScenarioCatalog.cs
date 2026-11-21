@@ -5,13 +5,14 @@ using System.Text.Json.Serialization;
 
 namespace ContosoCare.Workload.Catalog;
 
-/// <summary>The demo targets (architecture.md): T1 SQL Server on an Azure VM, T2 Arc-enabled SQL Server, T3 Azure SQL Database, T4 Azure Database for PostgreSQL flexible server (Phase 24).</summary>
+/// <summary>The demo targets (architecture.md): T1 SQL Server on an Azure VM, T2 Arc-enabled SQL Server, T3 Azure SQL Database, T4 Azure Database for PostgreSQL flexible server (Phase 24), T5 Azure Cosmos DB for NoSQL.</summary>
 internal enum DemoTarget
 {
     T1,
     T2,
     T3,
     T4,
+    T5,
 }
 
 /// <summary>One scenario definition, loaded from <c>scenarios/&lt;id&gt;/scenario.json</c> (embedded in the runner at build time).</summary>

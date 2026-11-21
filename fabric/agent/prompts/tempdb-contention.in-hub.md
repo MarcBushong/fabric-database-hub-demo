@@ -55,7 +55,7 @@ List the evidence behind your conclusion about {target}: metric names, the UTC w
 |---|---|---|
 | T1 | Buffer Latch waits (`PAGELATCH_EX`, `PAGELATCH_SH`, `PAGELATCH_UP`) with many tasks and short average waits; `Temp Tables Creation Rate` and `Active Temp Tables` up; `SQL Re-Compilations/sec` and CPU rising | tempdb is on the VM's local temporary disk |
 | T2 (default) | The same as T1 | tempdb is in the guest; nested-guest Performance support is validated live |
-| T3 | Fewer latch waits and more CPU waits | The service manages tempdb, and at 1 vCore or less fewer sessions run at once |
+| T3 | Fewer latch waits and more CPU waits | The service manages tempdb (seen at 1 vCore; T3's maximum is 2 vCores since 2026-11-18) |
 
 - Buffer Latch (`PAGELATCH_*`) is contention for pages already in memory. Buffer IO (`PAGEIOLATCH_*`) is waiting for the disk; the two point to different fixes.
 - The pages a latch wait is on aren't in the telemetry. The skills version reads them from the server.

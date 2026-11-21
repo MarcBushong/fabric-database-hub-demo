@@ -11,7 +11,8 @@ function Get-DemoDeploymentState {
     those hashes), NetworkMode, T3UseFreeLimit ($null when unknown), T3AdminGroupName, BastionExpiresUtc,
     HostPasswordUtc, TrackT1, TrackT2, TrackT4, and TrackFabric (the last step each parallel track finished, ADR 0018),
     FabricSha256 (the Fabric content the Fabric step last published in full, in the DbHubFabricSha256 tag; 2026-11-16,
-    Get-DemoFabricContentReopen),
+    Get-DemoFabricContentReopen), AppControlNotebookId (the NB_DatabaseHub_Control item ID the Insights app's Manage was
+    last deployed with, empty when it had none, in the DbHubAppControlNotebook tag; 2026-11-19, Get-DemoInsightsAppManageGap),
     T2Source (golden or build), FabricCapacityResumed and FabricCapacityResumedUtc (the capacity start-demo.ps1 resumed
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid; while it's still set after that, the guided stop's cleanup didn't finish and its Bastion
@@ -24,10 +25,16 @@ function Get-DemoDeploymentState {
     runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the
     DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), T4Replica (Session once deploy.ps1 has set up T4's
     read replica for this environment, in the DbHubT4Replica tag; 2026-11-13, ADR 0025), T4ReplicaSize (the size and zone the
-    last replica was created with, in the DbHubT4ReplicaSize tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
+    last replica was created with, in the DbHubT4ReplicaSize tag), T5Container (2026-11-19, ADR 0027: Session once the session
+    control's role can create T5's container, so it exists only during a session; AlwaysOn while it can't; in the
+    DbHubT5Container tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
     nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
     ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
-    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), and Tags
+    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), T5Refused (when
+    Azure didn't create T5's account and the run deployed the rest without it, in DbHubT5Refused; 2026-11-19,
+    Resolve-DemoT5LeftOut), StartDemoUtc (when the last start-demo.ps1 began, in DbHubStartDemoUtc; 2026-11-19,
+    Get-DemoUpdateStopSession), ArcSweepUtc (when an Arc onboarding of T2's guest began whose sign-in data sweep hasn't
+    passed yet, in DbHubArcSweepUtc; 2026-11-19, Invoke-DemoArcOnboarding), and Tags
     (every tag on the group). Read-only.
 
     .PARAMETER Config
@@ -73,6 +80,7 @@ function Get-DemoDeploymentState {
         TrackT4           = & $read 'TrackT4'
         TrackFabric       = & $read 'TrackFabric'
         FabricSha256      = (& $read 'FabricSha256').ToLowerInvariant()
+        AppControlNotebookId = (& $read 'AppControlNotebookId').ToLowerInvariant()
         T2Source          = & $read 'T2Source'
         FabricCapacityResumed    = & $read 'FabricCapacityResumed'
         FabricCapacityResumedUtc = & $read 'FabricCapacityResumedUtc'
@@ -83,10 +91,14 @@ function Get-DemoDeploymentState {
         T2InstallMode     = & $read 'T2InstallMode'
         T4Replica         = & $read 'T4Replica'
         T4ReplicaSize     = & $read 'T4ReplicaSize'
+        T5Container       = & $read 'T5Container'
         BusyUntilUtc      = & $read 'BusyUntilUtc'
         BusyBy            = & $read 'BusyBy'
         FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
         ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
+        T5Refused         = & $read 'T5Refused'
+        StartDemoUtc      = & $read 'StartDemoUtc'
+        ArcSweepUtc       = & $read 'ArcSweepUtc'
         Tags              = $tags
     }
 }

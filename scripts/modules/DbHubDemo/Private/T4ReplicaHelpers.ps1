@@ -1391,12 +1391,46 @@ function Format-DemoT4ReplicaMetricText {
     return ($parts -join ', ')
 }
 
+function Test-DemoT4ReplicaSourceRunning {
+    # True while T4, the replica's source, runs: Ready, or Updating or Restarting, which a running server goes through (a
+    # scale, a parameter, the replica's own creation) and leaves by itself. A replica that's there while T4 is stopped,
+    # stopping, starting, or missing has nothing to replicate (2026-11-18). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $T4State
+    )
+
+    return ([bool](Get-DemoMemberValue -InputObject $T4State -Name 'Exists') -and [string](Get-DemoMemberValue -InputObject $T4State -Name 'State') -in 'Ready', 'Updating', 'Restarting')
+}
+
+function Format-DemoT4ReplicaSourceState {
+    # T4's state as a replica check says it: "is Stopped", "is Starting", "isn't there", or "couldn't be read". Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $T4State
+    )
+
+    $state = [string](Get-DemoMemberValue -InputObject $T4State -Name 'State')
+    if ($state -eq 'NotFound') {
+        return 'isn''t there'
+    }
+    if (-not $state -or $state -eq 'Unknown') {
+        return 'couldn''t be read'
+    }
+    return ('is {0}' -f $state)
+}
+
 function Test-DemoT4ReplicaMetricFlow {
     <#
     .SYNOPSIS
     METRICS.T4.REPLICA: whether Azure Monitor has the replica's Read Replica Lag (physical_replication_delay_in_seconds),
     which Database Hub's PostgreSQL dashboard charts as Read replica lag, from the last -Minutes. With -WaitMinutes, reads
-    again every minute until it arrives (a replica created minutes ago). Internal.
+    again every minute until it arrives (a replica created minutes ago). A replica that isn't there, isn't Ready, or runs
+    while T4 doesn't (2026-11-18) is a Warning with the reason. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1420,16 +1454,23 @@ function Test-DemoT4ReplicaMetricFlow {
     if (-not (Test-DemoT4ReplicaSetUp -State $state)) {
         return (New-DemoT4ReplicaNotSetUpResult -CheckId 'METRICS.T4.REPLICA' -Status 'Warning')
     }
-    $support = Get-DemoT4ReplicaSupport -T4State (Get-DemoT4State -Config $Config -DeploymentId $DeploymentId)
+    $t4 = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    $support = Get-DemoT4ReplicaSupport -T4State $t4
     if ($support.Reason -eq 'Burstable') {
         return (New-DemoT4ReplicaNotSupportedResult -CheckId 'METRICS.T4.REPLICA' -T4SkuName $support.SkuName)
     }
     $replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
     if (-not $replica.Exists) {
-        return (New-DemoResult -CheckId 'METRICS.T4.REPLICA' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) isn''t there, so it has no metrics: it exists only during a session.' -f $replica.Names.ServerName) -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 creates it; its metrics arrive within a few minutes.' -DocUrl $docUrl)
+        $message = if ($replica.Removing) { 'T4''s read replica ({0}) is being deleted, so it has no metrics: it exists only during a session.' -f $replica.Names.ServerName } elseif ($replica.State -eq 'NotFound') { 'T4''s read replica ({0}) isn''t there, so it has no metrics: it exists only during a session.' -f $replica.Names.ServerName } else { 'T4''s read replica ({0}) couldn''t be read, so neither were its metrics: {1}' -f $replica.Names.ServerName, $replica.Error }
+        return (New-DemoResult -CheckId 'METRICS.T4.REPLICA' -Area 'hub' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 creates it; its metrics arrive within a few minutes.' -DocUrl $docUrl)
     }
     if ($replica.State -ne 'Ready') {
-        return (New-DemoResult -CheckId 'METRICS.T4.REPLICA' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is {1}, so it sends no fresh metrics.' -f $replica.Names.ServerName, $replica.State) -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 starts or creates it.' -DocUrl $docUrl)
+        $now = if ($replica.State -eq 'Provisioning') { 'is being created (Provisioning)' } else { 'is {0}' -f $replica.State }
+        return (New-DemoResult -CheckId 'METRICS.T4.REPLICA' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) {1}, so it sends no fresh metrics.' -f $replica.Names.ServerName, $now) -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 starts or creates it.' -DocUrl $docUrl)
+    }
+    if (-not (Test-DemoT4ReplicaSourceRunning -T4State $t4)) {
+        # 2026-11-18: a replica that runs while T4 doesn't has nothing to replicate, so its lag says nothing about a session.
+        return (New-DemoResult -CheckId 'METRICS.T4.REPLICA' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) runs, but T4 ({1}) {2}, so it has nothing to replicate and no Read replica lag to show.' -f $replica.Names.ServerName, $t4.Names.ServerName, (Format-DemoT4ReplicaSourceState -T4State $t4)) -Evidence ([ordered]@{ state = $replica.State; t4State = [string]$t4.State }) -Remediation './scripts/start-demo.ps1 or the control notebook''s Run all starts T4; the check runs then (./scripts/validate.ps1 -Area T4).' -DocUrl $docUrl)
     }
     $deadline = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
     while ($true) {
@@ -1455,7 +1496,9 @@ function Test-DemoT4ReplicaServer {
     .SYNOPSIS
     T4.REPLICA: the replica's checks (ADR 0025): it exists and replicates from T4 (replicationRole AsyncReplica, its
     source T4), its size has at least T4's vCores, it's in T4's subnet and private DNS zone, Microsoft Entra only, and its
-    replay delay is the lag scenario's. Not set up, Not supported, and between sessions are reported as such. Internal.
+    replay delay is the lag scenario's. Not set up, Not supported, and between sessions are reported as such. A replica
+    being created or deleted, or there while T4 doesn't run (stopped, stopping, starting, or missing), is a Warning with
+    the reason (2026-11-18), never a Pass or a Fail. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1487,8 +1530,12 @@ function Test-DemoT4ReplicaServer {
     $names = $replica.Names
     if (-not $replica.Exists) {
         $status = if ($replica.State -in 'NotFound') { 'Pass' } else { 'Warning' }
-        $message = if ($replica.State -eq 'NotFound') { 'T4''s read replica ({0}) isn''t there now: it exists only during a session (start-demo.ps1 creates it, stop-demo.ps1 deletes it), so nothing bills for it between sessions.' -f $names.ServerName } elseif ($replica.Removing) { 'T4''s read replica ({0}) is being deleted.' -f $names.ServerName } else { 'T4''s read replica ({0}) couldn''t be read: {1}' -f $names.ServerName, $replica.Error }
+        $message = if ($replica.State -eq 'NotFound') { 'T4''s read replica ({0}) isn''t there now: it exists only during a session (start-demo.ps1 creates it, stop-demo.ps1 deletes it), so nothing bills for it between sessions.' -f $names.ServerName } elseif ($replica.Removing) { 'T4''s read replica ({0}) is being deleted (stop-demo.ps1 deletes it at a session''s end, and Azure removes a size it refused), so it isn''t checked.' -f $names.ServerName } else { 'T4''s read replica ({0}) couldn''t be read: {1}' -f $names.ServerName, $replica.Error }
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $status -Message $message -Evidence ([ordered]@{ replica = $names.ServerName; state = $replica.State }) -Remediation $(if ($status -eq 'Pass') { '' } else { 'Check it again in a few minutes.' }) -DocUrl $docUrl)
+    }
+    if ($replica.State -eq 'Provisioning') {
+        # Being created (start-demo.ps1, the control notebook's Run all, or deploy.ps1), so its settings aren't final yet.
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is being created (Provisioning), so it isn''t checked yet: a session''s replica takes about {1} minutes.' -f $names.ServerName, $setting['createMinutes']) -Evidence ([ordered]@{ replica = $names.ServerName; state = $replica.State; t4State = [string]$t4.State }) -Remediation 'Check it again once it''s Ready (./scripts/validate.ps1 -Area T4).' -DocUrl $docUrl)
     }
     $properties = Get-DemoMemberValue -InputObject $replica.Server -Name 'properties'
     $network = Get-DemoMemberValue -InputObject $properties -Name 'network'
@@ -1514,12 +1561,20 @@ function Test-DemoT4ReplicaServer {
         $problems.Add('password authentication is on')
     }
     $delay = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'max_standby_streaming_delay'
-    $evidence = [ordered]@{ replica = $names.ServerName; state = $replica.State; skuName = $replica.SkuName; zone = $replica.Zone; role = $replica.Role; t4SkuName = $support.SkuName; t4Zone = $support.Zone; maxStandbyStreamingDelayMs = $delay.Value }
+    $evidence = [ordered]@{ replica = $names.ServerName; state = $replica.State; skuName = $replica.SkuName; zone = $replica.Zone; role = $replica.Role; t4SkuName = $support.SkuName; t4Zone = $support.Zone; t4State = [string]$t4.State; maxStandbyStreamingDelayMs = $delay.Value }
     if ($delay.Found -and $delay.Value -ne [string]$setting['maxStandbyStreamingDelayMs']) {
         $problems.Add(('max_standby_streaming_delay is {0} ms, not {1}, so replica-lag shows less lag' -f $delay.Value, $setting['maxStandbyStreamingDelayMs']))
     }
     if ($problems.Count -gt 0) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is there, but {1}.' -f $names.ServerName, ($problems -join '; ')) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1, which deletes it, then ./scripts/start-demo.ps1, which creates it as the template says.' -DocUrl $docUrl)
+    }
+    if (-not (Test-DemoT4ReplicaSourceRunning -T4State $t4)) {
+        # 2026-11-18: a replica that's there while T4 doesn't run has nothing to replicate: T4 still starting after it
+        # (Azure starts a replica before its source), or a session that ended without stop-demo.ps1. Never a Pass or a Fail.
+        $t4Now = [string]$t4.State
+        $why = if ($t4Now -eq 'Starting') { ' until T4 is Ready (Azure starts a replica before its source)' } elseif ($t4Now -in 'Stopped', 'Stopping') { ': a session that ended without stop-demo.ps1 leaves it, and it bills until it''s deleted' } else { '' }
+        $fix = if ($t4Now -eq 'Starting') { 'Check it again once T4 is Ready (./scripts/validate.ps1 -Area T4).' } else { './scripts/stop-demo.ps1 deletes it, or ./scripts/start-demo.ps1 or the control notebook''s Run all starts T4 for a session; the check runs then (./scripts/validate.ps1 -Area T4).' }
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is {1}, but T4 ({2}) {3}, so it has nothing to replicate{4}.' -f $names.ServerName, $replica.State, $names.SourceName, (Format-DemoT4ReplicaSourceState -T4State $t4), $why) -Evidence $evidence -Remediation $fix -DocUrl $docUrl)
     }
     $zones = if ($replica.Zone -and $support.Zone) { ' (zone {0}; T4 in zone {1})' -f $replica.Zone, $support.Zone } else { '' }
     $running = if ($replica.State -eq 'Ready') { 'running (Ready)' } else { $replica.State }
@@ -1532,7 +1587,8 @@ function Get-DemoT4ReplicaStatusResult {
     .SYNOPSIS
     STATUS.T4.REPLICA for status.ps1 (ADR 0025): not set up yet (the upgrade's command), Not supported on a Burstable T4,
     none between sessions, running with its lag and health, or left over while T4 is stopped (a session that ended
-    without stop-demo.ps1), which bills storage and its Defender plans until stop-demo.ps1 deletes it. Internal.
+    without stop-demo.ps1), which bills storage and its Defender plans until stop-demo.ps1 deletes it. Being created or
+    deleted, or running while T4 is still starting, is a Warning that says so (2026-11-18); never a Fail. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1576,20 +1632,27 @@ function Get-DemoT4ReplicaStatusResult {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4''s read replica ({0}) isn''t there: it exists only during a session, so nothing bills for it now. {1}' -f $names.ServerName, $next) -Evidence $evidence -DocUrl $docUrl)
     }
     if ($replica.Removing) {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4''s read replica ({0}) is being deleted (stop-demo.ps1, or a refused size''s shell).' -f $names.ServerName) -Evidence $evidence -DocUrl $docUrl)
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is being deleted (stop-demo.ps1, or a refused size''s shell), so it''s gone within minutes.' -f $names.ServerName) -Evidence $evidence -Remediation 'Check it again in a few minutes (./scripts/status.ps1).' -DocUrl $docUrl)
     }
     if ($replica.State -eq 'Ready') {
         $snapshot = Get-DemoT4ReplicaMetricSnapshot -Config $Config -ServerId $names.ServerId -PrimaryId $names.SourceId -Minutes 15
         $evidence['latest'] = $snapshot.Latest
         $evidence['peak'] = $snapshot.Peak
         $metricText = if ($snapshot.Succeeded -and $snapshot.Latest.Count -gt 0) { ': {0}' -f (Format-DemoT4ReplicaMetricText -Snapshot $snapshot) } else { '; Azure Monitor has no fresh metrics for it yet' }
-        if ($T4State.State -ne 'Ready') {
+        if ([string]$T4State.State -eq 'Starting') {
+            # start-demo.ps1 or Run all in progress: Azure starts a replica before its source (2026-11-18).
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is running while T4 is Starting (Azure starts a replica before its source), so it has nothing to replicate until T4 is Ready.' -f $names.ServerName) -Evidence $evidence -Remediation 'Check it again in a few minutes (./scripts/status.ps1).' -DocUrl $docUrl)
+        }
+        if (-not (Test-DemoT4ReplicaSourceRunning -T4State $T4State)) {
             return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is running while T4 is {1}, so it bills its compute with nothing to replicate.' -f $names.ServerName, $T4State.State) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1, which deletes it.' -DocUrl $docUrl)
         }
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4''s read replica ({0}, {1}) is running{2}.' -f $names.ServerName, $replica.SkuName, $metricText) -Evidence $evidence -DocUrl $docUrl)
     }
     if ($replica.State -eq 'Stopped') {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is stopped: a session ended without stop-demo.ps1, and the nightly safety stop stopped it after T4. It bills its storage and Defender plans while it''s there, and Azure starts it again on its own after 7 days, until the safety stop stops it again.' -f $names.ServerName) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1, which deletes it; the next ./scripts/start-demo.ps1 creates a new one. (start-demo.ps1 starts this one first if it''s still there, because Azure starts T4 only after its replicas.)' -DocUrl $docUrl)
+    }
+    if ($replica.State -eq 'Provisioning') {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is being created (Provisioning): start-demo.ps1, the control notebook''s Run all, and deploy.ps1 create it in about {1} minutes.' -f $names.ServerName, $setting['createMinutes']) -Evidence $evidence -Remediation 'Check it again in a few minutes (./scripts/status.ps1).' -DocUrl $docUrl)
     }
     return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is {1}.' -f $names.ServerName, $replica.State) -Evidence $evidence -Remediation 'Check it again in a few minutes.' -DocUrl $docUrl)
 }
@@ -1656,6 +1719,9 @@ function Test-DemoT4ReplicaEstate {
     $replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
     if (-not $replica.Present) {
         return (New-DemoResult -CheckId $checkId -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) isn''t there, so the Hub Estate doesn''t list it: it exists only during a session.' -f $names.ServerName) -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 creates it; Resource Graph lists it within minutes.' -DocUrl $docUrl)
+    }
+    if ($replica.Removing) {
+        return (New-DemoResult -CheckId $checkId -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is being deleted (stop-demo.ps1, or a refused size''s shell), so the Hub Estate doesn''t list it: it exists only during a session.' -f $names.ServerName) -Evidence ([ordered]@{ state = $replica.State }) -Remediation './scripts/start-demo.ps1 creates it again; Resource Graph lists it within minutes.' -DocUrl $docUrl)
     }
     return (New-DemoResult -CheckId $checkId -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) exists, but Azure Resource Graph doesn''t list it yet.' -f $names.ServerName) -Evidence ([ordered]@{ state = $replica.State }) -Remediation 'A new resource can take a few minutes to appear in Resource Graph; run ./scripts/validate.ps1 -Area Hub again.' -DocUrl $docUrl)
 }
@@ -1746,19 +1812,25 @@ function Get-DemoT4ReplicaHold {
     <#
     .SYNOPSIS
     Whether a demo session uses T4's read replica now (2026-11-16), so deploy.ps1 leaves it at its end
-    (Invoke-DemoT4ReplicaDeployEnd). Returns Held, By (Control, StartDemo, Unknown, or ''), UntilUtc, and Error. Read-only;
-    never throws. Internal.
+    (Invoke-DemoT4ReplicaDeployEnd). Returns Held, By (Control, StartDemo, Unknown, or ''), UntilUtc, StartedUtc (a
+    start-demo.ps1 auto-stop's session start, from its description; $null otherwise), and Error. Read-only; never throws.
+    Internal.
 
     .DESCRIPTION
     - A session or run the control notebook started (ADR 0020, ADR 0026): its auto-stop, the one-time schedule
       dbhub-autostop in the control's Automation account, is still to come. That auto-stop deletes the replica at the
-      session's end.
+      session's end. Since 2026-11-19 a start-demo.ps1 session has one too, marked in its description: By StartDemo.
     - A session start-demo.ps1 started: the replica's DbHubSessionUntilUtc tag, the VMs' next auto-shutdown when the
       session started, is still ahead. A new replica has it from its creation (Start-DemoT4ReplicaCreate); one that was
       there already gets it from Set-DemoT4ReplicaHold. The tag goes with the replica, which stop-demo.ps1 and a
       control session's auto-stop delete; one more than a day ahead is ignored, so no tag keeps a replica longer.
     - The control's auto-stop couldn't be read (anything but "not there", such as no control at all): Held, By Unknown,
-      so a replica a session may use is never deleted.
+      so a replica a session may use is never deleted. So is a replica whose mark couldn't be read (2026-11-19, the review
+      of the stop at the end of an update): its read failed, or the resource group has no deploymentId tag to name it.
+    - -StartDemoSinceUtc (deploy.ps1's stop at the end of an update, which found the demo stopped when it began): a
+      start-demo.ps1 auto-stop from a session that started before then, with a nightly stop between, is left over, because
+      the nightly stop or the VMs' auto-shutdown ended that session without removing it, so it doesn't count (Ignored has its
+      time). One with no nightly stop between counts: its session may not have started its VMs yet when the run began.
     https://learn.microsoft.com/rest/api/automation/schedule/get
     #>
     [CmdletBinding()]
@@ -1772,19 +1844,48 @@ function Get-DemoT4ReplicaHold {
 
         [string] $DeploymentId = '',
 
+        [AllowNull()]
+        [object] $StartDemoSinceUtc = $null,
+
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
     $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { $NowUtc }
+    $since = if ($null -ne $StartDemoSinceUtc) { ConvertTo-DemoUtcDateTime -Value $StartDemoSinceUtc } else { $null }
+    $ignored = $null
     $controlError = ''
     try {
         $name = Get-DemoActivityControlName -Config $Config
         $url = Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
         $schedule = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url $url
         if ($schedule.Ok) {
-            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+            $properties = Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties'
+            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'startTime')
             if ($null -ne $stopUtc -and $stopUtc -gt $now) {
-                return [pscustomobject]@{ Held = $true; By = 'Control'; UntilUtc = $stopUtc; Error = '' }
+                # A start-demo.ps1 session's own auto-stop (2026-11-19) is the same schedule, marked in its description, which
+                # also says when its session started (Register-DemoActivityControlAutoStop).
+                $description = [string](Get-DemoMemberValue -InputObject $properties -Name 'description')
+                $startDemo = $description.StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)
+                $startedUtc = $null
+                $found = [regex]::Match($description, 'session started at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)')
+                if ($startDemo -and $found.Success) {
+                    $startedUtc = ConvertTo-DemoUtcDateTime -Value $found.Groups[1].Value
+                }
+                # A start-demo.ps1 auto-stop left over (deploy.ps1's stop at the end of an update): its session started before
+                # the run, and a nightly stop came between, which ended it without removing the schedule. With no nightly stop
+                # between, it may be a session whose VMs weren't started yet when the run began, so it counts (the re-review
+                # of 2026-11-19).
+                $leftOver = $false
+                if ($startDemo -and $null -ne $startedUtc -and $null -ne $since -and $startedUtc -lt $since) {
+                    $nightlyUtc = Get-DemoLastNightlyStopUtc -Config $Config -BeforeUtc $since
+                    $leftOver = $null -ne $nightlyUtc -and $nightlyUtc -gt $startedUtc
+                }
+                if ($leftOver) {
+                    $ignored = $stopUtc
+                }
+                else {
+                    return [pscustomobject]@{ Held = $true; By = $(if ($startDemo) { 'StartDemo' } else { 'Control' }); UntilUtc = $stopUtc; StartedUtc = $startedUtc; Ignored = $null; Error = '' }
+                }
             }
         }
         elseif (-not $schedule.Missing) {
@@ -1794,24 +1895,36 @@ function Get-DemoT4ReplicaHold {
     catch {
         $controlError = Protect-DemoText -Text $_.Exception.Message
     }
+    $replicaError = ''
+    $replicaError = ''
     try {
         if ($null -eq $Replica) {
             $Replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
+        }
+        # A mark that can't be read keeps a session it may belong to (2026-11-19): a read that failed, or no server name
+        # because the resource group has no deploymentId tag.
+        $replicaNames = Get-DemoMemberValue -InputObject $Replica -Name 'Names'
+        if ($null -ne $replicaNames -and -not [string](Get-DemoMemberValue -InputObject $replicaNames -Name 'ServerName')) {
+            $replicaError = 'T4''s read replica can''t be named: the resource group has no deploymentId tag'
+        }
+        elseif ([string](Get-DemoMemberValue -InputObject $Replica -Name 'State') -eq 'Unknown' -and $null -eq (Get-DemoMemberValue -InputObject $Replica -Name 'Server')) {
+            $readError = [string](Get-DemoMemberValue -InputObject $Replica -Name 'Error')
+            $replicaError = 'T4''s read replica couldn''t be read{0}' -f $(if ($readError) { ' ({0})' -f $readError.TrimEnd('.') } else { '' })
         }
         $tags = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Replica -Name 'Server') -Name 'tags'
         $mark = [string](Get-DemoMemberValue -InputObject $tags -Name $script:T4ReplicaSessionTag)
         $until = if ($mark) { ConvertTo-DemoUtcDateTime -Value $mark } else { $null }
         if ($null -ne $until -and $until -gt $now -and $until -le $now.AddHours(24)) {
-            return [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $until; Error = '' }
+            return [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $until; StartedUtc = $null; Ignored = $ignored; Error = '' }
         }
     }
     catch {
-        Write-DemoLog -Level Debug -Message ('T4''s read replica''s session mark couldn''t be read: {0}' -f $_.Exception.Message)
+        $replicaError = 'T4''s read replica''s session mark couldn''t be read ({0})' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.')
     }
-    if ($controlError) {
-        return [pscustomobject]@{ Held = $true; By = 'Unknown'; UntilUtc = $null; Error = (Protect-DemoText -Text $controlError) }
+    if ($controlError -or $replicaError) {
+        return [pscustomobject]@{ Held = $true; By = 'Unknown'; UntilUtc = $null; StartedUtc = $null; Ignored = $ignored; Error = (Protect-DemoText -Text ((@($controlError, $replicaError) | Where-Object { $_ }) -join '; ')) }
     }
-    return [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Error = '' }
+    return [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; StartedUtc = $null; Ignored = $ignored; Error = '' }
 }
 
 function Set-DemoT4ReplicaHold {

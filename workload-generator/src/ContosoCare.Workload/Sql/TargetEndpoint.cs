@@ -33,6 +33,11 @@ internal sealed record TargetEndpoint(DemoTarget Target, string Server, SqlAuthM
             throw new ScenarioRequestException("T4 is Azure Database for PostgreSQL; its endpoint comes from PgEndpoint.Create.");
         }
 
+        if (target == DemoTarget.T5)
+        {
+            throw new ScenarioRequestException("T5 is Azure Cosmos DB for NoSQL; its endpoint comes from CosmosEndpoint.Create.");
+        }
+
         if (sqlLoginFromEnvironment)
         {
             if (target == DemoTarget.T3)

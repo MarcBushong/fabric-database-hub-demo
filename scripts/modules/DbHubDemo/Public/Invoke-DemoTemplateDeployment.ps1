@@ -17,7 +17,10 @@ function Invoke-DemoTemplateDeployment {
     3. Runs 'az deployment sub create' (or 'what-if --no-pretty-print') through Invoke-DemoAz, deployment name
        <prefix>-<environment>-main (dbhub-demo-main with the defaults).
     4. If the deployment fails because Azure rejected the free offer (Resolve-DemoT3FreeOfferError), it
-       deploys again with t3UseFreeLimit false and returns the T3.FREEOFFER Warning (ADR 0016, C7).
+       deploys again with t3UseFreeLimit false and returns the T3.FREEOFFER Warning (ADR 0016, C7). T5's free tier
+       (2026-11-18, ADR 0027) is decided first (Resolve-DemoT5FreeTier, DEPLOY.T5.FREETIER: an existing account keeps what
+       it has; a new one gets it when no other account in the subscription has it), and a refusal deploys again without it,
+       once (a DEPLOY.T5.FREETIER Warning).
     5. Phase 24: an existing VM's disks whose type drifted from the profile (Get-DemoVmDiskDrift; the
        subscription's automation can switch a deallocated VM's disks to Standard HDD) keep their current type
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
@@ -65,7 +68,8 @@ function Invoke-DemoTemplateDeployment {
        fallback tries is priced instead, unless the fallback's own check prices it. A record that doesn't
        match the server that exists is cleared, never set to its size, unless it's the size a refused scale kept. A
        record no longer holds once the configuration sets t4SkuName (review finding 5). The VMs that exist are read again
-       before each attempt, so a VM a failed attempt created never gets an osProfile again. While the fallback is
+       before each attempt, so a VM a failed attempt created never gets an osProfile again, and so are the group's tags
+       (2026-11-19), so a tag another command wrote meanwhile isn't lost. While the fallback is
        choosing, T4 is read again after each failed attempt that sent it (review of 64c28b2): its server depends only on
        the network, so an attempt that failed for another resource (the T3 free offer, a budget) can still have created
        it, and a server that exists is treated as existing from then on: it keeps its own size and record, isn't priced
@@ -85,13 +89,19 @@ function Invoke-DemoTemplateDeployment {
        included (Get-DemoDeploymentFailure, New-DemoTemplateFailureResult), for example "Microsoft.Consumption/budgets
        budget-dbhub-demo: 400: Start date of budgets cannot be updated. ..."; when they can't be read, the Azure
        CLI's error, as before. A refused budget start date gets a remediation that says how to recreate the budget.
+    8. Review of T5 (2026-11-19): when this run creates T5's account and the deployment failed in T5's resources alone
+       (Get-DemoT5OnlyFailure: a region that refuses new Azure Cosmos DB accounts, or a policy that denies them), the
+       template is deployed again once without T5 (Copy-DemoT5OffConfig), with DEPLOY.T5's Warning (Azure's reason, and
+       t5Enabled false as the fix when it lasts), and the group records it (DbHubT5Refused), so a resume leaves T5 out
+       instead of starting from preflight; a run whose template creates T5 clears it.
 
     Deployment success alone is never Pass (ADR 0012): the result is DEPLOY.TEMPLATE Pass only with the
     provisioning state Succeeded, and later stages check what was deployed.
 
     Returns Succeeded, Results (DEPLOY.TEMPLATE plus any fallback Warning), Outputs (the template outputs as
     name -> value), Changes (what-if only), T3UseFreeLimit (what was deployed), T4Enabled and T4SkuName (what
-    T4 got), and T4Note (the fallback's line for the console and the status page, or '').
+    T4 got), T4Note (the fallback's line for the console and the status page, or ''), and T5Enabled and T5LeftOut
+    (whether T5 was deployed, and Azure's reason when this run left it out, or '').
 
     Sources (checked 2026-10-20; the last three 2026-11-02):
     - az deployment sub create: https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-create
@@ -394,6 +404,29 @@ function Invoke-DemoTemplateDeployment {
 
     $useFreeLimit = $T3UseFreeLimit
     $freeOfferTried = $false
+    # T5's free tier (2026-11-18, ADR 0027): an existing account keeps what it has (Azure sets it only at creation); a new one
+    # gets it when no other account in the subscription has it (Resolve-DemoT5FreeTier, DEPLOY.T5.FREETIER). A refusal
+    # (another account took it meanwhile) deploys again without it, once.
+    $t5FreeTier = $false
+    $t5FreeTried = $false
+    $t5FreeResult = $null
+    # Whether this run creates T5's account (review, 2026-11-19): only then does a failure in T5's resources alone deploy
+    # the template again without T5 (below), so the rest of the run finishes, instead of ending NOT DONE.
+    $t5Creating = $false
+    $t5OffTried = $false
+    $t5LeftOut = ''
+    if (Test-DemoT5Enabled -Config $effective) {
+        try {
+            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5FreeTier = [bool]$t5Free.UseFreeTier
+            $t5FreeResult = $t5Free.Result
+            $t5Creating = -not [bool]$t5Free.Exists
+            $results.Add($t5FreeResult)
+        }
+        catch {
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Whether T5 can use the subscription''s free tier couldn''t be read ({0}), so it''s created without it: its throughput is billed every hour.' -f (Protect-DemoText -Text $_.Exception.Message)) -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
+        }
+    }
     # The fallback works on $effective, only for a server that doesn't exist yet: without t4SkuName (2026-11-04), and for a
     # size t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning").
     $ladder = $t4On -and -not $t4Exists -and $Action -eq 'Create'
@@ -475,6 +508,26 @@ function Invoke-DemoTemplateDeployment {
     }
     # An older caller's None counts as Standard_D2ds_v5, and Refused as no start (2026-11-09: no step leaves T4 out).
     $startSku = switch ($T4StartSku) { 'None' { 'Standard_D2ds_v5' } 'Refused' { '' } default { $T4StartSku } }
+    # T5 left out because Azure didn't create its account (review, 2026-11-19): when, in DbHubT5Refused, so a resume leaves T5
+    # out too (Resolve-DemoT5LeftOut) rather than start from preflight; cleared by a run whose template creates T5. Into the
+    # tags the template carries and, once the group exists, the group's own, as T4's record does.
+    $t5RefusedTagName = (Get-DemoDeploymentStateTagName)['T5Refused']
+    $recordT5 = {
+        param([string] $Value)
+        if ([string]$tags[$t5RefusedTagName] -ceq $Value) {
+            return
+        }
+        $tags[$t5RefusedTagName] = $Value
+        if (-not $groupSeen) {
+            return
+        }
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ T5Refused = $Value } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('T5''s record (DbHubT5Refused) wasn''t set on the resource group, so a resume may start from preflight for T5: {0}' -f $_.Exception.Message)
+        }
+    }
     # A refused scale's record (#25) whose server is gone: this run creates T4 at the recorded size, so the record becomes
     # the fallback's, without "kept".
     if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'record' -and (ConvertFrom-DemoT4RefusedRecord -Value ([string]$tags[$t4RefusedTagName])).Kept) {
@@ -568,9 +621,9 @@ function Invoke-DemoTemplateDeployment {
         return (-not $shell)
     }
     # One attempt for each size the fallback can try, the asked size's retry in another zone, one without T4 after Azure
-    # refused them all, and one after the T3 free offer's rejection: 6 without t4SkuName, as before, and up to 8 for a size
-    # it sets (2026-11-09).
-    $attemptLimit = 4 + @(Get-DemoT4FallbackOrder -Config $effective).Count
+    # refused them all, one after the T3 free offer's rejection, one after T5's free tier's refusal, and one without T5
+    # after Azure didn't create its account (review, 2026-11-19): 8 without t4SkuName, and up to 10 for a size it sets.
+    $attemptLimit = 6 + @(Get-DemoT4FallbackOrder -Config $effective).Count
     for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
         # A size t4SkuName sets (2026-11-09): right before the fallback creates T4 at another size, that size's cost check
         # runs, as the 2-vCore one does, and only reports; its result says what this run tries, and why.
@@ -647,7 +700,7 @@ function Invoke-DemoTemplateDeployment {
                 if ($ProgressPath) {
                     Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server' -State 'Pending' -Message $removingText | Out-Null
                 }
-                return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
+                return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
             }
         }
         if ($attempt -gt 1) {
@@ -657,6 +710,20 @@ function Invoke-DemoTemplateDeployment {
             $attachHostDisk = $vms.AttachHostDisk
             $hostSnapshotId = $vms.HostSnapshotId
         }
+        # The group's tags again, right before each attempt (2026-11-19, the re-review of the stop at the end of an update):
+        # each attempt deploys the group with them, and a group's PUT replaces all its tags, so one that another command wrote
+        # since the last read, such as start-demo.ps1's DbHubStartDemoUtc or the busy marker's refresh, would be lost. What
+        # this function records itself stays as it set it: T4's size and refusals, T5's record, and Phase 28's DbHubT4Sku,
+        # which it drops. A read that fails changes nothing (Get-DemoResourceGroupTag is empty then).
+        if ($groupSeen -or (Test-DemoResourceGroupExist -Config $Config)) {
+            $ownTags = @($t4TagName, $t4RefusedTagName, $t5RefusedTagName) + @(if ($Action -eq 'Create') { 'DbHubT4Sku' })
+            $freshTags = Get-DemoResourceGroupTag -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName
+            foreach ($key in @($freshTags.Keys)) {
+                if ([string]$key -notin $ownTags) {
+                    $tags[[string]$key] = $freshTags[$key]
+                }
+            }
+        }
         $parameterArguments = @{
             Config                    = $effective
             ExistingResourceGroupTags = $tags
@@ -664,6 +731,7 @@ function Invoke-DemoTemplateDeployment {
             ExistingVmName            = $existing
             T1SecurityType            = $securityType.SecurityType
             T3UseFreeLimit            = $useFreeLimit
+            T5FreeTier                = $t5FreeTier
         }
         if ($budgetStart) {
             $parameterArguments['BudgetStartDate'] = $budgetStart
@@ -770,8 +838,12 @@ function Invoke-DemoTemplateDeployment {
             if ($state -eq 'Succeeded' -and $t4Deployed -and $null -ne $createResult -and [string]$createResult.evidence['skuName'] -ceq $t4SkuName) {
                 $t4Note = (@($t4Note, ('{0} {1}' -f $createResult.message, $createResult.remediation)) | Where-Object { $_ }) -join ' '
             }
+            # T5 created by this run's template: an earlier run's record that left it out no longer holds (review, 2026-11-19).
+            if ($state -eq 'Succeeded' -and (Test-DemoT5Enabled -Config $effective) -and [string]$tags[$t5RefusedTagName]) {
+                & $recordT5 ''
+            }
             $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status $status -Message ('Deployment {0}: {1} in {2}.' -f $deploymentName, $state, $duration) -Evidence ([ordered]@{ provisioningState = $state; duration = $duration; newVms = $missing; t3UseFreeLimit = $useFreeLimit; bundle = $BootstrapBundleSha256; runner = $WorkloadRunnerSha256; t2Disk = $(if ($hostSnapshotId) { 'golden: ' + ($hostSnapshotId -replace '^.*/', '') } elseif ($attachHostDisk) { 'attached' } else { 'image' }); t4Enabled = $t4Deployed; t4SkuName = (Get-DemoT4SkuName -Config $effective); t4Fallback = $(if ($t4Deployed -and $t4Refused.Count -gt 0) { $t4SkuName } elseif ($t4Refused.Count -gt 0) { [string]$tags[$t4TagName] } else { '' }); t4Scaled = $(if ($t4Deployed -and $t4Scaling) { $t4ServerSku } else { '' }); t4AutonomousTuning = $($t4Deployed -and (Get-DemoT4Tuning -Config $effective).Enabled) }) -DocUrl $docUrl))
-            return [pscustomobject]@{ Succeeded = ($state -eq 'Succeeded'); Results = $results.ToArray(); Outputs = (ConvertTo-DemoDeploymentOutput -Deployment $parsed); Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = $t4Deployed; T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
+            return [pscustomobject]@{ Succeeded = ($state -eq 'Succeeded'); Results = $results.ToArray(); Outputs = (ConvertTo-DemoDeploymentOutput -Deployment $parsed); Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = $t4Deployed; T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
         }
 
         if ($Action -eq 'Create') {
@@ -824,6 +896,24 @@ function Invoke-DemoTemplateDeployment {
             elseif ($null -ne $t4Now -and [string](Get-DemoMemberValue -InputObject $t4Now -Name 'State') -ne 'NotFound') {
                 Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read after the failed attempt, so the fallback goes on as if it doesn''t exist: {0}' -f (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $t4Now -Name 'Error'))))
             }
+        }
+        # T5's free tier refused (ADR 0027): the subscription's offer doesn't include it ("Free tier is not supported for
+        # Internal subscriptions", live 2026-11-18), another account took it after Resolve-DemoT5FreeTier read the
+        # subscription, or Resource Graph didn't list that account. Learn lists no error code, so the match needs an error that
+        # names the free tier (Test-DemoT5FreeTierRefusal); the template is deployed again once, without it, and the warning
+        # replaces the Pass that Resolve-DemoT5FreeTier gave. Before T3's free offer (review, 2026-11-19): Cosmos DB's refusal
+        # must never read as T3's, which would move T3 off its free offer.
+        if (-not $t5FreeTried -and $t5FreeTier -and (Test-DemoT5FreeTierRefusal -Text ([string]$run.StdErr))) {
+            $t5FreeTried = $true
+            $t5FreeTier = $false
+            if ($null -ne $t5FreeResult) {
+                [void]$results.Remove($t5FreeResult)
+                $t5FreeResult = $null
+            }
+            $reason = Get-DemoT5FreeTierRefusalReason -Text ([string]$run.StdErr)
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Azure refused T5''s free tier ({0}), so the template was deployed again without it: T5''s throughput is billed every hour (estimate-cost.ps1 prices it).' -f $reason) -Evidence ([ordered]@{ useFreeTier = $false; refused = $true; reason = $reason }) -Remediation 'Nothing to do. Azure sets the free tier only when an account is created, so T5 keeps list price.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
+            Write-DemoLog -Level Warning -Message ('Azure refused T5''s free tier ({0}); deploying again without it.' -f $reason)
+            continue
         }
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText ([string]$run.StdErr)
         if (-not $freeOfferTried -and $useFreeLimit -and $verdict.IsFreeOfferError) {
@@ -963,14 +1053,43 @@ function Invoke-DemoTemplateDeployment {
         # Phase 28 live finding (2026-11-02): a deployment that failed while it ran names its cause in its operations, read
         # only now, after the free offer's and T4's own handling above, which reads the error as before.
         $cause = if ($Action -eq 'Create') { Get-DemoDeploymentFailure -Config $Config -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) } else { $null }
-        $results.Add((New-DemoTemplateFailureResult -Config $Config -Verb $verb -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) -Cause $cause -DocUrl $docUrl))
+        # T5's creation failed, and nothing else did (review, 2026-11-19): a region that refuses new Azure Cosmos DB accounts,
+        # or a policy that denies them that preflight couldn't evaluate. The template is deployed again once without T5, so
+        # the rest of the run finishes and can end DONE; DEPLOY.T5 says why, with the fix (t5Enabled false), and the group
+        # records it (DbHubT5Refused), so a resume leaves T5 out instead of starting from preflight. A run that deploys the
+        # template tries T5 again. An account that existed before this run is never left out.
+        if ($Action -eq 'Create' -and $t5Creating -and -not $t5OffTried -and (Test-DemoT5Enabled -Config $effective)) {
+            $t5Only = Get-DemoT5OnlyFailure -Config $effective -Cause $cause -ErrorText ([string]$run.StdErr)
+            if ($t5Only.T5Only) {
+                $t5OffTried = $true
+                $t5Off = New-DemoT5LeftOutResult -Cause ([string]$t5Only.Text)
+                $t5LeftOut = [string]$t5Only.Text
+                $effective = Copy-DemoT5OffConfig -Config $effective -Reason $t5LeftOut
+                $t5FreeTier = $false
+                if ($null -ne $t5FreeResult) {
+                    [void]$results.Remove($t5FreeResult)
+                    $t5FreeResult = $null
+                }
+                $results.Add($t5Off)
+                & $recordT5 ([DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture))
+                Write-DemoLog -Level Warning -Message ('{0} Deploying the rest again without T5.' -f $t5Off.message)
+                continue
+            }
+        }
+        $failure = New-DemoTemplateFailureResult -Config $Config -Verb $verb -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) -Cause $cause -DocUrl $docUrl
+        # T5's resources alone failed, with an account that existed before this run, which is never left out (review,
+        # 2026-11-19): the fix says how to deploy without T5.
+        if ($Action -eq 'Create' -and (Test-DemoT5Enabled -Config $effective) -and (Get-DemoT5OnlyFailure -Config $effective -Cause $cause -ErrorText ([string]$run.StdErr)).T5Only) {
+            $failure.remediation = '{0} Every failed operation is T5''s (Azure Cosmos DB): to deploy the rest without T5, set "t5Enabled": false in config/demo.config.json.' -f $failure.remediation
+        }
+        $results.Add($failure)
         if ($null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             # A size Azure refused for T4 that the configuration sets gets its own Fail, with the documented fallback (Phase 24, ADR 0019).
             $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure))
         }
-        return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
+        return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
     }
     # Every attempt above returns or moves on to a next one; this is reached only if they all moved on.
     $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'The template deployment didn''t succeed within its attempts (the T3 free offer''s and T4''s fallbacks included).' -Remediation 'Run deploy.ps1 -Resume; the results above say what each attempt changed.' -DocUrl $docUrl))
-    return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
+    return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
 }

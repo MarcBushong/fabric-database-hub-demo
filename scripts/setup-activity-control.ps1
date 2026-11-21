@@ -1,34 +1,36 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-Sets up the optional on-demand activity control (ADR 0020), grants its roles as an Owner, rotates its webhook, or
-removes it.
+Sets up the session control (ADR 0020, ADR 0026), grants its roles as an Owner, rotates its webhook, or removes it.
+You don't need it: ./scripts/deploy.ps1 sets the control up in every deployment, and an Owner's
+./scripts/grant-safety-stop.ps1 grants its roles.
 
 .DESCRIPTION
-The control lets a Fabric notebook start the demo's targets and run bounded scenarios on demand, through an Azure
-Automation webhook whose URL lives only in a Key Vault secret, with a one-time auto-stop for every run, Stop now,
-and the nightly auto-shutdown behind it. It's off by default (control.enabled); Contributor-only deployers use
-./scripts/demo-control.ps1 or the demo-control workflow instead.
+The control lets NB_DatabaseHub_Control's Run all start the demo's targets and run a bounded session, through an
+Azure Automation webhook whose URL lives only in a Key Vault secret, with a one-time auto-stop for every run, Stop
+now, and the nightly auto-shutdown behind it. Until an Owner grants its roles, ./scripts/start-demo.ps1 and
+./scripts/stop-demo.ps1 run a session from your PC.
 
 Without a switch (Contributor): resolves the vault's network mode from control.vaultNetworkMode and the tenant's
 policy, then creates or updates rg-<prefix>-control with the identity, the Automation account, the vault, the
 runbooks, the daily T4 safety stop, the webhook and its secret, and the control notebook (in a folder of the existing
-workspace when vaults can be public, or in the "DBHub Control" workspace with a managed private endpoint when a
-policy makes them private). It never resumes, pauses, or scales the Fabric capacity.
+workspace when vaults can be public, or in its own workspace, "<workspace> Control" by default, with a managed private
+endpoint when a policy makes them private). It never resumes, pauses, or scales the Fabric capacity.
 
--GrantRole (an Owner, signed in with multifactor authentication, once): the custom role "DbHub Demo Activity
-Operator" and its assignments A1-A3, with a confirmation that shows each role, scope, and object ID.
+-GrantRole (an Owner, signed in with multifactor authentication, once): the custom roles "DbHub Demo Activity
+Operator" and "DbHub Demo Session Writer" and their assignments A1-A4, with a confirmation that shows each role, scope, and object ID.
 
 -RotateWebhook: a new webhook and secret version, then the old webhook goes. -Remove: deletes everything the control
 created, after a confirmation for each part unless -Force.
 
--WhatIf changes nothing and lists what each step would do. destroy.ps1 never touches rg-<prefix>-control.
+-WhatIf changes nothing and lists what each step would do. destroy.ps1 deletes rg-<prefix>-control when its runbooks
+serve the environment it destroys (DESTROY.CONTROL).
 
 .PARAMETER ConfigPath
 Path to the demo configuration (config/demo.config.json).
 
 .PARAMETER GrantRole
-Create the custom role and assign A1, A2, and A3 (an Owner).
+Create the custom roles and assign A1 to A4 (an Owner).
 
 .PARAMETER RotateWebhook
 Replace the webhook and its secret.

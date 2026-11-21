@@ -1132,7 +1132,7 @@ function Complete-DemoBusyMarkerRun {
             $changes = @(Sync-DemoAutoShutdownForBusy -Config $Config -TargetClock $stopAt.Clock -NowUtc $NowUtc -Confirm:$false)
             $shutdownSet = @($changes | Where-Object { -not $_.Ok }).Count -eq 0
             $message = Get-DemoBusyMarkerEndText -Pass $pass -StopText $stopAt.Text -TimeZone $shutdown.TimeZoneId -GraceMinutes ([int]$setting['graceMinutes']) -PassScheduled ([bool]$scheduled.Ok) -PassError ([string]$scheduled.Error) -ShutdownSet $shutdownSet
-            $remediation = 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and the next nightly stop is tomorrow at {0}. To stop the demo now, run ./scripts/stop-demo.ps1.' -f (Format-DemoClockText -Clock $shutdown.Time)
+            $remediation = 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and then its session stops by itself 4 hours after that start (-Hours sets them; since 2026-11-19), or at the next nightly stop, tomorrow at {0}, if that comes first. To stop the demo now, run ./scripts/stop-demo.ps1.' -f (Format-DemoClockText -Clock $shutdown.Time)
             $evidence = [ordered]@{ pass = $(if ($null -ne $pass) { [string]$pass.Run } else { 'EarlierRun' }); passLocalTime = $(if ($null -ne $pass) { [string]$pass.LocalTime } else { '' }); timeZone = $shutdown.TimeZoneId; busyUntilUtc = (ConvertTo-DemoBusyTimeText -Utc $graceEnd); stopsAtUtc = (ConvertTo-DemoBusyTimeText -Utc $stopAt.Utc); stopsAt = $stopAt.Text; graceMinutes = [int]$setting['graceMinutes']; deferredPass = $(if ($scheduled.Ok) { 'Scheduled' } else { 'Failed' }); deferredPassError = [string]$scheduled.Error; autoShutdown = @($changes | ForEach-Object { '{0}: {1} -> {2}{3}' -f $_.VmName, $_.From, $_.To, $(if ($_.Ok) { '' } else { ' (failed: {0})' -f $_.Error }) }) }
             if ($ProgressPath) {
                 Set-DemoProgressStep -Path $ProgressPath -Id 'NightlyStop' -State 'Done' -Status 'Warning' -Message ('{0} {1}' -f $message, $remediation)
@@ -1287,7 +1287,7 @@ function Resolve-DemoBusyNightlyStop {
         return @()
     }
     $why = if ($Purpose -eq 'Start') { 'This session takes over from a run the nightly stop waited for' } else { 'Everything stops now, so nothing waits for the nightly stop' }
-    $next = if ($Purpose -eq 'Start') { ' The demo runs until ./scripts/stop-demo.ps1 or the next nightly stop at {0} ({1}).' -f (Format-DemoClockText -Clock $shutdown.Time), $shutdown.TimeZoneId } else { '' }
+    $next = if ($Purpose -eq 'Start') { ' The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at {0} ({1}).' -f (Format-DemoClockText -Clock $shutdown.Time), $shutdown.TimeZoneId } else { '' }
     $evidence = [ordered]@{ done = $done.ToArray(); failed = $failed.ToArray(); marker = $marker.Text; markerBy = $marker.By }
     if ($failed.Count -gt 0) {
         return @(New-DemoResult -CheckId $checkId -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('{0}, but not all of it was put back: {1}.{2}' -f $why, ($failed -join '; '), $next) -Evidence $evidence -Remediation ('Run ./scripts/{0}-demo.ps1 again; ./scripts/status.ps1 shows what''s left (STATUS.NIGHTLYSTOP).' -f $Purpose.ToLowerInvariant()) -DocUrl $script:BusyMarkerDoc)

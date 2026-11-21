@@ -150,10 +150,11 @@ function Get-DemoFabricDemoItem {
     .SYNOPSIS
     The items the demo creates in its Fabric workspace, by type and name: the lakehouse and its SQL analytics endpoint,
     each notebook in fabric/notebooks (Get-DemoFabricNotebookName), the control notebook, the Real-Time Dashboard, the
-    history model and report, and the Insights app with its connector. destroy.ps1 deletes the demo's workspace only when
-    everything in it is among these (Get-DemoDestroyFabricPlan), and a first run that recovers an environment updates the
-    workspace's notebooks then too (issue 60, Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each.
-    Internal.
+    history model and report, and the Insights app with what its backend creates beside it: the user data functions of
+    its connectors and of its functions (config/versions.json fabricApp.backendItems; the functions' since 2026-11-18).
+    destroy.ps1 deletes the demo's workspace only when everything in it is among these (Get-DemoDestroyFabricPlan), and a
+    first run that recovers an environment updates the workspace's notebooks then too (issue 60,
+    Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -176,7 +177,9 @@ function Get-DemoFabricDemoItem {
     $items.Add([pscustomobject]@{ Type = 'SemanticModel'; Name = [string]$app['semanticModelName'] })
     $items.Add([pscustomobject]@{ Type = 'Report'; Name = [string]$app['reportName'] })
     $items.Add([pscustomobject]@{ Type = [string]$app['itemType']; Name = [string]$app['itemName'] })
-    $items.Add([pscustomobject]@{ Type = 'UserDataFunction'; Name = ('{0}_connector' -f [string]$app['itemName']) })
+    foreach ($backendItem in @($app['backendItems']['items'])) {
+        $items.Add([pscustomobject]@{ Type = [string]$backendItem['type']; Name = ([string]$backendItem['name']).Replace('{itemName}', [string]$app['itemName']) })
+    }
     return $items.ToArray()
 }
 
@@ -205,8 +208,9 @@ function Get-DemoDestroyFabricPlan {
     Which Fabric workspaces destroy.ps1 deletes, read-only: the demo's (fabric.workspaceName), when every item in it is
     one the demo creates; and the control's (control.fabricWorkspaceName), when everything in it is the control
     notebook, and that notebook names this environment's resource group, or the workspace is empty and the control
-    serves this environment. Either goes only when no other demo environment records it, none was deployed by a version
-    that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard, 2026-11-17);
+    serves this environment. Either goes only when no other demo environment records it, none that records no workspace
+    might use it (one being deployed, or deployed by an earlier version), and Azure Resource Graph answered
+    (Get-DemoFabricWorkspaceGuard, 2026-11-17);
     otherwise Guard says why it stays (Unreadable, Claimed, or Untagged), with ClaimedBy, Untagged, and Remediation.
     Returns Ok, Error, Kind (Get-DemoFabricListFailureKind, when a list failed), Demo, and Control; each workspace has
     Name, Id, Exists, Delete, Items (type: name), Foreign (what the demo didn't create), Reason, and the guard's fields.
@@ -321,8 +325,8 @@ function Get-DemoDestroyFabricPlan {
     }
 
     # 2026-11-17 (the coordinator's decision: destroy.ps1 never deletes what another environment might use): a workspace
-    # those checks found to be this environment's goes only when no other demo environment records it, none was deployed
-    # by a version that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard).
+    # those checks found to be this environment's goes only when no other demo environment records it, none that records
+    # no workspace might use it, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard).
     $deleting = @(@($answer.Demo, $answer.Control) | Where-Object { $null -ne $_ -and $_.Delete })
     if ($deleting.Count -gt 0) {
         $claim = $null
@@ -404,8 +408,11 @@ function Get-DemoDestroyExtraPlan {
     .SYNOPSIS
     What destroy.ps1 deletes, and keeps, beyond the resource group, read before the confirmation: Control
     (Get-DemoDestroyControlPlan), Fabric (Get-DemoDestroyFabricPlan, or why it wasn't read), Group
-    (Get-DemoDestroyGroupPlan), and Delete and Keep, the lines the confirmation lists. A part that can't be read is kept
-    and says why. Internal.
+    (Get-DemoDestroyGroupPlan), T3Agent (T3's server name, from the group's deploymentId tag, while the group exists: no
+    API removes T3 from Database Hub's Database agent settings, so it's kept, and DESTROY.HUB.AGENT.T3 says how to remove
+    it, 2026-11-20), NoT3 (the group is the golden boot test's, purpose t2-golden-boot-test, which has a deploymentId tag
+    but never a T3, so nothing names one; review of 5d1f4b0), and Delete and Keep, the lines the confirmation lists. A part
+    that can't be read is kept and says why. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -478,7 +485,28 @@ function Get-DemoDestroyExtraPlan {
     }
     $delete.Add(('the custom role "{0}" once no role assignment holds it' -f $script:SafetyStopRoleName))
     $keep.Add('the Fabric capacity and your licenses, which you manage')
-    return [pscustomobject]@{ Control = $control; Fabric = $fabric; Group = $group; Delete = $delete.ToArray(); Keep = $keep.ToArray() }
+    # T3's selection in Database agent settings (2026-11-20): deleted databases can stay in that list, selected, for a
+    # while, and a Save fails while one is. Its name comes from the group's tag, which is empty once the group is gone; a
+    # read that fails leaves the line out, and DESTROY.HUB.AGENT.T3 still names it from the manifest. The golden boot
+    # test's group has a deploymentId tag but never a T3 (infra/golden-test.bicep), so it names none, and NoT3 keeps
+    # Remove-DemoEnvironment from naming one from the manifest (review of 5d1f4b0).
+    $t3Agent = ''
+    $noT3 = $false
+    try {
+        $tags = Get-DemoResourceGroupTag -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config)
+        $noT3 = [string]$tags['purpose'] -eq $script:GoldenTestPurpose
+        $id = [string]$tags['deploymentId']
+        if (-not $noT3 -and $id -match '^[a-z0-9]{6}$') {
+            $t3Agent = 'azuresql01-{0}' -f $id
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('T3''s name for Database agent settings wasn''t read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if ($t3Agent) {
+        $keep.Add(('T3''s selection in Database Hub''s Database agent settings ({0}/ContosoCare), if you made it: no API removes it' -f $t3Agent))
+    }
+    return [pscustomobject]@{ Control = $control; Fabric = $fabric; Group = $group; T3Agent = $t3Agent; NoT3 = $noT3; Delete = $delete.ToArray(); Keep = $keep.ToArray() }
 }
 
 function Remove-DemoUnassignedRoleDefinition {

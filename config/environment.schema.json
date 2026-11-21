@@ -150,6 +150,16 @@
       "enum": ["", "1", "2", "3"],
       "default": ""
     },
+    "t5Enabled": {
+      "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId> (2026-11-18, ADR 0027): Microsoft Entra only (local authentication off), a private endpoint in both network modes with public network access off, and the patient-events container at 400 RU/s of manual throughput, which Database Hub charts from Azure Monitor (normalized RU, throttled requests, availability). On by default, in every deployment and in an upgrade of an existing demo. Cosmos DB has no stop, so since 2026-11-19 the container exists only during a session once the session control's role can create it again: its throughput bills only while the demo runs, about 0.032 USD an hour at list price (2026-11-18), or nothing on the subscription's free-tier account (t5UseFreeTier), and its private endpoint about 0.01 USD an hour all month; estimate-cost.ps1 prices them. Set false only when your subscription can't have a Cosmos DB account (for example, a policy that denies the resource type); deploy.ps1 then says T5 is off (DEPLOY.T5.OFF) and leaves an existing account as it is.",
+      "type": "boolean",
+      "default": true
+    },
+    "t5UseFreeTier": {
+      "description": "T5 uses the subscription's free-tier account, the first 1,000 RU/s and 25 GB of one Azure Cosmos DB account a subscription gets free, when no other account in the subscription has it and the subscription isn't internal, which Azure refuses it in (true, the default). Azure sets free tier only when an account is created, so an existing T5 keeps what it has. deploy.ps1 reads the subscription's accounts through Azure Resource Graph before it creates T5, says which one has the free tier when another account does (DEPLOY.T5.FREETIER), and deploys T5 again without it when Azure refuses it. false never uses it (ADR 0027).",
+      "type": "boolean",
+      "default": true
+    },
     "activityProfile": {
       "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (the steady Contoso Care mix), business-day (default since 2026-11-03: the baseline plus bounded incidents at fixed minutes past each UTC hour, so Database Hub's Performance page has problems to show), or incident:<scenario> (ADR 0010). A profile with incidents starts as baseline, and the run switches to it once its own Run Commands on a VM are done; the VMs set baseline in its place by themselves (after a runner install, and at a boot with activityProfileOnBoot). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
       "type": "string",
@@ -180,16 +190,16 @@
       "default": "demo"
     },
     "monthlyCeilingUsd": {
-      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where the on-demand control's daily T4 safety stop is fully in place, otherwise the rest of the month. 375 by default since 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. When the estimate is over it, raise it: preflight names the amount. A T4 size you didn't choose never makes it a Fail by itself (2026-11-09): when only a size deploy.ps1's fallback chose, because Azure refused the one t4SkuName sets, or T4's default with exactly 250, which init.ps1 wrote from 2026-10-27 to 2026-11-04, puts the month over it, and the month would fit at the size asked for (Standard_B1ms for 250), it's a Warning, and this value stays as it is (ADR 0016).",
+      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where a safety stop is fully in place (the nightly safety stop that every deployment sets up, or the session control's daily T4 safety stop), otherwise the rest of the month. 415 by default for a new configuration since 2026-11-19 (the owner's decision: room for T5, the Azure Cosmos DB account, in a Contributor's first deployment's worst case; a value already in your configuration is never changed); 375 from 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. When the estimate is over it, raise it: preflight names the amount. A T4 size you didn't choose never makes it a Fail by itself (2026-11-09): when only a size deploy.ps1's fallback chose, because Azure refused the one t4SkuName sets, or T4's default with exactly 250, which init.ps1 wrote from 2026-10-27 to 2026-11-04, puts the month over it, and the month would fit at the size asked for (Standard_B1ms for 250), it's a Warning, and this value stays as it is (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 375
+      "default": 415
     },
     "sessionCeilingUsd": {
-      "description": "Ceiling for one demo-day session.",
+      "description": "Ceiling for one demo-day session: preflight, start-demo.ps1, and estimate-cost.ps1 report a Warning when a session's estimate is above it, never a Fail. 20 by default since 2026-11-18 (the owner's decision; it was 15), because lowest-cost's T3 went from 1 to 2 maximum vCores: Database Agents doesn't support one-vCore serverless databases (https://learn.microsoft.com/fabric/database/hub/database-agents). A configuration with exactly 15, the default that init.ps1 wrote before 2026-11-18, gets 20 with no edit, and deploy.ps1 says so in one line at its start; any other value stays as it is (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 15
+      "default": 20
     },
     "autoShutdownTime": {
       "description": "Daily auto-shutdown time (HHmm, 24-hour) for T1 and the T2 host.",
@@ -215,7 +225,7 @@
       "default": false
     },
     "presenterObjectIds": {
-      "description": "User object IDs of presenters who aren't Contributors (prerequisite P8). Used only when assignRoles is true; the role assignments are created with --assignee-principal-type User.",
+      "description": "User object IDs of presenters who aren't Contributors (prerequisite P8). With assignRoles true, they get the Azure roles Database Hub needs: Reader on the subscription and Arc SQL telemetry read on the demo resource group (the role assignments are created with --assignee-principal-type User). Since 2026-11-18, deploy.ps1 also adds them to the demo's Fabric workspace as Viewers, whatever assignRoles says, so they can open the Real-Time Dashboard, the history report, and the Insights app (FABRIC.PRESENTER.VIEWER).",
       "type": "array",
       "items": { "$ref": "#/$defs/uuid" },
       "uniqueItems": true,
@@ -229,7 +239,7 @@
       "default": 4
     },
     "keyVault": {
-      "description": "Opt-in Azure Key Vault for the one-time T2 host password, so a Bastion session needs no clipboard on the machine that runs start-demo.ps1 (ADR 0009). Off by default: the default path creates no vault and no role assignment. enabled requires assignRoles, because access to the vault is a role assignment on the vault only (ADR 0008).",
+      "description": "Opt-in Azure Key Vault for the one-time T2 host password, so a Bastion session needs no clipboard on the machine that runs start-demo.ps1 (ADR 0009). Off by default: no vault in the demo resource group (the session control has its own, in rg-<prefix>-control, for its webhook URL and session status). enabled requires assignRoles, because access to the vault is a role assignment on the vault only (ADR 0008).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -288,7 +298,7 @@
           "default": true
         },
         "vaultNetworkMode": {
-          "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in a separate DBHub Control workspace with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
+          "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in its own workspace, control.fabricWorkspaceName or \"<fabric.workspaceName> Control\" by default, with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
           "enum": ["auto", "public", "private"],
           "default": "auto"
         },
@@ -306,7 +316,7 @@
           "default": ""
         },
         "notebookUserObjectIds": {
-          "description": "More users who get Key Vault Secrets User on the webhook secret only (A3), besides the Owner who runs -GrantRole. Only -GrantRole assigns them.",
+          "description": "More users who get Key Vault Secrets User on the control vault's three secrets (A3), besides the Owner who grants the roles and the environment's deployer (CONTROL.ROLE.DEPLOYER). deploy.ps1 run by an Owner, or an Owner's grant-safety-stop.ps1, assigns them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/uuid"
@@ -331,6 +341,31 @@
           "description": "Gives this environment its own two custom roles, \"DbHub Demo Activity Operator (<suffix>)\" and \"DbHub Demo Session Writer (<suffix>)\", for an environment that shares its subscription with a demo on other code (custom roles are shared by the whole subscription). Empty: the shared roles.",
           "type": "string",
           "pattern": "^[A-Za-z0-9-]{0,24}$",
+          "default": ""
+        }
+      },
+      "default": {}
+    },
+    "ask": {
+      "description": "The Insights app's in-app GitHub Copilot chat (Ask, ADR 0028). deploy.ps1 runs its chat relay as an Azure Container App in the demo's resource group (it scales to zero and holds no credentials) and points the app at it; each viewer signs in once with their own GitHub account and Copilot license. When the relay can't be deployed, the status page shows a Warning and DONE stays.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "false: no relay, and the app's Copilot dock says Ask isn't deployed. While nobody asks, the relay has no replica and costs nothing.",
+          "type": "boolean",
+          "default": true
+        },
+        "image": {
+          "description": "Your own relay image instead of the pinned one (config/versions.json askRelay.image): a full reference pinned by digest (registry/repository@sha256:...) that Azure Container Apps can pull without credentials. Empty: the pinned image.",
+          "type": "string",
+          "pattern": "^([a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64})?$",
+          "default": ""
+        },
+        "githubClientId": {
+          "description": "Your own GitHub OAuth App's client ID (device flow on, no client secret) instead of the shared app's in config/versions.json (askRelay.githubClientId). Empty: the shared app, so nobody registers anything.",
+          "type": "string",
+          "pattern": "^([A-Za-z0-9.]{16,40})?$",
           "default": ""
         }
       },
@@ -395,7 +430,7 @@
           "default": "LH_DatabaseHub"
         },
         "capacityName": {
-          "description": "The Fabric capacity's display name, used only to create the workspace or to assign one that has no capacity. It must be an F or Trial capacity you're a contributor or administrator of, and Active. The scripts never create, resume, pause, or scale a capacity. Empty: an existing workspace keeps its capacity, and a missing one is Manual action required.",
+          "description": "The Fabric capacity's display name, used only to create the workspace or to assign one that has no capacity. It must be an F or Trial capacity you're a contributor or administrator of, and Active. The scripts never create or scale a capacity, and resume or pause one only with fabric.manageCapacity. Empty: an existing workspace keeps its capacity, and a missing one is Manual action required.",
           "type": "string",
           "maxLength": 256,
           "default": ""

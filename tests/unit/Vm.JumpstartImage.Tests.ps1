@@ -157,7 +157,7 @@ Describe 'The guest''s source' {
         $result = Get-DemoHostGuestSourceFailure -Context $context
         $result.Outcome | Should -Be 'Failed'
         $result.Message | Should -Match 'PaygWizard'
-        $result.Message | Should -Match 'destroy\.ps1, then \./scripts/deploy\.ps1'
+        $result.Message | Should -Match 'destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1'
     }
 
     It 'records the source when the guest is made' {

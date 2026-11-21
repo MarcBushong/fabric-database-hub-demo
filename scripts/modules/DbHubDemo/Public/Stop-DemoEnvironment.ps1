@@ -19,11 +19,20 @@ function Stop-DemoEnvironment {
       doesn't finish in time is a Warning: the host's deallocation shuts the guest down through its automatic stop
       action, ShutDown); then deallocates the T2 VM and sqlvm01. T3 isn't
       touched: with its profile off (the T3 profile is a file on T1, so this doesn't wake it), serverless
-      auto-pause stops its compute t3AutoPauseMinutes after the last session. T4, the PostgreSQL flexible
+      auto-pause stops its compute t3AutoPauseMinutes after the last session. Only when T3's profile went off here,
+      during a session, is T3 touched: before T1 deallocates, the Database Agent beat's hold, if any, is released through
+      T3 itself (Invoke-DemoT3AutoTuningRelease), which puts back only what the hold recorded; after it, T3's
+      FORCE_LAST_GOOD_PLAN is read and reported (STOP.T3.AUTOTUNING; 2026-11-18, review). T4, the PostgreSQL flexible
       server (Phase 24, ADR 0019), gets its profile off and is stopped (STOP.T4.STOP; Servers - Stop). A
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
       storage and the Defender plans a tenant policy enables are billed while it's stopped.
+      T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off. An account has no stop, and a
+      container's throughput can't be taken away, so its container is deleted at the end (2026-11-19, STOP.T5,
+      Invoke-DemoT5ContainerStop): its throughput stops billing until the next session creates it again, and only its
+      private endpoint and DNS zone bill between sessions. It's kept, with a Warning and the grant command, while Run all
+      couldn't create it again (the session control's role lacks the container's actions; the DbHubT5Container tag isn't
+      Session), so a session never runs without it. destroy.ps1 deletes the account.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
       it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP). The busy marker (2026-11-14) is cleared, a
       deferred nightly pass removed, and the VMs' auto-shutdown put back at autoShutdownTime, since everything stops now
@@ -41,7 +50,9 @@ function Stop-DemoEnvironment {
       T4's read replica (ADR 0025) is deleted after each session, and its Azure Monitor metrics with it, so -SaveHistory
       first reads T4's and the replica's metrics (STOP.T4.HISTORY) and sends them with that run; when the run doesn't save
       them (a paused capacity, for example), they're kept in out/history-pending, with the command that adds them once
-      the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending).
+      the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending). T5's Azure Monitor metrics
+      (2026-11-18, ADR 0027) are read right before the run (STOP.T5.HISTORY, Get-DemoCosmosHistoryCapture) and sent as
+      COSMOS_METRICS; its account stays, so a run that doesn't save them leaves them in Azure Monitor for a later one.
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -71,6 +82,23 @@ function Stop-DemoEnvironment {
     How long the profiles' off waits for both VMs together before the stop goes on anyway, and how long the guest's clean
     shutdown may take (default 180).
 
+    .PARAMETER SkipFabric
+    Leave Fabric alone (2026-11-19): no history save, not even with fabric.saveHistoryOnStop, and no pause of the Fabric
+    capacity. deploy.ps1's stop at the end of an update uses it (Invoke-DemoUpdateEndStop): that run took its own history
+    snapshot, which goes on in Fabric and must not be cancelled by a pause.
+
+    .PARAMETER UpdateEnd
+    deploy.ps1's stop at the end of an update (2026-11-19, Invoke-DemoUpdateEndStop; the review of the stop, findings 1, 2,
+    and 4). A session that uses the demo (Get-DemoUpdateStopSession) ends the stop: checked before its first change, which
+    stops nothing (STOP.SESSION, Not selected), and again before T2's guest and the VMs, which keep running (STOP.SESSION, a
+    Warning, because the activity is off already). The nightly stop is settled last, and only once the VMs, T4, and T5's
+    container are stopped (Resolve-DemoUpdateStopNightly), so a stop cut short (Ctrl+C) or one that failed leaves tonight's
+    stop in place. Not with -ParkT2.
+
+    .PARAMETER RunStartedUtc
+    With -UpdateEnd: when the run began, so a start-demo.ps1 session from before then, which the nightly stop ended, doesn't
+    count, and one that started since then does.
+
     .EXAMPLE
     Stop-DemoEnvironment -Config $config -RemoveT3
     #>
@@ -94,7 +122,14 @@ function Stop-DemoEnvironment {
         [int] $SaveHistoryWindowMinutes = 720,
 
         [ValidateRange(30, 900)]
-        [int] $ProfileOffWaitSeconds = 180
+        [int] $ProfileOffWaitSeconds = 180,
+
+        [switch] $SkipFabric,
+
+        [switch] $UpdateEnd,
+
+        [AllowNull()]
+        [object] $RunStartedUtc = $null
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -117,6 +152,17 @@ function Stop-DemoEnvironment {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
 
+    # deploy.ps1's stop at the end of an update (2026-11-19): a session that started since the end's last check keeps the
+    # demo. Checked before anything changes (the re-review of 2026-11-19), Bastion and the host password included, which an
+    # interactive session uses, so a held stop changes nothing.
+    $updateEnd = $UpdateEnd -and -not $ParkT2 -and -not $RemoveBastionOnly
+    if ($updateEnd) {
+        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
+        if ([bool]$session.Held) {
+            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage Before))
+            return $results.ToArray()
+        }
+    }
     $bastion = Remove-DemoBastion -Config $Config -IfExpired:$IfExpired -Confirm:$false
     $results.Add($bastion)
     $state = Get-DemoDeploymentState -Config $Config
@@ -153,9 +199,10 @@ function Stop-DemoEnvironment {
         # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
         $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
     }
-    if (-not $ParkT2) {
+    if (-not $ParkT2 -and -not $updateEnd) {
         # The busy marker (2026-11-14): everything stops now, so nothing waits for the nightly stop any more; a deferred
         # pass goes, and the VMs' auto-shutdown comes back to autoShutdownTime (STOP.NIGHTLYSTOP, when something changed).
+        # The stop at the end of an update settles it last instead (Resolve-DemoUpdateStopNightly).
         foreach ($item in @(Resolve-DemoBusyNightlyStop -Config $Config -State $state -Purpose Stop -Confirm:$false)) {
             $results.Add($item)
         }
@@ -176,7 +223,14 @@ function Stop-DemoEnvironment {
         $t4Read = Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $t4Missing = [string]$t4Read.State -eq 'NotFound' -or [bool](Get-DemoMemberValue -InputObject $t4Read -Name 'Removing')
     }
-    $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @('T2') }
+    $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2') }
+    # T5 (2026-11-18, ADR 0027): an account that doesn't exist yet (a demo deployed before T5) has no activity, and T1's
+    # runner may not know T5 yet, so it's left alone, as T4 is.
+    $t5Missing = $false
+    if ('T5' -in $profileTargets) {
+        $t5Read = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Missing = [string]$t5Read.State -eq 'NotFound'
+    }
     $offTargets = [System.Collections.Generic.List[string]]::new()
     foreach ($item in $profileTargets) {
         $vm = if ($item -eq 'T2') { $hostVm } else { 'sqlvm01' }
@@ -186,6 +240,9 @@ function Stop-DemoEnvironment {
         }
         elseif ($item -eq 'T4' -and $t4Missing) {
             $skip = 'T4 isn''t deployed, so it has no activity to turn off.'
+        }
+        elseif ($item -eq 'T5' -and $t5Missing) {
+            $skip = 'T5 isn''t deployed, so it has no activity to turn off.'
         }
         elseif ($item -eq 'T2' -and ($hostVm -ne 'archost01' -or 'archost01' -notin $state.RunnerSentTo)) {
             $skip = 'T2 has no workload runner (the evaluation-only mode, or the runner wasn''t sent to archost01).'
@@ -233,7 +290,7 @@ function Stop-DemoEnvironment {
         }
         else {
             $capacitySettingEarly = Get-DemoFabricCapacitySetting -Config $Config
-            if ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop) {
+            if (-not $SkipFabric -and ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop)) {
                 $postgresHistory = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
                 if ($null -ne $postgresHistory -and $null -ne $postgresHistory.Result) {
                     $results.Add($postgresHistory.Result)
@@ -249,6 +306,25 @@ function Stop-DemoEnvironment {
         }
     }
 
+    # The Database Agent beat (2026-11-18) holds FORCE_LAST_GOOD_PLAN off until its response, and its run's own cleanup
+    # puts it back when its profile goes off. In case the run stopped before that, the hold is released through T3 itself,
+    # from T1 while it still runs (Invoke-DemoT3AutoTuningRelease): only what a demo hold recorded is put back, so an off a
+    # person set outside the demo stays (2026-11-18 review). T3 is read only when its profile went off here, in a session.
+    $t3Tuning = $null
+    $tuningRelease = $null
+    if (-not $ParkT2 -and 'T3' -in $offTargets) {
+        $t3Tuning = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $tuningRelease = Invoke-DemoT3AutoTuningRelease -Config $Config -T3 $t3Tuning -DeploymentId ([string]$state.Tags['deploymentId'])
+    }
+
+    if ($updateEnd) {
+        # Again before T2's guest and the VMs (2026-11-19): a session that started while the activity went off keeps its VMs.
+        $session = Get-DemoUpdateStopSession -Config $Config -SinceUtc $RunStartedUtc
+        if ([bool]$session.Held) {
+            $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage During -ReplicaDeleting:$replicaDeleting))
+            return $results.ToArray()
+        }
+    }
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
         # action (ShutDown) shuts it down when the host deallocates otherwise.
@@ -270,6 +346,13 @@ function Stop-DemoEnvironment {
     }
     foreach ($record in $notOff) {
         $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds -DeallocationFailed:(-not [bool]$deallocated[[string]$record.VmName])))
+    }
+    if ($null -ne $t3Tuning) {
+        # What the release found, read after the deallocation, while T3 is still awake: read-only.
+        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 $t3Tuning -CheckId 'STOP.T3.AUTOTUNING' -Release $tuningRelease
+        if ($null -ne $tuning) {
+            $results.Add($tuning)
+        }
     }
     if (-not $ParkT2 -and $t4On -and -not $t4Missing) {
         if ($replicaDeleting) {
@@ -300,15 +383,25 @@ function Stop-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))
     }
 
-    if (-not $ParkT2) {
+    if (-not $ParkT2 -and -not $SkipFabric) {
         # Phase 26b (ADR 0023): the session's history first, then the capacity the demo resumed, because a pause would
-        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called.
+        # cancel a notebook run. Both are opt-in; with the defaults the capacity isn't called. -SkipFabric (deploy.ps1's stop
+        # at the end of an update, 2026-11-19) leaves both alone.
         $capacitySetting = Get-DemoFabricCapacitySetting -Config $Config
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
             $historySaved = $false
+            # T5's Azure Monitor metrics (2026-11-18, ADR 0027), for the notebook's COSMOS_METRICS: its account stays, so
+            # they're read now, right before the run (Get-DemoCosmosHistoryCapture never throws).
+            $cosmosHistory = $null
+            if (Test-DemoT5Enabled -Config $Config) {
+                $cosmosHistory = Get-DemoCosmosHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -DeploymentId ([string]$state.Tags['deploymentId']) -CheckId 'STOP.T5.HISTORY'
+                if ($null -ne $cosmosHistory.Result) {
+                    $results.Add($cosmosHistory.Result)
+                }
+            }
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' })
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
                 # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.
@@ -332,6 +425,18 @@ function Stop-DemoEnvironment {
         }
         else {
             $results.Add((Suspend-DemoFabricCapacity -Config $Config -State $state -CheckPrefix STOP -Confirm:$false))
+        }
+    }
+    # T5 (ADR 0027): an Azure Cosmos DB account has no stop or pause. Its activity is off now (above), the runner ended with
+    # sqlvm01, and its metrics were read for the history, so its container is deleted (2026-11-19): its throughput stops
+    # billing until the next session creates it again. It's kept when Run all couldn't create it again; STOP.T5 says why.
+    if (-not $ParkT2 -and (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((Invoke-DemoT5ContainerStop -Config $Config -State $(if ($t5Missing) { $null } else { $t5Read }) -DeploymentState $state -Confirm:$false))
+    }
+    if ($updateEnd) {
+        # The stop at the end of an update settles the nightly stop last, once everything is stopped (2026-11-19).
+        foreach ($item in @(Resolve-DemoUpdateStopNightly -Config $Config -Result $results.ToArray())) {
+            $results.Add($item)
         }
     }
 
