@@ -39,6 +39,9 @@ internal static class Reducer
 
     private static readonly string[] SentinelSources = ["RCA-SQL-09", "RCA-PG-10", "RCA-PG-03"];
 
+    // Enough halvings to bring any count the store's 20 MB per target allows down to one row.
+    private const int Halvings = 24;
+
     /// <param name="captures">Each target's capture for the document.</param>
     /// <param name="measure">The gzip size of a document with these detection tables.</param>
     /// <param name="budget">The most gzip the detection tables may take.</param>
@@ -49,8 +52,9 @@ internal static class Reducer
         foreach (var step in Steps())
         {
             var tables = Assemble(work);
-            var size = measure(tables);
-            if (size <= budget && tables.Values.All(t => t.Count <= RcaContract.MaximumRows))
+
+            // Past a document's 20,000 rows or strings is over budget too: the encoder refuses it, so it isn't measured.
+            if (EvidenceDocument.WithinLimits(tables) && measure(tables) <= budget)
             {
                 return new ReducedCapture(tables, Warnings(captures), cuts);
             }
@@ -137,6 +141,19 @@ internal static class Reducer
         yield return w => ThinResourceStats(w, 4);
         yield return DropSessions;
         yield return KeepEssentials;
+
+        // Past even that (thousands of deadlocks, or days of episodes between exports): the deadlock graphs go, then the
+        // deadlocks and the episodes are halved until the document fits. The coverage rows always stay.
+        yield return DropDeadlockGraphs;
+        for (var i = 0; i < Halvings; i++)
+        {
+            yield return HalveDeadlocks;
+        }
+
+        for (var i = 0; i < Halvings; i++)
+        {
+            yield return HalveEpisodes;
+        }
     }
 
     private static string? ThinSessions(Working work, int stride)
@@ -271,6 +288,55 @@ internal static class Reducer
         return kept == before ? null : "only capture episodes and deadlocks kept: the counters, replay samples, and other events left out.";
     }
 
+    private static string? DropDeadlockGraphs(Working work)
+    {
+        var graphs = work.Rows(RcaContract.Events).Count(r => r.Get("deadlock_json") is not null);
+        if (graphs == 0)
+        {
+            return null;
+        }
+
+        work.Map(RcaContract.Events, r => r.Get("deadlock_json") is null ? r : Copy(r).Set("deadlock_json", null));
+        return string.Create(CultureInfo.InvariantCulture, $"the graphs of {graphs} deadlock(s) left out; each deadlock row keeps its victim, module, and first object.");
+    }
+
+    private static string? HalveDeadlocks(Working work)
+    {
+        var deadlocks = work.Rows(RcaContract.Events).Where(r => r.Get("kind") is "deadlock").ToList();
+        if (deadlocks.Count < 2)
+        {
+            return null;
+        }
+
+        var keep = deadlocks.Where((_, i) => i % 2 == 0).ToHashSet();
+        work.Replace(RcaContract.Events, r => r.Get("kind") is not "deadlock" || keep.Contains(r));
+        return string.Create(CultureInfo.InvariantCulture, $"deadlock rows halved ({keep.Count} of {deadlocks.Count} kept).");
+    }
+
+    private static string? HalveEpisodes(Working work)
+    {
+        var episodes = work.Rows(RcaContract.Events).Where(r => r.Get("kind") is "capture").Select(r => r.Get("code") as string ?? string.Empty).Distinct(StringComparer.Ordinal).ToList();
+        if (episodes.Count < 2)
+        {
+            return null;
+        }
+
+        var keep = episodes.Where((_, i) => i % 2 == 0).ToHashSet(StringComparer.Ordinal);
+        work.Replace(RcaContract.Events, r => r.Get("kind") is not "capture" || keep.Contains(r.Get("code") as string ?? string.Empty));
+        return string.Create(CultureInfo.InvariantCulture, $"capture episodes halved ({keep.Count} of {episodes.Count} kept, each with its start and end).");
+    }
+
+    private static CaptureRow Copy(CaptureRow row)
+    {
+        var copy = new CaptureRow(row.Table, row.Target, row.At, row.Source, row.Sentinel);
+        foreach (var (column, value) in row.Values)
+        {
+            copy.Set(column, value);
+        }
+
+        return copy;
+    }
+
     private static Dictionary<string, List<CaptureRow>> Assemble(List<Working> work)
     {
         var tables = new Dictionary<string, List<CaptureRow>>(StringComparer.Ordinal);
@@ -319,6 +385,14 @@ internal static class Reducer
 
             tables[table] = [.. rows.Where(keep)];
             return tables[table].Count;
+        }
+
+        public void Map(string table, Func<CaptureRow, CaptureRow> map)
+        {
+            if (tables.TryGetValue(table, out var rows))
+            {
+                tables[table] = [.. rows.Select(map)];
+            }
         }
 
         /// <summary>The capture episodes in the window, from their escalated and relaxed rows.</summary>

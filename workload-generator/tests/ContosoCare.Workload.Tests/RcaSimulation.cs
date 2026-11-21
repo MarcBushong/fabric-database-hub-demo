@@ -79,15 +79,37 @@ internal static class RcaSimulation
     /// <summary>Six lock timeouts in each of these minutes.</summary>
     public static readonly DateTimeOffset[] TimeoutMinutes = [At(16, 53, 0), At(16, 54, 0), At(16, 56, 0), At(16, 58, 0), At(17, 0, 0)];
 
-    public static ScriptedConnector T1(ManualTime clock) => new((block, _) => T1Block(block, clock.Now));
+    /// <summary>T1's chain; <paramref name="moreEvents"/> adds events to its ring buffer, by the simulated time.</summary>
+    public static ScriptedConnector T1(ManualTime clock, Func<DateTimeOffset, IEnumerable<string>>? moreEvents = null) => new((block, _) => T1Block(block, clock.Now, moreEvents));
+
+    /// <summary>
+    /// T1's chain as T3 shows it: the same blocks, and its events through the database-scoped event session (RCA-XE-03
+    /// creates it, RCA-XE-04 reads it).
+    /// </summary>
+    public static ScriptedConnector T1AsT3(ManualTime clock, Func<DateTimeOffset, IEnumerable<string>>? moreEvents = null) =>
+        new((block, _) => T1Block(block switch { "RCA-XE-03" => "RCA-XE-01", "RCA-XE-04" => "RCA-XE-02", var other => other }, clock.Now, moreEvents));
+
+    /// <summary>A deadlock between two sessions in ContosoCare, the chain's run one of them, as its event session reports it.</summary>
+    public static string DeadlockReport(DateTimeOffset at, string eventName = "xml_deadlock_report")
+    {
+        const string Graph =
+            "<deadlock><victim-list><victimProcess id=\"p2\"/></victim-list><process-list>" +
+            "<process id=\"p1\" spid=\"81\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (aa11)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.demo.usp_transfer\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 42</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
+            "<process id=\"p2\" spid=\"82\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (bb22)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.demo.usp_transfer\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 43</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
+            "</process-list><resource-list>" +
+            "<keylock hobtid=\"1\" dbid=\"5\" objectname=\"ContosoCare.care.inventory\" indexname=\"pk_inventory\" mode=\"X\"><owner-list><owner id=\"p1\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"p2\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>" +
+            "<keylock hobtid=\"1\" dbid=\"5\" objectname=\"ContosoCare.care.inventory\" indexname=\"pk_inventory\" mode=\"X\"><owner-list><owner id=\"p2\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"p1\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>" +
+            "</resource-list></deadlock>";
+        return Event(eventName, at, [("xml_report", "__GRAPH__", null)], []).Replace("__GRAPH__", Graph, StringComparison.Ordinal);
+    }
 
     public static DateTimeOffset At(int hour, int minute, int second, int millisecond = 0) => new(2026, 11, 20, hour, minute, second, millisecond, TimeSpan.Zero);
 
-    private static IReadOnlyList<CaptureValues> T1Block(string block, DateTimeOffset now) => block switch
+    private static IReadOnlyList<CaptureValues> T1Block(string block, DateTimeOffset now, Func<DateTimeOffset, IEnumerable<string>>? moreEvents = null) => block switch
     {
         "RCA-XE-00" => [.. new[] { ("error_reported", "error_number"), ("error_reported", "severity"), ("error_reported", "message"), ("error_reported", "is_intercepted"), ("lock_escalation", "escalation_cause"), ("lock_escalation", "escalated_lock_count"), ("lock_escalation", "mode"), ("lock_escalation", "object_id"), ("xml_deadlock_report", "xml_report") }.Select(f => Row(("event_name", f.Item1), ("column_name", f.Item2)))],
         "RCA-XE-01" or "RCA-XE-05" => [],
-        "RCA-XE-02" => [Row(("target_data", RingBuffer(T1Events(now))))],
+        "RCA-XE-02" => [Row(("target_data", RingBuffer(T1Events(now).Concat(moreEvents?.Invoke(now) ?? []))))],
         "RCA-SQL-09" => Counters(now),
         "RCA-SQL-01" => ChainSessions(now),
         "RCA-SQL-02" => ChainLocks(now),

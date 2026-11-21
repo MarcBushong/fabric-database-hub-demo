@@ -20,6 +20,9 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
 {
     private const string DatabaseName = "ContosoCare";
 
+    // How long a truncated read keeps remembering an event it left out: the ring buffer may still hold it (ReadEventsAsync).
+    private static readonly TimeSpan EventMemory = TimeSpan.FromMinutes(20);
+
     // The fields the observer reads from each event (RCA-XE-00 lists what the server has; a missing one isn't captured).
     private static readonly Dictionary<string, string[]> Fields = new(StringComparer.Ordinal)
     {
@@ -32,7 +35,8 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
     private readonly bool databaseScoped = gate == DemoTarget.T3;
     private readonly CounterDeltas deltas = new();
     private readonly Dictionary<long, string> objects = [];
-    private readonly Dictionary<string, DateTimeOffset> seenEvents = new(StringComparer.Ordinal);
+    private readonly SeenEvents bufferEvents = new();
+    private readonly SeenEvents healthEvents = new();
     private readonly SortedDictionary<DateTimeOffset, int> errorMinutes = [];
     private EpisodeTrigger blocking = null!;
     private EpisodeTrigger errors = null!;
@@ -89,7 +93,8 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         blocking = new EpisodeTrigger(Ids, Options.QuietFor);
         errors = new EpisodeTrigger(Ids, Options.ErrorQuietFor);
         deltas.Clear();
-        seenEvents.Clear();
+        bufferEvents.Clear();
+        healthEvents.Clear();
         errorMinutes.Clear();
         whoRan.Clear();
         nextSentinel = now;
@@ -382,12 +387,14 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
 
         if (read.Truncated)
         {
-            GapOnce(now, "xe-truncated", $"{Target}'s ring buffer returned truncated XML, so its oldest events may be missing.");
+            GapOnce(now, "xe-truncated", $"{Target}'s ring buffer held more than the 4 MB of XML a read returns, so events that didn't fit may be missing.");
         }
 
+        var returned = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in read.Events.OrderBy(e => e.At))
         {
-            if (item.At < ObservingSince || !seenEvents.TryAdd(item.Fingerprint, item.At))
+            returned.Add(item.Fingerprint);
+            if (item.At < ObservingSince || !bufferEvents.Add(item))
             {
                 continue;
             }
@@ -395,10 +402,11 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
             Keep(item, databaseScoped ? "RCA-XE-03,RCA-XE-04" : "RCA-XE-01,RCA-XE-02");
         }
 
-        foreach (var old in seenEvents.Where(e => e.Value < now - TimeSpan.FromMinutes(20)).Select(e => e.Key).ToList())
-        {
-            seenEvents.Remove(old);
-        }
+        // The ring buffer drops its oldest events first and never returns one again, so an event a complete read left out
+        // is gone for good. A truncated read leaves out whatever didn't fit, from whichever end (Learn doesn't say), and
+        // the buffer may still hold it, so then only events older than EventMemory are forgotten. An event the buffer
+        // still returns is never written twice.
+        bufferEvents.Forget((fingerprint, at) => !returned.Contains(fingerprint) && (!read.Truncated || at < now - EventMemory));
 
         EvaluateErrors(now);
     }
@@ -596,7 +604,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
             }
 
             var item = ExtendedEvents.ParseEvent(element);
-            if (item.At < since - Options.EventLatency || !seenEvents.TryAdd(item.Fingerprint, item.At))
+            if (item.At < since - Options.EventLatency || !healthEvents.Add(item))
             {
                 continue;
             }
@@ -617,6 +625,9 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         {
             Gap(now, $"{Target}'s deadlock count rose, and neither its event session nor system_health had a graph in ContosoCare.");
         }
+
+        // system_health keeps its deadlocks for days; each read takes only those after the count rose, so the older ones go.
+        healthEvents.Forget((_, at) => at < now - EventMemory);
     }
 
     /// <summary>T3's 15-second resource rows (RCA-AZ-01): every row not kept yet, by end_time, with no deadband.</summary>

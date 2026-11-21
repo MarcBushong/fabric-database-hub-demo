@@ -1,3 +1,4 @@
+using System.Globalization;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca.Observer;
@@ -138,6 +139,118 @@ public sealed class RcaObserverTests
         // The lock timeouts' counter agrees: its deltas add up to the 30 events.
         Assert.Equal(30, sink.Table("rca_resource").Where(r => (string?)r.Get("metric") == "lock_timeouts").Sum(r => (double)r.Get("value")!));
         Assert.DoesNotContain(sink.Table("rca_events"), r => r.At == At(16, 51, 0));
+    }
+
+    [Theory]
+    [InlineData("T1")]
+    [InlineData("T3")]
+    public async Task InA90MinuteSessionEachEventIsWrittenOnceWhileTheRingBufferStillReturnsIt(string target)
+    {
+        // Review of 4e7817b (High): the observer forgot an event 20 minutes after it while the ring buffer, which keeps up
+        // to 5,000 events, still returned it, and wrote it again at every sentinel after: at 45 minutes, T1's 30 lock
+        // timeouts had become 1,113 rows and its 4 escalations 160. T3's database-scoped session (RCA-XE-04) too.
+        var clock = new ManualTime(T1From);
+        var t3 = target == "T3";
+        IEnumerable<string> Deadlock(DateTimeOffset now) => now >= At(16, 55, 1) ? [DeadlockReport(At(16, 55, 0), t3 ? "database_xml_deadlock_report" : "xml_deadlock_report")] : [];
+        var connector = t3 ? T1AsT3(clock, Deadlock) : RcaSimulation.T1(clock, Deadlock);
+        var observer = new SqlTargetObserver(target, t3 ? DemoTarget.T3 : DemoTarget.T1, connector, Options(), RunnerLog.Null);
+        var sink = new MemorySink();
+
+        await DriveAsync([observer], sink, clock, T1From, T1From.AddMinutes(90), TestContext.Current.CancellationToken);
+
+        Assert.Contains(connector.Calls, c => c.BlockId == (t3 ? "RCA-XE-04" : "RCA-XE-02") && c.Text == CaptureCatalog.Get(c.BlockId));
+        Assert.Equal(TimeoutMinutes.SelectMany(m => Enumerable.Range(0, 6).Select(i => m.AddSeconds(5 + (i * 9)))), sink.Events("error").Select(e => e.At));
+        Assert.Equal(Escalations, sink.Events("escalation").Select(e => e.At));
+        Assert.Equal(At(16, 55, 0), Assert.Single(sink.Events("deadlock")).At);
+    }
+
+    [Fact]
+    public async Task AnEventATruncatedReadLeftOutIsRememberedAndNeverWrittenAgain()
+    {
+        // A read of a ring buffer past 4 MB of XML leaves out what didn't fit, which the buffer may still hold (Learn:
+        // ring_buffer target), here its oldest event: the observer remembers such an event for 20 minutes, and once it has
+        // forgotten one, it never writes it again when a later read returns it.
+        var clock = new ManualTime(T1From);
+        var first = LockTimeout(T1From.AddSeconds(10), 64);
+        var second = LockTimeout(T1From.AddSeconds(90), 65);
+        var connector = RingBufferOnly(clock, now => now < T1From.AddMinutes(2) ? RingBuffer([first]) : now < T1From.AddMinutes(40) ? Truncated([second]) : RingBuffer([first, second]));
+        var sink = new MemorySink();
+
+        await DriveAsync([T1Observer(connector)], sink, clock, T1From, T1From.AddMinutes(60), TestContext.Current.CancellationToken);
+
+        Assert.Equal([T1From.AddSeconds(10), T1From.AddSeconds(90)], sink.Events("error").Select(e => e.At));
+
+        // While reads stay truncated, each 10 minutes have their gap, so every export window that has them says so.
+        Assert.Equal([At(16, 52, 0), At(17, 2, 0), At(17, 12, 0), At(17, 22, 0)], sink.Notes.Where(n => n.Kind == NoteKind.Gap && n.Text.Contains("4 MB of XML", StringComparison.Ordinal)).Select(n => n.At));
+    }
+
+    [Fact]
+    public async Task ATruncatedReadThatCutsTheNewestEventsLosesNoneAndWritesNoneTwice()
+    {
+        // Which end a truncated read cuts isn't documented; here it's the newest. E2 is kept, then cut for more than 20
+        // minutes, so it's forgotten while the buffer still holds it; E3 and E4 are cut from the start. Once a read is
+        // complete again (E1 gone, oldest first), E2 isn't written again, and E3 and E4 are written once.
+        var clock = new ManualTime(T1From);
+        var e1 = LockTimeout(At(16, 50, 10), 64);
+        var e2 = LockTimeout(At(16, 51, 30), 65);
+        var e3 = LockTimeout(At(16, 58, 0), 66);
+        var e4 = LockTimeout(At(17, 15, 0), 67);
+        var connector = RingBufferOnly(clock, now =>
+            now < At(16, 50, 11) ? RingBuffer([])
+            : now < At(16, 51, 31) ? RingBuffer([e1])
+            : now < At(16, 58, 1) ? RingBuffer([e1, e2])
+            : now < At(17, 20, 0) ? Truncated([e1])
+            : RingBuffer([e2, e3, e4]));
+        var sink = new MemorySink();
+
+        await DriveAsync([T1Observer(connector)], sink, clock, T1From, T1From.AddMinutes(40), TestContext.Current.CancellationToken);
+
+        Assert.Equal([(At(16, 50, 10), (long?)64), (At(16, 51, 30), (long?)65), (At(16, 58, 0), (long?)66), (At(17, 15, 0), (long?)67)], ErrorRows(sink));
+    }
+
+    [Fact]
+    public async Task AnEventInTheMillisecondOfAForgottenOneIsStillWritten()
+    {
+        // Re-review of ce4a5e2: S and X in one millisecond. Truncated reads return only S for 25 minutes, then nothing, so S
+        // is forgotten; then a complete read returns X. X was never seen, so it's new: S and X are each written once.
+        var clock = new ManualTime(T1From);
+        var s = LockTimeout(At(16, 50, 10), 64);
+        var x = LockTimeout(At(16, 50, 10), 65);
+        var connector = RingBufferOnly(clock, now =>
+            now < At(16, 50, 11) ? RingBuffer([])
+            : now < T1From.AddMinutes(25) ? Truncated([s])
+            : now < T1From.AddMinutes(30) ? Truncated([])
+            : RingBuffer([x]));
+        var sink = new MemorySink();
+
+        await DriveAsync([T1Observer(connector)], sink, clock, T1From, T1From.AddMinutes(40), TestContext.Current.CancellationToken);
+
+        Assert.Equal([(At(16, 50, 10), (long?)64), (At(16, 50, 10), (long?)65)], ErrorRows(sink));
+    }
+
+    [Fact]
+    public async Task AnEventTheRingBufferStopsReturningIsForgottenAndTheEventsAfterItAreEachWrittenOnce()
+    {
+        // The main path (re-review of ce4a5e2): complete reads for 40 minutes while the ring buffer wraps. A complete read
+        // that no longer returns an event means the buffer dropped it, oldest first, so it's forgotten: A at 5 minutes and
+        // B at 12. C arrives at 6, and D, two sessions in one millisecond, at 11. Each is written once.
+        var clock = new ManualTime(T1From);
+        var events = new (DateTimeOffset At, int Session, DateTimeOffset Gone)[]
+        {
+            (At(16, 50, 5), 64, T1From.AddMinutes(5)),
+            (At(16, 50, 15), 65, T1From.AddMinutes(12)),
+            (At(16, 56, 0), 66, DateTimeOffset.MaxValue),
+            (At(17, 1, 0, 250), 67, DateTimeOffset.MaxValue),
+            (At(17, 1, 0, 250), 68, DateTimeOffset.MaxValue),
+        };
+
+        // An event is in the buffer from a second after it (its dispatch) until the buffer drops it.
+        var connector = RingBufferOnly(clock, now => RingBuffer(events.Where(e => e.At.AddSeconds(1) <= now && now < e.Gone).Select(e => LockTimeout(e.At, e.Session))));
+        var sink = new MemorySink();
+
+        await DriveAsync([T1Observer(connector)], sink, clock, T1From, T1From.AddMinutes(40), TestContext.Current.CancellationToken);
+
+        Assert.Equal(events.Select(e => (e.At, (long?)e.Session)), ErrorRows(sink));
     }
 
     [Fact]
@@ -490,4 +603,18 @@ public sealed class RcaObserverTests
         Assert.Equal(12, samples.Count);
         Assert.Equal(samples.Count, samples.Distinct().Count());
     }
+
+    /// <summary>A lock timeout (error 1222) of the chain's run, as the observer's event session reports it.</summary>
+    private static string LockTimeout(DateTimeOffset at, int session) =>
+        Event("error_reported", at, [("error_number", "1222", null), ("severity", "16", null), ("is_intercepted", "true", null), ("message", "Lock request time out period exceeded.", null)], [("client_app_name", ChainApp), ("session_id", session.ToString(CultureInfo.InvariantCulture))]);
+
+    /// <summary>A read past 4 MB of XML: SQL Server sets truncated to 1 and leaves out what didn't fit.</summary>
+    private static string Truncated(IEnumerable<string> events) => RingBuffer(events).Replace("truncated=\"0\"", "truncated=\"1\"", StringComparison.Ordinal);
+
+    /// <summary>T1 with only its ring buffer scripted, by the simulated time; every other block returns nothing.</summary>
+    private static ScriptedConnector RingBufferOnly(ManualTime clock, Func<DateTimeOffset, string> buffer) =>
+        new((block, _) => block == "RCA-XE-02" ? [Row(("target_data", buffer(clock.Now)))] : []);
+
+    /// <summary>The error rows the observer wrote, in order: their times and sessions.</summary>
+    private static List<(DateTimeOffset At, long? Session)> ErrorRows(MemorySink sink) => [.. sink.Events("error").Select(e => (e.At, (long?)e.Get("session_id")))];
 }

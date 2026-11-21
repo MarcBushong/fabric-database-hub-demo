@@ -114,6 +114,40 @@ internal static class EvidenceDocument
     /// <summary>A time truncated to its second.</summary>
     public static DateTimeOffset Second(DateTimeOffset time) => new(time.UtcDateTime.Ticks - (time.UtcDateTime.Ticks % TimeSpan.TicksPerSecond), TimeSpan.Zero);
 
+    /// <summary>
+    /// True when the detection tables fit a document: at most 20,000 rows a table and 20,000 distinct strings, past which
+    /// <see cref="Write"/> refuses them. The reducer checks it before it measures, and cuts on while it's false.
+    /// </summary>
+    public static bool WithinLimits(IReadOnlyDictionary<string, List<CaptureRow>> detection)
+    {
+        var strings = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var table in RcaContract.Tables.Where(t => t.IsDetection))
+        {
+            if (!detection.TryGetValue(table.Name, out var rows))
+            {
+                continue;
+            }
+
+            if (rows.Count > RcaContract.MaximumRows)
+            {
+                return false;
+            }
+
+            foreach (var column in table.Columns.Where(c => c.Type == "string"))
+            {
+                foreach (var row in rows)
+                {
+                    if (row.Get(column.Name) is { } value && strings.Add(StringTable.Text(value)) && strings.Count > RcaContract.MaximumStrings)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
     private static List<(string Name, string Type, List<object?> Values)> Encode(RcaTable table, IReadOnlyList<CaptureRow> rows, StringTable strings, DateTimeOffset epoch)
     {
         if (rows.Count > RcaContract.MaximumRows)
@@ -156,7 +190,7 @@ internal static class EvidenceDocument
 
         return column.Type switch
         {
-            "string" => strings.Index(value as string ?? System.Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty),
+            "string" => strings.Index(value),
             "timestamp" => value is DateTimeOffset time ? (long)Math.Round((time - epoch).TotalMilliseconds, MidpointRounding.AwayFromZero) : throw new InvalidOperationException($"{column.Name} isn't a time."),
             "integer" => value switch
             {
@@ -237,13 +271,16 @@ internal static class EvidenceDocument
 
         public List<string> Values { get; } = [];
 
-        public int Index(string text)
+        /// <summary>A value as the dictionary holds it: its text, cut to 4,000 characters.</summary>
+        public static string Text(object value)
         {
-            if (text.Length > RcaContract.MaximumStringLength)
-            {
-                text = text[..(RcaContract.MaximumStringLength - 3)] + "...";
-            }
+            var text = value as string ?? System.Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+            return text.Length > RcaContract.MaximumStringLength ? text[..(RcaContract.MaximumStringLength - 3)] + "..." : text;
+        }
 
+        public int Index(object value)
+        {
+            var text = Text(value);
             if (indexes.TryGetValue(text, out var index))
             {
                 return index;
