@@ -4945,3 +4945,37 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live: the chunk names need a live proof before they ship,** with 8ff25e95's. On a net-new deployment and an update from bf010ed, `./scripts/deploy.ps1` delivers each VM's chunks as `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`, `INFRA.BOOTSTRAP.LOADER_*` pass, and `./scripts/status.ps1` shows no chunk left once its deletes finish.
 - **Longer chunk names:** 40 characters, and 55 for a held chunk's fresh name, the fallback. Learn names no length rule for a Run Command's name; the longest chunk name that ran live had 47 (2026-11-16).
+
+### Run all names a duration outside a session's bounds as the cause (F33, 2026-11-22)
+
+**Why.** Live at 14:20, with `DURATION_MINUTES = 20`, Run all said: "Nothing is started: the VMs' nightly auto-shutdown is at 19:00 (Eastern Standard Time), too soon for a session of at least 30 minutes." The cause was the duration asked. The control notebook's `session_plan` set `ok` to `planned >= minMinutes`, and `plan_lines` named the auto-shutdown whenever `ok` was false. The same code is at bf010ed.
+
+- **Over the showcase's 120 minutes:** the plan capped 150 at 120 and said "This session runs 120 of the 150 minutes asked: it ends at ..., before the VMs' nightly auto-shutdown", which named the wrong cause too. Then the session's request failed at `build_request` ("DURATION_MINUTES must be a whole number from 30 to 120"), as the runbook would have refused it.
+- **Without an auto-shutdown,** a duration under 30 read "This session runs 20 minutes" while nothing started.
+- **The runbook isn't affected:** its request check refuses a session's `durationMinutes` outside `minSessionMinutes` to the showcase's maximum, so its "too soon" refusal only ever means the auto-shutdown.
+
+**Work summary.**
+
+- **`session_plan`** refuses a duration outside `minMinutes` to the showcase's `maxMinutes`, as the runbook does, and says which bound (`durationOut`: `short` or `long`). It also says whether the auto-shutdown alone leaves less than `minMinutes` (`shutdownShort`). Within the bounds, the plan is the same as before.
+- **`plan_lines`** names the duration first:
+  - "Nothing is started: a session runs at least 30 minutes, and you asked for 20." with "Fix: set DURATION_MINUTES to 30 or more, then Run all again.";
+  - "at most 120 minutes ... 150" with "120 or less";
+  - when the auto-shutdown is too soon as well, "The VMs' nightly auto-shutdown at 19:00 (...) is too soon for one now, too.", and the fix adds "Run all again earlier in the day, or set autoShutdownTime ...".
+  - Within the bounds, the auto-shutdown's lines are as before.
+- **Docs:** troubleshooting (a row for the duration, and one for the auto-shutdown's own refusal, which had none), the control notebook's guide (`fabric/control/README.md`), the CHANGELOG, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 4: `session_plan` and `plan_lines`); tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1`; `docs/troubleshooting.md`, `fabric/control/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode and the bundled Python:
+
+- Fabric.ControlNotebook, ActivityControl, Fabric.Notebooks, and Docs.Walkthrough: 389 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped.
+- With HEAD's notebook and the tests kept, 3 tests fail:
+  - the plan test: 20 minutes at 14:20 and at 18:40, 150 minutes, and 20 minutes with no auto-shutdown;
+  - Run all with `DURATION_MINUTES = 20` at 14:20, which now sends nothing, names the duration, and doesn't say "too soon";
+  - Run all with 150, which at HEAD ended with `build_request`'s ValueError and now sends nothing and names the bound.
+- The other 20 Run all cases pass, the shutdown's refusal among them, unchanged. PSScriptAnalyzer on the test file: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live;** the notebook reaches a Fabric workspace with the next `./scripts/deploy.ps1`.
+- **A duration that isn't a whole number** (45.5, say) still plans its whole part and fails at the request, with `build_request`'s message, as before. The Insights app sends whole numbers from 30 to 120.

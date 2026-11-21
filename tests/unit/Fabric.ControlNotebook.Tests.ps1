@@ -471,7 +471,8 @@ with contextlib.redirect_stdout(buffer):
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
-                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
+                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False},
+                          "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
             if index == 2:
@@ -752,7 +753,7 @@ print(json.dumps(out))
         }
     }
 
-    It 'plans a session as the runbook does: before the VMs'' auto-shutdown, after whole showcase cycles when it''s cut short, and refused under 30 minutes' {
+    It 'plans a session as the runbook does: before the VMs'' auto-shutdown, after whole showcase cycles when it''s cut short, and refused under 30 minutes, naming the duration asked when that''s why (F33)' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
@@ -770,6 +771,12 @@ out = {}
 for label, hour, minute in (("morning", 9, 0), ("capped", 17, 45), ("short", 18, 20), ("late", 18, 40)):
     plan = ns["session_plan"](dt.datetime(2026, 11, 14, hour, minute, tzinfo=dt.timezone.utc), 90, catalog)
     out[label] = {"minutes": plan["minutes"], "ok": plan["ok"], "end": plan["endUtc"].strftime("%H:%M"), "lines": ns["plan_lines"](plan, catalog)}
+# The duration asked, outside 30 to 120 minutes (F33): at 14:20, at 18:40 too, and with no auto-shutdown configured.
+for label, hour, minute, asked, rules in (("asked20", 14, 20, 20, {}), ("asked20late", 18, 40, 20, {}), ("asked150", 9, 0, 150, {}),
+                                          ("asked20none", 14, 20, 20, {"autoShutdownTime": ""})):
+    shown = dict(catalog, session=dict(catalog.get("session") or {}, **rules))
+    plan = ns["session_plan"](dt.datetime(2026, 11, 14, hour, minute, tzinfo=dt.timezone.utc), asked, shown)
+    out[label] = {"ok": plan["ok"], "out": plan["durationOut"], "lines": ns["plan_lines"](plan, shown)}
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
@@ -788,6 +795,19 @@ print(json.dumps(out))
         $plan.short.lines[0] | Should -Match 'after 1 whole 30-minute showcase cycle,'
         $plan.late.ok | Should -BeFalse
         $plan.late.lines[0] | Should -Match 'Nothing is started: the VMs'' nightly auto-shutdown is at 19:00 \(UTC\), too soon for a session of at least 30 minutes'
+        # F33 (live, 2026-11-21): 20 minutes asked at 14:20 was refused as if the auto-shutdown at 19:00 were too soon.
+        $plan.asked20.ok | Should -BeFalse
+        $plan.asked20.out | Should -Be 'short'
+        @($plan.asked20.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20.', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        # Named only when it's what leaves too little time, as at 18:40.
+        @($plan.asked20late.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20. The VMs'' nightly auto-shutdown at 19:00 (UTC) is too soon for one now, too.', 'Fix: set DURATION_MINUTES to 30 or more, and Run all again earlier in the day, or set autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        # Over the showcase's 120: before, it read "runs 120 of the 150 minutes asked ... before the VMs' nightly
+        # auto-shutdown", and then the session's request failed; the runbook refuses it too.
+        $plan.asked150.ok | Should -BeFalse
+        $plan.asked150.out | Should -Be 'long'
+        @($plan.asked150.lines) | Should -Be @('Nothing is started: a session runs at most 120 minutes, and you asked for 150.', 'Fix: set DURATION_MINUTES to 120 or less, then Run all again.')
+        # Without an auto-shutdown, it read "This session runs 20 minutes" while it sent nothing.
+        @($plan.asked20none.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20.', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
     }
 
     It 'lists the showcase''s beats as the runner plans them: cycles from each target''s start, T4''s tier, and its replica' {
@@ -1324,6 +1344,8 @@ print(json.dumps(out))
     It 'runs Run all in <Case>' -ForEach @(
         @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
         @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
+        @{ Case = 'a duration under a session''s 30 minutes: nothing starts, and it names the duration, not the auto-shutdown (F33, live 2026-11-21)'; Scenario = 'askedshort'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at least 30 minutes, and you asked for 20\.\s+Fix: set DURATION_MINUTES to 30 or more, then Run all again\.' }
+        @{ Case = 'a duration over a session''s 120 minutes: nothing starts, and it names the duration, rather than a plan cut short by the auto-shutdown and a request that fails (F33)'; Scenario = 'askedlong'; Start = '2026-11-14T09:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at most 120 minutes, and you asked for 150\.\s+Fix: set DURATION_MINUTES to 120 or less, then Run all again\.' }
         @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
@@ -1411,6 +1433,10 @@ print(json.dumps(out))
         }
         if ($Scenario -in 'active', 'stopnow') {
             $report.sent[0].sessionId | Should -Be ('a' * 32)
+        }
+        if ($Scenario -in 'askedshort', 'askedlong') {
+            # The duration asked is the cause (F33): neither the auto-shutdown nor a plan cut short by it is named.
+            $report.printed | Should -Not -Match 'too soon|minutes asked'
         }
         if ($Scenario -eq 'stoppedend') {
             # A plain stop for whatever runs, then that session's history, with its metrics and window, after its telemetry.
