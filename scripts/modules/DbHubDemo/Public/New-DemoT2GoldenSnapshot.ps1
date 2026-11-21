@@ -28,7 +28,8 @@ function New-DemoT2GoldenSnapshot {
     6. Prepare: writes the capture marker first (T2's control relay leaves the guest alone while it's there; the
        capture's own Release removes it, at step 3 and in step 9), removes the sign-in data that setup leaves on the
        VM again and checks that none remains, turns IE
-       ESC on, writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
+       ESC on, deletes the Incident RCA's capture in the guest after stopping its workload runner (ADR 0031; anything
+       left means nothing is captured), writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
        network adapter disconnected), and shuts the guest down cleanly. With -WipeFreeSpace, HostCompact then
        compacts the guest's VHDX (Optimize-VHD -Mode Full, mounted read-only), overwrites the host's free space
        with zeros, deletes that file, and trims the host's volume, so the snapshot keeps none of the zeroed
@@ -332,11 +333,19 @@ function New-DemoT2GoldenSnapshot {
         }
         $prepared = $prepare.Data
         $prepareEvidence = [ordered]@{}
-        foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds') {
+        foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds', 'rcaSpansRemoved', 'rcaSpansNotExported') {
             $prepareEvidence[$name] = Get-DemoMemberValue -InputObject $prepared -Name $name
         }
         $record = Get-DemoMemberValue -InputObject $prepared -Name 'record'
-        & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' ('The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']) $prepareEvidence
+        $prepareMessage = 'The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']
+        # The Incident RCA's capture in the guest, deleted so the snapshot carries none (ADR 0031; the docs review of 0189a4b).
+        $rcaSpans = [int]$prepareEvidence['rcaSpansRemoved']
+        $rcaNotExported = [int]$prepareEvidence['rcaSpansNotExported']
+        if ($rcaSpans -gt 0) {
+            $rcaNote = if ($rcaNotExported -gt 0) { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), {1} of them never fully exported, so that part of T2''s evidence isn''t in the history.' -f $rcaSpans, $rcaNotExported } else { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), each exported already.' -f $rcaSpans }
+            $prepareMessage += $rcaNote
+        }
+        & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' $prepareMessage $prepareEvidence
         if ($WipeFreeSpace) {
             # 6b. With the guest off: its VHDX compacted, then the host's free space zeroed and trimmed.
             $compact = Invoke-DemoDiskWipeAction -Config $Config -Action 'HostCompact'

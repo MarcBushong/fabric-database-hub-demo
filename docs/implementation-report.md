@@ -4329,7 +4329,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 |---|---|---|---|
 | The contract (`rca/`) | Before 1.1 | The app's session, its owner | From ADR 0031's first commit |
 | The capture | 1.1, 1.2 | The capture session | Its final head, 4c432f1, merged as 631d067 |
-| The transport and history | 1.3 to 1.5 | The transport session | Its slice, 15ad76d. Its review fixes (3b1348a, then its re-reviews' heads) merge once the coordinator confirms them |
+| The transport and history | 1.3 to 1.5 | The transport session | Its slice, 15ad76d, then its review fixes at 02d398a, merged as f0adff2. Its last commit, a Low fix, merges once the coordinator confirms it |
 | The app, the integration, and the docs | 1.6, 1.7 | The app's session | 6fe2b5b, and this entry's docs |
 
 **Work summary.**
@@ -4356,7 +4356,9 @@ With them, at the coordinator's request: high contrast's selected and hovered na
    - the staged `RCA_EVIDENCE_FILE`;
    - `NB_DatabaseHub_LiveActivity`'s decoder and eight tables, and the deployment notebook's purge;
    - the history model's eight tables and seven measures, left out with `FABRIC.SEMANTICMODEL.RCA` while the lakehouse doesn't have them, and the update that runs the notebook once to create them;
-   - the scripts' export with `--session none`, and their pending list.
+   - the scripts' export, in `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s history snapshot, and `configure-fabric.ps1 -RunLiveActivity`, with `--session none`, and their pending list.
+
+   Its docs: [the runbooks](../automation/README.md#the-incident-rcas-evidence), [the history](../fabric/README.md#the-incident-rcas-evidence-in-the-history-2026-11-20), [the model](../fabric/powerbi/README.md#the-incident-rcas-tables-2026-11-20), and [troubleshooting](troubleshooting.md#the-incident-rcas-capture).
 4. **The app** (`fabric/app/src/rca/`, `src/copilot/`, `src/pages/`):
    - **The shared blind detector** (`detector.ts`) and the rules:
      - blocking (`locking.ts`): the chain, head blocker first, its depth, width, blocked count and time, and formations; idle in a transaction; escalation;
@@ -4370,29 +4372,31 @@ With them, at the coordinator's request: high contrast's selected and hovered na
    - **The blind Ask** ([decision 7](adr/0031-incident-rca.md#decisions-and-open-items)): `run_dax`'s refusals (`tools.ts`, `answer-key.ts`); every page's Ask hands the chat measured data only (`ask-blind.test.tsx`); and the blind entry points (`entry.ts`).
    - **The model guide's generator** (`scripts/build-model-guide.ts`): the guide without the answer key, and `denylistProblems`, which refuses a model change that would weaken `run_dax`'s refusals. The model's descriptions name no scenario.
    - **Without the RCA tables:** no Root cause, no tools or starters, and "No RCA capture is recorded yet" (`rca/view/app-rca.test.tsx`).
-5. **The integration:**
-   - the release, merged at bf010ed (34a9732), keeping its wording and the blind postmortem draft;
-   - the capture's final head, and the transport's slice;
+5. **The integration,** by merges, never a rebase, so each part's commits keep their SHAs:
+   - the release, merged at bf010ed (34a9732), keeping its wording and the blind postmortem draft, and its later docs reviews at b059c91 (0a9e0c2);
+   - the capture's final head, 4c432f1 (631d067), and the transport's slice, 15ad76d, then its review fixes at 02d398a (f0adff2);
    - the entry points the blind Ask had removed, back blind (f941d6a; [the list](adr/0031-incident-rca.md#decisions-and-open-items)).
-6. **The Phase 1 end docs,** this entry's commit:
+6. **The Phase 1 end docs:** 0189a4b, and after the transport's merge, the links to its docs and AGENTS.md's lines:
    - the CHANGELOG's Unreleased entry;
    - the README's cost, upgrade, and deletion notes;
    - [cost management's Incident RCA section](cost-management.md#the-incident-rca-2026-11-20);
    - ADR 0031's cost, upgrade-matrix, and validation lines;
+   - AGENTS.md: the RCA's status lines, which an assistant passes on;
    - the estimate: the session control's job minutes go from 60 to 300 a month. That's still within Azure Automation's included tier, so no figure changes, and a test checks that they stay within the 500 included.
 
-**Changed files.** At 6fe2b5b, 187 files against the release's bf010ed:
+**Changed files.** 212 files against the release's head, b059c91, after the transport's merge and these docs:
 
 - **The contract:** `rca/` (new).
 - **The capture:**
   - `workload-generator/src/ContosoCare.Workload/Rca/` (`Observer/`, `Store/`, `Export/`), the runner's commands, and their tests in `workload-generator/tests/ContosoCare.Workload.Tests/`;
   - `rca/capture/`'s two .sql files, which the runner embeds.
-- **The transport and history, at 15ad76d:**
+- **The transport and history, at 02d398a:**
   - the runbook: `automation/runbooks/DbHubControl.Common.ps1`;
   - the scripts: `scripts/configure-fabric.ps1` and `scripts/configure-powerbi.ps1`;
-  - the module: `Private/OneLakeHelpers.ps1` and `Public/Get-DemoRcaModelTablePlan.ps1` (new), `ActivityControlHelpers.ps1`, `TrackHelpers.ps1`, `WorkloadHelpers.ps1`, `Get-DemoFabricSemanticModelDefinition.ps1`, and `Test-DemoSemanticModelData.ps1`;
+  - the module: `Private/OneLakeHelpers.ps1`, `Private/RcaExportHelpers.ps1`, and `Public/Get-DemoRcaModelTablePlan.ps1` (new), `ActivityControlHelpers.ps1`, `FabricCapacityHelpers.ps1`, `HistorySnapshotHelpers.ps1`, `TrackHelpers.ps1`, `WorkloadHelpers.ps1`, `Get-DemoFabricSemanticModelDefinition.ps1`, `Stop-DemoEnvironment.ps1`, and `Test-DemoSemanticModelData.ps1`;
   - the notebooks: `NB_DatabaseHub_Control`, `NB_DatabaseHub_LiveActivity`, and `NB_DatabaseHub_Deployment`;
   - the history model's RCA tables;
+  - its docs: `automation/README.md`, `fabric/README.md`, `fabric/control/README.md`, `fabric/powerbi/README.md`, and in `docs/`: deployment, permissions, the security model, and troubleshooting;
   - and their tests.
 - **The app:**
   - `fabric/app/src/rca/` (new);
@@ -4402,8 +4406,9 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - and the model's descriptions.
 - **The docs:**
   - ADR 0031 (new), ADR 0010's amendment, and the ADR index;
-  - with this entry: `CHANGELOG.md`, `README.md`, `docs/cost-management.md`, and this report;
+  - with this entry: `AGENTS.md`, `CHANGELOG.md`, `README.md`, `docs/cost-management.md`, and this report;
   - and the estimate, `Get-DemoCostEstimate.ps1`, with `tests/unit/DbHubDemo.Cost.Tests.ps1`.
+- **The golden snapshot (the docs review of 0189a4b):** `vm/bootstrap/Invoke-DemoGoldenGuest.ps1` and `New-DemoT2GoldenSnapshot.ps1`, with `tests/unit/Vm.GoldenGuest.Tests.ps1` and `DbHubDemo.Golden.Tests.ps1`, and `docs/deployment.md`'s golden snapshot section.
 
 **Validation, before the live run.**
 
@@ -4412,7 +4417,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - **The repository:** static Pester at 9f3d35f: 5,164 passed and 80 skipped. One test failed, and only on this PC: Teardown's "Teardown tests stay out of the static run", whose child PowerShell loads this PC's broken OneDrive copy of Pester.
 - **The contract:** `Rca.Contract.Tests.ps1`'s 30 tests passed.
 - **The capture's queries:** all 24 T-SQL blocks parse with `TSql160Parser`, and every PostgreSQL block ran on the local primary and standby.
-- **This entry's docs:** see the validation line further down.
+- **This entry's docs:** see the validation lines further down.
 
 **Reviews and their findings.** Every finding below was fixed, each with a test that fails without its fix, unless it says otherwise.
 
@@ -4428,7 +4433,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - **Low to Medium:** 7 new blank-measure **Warnings** on every updated environment.
   - **Low:** inline and file evidence weren't merged.
 
-  Fixed on the transport's branch at 3b1348a. Its re-reviews led to 93243d6, which covers an earlier session's evidence that a start didn't finish, and found a Medium, evidence claimed by the wrong session, which is being fixed there.
+  Fixed on the transport's branch at 3b1348a. The re-review of 3b1348a led to a42ef8f, 3746782, and 93243d6: an earlier session's evidence that a start didn't finish is carried to later starts; the scripts count evidence as saved only once the notebook deleted the staged file; and an earlier session's capture that no export took is asked for 30 days, as long as the runner keeps it. The re-review of 93243d6 found a Medium, evidence claimed by the wrong session, fixed in 02d398a: each VM's capture is exported with its holder's ID first. The re-review of 02d398a found one Low, which the transport closes in one commit on top of it: capture from activity outside a Run all session isn't bound to a session.
 - **The app, bf010ed..34a9732, 10 findings and a test gap:**
   - **High:**
     - `run_dax` ran answer-key queries when a string held a comment marker;
@@ -4467,6 +4472,34 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 
   Fixed in 6fe2b5b: `run_dax` reads each carriage return and form feed as a line feed and sends that text, and a vertical tab ends a comment.
 - **The review of 6fe2b5b:** no findings.
+- **The docs review of 0189a4b, 1 Medium and 4 Low:**
+  - **Medium:** the docs said the scripts save the RCA capture, from code that came only with the transport's merge. After the merge, each of those lines was checked against the code: `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, and `configure-fabric.ps1 -RunLiveActivity` export and stage the evidence. This report's stale "being fixed there" is gone.
+  - **Low:** retention runs only when the runner exports or opens a new capture span (`EvidenceStore.Cleanup`), so the docs say what's kept goes at the first export or capture at least 7 days after its export (30 days after it started, for one no export took), and with no later session, at `destroy.ps1`.
+  - **Low, a code fix:** a T2 golden snapshot kept T2's capture, and a T2 restored from it would have given that capture to the new environment's session. `capture-t2-golden.ps1`'s Prepare (`vm/bootstrap/Invoke-DemoGoldenGuest.ps1`) now stops the guest's workload runner, deletes the store, and captures nothing while any is left. When the delete fails, it starts the runner again. `GOLDEN.CAPTURE.PREPARE` says how much it deleted, and how much no export had taken. Its 8 tests (`Vm.GoldenGuest.Tests.ps1`, `DbHubDemo.Golden.Tests.ps1`) fail without it.
+  - **Low:** Azure Automation's free minutes are summed across the subscription's accounts, and rate plans with a flat discount or a fixed monthly credit have none. Both are under "Not in the estimate" now.
+  - **Low:** the 1 to 5 ms timing was PostgreSQL's alone; the T-SQL blocks were only parsed.
+  - **Also:** ADR 0031 counted 29 contract tests; there are 30.
+
+  Fixed in the commit after the transport's merge (f0adff2).
+
+**Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (d644cdd) count the session control's Automation minutes differently. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
+
+| Part of a Run all session | Job minutes | Branch |
+|---|---|---|
+| `DbHub-Control`'s start | 20 | Both |
+| Following T2 after a cold start | 51 | The follow-ups |
+| The stop | 3 | Both |
+| `DbHub-Monitor`'s re-checks | About 6 | Both |
+| The Incident RCA's export: 6 at the stop, 8 at each of three re-checks, 6 at a start | 36 | This one |
+| **A session** | **116** | |
+
+Five sessions are 580 minutes; with the nightly safety stop's 120, 700, of which 200 are past the 500 included. The follow-ups' code prices the included minutes and the overflow, about $0.40 a month at $0.002 a minute. On this branch alone, the estimate keeps 5 sessions of 60 minutes (300), which fit in the 500 with the safety stop's 120 for one environment in a subscription, so no figure changes. Whoever merges second reconciles these lines:
+
+- `Get-DemoCostEstimate.ps1`, the session control's job minutes (lines 512 to 523 here);
+- `DbHubDemo.Cost.Tests.ps1`, the session control's test and this branch's test that the counted minutes fit in the 500 (lines 754 to 779 here), which no longer holds with both branches;
+- cost management's Automation bullet under "The session control", and the Incident RCA section's "In the estimate";
+- the README's "Close to nothing" bullet;
+- the CHANGELOG's Cost line and its estimate bullet, and ADR 0031's §10.
 
 **Left in Phase 1.**
 
@@ -4474,7 +4507,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - **The evaluation set's Phase 1 cases,** ported with blind questions.
 - **Step 1.8,** the live run below.
 - **Decision 6, names:** open for the owner.
-- **The transport's review fixes:** merged once the coordinator confirms them. They bring the transport's own docs, which these docs then link.
+- **The transport's last fix,** the re-review of 02d398a's Low: merged once the coordinator confirms it, with the affected suites run again. That head is the live test's SHA.
 
 **Step 1.8, the live run (the final tests fill it in).** ADR 0031's [Phase 1](adr/0031-incident-rca.md#phase-1) says what it must show: on each environment, a plain `./scripts/deploy.ps1` ends **DONE** with 0 **Fail** on its first run, `./scripts/validate.ps1` has 0 **Fail**, and no **Warning** is new against the release before it.
 
@@ -4503,6 +4536,16 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - `DbHubDemo`'s `Config`, `Cost`, `EstimateCost`, `FirstRun`, `Lifecycle`, `OneClick`, `OneCommand`, `Preflight`, `SafetyStop`, `T4Fallback`, `T5`, `Tracks`, and `Validation`.
 
 1,662 passed, none failed, and 3 were skipped because this PC lacks gitleaks. No unit test reached the Azure CLI. With the control's job minutes back at 60, the session control's estimate test fails. markdownlint found no issue in 152 files.
+
+**Validation of the transport's merge and the review's fixes.** On f0adff2 with these changes:
+
+- **.NET:** 807 tests at f0adff2: 786 passed, 21 skipped, none failed.
+- **The app:** `npm run verify`: typecheck, lint, Vitest's 472 tests in 29 files, the license check (136 production packages), and the build, all passed.
+- **The repository:** `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown`, with Program Files' Pester 5.9.1. PSScriptAnalyzer found nothing in 392 files, markdownlint no issue, and no unit test reached the Azure CLI.
+  - **Pester:** 5,205 passed, 85 skipped, and 1 failed.
+  - **The failure:** the transport's `DbHubDemo.HistorySnapshot.Tests.ps1` test "stages the evidence in Files/rca/inbox ...". It failed only under the static validation's `Set-StrictMode -Version Latest`. Its OneLake mock read `$Query`, which a file's delete doesn't pass, so the mock threw, and `Remove-DemoRcaEvidenceFile` caught that as a delete that didn't happen.
+  - **The fix:** the mock reads `-Query` from `$PesterBoundParameters` now, and the file passes 36 of 36 under strict mode. A second full run, under the same mode, found no other failure.
+- **The golden snapshot's fix:** its 8 new tests fail without it.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
 

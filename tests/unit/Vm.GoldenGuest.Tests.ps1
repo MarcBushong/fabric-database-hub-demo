@@ -147,7 +147,7 @@ Describe 'The capture marker (review, 2026-11-04)' {
             Mock -CommandName Get-GoldenHostFact -MockWith { @{ guestState = 'Running'; azureVmId = 'source-vm'; guestHyperVId = 'hyper-v-id' } }
             Mock -CommandName Wait-GoldenGuest -MockWith { [pscustomobject]@{ Credential = $script:credential; Seconds = 5 } }
             Mock -CommandName Invoke-Command -MockWith {
-                [pscustomobject]@{ signInCaches = @(); setupLogFilesWithToken = 0; ieEsc = 'On'; sqlEdition = 'Standard Edition (64-bit)'; agentJson = '{"status":"Connected","resourceName":"arcsql01","resourceGroup":"rg-dbhub-demo"}'; evaluationExpiresUtc = '2027-04-19T13:46:22Z'; cachesRemoved = 0; logFilesRedacted = 0 }
+                [pscustomobject]@{ signInCaches = @(); setupLogFilesWithToken = 0; ieEsc = 'On'; sqlEdition = 'Standard Edition (64-bit)'; agentJson = '{"status":"Connected","resourceName":"arcsql01","resourceGroup":"rg-dbhub-demo"}'; evaluationExpiresUtc = '2027-04-19T13:46:22Z'; cachesRemoved = 0; logFilesRedacted = 0; spans = 0; notExported = 0; runnersStopped = 0; left = $false; error = '' }
             }
             Mock -CommandName Set-VM -MockWith { if ($AutomaticStartAction -eq 'Nothing') { $script:markerAtAirGap = Test-Path -LiteralPath $script:markerPath } }
             Mock -CommandName Disconnect-GoldenAdapter -MockWith { }
@@ -170,6 +170,48 @@ Describe 'The capture marker (review, 2026-11-04)' {
             $marker.sourceAzureVmId | Should -Be 'source-vm'
             $result['captureSinceUtc'] | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
             (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+        }
+
+        It 'Prepare deletes the Incident RCA''s capture in the guest after its checks, before the capture record and the air gap (the docs review of 0189a4b)' {
+            $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611210100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $script:airGapped = $false
+            Mock -CommandName Set-VM -MockWith { if ($AutomaticStartAction -eq 'Nothing') { $script:airGapped = $true } }
+            Mock -CommandName Invoke-Command -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock } -MockWith {
+                $script:rcaArguments = @($ArgumentList)
+                $script:recordAtRca = Test-Path -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json')
+                $script:airGappedAtRca = $script:airGapped
+                [pscustomobject]@{ spans = 3; notExported = 1; runnersStopped = 1; left = $false; error = '' }
+            }
+            $result = Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' }
+            $result['succeeded'] | Should -BeTrue
+            Should -Invoke -CommandName Invoke-Command -Times 1 -Exactly -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock }
+            $script:rcaArguments[0] | Should -Be 'C:\ProgramData\DbHubDemo\rca'
+            $script:rcaArguments[1] | Should -Be 'C:\ProgramData\DbHubDemo\dotnet'
+            $script:recordAtRca | Should -BeFalse -Because 'the capture record comes after the capture is gone'
+            $script:airGappedAtRca | Should -BeFalse -Because 'the air gap comes after the capture is gone'
+            $script:airGapped | Should -BeTrue
+            $result['rcaSpansRemoved'] | Should -Be 3
+            $result['rcaSpansNotExported'] | Should -Be 1
+            $result['runnersStopped'] | Should -Be 1
+        }
+
+        It 'Prepare captures nothing while the Incident RCA''s capture is left in the guest, and never stops the runner when an earlier check fails (the docs review of 0189a4b)' {
+            $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611210100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            Mock -CommandName Invoke-Command -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock } -MockWith {
+                [pscustomobject]@{ spans = 2; notExported = 2; runnersStopped = 1; left = $true; error = 'The process cannot access the file because it is being used by another process.' }
+            }
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*Incident RCA''s capture is left in the guest (C:\ProgramData\DbHubDemo\rca): The process cannot access the file*nothing was captured*'
+            Should -Invoke -CommandName Set-VM -Times 0 -Exactly -ParameterFilter { $AutomaticStartAction -eq 'Nothing' }
+            Test-Path -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') | Should -BeFalse
+            # An answer without the field fails closed too.
+            Mock -CommandName Invoke-Command -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock } -MockWith { [pscustomobject]@{ spans = 0 } }
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*didn''t say whether it was deleted; nothing was captured*'
+            # Sign-in data left after the cleanup stops Prepare before the runner is touched.
+            Mock -CommandName Invoke-Command -MockWith {
+                [pscustomobject]@{ signInCaches = @('C:\Users\Administrator\AppData\Local\msal.cache'); setupLogFilesWithToken = 0; ieEsc = 'On'; sqlEdition = 'Standard Edition (64-bit)'; agentJson = ''; evaluationExpiresUtc = ''; cachesRemoved = 0; logFilesRedacted = 0 }
+            }
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*Sign-in residue is left in the guest*'
+            Should -Invoke -CommandName Invoke-Command -Times 2 -Exactly -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock }
         }
 
         It 'Prepare writes the marker''s time with the invariant culture under fi-FI, so it can be read back' {
@@ -280,5 +322,84 @@ Describe 'Wait-GoldenGuest and a broken PowerShell Direct channel (issue #65)' {
         { Wait-GoldenGuest -UserName 'Administrator' -TimeoutSeconds 1 } | Should -Throw '*did not answer over PowerShell Direct within 1 seconds*'
         $script:uptime = [timespan]::FromMinutes(2)
         { Wait-GoldenGuest -UserName 'Administrator' -TimeoutSeconds 2 -BrokenChannelSeconds 1 } | Should -Throw '*did not answer over PowerShell Direct within 2 seconds*'
+    }
+}
+
+Describe 'The Incident RCA''s capture in the guest, deleted before a golden snapshot (the docs review of 0189a4b)' {
+    BeforeAll {
+        # Stand-ins for the guest's ScheduledTasks and CIM cmdlets, which Linux doesn't have, defined in this block's own
+        # scope (function:local:) so Pester mocks the same commands on every OS.
+        $stubs = @{
+            'Get-ScheduledTask'   = 'param([string] $TaskName)'
+            'Stop-ScheduledTask'  = 'param([string] $TaskName)'
+            'Start-ScheduledTask' = 'param([string] $TaskName)'
+            'Get-CimInstance'     = 'param([string] $ClassName, [string] $Filter)'
+        }
+        foreach ($name in $stubs.Keys) {
+            Set-Item -Path ('function:local:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name]))
+        }
+        # A store as the runner keeps it: three spans (one an export took all of, one it took part of, one never exported),
+        # the exported documents, and the sessions' ledger.
+        function New-RcaStore {
+            $store = Join-Path -Path $TestDrive -ChildPath ('rca-' + [guid]::NewGuid().ToString('N'))
+            foreach ($span in '20261120T100000Z', '20261120T120000Z', '20261120T140000Z') {
+                $folder = Join-Path -Path $store -ChildPath $span
+                $null = New-Item -ItemType Directory -Path $folder -Force
+                Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'span.json') -Value '{"version":1,"spanId":"x","processId":4242}'
+                Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'T2.jsonl') -Value '{"kind":"sample"}'
+            }
+            Set-Content -LiteralPath (Join-Path -Path (Join-Path -Path $store -ChildPath '20261120T100000Z') -ChildPath 'export.json') -Value '{"version":1,"complete":true}'
+            Set-Content -LiteralPath (Join-Path -Path (Join-Path -Path $store -ChildPath '20261120T120000Z') -ChildPath 'export.json') -Value '{"version":1,"complete":false}'
+            $exports = Join-Path -Path $store -ChildPath 'exports'
+            $null = New-Item -ItemType Directory -Path $exports -Force
+            Set-Content -LiteralPath (Join-Path -Path $exports -ChildPath 'doc.gz') -Value 'gzip'
+            Set-Content -LiteralPath (Join-Path -Path $store -ChildPath 'sessions.json') -Value '{"version":1}'
+            $store
+        }
+    }
+
+    BeforeEach {
+        $script:store = New-RcaStore
+        $script:storeAtStop = $null
+        Mock -CommandName Get-ScheduledTask -MockWith { [pscustomobject]@{ TaskName = $TaskName; State = 'Running' } }
+        Mock -CommandName Stop-ScheduledTask -MockWith { $script:storeAtStop = Test-Path -LiteralPath $script:store }
+        Mock -CommandName Start-ScheduledTask -MockWith { }
+        Mock -CommandName Get-CimInstance -MockWith {
+            [pscustomobject]@{ ProcessId = 4242; ExecutablePath = 'C:\ProgramData\DbHubDemo\dotnet\dotnet.exe' }
+            [pscustomobject]@{ ProcessId = 5151; ExecutablePath = 'C:\Program Files\dotnet\dotnet.exe' }
+        }
+        Mock -CommandName Stop-Process -MockWith { }
+        Mock -CommandName Get-Process -MockWith { }
+        Mock -CommandName Start-Sleep -MockWith { }
+    }
+
+    It 'stops the runner first, then deletes the whole store, and counts the spans no export took all of' {
+        $result = & $script:GuestRcaClearBlock $script:store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        Test-Path -LiteralPath $script:store | Should -BeFalse
+        $script:storeAtStop | Should -BeTrue -Because 'the runner stops before anything is deleted'
+        Should -Invoke -CommandName Stop-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'DbHubDemo-Workload' }
+        Should -Invoke -CommandName Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 4242 }
+        Should -Invoke -CommandName Start-ScheduledTask -Times 0 -Exactly
+        $result.spans | Should -Be 3
+        $result.notExported | Should -Be 2
+        $result.runnersStopped | Should -Be 1
+        $result.left | Should -BeFalse
+    }
+
+    It 'starts the runner again, and says so, when the store can''t be deleted' {
+        Mock -CommandName Remove-Item -MockWith { }
+        $result = & $script:GuestRcaClearBlock $script:store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        Test-Path -LiteralPath $script:store | Should -BeTrue
+        $result.left | Should -BeTrue
+        $result.error | Should -Be 'it was still there after the delete'
+        Should -Invoke -CommandName Start-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'DbHubDemo-Workload' }
+    }
+
+    It 'leaves the runner alone when the guest has no capture' {
+        $result = & $script:GuestRcaClearBlock (Join-Path -Path $TestDrive -ChildPath 'no-store') 'C:\ProgramData\DbHubDemo\dotnet' 60
+        $result.spans | Should -Be 0
+        $result.left | Should -BeFalse
+        Should -Invoke -CommandName Stop-ScheduledTask -Times 0 -Exactly
+        Should -Invoke -CommandName Stop-Process -Times 0 -Exactly
     }
 }

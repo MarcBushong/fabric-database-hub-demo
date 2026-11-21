@@ -191,6 +191,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:calls = [System.Collections.Generic.List[string]]::new()
         $script:dataDisks = @()
         $script:guestEdition = 'Standard Edition (64-bit)'
+        $script:rcaSpans = 0
+        $script:rcaNotExported = 0
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -242,7 +244,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
                     if ($script:prepareFails) {
                         return [pscustomobject]@{ Succeeded = $false; Error = 'The guest did not shut down cleanly within 15 minutes (state Running); it was not turned off by force.'; Seconds = 900; Data = [pscustomobject]@{ succeeded = $false } }
                     }
-                    [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 120; Data = [pscustomobject]@{ succeeded = $true; cachesRemoved = 0; logFilesRedacted = 0; guestState = 'Off'; guestShutdownSeconds = 40; record = [pscustomobject]@{ sourceAzureVmId = 'vm-source' } } }
+                    [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 120; Data = [pscustomobject]@{ succeeded = $true; cachesRemoved = 0; logFilesRedacted = 0; guestState = 'Off'; guestShutdownSeconds = 40; rcaSpansRemoved = $script:rcaSpans; rcaSpansNotExported = $script:rcaNotExported; record = [pscustomobject]@{ sourceAzureVmId = 'vm-source' } } }
                 }
             }
         }
@@ -322,6 +324,21 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $create | Should -Not -Match 'deploymentId='
         $script:calls | Should -Contain 'az disk delete --resource-group rg-dbhub-golden --name snap-dbhub-t2golden-202610221230-verify --yes'
         @($script:calls | Where-Object { $_ -match '^az tag update .*dbhubDiskVerifiedUtc=' }).Count | Should -Be 1
+    }
+
+    It 'says when Prepare deleted the Incident RCA''s capture in the guest, and what of it the history doesn''t have (<Case>, the docs review of 0189a4b)' -ForEach @(
+        @{ Case = 'some never fully exported'; Spans = 3; NotExported = 1; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 3 observation span(s), 1 of them never fully exported, so that part of T2''s evidence isn''t in the history.' }
+        @{ Case = 'each exported'; Spans = 2; NotExported = 0; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 2 observation span(s), each exported already.' }
+        @{ Case = 'none in the guest'; Spans = 0; NotExported = 0; Expected = '*and is air-gapped and shut down in 40 seconds.' }
+    ) {
+        $script:rcaSpans = $Spans
+        $script:rcaNotExported = $NotExported
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $prepare = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.PREPARE'
+        $prepare.status | Should -Be 'Pass'
+        $prepare.message | Should -BeLike $Expected
+        $prepare.evidence.rcaSpansRemoved | Should -Be $Spans
+        $prepare.evidence.rcaSpansNotExported | Should -Be $NotExported
     }
     It 'captures nothing when sign-in data is left on the host or in the guest after the cleanup' {
         $script:sweepPass = $false

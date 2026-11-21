@@ -22,7 +22,9 @@ Actions:
   C:\ProgramData\DbHubDemo\golden\capture-in-progress.json (the snapshot name, the time, and this host's Azure VM
   ID): while it's there and recent, T2's control relay leaves the guest alone (Get-GoldenCaptureProgress). Then
   removes the sign-in data that setup leaves on the VM again and
-  checks that none remains, turns IE ESC back on when it's off, writes the capture record
+  checks that none remains, turns IE ESC back on when it's off, deletes the Incident RCA's capture in the guest
+  (C:\ProgramData\DbHubDemo\rca, after stopping the workload runner, which the next boot starts again) so the
+  snapshot carries none, writes the capture record
   C:\ProgramData\DbHubDemo\golden\capture.json (the snapshot name, this host's Azure VM ID, and the guest's
   Arc identity), applies the air gap (the guest's automatic start action becomes Nothing, and its network
   adapter is disconnected), then shuts the guest down cleanly and confirms it's off.
@@ -108,6 +110,10 @@ $script:JwtPattern = 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{
 $script:Notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
 # The last PowerShell Direct failure Test-GoldenGuestSession saw (Wait-GoldenGuest -BrokenChannelSeconds; issue #65).
 $script:GoldenSessionError = ''
+# In the guest: the Incident RCA's local store (the runner's EvidenceStore.DefaultRoot) and the workload's .NET runtime
+# (the bundle's Get-DemoVmWorkloadPath under the guest's tools folder, C:\ProgramData\DbHubDemo).
+$script:GuestRcaStore = 'C:\ProgramData\DbHubDemo\rca'
+$script:GuestRuntime = 'C:\ProgramData\DbHubDemo\dotnet'
 
 function Add-GoldenNote {
     param([string] $Text)
@@ -616,6 +622,69 @@ $script:GuestCleanBlock = {
     [pscustomobject]@{ cachesRemoved = $removed; logFilesRedacted = $redacted }
 }
 
+$script:GuestRcaClearBlock = {
+    # The Incident RCA's local store in the guest (ADR 0031): what the runner's observer captured of T2, with the demo's
+    # own sessions' statements, logins, and hosts. A golden snapshot carries none of it: a T2 restored from the snapshot
+    # would keep this environment's capture, and the new environment's first export would give it to its own session
+    # (the docs review of 0189a4b). The runner may hold the store's files open, so it's stopped first, as the bundle's
+    # Stop-DemoVmWorkload does: the DbHubDemo-Workload task, then any runner process on the workload's .NET runtime. The
+    # guest shuts down next, and the task starts the runner again at its next boot. When the store can't be deleted, the
+    # task starts again at once, and the caller captures nothing.
+    param($StoreRoot, $RuntimeRoot, $WaitSeconds)
+    $ErrorActionPreference = 'Continue'
+    $result = [ordered]@{ spans = 0; notExported = 0; runnersStopped = 0; left = $false; error = '' }
+    if (-not (Test-Path -LiteralPath $StoreRoot)) {
+        return [pscustomobject]$result
+    }
+    # Each observation span has a span.json; export.json says whether an export took all of it (complete).
+    foreach ($folder in @(Get-ChildItem -LiteralPath $StoreRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path -LiteralPath (Join-Path -Path $folder.FullName -ChildPath 'span.json'))) {
+            continue
+        }
+        $result['spans']++
+        $complete = $false
+        $exportPath = Join-Path -Path $folder.FullName -ChildPath 'export.json'
+        if (Test-Path -LiteralPath $exportPath) {
+            try {
+                $export = Get-Content -LiteralPath $exportPath -Raw | ConvertFrom-Json
+                $complete = $null -ne $export.PSObject.Properties['complete'] -and [bool]$export.complete
+            }
+            catch {
+                $complete = $false
+            }
+        }
+        if (-not $complete) {
+            $result['notExported']++
+        }
+    }
+    $taskName = 'DbHubDemo-Workload'
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    }
+    $prefix = ([string]$RuntimeRoot).TrimEnd('\') + '\'
+    $runners = @(Get-CimInstance -ClassName 'Win32_Process' -Filter "Name = 'dotnet.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { ([string]$_.ExecutablePath).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) })
+    foreach ($runner in $runners) {
+        Stop-Process -Id ([int]$runner.ProcessId) -Force -ErrorAction SilentlyContinue
+        $result['runnersStopped']++
+    }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($runners.Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt [int]$WaitSeconds -and @($runners | Where-Object { Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue }).Count -gt 0) {
+        Start-Sleep -Seconds 1
+    }
+    Remove-Item -LiteralPath $StoreRoot -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable removeErrors
+    if (Test-Path -LiteralPath $StoreRoot) {
+        $result['left'] = $true
+        $text = if (@($removeErrors).Count -gt 0) { [string]@($removeErrors)[0].Exception.Message } else { 'it was still there after the delete' }
+        $result['error'] = $text.Substring(0, [Math]::Min(200, $text.Length))
+        if ($task) {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        }
+    }
+    [pscustomobject]$result
+}
+
 $script:GuestAgentBlock = {
     # Only the Arc agent's state, for the wait until 'azcmagent show -j' can be read.
     $ErrorActionPreference = 'Continue'
@@ -913,6 +982,16 @@ function Invoke-GoldenPrepare {
     if ([string]$after.sqlEdition -notmatch 'Standard') {
         throw ('SQL Server in the guest reports edition ''{0}'', not Standard; nothing was captured.' -f [string]$after.sqlEdition)
     }
+    # The Incident RCA's capture in the guest (ADR 0031), deleted so the snapshot carries none, after the checks above so
+    # that none of them leaves the runner stopped (the docs review of 0189a4b).
+    $rca = Invoke-Command -VMName $GuestName -Credential $credential -ScriptBlock $script:GuestRcaClearBlock -ArgumentList $script:GuestRcaStore, $script:GuestRuntime, 60 -ErrorAction Stop
+    if ($null -eq $rca -or $null -eq $rca.PSObject.Properties['left'] -or [bool]$rca.left) {
+        $why = if ($null -ne $rca -and $null -ne $rca.PSObject.Properties['error'] -and [string]$rca.error) { [string]$rca.error } else { 'the guest didn''t say whether it was deleted' }
+        throw ('The Incident RCA''s capture is left in the guest ({0}): {1}; nothing was captured.' -f $script:GuestRcaStore, $why)
+    }
+    $result['rcaSpansRemoved'] = [int]$rca.spans
+    $result['rcaSpansNotExported'] = [int]$rca.notExported
+    $result['runnersStopped'] = [int]$rca.runnersStopped
     $agent = ConvertFrom-GoldenAgentJson -Text ([string]$after.agentJson)
     $record = [ordered]@{
         schemaVersion        = 1
