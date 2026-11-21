@@ -11,7 +11,9 @@ function New-DemoT2GoldenSnapshot {
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
        Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
        DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
-       deallocates archost01; otherwise nothing changes (review, 2026-11-04).
+       deallocates archost01; otherwise nothing changes (review, 2026-11-04). Nor may this PC's pending list of the
+       Incident RCA's evidence (out/history-pending, Read-DemoRcaPending) hold documents from T2, which Prepare would delete
+       before a history save took them (GOLDEN.CAPTURE.RCA, with the command that saves them; ADR 0031).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -198,6 +200,23 @@ function New-DemoT2GoldenSnapshot {
         return $results.ToArray()
     }
 
+    # 2c. T2's Incident RCA evidence that a history save didn't take (ADR 0031): the scripts fetch such documents again
+    # from the runner, which keeps them in T2's guest, and Prepare deletes what the guest keeps, so a capture now would
+    # lose them (the review of 3f6cd14). This PC's pending list (out/history-pending) names each document's VM.
+    $pending = Read-DemoRcaPending -Config $Config
+    $t2Pending = @(@($pending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
+    if ($t2Pending.Count -gt 0) {
+        $shown = [string]$pending.Path
+        $root = $script:RepoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if ($shown.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $shown = './' + $shown.Substring($root.Length).Replace('\', '/')
+        }
+        $hostPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
+        $save = if ($hostPower -eq 'PowerState/running') { './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' } else { './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists them), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f $t2Pending.Count, $shown) ([ordered]@{ path = $shown; documents = @($t2Pending | ForEach-Object { [string]$_['documentId'] }); hostPower = [string]$hostPower }) ('Save the history first: {0}, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.' -f $save)
+        return $results.ToArray()
+    }
+
     # 3. The host running, with a guest an interrupted capture left air-gapped released. The power state it was
     # found in is what GOLDEN.CAPTURE.SOURCE returns it to.
     $foundPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
@@ -342,7 +361,9 @@ function New-DemoT2GoldenSnapshot {
         $rcaSpans = [int]$prepareEvidence['rcaSpansRemoved']
         $rcaNotExported = [int]$prepareEvidence['rcaSpansNotExported']
         if ($rcaSpans -gt 0) {
-            $rcaNote = if ($rcaNotExported -gt 0) { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), {1} of them never fully exported, so that part of T2''s evidence isn''t in the history.' -f $rcaSpans, $rcaNotExported } else { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), each exported already.' -f $rcaSpans }
+            # "Exported" isn't "in the history": a save can fail after an export. Step 2c refused while this PC's pending list
+            # held T2's documents (the review of 3f6cd14).
+            $rcaNote = if ($rcaNotExported -gt 0) { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), {1} of them never fully exported, so that part of T2''s evidence isn''t in the history.' -f $rcaSpans, $rcaNotExported } else { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), each taken by an export, and none of T2''s documents was waiting in this PC''s pending list for a history save.' -f $rcaSpans }
             $prepareMessage += $rcaNote
         }
         & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' $prepareMessage $prepareEvidence

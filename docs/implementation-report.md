@@ -4481,8 +4481,14 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - **Also:** ADR 0031 counted 29 contract tests; there are 30.
 
   Fixed in the commit after the transport's merge (f0adff2).
+- **The review of 3f6cd14:** the docs, AGENTS.md's status lines, the retention wording, and a6b2052's mock fix were confirmed, and nothing but `capture-t2-golden.ps1` reaches Prepare. Three findings, fixed in one commit:
+  - **Medium:** Prepare also deleted documents an export had taken but no history save had, which the scripts fetch again from the runner (`Save-DemoRcaPending` keeps only their IDs), and said "each exported already" as if they were saved. The capture now reads this PC's pending list first (`Read-DemoRcaPending`) and captures nothing while it holds T2's documents (`GOLDEN.CAPTURE.RCA`, with the command that saves them: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity` while T2's host runs, or else `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory`). Prepare's note no longer reads "exported" as "in the history".
+  - **Low:** a Prepare step that failed after the RCA step (the capture record, the air gap, or the shutdown) left T2's runner stopped in a guest that kept running, until its next start. Prepare now starts the `DbHubDemo-Workload` task again first, when the RCA step had stopped it and the guest still runs.
+  - **Low:** the merge note below listed neither this branch's own figures in cost management nor the follow-ups' newer figures (fae05b4). It lists both now.
 
-**Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (d644cdd) count the session control's Automation minutes differently. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
+  The new tests (`Vm.GoldenGuest.Tests.ps1`, `DbHubDemo.Golden.Tests.ps1`) fail without their fixes.
+
+**Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
 | Part of a Run all session | Job minutes | Branch |
 |---|---|---|
@@ -4493,13 +4499,23 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 | The Incident RCA's export: 6 at the stop, 8 at each of three re-checks, 6 at a start | 36 | This one |
 | **A session** | **116** | |
 
-Five sessions are 580 minutes; with the nightly safety stop's 120, 700, of which 200 are past the 500 included. The follow-ups' code prices the included minutes and the overflow, about $0.40 a month at $0.002 a minute. On this branch alone, the estimate keeps 5 sessions of 60 minutes (300), which fit in the 500 with the safety stop's 120 for one environment in a subscription, so no figure changes. Whoever merges second reconciles these lines:
+Five sessions are 580 minutes; with the nightly safety stop's 120, 700, of which 200 are past the 500 included. The follow-ups' code prices the included minutes and the overflow, about $0.40 a month at $0.002 a minute, where the follow-ups alone have $0.04. On this branch alone, the estimate keeps 5 sessions of 60 minutes (300), which fit in the 500 with the safety stop's 120 for one environment in a subscription, so no figure changes.
 
-- `Get-DemoCostEstimate.ps1`, the session control's job minutes (lines 512 to 523 here);
-- `DbHubDemo.Cost.Tests.ps1`, the session control's test and this branch's test that the counted minutes fit in the 500 (lines 754 to 779 here), which no longer holds with both branches;
-- cost management's Automation bullet under "The session control", and the Incident RCA section's "In the estimate";
-- the README's "Close to nothing" bullet;
-- the CHANGELOG's Cost line and its estimate bullet, and ADR 0031's §10.
+Whoever merges second reconciles these. The tests catch the follow-ups' totals; nothing catches the docs' figures.
+
+- **This branch's code and tests:**
+  - `Get-DemoCostEstimate.ps1`, the session control's job minutes (lines 512 to 523 here);
+  - `DbHubDemo.Cost.Tests.ps1`, the session control's test and this branch's test that the counted minutes fit in the 500 (lines 754 to 779 here), which no longer holds with both branches.
+- **This branch's docs:**
+  - cost management's Automation bullet under "The session control": a session's jobs take at most 116 minutes, and past the included minutes, a session costs at most about $0.23;
+  - the Incident RCA section's "In the estimate" (the minutes no longer fit in the 500), and its "Not in the estimate" (lines 229 to 230 here): one environment passes the 500 after about three sessions, not six, and two environments in a subscription make 1,400 minutes a month, 900 of them billed, about $1.80, not 840, 340, and $0.68;
+  - the README's "Close to nothing" bullet;
+  - the CHANGELOG's Cost line and its estimate bullet, and ADR 0031's §10.
+- **The follow-ups' code and tests (fae05b4):** each month total that has the follow-ups' +$0.04 has +$0.40 with the export:
+  - the Cost tests' month totals: 23.27 becomes 23.63, 46.47 becomes 46.83, 20.07 becomes 20.43, 33.27 becomes 33.63, 46.63 becomes 46.99, 71.22 becomes 71.58, and 66.47 becomes 66.83;
+  - the component past the 500: 20 minutes and $0.04 become 200 minutes and $0.40;
+  - the business-hours test: 6,660 paid minutes and $13.32 become 9,828 and $19.656.
+- **The follow-ups' docs:** "520 job minutes", "$0.04", and "$1.04" in the README, cost management, and the deployment guide become 700, $0.40, and $1.40.
 
 **Left in Phase 1.**
 
@@ -4546,6 +4562,8 @@ Five sessions are 580 minutes; with the nightly safety stop's 120, 700, of which
   - **The failure:** the transport's `DbHubDemo.HistorySnapshot.Tests.ps1` test "stages the evidence in Files/rca/inbox ...". It failed only under the static validation's `Set-StrictMode -Version Latest`. Its OneLake mock read `$Query`, which a file's delete doesn't pass, so the mock threw, and `Remove-DemoRcaEvidenceFile` caught that as a delete that didn't happen.
   - **The fix:** the mock reads `-Query` from `$PesterBoundParameters` now, and the file passes 36 of 36 under strict mode. A second full run, under the same mode, found no other failure.
 - **The golden snapshot's fix:** its 8 new tests fail without it.
+- **A full run on 3f6cd14:** `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown` passed. Pester: 5,206 passed, none failed, 85 skipped. PSScriptAnalyzer found nothing in 392 files, markdownlint no issue, and no unit test reached the Azure CLI.
+- **The review of 3f6cd14's fixes:** under strict mode, `Vm.GoldenGuest.Tests.ps1` (22) and `DbHubDemo.Golden.Tests.ps1` (100) pass, and 7 of their new or changed tests fail against 3f6cd14's code. PSScriptAnalyzer found nothing in the changed files; markdownlint and the doc suites pass.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
 

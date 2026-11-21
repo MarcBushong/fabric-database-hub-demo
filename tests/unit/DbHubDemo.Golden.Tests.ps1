@@ -193,6 +193,10 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:guestEdition = 'Standard Edition (64-bit)'
         $script:rcaSpans = 0
         $script:rcaNotExported = 0
+        # This PC's pending list of the Incident RCA's evidence (out/history-pending): none, unless a test sets some.
+        $script:rcaPending = @()
+        $script:pendingPath = Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-pending-rg-dbhub-demo.json'
+        Mock -ModuleName DbHubDemo -CommandName Read-DemoRcaPending -MockWith { [pscustomobject]@{ Path = $script:pendingPath; Found = (@($script:rcaPending).Count -gt 0); Documents = @($script:rcaPending); Expired = 0 } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -328,7 +332,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
 
     It 'says when Prepare deleted the Incident RCA''s capture in the guest, and what of it the history doesn''t have (<Case>, the docs review of 0189a4b)' -ForEach @(
         @{ Case = 'some never fully exported'; Spans = 3; NotExported = 1; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 3 observation span(s), 1 of them never fully exported, so that part of T2''s evidence isn''t in the history.' }
-        @{ Case = 'each exported'; Spans = 2; NotExported = 0; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 2 observation span(s), each exported already.' }
+        @{ Case = 'each exported'; Spans = 2; NotExported = 0; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 2 observation span(s), each taken by an export, and none of T2''s documents was waiting in this PC''s pending list for a history save.' }
         @{ Case = 'none in the guest'; Spans = 0; NotExported = 0; Expected = '*and is air-gapped and shut down in 40 seconds.' }
     ) {
         $script:rcaSpans = $Spans
@@ -339,6 +343,35 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $prepare.message | Should -BeLike $Expected
         $prepare.evidence.rcaSpansRemoved | Should -Be $Spans
         $prepare.evidence.rcaSpansNotExported | Should -Be $NotExported
+    }
+
+    It 'captures nothing while this PC''s pending list holds T2''s Incident RCA evidence, and says how to save it (<Case>, the review of 3f6cd14)' -ForEach @(
+        @{ Case = 'host deallocated'; Power = 'PowerState/deallocated'; Save = './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+        @{ Case = 'host running'; Power = 'PowerState/running'; Save = './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' }
+    ) {
+        $script:hostPower = $Power
+        $script:rcaPending = @(
+            [ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' }
+            [ordered]@{ documentId = 'sqlvm01-20261120T170000Z-1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01'; exportedUtc = '2026-11-20T17:31:00Z' }
+        )
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -BeLike '1 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists them)*nothing was captured.'
+        $rca.remediation | Should -Be ('Save the history first: {0}, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.' -f $Save)
+        @($rca.evidence.documents) | Should -Be @('archost01-20261120T170000Z-1')
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.SNAPSHOT' | Should -BeNullOrEmpty
+    }
+
+    It 'captures as before when the pending list holds only other VMs'' documents (the review of 3f6cd14)' {
+        $script:rcaPending = @([ordered]@{ documentId = 'sqlvm01-20261120T170000Z-1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA' | Should -BeNullOrEmpty
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'guest Prepare'
     }
     It 'captures nothing when sign-in data is left on the host or in the guest after the cleanup' {
         $script:sweepPass = $false

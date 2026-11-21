@@ -214,6 +214,28 @@ Describe 'The capture marker (review, 2026-11-04)' {
             Should -Invoke -CommandName Invoke-Command -Times 2 -Exactly -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock }
         }
 
+        It 'Prepare starts the guest''s runner again when a step after the Incident RCA''s fails while the guest runs (the review of 3f6cd14)' {
+            $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611210100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $script:Notes.Clear()
+            $script:rcaStopped = $true
+            Mock -CommandName Invoke-Command -ParameterFilter { $ScriptBlock -eq $script:GuestRcaClearBlock } -MockWith {
+                [pscustomobject]@{ spans = 1; notExported = 0; runnersStopped = 1; taskStopped = $script:rcaStopped; left = $false; error = '' }
+            }
+            Mock -CommandName Invoke-Command -ParameterFilter { $ScriptBlock -eq $script:GuestRunnerStartBlock } -MockWith { [pscustomobject]@{ state = 'Running' } }
+            Mock -CommandName Set-VM -MockWith { if ($AutomaticStartAction -eq 'Nothing') { throw 'The operation cannot be performed while the virtual machine is in its current state.' } }
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*cannot be performed while the virtual machine*'
+            Should -Invoke -CommandName Invoke-Command -Times 1 -Exactly -ParameterFilter { $ScriptBlock -eq $script:GuestRunnerStartBlock }
+            @($script:Notes | Where-Object { $_ -like '*workload runner, stopped for the Incident RCA step, was started again*' }).Count | Should -Be 1
+            # A guest that's off starts its runner at its next start, and a Prepare whose RCA step stopped no runner has none
+            # to start: neither starts it.
+            $script:guestState = 'Off'
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*cannot be performed while the virtual machine*'
+            $script:guestState = 'Running'
+            $script:rcaStopped = $false
+            { Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' } } | Should -Throw '*cannot be performed while the virtual machine*'
+            Should -Invoke -CommandName Invoke-Command -Times 1 -Exactly -ParameterFilter { $ScriptBlock -eq $script:GuestRunnerStartBlock }
+        }
+
         It 'Prepare writes the marker''s time with the invariant culture under fi-FI, so it can be read back' {
             $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611040100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
             $previous = [System.Threading.Thread]::CurrentThread.CurrentCulture
@@ -383,6 +405,7 @@ Describe 'The Incident RCA''s capture in the guest, deleted before a golden snap
         $result.spans | Should -Be 3
         $result.notExported | Should -Be 2
         $result.runnersStopped | Should -Be 1
+        $result.taskStopped | Should -BeTrue
         $result.left | Should -BeFalse
     }
 
@@ -392,6 +415,7 @@ Describe 'The Incident RCA''s capture in the guest, deleted before a golden snap
         Test-Path -LiteralPath $script:store | Should -BeTrue
         $result.left | Should -BeTrue
         $result.error | Should -Be 'it was still there after the delete'
+        $result.taskStopped | Should -BeFalse -Because 'the runner runs again'
         Should -Invoke -CommandName Start-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'DbHubDemo-Workload' }
     }
 
@@ -399,6 +423,7 @@ Describe 'The Incident RCA''s capture in the guest, deleted before a golden snap
         $result = & $script:GuestRcaClearBlock (Join-Path -Path $TestDrive -ChildPath 'no-store') 'C:\ProgramData\DbHubDemo\dotnet' 60
         $result.spans | Should -Be 0
         $result.left | Should -BeFalse
+        $result.taskStopped | Should -BeFalse
         Should -Invoke -CommandName Stop-ScheduledTask -Times 0 -Exactly
         Should -Invoke -CommandName Stop-Process -Times 0 -Exactly
     }
