@@ -746,25 +746,32 @@ if ($RunLiveActivity -or $firstRun) {
                 $results.Add($item)
             }
         }
-        if ($null -ne $rcaExport -and [string]$rcaExport.Evidence) {
-            $rcaRun = & $module { param($Configuration, $Parameters, $Token, $Evidence, $Minutes, $Options) Invoke-DemoRcaNotebookRun -Config $Configuration -Parameter $Parameters -Token $Token -Evidence $Evidence -TimeoutMinutes $Minutes -RunOption $Options } $config $notebookParameters $runToken ([string]$rcaExport.Evidence) $runTimeout $runProgress
-            $run = $rcaRun.Run
-            if (-not [bool]$rcaRun.RcaSent) {
-                $results.Add((New-DemoResult -CheckId 'FABRIC.RCA.EVIDENCE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The RCA evidence wasn''t sent with the run: {0}.' -f [string]$rcaRun.RcaNote) -Remediation $(if ([string]$rcaRun.RcaNote -notmatch 'from before the Incident RCA') { 'Run this command again: it stages the evidence again.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again sends the evidence.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again sends the evidence.' }) -DocUrl 'https://learn.microsoft.com/fabric/onelake/onelake-access-api'))
+        $rcaRun = $null
+        $rcaPending = $null
+        try {
+            if ($null -ne $rcaExport -and [string]$rcaExport.Evidence) {
+                $rcaRun = & $module { param($Configuration, $Parameters, $Token, $Evidence, $Minutes, $Options) Invoke-DemoRcaNotebookRun -Config $Configuration -Parameter $Parameters -Token $Token -Evidence $Evidence -TimeoutMinutes $Minutes -RunOption $Options } $config $notebookParameters $runToken ([string]$rcaExport.Evidence) $runTimeout $runProgress
+                $run = $rcaRun.Run
+                if (-not [bool]$rcaRun.RcaSent) {
+                    $results.Add((New-DemoResult -CheckId 'FABRIC.RCA.EVIDENCE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The RCA evidence wasn''t sent with the run: {0}.' -f [string]$rcaRun.RcaNote) -Remediation $(if ([string]$rcaRun.RcaNote -notmatch 'from before the Incident RCA') { 'Run this command again: it stages the evidence again.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again sends the evidence.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again sends the evidence.' }) -DocUrl 'https://learn.microsoft.com/fabric/onelake/onelake-access-api'))
+                }
+            }
+            else {
+                $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
             }
         }
-        else {
-            $rcaRun = $null
-            $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
+        finally {
+            # The pending list whatever the run did (review of 3b1348a), as stop-demo.ps1 and deploy.ps1's snapshot keep it:
+            # the runner lists an exported document once, so what the run didn't take stays listed for the next save.
+            if ($null -ne $rcaExport) {
+                $rcaSaved = $null -ne $rcaRun -and [bool]$rcaRun.RcaSaved
+                $rcaWhy = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the run didn''t complete' }
+                $rcaPending = & $module { param($Configuration, $Export, $Saved, $Why) Save-DemoRcaPending -Config $Configuration -CheckPrefix FABRIC -Export $Export -Saved:$Saved -Why $Why -Confirm:$false } $config $rcaExport $rcaSaved $rcaWhy
+            }
         }
         $results.Add($run)
-        if ($null -ne $rcaExport) {
-            $rcaSaved = $null -ne $rcaRun -and [bool]$rcaRun.RcaSaved
-            $rcaWhy = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the run didn''t complete' }
-            $rcaPending = & $module { param($Configuration, $Export, $Saved, $Why) Save-DemoRcaPending -Config $Configuration -CheckPrefix FABRIC -Export $Export -Saved:$Saved -Why $Why -Confirm:$false } $config $rcaExport $rcaSaved $rcaWhy
-            if ($null -ne $rcaPending) {
-                $results.Add($rcaPending)
-            }
+        if ($null -ne $rcaPending) {
+            $results.Add($rcaPending)
         }
         if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.

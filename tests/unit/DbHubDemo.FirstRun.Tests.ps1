@@ -1601,7 +1601,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
 
     It 'stages the RCA evidence only for a notebook that knows RCA_EVIDENCE_FILE; the current release''s copy runs as before, with a Warning and its fix (2026-11-20)' {
         Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
-        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
         $evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
         $saved.Result.status | Should -Be 'Pass'
@@ -1632,6 +1632,22 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved.RcaSaved | Should -BeFalse
         $saved.RcaNote | Should -Be 'the history run didn''t start'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly
+    }
+
+    It 'says the RCA evidence went with the run but wasn''t written, and keeps it pending, when the notebook left the staged file (review of 3b1348a)' {
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
+        # The job completed, but the notebook left the file: its write failed, or Spark or the lakehouse wasn't available.
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $true } }
+        $evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.RcaSaved | Should -BeFalse
+        $saved.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        $saved.Result.message | Should -Match ('The RCA evidence went with it, but {0}; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$' -f [regex]::Escape($saved.RcaNote))
+        $saved.Result.remediation | Should -Be 'The next history save sends the RCA evidence again: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity while the VMs run.'
+        $saved.Result.evidence['rcaEvidence'] | Should -Be 'sent'
+        $saved.Result.evidence['rcaWritten'] | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -Times 1 -Exactly
     }
 
     Context 'in Stop-DemoEnvironment' {

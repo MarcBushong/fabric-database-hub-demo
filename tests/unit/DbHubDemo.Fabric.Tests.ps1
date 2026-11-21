@@ -792,7 +792,7 @@ Describe 'configure-fabric.ps1' {
             [pscustomobject]@{ Evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'; Documents = @([ordered]@{ documentId = 'd'; vm = 'sqlvm01' }); Pending = @(); PendingFound = $false; Results = @(New-DemoResult -CheckId 'FABRIC.RCA.EXPORT' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message '1 RCA evidence document(s), 1 part(s), for the history run.') }
         }
         Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
-        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
         Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $null }
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
@@ -821,6 +821,13 @@ Describe 'configure-fabric.ps1' {
         $withheld.remediation | Should -Match 'without -SkipNotebookImport, which updates the notebook'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -match 'from before the Incident RCA' }
+
+        # A run that throws (review of 3b1348a): the documents the export took from the runner, which lists each once, are
+        # still kept for the next save before the error goes on.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $true; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaNotebookRun -MockWith { throw 'The Fabric API didn''t answer.' }
+        { $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1 } | Should -Throw '*didn''t answer*'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -eq 'the run didn''t complete' -and $CheckPrefix -eq 'FABRIC' }
     }
 
     It 'adds the PostgreSQL metrics stop-demo.ps1 kept for a paused capacity with -PostgresMetricsPath, then moves the file aside (ADR 0025)' {

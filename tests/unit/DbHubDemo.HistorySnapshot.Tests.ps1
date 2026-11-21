@@ -773,6 +773,8 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
         $script:oneLake = [System.Collections.Generic.List[string]]::new()
         $script:jobStatus = 'Completed'
         $script:seenAtRun = ''
+        # The notebook deletes the file once it has written the evidence, and leaves it when it can't (review of 3b1348a).
+        $script:notebookKeeps = $false
         Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [securestring]::new() }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoOneLakeRequest -MockWith {
             $script:oneLake.Add(('{0} {1}?{2}' -f $Method, $Path, $Query))
@@ -786,6 +788,7 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
                 'Delete' {
                     $children = @($script:lake.Keys | Where-Object { $_ -like ($key + '/*') })
                     if ($children.Count -gt 0) { return [pscustomobject]@{ StatusCode = 409; Headers = @{}; Content = '{"error":{"code":"DirectoryNotEmpty"}}' } }
+                    if ($Query -ne 'recursive=false' -and -not $script:lake.Contains($key)) { return [pscustomobject]@{ StatusCode = 404; Headers = @{}; Content = '{"error":{"code":"PathNotFound"}}' } }
                     $script:lake.Remove($key)
                     return [pscustomobject]@{ StatusCode = 200; Headers = @{}; Content = '' }
                 }
@@ -794,6 +797,9 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $true; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith {
             $script:seenAtRun = [string]$script:lake[[string]$Parameter['RCA_EVIDENCE_FILE']]
+            if ($script:jobStatus -eq 'Completed' -and -not $script:notebookKeeps) {
+                $script:lake.Remove([string]$Parameter['RCA_EVIDENCE_FILE'])
+            }
             $status = switch ($script:jobStatus) { 'Completed' { 'Pass' } 'Failed' { 'Fail' } default { 'Warning' } }
             New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status $status -Message 'ran' -Evidence @{ status = $script:jobStatus; seconds = 90 }
         }
@@ -803,7 +809,7 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
 
         $run = & $runIt
         $run.RcaSent | Should -BeTrue
-        $run.RcaSaved | Should -BeTrue
+        $run.RcaSaved | Should -BeTrue -Because 'the notebook deleted the file, which it does once it has written the evidence'
         $run.RcaFile | Should -Match $script:inboxPattern
         $run.RcaFile | Should -Match '^Files/rca/inbox/[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,64}\.json$' -Because 'the notebook''s day-old sweep reads the time in the name'
         $script:seenAtRun | Should -BeExactly $evidence -Because 'the notebook reads the file the run names'
@@ -829,6 +835,20 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
         $run.RcaSaved | Should -BeFalse
         $run.RcaNote | Should -Be 'the history run didn''t complete'
         @($script:lake.Keys) | Should -BeNullOrEmpty
+
+        # A job that completes, but the notebook didn't write the evidence (no Spark or lakehouse, a write that failed): it
+        # left the file, which this deletes, and the documents stay pending (review of 3b1348a).
+        $script:jobStatus = 'Completed'
+        $script:notebookKeeps = $true
+        $script:oneLake.Clear()
+        $run = & $runIt
+        $run.Run.status | Should -Be 'Pass'
+        $run.RcaSent | Should -BeTrue
+        $run.RcaSaved | Should -BeFalse
+        $run.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        @($script:lake.Keys) | Should -BeNullOrEmpty -Because 'nothing is left in Files/'
+        @($script:oneLake | Where-Object { $_ -like 'Delete *' })[0] | Should -Be ('Delete {0}/{1}?' -f $script:lakehouseId, $run.RcaFile)
+        $script:notebookKeeps = $false
 
         # The current release's notebook, from before the Incident RCA: nothing is staged, and the run goes as before.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $false; Error = '' } }
@@ -865,7 +885,7 @@ Describe 'deploy.ps1''s history snapshot with the Incident RCA''s evidence (2026
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSemanticModelRefresh -MockWith { New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'refreshed' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $script:knowsFile; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
-        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
         Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith {
             if ($Saved) { return $null }
             New-DemoResult -CheckId 'DEPLOY.RCA.PENDING' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('2 RCA evidence document(s) aren''t in the history yet: {0}. The runner keeps them on sqlvm01 for 7 days, and ./out/history-pending/rca-pending-rg-dbhub-demo.json lists them.' -f $Why) -Remediation 'The next history save adds them while the VMs run.' -Evidence @{ documents = @('a', 'b') }

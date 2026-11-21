@@ -1205,13 +1205,14 @@ function Send-DemoRcaEvidenceFile {
 function Remove-DemoRcaEvidenceFile {
     <#
     .SYNOPSIS
-    Deletes a staged RCA_EVIDENCE_FILE (Path - Delete; one the notebook deleted already counts), then Files/rca/inbox and
-    Files/rca when they're empty: a folder's delete without recurse leaves one that still holds a file, such as another
-    run's. Returns $true when the file is gone. Never throws. Internal.
+    Deletes a staged RCA_EVIDENCE_FILE (Path - Delete), then Files/rca/inbox and Files/rca when they're empty: a folder's
+    delete without recurse leaves one that still holds a file, such as another run's. Returns Deleted ($true when the file
+    is gone) and Found ($true when it was still there, so this deleted it: NB_DatabaseHub_LiveActivity deletes it once it
+    has written the evidence, and leaves it when it couldn't read or write it; review of 3b1348a). Never throws. Internal.
     https://learn.microsoft.com/rest/api/storageservices/datalakestoragegen2/path/delete
     #>
     [CmdletBinding(SupportsShouldProcess)]
-    [OutputType([bool])]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
@@ -1220,8 +1221,9 @@ function Remove-DemoRcaEvidenceFile {
         [string] $Path
     )
 
+    $answer = [pscustomobject]@{ Deleted = $false; Found = $false }
     if ($Path -cnotmatch $script:RcaEvidenceFilePattern -or -not $PSCmdlet.ShouldProcess($Path, 'Delete the staged RCA evidence')) {
-        return $false
+        return $answer
     }
     $workspaceId = [string](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'workspaceId')
     $lakehouseId = [string](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'lakehouseId')
@@ -1230,19 +1232,21 @@ function Remove-DemoRcaEvidenceFile {
         $deleted = Remove-DemoOneLakeFile -WorkspaceId $workspaceId -LakehouseId $lakehouseId -Path $Path -Token $token
         if ([string]$deleted.Status -ne 'Pass') {
             Write-DemoLog -Level Warning -Message ('The staged RCA evidence {0} wasn''t deleted ({1}); the notebook''s next run deletes it a day later at the latest, and the deployment notebook''s purge with Files/rca/inbox.' -f $Path, $deleted.Error)
-            return $false
+            return $answer
         }
+        $answer.Deleted = $true
+        $answer.Found = [bool](Get-DemoMemberValue -InputObject $deleted -Name 'Found')
         foreach ($folder in $script:RcaInbox, 'Files/rca') {
-            $answer = Invoke-DemoOneLakeRequest -Method Delete -WorkspaceId $workspaceId -Path ('{0}/{1}' -f $lakehouseId.ToLowerInvariant(), $folder) -Query 'recursive=false' -Token $token
-            if ($answer.StatusCode -notin 200, 202, 204, 404) {
+            $folderAnswer = Invoke-DemoOneLakeRequest -Method Delete -WorkspaceId $workspaceId -Path ('{0}/{1}' -f $lakehouseId.ToLowerInvariant(), $folder) -Query 'recursive=false' -Token $token
+            if ($folderAnswer.StatusCode -notin 200, 202, 204, 404) {
                 break
             }
         }
-        return $true
+        return $answer
     }
     catch {
         Write-DemoLog -Level Warning -Message ('The staged RCA evidence {0} wasn''t deleted ({1}); the notebook''s next run deletes it a day later at the latest.' -f $Path, (Protect-DemoText -Text $_.Exception.Message))
-        return $false
+        return $answer
     }
 }
 
@@ -1252,7 +1256,8 @@ function Invoke-DemoRcaNotebookRun {
     Runs NB_DatabaseHub_LiveActivity on demand (Invoke-DemoFabricNotebookRun) with the RCA evidence staged as
     RCA_EVIDENCE_FILE (Send-DemoRcaEvidenceFile) when there's some and the workspace's copy of the notebook knows the
     parameter, and deletes the staged file once the job has ended (Remove-DemoRcaEvidenceFile). Returns Run (the run's
-    record), RcaSent, RcaSaved (sent, and the run completed), RcaFile, and RcaNote (why it wasn't sent or saved). Internal.
+    record), RcaSent, RcaSaved (sent, the run completed, and the notebook had deleted the file, which it does once it has
+    written the evidence), RcaFile, and RcaNote (why it wasn't sent or saved). Internal.
 
     .DESCRIPTION
     - A copy of the notebook from before the Incident RCA (Test-DemoFabricNotebookParameter: Known, without the parameter)
@@ -1261,6 +1266,10 @@ function Invoke-DemoRcaNotebookRun {
     - The file goes once the job has ended (Completed, Failed, Cancelled, Deduped), or when the run didn't start; a job that
       still runs reads it and deletes it itself, and the notebook's day-old sweep or the deployment notebook's purge takes
       one that nothing deleted.
+    - A job that completes doesn't mean the evidence was written (review of 3b1348a): the notebook never fails its run for
+      it, and leaves the file when it couldn't read or write it (no Spark or lakehouse, a write that failed, SAVE_RESULTS
+      false). So the evidence counts as saved only when the notebook had deleted the file (Path - Delete answers 404);
+      otherwise RcaNote says it wasn't written, and the caller keeps its documents for the next save (Save-DemoRcaPending).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1303,6 +1312,7 @@ function Invoke-DemoRcaNotebookRun {
         }
     }
     $ended = $true
+    $removed = $null
     try {
         $answer.Run = Invoke-DemoFabricNotebookRun -Config $Config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $Parameter -Token $Token -TimeoutMinutes $TimeoutMinutes @RunOption
         $jobStatus = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $answer.Run -Name 'evidence') -Name 'status')
@@ -1310,12 +1320,26 @@ function Invoke-DemoRcaNotebookRun {
     }
     finally {
         if ($answer.RcaFile -and $ended) {
-            $null = Remove-DemoRcaEvidenceFile -Config $Config -Path $answer.RcaFile -Confirm:$false
+            $removed = Remove-DemoRcaEvidenceFile -Config $Config -Path $answer.RcaFile -Confirm:$false
         }
     }
-    $answer.RcaSaved = $answer.RcaSent -and [string]$answer.Run.status -eq 'Pass'
+    # The notebook deletes the file once it has written the evidence; one this run deleted was left unwritten.
+    $removedFound = [bool](Get-DemoMemberValue -InputObject $removed -Name 'Found')
+    $taken = [bool](Get-DemoMemberValue -InputObject $removed -Name 'Deleted') -and -not $removedFound
+    $answer.RcaSaved = $answer.RcaSent -and [string]$answer.Run.status -eq 'Pass' -and $taken
     if ($answer.RcaSent -and -not $answer.RcaSaved) {
-        $answer.RcaNote = if ($ended) { 'the history run didn''t complete' } else { 'the history run was still going when the wait ended' }
+        $answer.RcaNote = if (-not $ended) {
+            'the history run was still going when the wait ended'
+        }
+        elseif ([string]$answer.Run.status -ne 'Pass') {
+            'the history run didn''t complete'
+        }
+        elseif ($removedFound) {
+            'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        }
+        else {
+            'the staged file couldn''t be checked, so whether NB_DatabaseHub_LiveActivity wrote it isn''t known (the next save writes only what isn''t in the history)'
+        }
     }
     return $answer
 }
