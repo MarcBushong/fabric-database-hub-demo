@@ -717,7 +717,7 @@ if ($out['sqlService'] -eq 'Running') {
 '@
     $answer = { param([bool] $Read, [string] $Bootstrap, [string] $Service, [object] $SingleUser, [string] $Problem) [pscustomobject]@{ Read = $Read; BootstrapState = $Bootstrap; SqlService = $Service; SingleUser = $SingleUser; Error = $Problem } }
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-SqlModeRead' -Script $script -TimeoutSeconds 300
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-SqlModeRead' -Script $script -TimeoutSeconds 300 -FreshName
     }
     catch {
         return (& $answer $false '' '' $null (Protect-DemoText -Text $_.Exception.Message))

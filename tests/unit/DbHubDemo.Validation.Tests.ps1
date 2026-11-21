@@ -298,6 +298,22 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $other.status | Should -Be 'Fail'
     }
 
+    It 'warns, and never fails, about a loader it can''t check because the health read didn''t answer (F31, live on dbhubra)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoBootstrapLoader -MockWith { New-DemoResult -CheckId ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('{0} has no bootstrap loader Run Command (DbHubDemo-Bootstrap): ERROR: Not Found' -f $VmName) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw ('Reading health.json on {0} failed (execution state Pending, exit code ): ' -f $VmName) }
+        $context = New-TestContext
+        $context.Tags['DbHubBundleSha256'] = 'abcdefabcdef' + ('0' * 52)
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X })
+        $loader = $results | Where-Object { $_.checkId -eq 'INFRA.BOOTSTRAP.LOADER_ARCHOST01' }
+        $loader.status | Should -Be 'Warning'
+        $loader.message | Should -BeExactly 'Whether archost01''s bootstrap loader ran couldn''t be checked: there''s no DbHubDemo-Bootstrap Run Command to read, because deploy.ps1''s parallel tracks remove it after the loader runs, and health.json, which names the bundle the loader installed, couldn''t be read (INFRA.HEALTH.ARCHOST01 says why).'
+        $loader.message | Should -Not -Match 'has no bootstrap loader Run Command'
+        $loader.remediation | Should -Be 'Run validate.ps1 again in a few minutes.'
+        ($results | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }).status | Should -Be 'Warning'
+        @($results | Where-Object { $_.checkId -like 'INFRA.BOOTSTRAP.*' -and $_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'health unknown is not a loader that''s missing'
+    }
+
     It 'names the step that warned, and what to do, for a Ready VM whose status is a Warning (F24, 2026-11-20)' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 3; warnings = @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.', 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') }

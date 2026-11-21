@@ -84,6 +84,19 @@ function Invoke-DemoVmRunCommand {
     .PARAMETER LeftoverWaitSeconds
     How long a leftover with the same name may take to go before the script runs under a fresh name instead.
 
+    .PARAMETER FreshName
+    For a read-only script (F31, 2026-11-22): it runs under a fresh name each time, the name and -yyyyMMddHHmmss
+    (Get-DemoRunCommandReadName), with no leftover wait first and no wait for its own delete. Live on archost01, the VM's Run
+    Command handler kept each name's last sequence number until a disable removed it and skipped a Run Command of that name
+    that came back with sequence number 0, so a health read under its one fixed name stayed Pending with no start for 444
+    to 623 seconds. Earlier copies whose owner stopped waiting go with the next read; at 24 Run Commands on the VM, it runs
+    under its own name, as before.
+
+    .PARAMETER PendingRetrySeconds
+    For a read-only script (F31): when it hasn't started this long after Azure accepted it, it's deleted and runs once more
+    under a fresh name, with the whole wait. 0 (the default) never does; the caller's -StartTimeoutSeconds, when it comes
+    first, governs instead.
+
     .EXAMPLE
     Invoke-DemoVmRunCommand -Config $config -VmName archost01 -RunCommandName DbHubDemo-HealthRead -Script (Get-Content ./vm/health/Get-DemoHealth.ps1 -Raw) -Parameter @{ View = 'Summary' }
     #>
@@ -123,7 +136,16 @@ function Invoke-DemoVmRunCommand {
         [int] $StartTimeoutSeconds = 0,
 
         [ValidateRange(0, 1800)]
-        [int] $LeftoverWaitSeconds = 300
+        [int] $LeftoverWaitSeconds = 300,
+
+        # For a read-only script (F31, 2026-11-22): it runs under a fresh name each time (Get-DemoRunCommandReadName), and its
+        # own delete isn't waited for.
+        [switch] $FreshName,
+
+        # For a read-only script (F31): when it hasn't started this long after Azure accepted it, it's deleted and runs once
+        # more under a fresh name. 0 (the default) never does.
+        [ValidateRange(0, 600)]
+        [int] $PendingRetrySeconds = 0
     )
 
     $subscriptionId = $Config['subscriptionId']
@@ -169,9 +191,20 @@ function Invoke-DemoVmRunCommand {
 
     $apiVersion = Get-DemoRunCommandApiVersion
     $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
-    # The name the script runs under: RunCommandName, or a fresh one while Azure keeps it in Deleting (2026-11-13).
-    $usedName = $RunCommandName
+    # The name the script runs under: RunCommandName; a fresh one for a read (-FreshName, F31: the VM's Run Command handler
+    # can skip a name it ran before); or a fresh one while Azure keeps it in Deleting (2026-11-13).
+    $usedName = if ($FreshName) { Get-DemoRunCommandReadName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $RunCommandName -OwnerWaitSeconds ([System.Math]::Max(3600, $TimeoutSeconds + 300 + $PendingRetrySeconds + 600)) } else { $RunCommandName }
     $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
+    # Another fresh name, never the one just deleted: the handler skipped a name created seconds after its delete (F31).
+    $nextName = {
+        $candidate = Get-DemoRunCommandFreshName -Name $RunCommandName
+        $bump = 0
+        while ($candidate -ceq $usedName) {
+            $bump++
+            $candidate = Get-DemoRunCommandFreshName -Name $RunCommandName -NowUtc ([DateTime]::UtcNow.AddSeconds($bump))
+        }
+        $candidate
+    }
     # A name Azure kept in Deleting earlier in this process isn't waited for again: 30 seconds at most (live, 2026-11-13: a
     # health read took 11 minutes with the whole wait and a fresh name's own delete waited for).
     $leftoverWait = if ($script:DemoRunCommandStuckName.Contains(('{0}/{1}' -f $VmName, $RunCommandName))) { [System.Math]::Min($LeftoverWaitSeconds, 30) } else { $LeftoverWaitSeconds }
@@ -183,13 +216,19 @@ function Invoke-DemoVmRunCommand {
     # A Run Command created again right after it was deleted can report the previous run's instance view
     # without running its own script (seen live on 2026-10-21); such a result is retried once, then fails.
     $maxAttempts = 2
-    Write-DemoLog -Message ('{0}: running {1} ({2} parameter(s), {3} protected).' -f $VmName, $RunCommandName, $publicList.Count, $ProtectedParameter.Count)
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    # A read that hasn't started -PendingRetrySeconds after Azure accepted it runs once more under a fresh name (F31).
+    $pendingRetried = $false
+    Write-DemoLog -Message ('{0}: running {1} ({2} parameter(s), {3} protected).' -f $VmName, $usedName, $publicList.Count, $ProtectedParameter.Count)
+    $attempt = 0
+    while ($true) {
+        $attempt++
         $directory = $null
         $removed = $false
         $putSent = $false
+        $pendingWatch = $false
         try {
-            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds $leftoverWait -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
+            # A fresh name is new, so there's no leftover of it to delete first (F31).
+            if ($usedName -ceq $RunCommandName -and -not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds $leftoverWait -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
                 # A PUT of a name Azure keeps marked for deletion fails with OperationNotAllowed, so the script runs under a
                 # fresh name; that throws when the VM has no room for one (2026-11-13 live finding).
                 $usedName = Resolve-DemoRunCommandFreshName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $RunCommandName -WaitedSeconds $leftoverWait
@@ -254,7 +293,14 @@ function Invoke-DemoVmRunCommand {
                 }
             }
 
-            $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -TimeoutSeconds ($TimeoutSeconds + 300) -PollIntervalSeconds $PollIntervalSeconds -NotBeforeUtc $notBeforeUtc -StartTimeoutSeconds $StartTimeoutSeconds
+            # The read's backstop (F31): wait -PendingRetrySeconds for a start the first time, unless the caller's own
+            # watchdog comes sooner.
+            $startTimeout = $StartTimeoutSeconds
+            $pendingWatch = $PendingRetrySeconds -gt 0 -and -not $pendingRetried -and ($StartTimeoutSeconds -eq 0 -or $StartTimeoutSeconds -gt $PendingRetrySeconds)
+            if ($pendingWatch) {
+                $startTimeout = $PendingRetrySeconds
+            }
+            $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -TimeoutSeconds ($TimeoutSeconds + 300) -PollIntervalSeconds $PollIntervalSeconds -NotBeforeUtc $notBeforeUtc -StartTimeoutSeconds $startTimeout
         }
         finally {
             Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
@@ -279,13 +325,28 @@ function Invoke-DemoVmRunCommand {
                 Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} is still being deleted; delete it with az vm run-command delete if it remains.' -f $VmName, $usedName)
             }
         }
-        if (-not [bool](Get-DemoMemberValue -InputObject $state -Name 'Stale')) {
-            break
-        }
-        if ($attempt -lt $maxAttempts) {
+        $stale = [bool](Get-DemoMemberValue -InputObject $state -Name 'Stale')
+        if ($stale -and $attempt -lt $maxAttempts) {
             Write-DemoLog -Level Warning -Message ('{0}: {1} reported an earlier run (started {2:u}) instead of running the script; trying again in 60 seconds.' -f $VmName, $usedName, $state.StartTime)
             Start-Sleep -Seconds 60
+            if ($usedName -cne $RunCommandName) {
+                # A fresh name was just deleted without a wait: the next try gets another (F31).
+                $usedName = & $nextName
+                $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
+            }
+            continue
         }
+        if (-not $stale -and $pendingWatch -and [bool](Get-DemoMemberValue -InputObject $state -Name 'NotStarted')) {
+            # Pending with no start (F31, live on archost01: 444 to 623 seconds): the VM's Run Command handler can skip a name
+            # it ran before until that name's delete reaches it. It was deleted above; once more under a fresh name.
+            $pendingRetried = $true
+            $skipped = $usedName
+            $usedName = & $nextName
+            $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
+            Write-DemoLog -Level Warning -Message ('{0}: {1} hadn''t started {2} seconds after Azure accepted it (the VM''s Run Command handler can skip a name it ran before), so it was deleted and runs once more as {3}.' -f $VmName, $skipped, $PendingRetrySeconds, $usedName)
+            continue
+        }
+        break
     }
     $stopwatch.Stop()
 

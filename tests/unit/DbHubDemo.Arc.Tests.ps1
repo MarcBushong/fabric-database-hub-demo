@@ -117,6 +117,9 @@ Describe 'Invoke-DemoVmRunCommand' {
         $script:putError = ''
         $script:putCount = 0
         $script:viewStart = $null
+        # Names the VM's Run Command handler skips (F31, live on archost01, 2026-11-20 and 21): its instance view stays
+        # Pending with no start until the name is deleted.
+        $script:skipped = [System.Collections.Generic.HashSet[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logs.Add([string]$Message) }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
@@ -156,6 +159,9 @@ Describe 'Invoke-DemoVmRunCommand' {
                     }
                     if (-not $script:runCommands.Contains($name)) {
                         return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: Not Found({"error":{"code":"NotFound"}})' }
+                    }
+                    if ($script:skipped.Contains($name)) {
+                        return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ name = $name; properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Pending' } } } | ConvertTo-Json -Depth 5); StdErr = '' }
                     }
                     $view = @{ executionState = 'Succeeded'; exitCode = 0; output = "log line`n{""outcome"":""Onboarded"",""succeeded"":true}"; error = '' }
                     if ($script:viewStart) {
@@ -347,6 +353,107 @@ Describe 'Invoke-DemoVmRunCommand' {
         $result.Succeeded | Should -BeTrue
         $result.Stale | Should -BeFalse
         @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 1
+    }
+
+    Context 'a read under a fresh name (F31, live on archost01: a read the VM''s Run Command handler skipped stayed Pending 444 to 623 seconds)' {
+        BeforeEach {
+            InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+            # The handler keeps the fixed name's last sequence number, so a Run Command of that name would never start.
+            $null = $script:skipped.Add('DbHubDemo-HealthRead')
+            $script:stamp = { param([int] $Minutes) 'DbHubDemo-HealthRead-{0}' -f [DateTime]::UtcNow.AddMinutes($Minutes).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        }
+
+        It 'runs it under a fresh name, with no leftover wait first and no wait for its own delete' {
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName
+
+            $result.Succeeded | Should -BeTrue
+            $result.RunCommandName | Should -Be 'DbHubDemo-HealthRead'
+            $result.UsedName | Should -Match '^DbHubDemo-HealthRead-\d{14}$'
+            @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name) | Should -Be @($result.UsedName) -Because 'nothing runs under the name the handler skips'
+            $script:calls[0].Method | Should -Be 'get' -Because 'one read of the VM''s Run Commands comes first'
+            $script:calls[0].Name | Should -BeNullOrEmpty
+            @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead' }) | Should -BeNullOrEmpty -Because 'there''s no leftover of a new name to wait for'
+            $lastDelete = [array]::LastIndexOf(@($script:calls.Method), 'delete')
+            $script:calls[$lastDelete].Name | Should -Be $result.UsedName
+            @($script:calls | Select-Object -Skip ($lastDelete + 1)) | Should -BeNullOrEmpty -Because 'its own delete isn''t waited for'
+            $script:runCommands.Count | Should -Be 0
+            @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult -Clear }) | Should -BeNullOrEmpty -Because 'a fresh name for a read is no stuck name'
+        }
+
+        It 'asks copies whose owner stopped waiting, and an earlier version''s fixed name, to go, and leaves a read in progress alone' {
+            $old = & $script:stamp -120
+            $young = & $script:stamp -1
+            foreach ($name in $old, $young, 'DbHubDemo-HealthRead') {
+                $script:runCommands[$name] = $true
+            }
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName
+
+            $result.Succeeded | Should -BeTrue
+            $deleted = @($script:calls | Where-Object Method -eq 'delete' | ForEach-Object Name)
+            $deleted | Should -Contain $old
+            $deleted | Should -Contain 'DbHubDemo-HealthRead'
+            $deleted | Should -Not -Contain $young -Because 'a younger copy is another read in progress'
+            $script:runCommands.Keys | Should -Contain $young
+        }
+
+        It 'runs under its own name, as before, when the VM is close to Azure''s limit of 25' {
+            $script:skipped.Clear()
+            $script:extraListed = 24
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName
+
+            $result.Succeeded | Should -BeTrue
+            $result.UsedName | Should -Be 'DbHubDemo-HealthRead'
+            ($script:logs -join ' ') | Should -Match 'archost01 already has 24 Run Commands, close to Azure''s limit of 25, so DbHubDemo-HealthRead runs under its own name'
+        }
+
+        It 'deletes a read that hasn''t started after -PendingRetrySeconds and runs it once more under a fresh name, only once' {
+            $script:waits = [System.Collections.Generic.List[object]]::new()
+            $script:startsAfter = 1
+            Mock -ModuleName DbHubDemo -CommandName Wait-DemoRunCommand -MockWith {
+                $script:waits.Add([pscustomobject]@{ Name = $(if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }); StartTimeout = $StartTimeoutSeconds })
+                $started = $script:waits.Count -gt $script:startsAfter
+                [pscustomobject]@{ Found = $true; NotFound = $false; ProvisioningState = 'Succeeded'; ExecutionState = $(if ($started) { 'Succeeded' } else { 'Pending' }); ExitCode = $(if ($started) { 0 } else { $null }); StartTime = $null; Output = $(if ($started) { '{"state":"Ready"}' } else { '' }); Error = ''; WaitTimedOut = $false; Stale = $false; NotStarted = (-not $started) }
+            }
+            $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName -PendingRetrySeconds 90
+
+            $result.Succeeded | Should -BeTrue
+            $result.NotStarted | Should -BeFalse
+            @($script:waits.StartTimeout) | Should -Be @(90, 0) -Because 'the first wait is the backstop''s, the second the whole wait'
+            $script:waits[1].Name | Should -Not -Be $script:waits[0].Name
+            $result.UsedName | Should -Be $script:waits[1].Name
+            $puts = @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name)
+            $puts | Should -Be @($script:waits[0].Name, $script:waits[1].Name)
+            @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $script:waits[0].Name }).Count | Should -Be 1 -Because 'the one that didn''t start is deleted'
+            ($script:logs -join ' ') | Should -Match ('{0} hadn''t started 90 seconds after Azure accepted it .*so it was deleted and runs once more as {1}' -f [regex]::Escape($script:waits[0].Name), [regex]::Escape($script:waits[1].Name))
+
+            # When the second doesn't start either, there's no third.
+            $script:waits.Clear()
+            $script:calls.Clear()
+            $script:startsAfter = 5
+            $again = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName -PendingRetrySeconds 90
+            $again.Succeeded | Should -BeFalse
+            $again.NotStarted | Should -BeTrue
+            $script:waits.Count | Should -Be 2
+            @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 2
+
+            # The caller's own watchdog, when it comes first, governs: no retry.
+            $script:waits.Clear()
+            $own = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshName -PendingRetrySeconds 90 -StartTimeoutSeconds 60
+            $own.NotStarted | Should -BeTrue
+            @($script:waits.StartTimeout) | Should -Be @(60)
+        }
+
+        It 'reads health.json, and the T1 SQL mode and the T2 probe, under fresh names, health with the backstop' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith { [pscustomobject]@{ Succeeded = $true; Output = '{"role":"host","state":"Ready"}'; Error = ''; ExecutionState = 'Succeeded'; ExitCode = 0 } }
+            $health = Get-DemoVmHealth -Config $config -VmName 'archost01'
+            $health.state | Should -Be 'Ready'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-HealthRead' -and $FreshName -and $PendingRetrySeconds -eq 90 }
+            foreach ($file in 'Private/SqlVmMonitoringHelpers.ps1', 'Private/ValidationAreas.ps1') {
+                $text = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath ('../../scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
+                $name = if ($file -like '*SqlVm*') { 'DbHubDemo-SqlModeRead' } else { 'DbHubDemo-ValidateProbe' }
+                $text | Should -Match ("-RunCommandName '{0}' [^\r\n]*-FreshName" -f $name) -Because $file
+            }
+        }
     }
 
     It 'refuses a public value that would not survive the command line, before calling Azure' {

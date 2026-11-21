@@ -291,6 +291,16 @@ The owner asked that people "sign into Az login and then have everything deploye
 
 Unit-tested in `tests/unit/DbHubDemo.FabricApp.Tests.ps1` and `DbHubDemo.FabricAppSignIn.Tests.ps1`. Seen live on 2026-11-09 in part: `rayfin up` with the Azure CLI's token, and the connector's direct route refusing the Power BI token ([ADR 0023](0023-first-run-automation.md#the-live-finding-the-apps-queries-with-only-az-login-2026-11-09)).
 
+### 2026-11-22: a health read that doesn't answer isn't a missing loader (F31)
+
+Live on `dbhubfn` (a8d51ac), `dbhubrb`, and `dbhubra`, `archost01`'s health read stayed Pending for 444 to 623 seconds, and on a running demo `validate.ps1` then gave `INFRA.BOOTSTRAP.LOADER_ARCHOST01` a **Fail**: "archost01 has no bootstrap loader Run Command". The host's own logs (`RunCommandHandler.log`, `WaAppAgent.log`) showed why. The VM's Run Command handler keeps each Run Command name's last sequence number in the registry until a disable removes it, and exits without running a Run Command of that name that comes back with sequence number 0. A delete that reached the agent without a disable, or a create seconds after a delete, left `DbHubDemo-HealthRead` that way, and only its next delete cleared it.
+
+- **Fresh names for reads:** health reads, T1's SQL mode read, and T2's isolation probe run under a fresh name each time, `<name>-yyyyMMddHHmmss` (`Invoke-DemoVmRunCommand -FreshName`). There's no leftover wait first and no wait for their own delete. One list of the VM's Run Commands comes first: copies whose owner has stopped waiting for them (at least an hour old) and an earlier version's fixed `DbHubDemo-HealthRead` are asked to go, a younger copy is another read in progress and stays, and at 24 Run Commands on the VM a read runs under its fixed name, as before (Azure allows 25).
+- **A backstop for health reads:** a health read that hasn't started 90 seconds after Azure accepted it is deleted and runs once more under a fresh name (`-PendingRetrySeconds 90`); only once.
+- **`INFRA.BOOTSTRAP.LOADER_<vm>`:** with no `DbHubDemo-Bootstrap` Run Command (`deploy.ps1`'s parallel tracks remove it after the loader runs) and a health read that didn't answer, a **Warning**, "Whether `<vm>`'s bootstrap loader ran couldn't be checked ...", pointing at `INFRA.HEALTH.<vm>`. A health read that answers keeps the checks as before: the recorded bundle passes, and anything else is still a **Fail**.
+
+Nothing reads `DbHubDemo-HealthRead` by its name: `status.ps1`, `deploy.ps1`, and `validate.ps1` read health through `Get-DemoVmHealth`, the session control's runbooks clean only their own `DbHubControl-` Run Commands, and `STATUS.RUNCOMMANDS` lists every `DbHubDemo-` one by its prefix. Unit-tested in `tests/unit/DbHubDemo.Arc.Tests.ps1` and `DbHubDemo.Validation.Tests.ps1`; not run live.
+
 ## Consequences
 
 - **Positive:** a presenter can trust a green result. Every manual step is explicit and actionable. Results are machine-readable for the notebooks and CI.

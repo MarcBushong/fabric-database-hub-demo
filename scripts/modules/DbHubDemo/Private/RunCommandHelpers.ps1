@@ -314,6 +314,94 @@ function Get-DemoRunCommandFreshName {
     return ('{0}-{1}' -f $Name, $NowUtc.ToUniversalTime().ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture))
 }
 
+function Get-DemoRunCommandReadName {
+    <#
+    .SYNOPSIS
+    The name a read-only Run Command runs under (F31, 2026-11-22): a fresh one each time, -RunCommandName and
+    -yyyyMMddHHmmss (Get-DemoRunCommandFreshName), or -RunCommandName itself when the VM has no room for another. Internal.
+
+    .DESCRIPTION
+    Live on archost01 (2026-11-20 and 21), a health read under its one fixed name stayed Pending with no start for 444 to
+    623 seconds. The VM's Run Command handler keeps each name's last sequence number until a disable removes it, and skips
+    a Run Command of that name that comes back with sequence number 0 ("Current sequence number, 0, is not greater than ...
+    MostRecentSequenceNumberFinished 0"). A delete that didn't reach it as a disable, or a create seconds after a delete,
+    left the name that way until the next delete. A new name has no such state (the RCA export's unique names never showed
+    it). One read of the VM's Run Commands comes first:
+    - Earlier copies of the name whose owner has stopped waiting for them (their time is more than -OwnerWaitSeconds
+      old), and the name itself left by an earlier version, are asked to go without waiting (Remove-DemoRunCommand -NoWait),
+      so copies whose delete Azure didn't finish never pile up. A younger copy is another read in progress, and stays.
+    - Azure allows 25 managed Run Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview)
+      and doesn't say whether one being deleted counts, so every one listed counts: at -Limit (24) or more, it runs under
+      -RunCommandName, as before. When the list can't be read, the fresh name is used, and its PUT says so if the VM is full.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion,
+
+        [Parameter(Mandatory)]
+        [string] $VmName,
+
+        [Parameter(Mandatory)]
+        [string] $RunCommandName,
+
+        [ValidateRange(60, 86400)]
+        [int] $OwnerWaitSeconds = 3600,
+
+        [ValidateRange(1, 25)]
+        [int] $Limit = 24,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $fresh = Get-DemoRunCommandFreshName -Name $RunCommandName -NowUtc $NowUtc
+    $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AllowFailure
+    if ($list.ExitCode -ne 0) {
+        Write-DemoLog -Level Debug -Message ('{0}: its Run Commands couldn''t be listed, so {1} runs as {2} without the room check: {3}' -f $VmName, $RunCommandName, $fresh, (Protect-DemoText -Text ([string]$list.StdErr).Trim()))
+        return $fresh
+    }
+    $parsed = if ([string]::IsNullOrWhiteSpace([string]$list.StdOut)) { $null } else { [string]$list.StdOut | ConvertFrom-Json -Depth 32 }
+    # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+    $values = Get-DemoMemberValue -InputObject $parsed -Name 'value'
+    $listed = 0
+    $copyPattern = '^{0}-(\d{{14}})$' -f [regex]::Escape($RunCommandName)
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $cutoff = $NowUtc.ToUniversalTime().AddSeconds(-$OwnerWaitSeconds)
+    foreach ($item in @($values | Where-Object { $null -ne $_ })) {
+        $itemName = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+        if (-not $itemName) {
+            continue
+        }
+        $listed++
+        $provisioning = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'provisioningState')
+        $abandoned = $false
+        if ($itemName -ceq $RunCommandName) {
+            # The fixed name an earlier version used, which nothing of this version runs under: its leftover goes, as that
+            # version's own next read deleted it first.
+            $abandoned = $provisioning -ne 'Deleting'
+        }
+        elseif ($itemName -match $copyPattern) {
+            $stamp = [DateTime]::MinValue
+            $abandoned = [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$stamp) -and $stamp -lt $cutoff
+        }
+        if ($abandoned) {
+            $null = Remove-DemoRunCommand -SubscriptionId $SubscriptionId -Url ('{0}/{1}?api-version={2}' -f $BaseUrl, $itemName, $ApiVersion) -NoWait -Confirm:$false
+        }
+    }
+    if ($listed -ge $Limit) {
+        Write-DemoLog -Level Warning -Message ('{0} already has {1} Run Commands, close to Azure''s limit of 25, so {2} runs under its own name. Azure deletes the earlier ones on its own (STATUS.RUNCOMMANDS lists them).' -f $VmName, $listed, $RunCommandName)
+        return $RunCommandName
+    }
+    return $fresh
+}
+
 function Test-DemoRunCommandFullError {
     # True for Resolve-DemoRunCommandFreshName's refusal: the VM had no room for a fresh name, because Azure keeps the
     # others in Deleting (2026-11-13 live finding). The health waits stop after 15 minutes of it. Pure. Internal.

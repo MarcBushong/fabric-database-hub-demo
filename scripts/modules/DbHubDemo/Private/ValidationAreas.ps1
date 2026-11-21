@@ -154,6 +154,11 @@ function Invoke-DemoValidationInfrastructure {
                 $loader = New-DemoResult -CheckId $loader.checkId -Area $loader.area -Target $loader.target -Status 'Pass' -Message ('{0} runs the recorded bootstrap bundle {1} (generation {2}). deploy.ps1''s parallel tracks ran its loader in a Run Command and removed it afterward, so there''s no DbHubDemo-Bootstrap Run Command to read.' -f $vmName, $recorded.Substring(0, 12).ToLowerInvariant(), $generation) -Evidence ([ordered]@{ vmName = $vmName; bundle = $recorded.Substring(0, 12).ToLowerInvariant(); generation = $generation }) -DocUrl $loader.docUrl -EvaluationOnly:$evaluationOnly
             }
         }
+        elseif ($loader -and [string]$loader.status -eq 'Fail' -and [string]$loader.message -match 'has no bootstrap loader Run Command') {
+            # The health read didn't answer (F31, 2026-11-22: live on a running demo, a read the VM's Run Command handler
+            # skipped stayed Pending), so whether the loader ran isn't known; that's not a loader that's missing.
+            $loader = New-DemoResult -CheckId $loader.checkId -Area $loader.area -Target $loader.target -Status 'Warning' -Message ('Whether {0}''s bootstrap loader ran couldn''t be checked: there''s no DbHubDemo-Bootstrap Run Command to read, because deploy.ps1''s parallel tracks remove it after the loader runs, and health.json, which names the bundle the loader installed, couldn''t be read (INFRA.HEALTH.{1} says why).' -f $vmName, $suffix) -Evidence ([ordered]@{ vmName = $vmName; healthRead = $read.Error }) -Remediation 'Run validate.ps1 again in a few minutes.' -DocUrl $loader.docUrl -EvaluationOnly:$evaluationOnly
+        }
         $results.Add($loader)
         $healthDoc = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
         if ($null -eq $read.Health) {
@@ -272,8 +277,8 @@ function Invoke-DemoValidationT2 {
     try {
         $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
         # The probe waits for the host's own bootstrap pass (its lock, at most 5 minutes here) and runs again while the guest
-        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both.
-        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -Confirm:$false
+        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both. A fresh name each time (F31, 2026-11-22).
+        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -FreshName -Confirm:$false
         if ($run.Succeeded) {
             $probe = ConvertFrom-DemoRunCommandOutput -Text $run.Output
         }

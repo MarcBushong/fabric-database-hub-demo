@@ -4761,3 +4761,33 @@ Until then, deployments keep the pinned image, which works as before.
 - **Not run live.** The Resource Graph count can lag a create or a delete by a few minutes, so an account deleted just before can still count; the fix says so.
 - **A raised quota with fewer accounts than the offer's default** (say a pay-as-you-go subscription raised to 5, with 1 account) reads as the default, 2, so a new deployment there fails until `automationAccountQuota` says 5; the fix names it.
 - **An offer that isn't in the table**, or one that couldn't be read, passes only when two accounts fit in an empty region; otherwise a **Warning**, never a **Fail**.
+
+### A health read under a fresh name, and a loader check that knows when it didn't answer (F31, 2026-11-22)
+
+**Why.** Seen on `dbhubfn` at a8d51ac, before the RCA, then on `dbhubrb` and `dbhubra`: `archost01`'s `DbHubDemo-HealthRead` stayed Pending for 444 to 623 seconds. On a running demo, `validate.ps1` then gave `INFRA.BOOTSTRAP.LOADER_ARCHOST01` a **Fail** ("archost01 has no bootstrap loader Run Command"), because the loader check's fallback reads `health.json`; and the stop at the end of an update waited the whole time. The final tests read the host's own logs:
+
+- The Run Command handler (`RunCommandHandler.log`) keeps each name's last sequence number in the registry until a `disable` removes it, and exits without running a Run Command of that name that comes back with sequence number 0: "Current sequence number, 0, is not greater than ... MostRecentSequenceNumberFinished 0. Exit".
+- A delete reached the agent ("cannot be found in the latest goal state ... NotEnabled", `WaAppAgent.log`) without a `disable`, and a create 10 seconds after a delete was skipped the same way. The instance view then had no execution at all, so the caller waited its whole timeout; only the next delete's `disable` cleared the name.
+
+**Work summary.**
+
+- **`Invoke-DemoVmRunCommand -FreshName`** (`Get-DemoRunCommandReadName`):
+  - The script runs as `<name>-yyyyMMddHHmmss`, a name the handler has never seen, with no leftover wait first (up to 300 seconds before) and no wait for its own delete (up to 180 seconds before).
+  - One list of the VM's Run Commands comes first. Copies of the name whose owner has stopped waiting for them (by the time in their name, at least an hour, longer than any read waits) are deleted without waiting, so the ones whose delete Azure didn't finish never pile up; a younger copy is another read in progress, and stays.
+  - The fixed name an earlier version used is deleted too, as that version's own next read did.
+  - At 24 Run Commands on the VM (Azure allows 25), the read runs under its fixed name, as before, with a log line; when the list can't be read, the fresh name is used.
+- **`-PendingRetrySeconds`:** a read that hasn't started that long after Azure accepted it is deleted and runs once more under a fresh name, never the one just deleted, with the whole wait; only once, and the caller's own `-StartTimeoutSeconds` governs when it comes first. A stale result's retry gets a fresh name too, when the first was fresh.
+- **Callers:** `Get-DemoVmHealth` (every health read: `deploy.ps1`'s tracks and its end stop, `validate.ps1`, `status.ps1`, Arc onboarding, the guided stop, and T2's guest) uses both, with 90 seconds; T1's SQL mode read (`DbHubDemo-SqlModeRead`) and `validate.ps1`'s T2 probe (`DbHubDemo-ValidateProbe`) use fresh names. The other Run Commands, which change something, keep their names.
+- **`INFRA.BOOTSTRAP.LOADER_<vm>`:** with no `DbHubDemo-Bootstrap` Run Command and a health read that didn't answer, a **Warning** that says whether the loader ran couldn't be checked, points at `INFRA.HEALTH.<vm>`, and keeps the read's error in its evidence. A read that answers keeps the old outcomes: the recorded bundle passes, and anything else, including a host with no `health.json`, is still a **Fail**.
+- **Nothing reads the fixed name:** `status.ps1`, `deploy.ps1`, and `validate.ps1` read health only through `Get-DemoVmHealth`. `STATUS.RUNCOMMANDS` lists `DbHubDemo-` Run Commands by prefix and leaves out ones being deleted, and the session control's runbooks clean only their own `DbHubControl-` ones. The guided stop's note about stuck names keys on `DEPLOY.RUNCOMMAND.STUCK_*`, which other names still raise.
+- **Docs:** ADR 0012's amendment, troubleshooting (the loader's **Warning**, and the retry's log line), the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/Get-DemoVmHealth.ps1`, `Private/RunCommandHelpers.ps1`, `Private/SqlVmMonitoringHelpers.ps1`, `Private/ValidationAreas.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1` (the invoker's fake ARM gets names the handler skips, which stay Pending) and `DbHubDemo.Validation.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Arc and Validation, 218 passed; then Arc, Validation, Lifecycle, Tracks, OneCommand, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, Teardown, and Repo.*, 1,393 passed, 0 az calls, and 1 failed that fails the same way with the source at HEAD: Teardown's "stay out of the static run" starts a child `pwsh` that imports Pester 5.9.1 by version, which on this PC resolves to a copy without `Pester.ps1`. With HEAD's five source files and the tests kept, all 6 new tests fail: the fresh name (no PUT to the skipped name, no leftover or delete wait, nothing reported as stuck); the cleanup (an abandoned copy and the old fixed name go, a read in progress stays); the fallback at 24; the backstop (90 then the whole wait, a different name, only once, and the caller's own watchdog first); the callers' switches; and the loader's **Warning**. PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The handler's behavior is from its own logs on `archost01`; a fresh name avoiding it is how the RCA export's unique names behaved there.
+- **More Run Command names on a VM for a moment:** each read's copy goes when its delete finishes. Where Azure's deletes stall (2026-11-13), copies stay until they're an hour old, and at 24 a read falls back to its fixed name, as before.
+- **A read that waits behind the VM's extension work** (a policy's `MDE.Windows` update) is deleted after 90 seconds and created again, which waits as long as before plus one delete.
