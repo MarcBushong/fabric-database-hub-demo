@@ -662,6 +662,11 @@ function Test-DemoHostDatabase {
         $status = Get-DemoHostDatabaseStatus -Context $Context
     }
     catch {
+        # A new guest has no tools for the check yet: this step's Set copies them in, so that's no warning (2026-11-20).
+        if ([string]$_.Exception.Message -match 'The guest has no demo tools at .+ yet') {
+            Write-DemoVmLog -Message 'The guest has no database tools yet; this step copies them in, then sets up ContosoCare.'
+            return $false
+        }
         Write-DemoVmLog -Level 'Warning' -Message ('Database check in the guest: {0}' -f $_.Exception.Message)
         return $false
     }

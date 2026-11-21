@@ -560,7 +560,13 @@ function Invoke-DemoGuestSqlQuery {
 
     return (Invoke-Command -VMName $Name -Credential $Credential -ArgumentList $GuestToolsFolder, $Query, $Database -ErrorAction Stop -ScriptBlock {
             param($Folder, $Text, $DatabaseName)
-            Import-Module -Name (Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1') -Force
+            $manifest = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            # A new guest's first check comes before the database step copies its tools in (Copy-DemoGuestTool): said
+            # plainly, so the step's check can tell it from a failure (2026-11-20).
+            if (-not (Test-Path -LiteralPath $manifest)) {
+                throw ('The guest has no demo tools at {0} yet; the database step copies them in.' -f $Folder)
+            }
+            Import-Module -Name $manifest -Force
             Invoke-DemoVmSql -Query $Text -Database $DatabaseName -TimeoutSeconds 3600
         })
 }

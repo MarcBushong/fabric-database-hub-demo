@@ -4420,3 +4420,15 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 **Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.OneCommand`, `SafetyStop`, `ActivityProfile`, `T4Fallback`, and `Repo.LifecycleScripts`, 597 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer found nothing in the changed files. The Pass case fails without the change; the two Warning cases (`-KeepRunning`, and a stop at the end that left archost01 running) pass either way, as they should. No live run: next week's update across the nightly stop's time shows it.
 
 **Risks.** None beyond the wording: the deferred pass, when the stop at the end didn't remove it, still runs and finds nothing running.
+
+### A quieter host log on a new T2 (item 6, 2026-11-20)
+
+**Why.** The owner's follow-up after the release: on a new T2, the host's log had "Database check in the guest: The specified module 'C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1' was not loaded" (live 2026-11-20, 19:47:55). `ConfigureSql`'s first check (`Test-DemoHostDatabase`) queries the guest through the demo's module, which only its own Set copies in (`Copy-DemoGuestTool`), so the check failed, logged a **Warning**, and the step ran, as it should. Harmless, but a warning in the log.
+
+**Work summary.** The guest's side of `Invoke-DemoGuestSqlQuery` now checks for the module first and, when it isn't there, says so plainly: "The guest has no demo tools at ... yet; the database step copies them in." `Test-DemoHostDatabase` logs that as an ordinary line ("The guest has no database tools yet; this step copies them in, then sets up ContosoCare.") and returns false, so the step's Set runs as before. Any other failure of the check is still a **Warning**. No extra PowerShell Direct call: the check is in the same one.
+
+**Changed files.** `vm/hyperv-guest/GuestSql.ps1` and `vm/bootstrap/HostSteps.ps1`; `tests/unit/Vm.HostPlan.Tests.ps1`; the CHANGELOG and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode: `Vm.HostPlan` (the guest's side run locally, with a tools folder that isn't there; and another failure still a Warning), with every `Vm.*` suite: 568 passed, none failed. PSScriptAnalyzer (the VM settings) found nothing in the changed files. The first case fails without the change; the second passes either way, as it should. No live run: the host's log on next week's new deployment shows it.
+
+**Risks.** None: the check returns false in both cases, as before, so the step's Set runs the same way; a host gets it with its next bundle.

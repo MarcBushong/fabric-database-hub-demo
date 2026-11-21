@@ -57,6 +57,37 @@ AfterAll {
     Remove-Module -Name DbHubDemo.Vm -ErrorAction SilentlyContinue
 }
 
+Describe 'The T2 host''s database check on a new guest (2026-11-20)' {
+    BeforeEach {
+        $script:context = New-TestHostContext -Mode 'JumpstartImage'
+        $script:logged = [System.Collections.Generic.List[object]]::new()
+        Mock -CommandName Write-DemoVmLog -MockWith { $script:logged.Add([pscustomobject]@{ Level = [string]$Level; Message = [string]$Message }) }
+        Mock -CommandName Get-DemoGuestCredential -MockWith {
+            $secure = [System.Security.SecureString]::new()
+            foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+            [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        }
+        # PowerShell Direct, run here: the guest's tools folder is a folder of the test drive.
+        Mock -CommandName Invoke-Command -MockWith { & $ScriptBlock @ArgumentList }
+        $script:context.Guest.ToolsFolder = Join-Path -Path $TestDrive -ChildPath ('guest-tools-' + [guid]::NewGuid().ToString('N'))
+    }
+
+    It 'says plainly in the guest that its tools aren''t copied in yet, and the step''s check logs that as no warning' {
+        $secure = [System.Security.SecureString]::new()
+        foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+        $credential = [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        { Invoke-DemoGuestSqlQuery -Name 'arcsql01' -Credential $credential -GuestToolsFolder $script:context.Guest.ToolsFolder -Query 'SELECT 1' } | Should -Throw '*The guest has no demo tools at * yet; the database step copies them in.*'
+        Test-DemoHostDatabase -Context $script:context | Should -BeFalse
+        @($script:logged | Where-Object Level -EQ 'Warning') | Should -BeNullOrEmpty -Because 'the step''s Set copies the tools in next'
+        @($script:logged | Where-Object { $_.Message -match '^The guest has no database tools yet; this step copies them in' }).Count | Should -Be 1
+    }
+
+    It 'still warns when the check fails for another reason' {
+        Mock -CommandName Invoke-DemoGuestSqlQuery -MockWith { throw 'A network-related or instance-specific error occurred while establishing a connection to SQL Server.' }
+        Test-DemoHostDatabase -Context $script:context -Seeded | Should -BeFalse
+        @($script:logged | Where-Object { $_.Level -eq 'Warning' -and $_.Message -match '^Database check in the guest: A network-related' }).Count | Should -Be 1
+    }
+}
 Describe 'T2 host step plan' {
     It 'follows the ADR 0003 order' {
         $plan = Get-DemoHostStepPlan -Context (New-TestHostContext -Mode 'PaygWizard')
