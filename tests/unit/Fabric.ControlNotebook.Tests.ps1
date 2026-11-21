@@ -257,6 +257,20 @@ if scenario == "stoppedlost":
     VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended, kept=False))
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "b" * 32, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=90)),
                                                  "endUtc": iso(ended), "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "takenoverstop":
+    # Session dddd...'s end passed 5 minutes ago, and its end's stop hasn't come: a start-demo.ps1 session took over from it
+    # (2026-11-20), and the app's Stop now runs now, inside the takeover window.
+    RUNBOOK.update(session="d" * 32, accepted=Clock.now - real_dt.timedelta(minutes=95), minutes=90)
+    VAULT["dbhub-session-status"] = json.dumps(running_status("d" * 32, RUNBOOK["accepted"], 90))
+if scenario == "takenoveragain":
+    # Session dddd...'s end, 5 minutes ago, found a start-demo.ps1 session that took over, and stopped nothing (2026-11-20);
+    # Stop now again, inside the takeover window.
+    ended = Clock.now - real_dt.timedelta(minutes=5)
+    RUNBOOK.update(session="d" * 32, accepted=ended - real_dt.timedelta(minutes=90), minutes=90)
+    taken = stopped_status("d" * 32, ended, running_status("d" * 32, RUNBOOK["accepted"], 90))
+    taken.update(stoppedBy="session end", takenOver={"by": "start-demo", "autoStopUtc": iso(ended + real_dt.timedelta(hours=3))},
+                 done=["nothing stopped: a start-demo.ps1 session took over from this one", "busy marker cleared"])
+    VAULT["dbhub-session-status"] = json.dumps(taken)
 if scenario == "endedrunning":
     # Session cccc...'s end passed 10 minutes ago, and nothing stopped it: the run that was ending it was cancelled first.
     RUNBOOK.update(session="c" * 32, accepted=Clock.now - real_dt.timedelta(minutes=100), minutes=90)
@@ -280,9 +294,12 @@ def runbook(body):
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "starting", "acceptedUtc": iso(Clock.now), "steps": []})
     elif action == "stop":
         session = body.get("sessionId") or ""
+        if not session and scenario in ("takenoverstop", "takenoveragain"):
+            # A stop with no session ID writes the stopped status of the session the group names (DbHubSessionId).
+            session = json.loads(VAULT["dbhub-session-status"]).get("sessionId") or ""
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
-        if scenario == "takenover" and session:
+        if (scenario == "takenover" or (scenario == "takenoverstop" and body.get("sessionId"))) and session:
             # A start-demo.ps1 session took over from this one (2026-11-20): the runbook stops nothing at its end, and says
             # when that session's auto-stop stops the demo (Complete-DbHubTakenOverSession).
             until = iso(Clock.now + real_dt.timedelta(hours=3))
@@ -431,6 +448,7 @@ with contextlib.redirect_stdout(buffer):
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
+                          "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
@@ -1005,6 +1023,31 @@ print(json.dumps(out))
         @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any end'
         $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
     }
+    It 'stops everything when Stop now comes inside a taken-over session''s end, and when it comes again after that end (the re-review of 2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The app's Stop now 5 minutes after the session's planned end, before its end's stop came: the runbook takes it for
+        # that end, so the notebook sends a stop with no session ID, which stops the start-demo.ps1 session too.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoverstop' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('stop', 'stop')
+        $report.sent[0].sessionId | Should -Be ('d' * 32)
+        $report.sent[1].PSObject.Properties.Name | Should -Not -Contain 'sessionId' -Because 'the runbook never takes a stop with no session ID for a session''s end'
+        $report.printed | Should -Match 'A start-demo\.ps1 session took over from this one, so Stop now stops that session too\.'
+        $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped, sqlvm01 deallocated\.'
+        $report.printed | Should -Not -Match 'Taken over: '
+        $report.printed | Should -Match 'the VMs and T4 are already stopped'
+        @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any Stop now'
+        # Stop now again, after an end that stopped nothing: the status says stopped, so its stop has no session ID.
+        $again = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoveragain' -Start '2026-11-14T14:00:00Z'
+        $again.error | Should -BeNullOrEmpty
+        @($again.sent | ForEach-Object action) | Should -Be @('stop')
+        $again.sent[0].PSObject.Properties.Name | Should -Not -Contain 'sessionId'
+        $again.printed | Should -Match 'No session runs \(its status says stopped\), so Stop now stops whatever runs\.'
+    }
+
     It 'saves the history of another environment''s session with that environment''s names, not the activity notebook''s defaults' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'

@@ -1527,6 +1527,17 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $stopped.planKept | Should -BeTrue -Because 'the notebook saves the session''s history with its beats'
         @($stopped.done)[0] | Should -Match '^nothing stopped: a start-demo\.ps1 session took over from this one'
 
+        # Stop now again inside the window (the re-review of 2026-11-20): the notebook's stop then has no session ID, as
+        # after an explicit Stop now that came back taken over, and the runbook never takes that for a session's end.
+        $script:calls.Clear()
+        $plain = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext -NowUtc $runEnd.AddMinutes(1))
+        $plain.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty -Because 'start-demo.ps1''s auto-stop goes with the demo it stopped'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+
         # An explicit Stop now before a taken-over session's planned end (the notebook's or the Insights app's) stops
         # everything, as the person asked.
         $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210' }) -Context (New-TestContext -NowUtc $script:clock)
