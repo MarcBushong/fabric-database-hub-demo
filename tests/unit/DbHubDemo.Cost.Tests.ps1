@@ -555,11 +555,12 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.HourlyRunning | Should -Be 2.3
         ($estimate.Components | Where-Object Name -EQ 'T3 compute (serverless)').Quantity | Should -Be 2
         $estimate.BastionHourly | Should -Be 0.2
-        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, and the session
-        # control's vault operations, 0.03 (every deployment since 2026-11-14). There's no artifact cache.
-        $estimate.IdleMonthly | Should -Be 23.23
+        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, the session
+        # control's vault operations, 0.03 (every deployment since 2026-11-14), and its 20 job minutes past the 500 included,
+        # 0.04 (5 Run all sessions, since 2026-11-21). There's no artifact cache.
+        $estimate.IdleMonthly | Should -Be 23.27
         $estimate.SessionCost | Should -Be 11.7
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.47
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
@@ -785,39 +786,51 @@ Describe 'Get-DemoCostEstimate' {
         $operations.Meter | Should -Be 'Key Vault / Standard / Operations'
         $operations.Quantity | Should -Be 1
         $operations.Basis | Should -Be 'idle'
-        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. Two sessions in the
-        # light-use month (10 hours of 5), at 80 minutes each, with the nightly stop's 120, stay within them.
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. Five Run all sessions in
+        # the light-use month (10 running hours at about 2 each; the coordinator's decision, 2026-11-21), at 80 minutes each,
+        # are 400: with the nightly stop's 120, 520, so 380 are included and 20 are priced at the next tier.
         $minutes = $with.Components | Where-Object { $_.Name -like 'Activity control job minutes*' }
-        @($minutes).Count | Should -Be 1
-        $minutes.UnitPrice | Should -Be 0
-        $minutes.Quantity | Should -Be 160
+        @($minutes).Count | Should -Be 2
+        $included = $minutes | Where-Object { $_.Name -eq 'Activity control job minutes (the first 500 a month are included)' }
+        $included.UnitPrice | Should -Be 0
+        $included.Quantity | Should -Be 380
+        $past = $minutes | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }
+        $past.Quantity | Should -Be 20
+        $past.UnitPrice | Should -Be 0.002
+        $past.Cost | Should -Be 0.04
+        $past.Basis | Should -Be 'idle'
         $operations.Cost | Should -Be 0.03
         $with.MissingPrices | Should -BeNullOrEmpty
+        # The count follows the light-use month's running hours, not the session -DemoHours prices: 10-hour sessions would
+        # have been 1 a month.
+        $longer = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 10 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($longer.Components | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }).Quantity | Should -Be 20
     }
 
     It 'prices the session control''s job minutes past the 500 included at the next tier, 80 a session, with the time it follows T2 after a cold start (2026-11-20)' {
-        # Business hours: 176 hours of 5 are 36 sessions, 2,880 minutes; the nightly stop's 120 leave 380 of the 500.
+        # Business hours: 176 running hours are 88 Run all sessions of about 2 hours, 7,040 minutes; the nightly stop's 120
+        # leave 380 of the 500.
         $busy = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 176 -BastionHours 1 -NetworkMode public
         $included = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes (the first 500 a month are included)' }
         $included.Quantity | Should -Be 380
         $included.Cost | Should -Be 0
         $paid = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }
-        $paid.Quantity | Should -Be 2500
+        $paid.Quantity | Should -Be 6660
         $paid.UnitPrice | Should -Be 0.002
-        $paid.Cost | Should -Be 5
+        $paid.Cost | Should -Be 13.32
         $busy.MissingPrices | Should -BeNullOrEmpty
     }
 
     It 'subtracts the free-offer allowance from the light-use month and keeps the session at list price' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
-        # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00.
-        $estimate.IdleMonthly | Should -Be 20.03
+        # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00, with the session control's 0.07.
+        $estimate.IdleMonthly | Should -Be 20.07
         # The session stays at list price: 2.30 x 5 + 0.20 = 11.70.
         $estimate.SessionCost | Should -Be 11.7
         # Allowance: 10 hours x 2 vCores = 20 vCore-hours (72,000 vCore-seconds, within the 100,000) x 0.50 = 10.00.
         # Month: 20 + 2.30 x 10 + 0.20 - 10.00 = 33.20, as at 1 vCore: the allowance covers T3 at light use either way.
         $estimate.T3FreeOfferCreditMonthly | Should -Be 10
-        $estimate.LightUseMonthly | Should -Be 33.23
+        $estimate.LightUseMonthly | Should -Be 33.27
         $estimate.T3FreeOffer | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer'
     }
@@ -830,7 +843,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless when the free offer is unavailable' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $false
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.47
         $estimate.T3FreeOffer | Should -BeFalse
         $estimate.T3FreeOfferUnchecked | Should -BeFalse
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'free offer'
@@ -838,7 +851,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless and says so when the free offer was not checked' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.47
         $estimate.T3FreeOfferUnchecked | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer wasn''t checked'
     }
@@ -952,10 +965,10 @@ Describe 'Get-DemoCostEstimate' {
 
         # Running: 2.30 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 2.439 per hour.
         $estimate.HourlyRunning | Should -Be 2.44
-        # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month.
-        $estimate.IdleMonthly | Should -Be 46.59
+        # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month, with the session control's 0.07.
+        $estimate.IdleMonthly | Should -Be 46.63
         $estimate.SessionCost | Should -Be 9.96
-        $estimate.LightUseMonthly | Should -Be 71.18
+        $estimate.LightUseMonthly | Should -Be 71.22
         $estimate.DefenderSession | Should -Be 0.56
         $estimate.DefenderMonthly | Should -Be 24.75
     }
@@ -998,7 +1011,7 @@ Describe 'Get-DemoCostEstimate' {
     }
 
     It 'checks the hard monthly ceiling against totals that include Defender' {
-        # Without Defender the light-use month is 46.43; with it, 71.18.
+        # Without Defender the light-use month is 46.47; with it, 71.22.
         $config = New-TestConfig -Override @{ monthlyCeilingUsd = 50 }
         $without = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -NetworkMode public -DefenderPlans @()
         ($without.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
@@ -1119,8 +1132,8 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ dataDiskSku = 'E10' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         ($estimate.Components | Where-Object Name -eq 'T1 data disk (E10)').Cost | Should -Be 10
         ($estimate.Components | Where-Object Name -eq 'T2 host data disk (E10)').Cost | Should -Be 10
-        # The two data disks add 2 x 10.00 to the default 46.43.
-        $estimate.LightUseMonthly | Should -Be 66.43
+        # The two data disks add 2 x 10.00 to the default 46.47.
+        $estimate.LightUseMonthly | Should -Be 66.47
     }
 
     It 'removes the demo-day data disks when dataDiskSku is None' {

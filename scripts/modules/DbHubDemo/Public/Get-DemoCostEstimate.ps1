@@ -528,12 +528,15 @@ function Get-DemoCostEstimate {
     # reads its few secrets a few times, so one block of operations is a ceiling. Automation includes the first 500 job
     # minutes a month. A session's jobs: DbHub-Control's start, 2 to 20 minutes, plus up to 51 while it follows T2's Run
     # Command after a cold start (2026-11-20, ADR 0026), its stop or DbHub-Stop, up to 3, and DbHub-Monitor's re-checks, a
-    # few: a ceiling of 80 minutes a session, for the light-use month's sessions. What the nightly stop's 120 leave of the
-    # 500 is priced at the included tier, and the rest at the next one.
+    # few: a ceiling of 80 minutes a session. The light-use month's sessions are Run all sessions, the owner's main path, at
+    # about 2 billed hours each (a 90-minute showcase touches 2 clock hours): 5 in 10 running hours (the coordinator's
+    # decision, 2026-11-21). What the nightly stop's 120 leave of the 500 is priced at the included tier, and the rest at the
+    # next one.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
-        $sessionsPerMonth = [System.Math]::Ceiling($LightUseHoursPerMonth / [System.Math]::Max(1.0, [double]$DemoHours))
+        $runAllSessionHours = 2.0
+        $sessionsPerMonth = [System.Math]::Ceiling($LightUseHoursPerMonth / $runAllSessionHours)
         $controlMinutes = $sessionsPerMonth * 80
         $includedMinutes = [System.Math]::Min($controlMinutes, [System.Math]::Max(0, 500 - 120))
         Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem $includedMinutes 'minute'
