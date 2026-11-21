@@ -1466,7 +1466,9 @@ function Invoke-DemoDeploymentTrack {
                         & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'No workload runner was deployed to T1 (-SkipRunner), so T1''s access to T5 wasn''t tried.'
                         break
                     }
-                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10))))
+                    # Through T1's subnet's service endpoint (2026-11-21), the warmup waits for its virtual network rule too.
+                    $viaRule = [string](Get-DemoMemberValue -InputObject (@($checks | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'T5.NETWORK' }) | Select-Object -First 1 | ForEach-Object { $_.evidence }) -Name 'path') -eq 'ServiceEndpoint'
+                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10)) -ServiceEndpoint:$viaRule))
                 }
                 'T1/Activity' {
                     $current = Get-DemoDeploymentState -Config $Config

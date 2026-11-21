@@ -17,7 +17,8 @@ function Invoke-DemoValidation {
     - T4 (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics: the PostgreSQL flexible server, Entra-only, its
       network, administrator, database, enhanced metrics, and METRICS.T4 (Azure Monitor has its metrics).
     - T5 (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics: the Azure Cosmos DB for NoSQL account, Entra-only, its
-      private endpoint, container and throughput, free tier, T1's data-plane role, and METRICS.T5 (Azure Monitor has its
+      network (its private endpoint, or T1's subnet rule; 2026-11-21), container and throughput, free tier, T1's
+      data-plane role, and METRICS.T5 (Azure Monitor has its
       requests and normalized RU). Without requests while sqlvm01, which runs T5's workload, is deallocated, METRICS.T5
       is a Warning.
     - Hub: Test-DemoFabricHubSetting (P4), Test-DemoFabricWorkspace (P5), Test-DemoHubEstate, and presenter

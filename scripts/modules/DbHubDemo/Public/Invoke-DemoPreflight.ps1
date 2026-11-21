@@ -612,16 +612,32 @@ function Invoke-DemoPreflight {
     # (PREFLIGHT.POLICY.SQLPUBLIC Fail) must stop the run before anything is created.
     $configuredNetworkMode = if ($Config['networkMode']) { [string]$Config['networkMode'] } else { 'auto' }
     $network = $null
+    # T5 (2026-11-21, ADR 0027): without a complete inventory, a new T5 keeps its private endpoint, which works under any
+    # policy (PREFLIGHT.POLICY.COSMOSPUBLIC, Get-DemoT5PolicyAccess).
+    $addT5Unread = {
+        param([string] $Mode, [string] $Why, [switch] $Deferred)
+        if (Test-DemoT5Enabled -Config $Config) {
+            $t5Access = Get-DemoT5PolicyAccess -NetworkMode $Mode -NotRead -Why $Why
+            $t5Evidence = @{ privateEndpointRequired = $t5Access.Required; reason = $t5Access.Reason; policies = @(); complete = $false }
+            if ($Deferred) {
+                # The deferred inventory's own result replaces it at the end of the run (ParallelDeployment's $applyPolicy).
+                $t5Evidence['deferred'] = $true
+            }
+            Add-Check 'PREFLIGHT.POLICY.COSMOSPUBLIC' 'subscription' $t5Access.Status $t5Access.Message -Evidence $t5Evidence -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])
+        }
+    }
     if ($DeferPolicyInventory -and -not $SkipPolicyInventory -and $configuredNetworkMode -eq 'private') {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' ('Deferred: networkMode is {0}, so the policy inventory resolves nothing the template needs. deploy.ps1 runs it alongside the template and adds its results at the end; the what-if check below catches policy denials before anything is created.' -f $configuredNetworkMode) -Evidence @{ deferred = $true }
         Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('networkMode is {0}, as configured; the deferred policy inventory reports any conflict at the end of the run.' -f $configuredNetworkMode) -Evidence @{ configuredNetworkMode = $configuredNetworkMode; effectiveNetworkMode = $configuredNetworkMode; assumed = $false; policies = @(); deferred = $true }
+        & $addT5Unread 'private' 'deferred to the end of the run' -Deferred
     }
     elseif ($SkipPolicyInventory) {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         $assumption = if ($network.Assumed) { ' (private works under any policy)' } else { '' }
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' 'The policy inventory was skipped (-SkipPolicyInventory). The what-if check still catches policy denials.'
         Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('Without the policy inventory, networkMode {0} resolves to {1}{2}.' -f $network.ConfiguredMode, $network.EffectiveMode, $assumption) -Evidence @{ configuredNetworkMode = $network.ConfiguredMode; effectiveNetworkMode = $network.EffectiveMode; assumed = $network.Assumed; policies = @() }
+        & $addT5Unread $network.EffectiveMode '-SkipPolicyInventory'
     }
     else {
         try {
@@ -635,6 +651,7 @@ function Invoke-DemoPreflight {
             $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
             Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Warning' ('The policy inventory failed ({0}). The what-if check still catches policy denials.' -f $_.Exception.Message.TrimEnd('.'))
             Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' $network.Status $network.Message -Evidence @{ configuredNetworkMode = $network.ConfiguredMode; effectiveNetworkMode = $network.EffectiveMode; assumed = $network.Assumed; policies = @() } -Remediation $network.Remediation
+            & $addT5Unread $network.EffectiveMode 'the inventory failed'
         }
     }
     $effectiveNetworkMode = $network.EffectiveMode
@@ -734,6 +751,10 @@ function Invoke-DemoPreflight {
     }
     # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # T5's private endpoint and DNS zone (2026-11-21): what this run's template step keeps or creates, from the account and
+    # the policies read above (PREFLIGHT.POLICY.COSMOSPUBLIC), as Resolve-DemoT5NetworkAccess decides it.
+    $t5PolicyCheck = $results | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.POLICY.COSMOSPUBLIC' } | Select-Object -First 1
+    $costParameters['T5PrivateEndpoint'] = Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode $effectiveNetworkMode -Policy $(if ($null -ne $t5PolicyCheck) { $t5PolicyCheck.evidence } else { $null })
     # What deploy.ps1 can set up in this run (2026-11-19, the coordinator's option 2 and gap fix): the nightly safety stop's
     # and the session control's roles need the deployer to assign them, and to write them when they aren't current.
     $deployer = Get-DemoDeployerRolePermission -Config $Config

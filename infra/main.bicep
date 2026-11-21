@@ -254,11 +254,14 @@ param t4AvailabilityZone string = ''
 @description('Current storage types of existing disks that differ from the profile, keyed by disk name (for example sqlvm01-osdisk). The subscription\'s automation can switch a deallocated VM\'s disks to Standard HDD, and Azure doesn\'t change an OS disk\'s type through its VM, so deploy.ps1 passes each drifted disk\'s current type and the template keeps it (Phase 24).')
 param diskSkuOverrides object = {}
 
-@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), a private endpoint in snet-pe in both network modes with public network access off, and the patient-events container at 400 RU/s. T1\'s managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027).')
+@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), reached from T1\'s subnet only (through a private endpoint in snet-pe, with public network access off, when t5PrivateAccess; otherwise through T1\'s subnet\'s service endpoint), and the patient-events container at 400 RU/s. T1\'s managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027).')
 param t5Enabled bool = true
 
 @description('T5 uses the subscription\'s one free-tier account (the first 1,000 RU/s and 25 GB free), which Azure sets only when the account is created. deploy.ps1 sets it when the subscription has no free-tier account yet and t5UseFreeTier is true, and passes an existing account\'s own value (ADR 0027).')
 param t5FreeTier bool = false
+
+@description('T5 keeps a private endpoint and its DNS zone, with public network access off (true, the default, and always in private mode). deploy.ps1 passes false only in public mode, for a new account (or one with public network access already on) when no policy turns Azure Cosmos DB public network access off or denies it and the policies could all be read: public network access is then limited to T1\'s subnet through its Microsoft.AzureCosmosDB service endpoint, as T3 in public mode, which saves the endpoint and its zone. An account that has its endpoint keeps it (DEPLOY.T5.NETWORK; ADR 0027, 2026-11-21).')
+param t5PrivateAccess bool = true
 
 var resourceGroupName = 'rg-${prefix}-${environment}'
 
@@ -334,6 +337,7 @@ module demo 'modules/demo.bicep' = {
     diskSkuOverrides: diskSkuOverrides
     t5Enabled: t5Enabled
     t5FreeTier: t5FreeTier
+    t5PrivateAccess: t5PrivateAccess
   }
 }
 

@@ -178,6 +178,11 @@ function Invoke-DemoTemplateDeployment {
     .PARAMETER T4RemovalPollSeconds
     How often that wait reads T4's server (15 by default).
 
+    .PARAMETER T5Policy
+    PREFLIGHT.POLICY.COSMOSPUBLIC's evidence (2026-11-21, ADR 0027): whether a policy needs T5's private endpoint, for a T5
+    this run creates (Resolve-DemoT5NetworkAccess). Without it, a new T5 gets the endpoint, which works under any policy;
+    an existing T5 keeps what it has either way. DEPLOY.T5.NETWORK says which and why.
+
     .EXAMPLE
     Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
     #>
@@ -229,7 +234,10 @@ function Invoke-DemoTemplateDeployment {
         [int] $T4RemovalWaitMinutes = 15,
 
         [ValidateRange(1, 300)]
-        [int] $T4RemovalPollSeconds = 15
+        [int] $T4RemovalPollSeconds = 15,
+
+        [AllowNull()]
+        [object] $T5Policy = $null
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -314,6 +322,24 @@ function Invoke-DemoTemplateDeployment {
             $t4ServerSku = ''
         }
     }
+    # T5's network (2026-11-21, ADR 0027): a private endpoint only when something needs it, as T3; an existing account keeps
+    # what it has, so an update changes nothing in its network (Resolve-DemoT5NetworkAccess, DEPLOY.T5.NETWORK). Decided
+    # before T4's cost checks below, which price T5's network as this run deploys it; the free tier reuses the read.
+    $t5PrivateAccess = $true
+    $t5State = $null
+    if (Test-DemoT5Enabled -Config $effective) {
+        try {
+            $t5State = Get-DemoT5State -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5Network = Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $t5State
+            $t5PrivateAccess = [bool]$t5Network.PrivateAccess
+            $results.Add($t5Network.Result)
+        }
+        catch {
+            $t5State = $null
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5''s network couldn''t be decided ({0}), so it keeps, or gets, a private endpoint, which works in every case.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do: the next ./scripts/deploy.ps1 decides again.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])))
+        }
+    }
+    $t5EndpointCost = if (Test-DemoT5Enabled -Config $effective) { $t5PrivateAccess } else { $null }
     # An existing server keeps its own size unless the configuration sets one, or it moves to the default (below): the
     # fallback never resizes a server, so a redeploy never sends another size to a server the fallback created, whatever
     # the record says (Phase 28 follow-up). A record that doesn't match the server that exists no longer holds, and is
@@ -346,7 +372,7 @@ function Invoke-DemoTemplateDeployment {
         if (-not (Test-DemoT4SizeIncrease -From $t4ServerSku -To $Target)) {
             return $null
         }
-        return (Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $T3UseFreeLimit -SkuName $Target)
+        return (Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $T3UseFreeLimit -SkuName $Target -T5PrivateEndpoint $t5EndpointCost)
     }
     if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
         $toDefault = $t4ServerSku -cne $t4Default -and (Get-DemoT4SkuName -Config $effective) -ceq $t4Default
@@ -417,7 +443,7 @@ function Invoke-DemoTemplateDeployment {
     $t5LeftOut = ''
     if (Test-DemoT5Enabled -Config $effective) {
         try {
-            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' }) -AccountState $t5State
             $t5FreeTier = [bool]$t5Free.UseFreeTier
             $t5FreeResult = $t5Free.Result
             $t5Creating = -not [bool]$t5Free.Exists
@@ -630,7 +656,7 @@ function Invoke-DemoTemplateDeployment {
         if ($ladder -and $t4Pinned -and (Test-DemoT4Enabled -Config $effective)) {
             $stepSku = Get-DemoT4SkuName -Config $effective
             if ($stepSku -cne $t4Asked -and -not $t4Costs.Contains($stepSku)) {
-                $stepCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $stepSku -Cache $costCache
+                $stepCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $stepSku -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
                 $t4Costs[$stepSku] = $stepCost
                 & $record $stepSku
                 $stepResult = New-DemoT4FallbackResult -Refused $lastRefusal -Next $stepSku -Cost $stepCost -Pinned $t4Pinned
@@ -644,7 +670,7 @@ function Invoke-DemoTemplateDeployment {
         # deployment). Never for a size the configuration sets.
         if ($ladder -and -not $t4Pinned -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
             $gpChecked = $true
-            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -Cache $costCache
+            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
             $t4Costs['Standard_D2ds_v5'] = $cost
             if ($cost.Allowed) {
                 & $record 'Standard_D2ds_v5'
@@ -668,7 +694,7 @@ function Invoke-DemoTemplateDeployment {
             $creating = Get-DemoT4SkuName -Config $effective
             if (-not $t4Costs.Contains($creating)) {
                 $createSku = $creating
-                $createCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $createSku -Cache $costCache
+                $createCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $createSku -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
                 $t4Costs[$createSku] = $createCost
                 if (-not $createCost.Allowed) {
                     $createResult = New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku '' -SkuName $createSku -Outcome Create -Cost $createCost -Explicit:($createSku -ceq $t4Pinned)
@@ -732,6 +758,7 @@ function Invoke-DemoTemplateDeployment {
             T1SecurityType            = $securityType.SecurityType
             T3UseFreeLimit            = $useFreeLimit
             T5FreeTier                = $t5FreeTier
+            T5PrivateAccess           = $t5PrivateAccess
         }
         if ($budgetStart) {
             $parameterArguments['BudgetStartDate'] = $budgetStart
@@ -819,8 +846,8 @@ function Invoke-DemoTemplateDeployment {
                 # with the zones, what was deployed, and T4's monthly estimate at both with the difference, priced as the
                 # fallback's cost check is: on the console now, and through T4Note on the status page's Infrastructure and T4
                 # rows and at DONE or NOT DONE.
-                $askedCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4Asked -Cache $costCache
-                $deployedCost = if ($t4Costs.Contains($t4SkuName)) { $t4Costs[$t4SkuName] } else { Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4SkuName -Cache $costCache }
+                $askedCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4Asked -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
+                $deployedCost = if ($t4Costs.Contains($t4SkuName)) { $t4Costs[$t4SkuName] } else { Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4SkuName -Cache $costCache -T5PrivateEndpoint $t5EndpointCost }
                 $change = New-DemoT4SizeChangeResult -Config $effective -Deployed $t4SkuName -Refusal @(& $refusalList) -AskedCost $askedCost -DeployedCost $deployedCost
                 $results.Add($change)
                 $t4Note = [string]$change.message

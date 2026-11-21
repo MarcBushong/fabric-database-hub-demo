@@ -87,3 +87,9 @@ suppression:
     - cosmos01-16cc7e
   Azure.Cosmos.ContinuousBackup:
     - cosmos01-16cc7e
+  # T5's network (2026-11-21, ADR 0027): infra/main.bicepparam deploys the private endpoint (t5PrivateAccess defaults to
+  # true). deploy.ps1 sets it false only in public mode, when no policy needs the endpoint: public network access is then
+  # limited to T1's subnet by a virtual network rule, with no IP rule, as T3's in public mode, and T5.NETWORK fails
+  # anything wider.
+  Azure.Cosmos.PublicAccess:
+    - cosmos01-16cc7e

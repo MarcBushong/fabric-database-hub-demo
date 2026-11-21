@@ -68,7 +68,7 @@ Database Hub shows T5 through its Azure Monitor platform metrics, which every ac
 | **Provisioned Throughput** | `ProvisionedThroughput` (Maximum, at a 5-minute grain or coarser) | The container's 400 RU/s | During a session, while the container exists | Between sessions, when the container is deleted |
 | **Availability** | `ServiceAvailability` (Average, hourly) | The account's own | Hourly | The current hour, until it ends |
 | **Avg Latency** | `ServerSideLatencyDirect` (Average): direct-mode connections only | Nothing: the runner uses the gateway (HTTPS through the private endpoint) | Never | Always |
-| **Security** | Microsoft Entra only, public network access, customer-managed keys | Configuration: T5 passes the first two; customer-managed keys stay a suggestion | On the assessment's schedule | A control already met |
+| **Security** | Microsoft Entra only, public network access, customer-managed keys | Configuration: T5 passes Microsoft Entra only, and public network access when it has its private endpoint; in public mode without one (since 2026-11-21), public network access is an Issue, as T3's. Customer-managed keys stay a suggestion | On the assessment's schedule | A control already met |
 
 ### Recommendations and optimizations
 

@@ -30,7 +30,8 @@ function Stop-DemoEnvironment {
       T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off. An account has no stop, and a
       container's throughput can't be taken away, so its container is deleted at the end (2026-11-19, STOP.T5,
       Invoke-DemoT5ContainerStop): its throughput stops billing until the next session creates it again, and only its
-      private endpoint and DNS zone bill between sessions. It's kept, with a Warning and the grant command, while Run all
+      private endpoint and DNS zone, when it has them (2026-11-21), bill between sessions. It's kept, with a Warning and the
+      grant command, while Run all
       couldn't create it again (the session control's role lacks the container's actions; the DbHubT5Container tag isn't
       Session), so a session never runs without it. destroy.ps1 deletes the account.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so

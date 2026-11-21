@@ -649,6 +649,34 @@ Describe 'Get-DemoCostEstimate' {
         $monthly | Should -Not -Match 'adds about|saves about'
     }
 
+    It 'prices T5''s private endpoint and DNS zone only when it has, or gets, them, and as an upper bound when that wasn''t told (2026-11-21, ADR 0027)' {
+        $config = New-TestConfig -Override @{ t5Enabled = $true }
+        $estimate = { param([object] $Endpoint, [string] $Mode = 'public', [string] $Lifecycle = 'Session') $parameters = @{ Config = $config; ProfileName = 'lowest-cost'; DemoHours = 5; LightUseHoursPerMonth = 40; BastionHours = 1; NetworkMode = $Mode; T5FreeTier = $false; T5ContainerLifecycle = $Lifecycle }; if ($null -ne $Endpoint) { $parameters['T5PrivateEndpoint'] = $Endpoint }; Get-DemoCostEstimate @parameters }
+        $none = & $estimate $false
+        @($none.Components | Where-Object Name -Match '^T5 private') | Should -BeNullOrEmpty
+        $none.T5FixedMonthly | Should -Be 0
+        $monthly = $none.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) has no private endpoint \(in public mode, T1''s subnet reaches it through its service endpoint, as T3\), so it costs nothing while the demo is stopped\. Its container exists only during a session'
+        $monthly.message | Should -Not -Match 'wasn''t checked, so the endpoint'
+        $monthly.evidence.t5PrivateEndpoint | Should -BeFalse
+        $monthly.evidence.t5PrivateEndpointChecked | Should -BeTrue
+        # All month too: its throughput and storage, and nothing of an endpoint.
+        ((& $estimate $false public AlwaysOn).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'costs 23\.61 USD a month whether the demo runs or not \(its 400 RU/s of throughput and storage\)'
+        # An account that has them, or gets them: 7.80 a month.
+        $kept = & $estimate $true
+        $kept.T5FixedMonthly | Should -Be 7.8
+        [System.Math]::Round($kept.IdleMonthly - $none.IdleMonthly, 2) | Should -Be 7.8
+        ($kept.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'wasn''t checked, so the endpoint'
+        # Not told: priced, an upper bound, and said.
+        $unknown = & $estimate $null
+        $unknown.T5FixedMonthly | Should -Be 7.8
+        $unknownCheck = $unknown.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $unknownCheck.message | Should -Match 'Whether a policy needs its private endpoint wasn''t checked, so the endpoint and its private DNS zone are counted, an upper bound; preflight checks it'
+        $unknownCheck.evidence.t5PrivateEndpointChecked | Should -BeFalse
+        # Private mode always has it.
+        (& $estimate $false private).T5FixedMonthly | Should -Be 7.8
+    }
+
     It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput while its container exists, and attributes the plan (2026-11-19, ADR 0027)' {
         $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'CosmosDbs'; pricingTier = 'Standard'; subPlan = $null })
         $session = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true

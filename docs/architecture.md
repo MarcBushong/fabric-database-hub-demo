@@ -83,7 +83,7 @@ Every value is a parameter; the profiles (`lowest-cost`, `demo-day`, `enhanced-p
 | T2 guest | Generation 2, 2 vCPU, 8 GiB static memory. `JumpstartImage` (the default): Arc Jumpstart ArcBox's prebuilt disk, a dynamic VHDX of at most 100 GiB (34 GiB to download), with Windows Server 2022 Standard (not an evaluation) and SQL Server 2022 Standard. The build modes (`ProductKey`, `Developer`, and a kept `PaygWizard` guest): a 64 GB dynamic VHDX with Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and the wire server blocked; automatic start and shutdown ([ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md)) |
 | T3 | `ContosoCare`, General Purpose serverless Gen5, 0.5–2 vCores in `lowest-cost`, auto-pause after 15 minutes, 32 GB | An older T3 at 1 vCore is scaled online by the next `deploy.ps1` (`DEPLOY.T3.SCALE`). [T3 as built](#t3-as-built-phase-8) |
 | T4 and its read replica | `Standard_D4ds_v5` (General Purpose, 4 vCores) with autonomous tuning, PostgreSQL 18, 32 GiB, `contosocare`; the replica at T4's size, only during a session | In every deployment ([T4 as built](#t4-as-built)) |
-| T5 | Azure Cosmos DB for NoSQL: `patient-events` at 400 RU/s, only during a session; a private endpoint; the free tier when it's free | [T5 as built](#t5-as-built) |
+| T5 | Azure Cosmos DB for NoSQL: `patient-events` at 400 RU/s, only during a session; a private endpoint in private mode or when something needs it, otherwise T1's subnet rule (since 2026-11-21); the free tier when it's free | [T5 as built](#t5-as-built) |
 | Budget and auto-shutdown | The budget at `monthlyCeilingUsd`, with alerts at 50%, 80%, and 100% to `ownerEmail`; DevTest Labs schedules for T1 and the T2 host at `autoShutdownTime` | The host shuts its guest down cleanly first ([cost](#cost)) |
 | Nightly safety stop | An Automation account (Basic, local authentication off) and its identity, with `DbHub-Stop` on `dbhub-safety-stop` (at `autoShutdownTime`, 19:00 by default), `dbhub-safety-t3check` (30 minutes later, or T3's auto-pause delay plus 15 when that's longer), and `dbhub-safety-deferred` (only after a `deploy.ps1` run it waited for) | [Sessions and stops](#sessions-and-stops) ([ADR 0024](adr/0024-nightly-safety-stop.md)) |
 | Session control | In `rg-<prefix>-control`: an Automation account with the runbooks `DbHub-Control`, `DbHub-Stop`, and `DbHub-Monitor` and the webhook, a Key Vault, and an identity; and the notebook `NB_DatabaseHub_Control` | Part of every deployment; `control.enabled: false` no longer turns it off ([ADR 0026](adr/0026-one-run-all-session.md)) |
@@ -107,7 +107,7 @@ Every value is a parameter; the profiles (`lowest-cost`, `demo-day`, `enhanced-p
 | T4's read replica, for each session | `pgreplica01-<deploymentId>` |
 | T5 account / database / container | `cosmos01-<deploymentId>` / `contosocare` / `patient-events` |
 | Network | `vnet-<prefix>-<environment>`; `nsg-<prefix>-<environment>-sqlvm`, `-archost`, `-pe`, `-pg`, and `-bastion`; with `outboundMode` `NatGateway`, `ng-<prefix>-<environment>` and `pip-<prefix>-<environment>-nat` |
-| Private endpoints | `pe-<prefix>-<environment>-cosmos01` (T5, both modes) and `pe-<prefix>-<environment>-azuresql01` (T3, private mode) |
+| Private endpoints | `pe-<prefix>-<environment>-cosmos01` (T5: private mode, a policy that needs it, or a T5 deployed before 2026-11-21) and `pe-<prefix>-<environment>-azuresql01` (T3, private mode) |
 | Bastion and its IP | `bas-<prefix>-<environment>`, `pip-<prefix>-<environment>-bastion` |
 | Budget and deployment record | `budget-<prefix>-<environment>`, `<prefix>-<environment>-main` |
 | Nightly safety stop | `aa-<prefix>-<environment>-safetystop`, `id-<prefix>-<environment>-safetystop` |
@@ -165,7 +165,8 @@ flowchart LR
   JS["Arc Jumpstart storage"]
   T1 -->|"5432"| T4
   T1 -->|"443"| PE
-  PE -->|"T5, both modes"| T5
+  PE -->|"T5, private mode or a policy"| T5
+  T1 -.->|"T5, public mode: a VNet rule"| T5
   PE -.->|"T3, private mode"| T3
   T1 -.->|"public mode: a VNet rule"| T3
   T1 -->|"443"| TEL
@@ -180,13 +181,13 @@ flowchart LR
 |---|---|---|
 | `snet-sqlvm` | `10.42.0.0/27` | T1 |
 | `snet-archost` | `10.42.0.32/27` | The T2 host; the guest is behind its NAT (`192.168.200.0/24`) |
-| `snet-pe` | `10.42.0.64/27` | Private endpoints: T5's in both modes, and T3's in private mode |
+| `snet-pe` | `10.42.0.64/27` | Private endpoints: T5's when it has one, and T3's in private mode |
 | `snet-pg` | `10.42.0.96/28` | T4, delegated to `Microsoft.DBforPostgreSQL/flexibleServers`, with `nsg-<prefix>-<environment>-pg`; its read replica joins it for each session |
 | `AzureBastionSubnet` | `10.42.0.128/26` | On-demand Bastion |
 
 - **Inbound:** RDP only from `AzureBastionSubnet`. From `snet-sqlvm` (T1) only: T4 on TCP 5432 (`Allow-Postgres-From-T1`), T5's private endpoint on TCP 443 (`Allow-Cosmos-From-T1`), and T3's on TCP 1433. Everything else from the virtual network or the internet is denied.
 - **Outbound:** TCP 443, and TCP 1688 to the two documented Azure KMS addresses. T1 also gets TCP 1433 and 11000–11999 to `Sql.<region>` for T3 in public mode, and `snet-pg` sends TCP 443 to Azure Storage, for T4's write-ahead log, and to Microsoft Entra ID. DNS, IMDS, and Windows licensing are platform traffic that NSGs allow by default; their service tags can only deny. Everything else to the internet is denied. NSGs can't restrict HTTPS by FQDN: a documented gap. In `JumpstartImage` mode the T2 host also downloads from Arc Jumpstart's public storage (`jumpstartprodsg.blob.core.windows.net`) and GitHub (`raw.githubusercontent.com`) over that TCP 443 ([outbound access](prerequisites.md#outbound-access)).
-- **Modes:** `public` (T3 reachable only through a VNet rule from `snet-sqlvm`) or `private` (T3's private endpoint and the `privatelink.database.windows.net` zone). The default, `auto`, is resolved by preflight from Azure Policy: `private` when a policy turns off public network access on SQL servers, otherwise `public`. T4 (virtual network integration, with its own private DNS zone) and T5 (its private endpoint and the `privatelink.documents.azure.com` zone) are private in both modes.
+- **Modes:** `public` (T3 reachable only through a VNet rule from `snet-sqlvm`) or `private` (T3's private endpoint and the `privatelink.database.windows.net` zone). The default, `auto`, is resolved by preflight from Azure Policy: `private` when a policy turns off public network access on SQL servers, otherwise `public`. T4 (virtual network integration, with its own private DNS zone) is private in both modes. T5 has its private endpoint and the `privatelink.documents.azure.com` zone in private mode, under a policy that turns Azure Cosmos DB's public network access off, when the policies couldn't all be read, and when it was deployed before 2026-11-21; otherwise, in public mode, as T3, a VNet rule for `snet-sqlvm` through that subnet's `Microsoft.AzureCosmosDB` service endpoint (`DEPLOY.T5.NETWORK`, [ADR 0027](adr/0027-t5-cosmos-db.md#2026-11-21-a-private-endpoint-only-when-something-needs-it)).
 - **Outbound path (`outboundMode`):** `DefaultOutboundAccess`, the default, sets `defaultOutboundAccess: true` on the VM subnets, because subnets are now private by default; `NatGateway` adds a NAT gateway and a public IP at extra cost ([ADR 0017](adr/0017-outbound-access.md)).
 - **Lateral movement and the guest:** the VM and private-endpoint subnets deny outbound RDP and SSH into the VNet. The guest's firewall and host-enforced Hyper-V port ACLs block IMDS and the wire server, and the guest's DNS goes through a forwarder on the host ([ADR 0004](adr/0004-guest-imds-isolation.md)). Full rules: [ADR 0007](adr/0007-networking-modes-and-egress.md).
 
@@ -338,7 +339,7 @@ T5 is an Azure Cosmos DB for NoSQL account, because Database Hub's general avail
 | Aspect | T5 |
 |---|---|
 | Resource | `Microsoft.DocumentDB/databaseAccounts` (`GlobalDocumentDB`; `infra/modules/cosmos01.bicep`, `cosmosdb` in `config/versions.json`): one region without zone redundancy, Session consistency, and the container `patient-events` at 400 RU/s of manual throughput. The free tier when no other account in the subscription has it and the subscription isn't internal (`DEPLOY.T5.FREETIER`); `t5Enabled: false` leaves T5 out |
-| Network and access | Public network access off in both network modes: the private endpoint (group `Sql`) in `snet-pe`, with the `privatelink.documents.azure.com` zone. Microsoft Entra only, with key authentication and key-based metadata writes off; T1's managed identity has Cosmos DB Built-in Data Contributor on the account (`infra/modules/cosmos01-access.bicep`), and no key exists anywhere |
+| Network and access | Public network access off, with the private endpoint (group `Sql`) in `snet-pe` and the `privatelink.documents.azure.com` zone, in private mode, under a policy that needs it, when the policies couldn't all be read, and for every T5 deployed before 2026-11-21. Otherwise, in public mode (since 2026-11-21), public network access on, limited to `snet-sqlvm` by a virtual network rule through its service endpoint, with no IP rule, as T3; Database Hub's Security page then lists it (`DEPLOY.T5.NETWORK`, `T5.NETWORK`). Microsoft Entra only, with key authentication and key-based metadata writes off; T1's managed identity has Cosmos DB Built-in Data Contributor on the account (`infra/modules/cosmos01-access.bicep`), and no key exists anywhere |
 | Workload and Database Hub | The runner's `--target T5 --server <account>.documents.azure.com`, over the documented REST API with T1's token: `healthy-baseline` and `ru-storm`. Estate and Performance chart its Azure Monitor metrics (`HUB.ESTATE.T5`, `METRICS.T5`) |
 | Lifecycle | `deploy.ps1` creates it (`DEPLOY.T5.MISSING` in an older demo), and T1's track checks it (`T5.*`, `WORKLOAD.T5.WARMUP`). Its container exists only during a session once the session control's role can create it again (the `DbHubT5Container` tag is `Session`; `DEPLOY.T5.LIFECYCLE`): the starts, `demo-control.ps1`, and `deploy.ps1` create it (`START.T5.CONTAINER`, `CONTROL.T5.CONTAINER`, `DEPLOY.T5.CONTAINER`), and every stop deletes it (`STOP.T5`). `destroy.ps1` removes the account with the resource group ([T5's cost](cost-management.md#t5-azure-cosmos-db-2026-11-18)) |
 | History | T5's metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `cosmosdb`) and the model through the notebook's `COSMOS_METRICS` |

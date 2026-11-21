@@ -691,6 +691,8 @@ function Invoke-DemoValidationCost {
         }
         # T5's free tier (ADR 0027): the account's own when it exists.
         $parameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $config -DeploymentId ([string]$Context.DeploymentId)
+        # T5's private endpoint and DNS zone (2026-11-21): priced only when the account has them, or when that can't be told.
+        $parameters['T5PrivateEndpoint'] = Get-DemoT5PrivateEndpointStatus -Config $config -NetworkMode ([string]$parameters['NetworkMode']) -DeploymentId ([string]$Context.DeploymentId)
         # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions, and why
         # (the re-review of 0590bbe).
         $t5Cost = Get-DemoT5CostLifecycle -Config $config -Detail

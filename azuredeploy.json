@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9827529834521370362"
+      "templateHash": "3651125032619119901"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -470,7 +470,7 @@
       "type": "bool",
       "defaultValue": true,
       "metadata": {
-        "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), a private endpoint in snet-pe in both network modes with public network access off, and the patient-events container at 400 RU/s. T1's managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027)."
+        "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), reached from T1's subnet only (through a private endpoint in snet-pe, with public network access off, when t5PrivateAccess; otherwise through T1's subnet's service endpoint), and the patient-events container at 400 RU/s. T1's managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027)."
       }
     },
     "t5FreeTier": {
@@ -478,6 +478,13 @@
       "defaultValue": false,
       "metadata": {
         "description": "T5 uses the subscription's one free-tier account (the first 1,000 RU/s and 25 GB free), which Azure sets only when the account is created. deploy.ps1 sets it when the subscription has no free-tier account yet and t5UseFreeTier is true, and passes an existing account's own value (ADR 0027)."
+      }
+    },
+    "t5PrivateAccess": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "T5 keeps a private endpoint and its DNS zone, with public network access off (true, the default, and always in private mode). deploy.ps1 passes false only in public mode, for a new account (or one with public network access already on) when no policy turns Azure Cosmos DB public network access off or denies it and the policies could all be read: public network access is then limited to T1's subnet through its Microsoft.AzureCosmosDB service endpoint, as T3 in public mode, which saves the endpoint and its zone. An account that has its endpoint keeps it (DEPLOY.T5.NETWORK; ADR 0027, 2026-11-21)."
       }
     }
   },
@@ -660,6 +667,9 @@
           },
           "t5FreeTier": {
             "value": "[parameters('t5FreeTier')]"
+          },
+          "t5PrivateAccess": {
+            "value": "[parameters('t5PrivateAccess')]"
           }
         },
         "template": {
@@ -670,7 +680,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "16425786594711647420"
+              "templateHash": "14067272236895514447"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -996,7 +1006,7 @@
               "type": "bool",
               "defaultValue": true,
               "metadata": {
-                "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, a private endpoint in snet-pe in both network modes, and one container at 400 RU/s (ADR 0027)."
+                "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, reached from T1's subnet only, and one container at 400 RU/s (ADR 0027)."
               }
             },
             "t5FreeTier": {
@@ -1004,6 +1014,13 @@
               "defaultValue": false,
               "metadata": {
                 "description": "T5 uses the subscription's one free-tier account, which Azure sets only at creation; deploy.ps1 decides, and passes an existing account's own value (ADR 0027)."
+              }
+            },
+            "t5PrivateAccess": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "T5 keeps a private endpoint in snet-pe, with public network access off (true, the default; always in private mode). False, which deploy.ps1 passes only in public mode, for a new account or one without an endpoint, when no policy needs one and the policies could all be read: public network access limited to T1's subnet through its service endpoint, as T3 (ADR 0027, 2026-11-21)."
               }
             }
           },
@@ -1327,6 +1344,7 @@
                 "dataPlaneRbac": "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
                 "disableLocalAuth": "https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control",
                 "privateEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints",
+                "vnetServiceEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint",
                 "freeTier": "https://learn.microsoft.com/azure/cosmos-db/free-tier",
                 "normalizedRu": "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
                 "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
@@ -1355,6 +1373,7 @@
             "t4ReplicaServerFqdn": "[if(startsWith(parameters('t4SkuName'), 'Standard_B'), '', format('{0}.postgres.database.azure.com', variables('t4ReplicaServerName')))]",
             "t5AccountName": "[format('{0}-{1}', variables('cosmos').accountNamePrefix, parameters('deploymentId'))]",
             "t5AccountHost": "[format('{0}.documents.azure.com', variables('t5AccountName'))]",
+            "t5Private": "[or(parameters('t5PrivateAccess'), equals(parameters('networkMode'), 'private'))]",
             "workloadSettings": {
               "runnerSha256": "[toLower(parameters('workloadRunnerSha256'))]",
               "runnerChunkCount": "[parameters('workloadRunnerChunkCount')]",
@@ -1414,6 +1433,9 @@
                   },
                   "tags": {
                     "value": "[parameters('tags')]"
+                  },
+                  "cosmosServiceEndpoint": {
+                    "value": "[and(parameters('t5Enabled'), not(variables('t5Private')))]"
                   }
                 },
                 "template": {
@@ -1424,7 +1446,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "14048794027523245067"
+                      "templateHash": "605850779924178053"
                     },
                     "description": "Virtual network, subnets, and NSGs (ADR 0007), with the outbound mode from ADR 0017."
                   },
@@ -1478,6 +1500,13 @@
                       "defaultValue": false,
                       "metadata": {
                         "description": "Golden snapshot boot test only (ADR 0018, guardrail 8): deny every outbound flow from snet-archost before the restored host first boots. The main template never sets it."
+                      }
+                    },
+                    "cosmosServiceEndpoint": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "In public mode, add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm, for a T5 reached from T1's subnet without a private endpoint (ADR 0027, 2026-11-21). False, the default, leaves snet-sqlvm's service endpoints as they were."
                       }
                     }
                   },
@@ -5296,7 +5325,7 @@
                                 "name": "snet-sqlvm",
                                 "addressPrefix": "[variables('subnetPrefixes').sqlvm]",
                                 "networkSecurityGroupResourceId": "[reference('nsgSqlvm').outputs.resourceId.value]",
-                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), createArray('Microsoft.Sql'), createArray())]",
+                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.Sql', 'Microsoft.AzureCosmosDB'), createArray('Microsoft.Sql')), createArray())]",
                                 "privateEndpointNetworkPolicies": "Disabled",
                                 "defaultOutboundAccess": "[variables('useDefaultOutbound')]",
                                 "natGatewayResourceId": "[variables('natGatewayId')]"
@@ -10266,6 +10295,12 @@
                   "enableFreeTier": {
                     "value": "[parameters('t5FreeTier')]"
                   },
+                  "privateAccess": {
+                    "value": "[variables('t5Private')]"
+                  },
+                  "allowedSubnetId": {
+                    "value": "[reference('network').outputs.subnetIds.value[0]]"
+                  },
                   "privateEndpointSubnetId": {
                     "value": "[reference('network').outputs.subnetIds.value[2]]"
                   },
@@ -10289,9 +10324,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "2303203040589875174"
+                      "templateHash": "10812435109822503450"
                     },
-                    "description": "T5 cosmos01: an Azure Cosmos DB for NoSQL account with local (key) authentication off, the contosocare database, and the patient-events container at 400 RU/s, reached through a private endpoint in snet-pe in both network modes (ADR 0027)."
+                    "description": "T5 cosmos01: an Azure Cosmos DB for NoSQL account with local (key) authentication off, the contosocare database, and the patient-events container at 400 RU/s, reached from T1's subnet only: through a private endpoint in snet-pe when something needs it, otherwise through T1's subnet's service endpoint (ADR 0027)."
                   },
                   "parameters": {
                     "location": {
@@ -10366,6 +10401,19 @@
                         "description": "Use the subscription's one free-tier account (1,000 RU/s and 25 GB free). Azure sets it only when the account is created, so deploy.ps1 passes an existing account's own value (ADR 0027)."
                       }
                     },
+                    "privateAccess": {
+                      "type": "bool",
+                      "defaultValue": true,
+                      "metadata": {
+                        "description": "Keep T5 behind its private endpoint, with public network access off (true, the default): in private mode, under a policy that turns Azure Cosmos DB public network access off or denies it, when the policies couldn't all be read, and for an account that already has its endpoint; deploy.ps1 decides (DEPLOY.T5.NETWORK). False: public network access on, limited to T1's subnet by a virtual network rule, with no private endpoint or DNS zone, as T3 in public mode (ADR 0027, 2026-11-21)."
+                      }
+                    },
+                    "allowedSubnetId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Resource ID of snet-sqlvm, T1's subnet: the one subnet the account's virtual network rule allows when privateAccess is false. Its Microsoft.AzureCosmosDB service endpoint is network.bicep's."
+                      }
+                    },
                     "privateEndpointSubnetId": {
                       "type": "string",
                       "metadata": {
@@ -10422,8 +10470,9 @@
                         "enableMultipleWriteLocations": false,
                         "disableLocalAuth": true,
                         "disableKeyBasedMetadataWriteAccess": true,
-                        "publicNetworkAccess": "Disabled",
-                        "isVirtualNetworkFilterEnabled": false,
+                        "publicNetworkAccess": "[if(parameters('privateAccess'), 'Disabled', 'Enabled')]",
+                        "isVirtualNetworkFilterEnabled": "[not(parameters('privateAccess'))]",
+                        "virtualNetworkRules": "[if(parameters('privateAccess'), createArray(), createArray(createObject('id', parameters('allowedSubnetId'), 'ignoreMissingVNetServiceEndpoint', false())))]",
                         "ipRules": [],
                         "minimalTlsVersion": "Tls12"
                       }
@@ -10468,6 +10517,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateDnsZones",
                       "apiVersion": "2024-06-01",
                       "name": "[parameters('privateDnsZoneName')]",
@@ -10475,6 +10525,7 @@
                       "tags": "[parameters('tags')]"
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
                       "apiVersion": "2024-06-01",
                       "name": "[format('{0}/{1}', parameters('privateDnsZoneName'), format('link-{0}', last(split(parameters('virtualNetworkId'), '/'))))]",
@@ -10491,6 +10542,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateEndpoints",
                       "apiVersion": "2025-09-01",
                       "name": "[parameters('privateEndpointName')]",
@@ -10518,6 +10570,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
                       "apiVersion": "2025-09-01",
                       "name": "[format('{0}/{1}', parameters('privateEndpointName'), 'default')]",
@@ -10548,7 +10601,7 @@
                     "documentEndpoint": {
                       "type": "string",
                       "metadata": {
-                        "description": "The T5 account's document endpoint (https://<account>.documents.azure.com:443/). Inside the VNet it resolves to the private endpoint."
+                        "description": "The T5 account's document endpoint (https://<account>.documents.azure.com:443/). With privateAccess it resolves to the private endpoint inside the VNet."
                       },
                       "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName')), '2025-10-15').documentEndpoint]"
                     },
@@ -10576,9 +10629,9 @@
                     "privateEndpointId": {
                       "type": "string",
                       "metadata": {
-                        "description": "Resource ID of the T5 private endpoint."
+                        "description": "Resource ID of the T5 private endpoint, or empty without privateAccess."
                       },
-                      "value": "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+                      "value": "[if(parameters('privateAccess'), resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName')), '')]"
                     }
                   }
                 }

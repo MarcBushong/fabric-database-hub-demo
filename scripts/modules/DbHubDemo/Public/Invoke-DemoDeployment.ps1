@@ -385,6 +385,8 @@ function Invoke-DemoDeployment {
         T2Complete       = (Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T2')
         OpenStage        = ''
         T4StartSku       = ''
+        # PREFLIGHT.POLICY.COSMOSPUBLIC's evidence (2026-11-21): $null without preflight, so a new T5 keeps its endpoint.
+        T5Policy         = $null
     }
     # The recorded stage only moves forward over stages that finished, so -Resume never skips an open one.
     $recordStage = {
@@ -524,6 +526,8 @@ function Invoke-DemoDeployment {
                 if ($group) {
                     $context.T3AdminGroupName = $group
                 }
+                # Whether a policy needs a new T5's private endpoint (2026-11-21, ADR 0027), for the template step.
+                $context.T5Policy = ($preflight | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.POLICY.COSMOSPUBLIC' } | Select-Object -First 1 | ForEach-Object { $_.evidence })
                 # Where T4's fallback starts (Phase 28 and its follow-up), as in the parallel path.
                 $context.T4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
                 & $ensureContext
@@ -541,6 +545,8 @@ function Invoke-DemoDeployment {
                     ScaleT4                 = $true
                     # The wait for a T4 server Azure refused shows on the status page (2026-11-09).
                     ProgressPath            = $ProgressPath
+                    # A new T5's private endpoint, only when a policy needs it (2026-11-21, ADR 0027).
+                    T5Policy                = $context.T5Policy
                 }
                 if ($context.T4StartSku) {
                     $deployArguments['T4StartSku'] = $context.T4StartSku
@@ -687,6 +693,7 @@ function Invoke-DemoDeployment {
                     BootstrapChunkCount     = $current.BundleChunkCount
                     ScaleT4                 = $true
                     ProgressPath            = $ProgressPath
+                    T5Policy                = $context.T5Policy
                 }
                 if ($current.RunnerSha256 -and @($runnerVms | Where-Object { $_ -notin $current.RunnerSentTo }).Count -eq 0) {
                     $deployArguments['WorkloadRunnerSha256'] = $current.RunnerSha256
@@ -782,7 +789,9 @@ function Invoke-DemoDeployment {
                     & $addAll $t5Checks
                     $t5Current = Get-DemoDeploymentState -Config $Config
                     if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
-                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
+                        # Through T1's subnet's service endpoint (2026-11-21), the warmup waits for its virtual network rule too.
+                        $viaRule = [string](Get-DemoMemberValue -InputObject (@($t5Checks | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'T5.NETWORK' }) | Select-Object -First 1 | ForEach-Object { $_.evidence }) -Name 'path') -eq 'ServiceEndpoint'
+                        $results.Add((Invoke-DemoT5WarmUp -Config $Config -ServiceEndpoint:$viaRule))
                     }
                 }
                 # T4 (Phase 24, ADR 0019): the server's checks, then T1 sets it up through the P6 group (already

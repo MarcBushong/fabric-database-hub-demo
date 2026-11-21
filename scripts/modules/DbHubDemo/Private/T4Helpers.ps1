@@ -882,13 +882,21 @@ function Get-DemoT4GeneralPurposeCost {
         [string] $SkuName = 'Standard_D2ds_v5',
 
         [AllowNull()]
-        [hashtable] $Cache = $null
+        [hashtable] $Cache = $null,
+
+        # Whether T5 keeps its private endpoint (2026-11-21): the template step's decision (Resolve-DemoT5NetworkAccess), so
+        # this estimate prices T5's network as the run deploys it. $null prices it, an upper bound.
+        [AllowNull()]
+        [object] $T5PrivateEndpoint = $null
     )
 
     $priced = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $SkuName
     $parameters = @{ Config = $priced; NetworkMode = $NetworkMode }
     if ($null -ne $T3UseFreeLimit) {
         $parameters['T3UseFreeLimit'] = [bool]$T3UseFreeLimit
+    }
+    if ($null -ne $T5PrivateEndpoint) {
+        $parameters['T5PrivateEndpoint'] = [bool]$T5PrivateEndpoint
     }
     if ($null -ne $Cache -and $Cache.ContainsKey('Shared')) {
         foreach ($key in $Cache['Shared'].Keys) {

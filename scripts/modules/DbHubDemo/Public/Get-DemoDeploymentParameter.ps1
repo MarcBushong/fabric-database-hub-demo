@@ -80,6 +80,11 @@ function Get-DemoDeploymentParameter {
     value, or true for a new one when no other account has it). False by default; ignored when t5Enabled is false
     (2026-11-18, ADR 0027).
 
+    .PARAMETER T5PrivateAccess
+    Whether T5 keeps a private endpoint and its DNS zone, with public network access off (Resolve-DemoT5NetworkAccess;
+    2026-11-21, ADR 0027). True by default, and always in private mode or with t5Enabled false; false only in public mode,
+    where T1's subnet reaches T5 through its service endpoint, as T3.
+
     .EXAMPLE
     Get-DemoDeploymentParameter -Config $config -NetworkMode private -T3UseFreeLimit $true | ConvertTo-Json -Depth 10
 
@@ -135,7 +140,9 @@ function Get-DemoDeploymentParameter {
 
         [switch] $T4Exists,
 
-        [bool] $T5FreeTier = $false
+        [bool] $T5FreeTier = $false,
+
+        [bool] $T5PrivateAccess = $true
     )
 
     if ($T2OsDiskSourceId -and $T2AttachExistingOsDisk) {
@@ -249,6 +256,8 @@ function Get-DemoDeploymentParameter {
         # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), with the free tier Resolve-DemoT5FreeTier decided.
         t5Enabled                 = (Test-DemoT5Enabled -Config $Config)
         t5FreeTier                = ((Test-DemoT5Enabled -Config $Config) -and $T5FreeTier)
+        # Its private endpoint only when something needs it (2026-11-21): never dropped in private mode, or with T5 off.
+        t5PrivateAccess           = (-not (Test-DemoT5Enabled -Config $Config)) -or $effectiveNetworkMode -eq 'private' -or $T5PrivateAccess
     }
     if ($DiskSkuOverride.Count -gt 0) {
         $overrides = [ordered]@{}

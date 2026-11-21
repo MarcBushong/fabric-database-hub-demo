@@ -1014,6 +1014,20 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T5.WARMUP' }).status | Should -Be 'Pass'
     }
 
+    It 'gives T5''s warm-up the service endpoint''s wait only when T5.NETWORK found T1''s subnet rule (-Sequential; 2026-11-21, ADR 0027)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { New-DemoResult -CheckId 'T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s network.' -Evidence @{ path = $script:t5Path } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { New-TestResult 'T4.SERVER' 'Pass' 't4' 'T4' }
+        foreach ($path in 'ServiceEndpoint', 'PrivateEndpoint') {
+            $script:t5Path = $path
+            $script:state = New-TestState @{ Stage = 'T3'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+            $null = Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -Resume -StopAfter T4
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -Times 1 -Exactly -ParameterFilter { [bool]$ServiceEndpoint }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -Times 1 -Exactly -ParameterFilter { -not [bool]$ServiceEndpoint }
+    }
+
     It 'goes on without T5 when the template left it out, and says so on the Infrastructure stage (-Sequential; review, 2026-11-19)' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }

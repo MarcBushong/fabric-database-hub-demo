@@ -9,6 +9,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Changed
 
 - `init.ps1` sets a new configuration's hard monthly ceiling (`monthlyCeilingUsd`) from its region's worst case for a Contributor's new deployment, priced then as preflight prices it, with 4% headroom, rounded up to 5 USD, and never below 415, so preflight passes it in every region: before, 415 fit only West US 3 and East US 2. `INIT.CONFIG` says the ceiling and why. A value already in your configuration doesn't change.
+- In public mode, a new T5 has no private endpoint unless something needs it, as T3, which saves its endpoint and private DNS zone, about $7.80 a month (2026-11-18 list prices). Its public network access is on, limited to T1's subnet (`snet-sqlvm`) by a virtual network rule and that subnet's Azure Cosmos DB service endpoint, with no IP rule, and Database Hub's Security page lists it, as it does T3's. A new T5 keeps the endpoint in private mode, under a policy that turns Azure Cosmos DB's public network access off or denies it (`PREFLIGHT.POLICY.COSMOSPUBLIC`), and when the policies couldn't all be read. An existing T5 keeps what it has: an update changes nothing in its network, and deletes no endpoint. `DEPLOY.T5.NETWORK` says which and why, `T5.NETWORK` checks it, and the estimate counts the endpoint and its zone only when T5 has or gets them ([ADR 0027](docs/adr/0027-t5-cosmos-db.md#2026-11-21-a-private-endpoint-only-when-something-needs-it)).
 
 ### Fixed
 

@@ -19,10 +19,10 @@ function Get-DemoPolicyConstraint {
     left count as unreadable, with one Warning that says why, so a lasting outage costs one read's retries instead
     of every definition's (review of c7c86ec).
 
-    Returns the kept rules with their category, the policies that turn off public network access on SQL
-    servers, the resolved network mode (Resolve-DemoNetworkMode), and PREFLIGHT.POLICY.* results:
-    INVENTORY, SQLPUBLIC, SQLENTRAONLY, VMSIZE, RESOURCETYPES, DEFENDER, EXTENSIONS, PUBLICIP, STORAGE,
-    MFA, and OTHER. Call Assert-DemoAzContext first.
+    Returns the kept rules with their category, the policies that turn off public network access on SQL servers, the
+    resolved network mode (Resolve-DemoNetworkMode), and PREFLIGHT.POLICY.* results: INVENTORY, SQLPUBLIC, COSMOSPUBLIC
+    (with T5 on: whether a new T5 needs a private endpoint; 2026-11-21, Get-DemoT5PolicyAccess), SQLENTRAONLY, VMSIZE,
+    RESOURCETYPES, DEFENDER, EXTENSIONS, PUBLICIP, STORAGE, MFA, and OTHER. Call Assert-DemoAzContext first.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig. Uses subscriptionId, networkMode, profile, t1Priority, hostPriority, and
@@ -315,6 +315,15 @@ function Get-DemoPolicyConstraint {
     $configuredMode = if ($Config['networkMode']) { [string]$Config['networkMode'] } else { 'auto' }
     $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredMode -SqlPublicAccessPolicy $sqlPolicies -PolicyUnknown:(-not $complete)
     Add-PolicyResult 'SQLPUBLIC' $network.Status $network.Message @{ configuredNetworkMode = $network.ConfiguredMode; effectiveNetworkMode = $network.EffectiveMode; assumed = $network.Assumed; policies = $sqlPolicies } $network.Remediation 'https://learn.microsoft.com/azure/azure-sql/database/connectivity-settings'
+
+    # COSMOSPUBLIC (2026-11-21, ADR 0027): whether a new T5 needs a private endpoint, as T3 does: in private mode, under a
+    # policy that turns Azure Cosmos DB public network access off or denies it, and when the policies couldn't all be read.
+    # Only with T5 on; deploy.ps1 passes the evidence to the template step (Resolve-DemoT5NetworkAccess).
+    if (Test-DemoT5Enabled -Config $Config) {
+        $cosmosRules = & $category 'COSMOSPUBLIC'
+        $t5Access = Get-DemoT5PolicyAccess -NetworkMode $network.EffectiveMode -Policy @($cosmosRules | ForEach-Object { $_.Policy }) -Complete $complete
+        Add-PolicyResult 'COSMOSPUBLIC' $t5Access.Status $t5Access.Message @{ privateEndpointRequired = $t5Access.Required; reason = $t5Access.Reason; policies = @($t5Access.Policies); complete = $complete } '' $(if ($t5Access.Required) { [string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'] } else { [string](Get-DemoCosmosSetting)['docUrls']['vnetServiceEndpoint'] })
+    }
 
     if ($listed) {
         # SQLENTRAONLY: T3 is Entra-only by design (ADR 0009).

@@ -743,6 +743,39 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $NetworkMode -eq 'public' }
     }
 
+    It 'leaves a new T5''s private endpoint out of the estimate only after a complete inventory, and keeps it when the inventory is skipped or fails (2026-11-21, ADR 0027)' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos-dbhub-t5'; PrivateEndpointName = 'pe-cosmos-dbhub-t5' }; Exists = $false; State = 'NotFound'; FreeTier = $false; Account = $null; Error = '' } }
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+
+        # A complete inventory without a policy on Azure Cosmos DB's public network access: no endpoint, so none is priced.
+        $complete = Invoke-DemoPreflight -Config $public -SkipWhatIf
+        $cosmos = $complete | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Pass'
+        $cosmos.evidence.privateEndpointRequired | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $false }
+
+        # Skipped: the endpoint, which works under any policy, and the estimate prices it.
+        $skipped = Invoke-DemoPreflight -Config $public -SkipWhatIf -SkipPolicyInventory
+        $cosmos = $skipped | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Not selected'
+        $cosmos.evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos.evidence.complete | Should -BeFalse
+        $cosmos.message | Should -Match 'The policy inventory didn''t run \(-SkipPolicyInventory\), so a new T5 gets a private endpoint'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+
+        # Failed: the same.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoPolicyConstraint -MockWith { throw 'Resource Graph throttled the read' }
+        $failed = Invoke-DemoPreflight -Config $public -SkipWhatIf
+        $cosmos = $failed | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Not selected'
+        $cosmos.evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos.message | Should -Match '\(the inventory failed\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 4 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+    }
+
     It 'skips the policy inventory with -SkipPolicyInventory and resolves auto to private' {
         Set-HappyAzMock
         $results = Invoke-DemoPreflight -Config $config -SkipPolicyInventory

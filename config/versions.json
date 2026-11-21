@@ -324,6 +324,7 @@
       "dataPlaneRbac": "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
       "disableLocalAuth": "https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control",
       "privateEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints",
+      "vnetServiceEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint",
       "freeTier": "https://learn.microsoft.com/azure/cosmos-db/free-tier",
       "normalizedRu": "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
       "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
