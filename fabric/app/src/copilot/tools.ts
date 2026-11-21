@@ -8,7 +8,7 @@
 // Copilot gets each tool's answer as text; the dock keeps the full results for charts, tables, and "Show the DAX".
 
 import { INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS } from "@/rca/tools";
-import { answerKeyIn, answerKeyRefusal } from "./answer-key";
+import { answerKeyIn, answerKeyRefusal, wholeModelRefusal } from "./answer-key";
 import { CHART_KINDS, MAX_CHART_ROWS, validateChartSpec, type ChartSpec, type ContextRow } from "./contract";
 import { ANSWER_KEY_MEASURES } from "./model-guide.generated";
 import type { ToolSpec } from "./relay";
@@ -186,6 +186,15 @@ export function toolSpecs(options: { estate: boolean; rca?: boolean }): ToolSpec
  * read whole, with its doubled closing character as an escape, so no string can hide the rest of a query (the review of 34a9732).
  */
 export function stripDaxComments(query: string): string {
+    return scanDax(query, false).trim();
+}
+
+/** The query's code alone: comments removed, and every string, quoted name, and bracketed name emptied, so a check for a function never matches text. */
+export function daxCode(query: string): string {
+    return scanDax(query, true);
+}
+
+function scanDax(query: string, emptyLiterals: boolean): string {
     let out = "";
     let i = 0;
     while (i < query.length) {
@@ -199,7 +208,7 @@ export function stripDaxComments(query: string): string {
                 if (query[j + 1] === close) j++;
                 else break;
             }
-            out += query.slice(i, j + 1);
+            out += emptyLiterals ? c + close : query.slice(i, j + 1);
             i = j + 1;
         } else if (c === "/" && next === "*") {
             const end = query.indexOf("*/", i + 2);
@@ -213,7 +222,7 @@ export function stripDaxComments(query: string): string {
             i++;
         }
     }
-    return out.trim();
+    return out;
 }
 
 /** Plain-language reason a query isn't accepted, or null when it is. */
@@ -223,6 +232,9 @@ export function checkDax(query: unknown): string | null {
     const body = stripDaxComments(query);
     if (!/^(DEFINE|EVALUATE)\b/i.test(body)) return "The query must start with EVALUATE (or DEFINE ... EVALUATE).";
     if (!/\bEVALUATE\b/i.test(body)) return "The query has no EVALUATE statement.";
+    // A function that reads the whole model reaches the answer key without naming it (the re-review of 817b81c).
+    const wholeModel = wholeModelRefusal(daxCode(query));
+    if (wholeModel) return wholeModel;
     // The text that runs is the query as written, so the answer key is looked for there too, comments and strings included:
     // naming a table in a comment or a string is refused with it, which never hides a real reference.
     const key = answerKeyIn(query, ANSWER_KEY_MEASURES) ?? answerKeyIn(body, ANSWER_KEY_MEASURES);

@@ -1,7 +1,8 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { buildGuideSource, OUTPUT, withoutScenarioClauses } from "../../scripts/build-model-guide";
+import { buildGuideSource, MODEL_DIR, OUTPUT, withoutScenarioClauses } from "../../scripts/build-model-guide";
 import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
 import { readContract, namesAScenario } from "@/rca/testdata/contract";
 import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "./answer-key";
@@ -38,7 +39,7 @@ describe("the model guide", () => {
         for (const measure of ANSWER_KEY_MEASURES) expect(MODEL_GUIDE).not.toContain(`[${measure}]`);
         for (const analysis of ANSWER_KEY_ANALYSES) expect(MODEL_GUIDE).not.toContain(`{ "${analysis}"`);
         expect(MODEL_GUIDE).not.toMatch(/scenario|inject/i);
-        expect(MODEL_GUIDE).toContain("[Log Rate Governor Wait (s)] (Waits and IO): Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance.");
+        expect(MODEL_GUIDE).toContain("[Log Rate Governor Wait (s)] (Waits and IO): Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, which limits how fast a database writes its transaction log.");
         // run_dax refuses a measure by its name alone, so none may also name a column the chat can query.
         const columns = new Set([...MODEL_GUIDE.matchAll(/'[^']+'\[([^\]]+)\]/g)].map((m) => m[1].toLowerCase()));
         expect(ANSWER_KEY_MEASURES.filter((m) => columns.has(m.toLowerCase()))).toEqual([]);
@@ -49,12 +50,13 @@ describe("the model guide", () => {
         const table = (name: string, measures: ReturnType<typeof measure>[]) => ({ name, description: "", source: "", columns: [], rows: [], measures });
         const reached = reachesAnswerKey(
             [
-                table("Key", [measure("Hosted", "COUNTROWS ( 'Key' )")]),
+                table("Key", [measure("Hosted", "COUNTROWS ( 'Key' )"), measure("Constant", "1")]),
                 table("Facts", [measure("Direct", "MAX ( 'Key'[At] )"), measure("Through", "IF ( [hosted], 1 )"), measure("Twice", "[Through] + 1"), measure("Clean", "SUM ( 'Facts'[Value] )")]),
             ],
             ["Key"],
         );
-        expect(reached).toEqual(["Direct", "Hosted", "Through", "Twice"]);
+        // A measure the key hosts is refused whatever it reads: TABLEOF ( [Constant] ) would return the key's table.
+        expect(reached).toEqual(["Constant", "Direct", "Hosted", "Through", "Twice"]);
         expect(withoutScenarioClauses("Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, the T3 log-rate scenario's signature.")).toBe(
             "Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance.",
         );
@@ -68,6 +70,33 @@ describe("the model guide", () => {
         expect(namesAScenario(MODEL_GUIDE.toLowerCase())).toEqual([]);
         expect(withoutScenarioClauses("The IO-pressure and missing-index signal. Buffer IO waits.")).toBe("Buffer IO waits.");
         expect(withoutScenarioClauses("Normalized RU per minute, 0 to 100 %, an ru-storm leaves it at 100 %.")).toBe("Normalized RU per minute, 0 to 100 %.");
+    });
+
+    // The re-review of 817b81c: INFO.VIEW.MEASURES () read scenario names from the model's own descriptions. run_dax refuses
+    // the INFO functions now, and the model holds none to read: no description in any table names a scenario, and nothing in a
+    // table the chat may query, or in the model's other files, mentions one. The answer-key tables hold them as their data.
+    it("holds no scenario name in the model's metadata, where a metadata query could read it", () => {
+        const tableDir = join(MODEL_DIR, "tables");
+        const files = readdirSync(tableDir).filter((f) => f.endsWith(".tmdl"));
+        expect(files.length).toBeGreaterThan(10);
+        const isKey = (file: string) => (ANSWER_KEY_TABLES as readonly string[]).includes(file.replace(/\.tmdl$/, ""));
+        for (const file of files) {
+            const text = readFileSync(join(tableDir, file), "utf8");
+            const descriptions = text.split(/\r?\n/).filter((line) => line.trim().startsWith("///")).join("\n");
+            expect(namesAScenario(descriptions.toLowerCase()), file).toEqual([]);
+            if (isKey(file)) continue;
+            expect(namesAScenario(text.toLowerCase()), file).toEqual([]);
+            expect(descriptions, file).not.toMatch(/scenario|inject/i);
+        }
+        for (const file of readdirSync(MODEL_DIR).filter((f) => f.endsWith(".tmdl"))) {
+            expect(namesAScenario(readFileSync(join(MODEL_DIR, file), "utf8").toLowerCase()), file).toEqual([]);
+        }
+        // TABLEOF reaches a measure's or a calendar's table, so every measure an answer-key table hosts is refused, whatever it
+        // reads, and no answer-key table has a calendar.
+        const hosted = files.filter(isKey).flatMap((f) => parseTable(readFileSync(join(tableDir, f), "utf8")).measures.map((m) => m.name));
+        expect(hosted).toEqual(expect.arrayContaining(["Injected Faults", "Scenario Requests", "Throttling Episodes"]));
+        expect(ANSWER_KEY_MEASURES).toEqual(expect.arrayContaining(hosted));
+        for (const file of files.filter(isKey)) expect(readFileSync(join(tableDir, file), "utf8"), file).not.toMatch(/^\s*calendar\s/m);
     });
 
     it("parses a table's description, columns, measures, and calculated rows", () => {

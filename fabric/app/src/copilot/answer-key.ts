@@ -14,8 +14,50 @@ export function answerKeyIn(dax: string, measures: readonly string[]): string | 
     const flat = dax.replace(/\s+/g, " ").toLowerCase();
     const table = ANSWER_KEY_TABLES.find((t) => flat.includes(t.toLowerCase()));
     if (table) return table;
-    const measure = measures.find((m) => flat.includes(`[${m.toLowerCase()}]`));
+    // [ Injected Faults ] too: the check doesn't rely on DAX reading a bracketed name as written.
+    const names = flat.replace(/\[ /g, "[").replace(/ \]/g, "]");
+    const measure = measures.find((m) => names.includes(`[${m.toLowerCase()}]`));
     return measure ? `[${measure}]` : null;
+}
+
+const INSTEAD = "it investigates the way a DBA's tools would. The model guide lists every table, column, and measure you can query: name them instead";
+
+/**
+ * DAX functions that read the model without naming a table, so the name check can't see what they reach; run_dax refuses
+ * each (the re-review of 817b81c). COLUMNSTATISTICS returns every column's minimum, maximum, and distinct count
+ * (learn.microsoft.com/dax/columnstatistics-function-dax); the INFO functions return the model's metadata, descriptions and
+ * expressions included (learn.microsoft.com/dax/info-functions-dax); CALENDARAUTO scans every date column
+ * (learn.microsoft.com/dax/calendarauto-function-dax); EXTERNALMEASURE names a measure by a string
+ * (learn.microsoft.com/dax/externalmeasure-function-dax). TABLEOF needs no entry: it reaches a table only through a column,
+ * measure, or calendar the query names, every measure an answer-key table hosts is refused, and none of them has a calendar
+ * (learn.microsoft.com/dax/tableof-function-dax; guide.test.ts pins both).
+ */
+export const WHOLE_MODEL_FUNCTIONS: readonly { name: string; called: RegExp; refusal: string }[] = [
+    {
+        name: "COLUMNSTATISTICS",
+        called: /\bCOLUMNSTATISTICS\b/i,
+        refusal: `COLUMNSTATISTICS returns the range of every column in every table, the demo's answer key included, which this chat doesn't read: ${INSTEAD}.`,
+    },
+    {
+        name: "INFO",
+        called: /\bINFO\s*\.\s*[A-Z]/i,
+        refusal: `INFO functions return the model's metadata, the demo's answer key included, which this chat doesn't read: ${INSTEAD}.`,
+    },
+    {
+        name: "CALENDARAUTO",
+        called: /\bCALENDARAUTO\b/i,
+        refusal: `CALENDARAUTO reads every date column in the model, the demo's answer key included, which this chat doesn't read. Use the 'Date' table, or CALENDAR with the dates you need.`,
+    },
+    {
+        name: "EXTERNALMEASURE",
+        called: /\bEXTERNALMEASURE\b/i,
+        refusal: `EXTERNALMEASURE names a measure by a string, so it can't be checked against the demo's answer key, which this chat doesn't read. Name the measure as [Measure] instead.`,
+    },
+];
+
+/** What run_dax says about the whole-model function a query calls, or null. `code` has its comments, strings, and names blanked. */
+export function wholeModelRefusal(code: string): string | null {
+    return WHOLE_MODEL_FUNCTIONS.find((f) => f.called.test(code))?.refusal ?? null;
 }
 
 /** What run_dax says when a query names the answer key: plain words, and what to use instead. */

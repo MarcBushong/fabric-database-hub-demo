@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ALLOWED_ROUTES, readEstate, type EstateScope, type EstateView } from "../../rayfin/functions/src/estate-core";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
-import { checkDax, createToolRunner, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
+import { checkDax, createToolRunner, daxCode, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
 
 // Every route path the estate function can call, as text Copilot must never get (R925 review).
 const ROUTE_TEXT = new RegExp(ALLOWED_ROUTES.map((r) => r.split(" ")[1].replace(/[/.]/g, "\\$&")).join("|"));
@@ -50,11 +50,44 @@ describe("checkDax", () => {
         }
     });
 
+    // The re-review of 817b81c: functions that read the whole model reached the answer key without naming it. COLUMNSTATISTICS
+    // returned every column's range (the scenario IDs, the first and last injection, the number of faults), and
+    // INFO.VIEW.MEASURES the descriptions that named scenarios.
+    it("refuses the functions that read the whole model, however they're written", () => {
+        for (const [query, refusal] of [
+            ["EVALUATE COLUMNSTATISTICS ()", /^COLUMNSTATISTICS returns/],
+            [`EVALUATE FILTER ( COLUMNSTATISTICS (), [Table Name] = "Scenario" & " Runs" )`, /^COLUMNSTATISTICS returns/],
+            ["evaluate columnstatistics()", /^COLUMNSTATISTICS returns/],
+            ["EVALUATE INFO.VIEW.MEASURES ()", /^INFO functions return/],
+            [`EVALUATE SELECTCOLUMNS ( INFO.VIEW.MEASURES (), "d", [Description] )`, /^INFO functions return/],
+            ["EVALUATE INFO.TABLES ()", /^INFO functions return/],
+            ["EVALUATE info.view.columns()", /^INFO functions return/],
+            ["EVALUATE INFO /* x */ . VIEW.TABLES ()", /^INFO functions return/],
+            ["DEFINE VAR t = INFO.MEASURES () EVALUATE t", /^INFO functions return/],
+            ["EVALUATE CALENDARAUTO ()", /^CALENDARAUTO reads/],
+            ["EVALUATE CALENDARAUTO ( 6 )", /^CALENDARAUTO reads/],
+            [`EVALUATE ROW ( "n", EXTERNALMEASURE ( "Injected" & " Faults", INTEGER ) )`, /^EXTERNALMEASURE names/],
+        ] as const) {
+            expect(checkDax(query), query).toMatch(refusal);
+        }
+    });
+
+    it("refuses an answer-key measure however it's spaced, and only a function the query calls", () => {
+        expect(checkDax('EVALUATE ROW ( "n", [ Injected Faults ] )')).toMatch(/^\[Injected Faults\] reads/);
+        expect(checkDax("EVALUATE ROW ( \"n\", [Injected\n    Faults] )")).toMatch(/^\[Injected Faults\] reads/);
+        // TABLEOF reaches a table only through a column or measure it names, and every measure an answer-key table hosts is refused.
+        expect(checkDax("EVALUATE FILTER ( TABLEOF ( [Scenario Requests] ), TRUE () )")).toMatch(/^\[Scenario Requests\] reads/);
+        expect(checkDax("EVALUATE TOPN ( 5, TABLEOF ( 'Telemetry Snapshots'[Metric] ) )")).toBeNull();
+        expect(checkDax(`EVALUATE ROW ( "note", "INFO.VIEW and COLUMNSTATISTICS () aren't run" ) // CALENDARAUTO ()`)).toBeNull();
+        expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], \"Info\", [Wait Time (s)] )")).toBeNull();
+    });
+
     it("reads strings and names whole when it strips comments, with their doubled quotes", () => {
         expect(stripDaxComments(`EVALUATE ROW ( "a", "--x" ) // tail`)).toBe(`EVALUATE ROW ( "a", "--x" )`);
         expect(stripDaxComments(`EVALUATE ROW ( "a", "say ""//"" here" ) -- tail`)).toBe(`EVALUATE ROW ( "a", "say ""//"" here" )`);
         expect(stripDaxComments(`EVALUATE 'a--b'[c /* d ]]] -- e`)).toBe(`EVALUATE 'a--b'[c /* d ]]]`);
         expect(stripDaxComments(`EVALUATE /* "a */ ROW ( "b", 1 )`)).toBe(`EVALUATE   ROW ( "b", 1 )`);
+        expect(daxCode(`EVALUATE ROW ( "a", "INFO.X ()" ) // COLUMNSTATISTICS ()\n'b--c'[d /* e ]]] -- f`)).toBe(`EVALUATE ROW ( "", "" ) \n''[] `);
         // Naming a table in a comment is refused with it: the query runs as written.
         expect(checkDax(`EVALUATE ROW ( "a", 1 ) // not 'Scenario Runs'`)).toMatch(/^Scenario Runs holds/);
     });
