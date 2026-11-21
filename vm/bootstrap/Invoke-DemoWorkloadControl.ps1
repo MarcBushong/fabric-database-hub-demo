@@ -905,6 +905,21 @@ function Get-DemoControlGoldenRefusal {
     return ''
 }
 
+function Get-DemoControlGuestVmPath {
+    <#
+    .SYNOPSIS
+    This bundle's vm/hyperv-guest/GuestVm.ps1: the guest's credential, PowerShell Direct's recovery (issue #65), and the
+    guest's state. Dot-sourcing it only defines functions, and they exist only in the scope that dot-sourced it, so a
+    function that calls one of them loads it first, in its own scope, unless every path to it has (live, 2026-11-21: the
+    Rca action didn't, so T2's export always failed; Vm.WorkloadSteps.Tests.ps1 checks every path).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return [System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1')
+}
+
 function Invoke-DemoControlGuestCommand {
     # One script block in the guest over PowerShell Direct (VMBus, no network); a function of its own so tests can mock it.
     [CmdletBinding()]
@@ -1207,7 +1222,7 @@ function Invoke-DemoControlRunner {
             $guestName = [string]$Settings['guest']['name']
         }
         # The guest restart that clears a broken PowerShell Direct channel, once for the caller's run (issue #65).
-        . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+        . (Get-DemoControlGuestVmPath)
         $requestKey = if ($Request.Contains('recoveryKey')) { [string]$Request['recoveryKey'] } else { '' }
         $recoveryKey = Get-DemoGuestRecoveryKey -Key $requestKey -Prefix 'control'
         $lockSeconds = 120
@@ -1338,6 +1353,12 @@ function Invoke-DemoControlT2Attempt {
     )
 
     $readyNote = [ordered]@{}
+    # The guest's credential comes from GuestVm.ps1, which only the Runner action had loaded: the Rca action's export
+    # failed with "Get-DemoGuestCredential is not recognized" (live, 2026-11-21). Loaded here, in this function's scope,
+    # whichever action calls it; Test-Path sees what a caller loaded, and searches no module.
+    if (-not (Test-Path -LiteralPath 'function:\Get-DemoGuestCredential')) {
+        . (Get-DemoControlGuestVmPath)
+    }
     if ($Activity) {
         # Live, 2026-11-03: the control's start found the guest off and air-gapped since a golden capture.
         $prepared = Invoke-DemoControlGuestReady -StateRoot $StateRoot -GuestName $GuestName -AdministratorName ([string]$Guest.AdministratorName) -ToolsFolder ([string]$Guest.ToolsFolder) -TimeoutSeconds ([System.Math]::Max(60, $ReadySeconds))
@@ -1457,6 +1478,10 @@ function Invoke-DemoControlT2Recovery {
     if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
         return $null
     }
+    # GuestVm.ps1's functions, in this function's scope when its caller hasn't loaded them (live, 2026-11-21).
+    if (-not (Test-Path -LiteralPath 'function:\Invoke-DemoGuestRecovery')) {
+        . (Get-DemoControlGuestVmPath)
+    }
     $credential = Get-DemoGuestCredential -SecretPath $secretPath -UserName $AdministratorName
     if ($BeforeCommand) {
         $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
@@ -1554,7 +1579,7 @@ function Invoke-DemoControlStopGuest {
         $guestName = [string]$Settings['guest']['name']
     }
     # A restart that its process didn't finish (#65) ends here, so nothing starts the guest that this stop turns off.
-    . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+    . (Get-DemoControlGuestVmPath)
     Close-DemoGuestRecoveryUnfinished -StateRoot $StateRoot -Confirm:$false
     $minutes = 10
     if ($Request.Contains('timeoutMinutes') -and [int]$Request['timeoutMinutes'] -ge 1) {
