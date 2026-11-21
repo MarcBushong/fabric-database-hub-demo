@@ -619,7 +619,9 @@ function Save-DemoFabricHistory {
         return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}{3}' -f $WindowMinutes, $postgresWithheld, $cosmosNote, $rcaNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
     }
     if ($run.status -eq 'Pass' -and ($cosmosWithheld -or $rcaWithheld -or $rcaUnwritten)) {
-        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' }
+        # T5's case keeps the release's text, for the owner's decision; the Incident RCA's own updates the activity notebook
+        # alone, leaving NB_DatabaseHub_Deployment as the person left it (the review of e716ff8).
+        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook' } elseif ($cosmosWithheld) { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' } else { 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies)' }
         $oldNotebook = $cosmosWithheld -or $rcaWithheld -match 'from before the Incident RCA'
         $steps = [System.Collections.Generic.List[string]]::new()
         if ($oldNotebook) {

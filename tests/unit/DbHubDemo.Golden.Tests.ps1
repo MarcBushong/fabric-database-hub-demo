@@ -391,7 +391,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be '1 Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in the variable DbHubSessionStatus of aa-dbhub-control), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
-        $rca.remediation | Should -Be 'First, run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+        $rca.remediation | Should -Be 'First, run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         @($rca.evidence.statusDocuments) | Should -Be @('archost01-20261120T190000Z-2')
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
@@ -406,27 +406,27 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be '3 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists 1, and the session control''s status, in the variable DbHubSessionStatus of aa-dbhub-control, lists 2), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
-        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. For the ones the status lists, run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         $script:calls | Should -Not -Contain 'guest Prepare'
     }
 
-    It 'asks for a Run all session for each session the status lists T2''s documents for, since each start fetches one session''s (<Case>, the review of 0a9fb8d)' -ForEach @(
+    It 'asks for at least a Run all session for each session the status lists, on any VM, since each start fetches one session''s, and the capture again after each (<Case>, the reviews of 0a9fb8d and e716ff8)' -ForEach @(
         @{
             Case    = 'the status only'; Pc = $false
-            Message = '3 Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, for 2 sessions, in the variable DbHubSessionStatus of aa-dbhub-control), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
-            Fix     = 'First, run a session with Run all in NB_DatabaseHub_Control for each session listed (2 here): each start fetches one session''s documents from T2, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+            Message = '3 Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in the variable DbHubSessionStatus of aa-dbhub-control), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+            Fix     = 'First, run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 3: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         }
         @{
             Case    = 'both lists'; Pc = $true
-            Message = '4 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists 1, and the session control''s status, in the variable DbHubSessionStatus of aa-dbhub-control, lists 3, for 2 sessions), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
-            Fix     = 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. For the ones the status lists, run a session with Run all in NB_DatabaseHub_Control for each session listed (2 here): each start fetches one session''s documents from T2, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+            Message = '4 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists 1, and the session control''s status, in the variable DbHubSessionStatus of aa-dbhub-control, lists 3), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+            Fix     = 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 3: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         }
     ) {
         $script:hostPower = 'PowerState/running'
         if ($Pc) {
             $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
         }
-        # Two sessions' T2 documents, and a third session's on another VM only, which doesn't count.
+        # Two sessions' T2 documents, and a third session's on another VM only, which counts too: a start may fetch it first.
         $script:controlPending = @(
             [ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01'; sessionId = ('a' * 32) }
             [ordered]@{ documentId = 'archost01-20261120T190000Z-3'; vm = 'archost01'; sessionId = ('a' * 32) }
@@ -438,7 +438,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be $Message
         $rca.remediation | Should -Be $Fix
-        $rca.evidence.statusSessions | Should -Be 2
+        $rca.evidence.statusSessions | Should -Be 3 -Because 'session c''s documents on sqlvm01 count too: a start may fetch them first'
         $script:calls | Should -Not -Contain 'guest Prepare'
     }
 
@@ -465,11 +465,11 @@ Describe 'New-DemoT2GoldenSnapshot' {
         }
         @{
             Case = 'the session control''s status'; Power = 'PowerState/deallocated'; Pc = $false; Status = $true; Import = $false
-            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         }
         @{
             Case = 'both lists'; Power = 'PowerState/running'; Pc = $true; Status = $true; Import = $false
-            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. For the ones the status lists, run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
         }
     ) {
         $script:hostPower = $Power

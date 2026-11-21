@@ -848,7 +848,7 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
         $run.Run.status | Should -Be 'Pass'
         $run.RcaSent | Should -BeTrue
         $run.RcaSaved | Should -BeFalse
-        $run.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        $run.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it writes none of the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
         @($script:lake.Keys) | Should -BeNullOrEmpty -Because 'nothing is left in Files/'
         @($script:oneLake | Where-Object { $_ -like 'Delete *' })[0] | Should -Be ('Delete {0}/{1}?' -f $script:lakehouseId, $run.RcaFile)
         $script:notebookKeeps = $false
@@ -930,7 +930,7 @@ Describe 'deploy.ps1''s history snapshot with the Incident RCA''s evidence (2026
         $record.evidence.outcome | Should -Be 'Saved' -Because 'the history itself was saved and framed'
         $record.evidence.parameters.RCA_EVIDENCE_FILE | Should -Be ''
         $record.message | Should -Match 'aren''t in the history yet: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA \(2026-11-20\), so it would ignore it\.'
-        $record.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); the next history save then adds them.'
+        $record.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); the next history save then adds them.' -Because 'the fix leaves NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('RCA_EVIDENCE_FILE') }
         # Never in DONE's way.

@@ -1621,7 +1621,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved.PostgresDropped | Should -BeFalse
         $saved.RcaNote | Should -Be 'the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA (2026-11-20), so it would ignore it'
         $saved.Result.message | Should -Match 'The RCA evidence wasn''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA \(2026-11-20\), so it would ignore it; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$'
-        $saved.Result.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); the next history save then sends the RCA evidence.'
+        $saved.Result.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); the next history save then sends the RCA evidence.' -Because 'the fix leaves NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
         $saved.Result.evidence['rcaEvidence'] | Should -Be 'withheld'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly -Because 'only the first run staged it'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['POSTGRES_METRICS'] -eq '{"version":1}' -and -not $Parameter.Contains('RCA_EVIDENCE_FILE') }
@@ -1642,7 +1642,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
         $saved.Result.status | Should -Be 'Warning'
         $saved.RcaSaved | Should -BeFalse
-        $saved.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        $saved.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it writes none of the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
         $saved.Result.message | Should -Match ('The RCA evidence went with it, but {0}; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$' -f [regex]::Escape($saved.RcaNote))
         $saved.Result.remediation | Should -Be 'The next history save sends the RCA evidence again: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity while the VMs run.'
         $saved.Result.evidence['rcaEvidence'] | Should -Be 'sent'

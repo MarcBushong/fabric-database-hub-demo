@@ -1922,6 +1922,15 @@ report["newerParameter"] = run(Lake(), Files(), evidence=evidence(parts, version
 report["otherSession"] = run(Lake(), Files(), session_id="f" * 32, evidence=evidence(parts))[0]
 report["unreadable"] = run(Lake(), Files(), evidence=evidence(parts + ["DBHUBDEMO-RCA 2 something else"]))[0]
 
+# A staged file nothing was written from stays, so a deleted file means written (review of 37a546bc): every document
+# another session's, or a file that can't be used; the control notebook and the scripts then find it left.
+files = Files()
+files.add(staged, json.dumps(PARAMETER))
+report["stagedOtherSession"] = run(Lake(), files, session_id="f" * 32, evidence_file=staged)[0]
+files = Files()
+files.add(staged, evidence(parts, version=2))
+report["stagedUnusable"] = run(Lake(), files, evidence_file=staged)[0]
+
 # A secret-looking string in a document is redacted before it's written; a document passed inline is read the same way.
 leaky = copy.deepcopy(DOCUMENTS["20261120T165000Z-sqlvm01-0001"])
 token = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
@@ -2139,6 +2148,21 @@ print(json.dumps(report, default=str))
         @($sweep['left']) | Should -Not -Contain $sweep['old']
         @($sweep['left']) | Should -Contain $sweep['recent']
         @($sweep['left']) | Should -Contain 'Files/rca/inbox/notes.txt'
+    }
+
+    It 'keeps a staged file it wrote nothing from, so a deleted file means written (review of 37a546bc)' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        foreach ($case in 'stagedOtherSession', 'stagedUnusable') {
+            $result = $rcaReport[$case]
+            $result['status'] | Should -Be 'Warning' -Because $case
+            @($result['documents']) | Should -BeNullOrEmpty -Because $case
+            @($result['left']) | Should -Contain 'Files/rca/inbox/20261120T172500Z-5f1c0e7a-0001.json' -Because ('{0}: the control notebook and the scripts read a deleted file as written' -f $case)
+        }
+        # One it wrote from goes: the fixtures' run above.
+        @($rcaReport['fixtures']['left']) | Should -BeNullOrEmpty
     }
 
     It 'merges the staged file''s parts with the inline RCA_EVIDENCE when both are passed, and writes each document once (review of 15ad76d)' {

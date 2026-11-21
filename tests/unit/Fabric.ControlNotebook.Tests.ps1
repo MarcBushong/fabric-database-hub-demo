@@ -170,8 +170,8 @@ LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob", "rcaleftoverjob
 VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
 # A session's history that runs as a job, with its evidence staged (re-check of d2067d69): the reference run fails, and the
 # job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
-# copy from before the Incident RCA), or Failed.
-RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed")
+# copy from before the Incident RCA), or Failed; or Completed with the staged file's check raising (review of 37a546bc).
+RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed", "rcajobunchecked")
 RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail") + RCA_JOB_SCENARIOS
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
@@ -198,6 +198,9 @@ class FileSystem:
         return True
 
     def exists(self, path):
+        if scenario == "rcajobunchecked" and path.endswith(".json"):
+            # OneLake didn't answer the staged file's check (review of 37a546bc).
+            raise OSError("OneLake didn't answer")
         return path in FILES or path in FOLDERS
 
     def ls(self, path):
@@ -1460,7 +1463,7 @@ print(json.dumps(out))
             }
             'sessionrcaold' {
                 $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
-                $report.printed | Should -Match 'Warning: NB_DatabaseHub_LiveActivity in the demo workspace didn''t read the session''s RCA evidence: its copy is from before the Incident RCA \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence'
+                $report.printed | Should -Match 'RCA\.EVIDENCE Warning: NB_DatabaseHub_LiveActivity in the demo workspace didn''t read the session''s RCA evidence: its copy is from before the Incident RCA \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence' -Because 'Run all''s line for an older notebook is labeled RCA.EVIDENCE, as its other evidence lines are'
             }
             'earlierrca' {
                 # The session's own evidence first, then the earlier session's alone: RCA_ONLY, with SAVE_RESULTS False, so a
@@ -1536,8 +1539,9 @@ print(json.dumps(out))
 
     It 'says what became of the Incident RCA''s evidence that a history job got, as far as Run all can tell: <Case> (ADR 0031, re-check of d2067d69)' -ForEach @(
         @{ Case = 'a job queued until Run all''s Spark session ends'; Scenario = 'rcajobqueued'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session {0}''s RCA evidence is saved: the history job is queued until this notebook''s Spark session ends\. Fix: once the job has run, the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line; when it isn''t Pass, or the job failed, Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
-        @{ Case = 'a job that ended and deleted the file'; Scenario = 'rcajobdone'; Files = 0; Says = 'Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: the history job read session {0}''s RCA evidence and deleted its file, as it does once it has handled it; the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line, with any document it skipped\.' }
-        @{ Case = 'a job that ended and left the file'; Scenario = 'rcajobold'; Files = 0; Says = 'RCA\.EVIDENCE Warning: the history job ended without writing session {0}''s RCA evidence: NB_DatabaseHub_LiveActivity in the demo workspace is from before the Incident RCA, or its write failed \(the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true' }
+        @{ Case = 'a job that ended and deleted the file'; Scenario = 'rcajobdone'; Files = 0; Says = 'Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: the history job read session {0}''s RCA evidence and deleted its file, as it does once it has written it; the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line, with any document it skipped\.' }
+        @{ Case = 'a job that ended and left the file'; Scenario = 'rcajobold'; Files = 0; Says = 'RCA\.EVIDENCE Warning: the history job ended without writing session {0}''s RCA evidence: NB_DatabaseHub_LiveActivity in the demo workspace is from before the Incident RCA, or it wrote none of it \(the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line\)\. Fix: when its copy is from before the Incident RCA, \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence' }
+        @{ Case = 'a job that ended, whose staged file couldn''t be checked (review of 37a546bc)'; Scenario = 'rcajobunchecked'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session {0}''s RCA evidence is saved: the history job is Completed, but whether it deleted its staged file couldn''t be checked\. Fix: the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line; when it isn''t Pass, Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
         @{ Case = 'a job that failed'; Scenario = 'rcajobfailed'; Files = 0; Says = 'Warning: the history job is Failed: Notebook execution failed in cell 4\.[^\n]*\s+RCA\.EVIDENCE Warning: session {0}''s RCA evidence wasn''t saved: the history job is Failed, so nothing read it\. Fix: Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
         @{ Case = 'an earlier session''s history saved as a job that Run all doesn''t look at'; Scenario = 'rcaleftoverjob'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session eeeeeeee''s RCA evidence is saved: Run all doesn''t wait for the history job\. Fix: once the job has run' }
     ) {

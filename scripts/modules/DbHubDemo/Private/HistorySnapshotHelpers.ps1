@@ -382,7 +382,7 @@ function ConvertTo-DemoRcaSnapshotNote {
         if (-not $fix) {
             $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Pending -Name 'remediation')
             if ([string](Get-DemoMemberValue -InputObject $Run -Name 'RcaNote') -match 'from before the Incident RCA') {
-                $fix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1 again, which updates the notebook; the next history save then adds them.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); the next history save then adds them.' }
+                $fix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1 again, which updates the notebook; the next history save then adds them.' } else { 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); the next history save then adds them.' }
             }
         }
     }

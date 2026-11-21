@@ -4497,6 +4497,14 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - **The reviews of e113eab:** the notebook's read (no create, prompt, or failure that makes noise, the same decision as `FABRIC.RCA.EVIDENCE`, and no Fabric call when nothing is listed), the merge note, the update table's row, and the commands were confirmed. Two Lows:
   - **The fix's update also replaced `NB_DatabaseHub_Deployment`:** `./scripts/configure-fabric.ps1 -SkipHubChecks` creates or updates both notebooks, so with `fabric.importNotebooks` false a person who keeps their edits would lose an edited deployment notebook, which the RCA doesn't need. The RCA's fixes now name `-Notebook NB_DatabaseHub_LiveActivity`, the script's documented way to import one notebook, which `-RunLiveActivity` runs after: `GOLDEN.CAPTURE.RCA`, `FABRIC.SEMANTICMODEL.RCA`, `FABRIC.RCA.EVIDENCE`, Run all's **Warning** for an older notebook, and the docs that quote them. The release's history texts, `STOP.FABRIC.SAVEHISTORY` and `DEPLOY.FABRIC.HISTORY`, stay as they are. Each changed text's test fails without the change.
   - **"Each says so, with that fix" wasn't accurate:** each names its own fix, which the README's and the CHANGELOG's command covers; they say so now, and AGENTS.md counts the two commands.
+- **The final check of e716ff8:** the control notebook's Python, `-Notebook` with `-RunLiveActivity`, and an empty `sessionId` were confirmed. Two Lows:
+  - **The stop's and the snapshot's own texts for an older notebook:** the Incident RCA's cases of `STOP.FABRIC.SAVEHISTORY` and `DEPLOY.FABRIC.HISTORY`, which this branch added, still named `./scripts/configure-fabric.ps1`, which runs the whole checklist and replaces both notebooks, while troubleshooting gave the narrowed command. They name `-SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity` now. T4's and T5's cases keep the release's text, for the owner's decision on updating the demo's notebooks.
+  - **The session count is a minimum:** each start fetches one session's evidence on any VM, unsaved bundles first, then the earliest to expire, so a session with documents on sqlvm01 only can come before T2's. The capture counts every session the status lists, says "at least N", since sessions with only unsaved bundles don't show in the list, and always asks for the capture again after each Run all.
+
+  Each fix's test fails without it: 1 test each for the stop's and the snapshot's texts, and 6 golden tests.
+- **The transport's last fix, merged at 37a546bc (4d4c9216):** its two new texts got the narrowing too: the control notebook's **Warning** for a history job that "ended without writing" the evidence names `-Notebook NB_DatabaseHub_LiveActivity`, and its troubleshooting row gives the fix for `fabric.importNotebooks` false.
+- **The re-check of 37a546bc (one Low):** `RCA.EVIDENCE` **Pass** for a history job only meant that Run all didn't find the staged file. When the file's check raised, `clean_rca_inbox` printed a note and answered "not there", which read as deleted, so as saved; and the activity notebook deleted a file it couldn't use, or whose every document it skipped, with nothing written. Now `clean_rca_inbox` answers None when it couldn't check the file, which gives the "can't tell" **Warning**, and `save_rca_evidence` deletes the file only once its evidence is in the history, written by that run or before. A deleted file means written, for Run all and for the scripts' check of the file (found, or already gone), whose note now says so.
+- **Final tests, live at 29a32acd:** ADR 0031's upgrade matrix said that beside an older activity notebook, the staged file "stays until the purge" with an `RCA.EXPORT` **Warning**. The code deletes it after the run, and Run all's line wasn't labeled. The matrix says what the code does now, and Run all's line is `RCA.EVIDENCE` **Warning**, as its other evidence lines are.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4543,7 +4551,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The evaluation set's Phase 1 cases,** ported with blind questions.
 - **Step 1.8,** the live run below.
 - **Decision 6, names:** open for the owner.
-- **The transport's last fix:** its re-check fixes merged at d2067d69 (29a32acd). One Low is left, an `RCA.EARLIER` **Warning** that says an earlier session's capture "isn't in any history now" when it's already bound to that session; it's merged once the coordinator confirms it, with the affected suites run again. That head is the live test's SHA.
+- **The transport's last fix:** merged at 37a546bc (4d4c9216), with the commit after it, whose head is the live test's SHA.
 
 **Step 1.8, the live run (the final tests fill it in).** ADR 0031's [Phase 1](adr/0031-incident-rca.md#phase-1) says what it must show: on each environment, a plain `./scripts/deploy.ps1` ends **DONE** with 0 **Fail** on its first run, `./scripts/validate.ps1` has 0 **Fail**, and no **Warning** is new against the release before it.
 
@@ -4596,6 +4604,13 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - the `Repo` suites, `Docs.Walkthrough`, and `Agent.PromptPack` (745; 3 skipped because this PC lacks gitleaks).
 
   With e113eab's step, the 2 new session tests fail; with e113eab's helper, the helper's test fails. Each narrowed fix fails its test with e113eab's text: 5 golden tests, `FABRIC.SEMANTICMODEL.RCA`'s, `FABRIC.RCA.EVIDENCE`'s, and the control notebook's older-notebook simulation. PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
+- **The transport's merge at 37a546bc, and the commit after it:** under strict mode, with Python 3.11.9 and pandas 2.3.3 for the notebooks, 1,624 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI:
+  - `Automation.Runbooks` (304), after the merge;
+  - `Fabric.ControlNotebook` (73) and `Fabric.Notebooks` (130), none skipped;
+  - `DbHubDemo.HistorySnapshot` (36), `FirstRun` (96), `Golden` (117), `PowerBI` (29), and `Fabric` (42), and `Vm.GoldenGuest` (22);
+  - the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, and `Rca.Contract` (775).
+
+  With the merge's notebooks, 4 control notebook tests (the job whose file couldn't be checked, and the job, older-notebook, and label texts) and the activity notebook's new test fail; with e716ff8's code, the stop's and the snapshot's text tests and 6 golden tests fail. PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
 

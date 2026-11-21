@@ -1335,7 +1335,7 @@ function Invoke-DemoRcaNotebookRun {
             'the history run didn''t complete'
         }
         elseif ($removedFound) {
-            'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+            'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it writes none of the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
         }
         else {
             'the staged file couldn''t be checked, so whether NB_DatabaseHub_LiveActivity wrote it isn''t known (the next save writes only what isn''t in the history)'
