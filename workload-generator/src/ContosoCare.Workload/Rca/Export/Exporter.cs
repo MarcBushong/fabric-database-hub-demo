@@ -47,6 +47,8 @@ internal sealed record ExportResult(IReadOnlyList<ExportedDocument> Documents, s
 /// and returns the index. Each target's window starts where its previous one ended, so a host's documents never
 /// overlap for a target. The first export that takes from a span binds it to the caller's session, and later exports
 /// keep that session for it: the runbook exports what an earlier session's stop left behind with that session's ID.
+/// A control session's documents share its budget over its exports; a sessionless export (<c>--session none</c>) has
+/// the budget to itself. A span that can't be exported is a Warning in the index, and the others still export.
 /// With <c>--final</c> it waits a bounded time for the observer to end its spans, so the session's last capture is in.
 /// </summary>
 internal sealed class Exporter(EvidenceStore store, RunnerLog log, string producerVersion)
@@ -83,9 +85,11 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
         now = store.Time.GetUtcNow();
         var ledger = store.ReadLedger();
         var documents = new List<ExportedDocument>();
+        var failures = new List<string>();
         var warnings = new List<string>();
         var cuts = 0;
         var late = 0;
+        var sessionless = 0;
         foreach (var span in store.Spans())
         {
             if (span.Export.Complete)
@@ -99,82 +103,43 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
                 break;
             }
 
-            var session = span.Export.Bound ? span.Export.SessionId : sessionId;
-            var plan = Read(span, now);
-            if (plan.Captures.Count == 0 && plan.AnswerKey.Count == 0)
+            try
             {
-                if (span.Finished)
+                if (ExportSpan(span, sessionId, final, now, ledger, sessionless) is not { } exported)
                 {
-                    span.Export.Complete = true;
-                    span.Export.LastExportUtc ??= now;
-                    EvidenceStore.WriteExport(span);
+                    continue;
                 }
 
-                continue;
+                documents.Add(exported.Document);
+                sessionless += exported.SessionlessBytes;
+                warnings.AddRange(exported.Warnings);
+                cuts += exported.Cuts;
+                late += exported.LateRows;
             }
-
-            var captures = plan.Captures.Count > 0 ? plan.Captures : Empty(span, now);
-            var key = session ?? "none";
-            if (!ledger.Sessions.TryGetValue(key, out var use))
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                ledger.Sessions[key] = use = new SessionUse();
+                // One span the export can't make a document of never keeps the others from exporting, or from the index.
+                failures.Add($"Span {span.Id} couldn't be exported ({ex.Message}); the next export tries it again.");
+                log.Warn("rca.export-span-failed", "Couldn't export an observation span; the others still export.", ("span", span.Id), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
+                log.Debug("rca.export-span-failed-detail", ex.ToString(), ("span", span.Id));
             }
-
-            var sessionBudget = span.Span.Targets.Keys.Count(t => t != "T5") > 1 ? MultiTargetBudget : SingleTargetBudget;
-            var detectionBudget = Math.Max(MinimumBudget, (int)Math.Min(RcaContract.MaximumDocumentBytes, sessionBudget - use.Bytes) - AnswerKeyReserve);
-            var sequence = use.Sequence + 1;
-            var windowStart = captures.Min(c => c.From);
-            var windowEnd = captures.Max(c => c.To);
-            var documentId = string.Create(CultureInfo.InvariantCulture, $"{EvidenceDocument.Second(windowStart).UtcDateTime:yyyyMMdd'T'HHmmss'Z'}-{store.Host}-{sequence:D4}");
-            var header = new DocumentHeader(documentId, session, store.Host, producerVersion, now, sequence, final, windowStart, windowEnd, [.. captures.Select(c => c.Target).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)]);
-            var reduced = Reducer.Reduce(captures, tables => PartCodec.Gzip(EvidenceDocument.Write(header, tables, [])).Length, detectionBudget);
-            var answerKey = plan.AnswerKey.ToList();
-            var gzip = PartCodec.Gzip(EvidenceDocument.Write(header, reduced.Tables, answerKey));
-            while (gzip.Length > RcaContract.MaximumDocumentBytes && answerKey.Count > 0)
-            {
-                // The answer key never shapes the detection tables: when it's over its reserve, it's what gives way.
-                var dropped = answerKey.Count - (answerKey.Count / 2);
-                answerKey = answerKey.Count > 1 ? answerKey[..(answerKey.Count / 2)] : [];
-                log.Warn("rca.answer-key-cut", "The answer key didn't fit its document; part of it was left out.", ("document", documentId), ("rows", dropped));
-                gzip = PartCodec.Gzip(EvidenceDocument.Write(header, reduced.Tables, answerKey));
-            }
-
-            store.WriteDocument(documentId, gzip);
-            var parts = PartCodec.PartCount(gzip.Length);
-            var sha256 = PartCodec.Sha256(gzip);
-            span.Export.Bound = true;
-            span.Export.SessionId = session;
-            foreach (var (target, through) in plan.Through)
-            {
-                if (!span.Export.Targets.TryGetValue(target, out var state))
-                {
-                    span.Export.Targets[target] = state = new TargetExport();
-                }
-
-                state.ThroughUtc = through;
-                state.ReadBytes = plan.ReadBytes.GetValueOrDefault(target);
-            }
-
-            span.Export.AnswerKeyBytes = plan.AnswerKeyEnd;
-            span.Export.LastExportUtc = now;
-            span.Export.Documents.Add(documentId);
-            span.Export.Complete = span.Finished && plan.ConsumedAll;
-            EvidenceStore.WriteExport(span);
-            use.Sequence = sequence;
-            use.Bytes += gzip.Length;
-            use.Parts += parts;
-            use.LastExportUtc = now;
-            documents.Add(new ExportedDocument(documentId, parts, sha256));
-            warnings.AddRange(reduced.Warnings);
-            cuts += reduced.Cuts.Count;
-            late += plan.Captures.Sum(c => c.LateRows);
-            log.Info("rca.exported", "Exported an evidence document.", ("document", documentId), ("session", key), ("parts", parts), ("bytes", gzip.Length), ("cuts", reduced.Cuts.Count));
         }
 
-        store.WriteLedger(ledger);
         if (documents.Count == 0)
         {
-            return new ExportResult([], "Not selected", Message("Nothing new to export: the RCA observer captured nothing since the previous export.", notes, warnings));
+            return failures.Count > 0
+                ? new ExportResult([], "Fail", Message("No evidence document was exported.", [.. failures, .. notes], warnings))
+                : new ExportResult([], "Not selected", Message("Nothing new to export: the RCA observer captured nothing since the previous export.", notes, warnings));
+        }
+
+        try
+        {
+            store.WriteLedger(ledger);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            failures.Add($"The export's ledger couldn't be saved ({ex.Message}), so the next export may count this session's budget from before this export.");
+            log.Warn("rca.ledger-failed", "Couldn't save the RCA export's ledger.", ("error", Redactor.Redact(ex.Message)));
         }
 
         var summary = string.Create(CultureInfo.InvariantCulture, $"{documents.Count} evidence document{(documents.Count == 1 ? string.Empty : "s")}, {documents.Sum(d => d.Parts)} parts, for {(sessionId is null ? "no control session" : "session " + sessionId)}.");
@@ -188,10 +153,9 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
             notes.Add(string.Create(CultureInfo.InvariantCulture, $"{late} row(s) arrived after their window was exported."));
         }
 
-        var status = warnings.Count > 0 || late > 0 || notes.Any(n => n.StartsWith("The observer was still", StringComparison.Ordinal)) ? "Warning" : "Pass";
-        return new ExportResult(documents, status, Message(summary, notes, warnings));
+        var status = failures.Count > 0 || warnings.Count > 0 || late > 0 || notes.Any(n => n.StartsWith("The observer was still", StringComparison.Ordinal)) ? "Warning" : "Pass";
+        return new ExportResult(documents, status, Message(summary, [.. failures, .. notes], warnings));
     }
-
     /// <summary>Prints part <paramref name="index"/> of a stored document, or null when the document or part doesn't exist.</summary>
     public string? Part(string documentId, int index)
     {
@@ -199,6 +163,86 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
         return gzip is null || index < 1 || index > PartCodec.PartCount(gzip.Length) ? null : PartCodec.Line(documentId, gzip, index);
     }
 
+    /// <summary>
+    /// Exports one span's new capture as a document; null when it has nothing new. When it throws, nothing about the span
+    /// is marked exported, so the next export takes the same window again.
+    /// </summary>
+    /// <param name="sessionless">What sessionless documents took of this export's budget so far.</param>
+    private SpanExported? ExportSpan(SpanInfo span, string? sessionId, bool final, DateTimeOffset now, SessionLedger ledger, int sessionless)
+    {
+        var session = span.Export.Bound ? span.Export.SessionId : sessionId;
+        var plan = Read(span, now);
+        if (plan.Captures.Count == 0 && plan.AnswerKey.Count == 0)
+        {
+            if (span.Finished)
+            {
+                span.Export.Complete = true;
+                span.Export.LastExportUtc ??= now;
+                EvidenceStore.WriteExport(span);
+            }
+
+            return null;
+        }
+
+        var captures = plan.Captures.Count > 0 ? plan.Captures : Empty(span, now);
+        var key = session ?? "none";
+        if (!ledger.Sessions.TryGetValue(key, out var use))
+        {
+            ledger.Sessions[key] = use = new SessionUse();
+        }
+
+        // A control session's documents share its budget over all of its exports. Outside one (--session none) there's no
+        // session to add them up to, so each export has the budget to itself.
+        var sessionBudget = span.Span.Targets.Keys.Count(t => t != "T5") > 1 ? MultiTargetBudget : SingleTargetBudget;
+        var spent = session is null ? sessionless : use.Bytes;
+        var detectionBudget = Math.Max(MinimumBudget, (int)Math.Min(RcaContract.MaximumDocumentBytes, sessionBudget - spent) - AnswerKeyReserve);
+        var sequence = use.Sequence + 1;
+        var windowStart = captures.Min(c => c.From);
+        var windowEnd = captures.Max(c => c.To);
+        var documentId = string.Create(CultureInfo.InvariantCulture, $"{EvidenceDocument.Second(windowStart).UtcDateTime:yyyyMMdd'T'HHmmss'Z'}-{store.Host}-{sequence:D4}");
+        var header = new DocumentHeader(documentId, session, store.Host, producerVersion, now, sequence, final, windowStart, windowEnd, [.. captures.Select(c => c.Target).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)]);
+        var reduced = Reducer.Reduce(captures, tables => PartCodec.Gzip(EvidenceDocument.Write(header, tables, [])).Length, detectionBudget);
+        var answerKey = plan.AnswerKey.ToList();
+        var gzip = PartCodec.Gzip(EvidenceDocument.Write(header, reduced.Tables, answerKey));
+        while (gzip.Length > RcaContract.MaximumDocumentBytes && answerKey.Count > 0)
+        {
+            // The answer key never shapes the detection tables: when it's over its reserve, it's what gives way.
+            var dropped = answerKey.Count - (answerKey.Count / 2);
+            answerKey = answerKey.Count > 1 ? answerKey[..(answerKey.Count / 2)] : [];
+            log.Warn("rca.answer-key-cut", "The answer key didn't fit its document; part of it was left out.", ("document", documentId), ("rows", dropped));
+            gzip = PartCodec.Gzip(EvidenceDocument.Write(header, reduced.Tables, answerKey));
+        }
+
+        store.WriteDocument(documentId, gzip);
+        var parts = PartCodec.PartCount(gzip.Length);
+        var sha256 = PartCodec.Sha256(gzip);
+        span.Export.Bound = true;
+        span.Export.SessionId = session;
+        foreach (var (target, through) in plan.Through)
+        {
+            if (!span.Export.Targets.TryGetValue(target, out var state))
+            {
+                span.Export.Targets[target] = state = new TargetExport();
+            }
+
+            state.ThroughUtc = through;
+            state.ReadBytes = plan.ReadBytes.GetValueOrDefault(target);
+        }
+
+        span.Export.AnswerKeyBytes = plan.AnswerKeyEnd;
+        span.Export.LastExportUtc = now;
+        span.Export.Documents.Add(documentId);
+        span.Export.Complete = span.Finished && plan.ConsumedAll;
+        EvidenceStore.WriteExport(span);
+
+        // The span is exported from here on: nothing below can fail.
+        use.Sequence = sequence;
+        use.Bytes += gzip.Length;
+        use.Parts += parts;
+        use.LastExportUtc = now;
+        log.Info("rca.exported", "Exported an evidence document.", ("document", documentId), ("session", key), ("parts", parts), ("bytes", gzip.Length), ("cuts", reduced.Cuts.Count));
+        return new SpanExported(new ExportedDocument(documentId, parts, sha256), session is null ? gzip.Length : 0, reduced.Warnings, reduced.Cuts.Count, plan.Captures.Sum(c => c.LateRows));
+    }
     private static string Message(string summary, List<string> notes, List<string> warnings)
     {
         var text = new StringBuilder(summary);
@@ -314,6 +358,8 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
         return plan;
     }
 
+    /// <summary>What one span's export made: its document, what it took of a sessionless budget, and what the index's message counts.</summary>
+    private sealed record SpanExported(ExportedDocument Document, int SessionlessBytes, IReadOnlyList<string> Warnings, int Cuts, int LateRows);
     private sealed class SpanPlan
     {
         public List<TargetCapture> Captures { get; } = [];

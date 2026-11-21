@@ -27,7 +27,7 @@ internal static partial class CommandLine
     {
         var command = new Command("rca", "The Incident RCA evidence (ADR 0031): export what the observer lane of 'profile run' captured, and print its parts.");
 
-        var export = new Command("export", "Reduce what the RCA observer captured since the previous export into evidence documents, and print their index: one line, DBHUBDEMO-RCA-INDEX <json>. Exit code 0, 2 when there's nothing to export, 1 when the export failed.");
+        var export = new Command("export", "Reduce what the RCA observer captured since the previous export into evidence documents, and print their index: one line, DBHUBDEMO-RCA-INDEX <json>. Exit code 0 (with a Warning when a span couldn't be exported, which the next export tries again), 2 when there's nothing to export, 1 when nothing could be exported.");
         var session = new Option<string>("--session") { Description = "The control session's ID (32 lowercase hex, the resource group's DbHubSessionId), or none outside a control session.", Required = true };
         var final = new Option<bool>("--final") { Description = "The session's end: wait for the observer to end its capture (at most --wait-seconds), and mark the documents final." };
         var wait = new Option<int>("--wait-seconds") { Description = "With --final, how long to wait for the observer to end its capture (0 to 300).", DefaultValueFactory = _ => 60 };
@@ -52,7 +52,7 @@ internal static partial class CommandLine
                 var store = new EvidenceStore(parseResult.GetValue(exportStore) ?? EvidenceStore.DefaultRoot, TimeProvider.System, secure: parseResult.GetValue(exportStore) is null);
                 var result = new Exporter(store, log, Program.GetVersion()).Export(text == "none" ? null : text, parseResult.GetValue(final), TimeSpan.FromSeconds(Math.Clamp(parseResult.GetValue(wait), 0, 300)));
                 output.WriteLine(result.IndexLine());
-                return Task.FromResult(result.Documents.Count > 0 ? ExitCodes.Success : ExitCodes.ManualActionRequired);
+                return Task.FromResult(result.Status == "Fail" ? ExitCodes.Failure : result.Documents.Count > 0 ? ExitCodes.Success : ExitCodes.ManualActionRequired);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
             {

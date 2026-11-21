@@ -326,6 +326,169 @@ public sealed class RcaExportTests : IDisposable
     }
 
     [Fact]
+    public void PastTheRowLimitTheReducerCutsInsteadOfThrowing()
+    {
+        // Review of 4e7817b: about 4 hours of sqlvm01's capture between exports passes 20,000 RCA Resource rows; the
+        // reducer measured the document before it checked the limit, and the encoder threw.
+        var store = Store(T1From, out var clock);
+        var span = store.Open(T1From);
+        span.Began("T1", T1From);
+        for (var i = 0; i < 20_100; i++)
+        {
+            span.Write(Resource(T1From.AddSeconds(i), 0));
+        }
+
+        span.Close(T1From.AddSeconds(20_100));
+        clock.Set(T1From.AddSeconds(20_100).AddMinutes(1));
+
+        var result = new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: true, TimeSpan.Zero);
+
+        var view = Decode(store, Assert.Single(result.Documents));
+        Assert.Empty(RcaSchemas.Errors(RcaSchemas.Evidence, view.Json));
+        Assert.InRange(view.Table("rca_resource").Count, 1, 10_050);
+        Assert.Contains("export budget: the sentinel's counter samples outside capture episodes thinned to 1 in 2", (string)Assert.Single(view.Table("rca_coverage"))["gaps"]!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PastTheStringLimitTheReducerCutsInsteadOfThrowing()
+    {
+        // 10,500 blocking rows, each with its own statement and wait resource: 21,000 strings, past a document's 20,000.
+        var store = Store(T1From, out var clock);
+        var span = store.Open(T1From);
+        span.Began("T1", T1From);
+        var random = new Random(11);
+        for (var i = 0; i < 10_500; i++)
+        {
+            span.Write(Blocked(T1From.AddSeconds(i), random).Set("wait_resource", "KEY: 5:72057594045071360 (" + Hex(random, 6) + ")"));
+        }
+
+        WriteSentinel(span, T1From, T1From.AddSeconds(10_500));
+        span.Close(T1From.AddSeconds(10_500));
+        clock.Set(T1From.AddSeconds(10_500).AddMinutes(1));
+
+        var result = new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: true, TimeSpan.Zero);
+
+        var view = Decode(store, Assert.Single(result.Documents));
+        Assert.Empty(RcaSchemas.Errors(RcaSchemas.Evidence, view.Json));
+        Assert.True(view.Strings.Count <= RcaContract.MaximumStrings);
+        Assert.Contains("export budget: blocking samples thinned to 1 in 2", (string)Assert.Single(view.Table("rca_coverage"))["gaps"]!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EvenPastItsEssentialsTheReducerMakesADocumentThatFits()
+    {
+        // The last cuts: 21,000 deadlocks with their graphs, past the row limit after every other cut. The graphs go, then
+        // the deadlocks are halved until the document fits its budget; the coverage row stays.
+        var from = T1From;
+        var rows = Enumerable.Range(0, 21_000).Select(i => new CaptureRow(RcaContract.Events, "T1", from.AddSeconds(i), "RCA-XE-01,RCA-XE-02")
+            .Set("event_time_utc", from.AddSeconds(i)).Set("target", "T1").Set("kind", "deadlock").Set("event_name", "xml_deadlock_report")
+            .Set("session_id", 60L + (i % 40)).Set("event_count", 1L).Set("deadlock_json", "{\"victim\":" + (60 + (i % 40)).ToString(CultureInfo.InvariantCulture) + ",\"n\":" + i.ToString(CultureInfo.InvariantCulture) + "}")
+            .Set("detail", "Deadlock " + i.ToString(CultureInfo.InvariantCulture) + ": a victim was chosen.")).ToList();
+        var to = from.AddSeconds(21_000);
+        var capture = new TargetCapture("T1", from, to, rows, [], [(from, to)]);
+        var header = new DocumentHeader("20261120T165000Z-sqlvm01-0001", Session, "sqlvm01", "1.0.0", to, 1, true, from, to, ["T1"]);
+        int Measure(Dictionary<string, List<CaptureRow>> tables) => PartCodec.Gzip(EvidenceDocument.Write(header, tables, [])).Length;
+
+        var reduced = Reducer.Reduce([capture], Measure, 20 * 1024);
+
+        Assert.True(EvidenceDocument.WithinLimits(reduced.Tables));
+        Assert.True(Measure(reduced.Tables) <= 20 * 1024);
+        var deadlocks = reduced.Tables[RcaContract.Events];
+        Assert.InRange(deadlocks.Count, 1, 10_500);
+        Assert.All(deadlocks, d => Assert.Null(d.Get("deadlock_json")));
+        Assert.Equal(from, deadlocks[0].At);
+        var gaps = (string)Assert.Single(reduced.Tables[RcaContract.Coverage]).Get("gaps")!;
+        Assert.Contains("export budget: the graphs of 21000 deadlock(s) left out", gaps, StringComparison.Ordinal);
+        Assert.Contains("export budget: deadlock rows halved (10500 of 21000 kept).", gaps, StringComparison.Ordinal);
+        Assert.Equal(21_000, rows.Count(r => r.Get("deadlock_json") is not null));
+    }
+
+    [Fact]
+    public void AFailingSpanIsAWarningAndTheSpansAroundItStillExportAndAreIndexed()
+    {
+        // Review of 4e7817b: a span the export couldn't make a document of stopped the export, so the spans after it
+        // waited forever, and the documents it had already written were marked exported but missing from the index.
+        var store = Store(T1From, out var clock);
+        SpanWriter Span(DateTimeOffset from, bool broken)
+        {
+            var span = store.Open(from);
+            span.Began("T1", from);
+            WriteSentinel(span, from, from.AddMinutes(5));
+            if (broken)
+            {
+                // A row without its required metric: the encoder refuses the span's document.
+                span.Write(new CaptureRow(RcaContract.Resource, "T1", from.AddMinutes(1), "RCA-SQL-09").Set("at_utc", from.AddMinutes(1)).Set("target", "T1").Set("source", "RCA-SQL-09").Set("value", 1.0));
+            }
+
+            span.Close(from.AddMinutes(5));
+            return span;
+        }
+
+        var good = Span(T1From, broken: false);
+        var bad = Span(T1From.AddMinutes(10), broken: true);
+        var later = Span(T1From.AddMinutes(20), broken: false);
+        clock.Set(T1From.AddMinutes(30));
+        var exporter = new Exporter(store, RunnerLog.Null, "1.0.0");
+
+        var result = exporter.Export(Session, final: true, TimeSpan.Zero);
+
+        Assert.Equal("Warning", result.Status);
+        Assert.Equal(["20261120T165000Z-sqlvm01-0001", "20261120T171000Z-sqlvm01-0002"], result.Documents.Select(d => d.DocumentId));
+        Assert.All(result.Documents, d => Assert.Empty(RcaSchemas.Errors(RcaSchemas.Evidence, Decode(store, d).Json)));
+        Assert.Contains($"Span {bad.Id} couldn't be exported (rca_resource.metric is required, and a row has no value.); the next export tries it again.", result.Message, StringComparison.Ordinal);
+        Assert.Empty(RcaSchemas.Errors(RcaSchemas.Transport, result.IndexLine()[(RcaContract.IndexMarker.Length + 1)..]));
+        var spans = store.Spans().ToDictionary(s => s.Id);
+        Assert.True(spans[good.Id].Export.Complete);
+        Assert.False(spans[bad.Id].Export.Bound);
+        Assert.Empty(spans[bad.Id].Export.Documents);
+        Assert.True(spans[later.Id].Export.Complete);
+
+        // With nothing else to export, the span that still fails is a Fail, and the command's exit code says so.
+        var again = exporter.Export(Session, final: true, TimeSpan.Zero);
+        var (exit, output, _) = CliHarness.Invoke("rca", "export", "--session", Session, "--rca-store", root);
+
+        Assert.Equal("Fail", again.Status);
+        Assert.Empty(again.Documents);
+        Assert.StartsWith("No evidence document was exported. Span " + bad.Id, again.Message, StringComparison.Ordinal);
+        Assert.Equal(1, exit);
+        Assert.Contains("\"status\":\"Fail\"", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExportsOutsideAControlSessionEachHaveTheBudgetToThemselves()
+    {
+        // Review of 4e7817b: every rca export --session none added to one running total that was never reset, so after
+        // about 56 KiB on sqlvm01 (24 KiB in T2's guest) each sessionless document was cut to the 2 KiB minimum.
+        var store = Store(T1From, out var clock);
+        var span = store.Open(T1From);
+        span.Began("T1", T1From);
+        var exporter = new Exporter(store, RunnerLog.Null, "1.0.0");
+        var random = new Random(5);
+        var sizes = new List<int>();
+        for (var export = 0; export < 6; export++)
+        {
+            var from = T1From.AddMinutes(10 * export);
+            WriteSentinel(span, from, from.AddMinutes(10));
+            for (var i = 0; i < 600; i++)
+            {
+                span.Write(Blocked(from.AddSeconds(i), random));
+            }
+
+            Watermark(span, clock, from.AddMinutes(10));
+            var document = Assert.Single(exporter.Export(null, final: false, TimeSpan.Zero).Documents);
+            var view = Decode(store, document);
+
+            Assert.Null(view.Root["sessionId"]);
+            Assert.Equal(600, view.Table("rca_sessions").Count);
+            Assert.Null(Assert.Single(view.Table("rca_coverage")).GetValueOrDefault("gaps"));
+            sizes.Add(store.ReadDocument(document.DocumentId)!.Length);
+        }
+
+        // Together they're past what one session's budget allows on a host that observes one target.
+        Assert.True(sizes.Sum() > Exporter.SingleTargetBudget, string.Join(", ", sizes));
+    }
+
+    [Fact]
     public void IdenticalEventsInAMinuteBecomeOneCountedRowAndOthersStayAsTheyAre()
     {
         var minute = new DateTimeOffset(2026, 11, 20, 16, 53, 0, TimeSpan.Zero);
@@ -678,6 +841,19 @@ public sealed class RcaExportTests : IDisposable
     private static CaptureRow Resource(DateTimeOffset at, double value) =>
         new CaptureRow(RcaContract.Resource, "T1", at, "RCA-SQL-09", sentinel: true)
             .Set("at_utc", at).Set("target", "T1").Set("source", "RCA-SQL-09").Set("metric", "processes_blocked").Set("value", value).Set("unit", "count");
+
+    /// <summary>A session blocked by session 60, with a statement of its own: one string the dictionary can't share.</summary>
+    private static CaptureRow Blocked(DateTimeOffset at, Random random) =>
+        new CaptureRow(RcaContract.Sessions, "T1", at, "RCA-SQL-01,RCA-SQL-02")
+            .Set("captured_at_utc", at).Set("target", "T1").Set("session_id", 61L).Set("blocked_by", "60").Set("wait_type", "LCK_M_U").Set("is_demo", true)
+            .Set("statement_text", "UPDATE care.work_queues SET note = ? WHERE id = @id" + Hex(random, 8));
+
+    private static string Hex(Random random, int bytes)
+    {
+        var buffer = new byte[bytes];
+        random.NextBytes(buffer);
+        return Convert.ToHexStringLower(buffer);
+    }
 
     private static CaptureRow Capture(DateTimeOffset at, string name, string code) =>
         new CaptureRow(RcaContract.Events, "T1", at, "observer")

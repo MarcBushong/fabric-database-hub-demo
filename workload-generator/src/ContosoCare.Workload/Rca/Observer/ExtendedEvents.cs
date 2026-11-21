@@ -27,6 +27,43 @@ internal sealed record XeEvent(string Name, DateTimeOffset At, IReadOnlyDictiona
 /// <summary>What one read of the ring buffer returned.</summary>
 internal sealed record XeRead(IReadOnlyList<XeEvent> Events, bool Truncated, long Dropped);
 
+/// <summary>
+/// The events a source returned that the observer already kept (or left out), by fingerprint, so it writes none of them
+/// twice however long the source keeps returning it: the ring buffer holds an event until 5,000 newer ones or its memory
+/// push it out. Forgetting keeps the memory bounded, and nothing at or before the newest forgotten event is new again.
+/// </summary>
+internal sealed class SeenEvents
+{
+    private readonly Dictionary<string, DateTimeOffset> seen = new(StringComparer.Ordinal);
+
+    /// <summary>The newest time of an event forgotten so far: an event at or before it is never taken as new.</summary>
+    public DateTimeOffset ForgottenThrough { get; private set; } = DateTimeOffset.MinValue;
+
+    public int Count => seen.Count;
+
+    /// <summary>True the first time an event is offered; false when it was offered before, or isn't after what was forgotten.</summary>
+    public bool Add(XeEvent item) => item.At > ForgottenThrough && seen.TryAdd(item.Fingerprint, item.At);
+
+    /// <summary>Forgets the events <paramref name="forget"/> picks, by fingerprint and event time.</summary>
+    public void Forget(Func<string, DateTimeOffset, bool> forget)
+    {
+        foreach (var (fingerprint, at) in seen.Where(e => forget(e.Key, e.Value)).ToList())
+        {
+            seen.Remove(fingerprint);
+            if (at > ForgottenThrough)
+            {
+                ForgottenThrough = at;
+            }
+        }
+    }
+
+    public void Clear()
+    {
+        seen.Clear();
+        ForgottenThrough = DateTimeOffset.MinValue;
+    }
+}
+
 /// <summary>A deadlock graph reduced to what the rules read (rca/README.md, Deadlocks).</summary>
 internal sealed record DeadlockSummary(bool InDatabase, long? Victim, ReducedName VictimName, string? VictimLogin, string? VictimHost, string? VictimModule, string? FirstObject, int Processes, int Resources, string Json);
 

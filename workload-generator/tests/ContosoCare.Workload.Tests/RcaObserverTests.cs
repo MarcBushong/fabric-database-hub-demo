@@ -1,3 +1,4 @@
+using System.Globalization;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca.Observer;
@@ -138,6 +139,57 @@ public sealed class RcaObserverTests
         // The lock timeouts' counter agrees: its deltas add up to the 30 events.
         Assert.Equal(30, sink.Table("rca_resource").Where(r => (string?)r.Get("metric") == "lock_timeouts").Sum(r => (double)r.Get("value")!));
         Assert.DoesNotContain(sink.Table("rca_events"), r => r.At == At(16, 51, 0));
+    }
+
+    [Theory]
+    [InlineData("T1")]
+    [InlineData("T3")]
+    public async Task InA90MinuteSessionEachEventIsWrittenOnceWhileTheRingBufferStillReturnsIt(string target)
+    {
+        // Review of 4e7817b (High): the observer forgot an event 20 minutes after it while the ring buffer, which keeps up
+        // to 5,000 events, still returned it, and wrote it again at every sentinel after: at 45 minutes, T1's 30 lock
+        // timeouts had become 1,113 rows and its 4 escalations 160. T3's database-scoped session (RCA-XE-04) too.
+        var clock = new ManualTime(T1From);
+        var t3 = target == "T3";
+        IEnumerable<string> Deadlock(DateTimeOffset now) => now >= At(16, 55, 1) ? [DeadlockReport(At(16, 55, 0), t3 ? "database_xml_deadlock_report" : "xml_deadlock_report")] : [];
+        var connector = t3 ? T1AsT3(clock, Deadlock) : RcaSimulation.T1(clock, Deadlock);
+        var observer = new SqlTargetObserver(target, t3 ? DemoTarget.T3 : DemoTarget.T1, connector, Options(), RunnerLog.Null);
+        var sink = new MemorySink();
+
+        await DriveAsync([observer], sink, clock, T1From, T1From.AddMinutes(90), TestContext.Current.CancellationToken);
+
+        Assert.Contains(connector.Calls, c => c.BlockId == (t3 ? "RCA-XE-04" : "RCA-XE-02") && c.Text == CaptureCatalog.Get(c.BlockId));
+        Assert.Equal(TimeoutMinutes.SelectMany(m => Enumerable.Range(0, 6).Select(i => m.AddSeconds(5 + (i * 9)))), sink.Events("error").Select(e => e.At));
+        Assert.Equal(Escalations, sink.Events("escalation").Select(e => e.At));
+        Assert.Equal(At(16, 55, 0), Assert.Single(sink.Events("deadlock")).At);
+    }
+
+    [Fact]
+    public async Task AnEventATruncatedReadLeftOutIsRememberedAndNeverWrittenAgain()
+    {
+        // A read of a ring buffer past 4 MB of XML leaves out what didn't fit, which the buffer may still hold (Learn:
+        // ring_buffer target): the observer remembers such an event for 20 minutes, and once it has forgotten one, it
+        // never writes it again when a later read returns it.
+        var clock = new ManualTime(T1From);
+        static string Timeout(DateTimeOffset at, int session) =>
+            Event("error_reported", at, [("error_number", "1222", null), ("severity", "16", null), ("is_intercepted", "true", null), ("message", "Lock request time out period exceeded.", null)], [("client_app_name", ChainApp), ("session_id", session.ToString(CultureInfo.InvariantCulture))]);
+        var first = Timeout(T1From.AddSeconds(10), 64);
+        var second = Timeout(T1From.AddSeconds(90), 65);
+        var connector = new ScriptedConnector((block, _) => block switch
+        {
+            "RCA-XE-02" => [Row(("target_data", clock.Now < T1From.AddMinutes(2)
+                ? RingBuffer([first])
+                : clock.Now < T1From.AddMinutes(40) ? RingBuffer([second]).Replace("truncated=\"0\"", "truncated=\"1\"", StringComparison.Ordinal) : RingBuffer([first, second])))],
+            _ => [],
+        });
+        var sink = new MemorySink();
+
+        await DriveAsync([T1Observer(connector)], sink, clock, T1From, T1From.AddMinutes(60), TestContext.Current.CancellationToken);
+
+        Assert.Equal([T1From.AddSeconds(10), T1From.AddSeconds(90)], sink.Events("error").Select(e => e.At));
+
+        // While reads stay truncated, each 10 minutes have their gap, so every export window that has them says so.
+        Assert.Equal([At(16, 52, 0), At(17, 2, 0), At(17, 12, 0), At(17, 22, 0)], sink.Notes.Where(n => n.Kind == NoteKind.Gap && n.Text.Contains("4 MB of XML", StringComparison.Ordinal)).Select(n => n.At));
     }
 
     [Fact]
