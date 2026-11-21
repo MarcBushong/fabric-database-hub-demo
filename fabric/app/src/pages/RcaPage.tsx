@@ -1,7 +1,8 @@
 // The Root cause view (ADR 0031): the incidents the blind detector found in the history, and for the one selected, its root
 // cause with the evidence and times, the blocking chain head blocker first, the timeline, the errors, the recommendations,
 // the next steps, and what wasn't captured. It reads only what a DBA's tools would show: the RCA capture, Database Hub's
-// telemetry, and Azure Monitor's metrics. Shown only when the history model has the RCA tables.
+// telemetry, and Azure Monitor's metrics. Shown when the history model has the RCA tables, and while their check has failed,
+// to say so with Try again.
 
 import { useContext, useEffect, useMemo, useState } from "react";
 import { Button, Spinner } from "@fluentui/react-components";
@@ -38,22 +39,26 @@ const asResult = (value: InvestigationResult | string): InvestigationResult => {
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 export default function RcaPage() {
-    const { view, setView, provenance, meta, rca } = useApp();
+    const { view, setView, provenance, meta, rca, rcaError, rcaRetrying, retryRca } = useApp();
     const queryClient = useContext(QueryClientContext);
     const copilot = useCopilot();
     const client = useMemo(() => (queryClient ? createRcaClient(queryClient) : null), [queryClient]);
     const selection = useMemo(() => parseSelection(view.incident), [view.incident]);
     const [list, setList] = useState<Keyed<InvestigationResult> | null>(null);
     const [report, setReport] = useState<Keyed<{ incident: InvestigationResult; errors: InvestigationResult | null; logs: DaxLog[] }> | null>(null);
+    // Try again after a read that failed, also once its retries ran out (src/data/retry.ts): each try is a new key.
+    const [listTry, setListTry] = useState(0);
+    const [reportTry, setReportTry] = useState(0);
 
     // The incidents in the selected window, or in the history's newest 90 minutes.
-    const listKey = JSON.stringify(selection?.kind === "window" ? { from: selection.from.toISOString(), to: selection.to.toISOString(), targets: [selection.target] } : {});
+    const listArgs = JSON.stringify(selection?.kind === "window" ? { from: selection.from.toISOString(), to: selection.to.toISOString(), targets: [selection.target] } : {});
+    const listKey = `${listArgs}#${listTry}`;
     useEffect(() => {
         if (rca !== true || !client) return;
         let alive = true;
         client
             .tools()
-            .then((tools) => tools.investigate("find_incidents", JSON.parse(listKey) as Record<string, unknown>))
+            .then((tools) => tools.investigate("find_incidents", JSON.parse(listArgs) as Record<string, unknown>))
             .then(asResult)
             .then(
                 (value) => alive && setList({ key: listKey, value }),
@@ -62,7 +67,7 @@ export default function RcaPage() {
         return () => {
             alive = false;
         };
-    }, [client, listKey, rca]);
+    }, [client, listArgs, listKey, rca]);
 
     const listed = list && list.key === listKey ? list : null;
     // The incidents with the richest evidence first: the capture's own (a blocking chain, the replica's stall), then the
@@ -75,8 +80,9 @@ export default function RcaPage() {
     const selected = episodes.find((e) => e.key === selectedKey) ?? null;
     const fallbackTarget = selection?.target ?? "T1";
 
+    const reportKey = selectedKey ? `${selectedKey}#${reportTry}` : null;
     useEffect(() => {
-        if (rca !== true || !client || !selectedKey) return;
+        if (rca !== true || !client || !selectedKey || !reportKey) return;
         let alive = true;
         (async () => {
             client.drainLogs();
@@ -92,15 +98,15 @@ export default function RcaPage() {
             });
             return { incident, errors: typeof errors === "string" ? null : errors, logs: client.drainLogs() };
         })().then(
-            (value) => alive && setReport({ key: selectedKey, value }),
-            (err: unknown) => alive && setReport({ key: selectedKey, error: message(err) }),
+            (value) => alive && setReport({ key: reportKey, value }),
+            (err: unknown) => alive && setReport({ key: reportKey, error: message(err) }),
         );
         return () => {
             alive = false;
         };
-    }, [client, rca, selectedKey, fallbackTarget]);
+    }, [client, rca, selectedKey, reportKey, fallbackTarget]);
 
-    const shown = report && report.key === selectedKey ? report : null;
+    const shown = report && report.key === reportKey ? report : null;
     const logs = shown?.value?.logs ?? [];
     const explain = () => {
         if (!selectedKey) return;
@@ -129,6 +135,22 @@ export default function RcaPage() {
                 </p>
             </EmptyState>
         );
+    } else if (rcaError) {
+        // The check failed, also after its retries: it says nothing about the capture, so this never reads as "none recorded".
+        body = (
+            <EmptyState
+                icon={<Warning20Regular />}
+                title="The history couldn't be read"
+                actions={
+                    <Button appearance="primary" disabledFocusable={!!rcaRetrying} icon={rcaRetrying ? <Spinner size="tiny" /> : undefined} onClick={retryRca}>
+                        {rcaRetrying ? "Trying again" : "Try again"}
+                    </Button>
+                }
+            >
+                <p>Whether it holds the Incident RCA's capture isn't known: checking failed, also after waiting and trying again.</p>
+                <p>{rcaError}</p>
+            </EmptyState>
+        );
     } else if (rca !== true || !listed) {
         body = (
             <div className="page-loading">
@@ -137,7 +159,14 @@ export default function RcaPage() {
         );
     } else if (!listed.value) {
         body = (
-            <EmptyState title="The incidents couldn't load">
+            <EmptyState
+                title="The incidents couldn't load"
+                actions={
+                    <Button appearance="primary" onClick={() => setListTry((n) => n + 1)}>
+                        Try again
+                    </Button>
+                }
+            >
                 <p>{listed.error}</p>
             </EmptyState>
         );
@@ -192,7 +221,14 @@ export default function RcaPage() {
                     ) : shown?.value ? (
                         <RcaReport incident={shown.value.incident} errors={shown.value.errors} timeZone={timeZone} logs={logs} />
                     ) : shown?.error ? (
-                        <EmptyState title="This incident couldn't be explained">
+                        <EmptyState
+                            title="This incident couldn't be explained"
+                            actions={
+                                <Button appearance="primary" onClick={() => setReportTry((n) => n + 1)}>
+                                    Try again
+                                </Button>
+                            }
+                        >
                             <p>{shown.error}</p>
                         </EmptyState>
                     ) : (

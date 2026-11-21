@@ -5,8 +5,9 @@
 
 import { toBins, toCosmosCapture, toPostgresCapture, toWaitBins, withCategoryWaits } from "@/data/model";
 import { incidentSeriesQuery, incidentWaitsQuery, type QuerySpec } from "@/data/queries";
+import { isMissingInModel } from "@/data/retry";
 import { SQL_TARGETS } from "@/lib/dax";
-import { loadEvidence, MONITOR_ROW_LIMIT, rcaMonitorDax, type DaxLog } from "./loader";
+import { loadEvidence, MONITOR_ROW_LIMIT, RcaReadError, rcaMonitorDax, type DaxLog } from "./loader";
 import { toDate } from "./rows";
 import type { Telemetry } from "./tools";
 import type { Evidence, RcaTarget } from "./types";
@@ -43,7 +44,8 @@ function hash(text: string): string {
 export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): RcaSources {
     const spec = (title: string, dax: string, rowLimit: number): QuerySpec => ({ id: `rca-${hash(dax)}`, title, dax, rowLimit, columns: [] });
 
-    /** One telemetry query, logged; a failure leaves its part empty, and the investigations say what they didn't have. */
+    /** One telemetry query, logged. A read that fails (Telemetry Snapshots is in every model) fails the window's
+     *  investigation (RcaReadError), so its part never reads as quiet. */
     async function read(table: string, query: QuerySpec): Promise<Row[]> {
         const started = Date.now();
         try {
@@ -52,7 +54,8 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
             return rows;
         } catch (err) {
             onDax?.({ table, query: query.dax, rows: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
-            return [];
+            if (isMissingInModel(err)) return [];
+            throw new RcaReadError([{ table, error: err }]);
         }
     }
 

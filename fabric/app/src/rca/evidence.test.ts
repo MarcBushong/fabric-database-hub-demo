@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { QueryFailure } from "@/data/query-client";
 import { decodeEvidence, EvidenceFormatError } from "./evidence";
-import { loadEvidence, rcaDax, RCA_PRESENCE_DAX, type DaxLog } from "./loader";
+import { loadEvidence, rcaDax, RCA_PRESENCE_DAX, RcaReadError, type DaxLog } from "./loader";
 import { RCA_SPEC, PHASE_1_TABLES, type RcaTableKey } from "./spec";
 import { fixtureEvidence, FIXTURES, namesAScenario, readContract } from "./testdata/contract";
 import type { Evidence } from "./types";
@@ -100,16 +101,39 @@ describe("the DAX loader", () => {
         expect(got.coverage).toEqual(expected.coverage);
     });
 
-    it("leaves a failing table empty and says so, and reads the others", async () => {
+    it("leaves a table the model doesn't have empty and says so, and reads the others", async () => {
         const logs: DaxLog[] = [];
+        // Execute Queries' answer on a model without the table (live, 2026-11-21, a model from before the Incident RCA).
         const runDax = async (query: string) => {
-            if (query.includes("'RCA Replica',")) throw new Error("The model rejected the query.");
+            if (query.includes("'RCA Replica',")) throw new QueryFailure("The model rejected the query: Query (1, 101) Cannot find table '<oii>RCA Replica</oii>'.", "query");
             return [];
         };
         const got = await loadEvidence(runDax, at("17:00:00"), at("17:20:00"), ["T4-replica"], { onDax: (l) => logs.push(l) });
         expect(got.replica).toEqual([]);
-        expect(logs.find((l) => l.table === "RCA Replica")?.error).toMatch(/rejected/);
+        expect(logs.find((l) => l.table === "RCA Replica")?.error).toMatch(/Cannot find table/);
         expect(logs.filter((l) => !l.error)).toHaveLength(PHASE_1_TABLES.length - 1);
+    });
+
+    // Live, 2026-11-21: Power BI's Execute Queries answered 429 to the app's reads. An empty table there would read as
+    // nothing captured.
+    it("fails the load when a read fails, also after its retries, with every table logged and the failed ones named", async () => {
+        const logs: DaxLog[] = [];
+        const throttled = new QueryFailure("Fabric couldn't run the query: You have exceeded the amount of requests allowed in the current time frame and further requests will fail. Retry in 60 seconds.", "api", "429");
+        const runDax = async (query: string) => {
+            if (query.includes("'RCA Replica',") || query.includes("'RCA Events',")) throw throttled;
+            return [];
+        };
+        const load = loadEvidence(runDax, at("17:00:00"), at("17:20:00"), ["T4-replica"], { onDax: (l) => logs.push(l) });
+        await expect(load).rejects.toBeInstanceOf(RcaReadError);
+        await expect(load).rejects.toMatchObject({ tables: expect.arrayContaining(["RCA Replica", "RCA Events"]) });
+        await expect(load).rejects.toThrow(/^The history couldn't be read, so nothing is concluded from it \(RCA (?:Replica, RCA Events|Events, RCA Replica): Fabric couldn't run the query: .*Retry in 60 seconds\.\)\. Try again in a minute: Power BI allows each viewer 120 queries a minute\.$/);
+        expect(logs).toHaveLength(PHASE_1_TABLES.length);
+        expect(logs.filter((l) => l.error).map((l) => l.table).sort()).toEqual(["RCA Events", "RCA Replica"]);
+        // A query the model rejected for another reason fails it too, with no promise that waiting helps.
+        const rejected = loadEvidence(async () => {
+            throw new QueryFailure("The model rejected the query: syntax error", "query");
+        }, at("17:00:00"), at("17:20:00"), ["T1"]);
+        await expect(rejected).rejects.toThrow(/syntax error\)\.$/);
     });
 
     it("never queries the answer key (rca/blind-detection.json)", async () => {

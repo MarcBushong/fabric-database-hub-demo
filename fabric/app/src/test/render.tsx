@@ -235,6 +235,10 @@ export interface RenderOptions {
     runtime?: Partial<AppRuntime>;
     /** Whether the history model has the Incident RCA's tables (ADR 0031); unknown when absent, as before the model answers. */
     rca?: boolean | null;
+    /** Why the check of the RCA tables failed, after its retries, whether a Try again is running, and what it calls. */
+    rcaError?: string | null;
+    rcaRetrying?: boolean;
+    retryRca?: () => void;
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
@@ -262,6 +266,9 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
         notify,
         manage: options.manage ?? MANAGE_READ_ONLY,
         ...(options.rca !== undefined ? { rca: options.rca } : {}),
+        ...(options.rcaError !== undefined ? { rcaError: options.rcaError } : {}),
+        ...(options.rcaRetrying !== undefined ? { rcaRetrying: options.rcaRetrying } : {}),
+        ...(options.retryRca ? { retryRca: options.retryRca } : {}),
     };
     const copilot: CopilotApi = { open: vi.fn(), ask: vi.fn() };
     const client = options.client ?? fakeQueryClient();

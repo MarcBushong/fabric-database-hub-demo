@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ANSWER_KEY_TABLES } from "@/copilot/answer-key";
+import { QueryFailure } from "@/data/query-client";
 import type { QuerySpec } from "@/data/queries";
-import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
+import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
 import { createRcaSources, newestCapturePerBin } from "./sources";
 import { createInvestigationTools } from "./tools";
 
@@ -63,5 +64,21 @@ describe("the investigations' sources", () => {
         const result = await tools.investigate("explain_errors", {});
         expect(typeof result === "string" ? result : result.window).toMatchObject({ fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" });
         expect(typeof result === "string" ? [] : result.notCaptured).toContain("RCA Events: the window holds more rows than one query returns, so its latest rows weren't read; ask about a narrower window");
+    });
+
+    // Live, 2026-11-21: Power BI answered 429 to the app's reads. A telemetry read that failed left its part empty, so the
+    // window could read as quiet.
+    it("fail the window's telemetry when a read fails, never leaving it quiet, and leave out only what the model doesn't have", async () => {
+        const throttled = new QueryFailure("Fabric couldn't run the query: You have exceeded the amount of requests allowed in the current time frame and further requests will fail. Retry in 60 seconds.", "api", "429");
+        const failing = createRcaSources(async () => {
+            throw throttled;
+        });
+        const read = failing.telemetry(at("17:00"), at("17:20"), ["T1", "T4-replica"]);
+        await expect(read).rejects.toBeInstanceOf(RcaReadError);
+        await expect(read).rejects.toThrow(/^The history couldn't be read, so nothing is concluded from it \(Telemetry Snapshots(?: \(Azure Monitor\))?: Fabric couldn't run the query: /);
+        const older = createRcaSources(async () => {
+            throw new QueryFailure("The model rejected the query: Query (1, 20) Column '<oii>Metric</oii>' in table '<oii>Telemetry Snapshots</oii>' cannot be found or may not be used in this expression.", "query");
+        });
+        await expect(older.telemetry(at("17:00"), at("17:20"), ["T4-replica"])).resolves.toMatchObject({ bins: [] });
     });
 });

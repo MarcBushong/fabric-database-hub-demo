@@ -65,6 +65,12 @@ export interface AppContextValue {
     manage: ManageAccess;
     /** Whether the history model has the Incident RCA's tables (ADR 0031): true or false once known, null or absent before. */
     rca?: boolean | null;
+    /** Why the check of the RCA tables failed, after its retries: rca stays null, and Root cause offers retryRca. */
+    rcaError?: string | null;
+    /** Whether a Try again of that check is running: the failure stays shown until it answers. */
+    rcaRetrying?: boolean;
+    /** Checks for the RCA tables again. */
+    retryRca?: () => void;
 }
 
 export const AppContext = createContext<AppContextValue | null>(null);

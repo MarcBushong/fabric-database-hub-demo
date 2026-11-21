@@ -2,12 +2,36 @@
 // through the history connector's executeQuery (as run_dax does), mapped to evidence rows by the model's columns.
 // Detection reads only the detection tables and the telemetry: never the answer key (rca/blind-detection.json).
 
+import { isMissingInModel, retryHint } from "@/data/retry";
 import { ROW_MAPPERS } from "./rows";
 import { PHASE_1_TABLES, RCA_SPEC, TARGET_KEY, type RcaTableKey } from "./spec";
 import { emptyEvidence, type Evidence, type RcaTarget } from "./types";
 
 /** Rows of one DAX query, keyed by the model's column names (src/data/query-client.ts normalizes them). */
 export type RunDax = (query: string, rowLimit: number) => Promise<Array<Record<string, unknown>>>;
+
+/**
+ * Reads of the history that failed, after the retries a throttled or failed read gets (src/data/retry.ts): what the
+ * window holds isn't known, so nothing is concluded from it, and nothing reads as "not captured" or "nothing abnormal"
+ * (live, 2026-11-21: Power BI's Execute Queries answered 429 to the app's reads).
+ */
+export class RcaReadError extends Error {
+    /** The tables, or telemetry, that couldn't be read. */
+    readonly tables: string[];
+
+    constructor(failures: ReadonlyArray<{ table: string; error: unknown }>) {
+        const byText = new Map<string, string[]>();
+        for (const { table, error } of failures) {
+            const text = error instanceof Error ? error.message : String(error);
+            byText.set(text, [...(byText.get(text) ?? []), table]);
+        }
+        const what = [...byText].map(([text, tables]) => `${[...new Set(tables)].join(", ")}: ${text}`).join("; ");
+        const hint = retryHint(failures.map((f) => f.error));
+        super(`The history couldn't be read, so nothing is concluded from it (${what}).${hint ? ` ${hint}` : ""}`);
+        this.name = "RcaReadError";
+        this.tables = [...new Set(failures.map((f) => f.table))];
+    }
+}
 
 /** The most rows one table returns per 30 minutes of window; a 30-minute window of 10-second chains is about 1,000. */
 export const RCA_ROW_LIMIT = 2000;
@@ -101,13 +125,15 @@ export interface LoadOptions {
 }
 
 /**
- * The window's evidence from the history model. A table that fails is left empty and logged, so one missing table
- * (an older model, Phase 2's waits) never hides the rest; the coverage rows say what was captured.
+ * The window's evidence from the history model. A table the model doesn't have (an older model, Phase 2's waits) is left
+ * empty and logged, so it never hides the rest; the coverage rows say what was captured. Any other read that fails is
+ * logged too, and then fails the load (RcaReadError), because an empty table there would read as nothing captured.
  */
 export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets: readonly RcaTarget[], options: LoadOptions = {}): Promise<Evidence> {
     const evidence = emptyEvidence();
     const tables = options.tables ?? PHASE_1_TABLES;
     const limit = rcaRowLimit(from, to);
+    const failed: Array<{ table: string; error: unknown }> = [];
     await Promise.all(
         tables.map(async (key) => {
             const spec = RCA_SPEC[key];
@@ -123,8 +149,10 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
                 options.onDax?.({ table: spec.model, query, rows: rows.length, ms: Date.now() - started });
             } catch (err) {
                 options.onDax?.({ table: spec.model, query, rows: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
+                if (!isMissingInModel(err)) failed.push({ table: spec.model, error: err });
             }
         }),
     );
+    if (failed.length > 0) throw new RcaReadError(failed);
     return evidence;
 }

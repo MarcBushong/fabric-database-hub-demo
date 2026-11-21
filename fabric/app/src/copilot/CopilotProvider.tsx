@@ -11,6 +11,7 @@ import type { AskContext, CopilotAccountState, CopilotApi, CopilotDockState } fr
 import { clearConversation, contextPrompt, endedWithoutAnswer, loadAskSettings, loadConversation, recap, reduceConversation, retryPrompt, saveConversation, toMarkdown, type AskSettings, type ConversationAction } from "./conversation";
 import type { EstateView } from "./estate";
 import { clearSession, deviceStartOf, fromPoll, GITHUB_DEVICE_PAGE, loadSession, renewSession, saveSession, SESSION_KEY, sessionState, waitForDeviceToken, type DeviceCode, type GitHubSession } from "./github-session";
+import type { RcaCheck } from "./investigations";
 import { describeAskError, planLabel } from "./messages";
 import { ChatConnection, isTransient, RelayClient, RelayError, type GitHubUser, type RelayEvent } from "./relay";
 import { COSMOS_PROBE_DAX } from "./starters";
@@ -152,17 +153,26 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         );
     }, [isOpen, queryClient, relay]);
 
-    // Whether the history model has the Incident RCA's tables (ADR 0031), asked once, when the dock first opens or a
-    // conversation starts: with them, the dock offers the investigation starters, and each conversation the tools and the
-    // playbook. A model from before the feature, or a failed check, leaves them out, and the chat answers from the telemetry.
+    // Whether the history model has the Incident RCA's tables (ADR 0031), asked when the dock first opens or a conversation
+    // starts: with them, the dock offers the investigation starters, and each conversation the tools and the playbook. A
+    // model from before the feature leaves them out. A check that failed, after its retries (src/data/retry.ts), says
+    // nothing about the model: it leaves them out of this conversation only, and the next one asks again.
     const [rcaHistory, setRcaHistory] = useState(false);
     const rcaProbe = useRef<Promise<boolean> | null>(null);
     const probeRca = useCallback((): Promise<boolean> => {
         if (!queryClient) return Promise.resolve(false);
-        rcaProbe.current ??= import("./investigations").then(
-            (m) => m.hasRcaTables(queryClient),
-            () => false,
-        );
+        if (!rcaProbe.current) {
+            const kept: Promise<boolean> = import("./investigations")
+                .then(
+                    (m) => m.checkRcaTables(queryClient),
+                    (): RcaCheck => ({ state: "failed", error: "The chat's modules didn't load." }),
+                )
+                .then((check) => {
+                    if (check.state === "failed" && rcaProbe.current === kept) rcaProbe.current = null;
+                    return check.state === "present";
+                });
+            rcaProbe.current = kept;
+        }
         return rcaProbe.current;
     }, [queryClient]);
     useEffect(() => {
@@ -341,6 +351,8 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }, { createInvestigations }] = await loadChatModules();
                 const rca = await probeRca();
+                // The starters follow what this conversation's check found, also when an earlier check had failed.
+                setRcaHistory(rca);
                 if (stale()) throw newChatStarted();
                 // A conversation that learned the live view isn't available doesn't offer it again, even on a new session;
                 // nor does one that starts while Database Hub refuses the app as a whole, by the latest reads (liveOffNow).

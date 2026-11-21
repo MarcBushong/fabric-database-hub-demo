@@ -3,9 +3,10 @@
 
 import type { QueryClient } from "@/data/query-client";
 import { createRcaClient } from "@/rca/client";
+import { RcaReadError } from "@/rca/loader";
 import type { DaxRun, ToolOutcome } from "./tools";
 
-export { dayIn, hasRcaTables, NEWEST_BIN_DAX } from "@/rca/client";
+export { checkRcaTables, dayIn, NEWEST_BIN_DAX, type RcaCheck } from "@/rca/client";
 
 export interface InvestigationOptions {
     /** The viewer's time zone; the browser's by default. */
@@ -35,9 +36,14 @@ export function createInvestigations(client: QueryClient, options: Investigation
             }),
     });
     return {
+        /** Always answers: Copilot waits for each tool's result, so a read that failed comes back as that, never unanswered. */
         async run(name: string, args: unknown): Promise<ToolOutcome> {
-            const tools = await rca.tools();
-            return tools.run(name, args);
+            try {
+                const tools = await rca.tools();
+                return await tools.run(name, args);
+            } catch (err) {
+                return { ok: false, text: err instanceof RcaReadError ? err.message : `The investigation failed: ${err instanceof Error ? err.message : String(err)}` };
+            }
         },
     };
 }

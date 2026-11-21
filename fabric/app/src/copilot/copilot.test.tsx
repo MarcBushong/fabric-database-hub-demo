@@ -2,8 +2,9 @@ import { act, configure, fireEvent, render, screen, waitFor, within } from "@tes
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
-import { createQueryClient, type ConnectorResult, type Execute, type QueryClient } from "@/data/query-client";
+import { createQueryClient, describeFailure, QueryFailure, type ConnectorResult, type Execute, type QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
+import { retryClock } from "@/data/retry";
 import { RCA_PRESENCE_DAX } from "@/rca/loader";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
 import { AccountChips } from "@/shell/AccountChips";
@@ -150,9 +151,16 @@ const signedInNineHoursAgo = () => ({ accessToken: fakeToken(), expiresAt: Date.
 let hasCosmos = 0;
 /** Whether the history model has the Incident RCA's tables: without them, the presence check fails, as on a model from before the feature. */
 let hasRca = false;
+/** How many more presence checks Power BI throttles, as it answers past 120 queries a minute (live, 2026-11-21). */
+let rcaThrottled = 0;
 const queryClient: QueryClient = {
     run: vi.fn(async (spec) => {
-        if (spec.dax === RCA_PRESENCE_DAX && !hasRca) throw new Error("The model has no table named 'RCA Coverage'.");
+        if (spec.dax === RCA_PRESENCE_DAX && rcaThrottled > 0) {
+            rcaThrottled -= 1;
+            throw new QueryFailure(describeFailure("api", "You have exceeded the amount of requests allowed in the current time frame and further requests will fail. Retry in 60 seconds."), "api", "429");
+        }
+        // Execute Queries' answer on a model from before the Incident RCA (live, 2026-11-21), as the history source reports it.
+        if (spec.dax === RCA_PRESENCE_DAX && !hasRca) throw new QueryFailure(describeFailure("api", "Query (1, 32) Cannot find table '<oii>RCA Coverage</oii>'."), "api", "400");
         const rows =
             spec.dax === COSMOS_PROBE_DAX
                 ? [{ HasCosmos: hasCosmos }]
@@ -182,6 +190,7 @@ function renderDock(initialOpen = true, estate = false) {
 beforeEach(() => {
     hasCosmos = 0;
     hasRca = false;
+    rcaThrottled = 0;
     FakeSocket.startError = null;
     FakeSocket.script = null;
     FakeSocket.startGate = null;
@@ -315,6 +324,47 @@ describe("the Copilot dock", () => {
         const answer = JSON.parse(String(result?.result)) as { tool: string; window: { fromUtc: string; toUtc: string } };
         expect(answer).toMatchObject({ tool: "find_incidents", window: { fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" } });
         expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX)).toHaveLength(1);
+    });
+
+    // Live, 2026-11-21: a check that Power BI throttled said nothing about the model, but the dock kept "no RCA tables" for
+    // the rest of the session.
+    it("asks again for the next conversation when its check stayed throttled, and gives that conversation the investigations", async () => {
+        hasRca = true;
+        rcaThrottled = 2;
+        const sleep = vi.spyOn(retryClock, "sleep").mockResolvedValue(undefined);
+        try {
+            window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+            vi.stubGlobal(
+                "fetch",
+                fetchStub({
+                    "/healthz": { ok: true, version: "t", signIn: "device" },
+                    "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                    "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+                }),
+            );
+            FakeSocket.script = (socket, message) => {
+                if (message.type === "user") {
+                    socket.emit({ type: "message", messageId: "m1", text: "T1 worked hardest." });
+                    socket.emit({ type: "idle" });
+                }
+            };
+            const asked = () => vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX).length;
+            renderDock();
+            // The dock's own check: throttled, then throttled again with its next wait past the budget.
+            await waitFor(() => expect(asked()).toBe(2));
+            await act(async () => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            });
+            expect(screen.queryByRole("button", { name: "What caused the latest incident?" })).not.toBeInTheDocument();
+            fireEvent.click(await screen.findByRole("button", { name: "Which target worked hardest this week?" }));
+            expect(await screen.findByText("T1 worked hardest.")).toBeInTheDocument();
+            expect(asked()).toBe(3);
+            const start = FakeSocket.last!.sent[0];
+            expect((start.tools as Array<{ name: string }>).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", ...INVESTIGATION_TOOL_NAMES]);
+            expect(String(start.systemMessage)).toContain("# Investigating incidents");
+        } finally {
+            sleep.mockRestore();
+        }
     });
 
     it("keeps the viewer signed in 9 hours after sign-in: it renews before asking GitHub who the token is (security review, 2026-11-19)", async () => {

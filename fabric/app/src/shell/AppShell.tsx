@@ -104,7 +104,7 @@ function ThemeMenu() {
 }
 
 export function AppShell({ email, onSignOut, banner, children }: { email: string | null; onSignOut: () => void; banner?: ReactNode; children: ReactNode }) {
-    const { view, navigate, runtime, rca } = useApp();
+    const { view, navigate, runtime, rca, rcaError } = useApp();
     const dock = useCopilotDock();
     const wide = useMediaQuery("(min-width: 1180px)");
     const [navPref, setNavPref] = useState<boolean | null>(loadNav);
@@ -146,7 +146,8 @@ export function AppShell({ email, onSignOut, banner, children }: { email: string
 
             <nav id="app-nav" className="nav" aria-label="Pages">
                 <ul>
-                    {PAGES.filter((p) => p.id !== "rca" || rca === true).map((p) => {
+                    {/* Root cause with the RCA tables, and while their check failed, so the viewer reaches its Try again. */}
+                    {PAGES.filter((p) => p.id !== "rca" || rca === true || !!rcaError).map((p) => {
                         const Icon = ICONS[p.id];
                         const current = view.page === p.id;
                         const button = (

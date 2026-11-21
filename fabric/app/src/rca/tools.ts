@@ -7,6 +7,7 @@
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { describeEpisode, findEpisodes } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
+import { RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { bothTimes, resolveTime, windowAround } from "./time";
@@ -430,13 +431,15 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             const handler = handlers[name];
             return handler ? handler(args) : `There's no tool named ${name}.`;
         },
-        /** As the dock's tool runner returns it: ok and the text Copilot reads. */
+        /** As the dock's tool runner returns it: ok and the text Copilot reads. A read that failed is said as such, never
+         *  as an empty or quiet window (RcaReadError). */
         async run(name: string, args: unknown): Promise<{ ok: boolean; text: string }> {
             const input = typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
             try {
                 const result = await this.investigate(name, input);
                 return typeof result === "string" ? { ok: false, text: result } : { ok: true, text: bounded(result) };
             } catch (err) {
+                if (err instanceof RcaReadError) return { ok: false, text: err.message };
                 return { ok: false, text: `The investigation failed: ${err instanceof Error ? err.message : String(err)}` };
             }
         },
