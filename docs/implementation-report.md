@@ -4512,3 +4512,24 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 **Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.SafetyStop` and `DbHubDemo.Validation`. The repro test fails on the code before item 12 (no `STOP.NIGHTLYSTOP`), and the `COST.AUTOSHUTDOWN` test fails without this change. Not run live.
 
 **Risks.** An environment that bf010ed's code left in this state has no tag, so `stop-demo.ps1` can't see the move there; the update's `./scripts/deploy.ps1` puts it back (its template, then its end). The deferred pass, while it's there, finds nothing running once the session has stopped everything.
+
+### The relay checks GitHub's sign-in page (item 8, 2026-11-21)
+
+**Why.** The owner's follow-up after the release, as defense in depth: the Insights app already links only `https://github.com/login/device`, but the relay passed on GitHub's `verification_uri` as it came.
+
+**Work summary.** `ask-relay/src/github.ts`: `startDeviceFlow` passes on `verification_uri` only when it's exactly GitHub's device page (`safeVerificationUri`): https, origin exactly `https://github.com`, no user name or password, path `/login/device`, and no query or fragment. Otherwise it answers that page itself (`VERIFICATION_URI`). An answer without a verification page is still refused, as before.
+
+**Changed files.** `ask-relay/src/github.ts`, `ask-relay/test/github.test.ts` (new), `ask-relay/README.md`, the CHANGELOG, and this report.
+
+**Validation.** `npm ci` and `npm test` in `ask-relay` with Node.js 24.22.2: 4 files, 52 tests passed. `npm run typecheck`: no errors. Without the change, 15 of the 16 new tests fail; the 16th, an answer without a page, passes before too.
+
+**To release it (not done here: nothing is pushed).**
+
+1. Once this branch reaches `ignite-updates` or `main`, `.github/workflows/ask-relay-image.yml` builds, tests, and publishes the relay's image to GitHub Container Registry. Its run summary prints the digest to pin.
+2. Pin that digest in `config/versions.json` (`askRelay.image`), commit, and push.
+3. Check that an anonymous pull of the pinned digest works, as on 2026-11-19.
+4. Then `./scripts/deploy.ps1` runs the new image.
+
+Until then, deployments keep the pinned image, which works as before.
+
+**Risks.** None for viewers: the page they're sent to is the same.

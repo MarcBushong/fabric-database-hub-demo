@@ -23,6 +23,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - After a Run all session in the grace of a `deploy.ps1` that the nightly stop waited for, `./scripts/stop-demo.ps1` puts the VMs' auto-shutdown back and removes the deferred stop (F27): the session had replaced the busy marker with its own and cleared it at its end, so `stop-demo.ps1` said nothing, and both stayed until the next `deploy.ps1`. `validate.ps1`'s `COST.AUTOSHUTDOWN` now names such a time and these commands, rather than a redeployment.
 - T3's Database Agent beat no longer starts without its regression (F26): a lookup that another session compiled around the switch could put the fast plan back within the same second, so T3's CPU stayed low and Database Agents had no issue to raise. The other sessions now stay out from 2 seconds before the switch, and the run checks the lookup's cached plan after it and switches again, at most twice, when it doesn't scan. A switch that doesn't hold is the run's `plan-switch-unverified` event, and Run all's live view says from T3's CPU whether the regression started (a **Warning** below 30%), as the session's summary does. Every way a session ends still puts `FORCE_LAST_GOOD_PLAN` back ([ADR 0013](docs/adr/0013-agent-experience.md#amendment-2026-11-21-the-database-agent-beats-switch-is-checked-f26)).
 
+### Security
+
+- The Ask relay passes on GitHub's device sign-in page only when it's exactly `https://github.com/login/device` (https, origin `https://github.com`), and that page otherwise, as defense in depth: the Insights app already links only that page. It takes effect with the next relay image, which `config/versions.json` (`askRelay.image`) pins once CI has published it.
+
 ## [2026-11-20]
 
 **The Ignite updates.** Microsoft Fabric Database Hub is generally available since 2026-11-17, and the demo follows it.
