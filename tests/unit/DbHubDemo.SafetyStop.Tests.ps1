@@ -243,6 +243,7 @@ BeforeAll {
         $script:published = ''
         $script:draft = ''
         $script:templateFails = $false
+        $script:templateError = ''
         $script:jobs = @()
         $script:jobsReadFails = $false
         $script:outputs = @{}
@@ -323,6 +324,9 @@ BeforeAll {
                     $script:deployments.Add([pscustomobject]@{ Text = $text; Parameters = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable) })
                     if ($script:templateFails) {
                         return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) Resource ''aa-dbhub-demo-safetystop'' was disallowed by policy.')
+                    }
+                    if ($script:templateError) {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:templateError)
                     }
                     return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ identityPrincipalId = @{ value = $script:principal }; identityClientId = @{ value = $script:clientId }; automationAccountId = @{ value = $script:account } }))
                 }
@@ -634,6 +638,19 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $script:writes | Should -BeNullOrEmpty
         $note = InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoSafetyStopNote -Result $Result }
         $note | Should -Match '^The nightly safety stop isn''t fully set up \(SAFETYSTOP\.RESOURCES\): .*RequestDisallowedByPolicy.* Until it is, T4 isn''t stopped when Azure starts it again after 7 days'
+    }
+
+    It 'says the subscription''s quota for Automation accounts in the region is used up, with how to free one or raise it (F28, live 2026-11-21)' {
+        # Azure's answer on dbhubra, in a subscription with 10 Automation accounts in westus3 (five environments' two each).
+        $script:templateError = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/dbhub-safetystop","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.","details":[{"code":"Conflict","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-demo/providers/Microsoft.Automation/automationAccounts/aa-dbhub-demo-safetystop","message":"{\r\n  \"code\": \"Conflict\",\r\n  \"message\": \"The operation could not be completed because it exceeded your quota for Automation accounts in your subscription in the region. Please check the applicable quotas for your subscription. Requests for quota increase are subject to approval and resource availability in the region.  Learn more- https://aka.ms/Azure-Automation-Quotas-and-Limits\"\r\n}"}]}}'
+        $results = & $script:setup
+        @($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('SAFETYSTOP.RESOURCES=Warning')
+        $results[0].message | Should -BeExactly 'The nightly safety stop isn''t set up: infra/safetystop/safetystop.bicep couldn''t be deployed: Azure refused aa-dbhub-demo-safetystop because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'
+        $results[0].remediation | Should -Match '^Free an Automation account in westus3: \./scripts/destroy\.ps1 on a demo environment you no longer use deletes its two, .* Or raise the subscription''s quota for Automation accounts in westus3 \(the Azure portal''s Quotas page, .*\)\. Then run \./scripts/deploy\.ps1 again\. Meanwhile the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'
+        $results[0].remediation | Should -Not -Match 'policy denial'
+        $results[0].evidence['quotaUsedUp'] | Should -BeTrue
+        $results[0].evidence['error'] | Should -Match 'exceeded your quota for Automation accounts'
+        $results[0].docUrl | Should -Be 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'
     }
 
     It 'changes nothing with -WhatIf' {

@@ -957,7 +957,7 @@ function Invoke-DemoDeployment {
                 # The session control's notebook (ADR 0026), now that the workspace exists, and before the Insights app, whose
                 # Manage runs it (ADR 0029): the app's step reads its IDs, so a first deployment's Manage has them
                 # (2026-11-19, the final tests' net-new run). Never a Fail.
-                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath -PriorResult $results.ToArray())
                 & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
                 $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
                 & $addAll $app

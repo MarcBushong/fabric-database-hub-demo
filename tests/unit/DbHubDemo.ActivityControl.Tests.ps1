@@ -67,6 +67,12 @@ BeforeAll {
         [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr }
     }
 
+    # Azure's answer when the subscription's quota for Automation accounts in the region is used up (F28; live on dbhubra,
+    # 2026-11-21, with 10 Automation accounts in westus3).
+    function Get-QuotaError([string] $Account = 'aa-dbhub-control') {
+        'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-control/providers/Microsoft.Resources/deployments/dbhub-control","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.","details":[{"code":"Conflict","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-control/providers/Microsoft.Automation/automationAccounts/' + $Account + '","message":"{\r\n  \"code\": \"Conflict\",\r\n  \"message\": \"The operation could not be completed because it exceeded your quota for Automation accounts in your subscription in the region. Please check the applicable quotas for your subscription. Requests for quota increase are subject to approval and resource availability in the region.  Learn more- https://aka.ms/Azure-Automation-Quotas-and-Limits\"\r\n}"}]}}'
+    }
+
     function Get-ArgumentValue([object[]] $Arguments, [string] $Name) {
         $index = [array]::IndexOf($Arguments, $Name)
         if ($index -ge 0 -and $index + 1 -lt $Arguments.Count) {
@@ -385,6 +391,7 @@ BeforeAll {
         $script:safetyStopLinked = $true
         $script:safetyStopReadFails = $false
         $script:connections = [System.Collections.Generic.List[object]]::new()
+        $script:controlTemplateError = ''
     }
 
     function Register-FakeAzure {
@@ -427,6 +434,9 @@ BeforeAll {
                 'deployment group create*' {
                     $file = (Get-ArgumentValue $words '--parameters').Substring(1)
                     $script:deployments.Add([pscustomobject]@{ Text = $text; File = $file; Parameters = (Get-Content -LiteralPath $file -Raw) })
+                    if ($script:controlTemplateError -and $text -match 'control\.bicep') {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:controlTemplateError)
+                    }
                     return (New-AzResult -StdOut '{"identityClientId":{"value":"99999999-9999-9999-9999-999999999999"}}')
                 }
                 'deployment group delete*' { return (New-AzResult) }
@@ -931,15 +941,35 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
         Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([pscustomobject]@{ Id = (@($PesterBoundParameters['Id']) -join ','); State = $PesterBoundParameters['State']; Status = $PesterBoundParameters['Status']; Message = $PesterBoundParameters['Message'] }) }
         $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
         $script:vaultAnswer = 'Disabled'
+        # What Run all needs in Azure (F28, 2026-11-21): the control's account, a live webhook for DbHub-Control, and the
+        # secrets; all there by default. 'Missing' answers HTTP 404, 'Error' a read that fails otherwise.
+        $script:accountAnswer = 'Ok'
+        $script:hookSecretAnswer = 'Ok'
+        $script:statusSecretAnswer = 'Ok'
+        $script:controlHooks = @(@{ name = 'dbhub-activity-202611140000'; properties = @{ isEnabled = $true; expiryTime = [DateTime]::UtcNow.AddDays(300).ToString('o'); runbook = @{ name = 'DbHub-Control' } } })
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            $missing = [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
             if ($Url -match '/vaults/') {
-                if ($script:vaultAnswer -eq 'Missing') {
-                    return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+                if ($script:vaultAnswer -eq 'Missing' -or ($Url -match '/secrets/dbhub-activity-webhook\?' -and $script:hookSecretAnswer -eq 'Missing') -or ($Url -match '/secrets/dbhub-session-status\?' -and $script:statusSecretAnswer -eq 'Missing')) {
+                    return $missing
                 }
                 return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ publicNetworkAccess = $script:vaultAnswer } }; Error = '' }
             }
             if ($Url -match '/userAssignedIdentities/') {
                 return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ clientId = $script:clientId } }; Error = '' }
+            }
+            if ($Url -match '/automationAccounts/aa-dbhub-control(/webhooks)?\?') {
+                $isHooks = [bool]$Matches[1]
+                if ($script:accountAnswer -eq 'Missing') {
+                    return $missing
+                }
+                if ($script:accountAnswer -eq 'Error') {
+                    return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' }
+                }
+                if ($isHooks) {
+                    return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ value = @($script:controlHooks | Where-Object { $null -ne $_ }) }; Error = '' }
+                }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'aa-dbhub-control' }; Error = '' }
             }
             throw ('unexpected ARM call: {0}' -f $Url)
         }
@@ -1082,6 +1112,139 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
         $script:recorded | Should -BeNullOrEmpty
     }
 
+    Context 'what Run all needs in Azure (F28, live on dbhubra 2026-11-21)' {
+        BeforeEach {
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control was updated.' -Evidence ([ordered]@{ workspace = $Name.FabricWorkspace; folder = ''; mode = $Mode })
+            }
+            # This run's Azure part, as Invoke-DemoActivityControlSetup returns it: by default, the template refused for the
+            # subscription's quota for Automation accounts, where the setup stops.
+            $script:quotaFix = 'Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two, the session control''s and the nightly safety stop''s. Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request; Free Trial and Azure for Students subscriptions can''t be raised). Then run ./scripts/deploy.ps1 again.'
+            $script:setupResults = @(
+                [pscustomobject]@{ CheckId = 'CONTROL.MODE'; Status = 'Pass'; Message = 'The vault is private.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.PROVIDER'; Status = 'Pass'; Message = 'The Microsoft.Automation resource provider is registered.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.GROUP'; Status = 'Pass'; Message = 'rg-dbhub-control exists; destroy.ps1 keeps it.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Fail'; Message = 'infra/control/control.bicep couldn''t be deployed: Azure refused aa-dbhub-control because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'; Remediation = $script:quotaFix }
+                [pscustomobject]@{ CheckId = 'CONTROL.SUMMARY'; Status = 'Fail'; Message = '1 step(s) failed; fix them and run ./scripts/deploy.ps1 again.'; Remediation = '' }
+            )
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlSetup -MockWith {
+                foreach ($item in $script:setupResults) {
+                    New-DemoResult -CheckId $item.CheckId -Area 'workload' -Target 'subscription' -Status $item.Status -Message $item.Message -Remediation $item.Remediation
+                }
+            }
+            $script:bothParts = {
+                $azure = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Azure -ProgressPath 'out/progress.json' })
+                $fabric = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig); Prior = $azure } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric -ProgressPath 'out/progress.json' -PriorResult $Prior })
+                [pscustomobject]@{ All = @($azure) + @($fabric); Control = ($fabric | Where-Object checkId -EQ 'DEPLOY.CONTROL') }
+            }
+        }
+
+        It 'never says Run all is ready when Azure refused the control''s Automation account: a Warning with the quota and its fix, on the status page and in DONE' {
+            $script:accountAnswer = 'Missing'
+            $run = & $script:bothParts
+            $control = $run.Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -BeExactly 'NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up.'
+            $control.remediation | Should -BeExactly ('{0} Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.' -f $script:quotaFix)
+            $control.evidence['ready'] | Should -BeFalse -Because 'DONE then names only the scripts for each session'
+            $control.evidence['missing'] | Should -Be 'Account'
+            $control.evidence['cause'] | Should -Be 'CONTROL.RESOURCES'
+            @($run.All | Where-Object status -In 'Fail', 'Manual action required') | Should -BeNullOrEmpty -Because 'the session control never keeps the run from DONE (ADR 0026)'
+            $script:steps[-1].Id | Should -Be 'Control'
+            $script:steps[-1].Status | Should -Be 'Warning'
+            $script:steps[-1].Message | Should -Match '^NB_DatabaseHub_Control is in .*, but Run all can''t start a session yet: .* is used up\. Free an Automation account in westus3: '
+            # DONE's line says it once, with the fix, and doesn't repeat the template's refusal under "In Azure".
+            $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ All = $run.All } { Get-DemoControlDeployNote -Result $All }
+            $note | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: '
+            $note | Should -Not -Match 'Run all is ready|In Azure:'
+            ([regex]::Matches($note, 'is used up')).Count | Should -Be 1
+            $note | Should -Match 'Meanwhile \./scripts/start-demo\.ps1 runs a session from this PC\.$'
+        }
+
+        It 'names a missing <Case>, with this run''s step that says why' -ForEach @(
+            @{ Case = 'webhook'; Hooks = 'none'; HookSecret = 'Ok'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'has no webhook that starts DbHub-Control, or the control vault kv-dbhub-ctl-[0-9a-f]{6} doesn''t keep its URL \(dbhub-activity-webhook\); this run''s CONTROL\.WEBHOOK says: The webhook or its secret couldn''t be created: Conflict\.$' }
+            @{ Case = 'webhook, only an expired one left'; Hooks = 'expired'; HookSecret = 'Ok'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'has no webhook that starts DbHub-Control' }
+            @{ Case = 'webhook URL in the vault'; Hooks = 'live'; HookSecret = 'Missing'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'doesn''t keep its URL \(dbhub-activity-webhook\)' }
+            @{ Case = 'session status'; Hooks = 'live'; HookSecret = 'Ok'; Status = 'Missing'; Failing = 'CONTROL.SECRETS'; Message = 'The session''s secret dbhub-session-status couldn''t be created: Forbidden.'; Missing = 'StatusSecret'; Text = 'the control vault kv-dbhub-ctl-[0-9a-f]{6} has no session status \(dbhub-session-status\), which Run all reads first; this run''s CONTROL\.SECRETS says: The session''s secret dbhub-session-status couldn''t be created: Forbidden\.$' }
+        ) {
+            $script:setupResults = @(
+                [pscustomobject]@{ CheckId = 'CONTROL.MODE'; Status = 'Pass'; Message = 'The vault is private.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.PROVIDER'; Status = 'Pass'; Message = 'Registered.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.GROUP'; Status = 'Pass'; Message = 'It exists.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Pass'; Message = 'Deployed.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RUNBOOKS'; Status = 'Pass'; Message = 'Published.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = $Failing; Status = 'Fail'; Message = $Message; Remediation = 'Run setup-activity-control.ps1 again; a webhook without its secret is replaced.' }
+            )
+            $script:controlHooks = switch ($Hooks) {
+                'none' { @() }
+                'expired' { @(@{ name = 'dbhub-activity-202601010000'; properties = @{ isEnabled = $true; expiryTime = [DateTime]::UtcNow.AddDays(-1).ToString('o'); runbook = @{ name = 'DbHub-Control' } } }) }
+                default { $script:controlHooks }
+            }
+            $script:hookSecretAnswer = $HookSecret
+            $script:statusSecretAnswer = $Status
+            $control = (& $script:bothParts).Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -Match ('^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: .*{0}' -f $Text)
+            $control.remediation | Should -BeExactly 'Run ./scripts/deploy.ps1 again; a webhook without its secret is replaced. Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.'
+            $control.evidence['ready'] | Should -BeFalse
+            $control.evidence['missing'] | Should -Be $Missing
+            $control.evidence['cause'] | Should -Be $Failing
+        }
+
+        It 'says this run''s setup stopped, as a Warning, when what an earlier deploy.ps1 set up still starts a session' {
+            $script:setupResults[3] = [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Fail'; Message = 'infra/control/control.bicep couldn''t be deployed: ERROR: (RequestDisallowedByPolicy) Resource ''kv-dbhub-ctl-000000'' was disallowed by policy.'; Remediation = 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' }
+            $run = & $script:bothParts
+            $control = $run.Control
+            $control.status | Should -Be 'Warning' -Because 'this run''s Azure part didn''t finish'
+            $control.message | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", and Run all starts a session with the session control an earlier \./scripts/deploy\.ps1 set up in rg-dbhub-control: this run''s setup of the session control stopped at CONTROL\.RESOURCES: infra/control/control\.bicep couldn''t be deployed: .*RequestDisallowedByPolicy'
+            $control.remediation | Should -BeExactly 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.'
+            $control.evidence['ready'] | Should -BeTrue
+            $control.evidence['missing'] | Should -Be ''
+            $control.evidence['cause'] | Should -Be 'CONTROL.RESOURCES'
+            $script:steps[-1].Status | Should -Be 'Warning'
+            $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ All = $run.All } { Get-DemoControlDeployNote -Result $All }
+            $note | Should -Not -Match 'In Azure:'
+            ([regex]::Matches($note, 'RequestDisallowedByPolicy')).Count | Should -Be 1
+
+            # When the control's account can't be read, Run all may not start a session: not ready.
+            $script:accountAnswer = 'Error'
+            $control = (& $script:bothParts).Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all may not start a session: this run''s setup of the session control stopped at CONTROL\.RESOURCES: '
+            $control.remediation | Should -BeExactly 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again. Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.'
+            $control.evidence['ready'] | Should -BeFalse
+        }
+
+        It 'claims nothing it couldn''t read, and is Pass, as before, when the setup finished' {
+            $script:setupResults = @($script:setupResults | Select-Object -First 3) + @([pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Pass'; Message = 'Deployed.'; Remediation = '' })
+            foreach ($answer in 'Ok', 'Error') {
+                $script:accountAnswer = $answer
+                $control = (& $script:bothParts).Control
+                $control.status | Should -Be 'Pass' -Because $answer
+                $control.message | Should -BeExactly 'Run all is ready: open NB_DatabaseHub_Control in the workspace "Database Hub Demo Control" and select Run all. It runs the whole session and stops it.'
+                $control.evidence['ready'] | Should -BeTrue
+            }
+        }
+
+        It 'counts CONTROL.MODE as where the setup stopped only when nothing after it ran' {
+            $stopAt = {
+                param([string[]] $Pairs)
+                $items = @(foreach ($pair in $Pairs) {
+                        $id, $status = $pair -split '='
+                        [pscustomobject]@{ checkId = $id; status = $status; message = $id; remediation = '' }
+                    })
+                $stop = InModuleScope -ModuleName DbHubDemo -Parameters @{ Items = $items } { Get-DemoControlSetupStop -Result $Items }
+                if ($null -eq $stop) { '' } else { [string]$stop.checkId }
+            }
+            & $stopAt @('CONTROL.MODE=Warning', 'CONTROL.PROVIDER=Pass', 'CONTROL.GROUP=Pass', 'CONTROL.RESOURCES=Pass') | Should -Be '' -Because 'a note about the vault''s mode'
+            & $stopAt @('CONTROL.MODE=Warning') | Should -Be 'CONTROL.MODE' -Because 'a vault mode the policy refuses stops the setup'
+            & $stopAt @('CONTROL.MODE=Pass', 'CONTROL.PROVIDER=Pass', 'CONTROL.GROUP=Warning') | Should -Be 'CONTROL.GROUP'
+            & $stopAt @('CONTROL.SETUP=Warning') | Should -Be 'CONTROL.SETUP'
+            & $stopAt @('CONTROL.MODE=Pass', 'CONTROL.RESOURCES=Pass', 'CONTROL.RUNBOOKS=Warning', 'CONTROL.WEBHOOK=Warning') | Should -Be '' -Because 'the runbooks have their own note'
+            & $stopAt @() | Should -Be ''
+        }
+    }
+
     Context 'the Fabric workspaces it uses, recorded on its resource group (2026-11-17)' {
         BeforeEach {
             Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
@@ -1157,7 +1320,7 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
                 # Only the safety stop's plan Warning comes between them (2026-11-19, the coordinator's option 2).
                 @([regex]::Matches($match.Groups[1].Value, '\b[A-Z][a-z]+-Demo[A-Za-z]+') | ForEach-Object { $_.Value } | Sort-Object -Unique) | Should -Be @('Add-DemoProgressStepNote', 'New-DemoSafetyStopPlanResult', 'Write-DemoLog') -Because $file
             }
-            $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath' -Because $file
+            $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath -PriorResult \$results\.ToArray\(\)' -Because ('{0}: the notebook''s part reads where the Azure part stopped (F28)' -f $file)
             $text | Should -Not -Match 'Invoke-DemoActivityControlRegrant' -Because $file
             # Since Phase 28 both paths build DEPLOY.SUMMARY in one place.
             $text | Should -Match 'Get-DemoDeploySummary -Result \$all' -Because $file
@@ -1235,6 +1398,24 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -Mode 'public') -Confirm:$false)
         ($results | Where-Object checkId -EQ 'CONTROL.MODE').status | Should -Be 'Fail'
         $script:azCalls.Count | Should -Be 0
+    }
+
+    It 'says the subscription''s quota for Automation accounts in the region is used up, with how to free one or raise it, and stops there (F28, live 2026-11-21)' {
+        $script:controlTemplateError = Get-QuotaError
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -SkipFabric -Confirm:$false)
+        $template = $results | Where-Object checkId -EQ 'CONTROL.RESOURCES'
+        $template.status | Should -Be 'Fail'
+        $template.message | Should -BeExactly 'infra/control/control.bicep couldn''t be deployed: Azure refused aa-dbhub-control because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'
+        $template.remediation | Should -BeExactly 'Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two, the session control''s and the nightly safety stop''s. Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request; Free Trial and Azure for Students subscriptions can''t be raised). Then run ./scripts/deploy.ps1 again.'
+        $template.evidence['quotaUsedUp'] | Should -BeTrue
+        $template.evidence['error'] | Should -Match 'exceeded your quota for Automation accounts'
+        $template.docUrl | Should -Be 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'
+        @($results | Where-Object checkId -In 'CONTROL.RUNBOOKS', 'CONTROL.WEBHOOK', 'CONTROL.SECRETS') | Should -BeNullOrEmpty -Because 'the setup stops at its template'
+        # Any other refusal keeps its own words and fix.
+        $script:controlTemplateError = 'ERROR: (RequestDisallowedByPolicy) Resource ''aa-dbhub-control'' was disallowed by policy.'
+        $other = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -SkipFabric -Confirm:$false) | Where-Object checkId -EQ 'CONTROL.RESOURCES'
+        $other.message | Should -Match 'RequestDisallowedByPolicy'
+        $other.remediation | Should -Be 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.'
     }
 
     It 'stores the webhook URL only through the secure template parameter, never in a result or the log' {

@@ -1322,7 +1322,16 @@ function Invoke-DemoActivityControlTemplate {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false -WhatIf:$false | Out-Null
     }
     if ($run.ExitCode -ne 0) {
-        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: {0}' -f (Protect-DemoText -Text ([string]$run.StdErr)).Trim()) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $null }
+        $errorText = (Protect-DemoText -Text ([string]$run.StdErr)).Trim()
+        # The subscription's quota for Automation accounts in the region (F28, 2026-11-21): said in plain words, with its fix,
+        # and Azure's own answer kept in the evidence.
+        $quota = Get-DemoAutomationQuotaText -Text $errorText -Location ([string]$Config['location'])
+        if ($null -ne $quota) {
+            $evidence['error'] = Get-DemoDeploymentErrorText -Text $errorText -MaxLength 1200
+            $evidence['quotaUsedUp'] = $true
+            return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: Azure refused {0} because {1} (Conflict).' -f $Name.AutomationAccount, $quota.Reason) -Evidence $evidence -Remediation $quota.Remediation -DocUrl 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'); Outputs = $null }
+        }
+        return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: {0}' -f $errorText) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $null }
     }
     $raw = [string]$run.StdOut | ConvertFrom-Json -AsHashtable -Depth 16
     $outputs = [ordered]@{}
@@ -1625,6 +1634,8 @@ function Get-DemoActivityControlWebhook {
         Error         = $list.Error
         Webhooks      = @($hooks | Sort-Object -Property { if ($_.ExpiryUtc) { $_.ExpiryUtc } else { [datetime]::MinValue } } -Descending)
         SecretExists  = $secret.Ok
+        # Azure answered that the secret isn't there (HTTP 404), not just that it couldn't be read (F28, 2026-11-21).
+        SecretMissing = [bool]$secret.Missing
         SecretExpiry  = $secretExpiry
     }
 }
