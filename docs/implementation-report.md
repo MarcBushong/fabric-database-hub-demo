@@ -4488,6 +4488,11 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 
   The new tests (`Vm.GoldenGuest.Tests.ps1`, `DbHubDemo.Golden.Tests.ps1`) fail without their fixes.
 - **The coordinator's follow-up of c059878:** documents that the session control's runbooks exported but couldn't fetch are listed in the control's status, not on this PC, and only the control's next start fetches them. The capture reads that status too, from the control account's variable `DbHubSessionStatus`. The variable is unencrypted, so Azure Resource Manager returns its value with the read access the scripts already use on the control's account, and nothing is granted (`Get-DemoGoldenControlRcaPending`). The capture refuses while the status lists T2's documents, whether the status's own, a re-check's handoff, or an earlier session's not yet expired; the fix it names is a Run all session. A status that can't be read captures nothing, as `GOLDEN.CAPTURE.CONTROL` does. With the step as c059878 had it, the 3 new capture tests fail; leaving out the handoff, the expiry, or the second JSON decoding fails the helper's test.
+- **The re-checks of c059878 (two Lows), and a docs check:**
+  - **Low, the golden fix text:** both saves that `GOLDEN.CAPTURE.RCA` named use the demo workspace's `NB_DatabaseHub_LiveActivity`, Run all's included. A copy from before the Incident RCA, which an update keeps while `fabric.importNotebooks` is false, ignores the evidence, so the scripts' save fetched T2's documents again without saving them, and the refusal would come back every time. The capture now reads the notebook's definition when T2's documents are listed, as `FABRIC.RCA.EVIDENCE` reads it (`Get-DemoGoldenRcaNotebookState`: the workspace by name, read-only, then Get Item Definition), and for an older copy names `./scripts/configure-fabric.ps1 -SkipHubChecks` first. A definition it can't read gets that step as a condition. With the step as 0a9fb8d had it, 7 capture tests fail: the 5 new ones, and the 2 that now check the notebook's state; reading another parameter than `RCA_EVIDENCE_FILE`, or the lakehouse as well, fails the helper's test.
+  - **Low, the merge note:** it missed some of the follow-ups' lines, and its blanket "$0.04 becomes $0.40" would have changed a session's figure and T3's price an hour. It lists each line now, with a session's figures on their own.
+  - **The docs check:** the README, the CHANGELOG, the deployment guide's update table, troubleshooting, and AGENTS.md say what an update brings with each value of `fabric.importNotebooks`. With true, which `init.ps1` writes for a workspace it creates, the update republishes the RCA's notebook. With false, Run all's and the scripts' RCA saves wait for `./scripts/configure-fabric.ps1 -SkipHubChecks -RunLiveActivity` once, then `./scripts/configure-powerbi.ps1`, and each says so. Run all needs it too: `NB_DatabaseHub_Control` saves the history with the demo workspace's copy of the notebook.
+  - **An older notebook doesn't fail Run all:** Fabric adds the parameters a run passes in a new cell beneath the notebook's parameters cell ([Designate a parameters cell](https://learn.microsoft.com/fabric/data-engineering/author-execute-notebook#designate-a-parameters-cell)), so `RCA_EVIDENCE_FILE` is a variable nothing in the older notebook reads, and it saves the rest of the history as before. The scripts' jobs have passed today's notebook `CONFIRM`, `STOP_ACTIVITY`, and `KEY_VAULT_URL`, which it doesn't define, on every save since 2026-11-14. Run all's reference run then finds the staged file left, deletes it, and prints its **Warning** with the fix (`rca_outcome`); from then on, an earlier session's evidence waits rather than going to that copy (`save_rca_only`). A history saved as a job, when Run all's own Spark session can't save it, prints no RCA line; the inbox's day-old sweep deletes the file.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4516,7 +4521,17 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - the Cost tests' month totals: 23.27 becomes 23.63, 46.47 becomes 46.83, 20.07 becomes 20.43, 33.27 becomes 33.63, 46.63 becomes 46.99, 71.22 becomes 71.58, and 66.47 becomes 66.83;
   - the component past the 500: 20 minutes and $0.04 become 200 minutes and $0.40;
   - the business-hours test: 6,660 paid minutes and $13.32 become 9,828 and $19.656.
-- **The follow-ups' docs:** "520 job minutes", "$0.04", and "$1.04" in the README, cost management, and the deployment guide become 700, $0.40, and $1.40.
+- **The follow-ups' docs (fae05b4), line by line.** A blanket "$0.04 becomes $0.40" would be wrong twice: "about $0.04 a session" is a session's figure, not a month's, and cost management's "$1.04" in its T3 row (line 17) is T3's price an hour, which doesn't change. With 380 job minutes left for sessions beside the nightly stop's 120, a session of at most 116 minutes (65 without following T2), and $0.002 a minute:
+  - the CHANGELOG's estimate bullet (line 13): "80 minutes each, 400 in all", "20 minutes past the 500", and "about $0.04 a month" become 116 minutes each, 580 in all, 200 minutes past the 500, and about $0.40 a month;
+  - the README's "Close to nothing" bullet (line 70): "about 520 job minutes" and "about $0.04 past them" become about 700 and about $0.40;
+  - cost management's table row for the session control (line 22): "$0.04 for 20 job minutes past the 500 included" and "don't include" that $0.04 become $0.40 for 200 job minutes, and $0.40;
+  - cost management's note on the 500 included minutes (line 80): "a light-use month's 520 job minutes cost about $1.04" becomes 700 job minutes, about $1.40;
+  - cost management's Azure Automation bullet (line 214):
+    - its list of a session's jobs adds the Incident RCA's export (at most 6 minutes at the stop, 8 at each re-check, and 6 at a start), as this branch's bullet has it;
+    - "about 5 sessions a month fit when each follows T2 for the full 51 minutes" becomes about 3 (380 / 116), and "about 20 to 45 otherwise" becomes about 6 (380 / 65);
+    - a session's cost past them, "about $0.04 a session, up to about $0.15 after a cold start", becomes about $0.13 a session (65 minutes), up to about $0.23 after a cold start (116 minutes);
+    - the month: "80 job minutes for each", "400 minutes", "come to 520", "20 are priced", "about $0.04 a month" (in bold there), and "don't include that $0.04" become 116, 580, 700, 200, about $0.40 a month, and $0.40;
+  - the deployment guide's Cost bullet (line 155): "about 20 job minutes past Azure Automation's 500 included, about $0.04" becomes about 200 job minutes, about $0.40.
 
 **Left in Phase 1.**
 
@@ -4524,7 +4539,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The evaluation set's Phase 1 cases,** ported with blind questions.
 - **Step 1.8,** the live run below.
 - **Decision 6, names:** open for the owner.
-- **The transport's last fix,** the re-review of 02d398a's Low: merged once the coordinator confirms it, with the affected suites run again. That head is the live test's SHA.
+- **The transport's last fix:** its re-check fixes merged at d2067d69 (29a32acd). One Low is left, an `RCA.EARLIER` **Warning** that says an earlier session's capture "isn't in any history now" when it's already bound to that session; it's merged once the coordinator confirms it, with the affected suites run again. That head is the live test's SHA.
 
 **Step 1.8, the live run (the final tests fill it in).** ADR 0031's [Phase 1](adr/0031-incident-rca.md#phase-1) says what it must show: on each environment, a plain `./scripts/deploy.ps1` ends **DONE** with 0 **Fail** on its first run, `./scripts/validate.ps1` has 0 **Fail**, and no **Warning** is new against the release before it.
 
@@ -4565,6 +4580,12 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The golden snapshot's fix:** its 8 new tests fail without it.
 - **A full run on 3f6cd14:** `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown` passed. Pester: 5,206 passed, none failed, 85 skipped. PSScriptAnalyzer found nothing in 392 files, markdownlint no issue, and no unit test reached the Azure CLI.
 - **The review of 3f6cd14's fixes:** under strict mode, `Vm.GoldenGuest.Tests.ps1` (22) and `DbHubDemo.Golden.Tests.ps1` (100) pass, and 7 of their new or changed tests fail against 3f6cd14's code. PSScriptAnalyzer found nothing in the changed files; markdownlint and the doc suites pass.
+- **The transport's merge at d2067d69 (29a32acd):** under strict mode, `Automation.Runbooks` (299), `DbHubDemo.HistorySnapshot` (36), and `DbHubDemo.Golden` (106) pass, and no unit test reached the Azure CLI.
+- **The re-checks of c059878:** on 29a32acd with this change, under strict mode with Program Files' Pester 5.9.1 and the Azure CLI guard, 1,217 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI:
+  - `DbHubDemo.Golden` (115), `Vm.GoldenGuest` (22), `Automation.Runbooks` (299), and `DbHubDemo.HistorySnapshot` (36);
+  - the `Repo` suites, `Docs.Walkthrough`, and `Agent.PromptPack`, which read the docs and AGENTS.md (745).
+
+  With the step as 0a9fb8d had it, 7 of the capture tests fail, and each of the helper's 2 mutations fails its test. PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
 

@@ -201,6 +201,10 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:controlPending = @()
         $script:controlError = ''
         Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
+        # unless a test sets another.
+        $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -MockWith { $script:notebookState }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -364,6 +368,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca.message | Should -BeLike '1 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists them)*nothing was captured.'
         $rca.remediation | Should -Be ('Save the history first: {0}, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.' -f $Save)
         @($rca.evidence.documents) | Should -Be @('archost01-20261120T170000Z-1')
+        $rca.evidence.activityNotebook | Should -Be 'current'
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
         }
@@ -377,6 +382,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA' | Should -BeNullOrEmpty
         ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
         $script:calls | Should -Contain 'guest Prepare'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -Times 0 -Exactly -Because 'the notebook is read only when T2''s documents are listed'
     }
 
     It 'captures nothing while the session control''s status lists T2''s documents its runbooks couldn''t fetch, and says to run a session (the review of 3f6cd14)' {
@@ -414,6 +420,55 @@ Describe 'New-DemoT2GoldenSnapshot' {
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
         }
+    }
+
+    It 'updates a notebook from before the Incident RCA first, which no history save would take them with (<Case>, the review of c059878)' -ForEach @(
+        @{
+            Case = 'this PC''s list, host running'; Power = 'PowerState/running'; Pc = $true; Status = $false; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+        @{
+            Case = 'this PC''s list, host deallocated, fabric.importNotebooks true'; Power = 'PowerState/deallocated'; Pc = $true; Status = $false; Import = $true
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them: ./scripts/configure-fabric.ps1 -SkipHubChecks. Then save the history: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+        @{
+            Case = 'the session control''s status'; Power = 'PowerState/deallocated'; Pc = $false; Status = $true; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks. Then run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+        @{
+            Case = 'both lists'; Power = 'PowerState/running'; Pc = $true; Status = $true; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. For the ones the status lists, run a session with Run all in NB_DatabaseHub_Control once: its start fetches them from T2, and its end saves them with its history. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+    ) {
+        $script:hostPower = $Power
+        $config['fabric']['importNotebooks'] = $Import
+        $script:notebookState = [pscustomobject]@{ Known = $true; Current = $false; Error = '' }
+        if ($Pc) {
+            $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        }
+        if ($Status) {
+            $script:controlPending = @([ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01' })
+        }
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.remediation | Should -Be $Fix
+        $rca.evidence.activityNotebook | Should -Be 'fromBeforeRca'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'says to update the notebook when a save says it''s from before the Incident RCA, when its definition couldn''t be read (the review of c059878)' {
+        $script:hostPower = 'PowerState/running'
+        $script:notebookState = [pscustomobject]@{ Known = $false; Current = $false; Error = 'Fabric didn''t answer' }
+        $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2. If a save says the demo workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA, run ./scripts/configure-fabric.ps1 -SkipHubChecks, which updates it, and save again. Then run ./scripts/capture-t2-golden.ps1 again.'
+        $rca.evidence.activityNotebook | Should -Be 'unknown'
+        $script:calls | Should -Not -Contain 'guest Prepare'
     }
     It 'captures nothing when sign-in data is left on the host or in the guest after the cleanup' {
         $script:sweepPass = $false
@@ -1369,5 +1424,49 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = ''
         $script:variable = '{not json'
         (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
+    }
+}
+
+Describe 'Get-DemoGoldenRcaNotebookState (the review of c059878)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:tokenFails = ''
+        $script:resolved = $true
+        $script:definition = [pscustomobject]@{ Known = $true; Has = $false; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { if ($script:tokenFails) { throw $script:tokenFails }; [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith { [pscustomobject]@{ Resolved = $script:resolved; WorkspaceId = $(if ($script:resolved) { 'dddddddd-0000-0000-0000-000000000001' } else { '' }); Config = $Config; Results = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { $script:definition }
+        function Get-NotebookState {
+            & (Get-Module -Name DbHubDemo) { param($c) Get-DemoGoldenRcaNotebookState -Config $c } $config
+        }
+    }
+
+    It 'reads whether the demo workspace''s NB_DatabaseHub_LiveActivity knows RCA_EVIDENCE_FILE, with the workspace found by name and nothing created' {
+        $old = Get-NotebookState
+        $old.Known | Should -BeTrue
+        $old.Current | Should -BeFalse
+        $old.Error | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq 'dddddddd-0000-0000-0000-000000000001' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'RCA_EVIDENCE_FILE' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters.ContainsKey('SkipLakehouse') -and -not $PesterBoundParameters.ContainsKey('Create') }
+        $script:definition = [pscustomobject]@{ Known = $true; Has = $true; Error = '' }
+        $current = Get-NotebookState
+        $current.Known | Should -BeTrue
+        $current.Current | Should -BeTrue
+    }
+
+    It 'says why it isn''t known, and never throws: <Case>' -ForEach @(
+        @{ Case = 'no Fabric token'; TokenFails = 'No verified Fabric token is available.'; Resolved = $true; Definition = $null; Why = 'No verified Fabric token is available.' }
+        @{ Case = 'the workspace not resolved'; TokenFails = ''; Resolved = $false; Definition = $null; Why = 'the demo''s Fabric workspace isn''t resolved' }
+        @{ Case = 'the definition not read'; TokenFails = ''; Resolved = $true; Definition = @{ Known = $false; Has = $false; Error = 'NB_DatabaseHub_LiveActivity isn''t in the workspace' }; Why = 'NB_DatabaseHub_LiveActivity isn''t in the workspace' }
+    ) {
+        $script:tokenFails = $TokenFails
+        $script:resolved = $Resolved
+        if ($null -ne $Definition) {
+            $script:definition = [pscustomobject]$Definition
+        }
+        $state = Get-NotebookState
+        $state.Known | Should -BeFalse
+        $state.Current | Should -BeFalse
+        $state.Error | Should -Be $Why
     }
 }

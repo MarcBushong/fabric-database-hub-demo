@@ -1068,3 +1068,42 @@ function Get-DemoGoldenControlRcaPending {
     $answer.Documents = $documents.ToArray()
     return $answer
 }
+
+function Get-DemoGoldenRcaNotebookState {
+    <#
+    .SYNOPSIS
+    Whether the demo workspace's NB_DatabaseHub_LiveActivity saves the Incident RCA's evidence, for capture-t2-golden.ps1's
+    GOLDEN.CAPTURE.RCA (ADR 0031; the review of c059878). The scripts' history saves and Run all both save it with that
+    notebook, and a copy from before the Incident RCA doesn't know RCA_EVIDENCE_FILE, so it saves none: with
+    fabric.importNotebooks false, deploy.ps1 keeps the workspace's copy, and the scripts' save would fetch T2's documents
+    again and again. Read as FABRIC.RCA.EVIDENCE reads it (Invoke-DemoRcaNotebookRun): a Fabric token for the configured
+    subscription (Get-DemoFabricToken), the workspace by name, read-only (Resolve-DemoFabricConfig -SkipLakehouse, no
+    -Create), and the notebook's definition (Test-DemoFabricNotebookParameter). Returns Known (the definition was read),
+    Current (it knows RCA_EVIDENCE_FILE), and Error (why it isn't known). Never throws. Internal.
+    https://learn.microsoft.com/rest/api/fabric/core/items/get-item-definition
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $answer = [pscustomobject]@{ Known = $false; Current = $false; Error = '' }
+    try {
+        $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
+        $resolution = Resolve-DemoFabricConfig -Config $Config -Token $token -SkipLakehouse
+        if (-not $resolution.Resolved) {
+            $answer.Error = 'the demo''s Fabric workspace isn''t resolved'
+            return $answer
+        }
+        $knows = Test-DemoFabricNotebookParameter -WorkspaceId ([string]$resolution.WorkspaceId) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'RCA_EVIDENCE_FILE' -Token $token
+        $answer.Known = [bool]$knows.Known
+        $answer.Current = [bool]$knows.Known -and [bool]$knows.Has
+        $answer.Error = [string]$knows.Error
+    }
+    catch {
+        $answer.Error = Protect-DemoText -Text $_.Exception.Message
+    }
+    return $answer
+}
