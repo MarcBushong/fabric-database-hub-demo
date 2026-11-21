@@ -264,6 +264,14 @@ function Complete-DemoDeploymentRun {
         }
         if ($null -ne $endStop -and $null -ne $endStop.Result) {
             $added.Add($endStop.Result)
+            if ([bool]$endStop.Stopped) {
+                # The run stopped the demo itself (item 11, 2026-11-20): DEPLOY.NIGHTLYSTOP says so, as a Pass with no stop to
+                # offer, not the Warning that the demo stops later tonight. -KeepRunning, and a demo the run leaves running,
+                # keep the Warning.
+                for ($index = 0; $index -lt $added.Count; $index++) {
+                    $added[$index] = ConvertTo-DemoBusyMarkerStoppedResult -Record $added[$index]
+                }
+            }
             # The Insights app's records from its step once more (F18), after the stop's.
             foreach ($item in @($appAgain | Where-Object { $null -ne $_ })) {
                 $added.Add($item)

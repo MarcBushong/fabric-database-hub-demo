@@ -2249,6 +2249,45 @@ Describe 'The stop at the end of an update: an update leaves the demo as it foun
             (Get-ModelStep -Path $run.ProgressPath -Id 'NightlyStop')['message'] | Should -Not -Match 'Not needed tonight any more'
         }
 
+        It 'says in DEPLOY.NIGHTLYSTOP that the run stopped the demo itself, as a Pass with no stop to offer, once its stop at the end did (item 11, 2026-11-20)' {
+            # Live, dbhubfu's update at bf010ed: DEPLOY.NIGHTLYSTOP said the demo stops at 21:25 and offered stop-demo.ps1,
+            # while DEPLOY.ENDSTOP had stopped everything and DONE said "Stopped at the end".
+            $waited = 'The nightly stop waited for this run: its 19:30 T3 check (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing.'
+            $script:settledNightly = New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ($waited + ' The demo now stops at 21:25 (Pacific Standard Time), 60 minutes after this run ended.') -Remediation 'To keep the demo running tonight, run ./scripts/start-demo.ps1. To stop the demo now, run ./scripts/stop-demo.ps1.' -Evidence ([ordered]@{ pass = 'T3Check'; passLocalTime = '19:30'; waited = $waited; stopsAt = '21:25'; stopsAtUtc = '2026-11-21T05:25:00Z' })
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoBusyMarkerRun -MockWith { [pscustomobject]@{ Job = $null; StartedUtc = [DateTime]::UtcNow; By = 'deploy'; Completed = $false } }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -MockWith { @($script:settledNightly) }
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -BusyMarker -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (@(New-DoneResult) + @(New-VmStartResult)) -State (New-FinishedState -WithT4)
+            $outcome.Kind | Should -Be 'Done'
+            @($outcome.Added | Where-Object checkId -EQ 'DEPLOY.ENDSTOP')[0].status | Should -Be 'Pass'
+            $nightly = @($outcome.Added | Where-Object checkId -EQ 'DEPLOY.NIGHTLYSTOP')
+            $nightly.Count | Should -Be 1
+            $nightly[0].status | Should -Be 'Pass'
+            $nightly[0].message | Should -Be ($waited + ' This run stopped the demo itself at its end (DEPLOY.ENDSTOP), so the nightly stop''s later pass finds nothing running.')
+            $nightly[0].remediation | Should -BeNullOrEmpty -Because 'there''s nothing left to stop'
+            $nightly[0].evidence['stoppedByRun'] | Should -BeTrue
+            $nightly[0].evidence['pass'] | Should -Be 'T3Check'
+            @($outcome.Notes | Where-Object { $_ -match 'stop-demo\.ps1' }) | Should -BeNullOrEmpty
+            (Get-ModelStep -Path $run.ProgressPath -Id 'NightlyStop')['status'] | Should -Be 'Pass'
+        }
+
+        It 'keeps DEPLOY.NIGHTLYSTOP''s Warning, with its stop, when <Case> (item 11)' -ForEach @(
+            @{ Case = 'deploy.ps1 -KeepRunning leaves the demo running'; Keep = $true; Partial = $false }
+            @{ Case = 'the stop at the end didn''t stop everything'; Keep = $false; Partial = $true }
+        ) {
+            $script:settledNightly = New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The nightly stop waited for this run: its 19:30 T3 check (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:25 (Pacific Standard Time), 60 minutes after this run ended.' -Remediation 'To stop the demo now, run ./scripts/stop-demo.ps1.' -Evidence ([ordered]@{ pass = 'T3Check'; waited = 'The nightly stop waited for this run.'; stopsAt = '21:25'; stopsAtUtc = '2026-11-21T05:25:00Z' })
+            if ($Partial) {
+                $script:stopResults = @((New-StopResult 'STOP.VM_ARCHOST01' 'Warning'), (New-StopResult 'STOP.VM_SQLVM01'), (New-StopResult 'STOP.T4.STOP'))
+            }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoBusyMarkerRun -MockWith { [pscustomobject]@{ Job = $null; StartedUtc = [DateTime]::UtcNow; By = 'deploy'; Completed = $false } }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -MockWith { @($script:settledNightly) }
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -BusyMarker -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $script:config -Result (@(New-DoneResult) + @(New-VmStartResult)) -State (New-FinishedState -WithT4) -KeepRunning:$Keep
+            $nightly = @($outcome.Added | Where-Object checkId -EQ 'DEPLOY.NIGHTLYSTOP')
+            $nightly.Count | Should -Be 1
+            $nightly[0].status | Should -Be 'Warning'
+            $nightly[0].remediation | Should -Match 'stop-demo\.ps1'
+        }
         It 'finishes the ending when Ctrl+C cuts the stop at the end short, as in deploy.ps1''s finally block: the stop''s row, the run''s state, and the outcome deploy.ps1 reports (the review''s finding 2)' {
             $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
             $marker = Join-Path -Path $TestDrive -ChildPath ('endstop-' + [guid]::NewGuid().ToString('N'))

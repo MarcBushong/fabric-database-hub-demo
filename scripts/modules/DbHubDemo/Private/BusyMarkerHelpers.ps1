@@ -986,6 +986,62 @@ function Receive-DemoBusyMarkerOutput {
     }
 }
 
+function Get-DemoBusyMarkerWaitText {
+    # DEPLOY.NIGHTLYSTOP's first sentence for a run the nightly stop waited for: -Pass is the nightly pass that came during
+    # the run, or $null when an earlier run's deferred stop waited for this one too. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Pass
+    )
+
+    if ($null -ne $Pass) {
+        return ('The nightly stop waited for this run: its {0} found deploy.ps1 still running, so it changed nothing.' -f (Get-DemoBusyPassText -Pass $Pass))
+    }
+    return 'The nightly stop was already waiting tonight, for an earlier run, and it waited for this one too.'
+}
+
+function ConvertTo-DemoBusyMarkerStoppedResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.NIGHTLYSTOP once the run's own stop at its end stopped the demo (item 11, 2026-11-20; live, dbhubfu's update at
+    bf010ed): the Warning said when the demo stops later tonight and offered ./scripts/stop-demo.ps1, while DEPLOY.ENDSTOP had
+    stopped everything already and DONE said so. Returns the same record as a Pass: its first sentence (its evidence's
+    waited), that this run stopped the demo itself so the nightly stop's later pass finds nothing running, its evidence with
+    stoppedByRun, and no remediation. Any other record comes back as it was. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowNull()]
+        [object] $Record
+    )
+
+    if ($null -eq $Record -or [string](Get-DemoMemberValue -InputObject $Record -Name 'checkId') -ne 'DEPLOY.NIGHTLYSTOP' -or [string](Get-DemoMemberValue -InputObject $Record -Name 'status') -ne 'Warning') {
+        return $Record
+    }
+    $evidence = [ordered]@{}
+    $earlier = Get-DemoMemberValue -InputObject $Record -Name 'evidence'
+    if ($earlier -is [System.Collections.IDictionary]) {
+        foreach ($key in @($earlier.Keys)) {
+            $evidence[[string]$key] = $earlier[$key]
+        }
+    }
+    elseif ($null -ne $earlier) {
+        foreach ($property in $earlier.PSObject.Properties) {
+            $evidence[$property.Name] = $property.Value
+        }
+    }
+    $evidence['stoppedByRun'] = $true
+    $waited = [string](Get-DemoMemberValue -InputObject $earlier -Name 'waited')
+    if (-not $waited) {
+        $waited = 'The nightly stop waited for this run.'
+    }
+    $message = '{0} This run stopped the demo itself at its end (DEPLOY.ENDSTOP), so the nightly stop''s later pass finds nothing running.' -f $waited
+    return (New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl $script:BusyMarkerDoc)
+}
+
 function Get-DemoBusyMarkerEndText {
     # DEPLOY.NIGHTLYSTOP's message for a run the nightly stop waited for: -Pass is the nightly pass that came during the run,
     # or $null when an earlier run's deferred stop waited for this one too. Pure. Internal.
@@ -1011,12 +1067,7 @@ function Get-DemoBusyMarkerEndText {
         [bool] $ShutdownSet = $true
     )
 
-    $first = if ($null -ne $Pass) {
-        'The nightly stop waited for this run: its {0} found deploy.ps1 still running, so it changed nothing.' -f (Get-DemoBusyPassText -Pass $Pass)
-    }
-    else {
-        'The nightly stop was already waiting tonight, for an earlier run, and it waited for this one too.'
-    }
+    $first = Get-DemoBusyMarkerWaitText -Pass $Pass
     if ($PassScheduled) {
         $then = ' The demo now stops at {0} ({1}), {2} minutes after this run ended: the deferred pass dbhub-safety-deferred stops the VMs and T4{3}.' -f $StopText, $TimeZone, $GraceMinutes, $(if ($ShutdownSet) { ', and the VMs'' auto-shutdown is set to that time for tonight' } else { '' })
         return ($first + $then)
@@ -1133,7 +1184,7 @@ function Complete-DemoBusyMarkerRun {
             $shutdownSet = @($changes | Where-Object { -not $_.Ok }).Count -eq 0
             $message = Get-DemoBusyMarkerEndText -Pass $pass -StopText $stopAt.Text -TimeZone $shutdown.TimeZoneId -GraceMinutes ([int]$setting['graceMinutes']) -PassScheduled ([bool]$scheduled.Ok) -PassError ([string]$scheduled.Error) -ShutdownSet $shutdownSet
             $remediation = 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and then its session stops by itself 4 hours after that start (-Hours sets them; since 2026-11-19), or at the next nightly stop, tomorrow at {0}, if that comes first. To stop the demo now, run ./scripts/stop-demo.ps1.' -f (Format-DemoClockText -Clock $shutdown.Time)
-            $evidence = [ordered]@{ pass = $(if ($null -ne $pass) { [string]$pass.Run } else { 'EarlierRun' }); passLocalTime = $(if ($null -ne $pass) { [string]$pass.LocalTime } else { '' }); timeZone = $shutdown.TimeZoneId; busyUntilUtc = (ConvertTo-DemoBusyTimeText -Utc $graceEnd); stopsAtUtc = (ConvertTo-DemoBusyTimeText -Utc $stopAt.Utc); stopsAt = $stopAt.Text; graceMinutes = [int]$setting['graceMinutes']; deferredPass = $(if ($scheduled.Ok) { 'Scheduled' } else { 'Failed' }); deferredPassError = [string]$scheduled.Error; autoShutdown = @($changes | ForEach-Object { '{0}: {1} -> {2}{3}' -f $_.VmName, $_.From, $_.To, $(if ($_.Ok) { '' } else { ' (failed: {0})' -f $_.Error }) }) }
+            $evidence = [ordered]@{ pass = $(if ($null -ne $pass) { [string]$pass.Run } else { 'EarlierRun' }); passLocalTime = $(if ($null -ne $pass) { [string]$pass.LocalTime } else { '' }); waited = (Get-DemoBusyMarkerWaitText -Pass $pass); timeZone = $shutdown.TimeZoneId; busyUntilUtc = (ConvertTo-DemoBusyTimeText -Utc $graceEnd); stopsAtUtc = (ConvertTo-DemoBusyTimeText -Utc $stopAt.Utc); stopsAt = $stopAt.Text; graceMinutes = [int]$setting['graceMinutes']; deferredPass = $(if ($scheduled.Ok) { 'Scheduled' } else { 'Failed' }); deferredPassError = [string]$scheduled.Error; autoShutdown = @($changes | ForEach-Object { '{0}: {1} -> {2}{3}' -f $_.VmName, $_.From, $_.To, $(if ($_.Ok) { '' } else { ' (failed: {0})' -f $_.Error }) }) }
             if ($ProgressPath) {
                 Set-DemoProgressStep -Path $ProgressPath -Id 'NightlyStop' -State 'Done' -Status 'Warning' -Message ('{0} {1}' -f $message, $remediation)
             }
