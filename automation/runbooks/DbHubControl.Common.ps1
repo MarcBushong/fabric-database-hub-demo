@@ -3533,9 +3533,10 @@ function Start-DbHubActivityRun {
         [AllowNull()]
         [scriptblock] $OnT4Ready = $null,
 
-        # Called with a VM's name once it runs, after this control's earlier Run Commands there are deleted and right before
-        # its activity goes out (2026-11-20, ADR 0031): a session's start sends an earlier session's evidence export there.
-        # It returns the name of a Run Command it sent, which no cleanup of this run deletes, or ''.
+        # Called with a VM's name once it runs, and whether it ran before this run started it, after this control's earlier
+        # Run Commands there are deleted and right before its activity goes out (2026-11-20, ADR 0031): a session's start
+        # sends an evidence export there. It returns the name of a Run Command it sent, which no cleanup of this run
+        # deletes, or ''.
         [AllowNull()]
         [scriptblock] $OnVmReady = $null
     )
@@ -3848,7 +3849,7 @@ function Start-DbHubActivityRun {
             # This control's earlier Run Commands on the VM go first: a VM takes 25 managed ones.
             Clear-DbHubOldRunCommand -Context $Context -VmName $vm -Keep $runNames.ToArray()
             if ($null -ne $OnVmReady) {
-                $readyName = [string](& $OnVmReady $vm)
+                $readyName = [string](& $OnVmReady $vm ($vm -notin $startedVms))
                 if ($readyName) {
                     $runNames.Add($readyName)
                 }
@@ -6406,7 +6407,12 @@ function Invoke-DbHubRcaExport {
     export listed only another session's documents), Stopped (its export ran, but the VM stopped before their parts were
     fetched), Held (no export: an earlier session holds its capture), OldRunner, OldBundle, Failed, TimedOut, NotRunning,
     or NoRoom. Each host also has ForSession (the session its export was for), ExportRead (that export ran, and its index
-    was read), and Held.
+    was read), Held, Outside (documents it listed that were captured outside the session they'd go with, not fetched:
+    review of 02d398a), and Consumed (those an export with no session listed that no session takes).
+    -HeldBy names, by VM, the earlier session that holds its capture that no export took, when it's known when that
+    session's activity ended (-SessionWindow): what an export with no session lists there from within that activity is
+    that session's capture, fetched or in Others like its own export's (review of 02d398a: a VM that still ran that
+    session's activity at this start, such as a Run all in the minutes between a session's end and its auto-stop).
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -6437,6 +6443,18 @@ function Invoke-DbHubRcaExport {
         [AllowNull()]
         [AllowEmptyCollection()]
         [string[]] $SkipVm = @(),
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $SessionWindow = $null,
+
+        [AllowNull()]
+        [object] $OutsideFromUtc = $null,
+
+        [AllowNull()]
+        [object] $OutsideToUtc = $null,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $HeldBy = $null,
 
         [int] $PollSeconds = 10,
 
@@ -6476,7 +6494,45 @@ function Invoke-DbHubRcaExport {
         }
     }
     # What an export printed (review of 93243d6, from a running VM or one that stopped since): its own session's documents
-    # are fetched, another session's go to Others, for that session's start.
+    # are fetched, another session's go to Others, for that session's start. A document captured outside the session the
+    # export is for isn't fetched (review of 02d398a), decided from its ID, which starts with its window's start:
+    # - before that session's activity began or after it ended (-SessionWindow, by session: StartUtc and EndUtc, an earlier
+    #   session's at a start), or in the gap between the session before this one and this one (-OutsideFromUtc to
+    #   -OutsideToUtc), where no session ran;
+    # - everything an export with no session lists (a start's, on a VM that ran before it: activity outside a Run all
+    #   session ran there), which goes with no session (Consumed), except what falls within the activity of the earlier
+    #   session that holds the VM (-HeldBy), which is that session's.
+    $slack = $script:DbHubRcaSlackMinutes
+    $windows = $SessionWindow
+    $gapFrom = $OutsideFromUtc
+    $gapTo = $OutsideToUtc
+    $holders = $HeldBy
+    $isOutside = {
+        param([string] $For, [AllowNull()] [object] $At)
+        if ($At -isnot [datetime]) {
+            return $false
+        }
+        if ($null -ne $windows -and $For -and $windows.Contains($For)) {
+            $window = $windows[$For]
+            $from = Get-DbHubMember -InputObject $window -Name 'StartUtc'
+            $to = Get-DbHubMember -InputObject $window -Name 'EndUtc'
+            if (($from -is [datetime] -and $At -lt ([datetime]$from).AddMinutes(-$slack)) -or ($to -is [datetime] -and $At -gt ([datetime]$to).AddMinutes($slack))) {
+                return $true
+            }
+        }
+        return ($For -eq $SessionId -and $gapFrom -is [datetime] -and $gapTo -is [datetime] -and $At -gt ([datetime]$gapFrom).AddMinutes($slack) -and $At -lt ([datetime]$gapTo).AddMinutes(-$slack))
+    }
+    # Whether a document's window starts within a session's activity, whose end is known.
+    $isWithin = {
+        param([string] $For, [AllowNull()] [object] $At)
+        if ($At -isnot [datetime] -or -not $For -or $null -eq $windows -or -not $windows.Contains($For)) {
+            return $false
+        }
+        $window = $windows[$For]
+        $from = Get-DbHubMember -InputObject $window -Name 'StartUtc'
+        $to = Get-DbHubMember -InputObject $window -Name 'EndUtc'
+        return ($to -is [datetime] -and $At -le ([datetime]$to).AddMinutes($slack) -and ($from -isnot [datetime] -or $At -ge ([datetime]$from).AddMinutes(-$slack)))
+    }
     $others = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $takeExport = {
         param([object] $State, [object] $View)
@@ -6500,17 +6556,38 @@ function Invoke-DbHubRcaExport {
                 $State.ExportRead = $true
                 $State.Outcome = 'Exported'
                 foreach ($reference in @($index.Documents)) {
-                    if ($State.ForSession -eq $SessionId) {
+                    $at = ConvertFrom-DbHubRcaDocumentTime -DocumentId ([string]$reference['documentId'])
+                    $for = [string]$State.ForSession
+                    if (-not $for -and $SessionId) {
+                        $holder = ''
+                        if ($null -ne $holders -and $holders.Contains($State.Vm)) {
+                            $holder = [string]$holders[$State.Vm]
+                        }
+                        if (-not (& $isWithin $holder $at)) {
+                            $State.Consumed++
+                            continue
+                        }
+                        $for = $holder
+                    }
+                    elseif (& $isOutside $for $at) {
+                        $State.Outside++
+                        continue
+                    }
+                    if ($for -eq $SessionId) {
                         $State.Listed++
                         & $addDocument $State $reference
                         continue
                     }
-                    $others.Add([ordered]@{ documentId = [string]$reference['documentId']; parts = [int]$reference['parts']; sha256 = [string]$reference['sha256']; vm = $State.Vm; sessionId = $State.ForSession })
+                    $others.Add([ordered]@{ documentId = [string]$reference['documentId']; parts = [int]$reference['parts']; sha256 = [string]$reference['sha256']; vm = $State.Vm; sessionId = $for })
                     $State.Others++
                 }
                 if (@($index.Documents).Count -eq 0) {
                     $State.Outcome = 'Nothing'
                     $State.Message = '{0}: nothing new was captured since the last export.' -f $State.Vm
+                }
+                elseif ($State.Listed -eq 0 -and $State.Others -eq 0) {
+                    $State.Outcome = 'Nothing'
+                    $State.Message = '{0}: only capture from outside a Run all session, which no session''s history takes.' -f $State.Vm
                 }
             }
             else {
@@ -6541,7 +6618,7 @@ function Invoke-DbHubRcaExport {
             }
         }
         $held = -not $sentName -and $entry.Vm -in @($SkipVm)
-        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Held = $held; Others = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0 }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Held = $held; Others = 0; Outside = 0; Consumed = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0 }
         if (($NoNewExport -or $held) -and -not $sentName -and $earlier.Count -eq 0) {
             if ($held) {
                 $state.Outcome = 'Held'
@@ -6772,7 +6849,7 @@ function Invoke-DbHubRcaExport {
         elseif ($outcome -eq 'Stopped') {
             $message = '{0} stopped once its export had run, so {1} document(s) weren''t fetched; they stay on {0} for the next export.' -f $state.Vm, $left
         }
-        $answers.Add([pscustomobject]@{ Vm = $state.Vm; Targets = $state.Targets; Outcome = $outcome; Message = $message; ForSession = [string]$state.ForSession; ExportRead = [bool]$state.ExportRead; Held = [bool]$state.Held; Others = [int]$state.Others })
+        $answers.Add([pscustomobject]@{ Vm = $state.Vm; Targets = $state.Targets; Outcome = $outcome; Message = $message; ForSession = [string]$state.ForSession; ExportRead = [bool]$state.ExportRead; Held = [bool]$state.Held; Others = [int]$state.Others; Outside = [int]$state.Outside; Consumed = [int]$state.Consumed })
     }
     return [pscustomobject]@{ Hosts = $answers.ToArray(); Lines = $lines; Vms = $vms; Pending = $pendingOut.ToArray(); Others = $others.ToArray() }
 }
@@ -7066,6 +7143,15 @@ function Invoke-DbHubRcaSessionExport {
     sessionId and vm, and the caller hands them to that session's entry in rcaEarlierPending (Add-DbHubRcaElsewhere), for a
     later start. -SkipVm (Invoke-DbHubRcaExport) leaves out the export on VMs an earlier session holds; a final export
     counts them in leftVms. Hosts is Invoke-DbHubRcaExport's.
+    Capture from outside the session (review of 02d398a): -SessionWindow and -OutsideFromUtc keep Invoke-DbHubRcaExport
+    from fetching what was captured outside an earlier session's activity, or between the session before this one and
+    this one.
+    -OutsideToUtc is this session's start: once fetched, a document whose window starts before it is no capture of this
+    session's, so it's not written (activity outside a Run all session that this session's export took, which no history
+    takes), unless it's another session's, when it's that session's capture from before this one began, which goes to
+    Others. Another session's document whose window starts after it is this session's capture under that session's ID
+    (an earlier session's export at this session's start took it), which nothing separates now: it's not written, and
+    RCA.EXPORT is a Warning. -HeldBy is Invoke-DbHubRcaExport's.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -7096,6 +7182,18 @@ function Invoke-DbHubRcaSessionExport {
         [AllowEmptyCollection()]
         [string[]] $SkipVm = @(),
 
+        [AllowNull()]
+        [System.Collections.IDictionary] $SessionWindow = $null,
+
+        [AllowNull()]
+        [object] $OutsideFromUtc = $null,
+
+        [AllowNull()]
+        [object] $OutsideToUtc = $null,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $HeldBy = $null,
+
         [int] $PollSeconds = 10,
 
         [switch] $WhileRunning,
@@ -7111,7 +7209,7 @@ function Invoke-DbHubRcaSessionExport {
         return [pscustomobject]@{ State = $state; Index = $null; Lines = @([pscustomobject]@{ Step = 'RCA.EXPORT'; Status = 'Warning'; Message = $state['message']; Fix = 'Run ./scripts/deploy.ps1.' }); New = 0; Held = $false; Fresh = @(); Others = @(); Hosts = @() }
     }
     $earlierBundles = @($state['bundles']).Count
-    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc ((Get-DbHubUtcNow).AddMinutes($Minutes)) -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -NoNewExport:$NoNewExport -PollSeconds $PollSeconds
+    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc ((Get-DbHubUtcNow).AddMinutes($Minutes)) -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -SessionWindow $SessionWindow -OutsideFromUtc $OutsideFromUtc -OutsideToUtc $OutsideToUtc -HeldBy $HeldBy -NoNewExport:$NoNewExport -PollSeconds $PollSeconds
     $pending = New-Object -TypeName 'System.Collections.Generic.List[object]'
     foreach ($item in @($run.Pending)) {
         $pending.Add($item)
@@ -7131,6 +7229,11 @@ function Invoke-DbHubRcaSessionExport {
     $good = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $parsed = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $elsewhere = 0
+    $outside = 0
+    $misbound = 0
+    foreach ($item in @($run.Hosts)) {
+        $outside += [int](Get-DbHubMember -InputObject $item -Name 'Outside')
+    }
     foreach ($id in @($run.Lines.Keys)) {
         $lines = [string[]]$run.Lines[$id]
         $expanded = Expand-DbHubRcaDocument -Line $lines
@@ -7139,14 +7242,23 @@ function Invoke-DbHubRcaSessionExport {
             continue
         }
         $documentSession = [string](Get-DbHubMember -InputObject $expanded.Document -Name 'sessionId')
+        $at = ConvertFrom-DbHubRcaDocumentTime -DocumentId $id
+        $before = $OutsideToUtc -is [datetime] -and $null -ne $at -and $at -lt ([datetime]$OutsideToUtc).AddMinutes(-$script:DbHubRcaSlackMinutes)
         if ($documentSession -and $SessionId -and $documentSession -ne $SessionId) {
-            if ($documentSession -cmatch '^[0-9a-f]{32}$') {
+            if ($OutsideToUtc -is [datetime] -and -not $before) {
+                $misbound++
+            }
+            elseif ($documentSession -cmatch '^[0-9a-f]{32}$') {
                 $others.Add([ordered]@{ documentId = $id; parts = $lines.Count; sha256 = $lines[0].Split(' ')[4]; vm = [string]$run.Vms[$id]; sessionId = $documentSession })
                 $elsewhere++
             }
             else {
                 $notes.Add(('{0} was skipped: it''s another session''s.' -f $id))
             }
+            continue
+        }
+        if ($before) {
+            $outside++
             continue
         }
         if ($known.Contains($id)) {
@@ -7252,7 +7364,7 @@ function Invoke-DbHubRcaSessionExport {
         $state['finalRan'] = $true
     }
     $status = 'Pass'
-    if (@($reported | Where-Object { $_.Outcome -notin 'Exported', 'Nothing' }).Count -gt 0 -or $notes.Count -gt 0 -or ($Final -and $pending.Count -gt 0) -or $unlisted -gt 0) {
+    if (@($reported | Where-Object { $_.Outcome -notin 'Exported', 'Nothing' }).Count -gt 0 -or $notes.Count -gt 0 -or ($Final -and $pending.Count -gt 0) -or $unlisted -gt 0 -or $misbound -gt 0) {
         $status = 'Warning'
     }
     elseif ($documents.Count -eq 0) {
@@ -7287,6 +7399,12 @@ function Invoke-DbHubRcaSessionExport {
     if ($elsewhere + $listed -gt 0) {
         $extra.Add(('{0} document(s) of another session go with that session''s evidence (RCA.EARLIER).' -f ($elsewhere + $listed)))
     }
+    if ($outside -gt 0) {
+        $extra.Add(('{0} document(s) from before the session began or after it ended weren''t saved: no session''s history takes them.' -f $outside))
+    }
+    if ($misbound -gt 0) {
+        $extra.Add(('{0} document(s) of this session''s capture went with an earlier session''s ID, so they aren''t saved: that session''s export at this session''s start ran with this session''s activity on the VM.' -f $misbound))
+    }
     if ($extra.Count -gt 0) {
         $message = '{0} {1}' -f $message, ($extra -join ' ')
     }
@@ -7305,6 +7423,9 @@ function Invoke-DbHubRcaSessionExport {
         }
         if (@($reported | Where-Object { $_.Outcome -in 'OldRunner', 'OldBundle' }).Count -gt 0) {
             $fixes.Add('a runner or bootstrap bundle that predates the export is updated by ./scripts/deploy.ps1')
+        }
+        if ($misbound -gt 0) {
+            $fixes.Add('nothing separates that capture now; it happens when a VM sets its activity profile at boot (activityProfileOnBoot) and an earlier session holds it, and with activityProfileOnBoot false it doesn''t')
         }
         if ($fixes.Count -gt 0) {
             $fix = ($fixes -join '; ') + '.'
@@ -7356,6 +7477,90 @@ $script:DbHubRcaCarryMost = 4
 $script:DbHubRcaCarryBytes = 6000
 $script:DbHubRcaRanPhases = @('starting', 'replica', 'running', 'stopped')
 $script:DbHubRcaApartFix = 'Nothing separates it now. Each start exports what an earlier session left on a VM before its own activity there; this happens only when that export can''t run there.'
+$script:DbHubRcaOutsideFix = 'Nothing separates it now. A start that finds a VM stopped exports what an earlier session left there before its own activity, so stop the demo (./scripts/stop-demo.ps1) before Run all when it runs outside a session.'
+# How far a document's window may stray from its session's before it counts as captured outside it (review of 02d398a):
+# the VMs' and the sandbox's clocks, and the observer's last half-minute sample.
+$script:DbHubRcaSlackMinutes = 2
+# How long a session's start waits for an export it sent to a VM before that VM's activity goes out (review of 02d398a).
+$script:DbHubRcaReadySeconds = 180
+
+function ConvertFrom-DbHubRcaDocumentTime {
+    # When a document's capture window starts, from its ID (<yyyyMMddTHHmmssZ>-<host>-<sequence>, Exporter.cs), or $null.
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $DocumentId
+    )
+
+    $at = [DateTime]::MinValue
+    if ([string]$DocumentId -cmatch '^([0-9]{8}T[0-9]{6}Z)-' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMdd''T''HHmmss''Z''', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$at)) {
+        return $at
+    }
+    return $null
+}
+
+function Get-DbHubRcaSessionEnd {
+    # When a session's activity ended, from its status (review of 02d398a): its stop (stoppedUtc) or its planned end
+    # (runEndUtc), whichever came first; $null when its status names neither. The observer captures a session only while
+    # its activity runs, so a document whose window starts later is capture from outside it.
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $Status
+    )
+
+    if ($null -eq $Status) {
+        return $null
+    }
+    $end = ConvertTo-DbHubUtc -Value $Status['runEndUtc']
+    $stopped = $null
+    if ([string]$Status['phase'] -eq 'stopped') {
+        $stopped = ConvertTo-DbHubUtc -Value $Status['stoppedUtc']
+    }
+    if ($null -ne $stopped -and ($null -eq $end -or $stopped -lt $end)) {
+        $end = $stopped
+    }
+    return $end
+}
+
+function Wait-DbHubRcaRunCommand {
+    <#
+    .SYNOPSIS
+    Waits at most -Seconds for one of the export's Run Commands to end (review of 02d398a). A session's start sends an
+    export to a VM right before that VM's activity goes out, and managed Run Commands run in parallel on a VM
+    (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed): an export that ran beside the activity
+    would take the new session's first capture too. Returns the instance view once it ended, or $null.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [int] $Seconds = $script:DbHubRcaReadySeconds,
+
+        [int] $PollSeconds = 10
+    )
+
+    $deadline = (Get-DbHubUtcNow).AddSeconds($Seconds)
+    while ($true) {
+        $view = Read-DbHubRunCommandView -Context $Context -VmName $VmName -Name $Name
+        if ($view.Found -and $view.ExecutionState -in $script:DbHubRcaTerminal) {
+            return $view
+        }
+        if (-not $view.Found) {
+            return $null
+        }
+        if ((Get-DbHubUtcNow) -ge $deadline) {
+            Write-DbHubLog -Context $Context -Message ('{0}: the RCA export {1} didn''t end in {2} seconds, so the activity goes out beside it.' -f $VmName, $Name, $Seconds)
+            return $null
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
 
 function Get-DbHubRcaActivityVm {
     <#
@@ -7479,7 +7684,9 @@ function ConvertTo-DbHubRcaCarry {
     One earlier session's evidence that's still on the VMs, as a status carries it in rcaEarlierPending (review of 3b1348a,
     93243d6): sessionId; pending, the documents an export listed but didn't fetch whole, each with its vm, and expiresUtc,
     when the runner deletes them (7 days after the export that listed them); leftVms, the VMs where it holds capture that no
-    export took, and heldUntilUtc, when the runner deletes that (30 days after it began: EvidenceStore.cs); and, while no
+    export took, and heldUntilUtc, when the runner deletes that (30 days after it began: EvidenceStore.cs); startUtc and
+    endUtc, when its activity began and ended, outside which nothing an export lists under its ID is its capture (review
+    of 02d398a); and, while no
     saved index lists its bundles (the nightly stop or the VMs' auto-shutdown ended it, or a start was refused before it
     fetched them), its bundles and documents, for the index of the start that fetches it. $null when nothing is left.
     #>
@@ -7510,6 +7717,12 @@ function ConvertTo-DbHubRcaCarry {
     if ($left.Count -gt 0 -and $Entry['heldUntilUtc'] -is [datetime]) {
         $carry['heldUntilUtc'] = ConvertTo-DbHubTimeText -Value $Entry['heldUntilUtc']
     }
+    if ($Entry['startUtc'] -is [datetime]) {
+        $carry['startUtc'] = ConvertTo-DbHubTimeText -Value $Entry['startUtc']
+    }
+    if ($Entry['endUtc'] -is [datetime]) {
+        $carry['endUtc'] = ConvertTo-DbHubTimeText -Value $Entry['endUtc']
+    }
     if ($bundles.Count -gt 0) {
         $carry['bundles'] = $bundles
         $carry['documents'] = $documents
@@ -7526,7 +7739,9 @@ function Get-DbHubRcaBacklog {
     documents not fetched whole, or bundles that no saved index lists. Returns Entries (each [ordered]@{ sessionId; pending;
     leftVms; expiresUtc; heldUntilUtc; rca, its RCA state for the fetch; previous; known; mustFetch }), Expired (each part
     past its time: documents 7 days after the export that listed them, capture 30 days after it began), Dropped (past the 4
-    sessions or 6,000 bytes a status keeps, the first to expire going first), and Inseparable (a VM two sessions held).
+    sessions or 6,000 bytes a status keeps, the first to expire going first), and Inseparable (a VM two sessions held). Each
+    entry's startUtc and endUtc are when its activity began (acceptedUtc) and ended (Get-DbHubRcaSessionEnd), or $null when
+    that isn't known.
 
     .DESCRIPTION
     The runner binds each span of capture to the session of the first export that takes from it (Exporter.cs), so a VM's
@@ -7582,7 +7797,7 @@ function Get-DbHubRcaBacklog {
             if ($null -eq $began -or $began -gt $since) {
                 $began = $since
             }
-            $own = [ordered]@{ sessionId = $ownId; pending = $pending; leftVms = @($held.Vms); expiresUtc = $since.AddDays($script:DbHubRcaCarryDays); heldUntilUtc = $began.AddDays($script:DbHubRcaCapturedDays); rca = $state; previous = $true; known = [bool]$held.Known; mustFetch = $unsaved }
+            $own = [ordered]@{ sessionId = $ownId; pending = $pending; leftVms = @($held.Vms); expiresUtc = $since.AddDays($script:DbHubRcaCarryDays); heldUntilUtc = $began.AddDays($script:DbHubRcaCapturedDays); startUtc = (ConvertTo-DbHubUtc -Value $Previous['acceptedUtc']); endUtc = (Get-DbHubRcaSessionEnd -Status $Previous); rca = $state; previous = $true; known = [bool]$held.Known; mustFetch = $unsaved }
         }
     }
     $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
@@ -7625,7 +7840,7 @@ function Get-DbHubRcaBacklog {
             continue
         }
         $state = ConvertTo-DbHubRcaState -State ([ordered]@{ sessionId = $session; bundles = $bundles; documents = @($carry['documents'] | Where-Object { $null -ne $_ }); pending = $pending; leftVms = $left; finalRan = $true }) -SessionId $session
-        $entries.Add([ordered]@{ sessionId = $session; pending = $pending; leftVms = $left; expiresUtc = $expires; heldUntilUtc = $heldUntil; rca = $state; previous = $false; known = $true; mustFetch = ($bundles.Count -gt 0) })
+        $entries.Add([ordered]@{ sessionId = $session; pending = $pending; leftVms = $left; expiresUtc = $expires; heldUntilUtc = $heldUntil; startUtc = (ConvertTo-DbHubUtc -Value $carry['startUtc']); endUtc = (ConvertTo-DbHubUtc -Value $carry['endUtc']); rca = $state; previous = $false; known = $true; mustFetch = ($bundles.Count -gt 0) })
     }
     if ($null -ne $own) {
         $entries.Add($own)
@@ -7726,21 +7941,30 @@ function Get-DbHubRcaEarlier {
 }
 
 function Get-DbHubRcaInseparableText {
-    # An earlier session's capture on a VM that a later session's activity reached before an export took it (review of
-    # 93243d6): the runner gives capture to the session of the first export that takes it (Exporter.cs), so it's that later
-    # session's now.
+    # An earlier session's capture on a VM that other activity reached before an export took it (reviews of 93243d6 and
+    # 02d398a): the runner gives capture that no export took to the first export that takes it (Exporter.cs), whose session
+    # keeps only what it captured itself, so that capture isn't in any history. -Item: sessionId, vm, with (the later
+    # session, or '' when the VM ran before this session's start and its export with no session couldn't tell that capture
+    # apart), and why.
     param(
         [Parameter(Mandatory = $true)]
         [System.Collections.IDictionary] $Item
     )
 
+    $earlier = ([string]$Item['sessionId']).Substring(0, 8)
+    if (-not [string]$Item['with']) {
+        $how = [string]$Item['why']
+        if (-not $how) {
+            $how = 'an export with no session took it with any activity outside a Run all session there'
+        }
+        return ('Session {0}''s capture on {1} that no export took isn''t in any history now: {1} was running before this session''s start, and {2}.' -f $earlier, $Item['vm'], $how)
+    }
     $why = ''
     if ([string]$Item['why']) {
         $why = ' ({0})' -f $Item['why']
     }
-    $earlier = ([string]$Item['sessionId']).Substring(0, 8)
     $later = ([string]$Item['with']).Substring(0, 8)
-    return ('Session {0}''s capture on {1} that no export took can''t be told apart from session {2}''s any more: {2}''s activity ran there before it was exported{3}, and the runner gives such capture to the first export that takes it, so it''s in session {2}''s history, not {0}''s.' -f $earlier, $Item['vm'], $later, $why)
+    return ('Session {0}''s capture on {1} that no export took isn''t in any history now: session {2}''s activity ran there before it was exported{3}, so the runner gave it to {2}''s export, which keeps only what {2} captured.' -f $earlier, $Item['vm'], $later, $why)
 }
 
 function Set-DbHubRcaBacklog {
@@ -7802,8 +8026,13 @@ function Send-DbHubRcaEarlierExport {
     final export of the earlier session that holds the VM's capture that no export took (Get-DbHubRcaBacklog's leftVms, one
     session at most per VM), with that session's ID, so the runner binds that capture to it before this session's activity
     starts there (review of 93243d6): an export gives capture that no export took to its own session (Exporter.cs). It goes
-    out whichever session this start fetches. Only sends the Run Command (Invoke-DbHubRcaEarlier reads it after the start).
-    Returns Name and SessionId, or $null.
+    out whichever session this start fetches. With -RanBefore (the VM ran before this start: review of 02d398a), an export
+    with no session instead, whatever an earlier session held there: activity outside a Run all session (deploy.ps1,
+    start-demo.ps1) could run there, so what the observer captured goes with no session, and no history takes it, except
+    what falls within the activity of the earlier session that holds the VM, which is that session's (Invoke-DbHubRcaEarlier:
+    the VM can still have run it, as after a Run all in the minutes between a session's end and its auto-stop); it isn't
+    final, so it doesn't wait for a span that's still capturing. Only sends the Run Command (Invoke-DbHubRcaEarlier reads it
+    after the start). Returns Name and SessionId ('' with -RanBefore), or $null.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -7814,23 +8043,28 @@ function Send-DbHubRcaEarlierExport {
 
         [AllowNull()]
         [AllowEmptyCollection()]
-        [object[]] $Entry = @()
+        [object[]] $Entry = @(),
+
+        [switch] $RanBefore
     )
 
     $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
     if (-not $bounds.Supported) {
         return $null
     }
-    $holder = @(@($Entry) | Where-Object { $null -ne $_ -and $VmName -in @($_['leftVms']) }) | Select-Object -First 1
-    if ($null -eq $holder) {
-        return $null
+    $session = ''
+    if (-not $RanBefore) {
+        $holder = @(@($Entry) | Where-Object { $null -ne $_ -and $VmName -in @($_['leftVms']) }) | Select-Object -First 1
+        if ($null -eq $holder) {
+            return $null
+        }
+        $session = [string]$holder['sessionId']
     }
     if ((Get-DbHubRcaRoom -Context $Context -VmName $VmName) -lt 2) {
         return $null
     }
-    $session = [string]$holder['sessionId']
     $name = '{0}rca-{1}-x-{2}' -f $Context.Settings.runCommandPrefix, $VmName, (Get-DbHubUtcNow).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
-    $request = [ordered]@{ command = 'export'; sessionId = $session; final = $true; timeoutSeconds = $bounds.ExportSeconds }
+    $request = [ordered]@{ command = 'export'; sessionId = $session; final = (-not $RanBefore); timeoutSeconds = $bounds.ExportSeconds }
     if (Send-DbHubRunCommand -Context $Context -VmName $VmName -Name $name -Script (Get-DbHubRcaScript -Settings $Context.Settings -Request $request) -TimeoutSeconds ($bounds.ExportSeconds + 120) -ConflictDelaySeconds 10) {
         return [pscustomobject]@{ Name = $name; SessionId = $session }
     }
@@ -7865,6 +8099,8 @@ function Add-DbHubRcaElsewhere {
         }
     }
     $week = $NowUtc.AddDays($script:DbHubRcaCarryDays)
+    # That session ended before this one began (review of 02d398a): nothing captured later is its.
+    $began = ConvertTo-DbHubUtc -Value $Status['acceptedUtc']
     $added = 0
     foreach ($item in @($Document)) {
         if ($null -eq $item) {
@@ -7887,6 +8123,10 @@ function Add-DbHubRcaElsewhere {
         $expires = ConvertTo-DbHubUtc -Value $carry['expiresUtc']
         if ($null -eq $expires -or $expires -lt $week) {
             $carry['expiresUtc'] = ConvertTo-DbHubTimeText -Value $week
+        }
+        $end = ConvertTo-DbHubUtc -Value $carry['endUtc']
+        if ($null -ne $began -and ($null -eq $end -or $began -lt $end)) {
+            $carry['endUtc'] = ConvertTo-DbHubTimeText -Value $began
         }
         $added++
     }
@@ -7920,9 +8160,15 @@ function Invoke-DbHubRcaEarlier {
     the one whose bundles no saved index lists yet, if any (the nightly stop or the VMs' auto-shutdown ended it), otherwise
     the one whose documents the runner deletes first. Their bundle index goes into the status's rcaEarlier, which the control
     notebook saves with that session's history, and what's left back into rcaEarlierPending, for later starts. A held VM that
-    this session's activity reached before its holder's export ran has lost that capture to this session: an RCA.EARLIER
-    Warning says so, and no export is sent for it later under the wrong session. RCA.EARLIER lines say what's still on the
-    VMs and what happens to it. Never throws: on an error, the entries stay as the start wrote them.
+    this session's activity reached before its holder's export ran has lost that capture: an RCA.EARLIER Warning says so,
+    and no export is sent for it later under the wrong session. RCA.EARLIER lines say what's still on the VMs and what
+    happens to it. Capture from outside a session (review of 02d398a): the export a start sent with no session (a VM that
+    ran before it) is read too, and what it listed goes with no session (an RCA.EXPORT Info line says how much), except
+    what falls within the activity of the earlier session that holds that VM, when its status says when that activity
+    ended, which goes with that session as its own export's would; a held VM there whose export wasn't read, or whose
+    holder's end isn't known, has lost its capture the same way. What an earlier session's export lists from outside that
+    session's activity (its startUtc to endUtc) isn't fetched. Never throws: on an error, the entries stay as the start
+    wrote them.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -7945,7 +8191,7 @@ function Invoke-DbHubRcaEarlier {
     )
 
     $entries = @(@($Entry) | Where-Object { $null -ne $_ })
-    if ($entries.Count -eq 0) {
+    if ($entries.Count -eq 0 -and ($null -eq $Sent -or $Sent.Count -eq 0)) {
         return
     }
     try {
@@ -7966,6 +8212,26 @@ function Invoke-DbHubRcaEarlier {
             }
         }
         $sentVms = @($sentFor.Keys)
+        # When each earlier session's activity began and ended (review of 02d398a): what an export lists under its ID from
+        # outside that window is capture from outside it, which isn't fetched.
+        $sessionWindow = @{}
+        foreach ($item in $entries) {
+            $sessionWindow[[string]$item['sessionId']] = [pscustomobject]@{ StartUtc = $item['startUtc']; EndUtc = $item['endUtc'] }
+        }
+        # The earlier session that holds each VM's capture that no export took, when it's known when its activity ended:
+        # what an export with no session lists there from within that activity is its (a VM that still ran it at this
+        # start, or that ran activity outside a Run all session since).
+        $heldBy = @{}
+        foreach ($item in $entries) {
+            if ($item['endUtc'] -isnot [datetime]) {
+                continue
+            }
+            foreach ($vm in @(@($item['leftVms']) | ForEach-Object { [string]$_ })) {
+                if (-not $heldBy.ContainsKey($vm)) {
+                    $heldBy[$vm] = [string]$item['sessionId']
+                }
+            }
+        }
         $activity = Get-DbHubRcaActivityVm -Settings $settings -Status $Status
         if ($null -eq $activity) {
             $activity = @()
@@ -7980,7 +8246,7 @@ function Invoke-DbHubRcaEarlier {
                 if (@($item['pending']).Count -gt 0) {
                     $key = $item['expiresUtc']
                 }
-                if (@($sentVms | Where-Object { $sentFor[$_] -eq [string]$item['sessionId'] }).Count -gt 0 -and $week -lt $key) {
+                if (@($sentVms | Where-Object { $sentFor[$_] -eq [string]$item['sessionId'] -or (-not $sentFor[$_] -and $heldBy[$_] -eq [string]$item['sessionId']) }).Count -gt 0 -and $week -lt $key) {
                     $key = $week
                 }
                 if ($key -lt $best) {
@@ -7995,32 +8261,72 @@ function Invoke-DbHubRcaEarlier {
             $fetchState = ConvertTo-DbHubRcaState -State $fetch['rca'] -SessionId ([string]$fetch['sessionId'])
             $fetchState['pending'] = @($fetch['pending'])
             $fetchState['leftVms'] = @($fetch['leftVms'])
-            $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId ([string]$fetch['sessionId']) -Final -Minutes $bounds.StartMinutes -Earlier $fetchState -Sent $Sent -SentSession $SentSession -OnlyVm $vms -NoNewExport -PollSeconds $PollSeconds
+            $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId ([string]$fetch['sessionId']) -Final -Minutes $bounds.StartMinutes -Earlier $fetchState -Sent $Sent -SentSession $SentSession -OnlyVm $vms -SessionWindow $sessionWindow -HeldBy $heldBy -NoNewExport -PollSeconds $PollSeconds
             if ($null -ne $done.Index) {
                 $Status['rcaEarlier'] = $done.Index
             }
         }
+        $hostResults = @()
+        $listedOthers = @()
+        if ($null -ne $done) {
+            $hostResults = @($done.Hosts)
+            $listedOthers = @($done.Others)
+        }
+        elseif ($sentVms.Count -gt 0 -and $bounds.Supported) {
+            # Only exports with no session went out (VMs that ran before this start): they're read, and what they listed
+            # goes with no session, or with the earlier session that holds the VM (review of 02d398a).
+            $readOnly = Invoke-DbHubRcaExport -Context $Context -SessionId $current -DeadlineUtc ($now.AddMinutes($bounds.StartMinutes)) -Sent $Sent -SentSession $SentSession -OnlyVm $sentVms -SessionWindow $sessionWindow -HeldBy $heldBy -NoNewExport -PollSeconds $PollSeconds
+            $hostResults = @($readOnly.Hosts)
+            $listedOthers = @($readOnly.Others)
+        }
         $read = @{}
         $result = @{}
-        if ($null -ne $done) {
-            foreach ($hostResult in @($done.Hosts)) {
-                $read[[string]$hostResult.Vm] = [bool](Get-DbHubMember -InputObject $hostResult -Name 'ExportRead')
-                $result[[string]$hostResult.Vm] = [string]$hostResult.Outcome
+        $consumed = [ordered]@{}
+        foreach ($hostResult in $hostResults) {
+            $read[[string]$hostResult.Vm] = [bool](Get-DbHubMember -InputObject $hostResult -Name 'ExportRead')
+            $result[[string]$hostResult.Vm] = [string]$hostResult.Outcome
+            $count = [int](Get-DbHubMember -InputObject $hostResult -Name 'Consumed')
+            if ($count -gt 0) {
+                $consumed[[string]$hostResult.Vm] = $count
             }
         }
-        # Each held VM: exported now with its holder's ID, reached by this session's activity first, or still held.
+        # Each held VM: exported now with its holder's ID (or with no session, on a VM that ran before this start, whose
+        # documents from within the holder's activity are the holder's), reached by this session's activity first, or still
+        # held.
         $apart = New-Object -TypeName 'System.Collections.Generic.List[object]'
         $exported = [ordered]@{}
+        $timed = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
         foreach ($item in $entries) {
             $session = [string]$item['sessionId']
             $kept = New-Object -TypeName 'System.Collections.Generic.List[string]'
             foreach ($vm in @(@($item['leftVms']) | ForEach-Object { [string]$_ })) {
-                $sentHere = $sentFor.ContainsKey($vm) -and $sentFor[$vm] -eq $session
+                $sentHere = $sentFor.ContainsKey($vm) -and ($sentFor[$vm] -eq $session -or (-not $sentFor[$vm] -and $heldBy[$vm] -eq $session))
                 if ($sentHere -and $read.ContainsKey($vm) -and $read[$vm]) {
                     if (-not $exported.Contains($session)) {
                         $exported[$session] = New-Object -TypeName 'System.Collections.Generic.List[string]'
                     }
                     $exported[$session].Add($vm)
+                    if (-not $sentFor[$vm]) {
+                        $null = $timed.Add($vm)
+                    }
+                    continue
+                }
+                if ($sentFor.ContainsKey($vm) -and -not $sentFor[$vm]) {
+                    # The VM ran before this start (review of 02d398a): its export with no session took this capture with any
+                    # activity outside a Run all session there, and nothing told them apart.
+                    $why = 'session {0}''s status doesn''t say when its activity ended, so the export with no session that this start sent there couldn''t tell that capture from any activity outside a Run all session' -f $session.Substring(0, 8)
+                    if ($sentHere) {
+                        $how = switch ([string]$result[$vm]) {
+                            'TimedOut' { 'it didn''t end in time' }
+                            'Failed' { 'it failed' }
+                            'NotRunning' { 'the VM stopped before it ended' }
+                            'OldBundle' { 'the VM''s bootstrap bundle predates the RCA export' }
+                            'OldRunner' { 'the VM''s runner predates the RCA export' }
+                            default { 'it wasn''t read in time' }
+                        }
+                        $why = 'the export with no session that this start sent there, to tell that capture from any activity outside a Run all session, wasn''t read ({0})' -f $how
+                    }
+                    $apart.Add([ordered]@{ sessionId = $session; vm = $vm; with = ''; why = $why })
                     continue
                 }
                 if ($vm -in $activity) {
@@ -8063,7 +8369,7 @@ function Invoke-DbHubRcaEarlier {
         # What the exports listed for another session, and documents of another session found in a fetched one: that
         # session's, kept 7 days from now (review of 93243d6).
         $listedFor = @{}
-        foreach ($document in @(if ($null -ne $done) { @($done.Others) })) {
+        foreach ($document in $listedOthers) {
             $session = [string](Get-DbHubMember -InputObject $document -Name 'sessionId')
             $reference = ConvertTo-DbHubRcaPendingList -Item @($document)
             if ($session -cnotmatch '^[0-9a-f]{32}$' -or $session -eq $current -or $reference.Count -eq 0) {
@@ -8119,10 +8425,21 @@ function Invoke-DbHubRcaEarlier {
             if ($listedFor.ContainsKey($session)) {
                 $count = $listedFor[$session]
             }
-            Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Info' -Message ('Session {0}''s capture on {1} that no export had taken was exported with its own ID before this session''s activity there: {2} document(s).' -f $session.Substring(0, 8), (@($exported[$session]) -join ' and '), $count)
+            $message = 'Session {0}''s capture on {1} that no export had taken was exported with its own ID before this session''s activity there: {2} document(s).'
+            if (@($exported[$session] | Where-Object { $timed.Contains($_) }).Count -gt 0) {
+                $message = 'Session {0}''s capture on {1} that no export had taken was exported before this session''s activity there, with no session because the VM ran before this start; the documents from within its activity are its: {2} document(s).'
+            }
+            Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Info' -Message ($message -f $session.Substring(0, 8), (@($exported[$session]) -join ' and '), $count)
         }
         foreach ($item in $apart) {
-            Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Warning' -Message (Get-DbHubRcaInseparableText -Item $item) -Fix $script:DbHubRcaApartFix
+            $apartFix = $script:DbHubRcaApartFix
+            if (-not [string]$item['with']) {
+                $apartFix = $script:DbHubRcaOutsideFix
+            }
+            Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Warning' -Message (Get-DbHubRcaInseparableText -Item $item) -Fix $apartFix
+        }
+        foreach ($vm in @($consumed.Keys)) {
+            Add-DbHubSessionStep -Status $Status -Step 'RCA.EXPORT' -State 'Info' -Message ('{0} ran before this session''s start, so an export with no session took what the observer captured there outside a Run all session: {1} document(s), which no history takes.' -f $vm, $consumed[$vm])
         }
         $unsaved = @($remaining | Where-Object { $_['mustFetch'] }).Count
         foreach ($item in $queued) {
@@ -8334,8 +8651,9 @@ function Update-DbHubSessionRca {
         $before = ConvertTo-DbHubRcaState -State $status['rca'] -SessionId $session
         # No bundle once the session's stop has begun (review of 15ad76d): its final version of the metrics, which the
         # notebook reads by its ID, lists only the bundles written before it. No export on a VM that an earlier session
-        # holds (review of 93243d6): it would take that session's capture.
-        $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Minutes $bounds.RecheckMinutes -Earlier $status['rca'] -SkipVm (Get-DbHubRcaHeldByEarlier -Status $status) -PollSeconds $PollSeconds -WhileRunning
+        # holds (review of 93243d6): it would take that session's capture. Nothing captured before the session began
+        # (review of 02d398a): its start, and when the session before it ended.
+        $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Minutes $bounds.RecheckMinutes -Earlier $status['rca'] -SkipVm (Get-DbHubRcaHeldByEarlier -Status $status) -OutsideFromUtc (ConvertTo-DbHubUtc -Value $status['rcaPreviousEndUtc']) -OutsideToUtc (ConvertTo-DbHubUtc -Value $status['acceptedUtc']) -PollSeconds $PollSeconds -WhileRunning
         $write = $status
         $again = Read-DbHubSessionStatusCopy -Context $Context
         if (-not (Test-DbHubRcaRecheckOpen -Status $again -SessionId $session -StopMinutes $bounds.StopMinutes)) {
@@ -8440,13 +8758,18 @@ function Invoke-DbHubRcaStop {
         $bounds = Get-DbHubRcaSetting -Settings $Context.Settings
         $earlier = $null
         $skip = @()
+        $from = $null
+        $to = $null
         $copy = Read-DbHubSessionStatusCopy -Context $Context
         if ($null -ne $copy -and [string]$copy['sessionId'] -eq $session) {
             $earlier = Get-DbHubMember -InputObject $copy -Name 'rca'
             # A VM an earlier session holds gets no export (review of 93243d6): it would give that session's capture to this one.
             $skip = @(Get-DbHubRcaHeldByEarlier -Status $copy)
+            # Nothing captured before the session began (review of 02d398a).
+            $from = ConvertTo-DbHubUtc -Value $copy['rcaPreviousEndUtc']
+            $to = ConvertTo-DbHubUtc -Value $copy['acceptedUtc']
         }
-        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -PollSeconds $PollSeconds)
+        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds)
     }
     catch {
         Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at its stop: {0}' -f $_.Exception.Message)
@@ -8515,9 +8838,18 @@ function Start-DbHubSession {
     # this session replaces, read before its first write: each VM's capture that no export took is exported with the ID of
     # the session that holds it right before this session's activity goes out there, one session's documents are fetched
     # (Invoke-DbHubRcaEarlier), and the status carries them all (rcaEarlierPending), so the next start still has them
-    # whatever happens to this one.
-    $rcaBacklog = Get-DbHubRcaBacklog -Settings $settings -Previous (Read-DbHubSessionStatusCopy -Context $Context) -SessionId ([string]$Request.SessionId) -NowUtc (Get-DbHubUtcNow)
+    # whatever happens to this one. When the session before this one ended goes into the status too (review of 02d398a):
+    # what the observer captured between then and this start is activity outside a Run all session, which this session's
+    # exports don't take.
+    $previousStatus = Read-DbHubSessionStatusCopy -Context $Context
+    $rcaBacklog = Get-DbHubRcaBacklog -Settings $settings -Previous $previousStatus -SessionId ([string]$Request.SessionId) -NowUtc (Get-DbHubUtcNow)
     Set-DbHubRcaBacklog -Status $status -Backlog $rcaBacklog
+    if ($null -ne $previousStatus -and [string]$previousStatus['sessionId'] -ne [string]$Request.SessionId) {
+        $previousEnd = Get-DbHubRcaSessionEnd -Status $previousStatus
+        if ($null -ne $previousEnd -and $previousEnd -le (Get-DbHubUtcNow)) {
+            $status['rcaPreviousEndUtc'] = ConvertTo-DbHubTimeText -Value $previousEnd
+        }
+    }
     $rcaEntries = @($rcaBacklog.Entries)
     $rcaSent = [ordered]@{}
     $rcaSentSession = [ordered]@{}
@@ -8652,18 +8984,24 @@ function Start-DbHubSession {
     }
     # An earlier session's capture that no export took on this VM (ADR 0031; review of 93243d6): exported with that
     # session's ID right before this session's activity goes out there, so the runner gives it to that session; its parts
-    # are fetched after the start, or by a later one.
+    # are fetched after the start, or by a later one. On a VM that ran before this start (review of 02d398a), activity
+    # outside a Run all session could run there (deploy.ps1, start-demo.ps1), so an export with no session takes what it
+    # captured instead, which no history takes, except what falls within the activity of the earlier session that holds
+    # the VM, which goes with that session (a Run all in the minutes between a session's end and its auto-stop finds that
+    # session's VMs still running). Either way the export ends before the activity goes out: Run Commands run in
+    # parallel on a VM, and one that ran beside the activity would take this session's first capture too.
     $onVmReady = {
-        param([string] $VmName)
-        if ($rcaEntries.Count -eq 0) {
+        param([string] $VmName, [bool] $RanBefore)
+        if ($rcaEntries.Count -eq 0 -and -not $RanBefore) {
             return ''
         }
-        $sentExport = Send-DbHubRcaEarlierExport -Context $Context -VmName $VmName -Entry $rcaEntries
+        $sentExport = Send-DbHubRcaEarlierExport -Context $Context -VmName $VmName -Entry $rcaEntries -RanBefore:$RanBefore
         if ($null -eq $sentExport) {
             return ''
         }
         $rcaSent[$VmName] = [string]$sentExport.Name
         $rcaSentSession[$VmName] = [string]$sentExport.SessionId
+        $null = Wait-DbHubRcaRunCommand -Context $Context -VmName $VmName -Name ([string]$sentExport.Name) -PollSeconds ([System.Math]::Min(10, $PollSeconds))
         return [string]$sentExport.Name
     }
     $run = Start-DbHubActivityRun -Context $Context -Request $Request -Tags $Tags -Plan $plan -OnProgress $onProgress -OnT4Ready $onT4Ready -OnVmReady $onVmReady -WaitMinutes $WaitMinutes -T4WaitMinutes $T4WaitMinutes -PollSeconds $PollSeconds
@@ -8882,7 +9220,7 @@ function Write-DbHubStopStatus {
     if ($session -notmatch '^[0-9a-f]{32}$') {
         return
     }
-    $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') }; planKept = $false }
+    $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedUtc = (ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)); stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') }; planKept = $false }
     # The metrics' final version (review of 15ad76d): the notebook reads it by its ID, because a re-check's bundle can still
     # be written after it.
     $metricsVersion = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsVersion')
