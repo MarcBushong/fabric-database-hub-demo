@@ -777,6 +777,9 @@ Describe 'The Incident RCA''s evidence from the scripts (2026-11-20, ADR 0031)' 
         $script:notebookKeeps = $false
         Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [securestring]::new() }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoOneLakeRequest -MockWith {
+            # A file's delete passes no -Query, and the static validation runs under Set-StrictMode -Version Latest, where an
+            # unbound parameter isn't a variable in a mock.
+            $Query = [string]$PesterBoundParameters['Query']
             $script:oneLake.Add(('{0} {1}?{2}' -f $Method, $Path, $Query))
             $key = $Path.Substring(37)
             switch ($Method) {
