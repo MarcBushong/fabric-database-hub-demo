@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { ALLOWED_ROUTES, readEstate, type EstateScope, type EstateView } from "../../rayfin/functions/src/estate-core";
 import { catalogForCheck } from "@/data/queries";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
-import { checkDax, createToolRunner, daxCode, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, plainCodeRefusal, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
+import { foldNames, wholeModelRefusal } from "./answer-key";
+import { checkDax, createToolRunner, daxCode, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, normalizeDax, plainCodeRefusal, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
 
 // Every route path the estate function can call, as text Copilot must never get (R925 review).
 const ROUTE_TEXT = new RegExp(ALLOWED_ROUTES.map((r) => r.split(" ")[1].replace(/[/.]/g, "\\$&")).join("|"));
@@ -76,13 +77,23 @@ describe("checkDax", () => {
         }
     });
 
-    it("refuses an answer-key measure however it's spaced, and only a function the query calls", () => {
+    it("refuses an answer-key measure however it's spaced, and a whole-model function's name anywhere, as a key table's", () => {
         expect(checkDax('EVALUATE ROW ( "n", [ Injected Faults ] )')).toMatch(/^\[Injected Faults\] reads/);
         expect(checkDax("EVALUATE ROW ( \"n\", [Injected\n    Faults] )")).toMatch(/^\[Injected Faults\] reads/);
         // TABLEOF reaches a table only through a column or measure it names, and every measure an answer-key table hosts is refused.
         expect(checkDax("EVALUATE FILTER ( TABLEOF ( [Scenario Requests] ), TRUE () )")).toMatch(/^\[Scenario Requests\] reads/);
         expect(checkDax("EVALUATE TOPN ( 5, TABLEOF ( 'Telemetry Snapshots'[Metric] ) )")).toBeNull();
-        expect(checkDax(`EVALUATE ROW ( "note", "INFO.VIEW and COLUMNSTATISTICS () aren't run" ) // CALENDARAUTO ()`)).toBeNull();
+        // The review of bfbbe2a: like a key table's name, a whole-model function's is refused in a string or a comment too, so
+        // no misreading of where one ends can hide a call. Until then, these ran.
+        for (const [query, refusal] of [
+            [`EVALUATE ROW ( "note", "INFO.VIEW and COLUMNSTATISTICS () aren't run" )`, /^COLUMNSTATISTICS returns/],
+            ['EVALUATE ROW ( "a", 1 ) // INFO.VIEW.TABLES ()', /^INFO functions return/],
+            ['EVALUATE ROW ( "a", 1 ) /* CALENDARAUTO () */', /^CALENDARAUTO reads/],
+            ["EVALUATE TOPN ( 1, 'EXTERNALMEASURE' )", /^EXTERNALMEASURE names/],
+        ] as const) {
+            expect(checkDax(query), query).toMatch(refusal);
+            expect(checkDax(query), query).toMatch(/Leave its name out of the query's strings, comments, and names too\.$/);
+        }
         expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], \"Info\", [Wait Time (s)] )")).toBeNull();
     });
 
@@ -136,19 +147,48 @@ describe("checkDax", () => {
         }
     });
 
-    // The same hardening: a line comment that ran past a line break the engine honors hid the code after it.
-    it("ends a line comment at any line break the engine might honor, so no code hides behind one", () => {
-        for (const [name, lineBreak] of [["CR", "\r"], ["NEL", "\u0085"], ["LS", "\u2028"], ["PS", "\u2029"]] as const) {
-            expect(checkDax(`EVALUATE ROW ( "a", 1 ) // note${lineBreak}EVALUATE COLUMNSTATISTICS ()`), name).toMatch(/^COLUMNSTATISTICS returns/);
-            expect(checkDax(`EVALUATE ROW ( "a", 1 ) -- note${lineBreak}EVALUATE INFO.VIEW.MEASURES ()`), name).toMatch(/^INFO functions return/);
+    // The review of bfbbe2a: a lone CR ended a line comment here, and CR was allowed in code, so if the engine ends a comment
+    // only at a line feed, a quote, an apostrophe, or a block comment after the CR hid the next line from the check, and the
+    // engine ran it. Before fb964e7, the opposite guess was the hole. run_dax now reads, and sends, each CR and form feed as a
+    // line feed, so the check never guesses where the engine ends a comment.
+    it("reads each CR and form feed as a line feed, as run_dax sends the query, so it never guesses where a comment ends", () => {
+        for (const query of [
+            'EVALUATE // x\r"\nCOLUMNSTATISTICS () // "',
+            "EVALUATE -- x\r'\nINFO.VIEW.MEASURES () -- '",
+            "EVALUATE // x\r/*\nCOLUMNSTATISTICS () // */",
+        ]) {
+            expect(checkDax(query), JSON.stringify(query)).toMatch(/^(COLUMNSTATISTICS returns|INFO functions return)/);
         }
-        expect(stripDaxComments('EVALUATE ROW ( "a", 1 ) // note\r\nEVALUATE ROW ( "b", 2 )')).toBe('EVALUATE ROW ( "a", 1 ) \r\nEVALUATE ROW ( "b", 2 )');
+        expect(normalizeDax("a\r\nb\rc\fd\ne\r\n\r\nf")).toBe("a\nb\nc\nd\ne\n\nf");
+        expect(stripDaxComments('EVALUATE ROW ( "a", 1 ) // note\r\nEVALUATE ROW ( "b", 2 )')).toBe('EVALUATE ROW ( "a", 1 ) \nEVALUATE ROW ( "b", 2 )');
+        // A CR or form feed between tokens is whitespace, as a line feed is: the query runs (a form feed was refused until then).
+        expect(checkDax('EVALUATE\fROW ( "a", 1 )')).toBeNull();
+        expect(checkDax('EVALUATE\rROW ( "a", 1 )\r\n')).toBeNull();
+        // After a comment, either one ends it, as a line feed does.
+        expect(checkDax('EVALUATE ROW ( "a", 1 ) // note\rEVALUATE COLUMNSTATISTICS ()')).toMatch(/^COLUMNSTATISTICS returns/);
+        expect(checkDax('EVALUATE ROW ( "a", 1 ) -- note\fEVALUATE INFO /* x */ .VIEW.MEASURES ()')).toMatch(/^INFO functions return/);
     });
 
-    it("refuses none of the app's own queries for a character: the catalog's code is plain ASCII outside its strings", () => {
+    // The same review: a vertical tab didn't end a line comment here, though Unicode makes it a line break, as it does U+0085,
+    // U+2028, and U+2029. Each now ends one, and is then refused as code, so the query is refused whatever the engine does.
+    it("ends a line comment at a vertical tab, U+0085, U+2028, or U+2029, and refuses each there as code", () => {
+        for (const [name, lineBreak, code] of [["VT", "\v", "U+000B"], ["NEL", "\u0085", "U+0085"], ["LS", "\u2028", "U+2028"], ["PS", "\u2029", "U+2029"]] as const) {
+            expect(checkDax(`EVALUATE ROW ( "a", 1 ) // note${lineBreak}EVALUATE COLUMNSTATISTICS ()`), name).toMatch(/^COLUMNSTATISTICS returns/);
+            // A name split by a comment, which only the code check finds, so this case needs the comment to end.
+            expect(checkDax(`EVALUATE ROW ( "a", 1 ) -- note${lineBreak}EVALUATE INFO /* x */ .VIEW.MEASURES ()`), name).toMatch(/^INFO functions return/);
+            expect(checkDax(`EVALUATE ROW ( "a", 1 ) // note${lineBreak}more note`), name).toContain(`the character ${code} outside a string`);
+            // In a string or a block comment, it's text.
+            expect(checkDax(`EVALUATE ROW ( "a", "x${lineBreak}y" ) /* ${lineBreak} */`), name).toBeNull();
+        }
+    });
+
+    it("refuses none of the app's own queries for a character or a whole-model function's name, anywhere in them", () => {
         const catalog = catalogForCheck(new Date(Date.UTC(2026, 10, 17)));
         expect(catalog.length).toBeGreaterThan(15);
-        for (const spec of catalog) expect(plainCodeRefusal(spec.dax), spec.id).toBeNull();
+        for (const spec of catalog) {
+            expect(plainCodeRefusal(spec.dax), spec.id).toBeNull();
+            expect(wholeModelRefusal(foldNames(spec.dax)), spec.id).toBeNull();
+        }
     });
 
     it("reads strings and names whole when it strips comments, with their doubled quotes", () => {
@@ -183,6 +223,27 @@ describe("the tool runner", () => {
         expect(await runner.run("run_dax", { query: "EVALUATE x", purpose: "p" })).toMatchObject({ ok: false, text: expect.stringMatching(/bad column/) });
         expect(onDax).toHaveBeenCalledTimes(2);
         expect(onDax.mock.calls[1][0].error).toMatch(/bad column/);
+    });
+
+    // The review of bfbbe2a: the engine never reads a CR or a form feed, and "Show the sources" shows the query as it was sent.
+    it("sends the query with a line feed for each CR and form feed, the text it checked, and shows that text", async () => {
+        const runDax = vi.fn().mockResolvedValue(rows);
+        const onDax = vi.fn();
+        const runner = createToolRunner({ runDax, onDax });
+        // The second hides, behind a CR, a key name that no fold matches and no raw check finds. Sent with the CR, it ran if the
+        // engine ends a comment only at a line feed. With a line feed for the CR, the check and the engine both read the quote
+        // after the comment as a string's start, so the name inside is text for both, and the engine refuses the query.
+        const accepted = ['// CPU per target\r\nEVALUATE\fROW ( "a", 1 )\r', "EVALUATE // x\r\"\nTOPN ( 1, 'Incident \u{1F600}Windows' ) // \""];
+        for (const query of accepted) expect(await runner.run("run_dax", { query, purpose: "p" }), JSON.stringify(query)).toMatchObject({ ok: true });
+        const sent = runDax.mock.calls.map(([query]) => query as string);
+        expect(sent).toEqual(['// CPU per target\nEVALUATE\nROW ( "a", 1 )', "EVALUATE // x\n\"\nTOPN ( 1, 'Incident \u{1F600}Windows' ) // \""]);
+        expect(onDax.mock.calls.map(([run]) => run.query)).toEqual(sent);
+        // A refused query isn't sent, and the viewer sees it as it was checked.
+        const refused = 'EVALUATE // x\r"\nCOLUMNSTATISTICS () // "';
+        expect(await runner.run("run_dax", { query: refused, purpose: "p" })).toMatchObject({ ok: false, text: expect.stringMatching(/^Not run: COLUMNSTATISTICS returns/) });
+        expect(runDax).toHaveBeenCalledTimes(2);
+        expect(onDax.mock.calls[2][0]).toMatchObject({ query: normalizeDax(refused), error: expect.stringMatching(/^COLUMNSTATISTICS returns/) });
+        for (const run of onDax.mock.calls.map(([r]) => r as DaxRun)) expect(run.query).not.toMatch(/[\r\f]/);
     });
 
     it("draws a validated chart from a result, and refuses unknown columns or results", async () => {

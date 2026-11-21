@@ -2,7 +2,7 @@ import { act, configure, fireEvent, render, screen, waitFor, within } from "@tes
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
-import type { QueryClient } from "@/data/query-client";
+import { createQueryClient, type ConnectorResult, type Execute, type QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
 import { RCA_PRESENCE_DAX } from "@/rca/loader";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
@@ -768,6 +768,37 @@ describe("the end of a turn (R925)", () => {
         expect(second.sent.filter((m) => m.type === "user").map((m) => m.text)).toEqual([QUESTION]);
         expect(screen.queryByText(/New chat started another conversation/)).not.toBeInTheDocument();
         expect(document.querySelectorAll(".copilot-answer")).toHaveLength(1);
+    });
+
+    // The review of bfbbe2a: what run_dax checked is what reaches the history connector's executeQuery, through the provider
+    // and the app's own query client, with no CR or form feed in it.
+    it("hands the history connector the query as run_dax checked it, with a line feed for each CR and form feed", async () => {
+        const execute = vi.fn(
+            async ({ query }: Parameters<Execute>[0]): Promise<ConnectorResult> =>
+                query.includes("'RCA ")
+                    ? { status: "error", error: { category: "query", message: "The model has no table named 'RCA Coverage'." }, requestId: "q" }
+                    : { status: "success", table: { columns: [{ name: "[CpuPct]", dataType: "Double" }], rows: [[88.2]] }, requestId: "q" },
+        );
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit({ type: "tool_call", callId: "c1", name: "run_dax", arguments: { query: '// Peak CPU\r\nEVALUATE\fROW("CpuPct", 88.2)\r', purpose: "Peak CPU" } });
+            else {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        render(
+            <QueryClientContext.Provider value={createQueryClient(execute)}>
+                <CopilotProvider initialOpen settings={{ relayUrl: RELAY, estate: false }}>
+                    <Harness />
+                </CopilotProvider>
+            </QueryClientContext.Provider>,
+        );
+        await ask();
+        await screen.findByText(ANSWER);
+        const queries = execute.mock.calls.map(([input]) => input.query);
+        expect(queries.filter((query) => query.includes("CpuPct"))).toEqual(['// Peak CPU\nEVALUATE\nROW("CpuPct", 88.2)']);
+        for (const query of queries) expect(query).not.toMatch(/[\r\f]/);
     });
 });
 

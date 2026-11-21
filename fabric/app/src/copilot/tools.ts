@@ -195,13 +195,28 @@ export function daxCode(query: string): string {
 }
 
 /**
- * Where a line comment ends: at the first line break the engine might honor. That's a lone \r, U+0085, U+2028, or U+2029
- * as well as \n, so no check takes code for a comment (the coordinator's hardening of 9f3d35f).
+ * The text run_dax checks and sends: each CRLF, lone CR, and form feed as a line feed (the review of bfbbe2a). Where the
+ * engine ends a `//` or `--` comment isn't documented, and both guesses about a lone CR let a query hide code from the
+ * check: ending the comment there before fb964e7, and not ending it there after. With neither character in the text, the
+ * check and the engine read every comment's end alike, whatever the engine does. A CR or form feed inside a string becomes
+ * a line feed too, which a query never needs.
  */
-const LINE_BREAK = /[\n\r\u0085\u2028\u2029]/g;
+export function normalizeDax(query: string): string {
+    return query.replace(/\r\n?|\f/g, "\n");
+}
 
-/** Reads a query without its comments, as stripDaxComments says, and empties its strings, or its names too, for checks that read code only. */
-function scanDax(query: string, empty: "nothing" | "strings" | "strings and names"): string {
+/**
+ * Where a line comment ends: at a line feed, where the engine ends it too, and at a vertical tab, U+0085, U+2028, or
+ * U+2029, which Unicode also makes mandatory line breaks. Whether the engine ends a comment at one of those isn't
+ * documented, so the comment ends there here, and the plain-ASCII rule then refuses that character as code: a query in
+ * which one could end a comment is refused, whatever the engine does (the reviews of fb964e7 and bfbbe2a). No CR or form
+ * feed gets here (normalizeDax).
+ */
+const LINE_BREAK = /[\n\v\u0085\u2028\u2029]/g;
+
+/** Reads a query, normalized as run_dax sends it, without its comments, as stripDaxComments says, and empties its strings, or its names too, for checks that read code only. */
+function scanDax(text: string, empty: "nothing" | "strings" | "strings and names"): string {
+    const query = normalizeDax(text);
     let out = "";
     let i = 0;
     while (i < query.length) {
@@ -233,8 +248,8 @@ function scanDax(query: string, empty: "nothing" | "strings" | "strings and name
     return out;
 }
 
-/** What a query's code may hold outside its strings and comments: printable ASCII, spaces, tabs, and line breaks. */
-const NOT_PLAIN = /[^\t\n\r\x20-\x7E]/u;
+/** What a query's code may hold outside its strings and comments: printable ASCII, spaces, tabs, and line feeds (no CR is left, normalizeDax). */
+const NOT_PLAIN = /[^\t\n\x20-\x7E]/u;
 
 /**
  * What run_dax says about a character outside plain ASCII in a query's code, outside its strings and comments, or null.
@@ -254,24 +269,29 @@ export function plainCodeRefusal(query: string): string | null {
     );
 }
 
-/** Plain-language reason a query isn't accepted, or null when it is. */
+/** Plain-language reason a query isn't accepted, or null when it is. It judges the query as run_dax sends it (normalizeDax). */
 export function checkDax(query: unknown): string | null {
     if (typeof query !== "string" || !query.trim()) return "The query is empty.";
-    if (query.length > DAX_MAX) return `The query is longer than ${DAX_MAX} characters.`;
-    const body = stripDaxComments(query);
+    const text = normalizeDax(query);
+    if (text.length > DAX_MAX) return `The query is longer than ${DAX_MAX} characters.`;
+    const body = stripDaxComments(text);
     if (!/^(DEFINE|EVALUATE)\b/i.test(body)) return "The query must start with EVALUATE (or DEFINE ... EVALUATE).";
     if (!/\bEVALUATE\b/i.test(body)) return "The query has no EVALUATE statement.";
     // A function that reads the whole model reaches the answer key without naming it (the re-review of 817b81c), however
-    // its name is written.
-    const wholeModel = wholeModelRefusal(foldNames(daxCode(query)));
+    // its name is written: in the code, where a comment can split its name, and, like a key table's name, in the text as
+    // written, strings and comments included, so no misreading of where a comment or a string ends can hide a call (the
+    // review of bfbbe2a).
+    const wholeModel = wholeModelRefusal(foldNames(daxCode(text)));
     if (wholeModel) return wholeModel;
+    const named = wholeModelRefusal(foldNames(text));
+    if (named) return `${named} Leave its name out of the query's strings, comments, and names too.`;
     // The text that runs is the query as written, so the answer key is looked for there too, comments and strings included,
     // with names folded as leniently as the engine's collation might compare them (foldNames): naming a table in a comment
     // or a string is refused with it, which never hides a real reference.
-    const key = answerKeyIn(query, ANSWER_KEY_MEASURES) ?? answerKeyIn(body, ANSWER_KEY_MEASURES);
+    const key = answerKeyIn(text, ANSWER_KEY_MEASURES) ?? answerKeyIn(body, ANSWER_KEY_MEASURES);
     if (key) return answerKeyRefusal(key);
     // Then plain ASCII outside strings and comments, so no character the fold doesn't know can spell a name.
-    return plainCodeRefusal(query);
+    return plainCodeRefusal(text);
 }
 
 function compactValue(value: unknown): unknown {
@@ -300,7 +320,9 @@ export function createToolRunner(deps: AskToolDeps) {
     let n = 0;
 
     async function runDax(args: Record<string, unknown>): Promise<ToolOutcome> {
-        const query = typeof args.query === "string" ? args.query.trim() : "";
+        // What's checked, sent to the history connector, and shown under "Show the sources" is one text: the query with a
+        // line feed for each CR and form feed (normalizeDax), so the engine never reads one (the review of bfbbe2a).
+        const query = typeof args.query === "string" ? normalizeDax(args.query).trim() : "";
         const purpose = str(args.purpose, 300) || "A query Copilot ran.";
         const id = `r${++n}`;
         const started = now();
