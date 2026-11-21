@@ -152,7 +152,12 @@ export interface MetricPoint {
     at: Date;
     metric: string;
     value: number | null;
+    /** Azure Monitor's interval: the value is the interval's highest (or its total) from `at` to `at` plus this. */
+    intervalMs?: number;
 }
+
+/** Whether a metric point falls in a window: an Azure Monitor point stands for its whole interval, so one that started before the window but runs into it does. */
+export const metricIn = (m: MetricPoint, from: Date, to: Date) => m.at.getTime() <= to.getTime() && m.at.getTime() + Math.max(0, (m.intervalMs ?? 0) - 1) >= from.getTime();
 
 /** Everything the investigations read for one window: the RCA tables and the telemetry. Nothing else. */
 export interface Evidence {

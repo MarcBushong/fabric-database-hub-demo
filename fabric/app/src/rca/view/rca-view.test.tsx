@@ -8,6 +8,10 @@ import IncidentsPage from "@/pages/IncidentsPage";
 import RcaPage from "@/pages/RcaPage";
 import { sampleRows } from "@/preview/sample-data";
 import { sampleRcaRows } from "@/preview/sample-rca";
+import { LIVE_KEYS, live, liveSources } from "@/rca/testdata/live-rb-2233e0ae";
+import { createInvestigationTools } from "@/rca/tools";
+import type { InvestigationResult } from "@/rca/types";
+import { RcaReport } from "@/rca/view/RcaReport";
 import { answerKeyInContext } from "@/test/blind";
 import { renderWithApp, type FakeQueryClient } from "@/test/render";
 import { STAGE_TOKENS } from "@/theme/stage";
@@ -112,4 +116,26 @@ describe("links into the Root cause view, one way (ADR 0031)", () => {
         },
         SLOW,
     );
+});
+
+// Live, 2026-11-21 (Final tests at 94a17ff7): T4's connection surge showed "The capture holds no cause for these minutes:
+// see what wasn't captured below", with nothing below.
+describe("the report's root cause, never blank", () => {
+    it("explains T4's connection surge, with its recommendations and what isn't captured below it", async () => {
+        const tools = createInvestigationTools({ ...liveSources(), timeZone: "UTC", latestDay: live("00:00:00"), latest: live("21:33:15") });
+        const incident = (await tools.investigate("explain_incident", { episodeKey: LIVE_KEYS.connections })) as InvestigationResult;
+        renderWithApp(<RcaReport incident={incident} errors={null} timeZone="UTC" logs={[]} />);
+        expect(screen.getByText(/^T4's client connections reached 35 of the 35 slots clients can use/)).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Not captured" })).toBeInTheDocument();
+        expect(screen.queryByText(/holds no cause/)).toBeNull();
+    });
+
+    it("says plainly that nothing holds a cause, and never points below at nothing", () => {
+        const incident: InvestigationResult = { tool: "explain_incident", version: 1, window: { fromUtc: "2026-11-21T15:26:41Z", toUtc: "2026-11-21T15:35:11Z" }, targets: ["T4"], episodes: [], findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: [] };
+        renderWithApp(<RcaReport incident={incident} errors={null} timeZone="UTC" logs={[]} />);
+        expect(screen.getByText("The capture and the telemetry hold no cause for these minutes.")).toBeInTheDocument();
+        expect(screen.queryByText(/see what wasn't captured below/)).toBeNull();
+        expect(screen.queryByRole("heading", { name: "Not captured" })).toBeNull();
+    });
 });

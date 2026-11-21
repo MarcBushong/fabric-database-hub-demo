@@ -4,7 +4,7 @@
 
 import { describeEpisode } from "./detector";
 import { AZURE_MONITOR } from "./errors";
-import { hhmmss, plural, type Episode, type Evidence, type RcaTarget } from "./types";
+import { hhmmss, metricIn, plural, type Episode, type Evidence, type RcaTarget } from "./types";
 
 export interface Hypothesis {
     target: RcaTarget;
@@ -27,9 +27,10 @@ const NEXT_TOOL: Record<string, string> = {
     deadlock: "explain_locking",
     replica_lag: "explain_replica_lag",
     errors: "explain_errors",
-    connections: "explain_errors",
+    // explain_incident with the episode's key explains these by what held the connections and the RU, beside any errors.
+    connections: "explain_incident",
     throttling: "explain_errors",
-    ru: "explain_errors",
+    ru: "explain_incident",
 };
 
 function score(e: Episode): number {
@@ -79,7 +80,7 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         if (hypotheses.some((h) => h.target === target && h.family === "errors")) continue;
         const events = input.evidence.events.filter((e) => e.target === target && (e.kind === "error" || e.kind === "attention") && inWindow(e.at, from, to));
         const throttled = hypotheses.some((h) => h.target === target && h.family === "throttling");
-        const counted = input.evidence.metrics.filter((m) => m.target === target && m.value !== null && m.value > 0 && (m.metric === "connections_failed" || (m.metric === "ThrottledRequests" && !throttled)) && inWindow(m.at, from, to));
+        const counted = input.evidence.metrics.filter((m) => m.target === target && m.value !== null && m.value > 0 && (m.metric === "connections_failed" || (m.metric === "ThrottledRequests" && !throttled)) && metricIn(m, from, to));
         const n = events.reduce((sum, e) => sum + e.count, 0) + counted.reduce((sum, m) => sum + (m.value ?? 0), 0);
         if (n === 0) continue;
         const times = [...events.map((e) => e.at), ...counted.map((m) => m.at)].sort((a, b) => a.getTime() - b.getTime());

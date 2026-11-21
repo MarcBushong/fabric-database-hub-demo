@@ -9,7 +9,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 **What's new:**
 
 - **The capture:** during every session, the workload runner's observer captures, read-only, what a DBA's own tools would show on T1 to T4: blocking chains with their head blocker, errors, deadlocks, lock escalations, and the replay of T4's read replica. The session's history keeps it.
-- **Root cause in the Insights app:** the incidents the blind detector finds; each blocking chain as a tree, head blocker first (its module or statement, program, login, idle time, open transaction, and lock); the errors by class; the replica's lag and its cause; and recommendations, each with its Microsoft Learn page and who approves it, and next steps.
+- **Root cause in the Insights app:** the incidents the blind detector finds; each blocking chain as a tree, head blocker first (its module or statement, program, login, idle time, open transaction, and lock); the errors by class; the replica's lag and its cause, from the capture's own samples; T4's connections against the limit, by what held them; and recommendations, each with its Microsoft Learn page and who approves it, and next steps.
 - **The chat investigates:** Ask's Copilot gets six tools to triage a window, find its incidents, and explain an incident, its blocking, its errors, and the replica's lag, citing the captured rows and their times. A card whose Ask had only the answer key to hand over hands the chat a window to investigate instead.
 - **Honest detection:** the detector, the Root cause view, and the chat never read what the demo injected, or a scenario's name. Only the "Did we catch it?" scoreboard and the tests compare what was found with what was injected.
 

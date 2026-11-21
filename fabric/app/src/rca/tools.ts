@@ -5,14 +5,16 @@
 // what anyone planned or ran. The relay forwards at most 16 tools (ask-relay/src/protocol.ts): the dock's 4 and these 6.
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
+import { analyzeConnections } from "./connections";
 import { describeEpisode, findEpisodes } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
 import { RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
+import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, NEWEST_MINUTES, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
+import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -48,7 +50,7 @@ export const INVESTIGATION_TOOL_SPECS: ToolSpec[] = [
     },
     {
         name: "triage_window",
-        description: "First-line triage for a time or window: what was abnormal on each target (blocking, deadlocks, CPU, wait classes, errors, T5 throttling, read replica lag), ranked, each with the tool that explains it. Call it first for 'why was it slow at ...' questions; it also says when nothing was abnormal." + COMMON,
+        description: "First-line triage for a time or window: what was abnormal on each target (blocking, deadlocks, CPU, wait classes, errors, T4's connections against the limit, T5 throttling and RU, read replica lag), ranked, each with the tool that explains it. Call it first for 'why was it slow at ...' questions; it also says when nothing was abnormal." + COMMON,
         parameters: { type: "object", properties: WINDOW_PROPS, additionalProperties: false },
     },
     {
@@ -123,26 +125,28 @@ function targetsOf(args: Record<string, unknown>): RcaTarget[] {
     return list.length ? list : [...RCA_TARGETS];
 }
 
-/** The Azure Monitor series the investigations read, as metric points: the replica's lag, T4's failed connections and CPU, T5's 429s and RU. */
+/** The Azure Monitor series the investigations read, as metric points, each with its interval: the replica's lag, T4's failed connections and CPU, T5's 429s, RU, and requests. */
 export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const out: MetricPoint[] = [];
     const pg = telemetry.postgres ?? null;
-    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value });
+    const pgInterval = pg?.intervalMinutes ? pg.intervalMinutes * MIN : undefined;
+    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value, intervalMs: pgInterval });
     for (const target of ["T4", "T4-replica"] as const) {
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value });
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value, intervalMs: pgInterval });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value, intervalMs: pgInterval });
     }
     const cosmos = telemetry.cosmos ?? null;
-    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value });
+    const cosmosInterval = cosmos?.intervalMinutes ? cosmos.intervalMinutes * MIN : undefined;
+    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, intervalMs: cosmosInterval });
     return out.sort((a, b) => a.at.getTime() - b.at.getTime());
 }
 
-/** Error counts the telemetry and the capture's counters hold, as events: T4's failed connections and deadlocks, T5's 429s. */
+/** Error counts the telemetry and the capture's counters hold, as events: T4's failed connections and deadlocks, T5's 429s. An Azure Monitor count stands for its whole interval. */
 function countedErrors(evidence: Evidence, from: Date, to: Date, targets: readonly RcaTarget[]): EventRow[] {
     const inside = (at: Date) => at >= from && at <= to;
     const out: EventRow[] = [];
     for (const m of evidence.metrics) {
-        if (!targets.includes(m.target) || !inside(m.at) || m.value === null || m.value <= 0) continue;
+        if (!targets.includes(m.target) || !metricIn(m, from, to) || m.value === null || m.value <= 0) continue;
         if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} in the interval (Azure Monitor)` });
         if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) in the interval (Azure Monitor)` });
     }
@@ -288,12 +292,27 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const sessions = g.evidence.sessions.filter((s) => targets.includes(s.target) && inside(s.capturedAt));
         const events = [...g.evidence.events.filter((e) => targets.includes(e.target) && inside(e.at)), ...countedErrors(g.evidence, w.from, w.to, targets).filter((e) => e.code === "40P01")];
         const a = analyzeLocking(sessions, events, w.at);
+        const base = envelope("explain_locking", w.from, w.to, targets, deps, g, w.at);
+        // Blocked processes the detector saw, on a target the capture covered, with no chain in its samples: say why there's
+        // none, rather than leave the cause blank (live, 2026-11-21's audit).
+        const pg = (t: RcaTarget) => t === "T4" || t === "T4-replica";
+        const chainless = targets.filter(
+            (t) =>
+                g.episodes.some((e) => e.target === t && e.family === "blocking" && e.start <= w.to && (e.end ?? e.last) >= w.from) &&
+                !a.episodes.some((e) => e.target === t) &&
+                g.evidence.coverage.some((c) => c.target === t && c.captured && c.from <= w.to && c.to >= w.from),
+        );
+        const noChain = chainless.map(
+            (t) =>
+                `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: it samples chains (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s once its 30-s sentinel sees ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, so blocking that began and ended between the sentinel's samples has none, and neither the head blocker nor its statement is known.`,
+        );
         return {
-            ...envelope("explain_locking", w.from, w.to, targets, deps, g, w.at),
+            ...base,
             findings: a.findings,
             rootCause: a.rootCause,
             recommendations: a.recommendations,
             nextSteps: a.nextSteps,
+            notCaptured: [...base.notCaptured, ...noChain],
             details: {
                 chain: a.chainLines,
                 chains: a.episodes.map((e) => ({ target: e.target, head: e.headSession, kind: e.headKind, blocked: e.peak.blocked, depth: e.peak.depth, width: e.peak.width, formations: e.cycles, first: iso(e.first), last: iso(e.last), activeAtAskedTime: !!w.at && e.first.getTime() - 15000 <= w.at.getTime() && w.at.getTime() <= e.last.getTime() + 15000 })),
@@ -318,11 +337,29 @@ export function createInvestigationTools(deps: InvestigationDeps) {
     async function replica(args: Record<string, unknown>): Promise<InvestigationResult | string> {
         const w = windowOf({ minutesBefore: 10, minutesAfter: 5, ...args }, deps);
         if (typeof w === "string" || !w.at) return typeof w === "string" ? w : "Give at.";
+        return replicaAt(w.at, w.from, w.to);
+    }
+
+    /**
+     * The replica's lag at `at`, for explain_replica_lag and for an incident alike: the rise around it, whole, and its cause
+     * from the rise's own minutes. When the rise or its cause runs past the minutes asked about (a stall that began before
+     * them, or ended after), those minutes are read too, once, so every question about one rise gets the same answer from
+     * the same rows (live, 2026-11-21: the RCA view and the chat explained one stall two ways).
+     */
+    async function replicaAt(at: Date, from: Date, to: Date): Promise<InvestigationResult> {
         const targets: RcaTarget[] = ["T4", "T4-replica"];
-        const g = await gather(w.from, w.to, targets);
-        const inside = (at: Date) => at >= w.from && at <= w.to;
-        const a = analyzeReplicaLag({ at: w.at, metrics: g.evidence.metrics.filter((m) => inside(m.at)), samples: g.evidence.replica.filter((r) => inside(r.at)), events: g.evidence.events });
-        const base = envelope("explain_replica_lag", w.from, w.to, targets, deps, g, w.at);
+        const analyze = async (w: { from: Date; to: Date }) => {
+            const g = await gather(w.from, w.to, targets);
+            const a = analyzeReplicaLag({ at, metrics: g.evidence.metrics.filter((m) => metricIn(m, w.from, w.to)), samples: g.evidence.replica.filter((r) => r.at >= w.from && r.at <= w.to), events: g.evidence.events });
+            return { w, g, a };
+        };
+        let r = await analyze({ from, to });
+        const reads = r.a.reads;
+        if (reads && (reads.from < r.w.from || reads.to > r.w.to)) {
+            r = await analyze({ from: new Date(Math.min(r.w.from.getTime(), reads.from.getTime() - 3 * MIN)), to: new Date(Math.max(r.w.to.getTime(), reads.to.getTime() + 3 * MIN)) });
+        }
+        const { w, g, a } = r;
+        const base = envelope("explain_replica_lag", w.from, w.to, targets, deps, g, at);
         return {
             ...base,
             findings: a.findings,
@@ -330,8 +367,32 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             recommendations: a.recommendations,
             nextSteps: a.nextSteps,
             notCaptured: [...base.notCaptured, ...a.notCaptured],
-            details: a.rise ? { source: a.rise.source, lag: a.rise.points.map((p) => ({ at: iso(p.at), seconds: Math.round(p.value * 10) / 10 })), slopeSPerS: a.rise.slope, peak: { at: iso(a.rise.peak.at), seconds: Math.round(a.rise.peak.value * 10) / 10 } } : {},
+            details: a.rise
+                ? {
+                      source: a.rise.source,
+                      lag: a.rise.points.map((p) => ({ at: iso(p.at), seconds: Math.round(p.value * 10) / 10, source: p.source, ...(p.intervalMs ? { intervalMinutes: Math.round(p.intervalMs / MIN) } : {}) })),
+                      slopeSPerS: a.rise.slope,
+                      peak: { at: iso(a.rise.peak.at), seconds: Math.round(a.rise.peak.value * 10) / 10 },
+                      lastReplay: iso(a.rise.stalledSince),
+                  }
+                : {},
         };
+    }
+
+    /** T4's connections against the limit, explained by what held them (connections.ts). */
+    async function connectionsAt(target: RcaTarget, from: Date, to: Date): Promise<InvestigationResult> {
+        const g = await gather(from, to, [target]);
+        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics });
+        const base = envelope("explain_connections", from, to, [target], deps, g);
+        return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
+    }
+
+    /** T5's normalized RU consumption at 100 %, explained from Azure Monitor's counts (throughput.ts). */
+    async function throughputAt(from: Date, to: Date): Promise<InvestigationResult> {
+        const g = await gather(from, to, ["T5"]);
+        const a = analyzeThroughput({ from, to, metrics: g.evidence.metrics });
+        const base = envelope("explain_throughput", from, to, ["T5"], deps, g);
+        return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
     }
 
     async function triage(args: Record<string, unknown>, tool = "triage_window"): Promise<InvestigationResult | string> {
@@ -350,12 +411,19 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         };
     }
 
-    /** One episode's investigation, by its family. CPU and the wait classes have only the telemetry in Phase 1. */
+    /**
+     * One episode's investigation, by its family: each family that EXPLAINED_FAMILIES lists has its own here. CPU and the
+     * wait classes have only the telemetry in Phase 1. A replica's lag is read from its own minutes, from before replay
+     * last advanced (its peak less its lag) to past its end, and explained as explain_replica_lag explains any time in it.
+     */
     async function explainEpisode(e: Episode): Promise<InvestigationResult | string | null> {
-        const span = { from: e.start.toISOString(), to: new Date((e.end ?? e.last).getTime() + MIN).toISOString(), targets: [e.target] };
+        const end = e.end ?? e.last;
+        const span = { from: e.start.toISOString(), to: new Date(end.getTime() + MIN).toISOString(), targets: [e.target] };
         if (e.family === "blocking" || e.family === "deadlock") return locking(span);
-        if (e.family === "replica_lag") return replica({ at: e.peakAt.toISOString() });
-        if (e.family === "errors" || e.family === "connections" || e.family === "throttling" || e.family === "ru") return errors(span);
+        if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN));
+        if (e.family === "connections") return connectionsAt(e.target, e.start, new Date(end.getTime() + MIN));
+        if (e.family === "ru") return throughputAt(e.start, new Date(end.getTime() + MIN));
+        if (e.family === "errors" || e.family === "throttling") return errors(span);
         return null;
     }
 
@@ -398,13 +466,16 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             })),
         ].sort((a, b) => RANK[b.confidence] - RANK[a.confidence]);
         const [rootCause, ...others] = causes;
+        const notCaptured = [...new Set([...base.notCaptured, ...parts.flatMap((p) => p.notCaptured), ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
+        // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
+        if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded from ${hhmmss(e.start)} to ${hhmmss(e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
             ...base,
             findings: parts.flatMap((p) => p.findings),
             rootCause: rootCause ?? null,
             recommendations: [...new Map(parts.flatMap((p) => p.recommendations).map((r) => [r.id, r])).values()],
             nextSteps: [...new Set(parts.flatMap((p) => p.nextSteps))],
-            notCaptured: [...new Set([...base.notCaptured, ...parts.flatMap((p) => p.notCaptured), ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])],
+            notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
                 alsoInTheseMinutes: others.map((c) => c.statement),

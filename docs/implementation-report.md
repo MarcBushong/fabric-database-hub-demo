@@ -4365,7 +4365,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
      - deadlocks and errors by class (`errors.ts`);
      - the replica's lag (`replica.ts`);
      - triage (`triage.ts`).
-   - **The recommendation catalog** (`catalog.ts`): 39 entries, each with its Learn page and who approves it.
+   - **The recommendation catalog** (`catalog.ts`): 39 entries, each with its Learn page and who approves it (40 since the live findings at 94a17ff7: `PG-IDLE-SESSION-TIMEOUT`).
    - **The DAX loader** (`loader.ts`, `client.ts`): at most one query per RCA table, with every query under "Show the sources".
    - **Ask's investigation:** six tools (`tools.ts`), the playbook in the system message (`playbook.ts`), and four starters (`starters.ts`). The app offers them only when the model has the RCA tables.
    - **The Root cause view** (`pages/RcaPage.tsx`, `rca/view/`): the episodes, the chain tree, the timeline, the errors, the recommendations, the next steps, what wasn't captured, and **Explain this incident**, in every theme and in forced colors.
@@ -4522,6 +4522,37 @@ With them, at the coordinator's request: high contrast's selected and hovered na
     - **The page's incident list and report:** they already said they couldn't load; each has **Try again** now.
     - **Not changed, outside the RCA:** the dock's T5 probe leaves T5's starter out when its read fails, which claims nothing.
   - **Tests:** 18 new tests fail against 8c66677d's code: `rca/client.test.ts` (a 429, a 5xx, a missing table, and Copilot's answers), the evidence and sources tests, `rca-retry.test.tsx` (the page's three **Try again**s), the whole app with its check failed by a 503 and then a 429, and throttled throughout (`app-rca.test.tsx`), and the dock's next conversation (`copilot.test.tsx`). `src/data/retry.test.ts` covers the new module. The tests' "no RCA tables" now uses the live text.
+- **Final tests, live at 94a17ff7: two accuracy findings in Root cause** (dbhubrb's 90-minute session 2233e0ae, opened headless against its model).
+  - **Finding 1, the replica's lag contradicted the capture.** For the capture's stall from 16:17:12 to 16:20:03 UTC (peak 176.7 s), the view said, at medium confidence: "Read Replica Lag rose from 16:15:00 to 178 s at 16:15:00 UTC (1 s, 178 s): replay advanced slower than WAL arrived". `explain_replica_lag`, asked at 16:17:12, found the replay conflict at high confidence: the startup process waited for AccessExclusiveLock on `demo.replica_lag_marks` from 16:16:21, which session 5883's replica query held.
+    - **Why:** the view asked at the episode's peak with a window 10 minutes before and 5 after. The lag series preferred Azure Monitor's 5-minute intervals, and the rise ended at its first peak because that window had no recovery point. So the cause was looked for from 16:14 to 16:16, before the stall began.
+    - **The fix:**
+      - The capture's own samples tell the rise wherever it took them. An Azure Monitor point counts as its whole interval, and is read for the minutes the capture didn't sample, or for an interval whose rise fell between its samples.
+      - A rise keeps all its points.
+      - The cause comes from the rise's own minutes, from a minute before replay last advanced to a minute after it recovered.
+      - The view anchors on the episode, and both paths read the rise whole: `replicaAt`, with one more read when it runs past the minutes asked about. Any time in one stall now gets the same finding.
+      - Where the samples tell the rise, Azure Monitor's intervals are cited beside them, as Database Hub charts them.
+  - **Finding 2, a connection surge's report was blank.** `connections` was listed as explained, but only `explain_errors` ran for it, and no connection was refused: Azure Monitor's failed connections were 0 in all 31 intervals. The report said "see what wasn't captured below" with nothing below; 5 such incidents were on the two environments.
+    - **The fix:** `connections.ts` explains a surge by what held the slots, from RCA-PG-10's counts by state against `max_connections` less the reserved slots:
+      - lock waits (`CONN-LOCK-WAIT`);
+      - idle in a transaction (`CONN-IDLE-IN-TX`);
+      - idle (`CONN-IDLE`);
+      - running queries (`CONN-ACTIVE`).
+
+      It says how long the surge held, and whether clients were refused, which only Azure Monitor counts (SQLSTATE 53300; PostgreSQL doesn't queue a connection). Its recommendations are PgBouncer with each application's pool below the limit, the new `idle_session_timeout` entry (PG-IDLE-SESSION-TIMEOUT, on the [statement-behavior parameters page](https://learn.microsoft.com/azure/postgresql/parameters/parameters-client-connection-defaults-statement-behavior)), `idle_in_transaction_session_timeout`, and `lock_timeout`, each where it fits.
+    - **Who held the idle connections isn't captured,** and the answer says exactly that: RCA-PG-10 counts by state, and RCA-PG-01 samples only sessions that aren't idle, and only while a client waits on a lock. Recording them needs a capture change, a runner update, and a deploy: a Phase 2 candidate, for the owner's decision.
+  - **The audit of every family.**
+    - *A coarse series over finer samples:* besides the replica's lag, Azure Monitor counts (T4's failed connections, T5's 429s) were filtered by their interval's start in the errors' and triage's windows. They now count when their interval overlaps the window (`metricIn`). Blocking (the capture's samples replace Database Hub's bins), T3's CPU (its 15-s rows replace the bins), and errors (exact events) were already right.
+    - *A family listed as explained with no explainer that answers:*
+      - `connections`: fixed as above.
+      - `ru`: T5's normalized RU at 100 % without a 429 had no cause. `throughput.ts` explains it from Azure Monitor (`RU-AT-LIMIT`, `RU-THROTTLED`), and says which partition key range was busiest isn't in the history.
+      - `blocking`: blocked processes that left no chain in the capture's samples now say so, where the cause was blank.
+    - Triage names `explain_incident` with the episode's key for both families, and the playbook says so. An incident with no cause still says what's missing, and the view points below only when something is there.
+  - **The fixture:** `rca/testdata/live-rb-2233e0ae.ts` holds the session's rows, rebuilt from the live answers (the harness saved the answers and the DAX, not the rows). On it, 94a17ff7's code gives the view's statement, the harness's `explain_replica_lag` statement, and the connection surge's empty report word for word. The surge's counts by state aren't in the live answers: they follow RCA-PG-10's shape with the episode's facts and T4's limit on every size (50 less 15 reserved).
+  - **Tests:** 23 new or changed tests fail against 94a17ff7's code:
+    - `live-accuracy.test.ts`, on the fixture: the stall's cause; the same finding from the chat at five times and windows, one of them cutting off the stall's start (it also fails with the extra read disabled); the second stall's own holder; the surge's statement; triage's next tool.
+    - the rules: capture first, Azure Monitor's intervals as intervals, a rise between samples, the four connection states, refusals, what isn't captured, and RU with and without 429s.
+    - the family audit: over the contract's fixtures, the live session, the local PostgreSQL capture, and an error burst, every episode of every family in `EXPLAINED_FAMILIES` gets a cause or what's missing, and all seven families appear.
+    - the view: the surge's report, and a report without a cause that points below at nothing.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4639,6 +4670,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
 
   markdownlint found no issue in 152 files.
+- **The two accuracy findings (live, at 94a17ff7):** `npm run verify` passed: typecheck, lint, Vitest's 524 tests in 33 files, the license check (136 production packages), and the build. With 94a17ff7's sources (the new modules kept), 23 new or changed tests fail, and with the extra read disabled, the narrow-window case fails. Under strict mode, with the Azure CLI guard, the same suites as above passed: 979 passed, none failed, 3 skipped because this PC lacks gitleaks; `Rca.Contract`'s scan finds no answer-key name or scenario ID in the new modules. markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
 

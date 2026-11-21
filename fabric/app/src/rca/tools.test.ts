@@ -1,10 +1,14 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { validateTools } from "../../../../ask-relay/src/protocol";
 import { toolSpecs } from "@/copilot/tools";
-import type { CosmosCapture, PostgresCapture } from "@/data/model";
+import { COSMOS_METRICS, type CosmosCapture, type PostgresCapture } from "@/data/model";
+import { decodeEvidence } from "./evidence";
 import { LAG_METRIC } from "./replica";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
-import { createInvestigationTools, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
+import { live, liveSources } from "./testdata/live-rb-2233e0ae";
+import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
 import { emptyEvidence, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
@@ -105,9 +109,11 @@ describe("the owner's four questions, at the live session's times (EST)", () => 
     it("'Why did the replica's lag spike at 12:14?': replay stood still behind a replica query's lock, not the network or the write volume", async () => {
         const r = await ask("explain_replica_lag", { at: "12:14" });
         expect(r.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-REPLAY-CONFLICT"] });
-        expect(r.rootCause?.statement).toMatch(/^Read Replica Lag rose from 17:12:00 to 166 s at 17:14:00 UTC \(0\.7 s, 45 s, 106 s, 166 s, 1 s\) and was back to 1 s at 17:15:00 UTC/);
+        // The capture's own samples tell the rise (live, 2026-11-21); Azure Monitor's minute values are cited beside them.
+        expect(r.rootCause?.statement).toMatch(/^The replica's time since its last replay rose from 17:11:30 to 175\.4 s at 17:14:10 UTC \(15\.4 s, 100\.4 s, 160\.4 s, 175\.4 s\), counting from its last replay at 17:11:14 UTC, and was back to 0\.9 s at 17:14:15 UTC/);
         for (const fact of ["demo.replica_lag_marks", "AccessExclusiveLock", "AccessShareLock", "session 41872", "WAL about 1020 bytes/s", "nothing was cancelled"]) expect(r.rootCause?.statement).toContain(fact);
-        expect(r.details).toMatchObject({ source: "Telemetry Snapshots", peak: { at: "2026-11-20T17:14:00Z", seconds: 166 } });
+        expect(r.rootCause?.evidence.map((x) => x.text)).toEqual(expect.arrayContaining(["Read Replica Lag 166 s"]));
+        expect(r.details).toMatchObject({ source: "RCA Replica", peak: { at: "2026-11-20T17:14:10Z", seconds: 175.4 }, lastReplay: "2026-11-20T17:11:14Z" });
         expect(r.episodes.map((e) => [e.target, e.family, e.source])).toContainEqual(["T4-replica", "replica_lag", "the RCA capture"]);
     });
 
@@ -165,5 +171,60 @@ describe("incidents, blind", () => {
             expect(namesAScenario(out.text), name).toEqual([]);
             expect(out.text, name).not.toMatch(/inject/i);
         }
+    });
+});
+
+// The live findings' audit (2026-11-21): T4's connection surge was listed as explained, but only its errors were read, so
+// its report was blank. Every family EXPLAINED_FAMILIES lists has an explainer now, which gives a cause or says exactly
+// what's missing.
+describe("every family the RCA explains", () => {
+    it("is explained, or says what's missing for its target, for every episode in the fixtures, and each family has one", async () => {
+        const pgLocal = decodeEvidence(JSON.parse(readFileSync(resolve(import.meta.dirname, "../preview/data/pg-local.evidence.json"), "utf8"))).evidence;
+        // An error burst: 12 lock timeouts on T3 in one minute.
+        const burst: Evidence = { ...emptyEvidence(), events: Array.from({ length: 12 }, (_, i) => ({ target: "T3" as const, at: new Date(at("16:10:00").getTime() + i * 4000), kind: "error" as const, code: "1222", count: 1, program: "ContosoCare.Demo", detail: "Lock request time out period exceeded." })) };
+        const sets: Array<[string, ReturnType<typeof tools>, Date, Date]> = [
+            ["the contract's fixtures", tools(), at("16:30:00"), at("17:40:00")],
+            ["the live session", createInvestigationTools({ ...liveSources(), timeZone: "America/New_York", latestDay: live("00:00:00"), latest: live("21:33:15") }), live("15:20:00"), live("16:50:00")],
+            ["the local PostgreSQL capture", tools({ evidence: pgLocal, telemetry: {} }), at("22:29:00"), at("22:32:00")],
+            ["an error burst", tools({ evidence: burst, telemetry: {} }), at("16:05:00"), at("16:15:00")],
+        ];
+        const families = new Set<string>();
+        for (const [name, deps, from, to] of sets) {
+            for (const e of (await deps.episodes(from, to)).filter((x) => EXPLAINED_FAMILIES.includes(x.family))) {
+                families.add(e.family);
+                const r = await ask("explain_incident", { episodeKey: e.key }, deps);
+                expect(r.rootCause !== null || r.notCaptured.some((s) => s.startsWith(`${e.target}: `)), `${name}: ${e.key}`).toBe(true);
+            }
+        }
+        expect([...families].sort()).toEqual([...EXPLAINED_FAMILIES].sort());
+    });
+
+    it("says why a blocking episode has no chain, when the sentinel saw blocked processes between the chain's samples", async () => {
+        const evidence: Evidence = {
+            ...emptyEvidence(),
+            events: [
+                { target: "T1", at: at("16:00:00"), kind: "capture", name: "escalated", code: "T1-20261120T160000Z", count: 1, detail: "processes_blocked 2 >= 1: blocking detail (RCA-SQL-01) every 10 s." },
+                { target: "T1", at: at("16:01:30"), kind: "capture", name: "relaxed", code: "T1-20261120T160000Z", count: 1, detail: "processes_blocked 0 for 60 s: back to the 30-s sentinel." },
+            ],
+            resource: [{ target: "T1", at: at("16:00:00"), source: "RCA-SQL-09", metric: "processes_blocked", value: 2 }],
+            coverage: [{ target: "T1", from: at("15:30:00"), to: at("16:30:00"), captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }],
+        };
+        const r = await ask("explain_incident", { episodeKey: "T1-blocking-20261120T160000Z" }, tools({ evidence, telemetry: {} }));
+        expect(r.rootCause).toBeNull();
+        expect(r.notCaptured).toContain(
+            "T1: the blocked processes from 16:00:00 to 16:02:30 UTC left no blocking chain in the capture: it samples chains (RCA-SQL-01) every 10 s once its 30-s sentinel sees a blocked process, so blocking that began and ended between the sentinel's samples has none, and neither the head blocker nor its statement is known.",
+        );
+    });
+
+    it("explains T5's normalized RU at 100 % that throttled nothing", async () => {
+        const points = Array.from({ length: 10 }, (_, i) => [
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.normalizedRu, value: i < 3 ? 100 : 40 },
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.requests, value: 1000 },
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.throttled, value: 0 },
+        ]).flat();
+        const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("17:20:00"), windowStart: at("17:00:00"), windowEnd: at("17:10:00"), intervalMinutes: 1, points };
+        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261120T170000Z" }, tools({ evidence: emptyEvidence(), telemetry: { cosmos } }));
+        expect(r.rootCause).toMatchObject({ ruleIds: ["RU-AT-LIMIT"], confidence: "medium" });
+        expect(r.rootCause?.statement).toMatch(/reached 100 % in 3 intervals from 17:00 to 17:03 UTC\. Azure Monitor counted 5000 requests in those minutes, none of them throttled/);
     });
 });

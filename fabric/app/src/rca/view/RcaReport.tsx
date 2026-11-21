@@ -156,7 +156,9 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
                         ) : null}
                     </>
                 ) : (
-                    <p className="rca-cause">The capture holds no cause for these minutes: see what wasn't captured below.</p>
+                    <p className="rca-cause">
+                        {notCaptured.length > 0 ? "The capture holds no cause for these minutes: see what wasn't captured below." : "The capture and the telemetry hold no cause for these minutes."}
+                    </p>
                 )}
                 {also.length > 0 ? (
                     <>
