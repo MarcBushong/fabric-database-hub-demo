@@ -993,8 +993,10 @@ function Get-DemoGoldenControlRcaPending {
     .SYNOPSIS
     The Incident RCA's documents that the session control's runbooks exported on a VM but couldn't fetch, as the session's
     status lists them, for capture-t2-golden.ps1 (ADR 0031; the review of 3f6cd14): the status's own (rca.pending, and
-    rcaHandoff, what a re-check found while a stop ran) and earlier sessions' (rcaEarlierPending), each with its VM. Only
-    the control's next start fetches them, from the IDs the status keeps. Read from the control account's variable
+    rcaHandoff, what a re-check found while a stop ran) and earlier sessions' (rcaEarlierPending), each with its VM and its
+    session's ID: the status's for its own and the handoff, the carry's for an earlier session's. Only the control's next
+    start fetches them, from the IDs the status keeps, and each start fetches one session's (Get-DbHubRcaEarlier; the review
+    of 0a9fb8d). Read from the control account's variable
     DbHubSessionStatus, the runbooks' copy of the status, which infra/control/control.bicep creates unencrypted, through Azure
     Resource Manager with the read access the scripts already use on the control's account: no new grant, and the vault's
     copy isn't read. Documents past the 7 days the runner keeps them are left out, since no start fetches them any more.
@@ -1044,25 +1046,25 @@ function Get-DemoGoldenControlRcaPending {
     }
     $documents = [System.Collections.Generic.List[object]]::new()
     $add = {
-        param([object] $Items)
+        param([object] $Items, [string] $Session)
         foreach ($item in @($Items)) {
             $id = [string](Get-DemoMemberValue -InputObject $item -Name 'documentId')
             $vm = [string](Get-DemoMemberValue -InputObject $item -Name 'vm')
             if ($id -and $vm) {
-                $documents.Add([ordered]@{ documentId = $id; vm = $vm })
+                $documents.Add([ordered]@{ documentId = $id; vm = $vm; sessionId = $Session })
             }
         }
     }
-    # The status's own: kept from its last write, as the next start reads them (Get-DbHubRcaBacklog).
+    # The status's own: kept from its last write, as the next start reads them (Get-DbHubRcaBacklog), with its session's ID.
     $updated = ConvertTo-DemoUtcDateTime -Value $status['updatedUtc']
     if ($null -eq $updated -or $updated.AddDays(7) -gt $NowUtc) {
-        & $add (Get-DemoMemberValue -InputObject $status['rca'] -Name 'pending')
-        & $add $status['rcaHandoff']
+        & $add (Get-DemoMemberValue -InputObject $status['rca'] -Name 'pending') ([string]$status['sessionId'])
+        & $add $status['rcaHandoff'] ([string]$status['sessionId'])
     }
     foreach ($carry in @($status['rcaEarlierPending'])) {
         $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $carry -Name 'expiresUtc')
         if ($null -eq $expires -or $expires -gt $NowUtc) {
-            & $add (Get-DemoMemberValue -InputObject $carry -Name 'pending')
+            & $add (Get-DemoMemberValue -InputObject $carry -Name 'pending') ([string](Get-DemoMemberValue -InputObject $carry -Name 'sessionId'))
         }
     }
     $answer.Documents = $documents.ToArray()

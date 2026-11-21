@@ -223,7 +223,7 @@ Describe 'Get-DemoRcaModelTablePlan (ADR 0031)' {
         @($plan.Excluded) | Should -Be @('RCA Waits', 'RCA Events', 'RCA Queries', 'RCA Resource', 'RCA Replica', 'RCA Coverage', 'RCA Answer Key')
         $plan.Result.status | Should -Be 'Warning'
         $plan.Result.message | Should -Match '^The lakehouse doesn''t have 7 of the Incident RCA''s 8 tables yet \(rca_waits, rca_events, .*\), so the history model leaves them out'
-        $plan.Result.remediation | Should -Match 'configure-fabric\.ps1 -SkipHubChecks -RunLiveActivity'
+        $plan.Result.remediation | Should -Match 'configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity, which updates that notebook alone' -Because 'the fix leaves NB_DatabaseHub_Deployment, which fabric.importNotebooks false keeps as the person left it (the review of e113eab)'
         [bool]$plan.Result.evidence['listed'] | Should -BeTrue
     }
 

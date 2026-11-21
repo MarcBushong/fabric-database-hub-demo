@@ -55,7 +55,7 @@ function Get-DemoRcaModelTablePlan {
 
     $tables = @(Get-DemoRcaHistoryTable)
     $docUrl = 'https://learn.microsoft.com/fabric/fundamentals/direct-lake-overview'
-    $fix = 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -RunLiveActivity, which updates the notebooks and runs NB_DatabaseHub_LiveActivity (it creates the tables), then ./scripts/configure-powerbi.ps1; ./scripts/deploy.ps1 does both when fabric.importNotebooks is true.'
+    $fix = 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity, which updates that notebook alone and runs it (it creates the tables), then ./scripts/configure-powerbi.ps1; ./scripts/deploy.ps1 does both when fabric.importNotebooks is true.'
     $why = ''
     $names = @()
     try {

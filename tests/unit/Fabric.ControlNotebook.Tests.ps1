@@ -1446,7 +1446,7 @@ print(json.dumps(out))
             }
             'sessionrcaold' {
                 $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
-                $report.printed | Should -Match 'Warning: NB_DatabaseHub_LiveActivity in the demo workspace didn''t read the session''s RCA evidence: its copy is from before the Incident RCA \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 updates it'
+                $report.printed | Should -Match 'Warning: NB_DatabaseHub_LiveActivity in the demo workspace didn''t read the session''s RCA evidence: its copy is from before the Incident RCA \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence'
             }
             'earlierrca' {
                 # The session's own evidence first, then the earlier session's alone: RCA_ONLY, with SAVE_RESULTS False, so a
