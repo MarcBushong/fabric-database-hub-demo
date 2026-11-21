@@ -337,14 +337,14 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 empty={!d.series.loading && mine.length === 0}
                 emptyText={`No telemetry bins on ${target} in this period.`}
                 table={d.seriesSpec && d.series.data ? { columns: d.seriesSpec.columns, rows: d.series.data.rows.filter((r) => r["Target Key"] === target), caption: `${target}'s bins` } : null}
-                summary={`CPU on ${target}; peak ${formatNumber(peak?.value ?? null, "percent")}.`}
+                summary={`CPU on ${target}; peak ${formatBeside(peak?.value ?? null, "percent", 80)}.`}
                 askPrompt={`Explain ${target}'s CPU over this period: what drove the peaks, and is anything abnormal?`}
             >
                 <ChartView
                     hideHeader
                     spec={{ kind: "area", title: `${target} CPU`, rows: cpuRows, x: "at", y: "CPU", unit: "%" }}
                     colors={{ CPU: info.color }}
-                    annotations={{ bands, thresholds: [{ value: 80, label: "80 %", tone: "warning" }], markers: peak ? [{ x: peak.at, y: peak.value, label: `peak ${formatNumber(peak.value, "percent")}` }] : [] }}
+                    annotations={{ bands, thresholds: [{ value: 80, label: "80 %", tone: "warning" }], markers: peak ? [{ x: peak.at, y: peak.value, label: `peak ${formatBeside(peak.value, "percent", 80)}` }] : [] }}
                 />
             </VisualCard>
 
@@ -562,7 +562,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         <ChartView
                             hideHeader
                             spec={{ kind: "area", title: "Read replica lag", rows: lagRows, x: "at", y: "T4-replica", unit: "s" }}
-                            annotations={{ thresholds: [{ value: REPLICA_LAG_WARNING_SECONDS, label: `${REPLICA_LAG_WARNING_SECONDS} s: warning`, tone: "warning" }], markers: lagPeak ? [{ x: lagPeak.at, y: lagPeak.value, label: `peak ${formatNumber(lagPeak.value, "seconds")}` }] : [] }}
+                            annotations={{ thresholds: [{ value: REPLICA_LAG_WARNING_SECONDS, label: `${REPLICA_LAG_WARNING_SECONDS} s: warning`, tone: "warning" }], markers: lagPeak ? [{ x: lagPeak.at, y: lagPeak.value, label: `peak ${formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)}` }] : [] }}
                         />
                     </VisualCard>
 
@@ -576,7 +576,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && cpuRows.length === 0}
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "series", label: "Server", kind: "text" }, { key: "value", label: "CPU (%)", kind: "percent" }], rows: cpuRows, caption: "CPU per interval" }}
-                        summary={`T4's CPU peaked at ${formatNumber(cpuPeak?.value ?? null, "percent")}.`}
+                        summary={`T4's CPU peaked at ${formatBeside(cpuPeak?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT)}.`}
                     >
                         <ChartView hideHeader height={200} spec={{ kind: "line", title: "CPU", rows: cpuRows, x: "at", y: "value", series: "series", unit: "%" }} annotations={{ thresholds: [{ value: POSTGRES_CPU_WARNING_PERCENT, label: `${POSTGRES_CPU_WARNING_PERCENT} %`, tone: "warning" }] }} />
                     </VisualCard>

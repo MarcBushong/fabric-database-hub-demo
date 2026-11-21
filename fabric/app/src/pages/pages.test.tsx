@@ -361,6 +361,21 @@ describe("Estate", () => {
         expect(within(glance).getByText("99.989 %").closest(".kpi")).toHaveClass("kpi-warning");
     });
 
+    it("writes a chart's peak just under its warning line as it is: the SQL and T4 CPU at 80 %, the replica's lag at 60 s (2026-11-21)", async () => {
+        // One decimal alone writes 79.996 % as 80.0 % and 59.96 s as 60.0 s, the lines the charts draw.
+        const sqlBins = FIXTURES["signals-per-bin"].map((r) => (r["Target Key"] === "T3" && r.Cpu === 120 ? { ...r, Cpu: 79.996 } : r));
+        const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T3" }, client: fakeQueryClient({ "signals-per-bin": sqlBins }) });
+        const sqlCpu = await screen.findByRole("region", { name: "CPU" });
+        expect(within(sqlCpu).getByText("CPU on T3; peak 79.996 %.")).toBeInTheDocument();
+        await waitFor(() => expect(within(sqlCpu).getByText("peak 79.996 %")).toBeInTheDocument());
+        unmount();
+        const pg = FIXTURES["postgres-series"].map((r) => (r.Value === 241.4 ? { ...r, Value: 59.96 } : r.TargetKey === "T4" && r.Value === 91.3 ? { ...r, Value: 79.996 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T4" }, client: fakeQueryClient({ "postgres-series": pg }) });
+        const lag = await screen.findByRole("region", { name: "Read replica lag" });
+        await waitFor(() => expect(within(lag).getByText("peak 59.96 s")).toBeInTheDocument());
+        expect(within(screen.getByRole("region", { name: "CPU" })).getByText("T4's CPU peaked at 79.996 %.")).toBeInTheDocument();
+    });
+
     it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
         const empty = { "cosmos-series": [], "cosmos-findings": [] };
         const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient(empty) });
