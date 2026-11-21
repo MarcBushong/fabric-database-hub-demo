@@ -162,12 +162,17 @@ def iso(value):
 SENT, JOBS, REFS, VALIDATORS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
-# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", and "leftoverjob".
-LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob") else "cccccccc-0000-0000-0000-000000000003"
+# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", "leftoverjob", and
+# "rcaleftoverjob".
+LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob", "rcaleftoverjob") else "cccccccc-0000-0000-0000-000000000003"
 # The Incident RCA (ADR 0031): the metrics secret's earlier versions, which hold the bundles the runbook wrote; the demo
 # lakehouse's files (notebookutils.fs); what the activity notebook found staged; and the versions read.
 VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
-RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail")
+# A session's history that runs as a job, with its evidence staged (re-check of d2067d69): the reference run fails, and the
+# job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
+# copy from before the Incident RCA), or Failed.
+RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed")
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail") + RCA_JOB_SCENARIOS
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
 DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
@@ -305,7 +310,7 @@ if scenario == "leftovercosmos":
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedBy": "control", "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
                                                  "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [],
                                                  "cosmos": cosmos_document("e" * 32, earlier - real_dt.timedelta(minutes=100), earlier)}, separators=(",", ":"))
-if scenario == "leftoverrca":
+if scenario in ("leftoverrca", "rcaleftoverjob"):
     # The Incident RCA's evidence alone (ADR 0031): an empty T4 document carries the bundle index as its rca member.
     earlier = Clock.now - real_dt.timedelta(days=1)
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedBy": "control", "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
@@ -432,7 +437,7 @@ class Notebook:
             return ""
         REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
-        if scenario == "refail":
+        if scenario == "refail" or scenario in RCA_JOB_SCENARIOS:
             raise RuntimeError("The referenced notebook's default lakehouse differs from the caller's.")
         if scenario in ("queued", "queuedjob"):
             # Live, 2026-11-16: Fabric's reference run failed on a cell's result, and the job then queued behind this session.
@@ -510,7 +515,16 @@ def request(method, url, json=None, headers=None, timeout=None):
         return Response(202, None, FABRIC + "/workspaces/x/items/nb-1/jobs/instances/run-%d" % len(JOBS))
     if method == "GET" and "/jobs/instances/run-" in url:
         JOBREADS[0] += 1
-        return Response(200, {"status": "NotStarted" if scenario in ("queued", "queuedjob") else "Completed"})
+        if scenario in ("queued", "queuedjob", "rcajobqueued"):
+            return Response(200, {"status": "NotStarted"})
+        if scenario == "rcajobfailed":
+            return Response(200, {"status": "Failed", "failureReason": {"message": "Notebook execution failed in cell 4."}})
+        if scenario == "rcajobdone":
+            # The job ran, and its notebook deleted the staged evidence once it had written it.
+            staged = JOBS[int(url.rsplit("-", 1)[1]) - 1].get("RCA_EVIDENCE_FILE") or ""
+            for name in [name for name in FILES if staged and name.endswith("/" + staged)]:
+                del FILES[name]
+        return Response(200, {"status": "Completed"})
     raise AssertionError("unexpected %s %s" % (method, url))
 
 
@@ -1508,6 +1522,34 @@ print(json.dumps(out))
                 @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555')
                 $report.printed | Should -Match 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent'
             }
+        }
+    }
+
+    It 'says what became of the Incident RCA''s evidence that a history job got, as far as Run all can tell: <Case> (ADR 0031, re-check of d2067d69)' -ForEach @(
+        @{ Case = 'a job queued until Run all''s Spark session ends'; Scenario = 'rcajobqueued'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session {0}''s RCA evidence is saved: the history job is queued until this notebook''s Spark session ends\. Fix: once the job has run, the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line; when it isn''t Pass, or the job failed, Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
+        @{ Case = 'a job that ended and deleted the file'; Scenario = 'rcajobdone'; Files = 0; Says = 'Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: the history job read session {0}''s RCA evidence and deleted its file, as it does once it has handled it; the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line, with any document it skipped\.' }
+        @{ Case = 'a job that ended and left the file'; Scenario = 'rcajobold'; Files = 0; Says = 'RCA\.EVIDENCE Warning: the history job ended without writing session {0}''s RCA evidence: NB_DatabaseHub_LiveActivity in the demo workspace is from before the Incident RCA, or its write failed \(the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true' }
+        @{ Case = 'a job that failed'; Scenario = 'rcajobfailed'; Files = 0; Says = 'Warning: the history job is Failed: Notebook execution failed in cell 4\.[^\n]*\s+RCA\.EVIDENCE Warning: session {0}''s RCA evidence wasn''t saved: the history job is Failed, so nothing read it\. Fix: Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
+        @{ Case = 'an earlier session''s history saved as a job that Run all doesn''t look at'; Scenario = 'rcaleftoverjob'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session eeeeeeee''s RCA evidence is saved: Run all doesn''t wait for the history job\. Fix: once the job has run' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # At d2067d69, Run all printed nothing about the evidence on the job path, and the inbox's day-old sweep later deleted a
+        # file the job left.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        $job = @($report.jobs | Where-Object { $_.PSObject.Properties.Name -contains 'RCA_EVIDENCE_FILE' })
+        $job.Count | Should -Be 1
+        $job[0].RCA_EVIDENCE_FILE | Should -Match '^Files/rca/inbox/\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{8}\.json$'
+        $report.printed | Should -Match ($Says -f $report.sent[0].sessionId.Substring(0, 8))
+        @([regex]::Matches($report.printed, '(?m)^RCA\.EVIDENCE (Pass|Warning):')).Count | Should -Be 1
+        # A job that will still run keeps its file; one that ended, or won't run, leaves nothing in the inbox.
+        @($report.files).Count | Should -Be $Files
+        if ($Files -gt 0) {
+            $report.files[0] | Should -BeLike ('*/' + $job[0].RCA_EVIDENCE_FILE)
         }
     }
 
