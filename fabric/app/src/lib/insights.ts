@@ -97,15 +97,24 @@ export interface IncidentComparison {
     ratio: number | null;
 }
 
+/** Twice its baseline or more is an incident insight's Warning. */
+const INCIDENT_WARNING_RATIO = 2;
+
+/** A ratio under 10 as formatBeside writes it against the Warning's 2×, so 1.96 reads "1.96", never "2.0" without the
+ *  Warning; 10 and more, whole. */
+function timesNumber(ratio: number): string {
+    return ratio >= 10 ? String(Math.round(ratio)) : formatBeside(ratio, "decimal", INCIDENT_WARNING_RATIO);
+}
+
 /** A ratio against a baseline on a tile: "3.4×", "35×", and ">100×" beyond, where a baseline near zero makes the exact
  *  number noise (dbhubc5's tempdb latch: 1610× a baseline of 0.02 s). */
 export function timesShort(ratio: number): string {
-    return ratio >= 100 ? ">100×" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×`;
+    return ratio >= 100 ? ">100×" : `${timesNumber(ratio)}×`;
 }
 
 /** The same ratio in a sentence: "3.4 times", "35 times", "more than 100 times". */
 export function timesText(ratio: number): string {
-    return ratio >= 100 ? "more than 100 times" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)} times`;
+    return ratio >= 100 ? "more than 100 times" : `${timesNumber(ratio)} times`;
 }
 
 /** "baseline 0.4 s per bin", or "baseline near zero" when it rounds to nothing at the signal's precision. */
@@ -144,7 +153,7 @@ export function incidentInsight(incident: Incident, comparison: IncidentComparis
     if (comparison && comparison.ratio !== null && comparison.during !== null) {
         return {
             id: `incident-ratio-${incident.key}`,
-            status: comparison.ratio >= 2 ? "Warning" : null,
+            status: comparison.ratio >= INCIDENT_WARNING_RATIO ? "Warning" : null,
             metric: timesShort(comparison.ratio),
             title: `${incident.target} ${comparison.signal} ran at ${timesText(comparison.ratio)} their baseline from ${span}.`,
             detail: `${formatNumber(comparison.during, comparison.kind)} per bin on average during the window, against ${formatNumber(comparison.baseline, comparison.kind)} in the ${formatDuration(incidentPadMinutes(incident))} before; peak ${formatNumber(comparison.peak, comparison.kind)} at ${formatTimeUtc(comparison.peakAt)} UTC.`,

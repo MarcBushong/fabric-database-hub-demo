@@ -131,6 +131,19 @@ describe("insights", () => {
         expect(insight.title).toContain("lasted 1 h");
     });
 
+    it("never writes a ratio just under the 2× Warning as 2.0 (the review of 29a7cb4)", () => {
+        const base = compareIncident(incident, [bin(9, 30, 10), bin(10, 0, 40)]);
+        const under = incidentInsight(incident, { ...base, during: 19.6, ratio: 1.96 });
+        expect(under.status).toBeNull();
+        expect(under.metric).toBe("1.96×");
+        expect(under.title).toContain("ran at 1.96 times their baseline");
+        const at2 = incidentInsight(incident, { ...base, during: 20, ratio: 2 });
+        expect(at2.status).toBe("Warning");
+        expect(at2.metric).toBe("2.0×");
+        expect(at2.title).toContain("ran at 2.0 times their baseline");
+        expect([timesShort(1.999), timesShort(3.42), timesText(9.96), timesShort(35.3)]).toEqual(["1.999×", "3.4×", "10.0 times", "35×"]);
+    });
+
     it("measures a wait family by its own category, as the detector does, not by all waits (dbhubc5, 2026-11-18)", () => {
         // T3's detected log flush waits: Tran Log IO at about 0.4 s a bin, then 15.8 to 20.4 s, while all the waits fell.
         const logFlush: Incident = { ...incident, key: "detected:T3:tran_log", family: "tran_log", start: at(1, 52), end: at(1, 57), durationMin: 5, peakValue: 20.417 };
