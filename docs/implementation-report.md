@@ -4727,3 +4727,37 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live.** The notebook runs offline against stand-ins for `notebookutils` and the webhook.
 - **The Insights app's Manage still shows "completed"** for a notebook run that started nothing, here as for any other "Manual action required" in the notebook: the app reads the Fabric job's status, and the notebook ends normally. Pre-existing; not changed here.
+
+### Preflight checks the Azure Automation accounts a deployment adds (F30, 2026-11-22)
+
+**Why.** Preflight checked the vCPU quota, but not the subscription's quota of Azure Automation accounts per region. On `dbhubra` (F28), a new deployment in a subscription with 10 accounts in westus3 learned only at the end, from two Warnings, that neither of its accounts was created.
+
+**Learn** ([Azure subscription and service limits, Automation limits](https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits); [Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-subscription-limits-faq); [Manage Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-limits-quotas); checked 2026-11-22):
+
+- At most 10 active Automation accounts in a subscription in a region for Enterprise and CSP subscriptions, 2 for pay-as-you-go, Sponsored, MSDN, MPN, and Azure Pass ones, both raisable by a support request or on the portal's **My quotas** page (provider **Automation accounts**).
+- 1 for Free Trial, Azure for Students, and Azure in Open ones, in six regions only, which can't be raised.
+- The offers' `quotaId`s are from [Understand Cost Management data](https://learn.microsoft.com/azure/cost-management-billing/costs/understand-cost-mgt-data). `MSDNDevTest_2014-09-01` covers Enterprise and pay-as-you-go Dev/Test alike, so its default is unknown. `Internal_2014-09-01` isn't on Learn: 10, as observed live, where the 11th account was refused.
+- No documented API returns the quota itself: the [Quota REST API](https://learn.microsoft.com/rest/api/quota/) covers virtual machines, Machine Learning, networking, HPC Cache, storage, and Purview, not Automation accounts, so a raised quota is a setting.
+
+**Work summary.**
+
+- **`PREFLIGHT.P3.AUTOMATION`** (`Get-DemoAutomationAccountQuotaResult`, after `PREFLIGHT.P3.PUBLICIP`):
+  - What this deployment adds: each of its two accounts (`aa-<prefix>-control`, which environments with one prefix share, and `aa-<prefix>-<environment>-safetystop`) that Azure Resource Manager answers isn't there (HTTP 404). An update whose accounts are there is a **Pass**, with nothing more read.
+  - What the subscription has in the region: one Azure Resource Graph count, through the verified-token path (`Invoke-DemoHubResourceGraph`).
+  - The quota: `automationAccountQuota` when set, else the offer's default (`Get-DemoAutomationAccountLimit`, from `Get-DemoSubscriptionQuotaId`).
+- **Its statuses:**
+  - **Pass** when they fit.
+  - **Fail** only for a new deployment whose accounts don't fit, before anything is created, with how to free an account or raise the quota. New means no demo resource group, or one with tags but no recorded stage (`Test-DemoAutomationQuotaNewDeployment`); a Free Trial gets its own fix.
+  - **Warning** for an environment that has deployed before (its update goes on), when it can't tell, when the count or an account can't be read, when the region has more accounts than the offer's default (a raised quota it can't read), and for an offer with no documented default above 2 accounts.
+- **`automationAccountQuota`:** an optional integer from 1 to 1,000 in `config/environment.schema.json`, with no default.
+- **Docs:** prerequisites (a P3 row), limitations, configuration, the cost guide (the account counts against a quota, not a price), troubleshooting (three `PREFLIGHT.P3.AUTOMATION` rows), ADR 0026's amendment, the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/AutomationQuotaHelpers.ps1`, `Public/Invoke-DemoPreflight.ps1`, `config/environment.schema.json`; tests in `tests/unit/DbHubDemo.Preflight.Tests.ps1`; `docs/prerequisites.md`, `docs/limitations.md`, `docs/configuration.md`, `docs/cost-management.md`, `docs/troubleshooting.md`, `docs/adr/0026-one-run-all-session.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Preflight and Config, 133 passed; 0 failed, 0 az calls. With HEAD's `AutomationQuotaHelpers.ps1` and `Invoke-DemoPreflight.ps1` and the tests kept, all 14 new tests fail: the live case (10 of 10, a new deployment, a **Fail** with nothing created, and a group created ahead); an update whose accounts are there (a **Pass**, nothing more read); an environment that has deployed before, and one it can't tell (**Warnings**); four cases that fit; a pay-as-you-go region with one account; `automationAccountQuota`; a raised quota it can't read; an offer with no documented default; Free Trial; a count or an account it can't read; and the check's place in preflight, whose **Fail** fails it. PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The Resource Graph count can lag a create or a delete by a few minutes, so an account deleted just before can still count; the fix says so.
+- **A raised quota with fewer accounts than the offer's default** (say a pay-as-you-go subscription raised to 5, with 1 account) reads as the default, 2, so a new deployment there fails until `automationAccountQuota` says 5; the fix names it.
+- **An offer that isn't in the table**, or one that couldn't be read, passes only when two accounts fit in an empty region; otherwise a **Warning**, never a **Fail**.

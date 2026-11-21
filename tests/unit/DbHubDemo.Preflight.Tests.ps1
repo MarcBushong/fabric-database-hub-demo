@@ -1487,3 +1487,196 @@ Describe 'Get-DemoDeploymentParameter' {
         { Get-DemoDeploymentParameter -Config $config -T3UseFreeLimit $true -NetworkMode private -BootstrapBundleSha256 'abc' -BootstrapChunkCount 1 } | Should -Throw
     }
 }
+
+Describe 'The Azure Automation accounts a deployment adds (PREFLIGHT.P3.AUTOMATION, F30)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith {}
+        # Whether Azure Resource Manager has each of the two accounts: there, missing (HTTP 404), or unread.
+        $script:accountState = @{ control = 'missing'; safety = 'missing' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            $state = if ($Url -match '/automationAccounts/aa-dbhub-control\?') { $script:accountState['control'] } elseif ($Url -match '/automationAccounts/aa-dbhub-demo-safetystop\?') { $script:accountState['safety'] } else { throw ('unexpected ARM call: {0}' -f $Url) }
+            switch ($state) {
+                'there' { [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'account' }; Error = '' } }
+                'missing' { [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' } }
+                default { [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' } }
+            }
+        }
+        # Live, 2026-11-21: 10 accounts in westus3 (five environments, two each), in a Microsoft internal subscription.
+        $script:graphTotal = 10
+        $script:graphFails = $false
+        $script:graphQueries = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -MockWith {
+            $script:graphQueries.Add($Query)
+            if ($script:graphFails) {
+                return [pscustomobject]@{ Succeeded = $false; Error = 'AuthorizationFailed.'; Rows = @(); Truncated = $false }
+            }
+            [pscustomobject]@{ Succeeded = $true; Error = ''; Rows = @([pscustomobject]@{ total = $script:graphTotal }); Truncated = $false }
+        }
+        $script:quotaId = 'Internal_2014-09-01'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { $script:quotaId }
+        # The demo resource group: missing, deployed (a stage recorded), created (tags, no stage), or unread.
+        $script:group = 'missing'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { $ArgumentList[0] -eq 'group' -and $ArgumentList[1] -eq 'exists' } -MockWith {
+            switch ($script:group) {
+                'missing' { [pscustomobject]@{ ExitCode = 0; StdOut = "false`n"; StdErr = '' } }
+                'unread' { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: The operation timed out.' } }
+                default { [pscustomobject]@{ ExitCode = 0; StdOut = "true`n"; StdErr = '' } }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith {
+            switch ($script:group) {
+                'deployed' { @{ solution = 'fabric-database-hub-demo'; DbHubDeployStage = 'Validation' } }
+                'created' { @{ costCenter = 'demo' } }
+                default { @{} }
+            }
+        }
+        $script:check = {
+            param([System.Collections.IDictionary] $Settings = $config)
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ Settings = $Settings } { Get-DemoAutomationAccountQuotaResult -Config $Settings }
+        }
+    }
+
+    It 'stops a new deployment whose two accounts don''t fit, before anything is created (live, dbhubra: 10 of 10 in westus3)' {
+        $result = & $script:check
+        $result.checkId | Should -Be 'PREFLIGHT.P3.AUTOMATION'
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -BeExactly 'The subscription has 10 Azure Automation account(s) in westus3, where its quota is 10, the default for a Microsoft internal subscription, so this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop) won''t fit: Azure would refuse them. Nothing was created.'
+        $result.remediation | Should -BeExactly 'Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two (Azure Resource Graph can list a deleted one for a few more minutes). Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request), then set automationAccountQuota in your configuration to it. Or set location to another region. Then run ./scripts/deploy.ps1 again.'
+        $result.docUrl | Should -Be 'https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits'
+        $result.evidence['adds'] | Should -Be 2
+        $result.evidence['existing'] | Should -Be 10
+        $result.evidence['quota'] | Should -Be 10
+        $result.evidence['quotaSource'] | Should -Be 'offer'
+        $result.evidence['newDeployment'] | Should -BeTrue
+        @($script:graphQueries) | Should -Be @("resources | where type =~ 'microsoft.automation/automationaccounts' and location =~ 'westus3' | summarize total = count()")
+        # A resource group created ahead, which no run has deployed into, is a new deployment too.
+        $script:group = 'created'
+        (& $script:check).status | Should -Be 'Fail'
+    }
+
+    It 'never stops an update whose accounts are there, and reads nothing more' {
+        $script:accountState = @{ control = 'there'; safety = 'there' }
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'This deployment adds no Azure Automation account: aa-dbhub-control and aa-dbhub-demo-safetystop are there.'
+        $script:graphQueries | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 0 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'group' }
+    }
+
+    It 'warns, and never stops, an environment that has deployed before and lacks its accounts (dbhubra''s next run), or when that can''t be read' {
+        $script:group = 'deployed'
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'won''t fit: Azure would refuse them\. This environment has deployed before, so its update goes on, and DEPLOY\.CONTROL and SAFETYSTOP\.RESOURCES say what''s missing\.$'
+        $result.remediation | Should -Match '^Free an Automation account in westus3: '
+        $result.evidence['newDeployment'] | Should -BeFalse
+        foreach ($unreadable in 'unread', 'tagsunread') {
+            $script:group = $unreadable
+            $result = & $script:check
+            $result.status | Should -Be 'Warning' -Because $unreadable
+            $result.message | Should -Match 'Whether this is a new deployment couldn''t be read, so it goes on' -Because $unreadable
+        }
+    }
+
+    It 'passes when they fit: <Case>' -ForEach @(
+        @{ Case = 'an Enterprise subscription with 8'; QuotaId = 'EnterpriseAgreement_2014-09-01'; Total = 8; Control = 'missing'; Adds = 2; Quota = 'where its quota is 10, the default for an Enterprise Agreement or Microsoft Customer Agreement subscription' }
+        @{ Case = 'a pay-as-you-go subscription with none'; QuotaId = 'PayAsYouGo_2014-09-01'; Total = 0; Control = 'missing'; Adds = 2; Quota = 'where its quota is 2, the default for a pay-as-you-go subscription' }
+        @{ Case = 'Learn''s spelling of pay-as-you-go'; QuotaId = 'Pay-as-you-go_2014-09-01'; Total = 0; Control = 'missing'; Adds = 2; Quota = 'where its quota is 2, the default for a pay-as-you-go subscription' }
+        @{ Case = 'a new environment of a prefix whose session control is there'; QuotaId = 'MSDN_2014-09-01'; Total = 1; Control = 'there'; Adds = 1; Quota = 'where its quota is 2, the default for a Visual Studio \(MSDN\) subscription' }
+    ) {
+        $script:quotaId = $QuotaId
+        $script:graphTotal = $Total
+        $script:accountState['control'] = $Control
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('^The subscription has {0} Azure Automation account\(s\) in westus3, {1}; this deployment adds ' -f $Total, $Quota)
+        $result.evidence['adds'] | Should -Be $Adds
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 0 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'group' }
+    }
+
+    It 'stops a new pay-as-you-go deployment that one account already in the region leaves no room for' {
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:graphTotal = 1
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match '^The subscription has 1 Azure Automation account\(s\) in westus3, where its quota is 2, the default for a pay-as-you-go subscription, so '
+    }
+
+    It 'uses automationAccountQuota, a quota that was raised, in place of the offer''s default' {
+        $config['automationAccountQuota'] = 15
+        try {
+            $script:graphTotal = 13
+            $result = & $script:check
+            $result.status | Should -Be 'Pass'
+            $result.message | Should -Match 'where its quota is 15 \(automationAccountQuota\); this deployment adds '
+            $result.evidence['quotaSource'] | Should -Be 'configuration'
+            $script:graphTotal = 14
+            (& $script:check).status | Should -Be 'Fail'
+        }
+        finally {
+            $config.Remove('automationAccountQuota')
+        }
+    }
+
+    It 'warns when the region has more accounts than the offer''s default: a raised quota it can''t read' {
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:graphTotal = 5
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The subscription has 5 Azure Automation account\(s\) in westus3, more than the default quota of 2 for a pay-as-you-go subscription, so its quota there was raised, by how much can''t be read'
+        $result.remediation | Should -Match '^Set automationAccountQuota in your configuration to the subscription''s quota for Automation accounts in westus3 '
+    }
+
+    It 'passes two accounts in an empty region for an offer Learn names no default for, and warns above that' {
+        $script:quotaId = 'MSDNDevTest_2014-09-01'
+        $script:graphTotal = 0
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.evidence['quotaSource'] | Should -Be 'unknown'
+        $script:graphTotal = 3
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'Learn names no default quota of Automation accounts for its offer, MSDNDevTest_2014-09-01, so whether '
+        $script:quotaId = ''
+        (& $script:check).message | Should -Match 'for its offer, which couldn''t be read, so whether '
+    }
+
+    It 'stops a new deployment in a Free Trial subscription, whose one account per region can''t be raised' {
+        $script:quotaId = 'FreeTrial_2014-09-01'
+        $script:graphTotal = 0
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'where its quota is 1, the default for a Free Trial subscription, so '
+        $result.remediation | Should -Match '^A Free Trial subscription has at most one Automation account per region, in East US, East US 2, West US, North Europe, Southeast Asia, and Japan West 2 only, and its quota can''t be raised, while every demo environment has two: use a pay-as-you-go or Enterprise subscription'
+    }
+
+    It 'warns when the accounts can''t be counted, or an account can''t be read' {
+        $script:graphFails = $true
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -BeExactly 'The subscription''s Azure Automation accounts in westus3 couldn''t be counted (AuthorizationFailed), so whether this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop) fit its quota there isn''t known.'
+        $script:graphFails = $false
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:graphTotal = 2
+        $script:accountState = @{ control = 'unread'; safety = 'there' }
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '; whether aa-dbhub-control is there couldn''t be read, and if it isn''t, this deployment''s aa-dbhub-control \(for the session control\) won''t fit\.$'
+    }
+
+    It 'runs in preflight after the public IP check, and a Fail there fails preflight' {
+        $script:policyAssignmentsJson = '{"value":[]}'
+        $script:groupOwnersJson = '{"value":[{"id":"88888888-8888-8888-8888-888888888888"}]}'
+        $script:whatIfParameters = $null
+        $script:pgCapabilitiesJson = '{}'
+        $script:pgDeploymentJson = '{}'
+        $script:pgOperationsJson = '[]'
+        Set-HappyAzMock
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids.IndexOf('PREFLIGHT.P3.AUTOMATION') | Should -Be ($ids.IndexOf('PREFLIGHT.P3.PUBLICIP') + 1)
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.P3.AUTOMATION').status | Should -Be 'Fail'
+        (Get-DemoExitCode -Result $results) | Should -Not -Be 0
+    }
+}

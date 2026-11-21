@@ -16,7 +16,9 @@ function Invoke-DemoPreflight {
     - P2: resource providers; missing ones are registered unless -SkipProviderRegistration is set.
     - P3: region, VM sizes, nested-virtualization families, vCPU quota, and public IP quota; with a zone
       configured, that both sizes and (for demo-day and enhanced-performance) Premium SSD v2 are offered in
-      that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features.
+      that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features. And the
+      Azure Automation accounts this deployment adds, against the subscription's quota in the region
+      (Get-DemoAutomationAccountQuotaResult, PREFLIGHT.P3.AUTOMATION; F30, 2026-11-22): a Fail only for a new deployment.
     - C6: Azure Hybrid Benefit only with the entitlement attestation.
     - P4 and P5: the Fabric tenant setting, read through the Fabric admin API when the caller is a Fabric
       administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
@@ -545,6 +547,16 @@ function Invoke-DemoPreflight {
     }
     else {
         Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so optional on-demand Bastion cannot be created; the deployment itself doesn''t need it.' -Remediation 'Request a public IP quota increase if you need interactive access.'
+    }
+
+    # The Azure Automation accounts this deployment adds, the session control's and the nightly safety stop's (F30,
+    # 2026-11-22): a new deployment whose accounts don't fit the subscription's quota in the region stops here, before
+    # anything is created; an update never does.
+    try {
+        $results.Add((Get-DemoAutomationAccountQuotaResult -Config $Config))
+    }
+    catch {
+        Add-Check 'PREFLIGHT.P3.AUTOMATION' 'subscription' 'Warning' ('Whether this deployment''s Azure Automation accounts fit the subscription''s quota in {0} couldn''t be checked: {1}' -f $location, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do now. If Azure refuses one, DEPLOY.CONTROL or SAFETYSTOP.RESOURCES says so, with the fix.' -DocUrl 'https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits'
     }
 
     # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,

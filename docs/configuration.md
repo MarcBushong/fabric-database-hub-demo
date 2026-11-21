@@ -121,6 +121,8 @@ The session control (formerly the on-demand activity control) runs a whole sessi
 | `control.t4SafetyStopTime` | Empty: 15 minutes after `autoShutdownTime` | The time of the control's daily T4 safety stop, as `HH:mm` in `autoShutdownTimeZone` |
 | `control.webhookExpiryDays` | `90` | Days until a new webhook expires, 15 to 365. `./scripts/setup-activity-control.ps1 -RotateWebhook` replaces it, and `status.ps1` warns 14 days before |
 
+`automationAccountQuota` (since 2026-11-22; none by default) is the subscription's quota of Azure Automation accounts in `location`, for a quota that was raised above its offer's default. Each environment has two accounts, the session control's (`aa-<prefix>-control`, which environments with one `prefix` share) and the nightly safety stop's (`aa-<prefix>-<environment>-safetystop`). Preflight checks that a new deployment's fit (`PREFLIGHT.P3.AUTOMATION`), from Learn's default for the subscription's offer when this isn't set: 10 per region for Enterprise and CSP subscriptions, 2 for pay-as-you-go, Visual Studio, and other offers ([Automation limits](https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits)). The Azure portal's **Quotas** page, provider **Automation accounts**, shows the quota.
+
 ## Ask, the Copilot chat in the Insights app
 
 Ask ([ADR 0028](adr/0028-ask-copilot-in-the-insights-app.md)) is part of every deployment, and its defaults need no edit: `deploy.ps1` deploys its chat relay with the Insights app, and each viewer signs in to GitHub once per browser, on their own GitHub Copilot plan.

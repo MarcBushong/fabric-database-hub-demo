@@ -125,7 +125,7 @@ F28 (live, `dbhubra` at b059c91, in a subscription that already had 10 Azure Aut
   1. The session control never keeps a run from **DONE** ([above](#in-every-deployment)); `DEPLOY.CONTROL` says what it still needs and who does it, as it does for missing roles.
   2. The demo itself is deployed and works: Database Hub, the targets, the Insights app, and sessions from a PC.
   3. **NOT DONE** tells a person, and an agent following [AGENTS.md](../../AGENTS.md), to run `./scripts/deploy.ps1` again, which can't help until an account is freed or the quota is raised, and would make every update of such an environment **NOT DONE**.
-  4. Preflight is where a new deployment stops when its two accounts won't fit, before it creates anything (F30).
+  4. `PREFLIGHT.P3.AUTOMATION` (F30) stops a new deployment before it creates anything when its two accounts won't fit.
 
 ### Nothing beyond Azure and Fabric
 

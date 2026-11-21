@@ -201,6 +201,12 @@
       "exclusiveMinimum": 0,
       "default": 20
     },
+    "automationAccountQuota": {
+      "description": "Optional, since 2026-11-22 (F30): the subscription's quota of Azure Automation accounts in location, when it was raised above its offer's default (the Azure portal's Quotas page, provider Automation accounts, shows it). Preflight checks that the accounts a new deployment adds, the session control's and the nightly safety stop's, fit it (PREFLIGHT.P3.AUTOMATION). Without it, preflight uses Learn's default for the subscription's offer: 10 per region for Enterprise and CSP subscriptions, 2 for pay-as-you-go, Visual Studio, and other offers, and 1 for Free Trial, Azure for Students, and Azure in Open (https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
     "autoShutdownTime": {
       "description": "Daily auto-shutdown time (HHmm, 24-hour) for T1 and the T2 host.",
       "type": "string",
