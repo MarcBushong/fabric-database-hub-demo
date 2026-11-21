@@ -327,12 +327,14 @@ function Invoke-DemoTemplateDeployment {
     # before T4's cost checks below, which price T5's network as this run deploys it; the free tier reuses the read.
     $t5PrivateAccess = $true
     $t5State = $null
+    $t5NetworkResult = $null
     if (Test-DemoT5Enabled -Config $effective) {
         try {
             $t5State = Get-DemoT5State -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
             $t5Network = Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $t5State
             $t5PrivateAccess = [bool]$t5Network.PrivateAccess
-            $results.Add($t5Network.Result)
+            $t5NetworkResult = $t5Network.Result
+            $results.Add($t5NetworkResult)
         }
         catch {
             $t5State = $null
@@ -441,6 +443,10 @@ function Invoke-DemoTemplateDeployment {
     $t5Creating = $false
     $t5OffTried = $false
     $t5LeftOut = ''
+    # A public T5 that Azure Policy denies, or whose public network access it turns off, under a policy preflight didn't find
+    # (one assigned to the resource group, say): the template is deployed again once with T5's private endpoint, which works
+    # under it (the review of fae05b4, 2026-11-22), before T5 is left out.
+    $t5PrivateTried = $false
     if (Test-DemoT5Enabled -Config $effective) {
         try {
             $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' }) -AccountState $t5State
@@ -554,6 +560,19 @@ function Invoke-DemoTemplateDeployment {
             Write-DemoLog -Level Warning -Message ('T5''s record (DbHubT5Refused) wasn''t set on the resource group, so a resume may start from preflight for T5: {0}' -f $_.Exception.Message)
         }
     }
+    # T5 moved to its private endpoint for the next attempt (the review of fae05b4, 2026-11-22): DEPLOY.T5.NETWORK says what
+    # Azure Policy did, in place of this run's earlier decision, with the account as it is now and whether it existed
+    # before this run. The caller sets $t5PrivateAccess and the rest.
+    $t5ToPrivate = {
+        param([string] $Found, [string] $Text, [object] $State, [object] $Replaces)
+        $switched = (Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $State -PolicyFound $Found -PolicyFoundText $Text).Result
+        $switched.evidence['existed'] = [bool](Get-DemoMemberValue -InputObject $t5State -Name 'Exists')
+        if ($null -ne $Replaces) {
+            [void]$results.Remove($Replaces)
+        }
+        $results.Add($switched)
+        return $switched
+    }
     # A refused scale's record (#25) whose server is gone: this run creates T4 at the recorded size, so the record becomes
     # the fallback's, without "kept".
     if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'record' -and (ConvertFrom-DemoT4RefusedRecord -Value ([string]$tags[$t4RefusedTagName])).Kept) {
@@ -647,9 +666,11 @@ function Invoke-DemoTemplateDeployment {
         return (-not $shell)
     }
     # One attempt for each size the fallback can try, the asked size's retry in another zone, one without T4 after Azure
-    # refused them all, one after the T3 free offer's rejection, one after T5's free tier's refusal, and one without T5
-    # after Azure didn't create its account (review, 2026-11-19): 8 without t4SkuName, and up to 10 for a size it sets.
-    $attemptLimit = 6 + @(Get-DemoT4FallbackOrder -Config $effective).Count
+    # refused them all, one after the T3 free offer's rejection, one after T5's free tier's refusal, one with T5 behind its
+    # private endpoint after a policy refused or changed its public network access (the review of fae05b4, 2026-11-22), and
+    # one without T5 after Azure didn't create its account (review, 2026-11-19): 9 without t4SkuName, and up to 11 for a
+    # size it sets.
+    $attemptLimit = 7 + @(Get-DemoT4FallbackOrder -Config $effective).Count
     for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
         # A size t4SkuName sets (2026-11-09): right before the fallback creates T4 at another size, that size's cost check
         # runs, as the 2-vCore one does, and only reports; its result says what this run tries, and why.
@@ -833,6 +854,28 @@ function Invoke-DemoTemplateDeployment {
             }
             $state = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'provisioningState')
             $duration = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'duration')
+            # A policy that turns a public T5's public network access off (Modify) where preflight can't see it, one assigned
+            # to the resource group, say: Azure creates, or updates, the account with it off and no private endpoint, which T1
+            # can't reach, so T5.NETWORK would fail and the run end NOT DONE. Read once after the deployment, and the template
+            # is deployed again with T5's endpoint, which works under it (the review of fae05b4, 2026-11-22).
+            if ($Action -eq 'Create' -and $state -eq 'Succeeded' -and -not $t5PrivateAccess -and -not $t5PrivateTried -and (Test-DemoT5Enabled -Config $effective)) {
+                $t5After = $null
+                try {
+                    $t5After = Get-DemoT5State -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('T5''s network couldn''t be read after the deployment, so T5.NETWORK checks it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+                $afterPublic = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $t5After -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+                if ([bool](Get-DemoMemberValue -InputObject $t5After -Name 'Exists') -and $afterPublic -and $afterPublic -ine 'Enabled') {
+                    $t5PrivateTried = $true
+                    $t5PrivateAccess = $true
+                    $t5EndpointCost = $true
+                    $t5NetworkResult = & $t5ToPrivate 'Modified' '' $t5After $t5NetworkResult
+                    Write-DemoLog -Level Warning -Message ('Azure Policy turned T5''s public network access off ({0}) when the template deployed it; deploying again with its private endpoint, which works under it.' -f $afterPublic)
+                    continue
+                }
+            }
             $status = if ($state -eq 'Succeeded') { 'Pass' } else { 'Fail' }
             $t4Deployed = Test-DemoT4Enabled -Config $effective
             $t4SkuName = if ($t4Deployed) { Get-DemoT4SkuName -Config $effective } else { '' }
@@ -1080,6 +1123,22 @@ function Invoke-DemoTemplateDeployment {
         # Phase 28 live finding (2026-11-02): a deployment that failed while it ran names its cause in its operations, read
         # only now, after the free offer's and T4's own handling above, which reads the error as before.
         $cause = if ($Action -eq 'Create') { Get-DemoDeploymentFailure -Config $Config -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) } else { $null }
+        # A public T5 that Azure Policy denied (RequestDisallowedByPolicy), and nothing else, under a policy preflight didn't
+        # find, one assigned to the resource group, say: deployed again once behind its private endpoint, which works under
+        # a policy that denies public network access (the review of fae05b4, 2026-11-22), before T5 is left out (below). An
+        # existing public account moves to its endpoint too, as it does under a policy the inventory reads
+        # (Resolve-DemoT5NetworkAccess).
+        if ($Action -eq 'Create' -and -not $t5PrivateAccess -and -not $t5PrivateTried -and (Test-DemoT5Enabled -Config $effective)) {
+            $t5Denied = Get-DemoT5OnlyFailure -Config $effective -Cause $cause -ErrorText ([string]$run.StdErr)
+            if ($t5Denied.T5Only -and [string]$t5Denied.Text -match '(?i)\bRequestDisallowedByPolicy\b') {
+                $t5PrivateTried = $true
+                $t5PrivateAccess = $true
+                $t5EndpointCost = $true
+                $t5NetworkResult = & $t5ToPrivate 'Denied' ([string]$t5Denied.Text) $t5State $t5NetworkResult
+                Write-DemoLog -Level Warning -Message ('Azure Policy denied T5 with public network access ({0}); deploying again with its private endpoint, which works under it.' -f [string]$t5Denied.Text)
+                continue
+            }
+        }
         # T5's creation failed, and nothing else did (review, 2026-11-19): a region that refuses new Azure Cosmos DB accounts,
         # or a policy that denies them that preflight couldn't evaluate. The template is deployed again once without T5, so
         # the rest of the run finishes and can end DONE; DEPLOY.T5 says why, with the fix (t5Enabled false), and the group
@@ -1096,6 +1155,11 @@ function Invoke-DemoTemplateDeployment {
                 if ($null -ne $t5FreeResult) {
                     [void]$results.Remove($t5FreeResult)
                     $t5FreeResult = $null
+                }
+                # Nor does T5's network: DEPLOY.T5 says T5 is left out.
+                if ($null -ne $t5NetworkResult) {
+                    [void]$results.Remove($t5NetworkResult)
+                    $t5NetworkResult = $null
                 }
                 $results.Add($t5Off)
                 & $recordT5 ([DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture))

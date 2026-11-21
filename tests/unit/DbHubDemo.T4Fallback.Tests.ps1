@@ -104,6 +104,9 @@ BeforeAll {
         $script:t5RefusalText = ''
         # Azure's error when it doesn't create T5's account at all (review, 2026-11-19), for every attempt that sends T5.
         $script:t5CreateFails = ''
+        # Azure's error for an attempt that sends T5 with public network access (t5PrivateAccess false): a policy that denies
+        # it where preflight's inventory doesn't read it (the review of fae05b4, 2026-11-22).
+        $script:t5PublicDenied = ''
         $script:createsServer = ''
         $script:elsewhere = @{}
         $script:refusesExisting = $false
@@ -199,6 +202,9 @@ BeforeAll {
                 }
                 if ($script:t5CreateFails -and $script:deployCalls[-1]['parameters'].Contains('t5Enabled') -and $script:deployCalls[-1]['parameters']['t5Enabled']['value']) {
                     return (New-AzResult -ExitCode 1 -StdErr $script:t5CreateFails)
+                }
+                if ($script:t5PublicDenied -and $script:deployCalls[-1]['parameters'].Contains('t5PrivateAccess') -and -not $script:deployCalls[-1]['parameters']['t5PrivateAccess']['value'] -and $script:deployCalls[-1]['parameters']['t5Enabled']['value']) {
+                    return (New-AzResult -ExitCode 1 -StdErr $script:t5PublicDenied)
                 }
                 # T5's free tier refused, in the live error's shape (2026-11-18, an internal subscription).
                 if ($t5Refused) {
@@ -2088,7 +2094,7 @@ Describe 'A failure in T5 alone leaves T5 out of the run, once, instead of endin
             $script:currentSize = 'Standard_D4ds_v5'
             $script:sizes.Add($script:currentSize)
             $script:sentZones.Add('')
-            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; t5PrivateAccess = @{ value = $(if ($PesterBoundParameters.ContainsKey('T5PrivateAccess')) { [bool]$PesterBoundParameters['T5PrivateAccess'] } else { $true }) }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
         }
         $script:regionText = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed."}}'
         function New-T5Cause([object[]] $Errors) {
@@ -2170,5 +2176,138 @@ Describe 'A failure in T5 alone leaves T5 out of the run, once, instead of endin
         $deployment.T5Enabled | Should -BeTrue
         $deployment.T5LeftOut | Should -Be ''
         $script:t5Records | Should -Be @('')
+    }
+}
+
+Describe 'A public T5 under a policy preflight didn''t find gets its private endpoint in the same run (the review of fae05b4, 2026-11-22)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        $script:t5Records = [System.Collections.Generic.List[string]]::new()
+        # The inventory read every policy and none needs the endpoint, so a new T5 in public mode starts without it.
+        $script:policyNone = @{ privateEndpointRequired = $false; reason = 'None'; policies = @(); complete = $true }
+        # T5's account: before this run (NotFound, or an existing public account), then after each deployment.
+        $script:t5Before = 'NotFound'
+        $script:t5AfterPublic = 'Enabled'
+        $script:t5Reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith {
+            $script:t5Reads++
+            $names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }
+            if ($script:deployCalls.Count -eq 0 -and $script:t5Before -eq 'NotFound') {
+                return [pscustomobject]@{ Names = $names; Exists = $false; State = 'NotFound'; FreeTier = $false; Account = $null; Error = '' }
+            }
+            $public = if ($script:deployCalls.Count -eq 0) { 'Enabled' } else { $script:t5AfterPublic }
+            [pscustomobject]@{ Names = $names; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = [pscustomobject]@{ properties = [pscustomobject]@{ publicNetworkAccess = $public } }; Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { 'Internal_2014-09-01' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentFailure -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+            if ($Value.Contains('T5Refused')) {
+                $script:t5Records.Add([string]$Value['T5Refused'])
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:currentSize = 'Standard_D4ds_v5'
+            $script:sizes.Add($script:currentSize)
+            $script:sentZones.Add('')
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; t5PrivateAccess = @{ value = $(if ($PesterBoundParameters.ContainsKey('T5PrivateAccess')) { [bool]$PesterBoundParameters['T5PrivateAccess'] } else { $true }) }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $script:policyDenial = 'ERROR: {"error":{"code":"InvalidTemplateDeployment","message":"The template deployment failed because of policy violation.","details":[{"code":"RequestDisallowedByPolicy","target":"cosmos01-abc123","message":"Resource ''cosmos01-abc123'' was disallowed by policy. Policy identifiers: ''[{\"policyAssignment\":{\"name\":\"Deny public Cosmos DB (example)\"}}]''."}]}}'
+        function Invoke-PublicTemplate([System.Collections.IDictionary] $Config) {
+            Invoke-DemoTemplateDeployment -Config $Config -NetworkMode public -T3UseFreeLimit $false -T5Policy $script:policyNone
+        }
+    }
+
+    It 'deploys <Case> again behind its private endpoint when a policy denies its public network access, instead of leaving it out' -ForEach @(
+        @{ Case = 'a new T5'; Before = 'NotFound'; Existed = $false }
+        @{ Case = 'an existing public T5'; Before = 'Public'; Existed = $true }
+    ) {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5Before = $Before
+        $script:t5PublicDenied = $script:policyDenial
+        $deployment = Invoke-PublicTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5Enabled']['value'] | Should -BeTrue
+        $deployment.T5Enabled | Should -BeTrue
+        $deployment.T5LeftOut | Should -Be ''
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5') | Should -BeNullOrEmpty
+        $script:t5Records.Count | Should -Be 0
+        $network = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK')
+        $network.Count | Should -Be 1 -Because 'the decision this run made first is replaced'
+        $network[0].status | Should -Be 'Pass'
+        $network[0].evidence['privateAccess'] | Should -BeTrue
+        $network[0].evidence['reason'] | Should -Be 'Policy'
+        $network[0].evidence['policyFound'] | Should -Be 'Denied'
+        $network[0].evidence['existed'] | Should -Be $Existed
+        $network[0].message | Should -Match '^T5 \(cosmos01-abc123\) is reached through its private endpoint pe-dbhub-demo-cosmos01 in snet-pe, with public network access off: Azure Policy denied it with public network access \(RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123\)'
+        $network[0].message | Should -Match 'bill all month'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE'))[0].status | Should -Be 'Pass'
+    }
+
+    It 'still leaves a new T5 out when Azure refuses it behind its endpoint too, and says nothing of its network then' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5CreateFails = $script:policyDenial
+        $deployment = Invoke-PublicTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 3
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $script:deployCalls[2]['parameters']['t5Enabled']['value'] | Should -BeFalse
+        $deployment.T5Enabled | Should -BeFalse
+        $deployment.T5LeftOut | Should -Match 'RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5'))[0].status | Should -Be 'Warning'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK') | Should -BeNullOrEmpty
+    }
+
+    It 'deploys <Case> again with its private endpoint when a policy turned its public network access off (Modify), instead of ending NOT DONE' -ForEach @(
+        @{ Case = 'a new T5'; Before = 'NotFound'; Existed = $false }
+        @{ Case = 'an existing public T5'; Before = 'Public'; Existed = $true }
+    ) {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5Before = $Before
+        $script:t5AfterPublic = 'Disabled'
+        $deployment = Invoke-PublicTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 2
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $deployment.T5Enabled | Should -BeTrue
+        $network = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK')
+        $network.Count | Should -Be 1
+        $network[0].evidence['privateAccess'] | Should -BeTrue
+        $network[0].evidence['reason'] | Should -Be 'Policy'
+        $network[0].evidence['policyFound'] | Should -Be 'Modified'
+        $network[0].evidence['publicNetworkAccess'] | Should -Be 'Disabled'
+        $network[0].evidence['existed'] | Should -Be $Existed -Because 'it says whether the account existed before this run'
+        $network[0].message | Should -Match 'Azure Policy turned its public network access off when the template deployed it'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE').Count | Should -Be 1
+    }
+
+    It 'deploys once, and reads T5 once more, when its public network access stays on' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $deployment = Invoke-PublicTemplate -Config $config
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 1
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:t5Reads | Should -Be 2
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK'))[0].evidence['reason'] | Should -Be 'Public'
+    }
+
+    It 'reads T5 no more, and deploys once, when it''s behind its endpoint from the start' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5AfterPublic = 'Disabled'
+        $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode public -T3UseFreeLimit $false -T5Policy @{ privateEndpointRequired = $true; reason = 'Policy'; policies = @('Azure Cosmos DB should disable public network access'); complete = $true }
+        $deployment.Succeeded | Should -BeTrue
+        $script:deployCalls.Count | Should -Be 1
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $script:t5Reads | Should -Be 1
     }
 }

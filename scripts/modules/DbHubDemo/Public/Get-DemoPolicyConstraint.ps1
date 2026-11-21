@@ -10,7 +10,8 @@ function Get-DemoPolicyConstraint {
     definition's defaults, plus any policyEffect override. Rules with deny, modify, deployIfNotExists,
     append, or denyAction effects are kept. Assignments with enforcement mode DoNotEnforce are reported
     and skipped. Exemptions and assignments scoped to resource groups aren't read; the what-if check
-    still catches denials.
+    still catches denials, for T5 too: preflight's what-if checks the T5 the template step deploys, and the template step
+    moves a public T5 that a policy denies or changes to its private endpoint (the review of fae05b4, 2026-11-22).
 
     Every call is a GET ('az rest') through Invoke-DemoAz, made one at a time; each definition is read
     once. Large tenant policy sets can take a few minutes (about 2-3 seconds per definition), so

@@ -776,6 +776,75 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 4 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
     }
 
+    It 'checks the T5 the template step deploys, and moves it behind its endpoint when a policy the inventory doesn''t read denies it with public network access (the review of fae05b4, 2026-11-22)' {
+        Set-HappyAzMock
+        $script:t5StateRead = 'NotFound'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }; Exists = $false; State = $script:t5StateRead; FreeTier = $false; Account = $null; Error = $(if ($script:t5StateRead -eq 'NotFound') { '' } else { 'AuthorizationFailed' }) } }
+        # A policy assigned to the existing demo resource group, which the inventory doesn't read, as Azure refuses it.
+        $script:whatIfSent = [System.Collections.Generic.List[object]]::new()
+        $script:whatIfDenies = @('cosmos01-abc123')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -like 'deployment sub what-if *' } -MockWith {
+            $parameterFile = ($ArgumentList | Where-Object { $_ -like '@*' } | Select-Object -First 1).Substring(1)
+            $sent = Get-Content -LiteralPath $parameterFile -Raw | ConvertFrom-Json -AsHashtable
+            $script:whatIfSent.Add($sent)
+            if (@($script:whatIfDenies).Count -gt 0 -and -not $sent['parameters']['t5PrivateAccess']['value']) {
+                $details = @(foreach ($name in $script:whatIfDenies) { '{{"code":"RequestDisallowedByPolicy","target":"{0}","message":"Resource ''{0}'' was disallowed by policy. Policy identifiers: ''[{{\"policyAssignment\":{{\"name\":\"Deny public Cosmos DB (example)\"}}}}]''."}}' -f $name }) -join ','
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ('ERROR: {{"error":{{"code":"InvalidTemplateDeployment","message":"The template deployment failed because of policy violation.","details":[{0}]}}}}' -f $details) }
+            }
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{"status":"Succeeded","changes":[{"changeType":"Create"},{"changeType":"Create"}]}'; StdErr = '' }
+        }
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+
+        # The inventory finds nothing, so T5 would be public: the what-if checks that, Azure denies it, and T5 gets its endpoint.
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 2
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse -Because 'the what-if checks the public T5 the template step would deploy'
+        $script:whatIfSent[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $whatIf = $results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF'
+        $whatIf.status | Should -Be 'Pass'
+        $whatIf.message | Should -Match 'with T5 behind its private endpoint, because Azure Policy denies it with public network access'
+        $cosmos = @($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC')
+        $cosmos.Count | Should -Be 1
+        $cosmos[0].status | Should -Be 'Pass'
+        $cosmos[0].evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos[0].evidence.reason | Should -Be 'Policy'
+        $cosmos[0].evidence.complete | Should -BeTrue
+        $cosmos[0].evidence.whatIfDenied | Should -Be 'RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123'
+        $cosmos[0].message | Should -Match '^The what-if found that Azure Policy denies T5 with public network access .*one assigned to the resource group'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+        # The template step decides from that evidence: the endpoint.
+        $decided = InModuleScope DbHubDemo -Parameters @{ Config = $public; Policy = $cosmos[0].evidence } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState ([pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }; Exists = $false; State = 'NotFound'; Account = $null; Error = '' }) }
+        $decided.PrivateAccess | Should -BeTrue
+        $decided.Reason | Should -Be 'Policy'
+
+        # A denial that names another resource too isn't T5's alone: one what-if, and its Fail, as before.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @('cosmos01-abc123', 'vnet-dbhub-demo')
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Fail'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC').evidence.privateEndpointRequired | Should -BeFalse
+
+        # Without the policy: one what-if, of the public T5.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @()
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').message | Should -Not -Match 'T5'
+
+        # Not known (an account that can't be read): the endpoint, the template's default, in the what-if as in the template step.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @('cosmos01-abc123')
+        $script:t5StateRead = 'Unknown'
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Pass'
+    }
+
     It 'skips the policy inventory with -SkipPolicyInventory and resolves auto to private' {
         Set-HappyAzMock
         $results = Invoke-DemoPreflight -Config $config -SkipPolicyInventory

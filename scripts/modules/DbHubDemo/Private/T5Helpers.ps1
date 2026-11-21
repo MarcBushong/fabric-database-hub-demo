@@ -338,8 +338,12 @@ function Get-DemoT5PolicyAccess {
       COSMOSPUBLIC category of Get-DemoPolicyRuleCategory: the endpoint, which works under it (Reason Policy).
     - The policies couldn't all be read, or weren't read (-NotRead): the endpoint, which works under any policy (Reason
       Unknown).
+    - Preflight's what-if found that Azure Policy denies a T5 with public network access (-Denied, Azure's reason), under
+      a policy the inventory doesn't read, such as one assigned to the resource group: the endpoint (Reason Policy; the
+      review of fae05b4, 2026-11-22).
     - Otherwise none (Reason None): public network access on, limited to T1's subnet through its service endpoint.
-    An existing account keeps what it has, whatever this says (Resolve-DemoT5NetworkAccess).
+    An existing account keeps what it has, whatever this says, unless a policy needs the endpoint
+    (Resolve-DemoT5NetworkAccess).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -355,7 +359,9 @@ function Get-DemoT5PolicyAccess {
 
         [switch] $NotRead,
 
-        [string] $Why = ''
+        [string] $Why = '',
+
+        [string] $Denied = ''
     )
 
     $policies = @($Policy | Where-Object { $_ } | Select-Object -Unique)
@@ -366,6 +372,9 @@ function Get-DemoT5PolicyAccess {
     $kept = 'so T5 keeps a private endpoint in snet-pe, with public network access off'
     if ($NetworkMode -eq 'private') {
         return (& $make $true 'NetworkMode' $(if ($NotRead) { 'Not selected' } else { 'Pass' }) ('networkMode is private, {0}, as T3 does.' -f $kept))
+    }
+    if ($Denied) {
+        return (& $make $true 'Policy' 'Pass' ('The what-if found that Azure Policy denies T5 with public network access ({0}), under a policy the inventory doesn''t read (one assigned to the resource group, say), so T5 is deployed behind a private endpoint in snet-pe, with public network access off, which works under it. Its endpoint and private DNS zone bill all month (estimate-cost.ps1 prices them).' -f (Protect-DemoText -Text $Denied.TrimEnd('.'))))
     }
     if ($policies.Count -gt 0) {
         $list = (@($policies | Select-Object -First 3) -join '; ') + $(if ($policies.Count -gt 3) { '; and {0} more' -f ($policies.Count - 3) } else { '' })
@@ -394,9 +403,15 @@ function Resolve-DemoT5NetworkAccess {
       read or weren't (-Policy, PREFLIGHT.POLICY.COSMOSPUBLIC's evidence; none at all counts as not read: Reason
       PolicyUnknown); otherwise public network access limited to T1's subnet through its service endpoint (Reason Public).
     - An account that couldn't be read, or is being deleted: the endpoint, which works in every case (Reason Unread).
+    - -PolicyFound, what the template step found that preflight didn't (the review of fae05b4, 2026-11-22): Azure Policy
+      denied T5 with public network access (Denied, Azure's reason in -PolicyFoundText), or turned it off when the template
+      deployed it, with no endpoint (Modified). Either way the endpoint, which works under the policy, deployed again in
+      the same run (Reason Policy).
     -AccountState is Get-DemoT5State's answer when the caller has read it already.
-    Sources: https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints and
-    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint (checked 2026-11-21).
+    Sources: https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints,
+    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint (checked 2026-11-21), and
+    https://learn.microsoft.com/azure/governance/policy/concepts/effect-modify and
+    https://learn.microsoft.com/azure/governance/policy/concepts/effect-deny (checked 2026-11-22).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -414,7 +429,12 @@ function Resolve-DemoT5NetworkAccess {
         [string] $DeploymentId = '',
 
         [AllowNull()]
-        [object] $AccountState = $null
+        [object] $AccountState = $null,
+
+        [ValidateSet('', 'Denied', 'Modified')]
+        [string] $PolicyFound = '',
+
+        [string] $PolicyFoundText = ''
     )
 
     $cosmos = Get-DemoCosmosSetting
@@ -433,12 +453,19 @@ function Resolve-DemoT5NetworkAccess {
     $make = {
         param([bool] $Private, [string] $Reason, [string] $Status, [string] $Message, [string] $Remediation = '')
         $evidence = [ordered]@{ account = $accountName; privateAccess = $Private; reason = $Reason; networkMode = $NetworkMode; existed = $exists; publicNetworkAccess = $public; privateEndpoint = $(if ($Private) { $endpointName } else { '' }); policies = $policies }
+        if ($PolicyFound) {
+            $evidence['policyFound'] = $PolicyFound
+        }
         $doc = if ($Private) { [string]$cosmos['docUrls']['privateEndpoint'] } else { [string]$cosmos['docUrls']['vnetServiceEndpoint'] }
         [pscustomobject]@{ PrivateAccess = $Private; Reason = $Reason; Result = (New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $doc) }
     }
     $endpointText = 'its private endpoint {0} in snet-pe, with public network access off' -f $endpointName
     if ($NetworkMode -eq 'private') {
         return (& $make $true 'NetworkMode' 'Pass' ('{0} is reached through {1}: networkMode is private, as for T3.' -f $label, $endpointText))
+    }
+    if ($PolicyFound) {
+        $found = if ($PolicyFound -eq 'Denied') { 'Azure Policy denied it with public network access ({0})' -f $(if ($PolicyFoundText) { Protect-DemoText -Text $PolicyFoundText.TrimEnd('.') } else { 'RequestDisallowedByPolicy' }) } else { 'Azure Policy turned its public network access off when the template deployed it, and it had no private endpoint for T1 to reach it through' }
+        return (& $make $true 'Policy' 'Pass' ('{0} is reached through {1}: {2}, under a policy that preflight didn''t find (one assigned to the resource group, say), so this run deployed it again with the endpoint, which works under it. Its endpoint and private DNS zone bill all month (estimate-cost.ps1 prices them).' -f $label, $endpointText, $found))
     }
     if ($exists -and $public -ine 'Enabled') {
         return (& $make $true 'Existing' 'Pass' ('{0} keeps {1}, and its private DNS zone: an update changes nothing in an existing account''s network. In public mode, a new T5 gets none unless a policy needs it (ADR 0027).' -f $label, $endpointText))
