@@ -509,13 +509,17 @@ function Get-DemoCostEstimate {
     # 2 to 4 minutes, more on a night it waits up to 10 minutes for a T4 that's starting. A ceiling: 120 job minutes a month.
     Add-Component 'Nightly safety stop job minutes (the first 500 a month are included)' 'idle' $automationItem 120 'minute'
 
-    # The optional on-demand activity control (ADR 0020), in rg-<prefix>-control: the vault bills per 10,000 operations
-    # and an on-demand run reads its one secret once, and Automation includes the first 500 job minutes a month, while
-    # a run's jobs take a few minutes. So these are ceilings: one block of operations, and 60 job minutes a month.
+    # The session control (ADR 0026), in rg-<prefix>-control: the vault bills per 10,000 operations, and Automation includes
+    # the first 500 job minutes a month. A light-use month's 10 hours are about 5 Run all sessions of about 2 billed hours,
+    # and a session's jobs take at most about 60 minutes with the Incident RCA's export (ADR 0031): its own job's 2 to 20,
+    # the stop's 1 to 3, and the export's limits, 6 at the stop and 8 at each of its about three 30-minute re-checks. So
+    # these are ceilings: one block of operations, a session's few dozen RCA bundles included, and 300 job minutes, which
+    # with the nightly safety stop's 120 stay within the 500 included, so the tier that starts at 0 is the right one
+    # (DbHubDemo.Cost.Tests.ps1 checks it).
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
-        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem 60 'minute'
+        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem 300 'minute'
     }
 
     # Microsoft Defender for Cloud, from the subscription's plans.

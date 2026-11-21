@@ -757,12 +757,25 @@ Describe 'Get-DemoCostEstimate' {
         $operations.Meter | Should -Be 'Key Vault / Standard / Operations'
         $operations.Quantity | Should -Be 1
         $operations.Basis | Should -Be 'idle'
-        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced.
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. A light-use month's
+        # 5 Run all sessions take at most about 60 job minutes each with the Incident RCA's export (ADR 0031).
         $minutes = $with.Components | Where-Object { $_.Name -like 'Activity control job minutes*' }
         $minutes.UnitPrice | Should -Be 0
-        $minutes.Quantity | Should -Be 60
+        $minutes.Quantity | Should -Be 300
         $operations.Cost | Should -Be 0.03
         $with.MissingPrices | Should -BeNullOrEmpty
+    }
+
+    It 'counts no more job minutes than Azure Automation includes a month, so the included tier is the right price (ADR 0031)' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $minutes = @($estimate.Components | Where-Object { $_.Unit -eq 'minute' -and $_.Meter -like 'Automation*' })
+        $minutes.Name | Should -Be @('Nightly safety stop job minutes (the first 500 a month are included)', 'Activity control job minutes (the first 500 a month are included)')
+        # Past 500 a month, Automation bills each minute (the fixture's 0.002), which the estimate doesn't price: a change
+        # that counts more minutes must price the tier past the included ones too.
+        ($minutes | Measure-Object -Property Quantity -Sum).Sum | Should -BeLessOrEqual 500
+        foreach ($component in $minutes) {
+            $component.Cost | Should -Be 0
+        }
     }
 
     It 'subtracts the free-offer allowance from the light-use month and keeps the session at list price' {

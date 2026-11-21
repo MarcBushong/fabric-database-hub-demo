@@ -4311,3 +4311,194 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - **Database Agents is a preview, so its UI can change:** the path through **Agent (preview)**, the gear that opens a row's **Agent policy**, the panel's texts, and the "temporarily limited" message are as seen on 2026-11-20, and the page marks each "(observed)".
 - **Why deleted databases stay listed** is inferred, not documented: the list matched the telemetry endpoint's Azure SQL databases in count and dates, and Learn doesn't say how the list is built. If that changes, the page's "Why deleted databases stay in the list" and troubleshooting's two rows are the places to update; `DESTROY.HUB.AGENT.T3`, the README, cleanup, and limitations say only that deleted databases can stay for a while.
 - **Telling the ContosoCare rows apart** is still the fallback until the owner says whether hovering or a row's gear shows the server.
+
+### The Incident RCA, Phase 1 (2026-11-20)
+
+**Why.** The owner asked for the root cause of blocking, waits, and errors, down to the statement, the procedure, and who ran it: "displaying the query blocking chain and what was the first one and some recommendation analysis and next steps". Then, for the chat: "I want the chat to be the first base investigation and extended DBA assistant. Full with specific detailed information and RCA and suggestions". And on grading: "Real demo and DBA would not know what the scenarios are and we should be able to see these items." It's the first item of the Insights app's Wave 2 ([ADR 0031](adr/0031-incident-rca.md)), under the owner's standing rules: documented interfaces, each with its Microsoft Learn page; Contributor as the minimum, with no new role assignment; nothing beyond Azure and Fabric; nothing new for the person running the demo; the app working from saved history; and one-click updates that break no existing environment.
+
+**How it was built.** A design and feasibility spike came first: ADR 0031's draft, a mock of the view, and every capture query proven where it could be without a live target. Then three sessions built Phase 1 in parallel against one contract, under the project's coordinator:
+
+| Part | Steps | Built by | In this branch |
+|---|---|---|---|
+| The contract (`rca/`) | Before 1.1 | The app's session, its owner | From ADR 0031's first commit |
+| The capture | 1.1, 1.2 | The capture session | Its final head, 4c432f1, merged as 631d067 |
+| The transport and history | 1.3 to 1.5 | The transport session | Its slice, 15ad76d. Its review fixes (3b1348a, then its re-reviews' heads) merge once the coordinator confirms them |
+| The app, the integration, and the docs | 1.6, 1.7 | The app's session | 6fe2b5b, and this entry's docs |
+
+**Work summary.**
+
+1. **The contract** ([`rca/`](../rca/README.md)):
+   - the JSON Schemas of an evidence document and of the transport (a bundle, the bundle index, `RCA_EVIDENCE`), generated from `history-tables.json`, the eight tables' spec;
+   - `blind-detection.json`: what detection may read, and what it must never name;
+   - the capture catalog: 24 T-SQL blocks and 12 PostgreSQL blocks, each with its trigger, permission, and Learn page;
+   - the fixtures, T1's blocking chain and T4's chain with its replica's lag, which every part's tests share (`tests/unit/Rca.Contract.Tests.ps1`).
+
+   One contract change came during the build (05d07ae): the event session's ring buffer holds 1,024 KB, not 4,096. Learn says a read returns at most 4 MB of XML, and recommends 1,024 KB or less ([ADR 0010's amendment](adr/0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20)).
+2. **The capture,** in the runner (`workload-generator/src/ContosoCare.Workload/Rca/`):
+   - the observer lane of `profile run`, on T1's VM for T1, T3, T4, and the replica, and in T2's guest for T2;
+   - the 30-second sentinel, and detail capture in the episodes it sees;
+   - the names and the normalization ([redaction](adr/0031-incident-rca.md#3-redaction-and-privacy));
+   - the event session `ContosoCare_RCA`;
+   - the local store, with its retention;
+   - `rca export` and `rca part`, with the reducer's budgets.
+
+   **Its blind run, end to end (4e7817b):** a local PostgreSQL 18.6 primary and hot standby, driven by the repository's runner. The capture found the head blocker idle in a transaction, the waiters, the deadlock, and the replay stall (an AccessExclusiveLock behind a report's AccessShareLock, with the holder's run token), and the answer key's tokens matched.
+3. **The transport and history,** in the control's runbook, the scripts, the notebooks, and the model:
+   - the runbook's export through managed Run Commands: at the stop, at each 30-minute re-check, and at a start that finds an earlier session's capture;
+   - the bundles and their index in the control vault's `dbhub-session-metrics`;
+   - the staged `RCA_EVIDENCE_FILE`;
+   - `NB_DatabaseHub_LiveActivity`'s decoder and eight tables, and the deployment notebook's purge;
+   - the history model's eight tables and seven measures, left out with `FABRIC.SEMANTICMODEL.RCA` while the lakehouse doesn't have them, and the update that runs the notebook once to create them;
+   - the scripts' export with `--session none`, and their pending list.
+4. **The app** (`fabric/app/src/rca/`, `src/copilot/`, `src/pages/`):
+   - **The shared blind detector** (`detector.ts`) and the rules:
+     - blocking (`locking.ts`): the chain, head blocker first, its depth, width, blocked count and time, and formations; idle in a transaction; escalation;
+     - deadlocks and errors by class (`errors.ts`);
+     - the replica's lag (`replica.ts`);
+     - triage (`triage.ts`).
+   - **The recommendation catalog** (`catalog.ts`): 39 entries, each with its Learn page and who approves it.
+   - **The DAX loader** (`loader.ts`, `client.ts`): at most one query per RCA table, with every query under "Show the sources".
+   - **Ask's investigation:** six tools (`tools.ts`), the playbook in the system message (`playbook.ts`), and four starters (`starters.ts`). The app offers them only when the model has the RCA tables.
+   - **The Root cause view** (`pages/RcaPage.tsx`, `rca/view/`): the episodes, the chain tree, the timeline, the errors, the recommendations, the next steps, what wasn't captured, and **Explain this incident**, in every theme and in forced colors.
+   - **The blind Ask** ([decision 7](adr/0031-incident-rca.md#decisions-and-open-items)): `run_dax`'s refusals (`tools.ts`, `answer-key.ts`); every page's Ask hands the chat measured data only (`ask-blind.test.tsx`); and the blind entry points (`entry.ts`).
+   - **The model guide's generator** (`scripts/build-model-guide.ts`): the guide without the answer key, and `denylistProblems`, which refuses a model change that would weaken `run_dax`'s refusals. The model's descriptions name no scenario.
+   - **Without the RCA tables:** no Root cause, no tools or starters, and "No RCA capture is recorded yet" (`rca/view/app-rca.test.tsx`).
+5. **The integration:**
+   - the release, merged at bf010ed (34a9732), keeping its wording and the blind postmortem draft;
+   - the capture's final head, and the transport's slice;
+   - the entry points the blind Ask had removed, back blind (f941d6a; [the list](adr/0031-incident-rca.md#decisions-and-open-items)).
+6. **The Phase 1 end docs,** this entry's commit:
+   - the CHANGELOG's Unreleased entry;
+   - the README's cost, upgrade, and deletion notes;
+   - [cost management's Incident RCA section](cost-management.md#the-incident-rca-2026-11-20);
+   - ADR 0031's cost, upgrade-matrix, and validation lines;
+   - the estimate: the session control's job minutes go from 60 to 300 a month. That's still within Azure Automation's included tier, so no figure changes, and a test checks that they stay within the 500 included.
+
+**Changed files.** At 6fe2b5b, 187 files against the release's bf010ed:
+
+- **The contract:** `rca/` (new).
+- **The capture:**
+  - `workload-generator/src/ContosoCare.Workload/Rca/` (`Observer/`, `Store/`, `Export/`), the runner's commands, and their tests in `workload-generator/tests/ContosoCare.Workload.Tests/`;
+  - `rca/capture/`'s two .sql files, which the runner embeds.
+- **The transport and history, at 15ad76d:**
+  - the runbook: `automation/runbooks/DbHubControl.Common.ps1`;
+  - the scripts: `scripts/configure-fabric.ps1` and `scripts/configure-powerbi.ps1`;
+  - the module: `Private/OneLakeHelpers.ps1` and `Public/Get-DemoRcaModelTablePlan.ps1` (new), `ActivityControlHelpers.ps1`, `TrackHelpers.ps1`, `WorkloadHelpers.ps1`, `Get-DemoFabricSemanticModelDefinition.ps1`, and `Test-DemoSemanticModelData.ps1`;
+  - the notebooks: `NB_DatabaseHub_Control`, `NB_DatabaseHub_LiveActivity`, and `NB_DatabaseHub_Deployment`;
+  - the history model's RCA tables;
+  - and their tests.
+- **The app:**
+  - `fabric/app/src/rca/` (new);
+  - in `src/copilot/`: `tools.ts`, `tmdl.ts`, `guide.ts`, `starters.ts`, `CopilotProvider.tsx`, `CopilotDock.tsx`, `answer-key.ts`, and `investigations.ts`, with their tests and `ask-blind.test.tsx`;
+  - the pages' Asks and links;
+  - `scripts/build-model-guide.ts` and the generated guide;
+  - and the model's descriptions.
+- **The docs:**
+  - ADR 0031 (new), ADR 0010's amendment, and the ADR index;
+  - with this entry: `CHANGELOG.md`, `README.md`, `docs/cost-management.md`, and this report;
+  - and the estimate, `Get-DemoCostEstimate.ps1`, with `tests/unit/DbHubDemo.Cost.Tests.ps1`.
+
+**Validation, before the live run.**
+
+- **The app:** `npm run verify` at 6fe2b5b: typecheck, lint, Vitest's 472 tests in 29 files, the license check (136 production packages), and the build, all passed.
+- **The runner:** .NET's 807 tests at the capture's merge (631d067). None failed and 21 were skipped.
+- **The repository:** static Pester at 9f3d35f: 5,164 passed and 80 skipped. One test failed, and only on this PC: Teardown's "Teardown tests stay out of the static run", whose child PowerShell loads this PC's broken OneDrive copy of Pester.
+- **The contract:** `Rca.Contract.Tests.ps1`'s 30 tests passed.
+- **The capture's queries:** all 24 T-SQL blocks parse with `TSql160Parser`, and every PostgreSQL block ran on the local primary and standby.
+- **This entry's docs:** see the validation line further down.
+
+**Reviews and their findings.** Every finding below was fixed, each with a test that fails without its fix, unless it says otherwise.
+
+- **The capture, 3779017..4e7817b:**
+  - **High:** Extended Events older than 20 minutes were ingested again every 30 seconds. That inflated counts, and could fill the store in a 90-minute session.
+  - **Medium:** the export threw above 20,000 rows, and one stuck span blocked later exports.
+  - **Medium:** exports with no session shared one byte budget forever.
+
+  Fixed in ce4a5e2; the re-review's same-millisecond fix, with its tests, is 4c432f1.
+- **The transport, 2161e8c..15ad76d:**
+  - **Medium:** a mid-session re-check could overwrite the stop's final metrics version, so the history would lose T4's and T5's metrics as well as the evidence.
+  - **Medium:** an earlier session's export could skip the other VM's pending documents.
+  - **Low to Medium:** 7 new blank-measure **Warnings** on every updated environment.
+  - **Low:** inline and file evidence weren't merged.
+
+  Fixed on the transport's branch at 3b1348a. Its re-reviews led to 93243d6, which covers an earlier session's evidence that a start didn't finish, and found a Medium, evidence claimed by the wrong session, which is being fixed there.
+- **The app, bf010ed..34a9732, 10 findings and a test gap:**
+  - **High:**
+    - `run_dax` ran answer-key queries when a string held a comment marker;
+    - Live views' connection check handed the chat `'Incident Windows'`;
+    - the system message named two scenarios.
+  - **Medium:**
+    - the replica's lag described a rise that didn't happen;
+    - each SQL Server deadlock was counted twice;
+    - "the chain formed N times" was inflated when two targets blocked at once;
+    - a capture anywhere in the window hid Database Hub's episodes elsewhere in it.
+  - **Low:**
+    - "HH:MM UTC" could land a day early;
+    - a session waiting on a special owner was reported as a head blocker;
+    - SQL Server errors were given PostgreSQL's SQLSTATE classes.
+  - **The test gap:** no app-level test covered the path without the RCA tables.
+
+  Fixed in f1854ec and 817b81c.
+- **The re-review of 34a9732..817b81c, 3 findings:**
+  - **High:** `run_dax` read the answer key through whole-model functions such as `COLUMNSTATISTICS` and `INFO.VIEW.MEASURES`, and the model's own descriptions named scenarios.
+  - **Medium:** the triage entry points gave times that `triage_window` rejected, or put on the wrong day.
+  - **Low:** the "HH:MM UTC" fix moved the bug across UTC midnight.
+
+  Fixed in 66594b9 and 9b1896c. The re-review found that f941d6a's entry points leak nothing.
+- **The final review of 817b81c..9b1896c:** no findings, and two hardening items, both in 9f3d35f:
+  - tests that pin the denylist's assumptions about the model: each key relationship filters one way, with the key on the many side; no other DAX reads the key; and every key name has a space;
+  - the refused measures' count, read from the generator instead of written in the docs.
+- **The coordinator's hardening, lookalike names (fb964e7):** names are compared after folding compatibility forms, accents, invisible characters, controls, and case away, and a character outside plain ASCII in a query's code is refused.
+- **The review of 9f3d35f, 2 Low findings:**
+  - a ``` block at column 0 escaped the model check;
+  - a blind table whose partition reads a key lakehouse table wasn't flagged.
+
+  Fixed in bfbbe2a, which also adds the 30-day retention of a capture no export took to the contract and the ADR.
+- **The review of bfbbe2a:**
+  - **Medium:** a lone carriage return ended a line comment in the check, and nothing refused it in code.
+  - **Low:** form feeds and vertical tabs.
+
+  Fixed in 6fe2b5b: `run_dax` reads each carriage return and form feed as a line feed and sends that text, and a vertical tab ends a comment.
+- **The review of 6fe2b5b:** no findings.
+
+**Left in Phase 1.**
+
+- **The postmortem's Cause from the RCA** ([§9](adr/0031-incident-rca.md#9-the-postmortems-cause)): drafted, and merged with its tests after the live test's SHA.
+- **The evaluation set's Phase 1 cases,** ported with blind questions.
+- **Step 1.8,** the live run below.
+- **Decision 6, names:** open for the owner.
+- **The transport's review fixes:** merged once the coordinator confirms them. They bring the transport's own docs, which these docs then link.
+
+**Step 1.8, the live run (the final tests fill it in).** ADR 0031's [Phase 1](adr/0031-incident-rca.md#phase-1) says what it must show: on each environment, a plain `./scripts/deploy.ps1` ends **DONE** with 0 **Fail** on its first run, `./scripts/validate.ps1` has 0 **Fail**, and no **Warning** is new against the release before it.
+
+| What | A net-new deployment | An update of an existing environment |
+|---|---|---|
+| The SHA, the environment, and its region | To fill | To fill |
+| `./scripts/deploy.ps1`'s first run: **DONE**, the **Fail** count, and **Warnings** new against the release | To fill | To fill |
+| `./scripts/validate.ps1`: the **Fail** count | To fill | To fill |
+| `FABRIC.SEMANTICMODEL.RCA`, and whether the update ran the activity notebook once | To fill | To fill |
+| A full Run all session: its ID and length | To fill | To fill |
+| `RCA.EXPORT`, `RCA.CAPTURE.<target>` for T1 to T4 and the replica, and `RCA.EVIDENCE` | To fill | To fill |
+| The session's rows in each `rca_*` table | To fill | To fill |
+| SQL Server's capture on T1, T2, and T3, run live for the first time (the build PC had no SQL Server): the chain and its head blocker; the event session's errors, deadlocks, and escalations; T3's `LCK_M_S_XACT_*` | To fill | To fill |
+| The session control's job minutes, measured: the stop, each re-check, and a start | To fill | To fill |
+| T2's export, one Run Command at a time: how long it took | To fill | To fill |
+| The Delta size the session added, and the vault versions it wrote | To fill | To fill |
+| The transport's live checks: **Stop now** during a re-check; Get Secret by version from the control workspace; OneLake's path creation; `fs.rm` of a folder that isn't empty; Direct Lake framing the new tables | To fill | To fill |
+| The lookalike probe: does the engine resolve `EVALUATE TOPN(1, 'Ｉｎｃｉｄｅｎｔ Ｗｉｎｄｏｗｓ')`, run against the deployed model without `checkDax`? (`run_dax` refuses it either way) | To fill | To fill |
+| The app: Root cause for the session's blocking (head blocker first), its errors, and the replica's lag; **Explain this incident**; the four starters | To fill | To fill |
+| The evaluation set's Phase 1 cases | To fill | To fill |
+
+**Validation of this entry's docs.** On 6fe2b5b with these changes, using Program Files' Pester 5.9.1 under the Azure CLI guard, I ran the suites that read the docs, the contract, or the estimate:
+
+- the six `Repo` suites;
+- `Docs.Walkthrough` and `Rca.Contract`;
+- `DbHubDemo`'s `Config`, `Cost`, `EstimateCost`, `FirstRun`, `Lifecycle`, `OneClick`, `OneCommand`, `Preflight`, `SafetyStop`, `T4Fallback`, `T5`, `Tracks`, and `Validation`.
+
+1,662 passed, none failed, and 3 were skipped because this PC lacks gitleaks. No unit test reached the Azure CLI. With the control's job minutes back at 60, the session control's estimate test fails. markdownlint found no issue in 152 files.
+
+**Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks), and three that only step 1.8 retires:
+
+- **SQL Server's capture** is proven only by its parse and the lane tests so far.
+- **The estimate's job minutes** come from the export's bounds, not from measurements.
+- **The history's 1 to 2 MB a session** is an estimate from the capture's tests.

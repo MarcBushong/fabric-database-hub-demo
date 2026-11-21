@@ -2,6 +2,43 @@
 
 All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and each release is a dated merge to `main`.
 
+## [Unreleased]
+
+**The Incident RCA, Phase 1:** the first item of the Insights app's Wave 2 ([ADR 0031](docs/adr/0031-incident-rca.md)). The app explains an incident the way a DBA would, from what the demo's own capture recorded and never from what it injected: who blocked whom, head blocker first, with what it ran and who ran it; the errors and deadlocks; and why T4's read replica fell behind; with recommendations and next steps. Its live proof, a new deployment and an update with a full Run all session each, comes before its release ([Phase 1](docs/adr/0031-incident-rca.md#phase-1)).
+
+**What's new:**
+
+- **The capture:** during every session, the workload runner's observer captures, read-only, what a DBA's own tools would show on T1 to T4: blocking chains with their head blocker, errors, deadlocks, lock escalations, and the replay of T4's read replica. The session's history keeps it.
+- **Root cause in the Insights app:** the incidents the blind detector finds; each blocking chain as a tree, head blocker first (its module or statement, program, login, idle time, open transaction, and lock); the errors by class; the replica's lag and its cause; and recommendations, each with its Microsoft Learn page and who approves it, and next steps.
+- **The chat investigates:** Ask's Copilot gets six tools to triage a window, find its incidents, and explain an incident, its blocking, its errors, and the replica's lag, citing the captured rows and their times. A card whose Ask had only the answer key to hand over hands the chat a window to investigate instead.
+- **Honest detection:** the detector, the Root cause view, and the chat never read what the demo injected, or a scenario's name. Only the "Did we catch it?" scoreboard and the tests compare what was found with what was injected.
+
+**How to update:** run `./scripts/deploy.ps1`. It updates the runner, the runbooks, the notebooks, the history model, and the Insights app, with no new permission or resource and nothing to set; a session saved before it says "no RCA capture recorded" ([upgrading](README.md#upgrading-an-existing-demo)).
+
+**Cost:** no new resource or meter. The export makes each session's Automation jobs longer, within the 500 job minutes Azure Automation includes in a light-use month, and the history grows by about 1 to 2 MB a session in OneLake ([cost management](docs/cost-management.md#the-incident-rca-2026-11-20)).
+
+### Added
+
+- **The observer lane** in the workload runner's `profile run`: a 30-second sentinel on each target while its activity runs, and 5- or 10-second detail capture during an episode it sees (a blocked process, a lock waiter or a deadlock on T4, the replica's replay stalled, T4's connections near the limit, or a jump in errors), from documented DMVs, Extended Events, and PostgreSQL's statistics views, each query with its Learn page in [the capture catalog](rca/capture/README.md). It keeps what it captures on the VM, SYSTEM and Administrators only, at most 20 MB per target, until 7 days after its export (30 days when no export took it); `rca export` and `rca part` print it as checksummed gzip parts.
+- **The observer's one Extended Events session,** `ContosoCare_RCA`: in memory, filtered to ContosoCare, created when the observer starts and dropped at the session's end; server-scoped on T1 and T2, database-scoped on T3 ([ADR 0010's amendment](docs/adr/0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20)).
+- **The transport:** the session control's runbooks export the capture through managed Run Commands that only read, at a session's stop, at each 30-minute re-check, and at a start that finds an earlier session's capture still on the VMs, and write it as earlier versions of the control vault's existing `dbhub-session-metrics` secret. Run all stages it in the lakehouse and hands the activity notebook its path, `RCA_EVIDENCE_FILE`; `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s history snapshot export and stage it with your own roles ([the contract](rca/README.md#transport)).
+- **Eight history tables** (`rca_sessions`, `rca_waits`, `rca_events`, `rca_queries`, `rca_resource`, `rca_replica`, `rca_coverage`, and `rca_answer_key`), which `NB_DatabaseHub_LiveActivity` writes and the deployment notebook's purge drops, with `Files/rca/inbox`; and the history model's eight RCA tables with seven measures, added once the lakehouse has them (`FABRIC.SEMANTICMODEL.RCA`).
+- **The Root cause view** in the Insights app, with the RCA tables ([the app](fabric/app/README.md#whats-in-it)): the shared blind detector's episodes, the blocking chain as a tree, the timeline, errors by class, recommendations with their Learn pages and approvers, next steps, what wasn't captured, and **Explain this incident**, in every theme and in Windows forced colors. The Incidents page's selected incident and a fault picked on the scoreboard link into it with a target and its minutes only, never a fault's name, and Mission Control links to it.
+- **Six investigation tools in Ask,** with the RCA tables: `triage_window`, `find_incidents`, `explain_incident`, `explain_locking`, `explain_errors`, and `explain_replica_lag`, with the investigation playbook in the chat's instructions and four starters.
+- **[The evidence contract](rca/README.md)** (`rca/`): the schemas, the tables' spec, the capture catalog, the blind-detection lists, and the fixtures that the runner's, the notebook's, the model's, and the app's tests share (`tests/unit/Rca.Contract.Tests.ps1`).
+
+### Changed
+
+- **Ask is blind, with or without the RCA tables** ([decision 7](docs/adr/0031-incident-rca.md#decisions-and-open-items)): `run_dax` refuses the demo's answer key (Scenario Runs, Incident Windows, Analysis Findings, RCA Answer Key, and every measure that reads them) and the functions that read the whole model (`COLUMNSTATISTICS`, the `INFO` functions, `CALENDARAUTO`, and `EXTERNALMEASURE`). It compares names as leniently as the engine might, takes only plain ASCII in a query's code, and sends exactly the text it checked. Every page's Ask hands the chat measured data only; one with nothing measured to hand over is gone, or, with the RCA tables, hands the chat a window to investigate. The pages and the scoreboard still show the answer key, labeled.
+- **The history model's descriptions name no scenario,** and `npm run guide:build` refuses a model change that would let a query reach the answer key without naming it.
+- **The estimate counts the session control's job minutes with the export:** 300 a month for a light-use month's sessions, at Azure Automation's included tier, so no figure changes ([the session control](docs/cost-management.md#the-session-control)).
+
+### Security
+
+- **No new grant, resource, or secret:** the capture uses the runner's existing sign-ins, the export the session control's existing Run Command and secret, and the scripts your existing roles ([ADR 0031](docs/adr/0031-incident-rca.md#10-permissions-cost-and-volume)).
+- **Redaction:** only the demo's own sessions keep statement text, login, and host; a statement is kept with its literals replaced, and never a password, connection string, or token ([ADR 0031](docs/adr/0031-incident-rca.md#3-redaction-and-privacy)).
+- **The bundles stay** as earlier versions of `dbhub-session-metrics` until `destroy.ps1` purges the vault. They hold what the history holds, never a secret, and only those who can already read the history can read them; disabling them would take a new grant ([transport](docs/adr/0031-incident-rca.md#4-transport-into-the-history)).
+
 ## [2026-11-20]
 
 **The Ignite updates.** Microsoft Fabric Database Hub is generally available since 2026-11-17, and the demo follows it.
