@@ -196,6 +196,8 @@ function Invoke-DemoValidationInfrastructure {
             $remediation = $warningNote.Remediation
             $healthEvidence['warningCount'] = $warningNote.Count
             $healthEvidence['warnings'] = Get-DemoMemberList -InputObject $health -Name 'warnings'
+            # Every warning a one-off note that a new VM's bootstrap gives by design (F32).
+            $healthEvidence['warningsExpected'] = [bool]$warningNote.Expected
         }
         $results.Add((New-DemoResult -CheckId ('INFRA.HEALTH.{0}' -f $suffix) -Area 'infra' -Target $target -Status $healthStatus -Message $text -Evidence $healthEvidence -Remediation $remediation -DocUrl $healthDoc -EvaluationOnly:$evaluationOnly))
 

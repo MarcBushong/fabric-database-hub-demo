@@ -427,20 +427,34 @@ function Get-DemoValidationQuietReason {
     return ''
 }
 
+# The one-off notes a new VM's bootstrap gives by design, and why (F32, 2026-11-22): on a new deployment, health.json's
+# Warning can have no other cause, so validate.ps1 and status.ps1 say these are expected. They're vm/bootstrap/lib/State.ps1's
+# legacy one-off notes, less two that aren't by design: a download without a pinned SHA-256, the repository's to fix, and
+# automatic sign-in left armed, which nothing in the demo does.
+$script:DemoHealthExpectedNote = [ordered]@{
+    '^The sign-in cleanup cleared '                                                             = 'a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009)'
+    '^SQL Server setup asked for a restart'                                                     = 'SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1'
+    '^SYSTEM was not a sysadmin, so '                                                           = 'a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin'
+    '^The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256' = 'Jumpstart''s image has no Content-MD5, so a new T2 host checks it by its length and its pinned SHA-256'
+}
+
 function Get-DemoHealthWarningNote {
     <#
     .SYNOPSIS
     What a VM's health summary says about the warnings that keep a Ready bootstrap's status a Warning (F24, 2026-11-20):
-    Count, Text (a sentence that names each warning shown, each naming the step it came from), Remediation, and Known
-    (whether the summary lists them: a VM whose bootstrap bundle predates 2026-11-20 doesn't). $null when the bootstrap
-    isn't Ready with a Warning. Pure. Internal.
+    Count, Text (a sentence that names each warning shown, each naming the step it came from, and which are expected),
+    Remediation, Known (whether the summary lists them: a VM whose bootstrap bundle predates 2026-11-20 doesn't), and
+    Expected (every warning is a one-off note a new VM's bootstrap gives by design, F32). $null when the bootstrap isn't
+    Ready with a Warning. Pure. Internal.
 
     .DESCRIPTION
     health.json's status is a Warning when the state is Ready and it has warnings (vm/health/README.md). Before, the
     validator's INFRA.HEALTH.<vm> and status.ps1's STATUS.VM_<vm> said only "<vm> reports Ready: Every step is in the
     desired state." with "The bootstrap is still working or waiting" as the fix (dbhubfn and dbhubfu, 2026-11-20). Since
     2026-11-20 the bootstrap names each warning's step, a new bootstrap generation clears its one-off notes (the others
-    stay while their cause does), and the summary view prints the first two (warnings, warningCount).
+    stay while their cause does), and the summary view prints the first two (warnings, warningCount). Since 2026-11-22
+    (F32: live on dbhubra, a new host's sign-in cleanup was its only cause), a one-off note that a new VM's bootstrap gives
+    by design ($script:DemoHealthExpectedNote) is called expected, with why; when every warning is one, the fix is nothing.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -462,6 +476,7 @@ function Get-DemoHealthWarningNote {
         return [pscustomobject]@{
             Count       = $null
             Known       = $false
+            Expected    = $false
             Text        = 'Its bootstrap reported a warning that this VM''s summary doesn''t name (its bootstrap bundle predates 2026-11-20).'
             Remediation = ('Nothing blocks the demo. Get-DemoVmHealth -Config $config -VmName {0} -View Full lists the warning and its step; the next ./scripts/deploy.ps1 sends {0} the bundle whose summary names it, and checks every step again.' -f $VmName)
         }
@@ -470,11 +485,38 @@ function Get-DemoHealthWarningNote {
     $list = (@($shown | ForEach-Object { ([string]$_).Trim().TrimEnd('.') }) -join '; ')
     $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
     $noun = if ($total -eq 1) { 'a warning' } else { '{0} warnings' -f $total }
+    # Which of them a new VM's bootstrap gives by design, and why (F32, 2026-11-22: live on dbhubra, a new host's sign-in
+    # cleanup was the Warning's only cause, and the result didn't say it was expected).
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $expected = 0
+    foreach ($warning in @($shown)) {
+        # A warning names its step first ("<Step>: ...", F24); one from an older bundle doesn't.
+        $body = ([string]$warning).Trim() -replace '^[A-Za-z0-9]+: ', ''
+        foreach ($pattern in $script:DemoHealthExpectedNote.Keys) {
+            if ($body -match $pattern) {
+                $expected++
+                $reason = [string]$script:DemoHealthExpectedNote[$pattern]
+                if (-not $reasons.Contains($reason)) {
+                    $reasons.Add($reason)
+                }
+                break
+            }
+        }
+    }
+    $allExpected = $expected -gt 0 -and $expected -eq $total
+    $expectedText = if ($allExpected) { ' {0} expected: {1}.' -f $(if ($total -eq 1) { 'That''s' } else { 'Those are' }), ($reasons -join '; ') } elseif ($expected -gt 0) { ' {0} of them {1} expected: {2}.' -f $expected, $(if ($expected -eq 1) { 'is' } else { 'are' }), ($reasons -join '; ') } else { '' }
+    $remediation = if ($allExpected) {
+        'Nothing to do: {0} expected, and the next bootstrap generation clears {1}, which the next ./scripts/deploy.ps1 that sends {2} a new bundle starts. {3}' -f $(if ($total -eq 1) { 'it''s' } else { 'they''re' }), $(if ($total -eq 1) { 'it' } else { 'them' }), $VmName, $full
+    }
+    else {
+        'Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts; any other warning stays while its cause does, until its step runs again. {1}' -f $VmName, $full
+    }
     return [pscustomobject]@{
         Count       = $total
         Known       = $true
-        Text        = ('Its bootstrap has {0}: {1}{2}.' -f $noun, $list, $more)
-        Remediation = ('Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts; any other warning stays while its cause does, until its step runs again. {1}' -f $VmName, $full)
+        Expected    = $allExpected
+        Text        = ('Its bootstrap has {0}: {1}{2}.{3}' -f $noun, $list, $more, $expectedText)
+        Remediation = $remediation
     }
 }
 function Test-DemoValidationWorkloadBound {

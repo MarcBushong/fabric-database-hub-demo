@@ -4879,3 +4879,32 @@ Until then, deployments keep the pinned image, which works as before.
   - then `./scripts/validate.ps1` and `./scripts/status.ps1`: the loader checks pass, and no copy is left once its delete finishes.
 - **An action at 24 Run Commands on its VM** runs under its fixed name, as before, and can still meet the skip.
 - **Chunk names** repeat when the same content goes to the same VM again; unchanged here.
+
+### A health Warning that's expected says so (F32, 2026-11-22)
+
+**Why.** Live on `dbhubra`, `validate.ps1`'s `INFRA.HEALTH.ARCHOST01` was a **Warning** that read "Every step is in the desired state", without the reason. The reason was health.json's own Warning from the new host's sign-in cleanup, which is by design. That release had no F24, which since names each warning's step; it still didn't say when a warning is expected.
+
+**Work summary.**
+
+- **`Get-DemoHealthWarningNote`** (`INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>`) recognizes the one-off notes that a new VM's bootstrap gives by design (`$script:DemoHealthExpectedNote`), with or without their step's name:
+  - a sign-in cleanup that cleared an event log, after T2's Arc onboarding on a new host or a rebuilt guest;
+  - the restart SQL Server setup asks for when it removes Analysis Services and Integration Services from a new T1;
+  - T1's sysadmin recovery, which its image's SQL IaaS Agent least-privilege mode needs;
+  - Jumpstart's image checked by its length and pinned SHA-256 without Content-MD5.
+- **Left out:** a download without a pinned SHA-256, which is the repository's to fix, and automatic sign-in left armed, which nothing in the demo does. These are `vm/bootstrap/lib/State.ps1`'s legacy one-off notes, less those two.
+- **The message** adds "That's expected: ..." (or "Those are"), or "`<n>` of them are expected: ..." beside other warnings. When every warning is one, the fix is "Nothing to do: it's expected, and the next bootstrap generation clears it ...". The status stays health.json's own **Warning**, and the evidence adds `warningsExpected`.
+- **Docs:** a troubleshooting row, the CHANGELOG's F24 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `Private/ValidationAreas.ps1`; tests in `tests/unit/DbHubDemo.Validation.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Validation, Lifecycle, Tracks, Progress, and Repo.NeutralWording: 576 passed, 0 failed, 0 az calls.
+- With HEAD's two source files and the tests kept, the new test fails, and so do F24's two exact messages, which now name what's expected.
+- The new test covers a host whose only warning is the sign-in cleanup (expected, nothing to do), an older bundle's note without its step, the cleanup beside a lasting warning (one expected, the general fix), and automatic sign-in left armed (not expected).
+- PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The notes are matched by their text; a note reworded on the VM side reads as unexpected, as before F32.
+- **The Warning stays,** so a new deployment still ends with these Warnings. Calling them a **Pass** would differ from health.json's own status; that's the owner's call.

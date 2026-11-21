@@ -321,7 +321,7 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $context = New-TestContext -Target T1
         $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
         $health.status | Should -Be 'Warning'
-        $health.message | Should -Be 'sqlvm01 reports Ready: Every step is in the desired state. Its bootstrap has 3 warnings: AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it; SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure (1 more).'
+        $health.message | Should -Be 'sqlvm01 reports Ready: Every step is in the desired state. Its bootstrap has 3 warnings: AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it; SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure (1 more). 2 of them are expected: SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1; a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin.'
         $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it and says what happens next\. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next \./scripts/deploy\.ps1 that sends sqlvm01 a new bundle starts; any other warning stays while its cause does, until its step runs again\.'
         $health.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists them all\.$'
         $health.remediation | Should -Not -Match 'still working' -Because 'a Ready bootstrap isn''t working or waiting'
@@ -339,6 +339,39 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'InProgress'; status = 'Warning'; message = 'Step SeedDatabase is converging.'; currentStep = 'SeedDatabase' }
         $working = New-TestContext -Target T1
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $working } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }).remediation | Should -Be 'The bootstrap is still working or waiting; run validate.ps1 again later.'
+    }
+
+    It 'says a new host''s sign-in cleanup is expected, and why, when it''s the only cause of the Warning (F32, live on dbhubra)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @($cleanup) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $read = {
+            $context = New-TestContext
+            @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        }
+        $health = & $read
+        $health.status | Should -Be 'Warning' -Because 'health.json''s own status stands'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap has a warning: {0} That''s expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009).' -f $cleanup)
+        $health.remediation | Should -Be 'Nothing to do: it''s expected, and the next bootstrap generation clears it, which the next ./scripts/deploy.ps1 that sends archost01 a new bundle starts. Get-DemoVmHealth -Config $config -VmName archost01 -View Full lists them all.'
+        $health.evidence['warningsExpected'] | Should -BeTrue
+
+        # An older bundle's note, which names no step, is the same note.
+        $script:summary.warnings = @('The sign-in cleanup cleared Application on archost01, because they held token-shaped values.')
+        (& $read).message | Should -Match ' That''s expected: a sign-in cleanup that clears an event log follows '
+
+        # Beside a warning that isn't by design, it says which; the fix stays the general one.
+        $script:summary.warningCount = 2
+        $script:summary.warnings = @($cleanup, 'GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass (setup exit code 1).')
+        $mixed = & $read
+        $mixed.message | Should -Match '\. 1 of them is expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding'
+        $mixed.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+        $mixed.evidence['warningsExpected'] | Should -BeFalse
+
+        # Automatic sign-in left armed isn't by design: nothing in the demo arms it.
+        $script:summary.warningCount = 1
+        $script:summary.warnings = @('AutoLogonSecret: Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.')
+        (& $read).message | Should -Not -Match 'expected'
     }
     It 'warns, with the extension-update finding, when health.json can''t be read' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
