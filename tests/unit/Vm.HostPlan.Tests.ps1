@@ -29,6 +29,8 @@ BeforeAll {
         Mock -CommandName Test-DemoHostMedia -MockWith { $true }
         Mock -CommandName Test-DemoGuestVhdx -MockWith { $true }
         Mock -CommandName Test-DemoGuestVm -MockWith { $true }
+        # The GuestNetwork step (2026-11-21): the guest is on its switch.
+        Mock -CommandName Test-DemoHostGuestNetwork -MockWith { $true }
         Mock -CommandName Test-DemoHostGuestReachable -MockWith { $true }
         Mock -CommandName Wait-DemoHostGuest -MockWith { $true }
         Mock -CommandName Get-DemoGuestCredential -MockWith {
@@ -93,7 +95,7 @@ Describe 'T2 host step plan' {
         $plan = Get-DemoHostStepPlan -Context (New-TestHostContext -Mode 'PaygWizard')
         $plan.Name | Should -Be @(
             'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestNetwork', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
             'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql',
             'SeedDatabase', 'WorkloadRunner')
     }

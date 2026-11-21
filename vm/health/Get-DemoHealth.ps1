@@ -17,7 +17,8 @@ guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (gue
 unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
 passed ArcOnboarding; rebuildUtc, rebuildMode, rebuildArcId, the old guest's Arc machine, and rebuildArcNew, whether
 the Arc marker is already for the guest that exists now: true, false only on positive evidence, or null when that
-can't be told; the Full view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
+can't be told; since 2026-11-21 rebuildRequested, true when reset-demo.ps1 -RebuildGuest asked for the rebuild; the Full
+view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
 request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
 the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
@@ -167,10 +168,10 @@ function Get-DemoHealthRebuildFact {
     if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
         return $null
     }
-    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; oldGuestVmId = ''; arcCurrent = $null }
+    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; oldGuestVmId = ''; requestId = ''; arcCurrent = $null }
     try {
         $record = [System.IO.File]::ReadAllText($recordPath) | ConvertFrom-Json
-        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId', 'oldGuestVmId') {
+        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId', 'oldGuestVmId', 'requestId') {
             $property = $record.PSObject.Properties[$name]
             if ($property -and $null -ne $property.Value) {
                 # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
@@ -386,6 +387,8 @@ if ($View -eq 'Summary') {
         rebuildMode    = $(if ($null -ne $rebuildFacts) { $rebuildFacts['oldMode'] } else { $null })
         rebuildArcId   = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcResourceId'] } else { $null })
         rebuildArcNew  = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcCurrent'] } else { $null })
+        # 2026-11-21: a rebuild that reset-demo.ps1 -RebuildGuest asked for (the record carries its request's id).
+        rebuildRequested = $(if ($null -ne $rebuildFacts) { [bool]$rebuildFacts['requestId'] } else { $null })
         arcOnboarded   = & $read $health @('details', 'arcOnboarded')
         guestState     = & $read $health @('details', 'guest', 'state')
         sqlEdition     = & $read $health @('details', 'guest', 'sql', 'edition')

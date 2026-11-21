@@ -68,6 +68,7 @@
         'Invoke-DemoAz'
         'Invoke-DemoControl'
         'Invoke-DemoDeployment'
+        'Invoke-DemoDeployScript'
         'Invoke-DemoFabricAppDeployment'
         'Invoke-DemoHubReadiness'
         'Invoke-DemoHubTelemetryQuery'

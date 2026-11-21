@@ -210,7 +210,7 @@ Its first cell's switches need no edit: `DURATION_MINUTES` (90 by default, 30 to
 
 ### Reset: `reset-demo.ps1`
 
-`./scripts/reset-demo.ps1 [-Target T1] [-Reseed] [-UndoRemediation]` runs the runner's `reset` on each target: it stops every scenario and profile, kills leftover `ContosoCare.Demo/` sessions, checks that no demo transaction is open, empties the scratch tables, and sets the profile to `off` (unless `-KeepProfile`). Resetting T3 resumes a paused database. `-RebuildGuest` is **Not supported** for now: run `./scripts/destroy.ps1 -KeepFabric`, then `./scripts/deploy.ps1`.
+`./scripts/reset-demo.ps1 [-Target T1] [-Reseed] [-UndoRemediation]` runs the runner's `reset` on each target: it stops every scenario and profile, kills leftover `ContosoCare.Demo/` sessions, checks that no demo transaction is open, empties the scratch tables, and sets the profile to `off` (unless `-KeepProfile`). Resetting T3 resumes a paused database. `-RebuildGuest` (since 2026-11-21) does only one thing: it makes T2's guest `arcsql01` again from Arc Jumpstart's image, with its disk, its Arc resources, and its database, for a guest that's broken beyond `deploy.ps1`'s own repairs, such as one with no network adapter. It asks `archost01` through a Run Command (`RESET.GUEST`), then runs `./scripts/deploy.ps1 -FromStage Artifacts`, which does it and finishes T2 (`DEPLOY.T2.REBUILD`): about an hour, with Arc onboarding; T1, T3, T4, T5, and Fabric are untouched. It needs `archost01` running, refuses a guest that a golden capture holds, and isn't supported in `ProductKey` or `Developer` mode or the evaluation-only mode, where `./scripts/destroy.ps1 -KeepFabric`, then `./scripts/deploy.ps1`, starts T2 over.
 
 ### Destroy: `destroy.ps1`
 

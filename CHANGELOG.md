@@ -6,6 +6,11 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 **The release's follow-ups.** Small fixes found during the 2026-11-20 release tests. **How to update:** run `./scripts/deploy.ps1`; your configuration needs no edit.
 
+### Added
+
+- `./scripts/reset-demo.ps1 -RebuildGuest` makes T2's guest `arcsql01` again from Arc Jumpstart's image, for a guest broken beyond `deploy.ps1`'s own repairs, such as one with no network adapter: it asks `archost01` (`RESET.GUEST`), then runs `./scripts/deploy.ps1 -FromStage Artifacts`, which deletes the guest with its disk, makes it again, deletes the old guest's Arc resources, and onboards the new one (`DEPLOY.T2.REBUILD`), in about an hour. T1, T3, T4, T5, and Fabric are untouched. It needs `archost01` running, refuses a guest that a golden capture holds, and in `ProductKey` or `Developer` mode, or the evaluation-only mode, it's **Not supported**, with the fix (`./scripts/destroy.ps1 -KeepFabric`, then `./scripts/deploy.ps1`). Before, it was **Not supported** in every mode.
+- T2's host connects its guest's network adapter to the NAT switch again when something took it off (`GuestNetwork`, a new host step, in every mode), so `./scripts/deploy.ps1` repairs a disconnected guest; a golden capture's air gap is left alone. `T2.GUEST.STATE`'s fix for a disconnected guest names `./scripts/deploy.ps1` first, then `-RebuildGuest`, with the by-hand command last. A host gets the step with its next `./scripts/deploy.ps1`.
+
 ### Changed
 
 - `init.ps1` sets a new configuration's hard monthly ceiling (`monthlyCeilingUsd`) from its region's worst case for a Contributor's new deployment, priced then as preflight prices it, with 4% headroom, rounded up to 5 USD, and never below 415, so preflight passes it in every region: before, 415 fit only West US 3 and East US 2. `INIT.CONFIG` says the ceiling and why. A value already in your configuration doesn't change.

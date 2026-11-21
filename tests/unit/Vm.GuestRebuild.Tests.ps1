@@ -13,6 +13,9 @@ BeforeAll {
         'Remove-VM'                = '[CmdletBinding(SupportsShouldProcess = $true)] param([string] $Name, [switch] $Force)'
         'Get-ScheduledTask'        = '[CmdletBinding()] param([string] $TaskName)'
         'Unregister-ScheduledTask' = '[CmdletBinding(SupportsShouldProcess = $true)] param([string] $TaskName)'
+        # The GuestNetwork step (2026-11-21).
+        'Get-VMNetworkAdapter'     = '[CmdletBinding()] param([string] $VMName)'
+        'Connect-VMNetworkAdapter' = '[CmdletBinding()] param([object] $VMNetworkAdapter, [string] $SwitchName)'
     }
     foreach ($name in $stubs.Keys) {
         Set-Item -Path ('function:local:' + $name) -Value ([scriptblock]::Create($stubs[$name]))
@@ -257,6 +260,170 @@ Describe 'The GuestSource step (2026-11-09)' {
     }
 }
 
+Describe 'A rebuild that reset-demo.ps1 -RebuildGuest asks for (2026-11-21)' {
+    BeforeEach {
+        Mock -CommandName Get-DemoHostGuestSourceState -MockWith { [pscustomobject]@{ Ok = $true; Expected = 'JumpstartImage'; Recorded = 'JumpstartImage'; RecordedMode = 'JumpstartImage' } }
+        Mock -CommandName Get-DemoHostGuestFinding -MockWith { throw 'A requested rebuild doesn''t plan from a finding.' }
+        Mock -CommandName Remove-DemoHostGuest -MockWith { }
+        Mock -CommandName Get-DemoHostGuestVmId -MockWith { 'aaaaaaaa-0000-4000-8000-000000000001' }
+        function Set-TestRequest([System.Collections.IDictionary] $Context, [string] $Id = 'rebuild-20261121-0300', [string] $Outcome = '') {
+            $request = [ordered]@{ schemaVersion = 1; id = $Id; requestedUtc = '2026-11-21T03:00:00Z'; requestedBy = 'reset-demo.ps1 -RebuildGuest' }
+            if ($Outcome) {
+                $request['outcome'] = $Outcome
+            }
+            Write-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildRequestPath -Context $Context) -InputObject $request
+        }
+    }
+
+    It 'is to do until a rebuild record carries its id, and never when it has an outcome or a bad id' {
+        $context = New-TestHostContext
+        Get-DemoHostGuestRebuildRequest -Context $context | Should -BeNullOrEmpty -Because 'nothing was asked for'
+        Set-TestRequest -Context $context
+        (Get-DemoHostGuestRebuildRequest -Context $context)['id'] | Should -Be 'rebuild-20261121-0300'
+        Write-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $context) -InputObject ([ordered]@{ schemaVersion = 1; state = 'Removed'; requestId = 'rebuild-20261121-0300' })
+        Get-DemoHostGuestRebuildRequest -Context $context | Should -BeNullOrEmpty -Because 'its rebuild started'
+        Set-TestRequest -Context $context -Id 'rebuild-20261121-0400'
+        (Get-DemoHostGuestRebuildRequest -Context $context)['id'] | Should -Be 'rebuild-20261121-0400' -Because 'a new request is to do again'
+        Set-TestRequest -Context $context -Id 'rebuild-20261121-0400' -Outcome 'Refused'
+        Get-DemoHostGuestRebuildRequest -Context $context | Should -BeNullOrEmpty
+        Set-TestRequest -Context $context -Id 'bad id; with spaces'
+        Get-DemoHostGuestRebuildRequest -Context $context | Should -BeNullOrEmpty
+    }
+
+    It 'runs the GuestSource step''s Set while it''s to do, though the guest''s source fits the mode' {
+        $context = New-TestHostContext
+        $step = Get-DemoHostStepPlan -Context $context | Where-Object { $_.Name -eq 'GuestSource' }
+        (& $step['Test'] $step) | Should -BeTrue
+        Set-TestRequest -Context $context
+        (& $step['Test'] $step) | Should -BeFalse
+    }
+
+    It 'deletes a finished guest, records the request, and runs the configured JumpstartImage mode from there on, a kept PaygWizard guest''s too' {
+        $context = New-TestHostContext -GuestSource ([ordered]@{ source = 'Build'; installMode = 'PaygWizard'; sqlSetUp = $true })
+        $context.Mode | Should -Be 'PaygWizard'
+        $context.ModeAdopted | Should -BeTrue
+        Write-DemoVmJsonFile -Path $context.ArcMarkerPath -InputObject ([ordered]@{ schemaVersion = 1; status = 'Connected'; resourceId = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.HybridCompute/machines/arcsql01' })
+        Set-TestRequest -Context $context
+        Invoke-DemoHostGuestSourceStep -Context $context | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Remove-DemoHostGuest -Times 1 -Exactly -ParameterFilter {
+            $RequestId -eq 'rebuild-20261121-0300' -and $Reason -match '^Requested by reset-demo\.ps1 -RebuildGuest \(rebuild-20261121-0300, at 2026-11-21T03:00:00Z\)\.$' -and $Finding.BuildMode -eq 'PaygWizard' -and $Finding.GuestVmId -eq 'aaaaaaaa-0000-4000-8000-000000000001' -and $Finding.ArcResourceId -match '/machines/arcsql01$' -and -not $Resume
+        }
+        Should -Invoke -CommandName Get-DemoHostGuestFinding -Times 0 -Exactly
+        $context.Mode | Should -Be 'JumpstartImage' -Because 'the image''s steps make the new guest in this pass'
+        $context.ModeAdopted | Should -BeFalse
+    }
+
+    It 'deletes nothing while a golden capture holds the guest, notes why for this generation, and checks the guest''s source as usual' {
+        $context = New-TestHostContext
+        $golden = Join-Path -Path $context.Root -ChildPath 'golden'
+        $null = New-Item -ItemType Directory -Path $golden -Force
+        Write-DemoVmJsonFile -Path (Join-Path -Path $golden -ChildPath 'capture.json') -InputObject ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $false })
+        Set-TestRequest -Context $context
+        $result = Invoke-DemoHostGuestSourceStep -Context $context
+        Should -Invoke -CommandName Remove-DemoHostGuest -Times 0 -Exactly
+        $result.Outcome | Should -Be 'Done'
+        @($result.TransientWarningMessage) | Should -HaveCount 1
+        $result.TransientWarningMessage[0] | Should -Match '^The rebuild of arcsql01 that \./scripts/reset-demo\.ps1 -RebuildGuest asked for \(rebuild-20261121-0300\) was refused, and nothing was deleted: a golden capture holds the guest'
+        $request = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildRequestPath -Context $context)
+        $request['outcome'] | Should -Be 'Refused'
+        $request['outcomeUtc'] | Should -Not -BeNullOrEmpty
+        Get-DemoHostGuestRebuildRequest -Context $context | Should -BeNullOrEmpty -Because 'a refused request is done'
+        Should -Invoke -CommandName Get-DemoHostGuestSourceState -Times 1 -Exactly
+    }
+
+    It 'deletes nothing when T2 runs a build mode, whose guest the image doesn''t make' {
+        $context = New-TestHostContext -Mode 'ProductKey'
+        Set-TestRequest -Context $context
+        $result = Invoke-DemoHostGuestSourceStep -Context $context
+        Should -Invoke -CommandName Remove-DemoHostGuest -Times 0 -Exactly
+        $result.TransientWarningMessage[0] | Should -Match 'T2 runs ProductKey mode, which builds its guest from media'
+        $result.TransientWarningMessage[0] | Should -Match 'destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1'
+    }
+
+    It 'deletes nothing when the guest may be a released copy that was never reset, which deploy.ps1 resets first' {
+        Mock -CommandName Get-DemoGuestHostVmId -MockWith { 'bbbbbbbb-0000-4000-8000-000000000002' }
+        $context = New-TestHostContext
+        $golden = Join-Path -Path $context.Root -ChildPath 'golden'
+        $null = New-Item -ItemType Directory -Path $golden -Force
+        Write-DemoVmJsonFile -Path (Join-Path -Path $golden -ChildPath 'capture.json') -InputObject ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $true; sourceAzureVmId = 'cccccccc-0000-4000-8000-000000000003' })
+        Set-TestRequest -Context $context
+        $result = Invoke-DemoHostGuestSourceStep -Context $context
+        Should -Invoke -CommandName Remove-DemoHostGuest -Times 0 -Exactly
+        $result.TransientWarningMessage[0] | Should -Match 'was refused, and nothing was deleted: the guest may be a copy restored from a golden snapshot whose Arc identity was never reset\. \./scripts/deploy\.ps1 resets it'
+        (Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildRequestPath -Context $context))['outcome'] | Should -Be 'Refused'
+    }
+
+    It 'fails the step with the space check''s fix, deleting nothing, and leaves the request to do' {
+        $context = New-TestHostContext
+        Mock -CommandName Remove-DemoHostGuest -MockWith { New-DemoVmStepResult -Outcome 'Failed' -Message 'The rebuild of arcsql01 that ./scripts/reset-demo.ps1 -RebuildGuest asked for can''t start: the Jumpstart image wouldn''t fit. Nothing was deleted.' }
+        Set-TestRequest -Context $context
+        (Invoke-DemoHostGuestSourceStep -Context $context).Outcome | Should -Be 'Failed'
+        (Get-DemoHostGuestRebuildRequest -Context $context)['id'] | Should -Be 'rebuild-20261121-0300'
+    }
+}
+
+Describe 'The GuestNetwork step: the scripted repair of a disconnected guest (2026-11-21)' {
+    BeforeEach {
+        $script:context = New-TestHostContext
+        $script:adapters = @(
+            [pscustomobject]@{ Name = 'Network Adapter'; SwitchName = 'DbHubDemoNat' }
+            [pscustomobject]@{ Name = 'Network Adapter 2'; SwitchName = '' }
+        )
+        Mock -CommandName Get-VMNetworkAdapter -MockWith { $script:adapters }
+        Mock -CommandName Connect-VMNetworkAdapter -MockWith { }
+        # This host's Azure VM ID (IMDS), which no test reads for real.
+        $script:hostVmId = 'bbbbbbbb-0000-4000-8000-000000000002'
+        Mock -CommandName Get-DemoGuestHostVmId -MockWith { $script:hostVmId }
+        function Set-TestCapture([System.Collections.IDictionary] $Record) {
+            $golden = Join-Path -Path $script:context.Root -ChildPath 'golden'
+            $null = New-Item -ItemType Directory -Path $golden -Force
+            Write-DemoVmJsonFile -Path (Join-Path -Path $golden -ChildPath 'capture.json') -InputObject $Record
+        }
+    }
+
+    It 'passes with every adapter on the switch, and fails with one off it' {
+        $script:context.Host.SwitchName | Should -Be 'DbHubDemoNat'
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeFalse
+        $script:adapters = @([pscustomobject]@{ Name = 'Network Adapter'; SwitchName = 'DbHubDemoNat' })
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeTrue
+    }
+
+    It 'reconnects only the adapters off the switch' {
+        Repair-DemoHostGuestNetwork -Context $script:context | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 1 -Exactly -ParameterFilter { $VMNetworkAdapter.Name -eq 'Network Adapter 2' -and $SwitchName -eq 'DbHubDemoNat' }
+    }
+
+    It 'leaves a guest that a golden capture holds off its network: the release reconnects it' {
+        Set-TestCapture ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $false; sourceAzureVmId = $script:hostVmId })
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeTrue
+        Repair-DemoHostGuestNetwork -Context $script:context | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 0 -Exactly
+        # Released on its source, it's the guest's own network again, and so is a reset copy's.
+        Set-TestCapture ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $true; sourceAzureVmId = $script:hostVmId })
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeFalse
+        Set-TestCapture ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $true; sourceAzureVmId = 'cccccccc-0000-4000-8000-000000000003'; resetUtc = '2026-11-20T10:00:00Z' })
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeFalse
+    }
+
+    It 'leaves a released copy that was never reset off its network, as T2''s relay does: it may hold the captured Arc identity' {
+        Set-TestCapture ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $true; sourceAzureVmId = 'cccccccc-0000-4000-8000-000000000003' })
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeTrue
+        Repair-DemoHostGuestNetwork -Context $script:context | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 0 -Exactly
+        # Nor when this host's VM ID can't be read, which can't tell the source from such a copy.
+        Set-TestCapture ([ordered]@{ snapshotName = 'snap-t2-golden'; released = $true; sourceAzureVmId = $script:hostVmId })
+        $script:hostVmId = ''
+        Test-DemoHostGuestNetwork -Context $script:context | Should -BeTrue
+        Repair-DemoHostGuestNetwork -Context $script:context | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 0 -Exactly
+    }
+
+    It 'fails with the rebuild as the fix when the guest has no adapter' {
+        $script:adapters = @()
+        { Repair-DemoHostGuestNetwork -Context $script:context } | Should -Throw -ExpectedMessage '*has no network adapter*reset-demo.ps1 -RebuildGuest*'
+    }
+}
+
 Describe 'Deleting an unfinished guest' {
     BeforeEach {
         $script:context = New-TestHostContext
@@ -342,6 +509,20 @@ Describe 'Deleting an unfinished guest' {
         Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
         Should -Invoke -CommandName Remove-VM -Times 1 -Exactly
     }
+
+    It 'records the request a rebuild that reset-demo.ps1 -RebuildGuest asked for, and says so when the image wouldn''t fit (2026-11-21)' {
+        Remove-DemoHostGuest -Context $script:context -Finding (New-TestFinding -BuildMode 'JumpstartImage') -Reason 'Requested.' -RequestId 'rebuild-20261121-0300' -Confirm:$false | Should -BeNullOrEmpty
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $script:context)
+        $record['state'] | Should -Be 'Removed'
+        $record['requestId'] | Should -Be 'rebuild-20261121-0300'
+        $record['oldMode'] | Should -Be 'JumpstartImage'
+        Mock -CommandName Get-DemoHostGuestRebuildSpace -MockWith { [pscustomobject]@{ Ok = $false; FreeBytes = [long]20GB; FreedBytes = [long]30GB; NeededBytes = [long]64GB } }
+        Remove-Item -LiteralPath (Get-DemoHostGuestRebuildPath -Context $script:context) -Force
+        $result = Remove-DemoHostGuest -Context $script:context -Finding (New-TestFinding -BuildMode 'JumpstartImage') -RequestId 'rebuild-20261121-0400' -Confirm:$false
+        $result.Outcome | Should -Be 'Failed'
+        $result.Message | Should -Match '^The rebuild of arcsql01 that \./scripts/reset-demo\.ps1 -RebuildGuest asked for can''t start: the Jumpstart image wouldn''t fit on .+ Nothing was deleted\.'
+        Test-Path -LiteralPath (Get-DemoHostGuestRebuildPath -Context $script:context) | Should -BeFalse
+    }
 }
 
 Describe 'The space check before a rebuild' {
@@ -388,6 +569,11 @@ Describe 'What the T2 host reports to deploy.ps1' {
         $summary.rebuildMode | Should -Be 'PaygWizard'
         $summary.rebuildArcId | Should -Match '/machines/arcsql01$'
         $summary.rebuildArcNew | Should -BeFalse -Because 'no Arc marker is there for the new guest yet'
+        $summary.rebuildRequested | Should -BeFalse -Because 'the host rebuilt an unfinished guest on its own'
+        # A rebuild that reset-demo.ps1 -RebuildGuest asked for (2026-11-21).
+        $rebuild['requestId'] = 'rebuild-20261121-0300'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'guest-rebuild.json'), (ConvertTo-Json -InputObject $rebuild -Depth 6))
+        ((& (Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1') -Root $root -View Summary) | ConvertFrom-Json).rebuildRequested | Should -BeTrue
     }
 
     It 'says the Arc marker is the new guest''s only on evidence, and false only on evidence that it isn''t: <Case> (review of 849d4c2)' -ForEach @(

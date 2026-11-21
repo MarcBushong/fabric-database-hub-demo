@@ -742,10 +742,30 @@ Describe 'Lifecycle scripts' {
     It 'reset-demo.ps1 and status.ps1 pass their switches through' {
         Mock -CommandName Reset-DemoWorkload -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Invoke-DemoDeployScript -MockWith { 0 }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -Target T1 -Reseed -OutputPath $outputPath
         Should -Invoke -CommandName Reset-DemoWorkload -Times 1 -Exactly -ParameterFilter { $Target -eq 'T1' -and $Reseed -and -not $UndoRemediation }
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 0 -Exactly
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -Detail -OutputPath $outputPath
         Should -Invoke -CommandName Get-DemoEnvironmentStatus -Times 1 -Exactly -ParameterFilter { $Detail }
+    }
+
+    It 'reset-demo.ps1 -RebuildGuest runs deploy.ps1 -FromStage Artifacts once archost01 has the request, with deploy.ps1''s exit code, and not otherwise (2026-11-21)' {
+        Mock -CommandName Reset-DemoWorkload -MockWith { New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status $capture['guestStatus'] -Message 'guest' }
+        Mock -CommandName Invoke-DemoDeployScript -MockWith { 3 }
+        $capture['guestStatus'] = 'Pass'
+        $capture['configPath'] = $configPath
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath
+        $LASTEXITCODE | Should -Be 3 -Because 'the command''s exit code is deploy.ps1''s'
+        Should -Invoke -CommandName Reset-DemoWorkload -Times 1 -Exactly -ParameterFilter { $RebuildGuest }
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 1 -Exactly -ParameterFilter { $FromStage -eq 'Artifacts' -and [System.IO.Path]::GetFileName($ConfigPath) -eq [System.IO.Path]::GetFileName($capture['configPath']) }
+        foreach ($status in 'Fail', 'Not selected', 'Not supported') {
+            $capture['guestStatus'] = $status
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath
+        }
+        $capture['guestStatus'] = 'Pass'
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath -WhatIf
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 1 -Exactly
     }
 
     It 'demo-control.ps1 takes the workflow''s string inputs' {

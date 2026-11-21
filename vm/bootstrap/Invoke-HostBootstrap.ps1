@@ -181,7 +181,8 @@ function Get-DemoHostStepPlan {
             Test = { param($Step) Test-DemoHostDnsForwarder -HostConfig $Step.Context.Host }
             Set = { param($Step) Initialize-DemoHostDnsForwarder -HostConfig $Step.Context.Host } }
         @{ Name = 'GuestSource'; MaxAttempts = 3
-            Test = { param($Step) (Get-DemoHostGuestSourceState -Context $Step.Context).Ok }
+            # 2026-11-21: a rebuild that reset-demo.ps1 -RebuildGuest asked for, and that isn't done yet, runs the Set.
+            Test = { param($Step) (Get-DemoHostGuestSourceState -Context $Step.Context).Ok -and $null -eq (Get-DemoHostGuestRebuildRequest -Context $Step.Context) }
             Set = { param($Step) Invoke-DemoHostGuestSourceStep -Context $Step.Context } }
         @{ Name = 'DataDisk'
             Test = { param($Step) Test-DemoHostStorage -Context $Step.Context }
@@ -215,6 +216,10 @@ function Get-DemoHostStepPlan {
             NotSelectedMessage = 'Only JumpstartImage mode makes Arc Jumpstart''s guest arcsql01 at its first boot; the build names the guest in its unattend file.'
             Test = { param($Step) Test-DemoJumpstartFirstBoot -Context $Step.Context }
             Set = { param($Step) Invoke-DemoJumpstartFirstBoot -Context $Step.Context } }
+        # 2026-11-21: a guest that something took off its switch later goes back on it, unless a golden capture holds it.
+        @{ Name = 'GuestNetwork'
+            Test = { param($Step) Test-DemoHostGuestNetwork -Context $Step.Context }
+            Set = { param($Step) Repair-DemoHostGuestNetwork -Context $Step.Context } }
         @{ Name = 'GuestOnline'
             Test = { param($Step) Test-DemoHostGuestReachable -Context $Step.Context }
             Set = { param($Step)

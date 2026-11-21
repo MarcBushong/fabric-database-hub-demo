@@ -67,7 +67,7 @@ Describe 'JumpstartImage step plan' {
         $plan = Get-DemoHostStepPlan -Context $context
         $plan.Name | Should -Be @(
             'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestNetwork', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2',
             'SqlUnattendedInstall', 'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard',
             'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
         $selected = @($plan | Where-Object { -not $_.Contains('When') -or [bool](@(& $_['When'] $_)[-1]) } | ForEach-Object { $_.Name })
@@ -101,6 +101,8 @@ Describe 'JumpstartImage step plan' {
         $script:firstBoot = $false
         Mock -CommandName Test-DemoJumpstartFirstBoot -MockWith { $script:firstBoot }
         Mock -CommandName Invoke-DemoJumpstartFirstBoot -MockWith { $script:firstBoot = $true }
+        # The GuestNetwork step (2026-11-21): the first boot connected the guest.
+        Mock -CommandName Test-DemoHostGuestNetwork -MockWith { $script:firstBoot }
         Mock -CommandName Test-DemoHostGuestReachable -MockWith { $true }
         Mock -CommandName Wait-DemoHostGuest -MockWith { $true }
         Mock -CommandName Get-DemoGuestCredential -MockWith {

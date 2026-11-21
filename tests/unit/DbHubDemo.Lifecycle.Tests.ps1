@@ -4403,12 +4403,91 @@ Describe 'Reset-DemoWorkload' {
         ($results | Where-Object { $_.checkId -eq 'RESET.T1' }).message | Should -Match 'activity profile is off'
     }
 
-    It 'skips targets whose VM isn''t running, and doesn''t support rebuilding the guest yet' {
+    It 'skips targets whose VM isn''t running' {
         $script:power = 'PowerState/deallocated'
-        $results = Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false
+        $results = Reset-DemoWorkload -Config $config -Confirm:$false
         $script:calls.Count | Should -Be 0
-        ($results | Where-Object { $_.checkId -eq 'RESET.GUEST' }).status | Should -Be 'Not supported'
         ($results | Where-Object { $_.checkId -eq 'RESET.T1' }).status | Should -Be 'Not selected'
+    }
+}
+
+Describe 'Reset-DemoWorkload -RebuildGuest: the T2 guest made again from Arc Jumpstart''s image (2026-11-21)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    BeforeEach {
+        $script:calls = [System.Collections.Generic.List[object]]::new()
+        $script:power = 'PowerState/running'
+        $script:health = [pscustomobject]@{ state = 'Ready'; t2Guest = [pscustomobject]@{ present = $true; state = 'Running'; adapters = 1; connected = 0 } }
+        $script:runSucceeded = $true
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01') } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:health }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:calls.Add($Target); [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Records = @(); Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:calls.Add(('{0}:{1}:{2}' -f $VmName, $RunCommandName, $Parameter['RequestId']))
+            [pscustomobject]@{ Succeeded = $script:runSucceeded; Output = 'DBHUBDEMO-GUESTREBUILD requested'; Error = $(if ($script:runSucceeded) { '' } else { 'The guest rebuild request failed: access denied' }) }
+        }
+    }
+
+    It 'asks archost01 for the rebuild with the request script, and resets no target' {
+        $results = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false)
+        $guest = $results | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be 'Pass'
+        $guest.message | Should -Match '^archost01 is asked to make its guest arcsql01 again from Arc Jumpstart''s image \(rebuild-\d{8}-\d{6}\)\. The \./scripts/deploy\.ps1 -FromStage Artifacts run that follows does it'
+        $guest.evidence.requestId | Should -Match '^rebuild-\d{8}-\d{6}$'
+        @($script:calls) | Should -HaveCount 1
+        $script:calls[0] | Should -Be ('archost01:DbHubDemo-GuestRebuild:{0}' -f $guest.evidence.requestId)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $Script -match 'guest-rebuild-request\.json' -and $Script -match 'DBHUBDEMO-GUESTREBUILD' }
+        @($results | Where-Object { [string]$_.checkId -like 'RESET.T*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'asks nothing <Case>' -ForEach @(
+        @{ Case = 'while archost01 isn''t running'; Power = 'PowerState/deallocated'; Health = $null; Status = 'Not selected'; Message = 'archost01 isn''t running \(PowerState/deallocated\)'; Fix = 'start-demo\.ps1, then run \./scripts/reset-demo\.ps1 -RebuildGuest again' }
+        @{ Case = 'while a golden capture is in progress'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; capture = [pscustomobject]@{ state = 'Active' } } }; Status = 'Fail'; Message = 'a golden capture is in progress on archost01'; Fix = 'T2\.GUEST\.STATE' }
+        @{ Case = 'for a copy whose golden record isn''t released'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; golden = [pscustomobject]@{ released = $false; reset = $false; role = 'Copy' } } }; Status = 'Fail'; Message = 'golden capture record that isn''t released'; Fix = 'T2\.GUEST\.STATE' }
+        @{ Case = 'for a released copy that was never reset'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; golden = [pscustomobject]@{ released = $true; reset = $false; role = 'Copy' } } }; Status = 'Fail'; Message = 'Arc identity was never reset'; Fix = 'T2\.GUEST\.STATE' }
+    ) {
+        $script:power = $Power
+        $script:health = $Health
+        $guest = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be $Status
+        $guest.message | Should -Match $Message
+        $guest.remediation | Should -Match $Fix
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+    }
+
+    It 'asks nothing in a build mode or the evaluation-only mode, and says how to start T2 over' {
+        foreach ($override in @(@{ t2SqlInstallMode = 'ProductKey' }, @{ t2SqlInstallMode = 'Developer' }, @{ t2Mode = 'EvaluationOnlyAzureVm' })) {
+            $modeConfig = New-TestConfig
+            foreach ($key in $override.Keys) {
+                $modeConfig[$key] = $override[$key]
+            }
+            $guest = @(Reset-DemoWorkload -Config $modeConfig -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+            $guest.status | Should -Be 'Not supported' -Because ($override | ConvertTo-Json -Compress)
+            $guest.remediation | Should -Match 'destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1'
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+    }
+
+    It 'asks anyway when the host''s health can''t be read, since the host checks again; and fails, changing nothing, when the request can''t be written' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Run Command conflict' }
+        (@(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST').status | Should -Be 'Pass'
+        $script:runSucceeded = $false
+        $failed = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'access denied'
+        $failed.remediation | Should -Match 'reset-demo\.ps1 -RebuildGuest again'
+    }
+
+    It 'only says what it would do with -WhatIf' {
+        $guest = @(Reset-DemoWorkload -Config $config -RebuildGuest -WhatIf) | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be 'Not selected'
+        $guest.message | Should -Match '^What if: archost01 would be asked'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
     }
 }
 

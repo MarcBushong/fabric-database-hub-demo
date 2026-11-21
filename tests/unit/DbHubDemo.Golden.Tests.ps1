@@ -1042,7 +1042,7 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
         @{ Case = 'a reset copy isn''t released'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $true; role = 'Copy' }) }; Status = 'Fail'; Match = 'was reset, but it isn''t released yet'; Fix = 'deploy\.ps1' }
         @{ Case = 'the host''s role can''t be read'; Guest = { New-Guest -State 'Off' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Unknown' }) }; Status = 'Fail'; Match = 'can''t tell a source from a copy'; Fix = 'Don''t connect the guest by hand' }
         @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'start of T2 \(Run all in NB_DatabaseHub_Control\), which starts an off guest.*As a last resort, run on archost01: .*Start-VM -Name arcsql01' }
-        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1; .*\./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
+        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1: archost01's GuestNetwork step connects arcsql01's network adapter to DbHubDemoNat again\. If T2\.GUEST\.STATE still says this \(a guest with no adapter, say\), run \./scripts/reset-demo\.ps1 -RebuildGuest, which makes arcsql01 again from Arc Jumpstart's image and onboards it \(about an hour\), or deploy the environment again: \./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
         @{ Case = 'a released capture''s guest is off'; Guest = { New-Guest -State 'Off' -Heartbeat '' -Golden ([pscustomobject]@{ released = $true; reset = $false; role = '' }) }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Start-VM' }
         @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
@@ -1069,6 +1069,16 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
     It 'never offers to connect a copy that may hold the captured identity' {
         $result = Get-GuestState (New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }))
         $result.remediation | Should -Not -Match 'Connect-VMNetworkAdapter|run-command'
+    }
+
+    It 'offers reset-demo.ps1 -RebuildGuest only where Arc Jumpstart''s image makes T2 (2026-11-21)' {
+        $productKey = New-TestConfig
+        $productKey['t2SqlInstallMode'] = 'ProductKey'
+        $health = [pscustomobject]@{ status = 'Pass'; state = 'Ready'; currentStep = 'Watchdog'; t2Guest = (New-Guest -Adapters 0 -Connected 0) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c, $h) Get-DemoT2GuestStateResult -Config $c -Health $h } $productKey $health
+        $result.status | Should -Be 'Fail'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: archost01''s GuestNetwork step'
+        $result.remediation | Should -Not -Match 'RebuildGuest'
     }
 
     It 'waits for a guest the build hasn''t created yet, fails one a Ready host lost, and says nothing without a Hyper-V read' {
