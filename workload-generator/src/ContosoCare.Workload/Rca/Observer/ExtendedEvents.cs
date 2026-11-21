@@ -30,19 +30,25 @@ internal sealed record XeRead(IReadOnlyList<XeEvent> Events, bool Truncated, lon
 /// <summary>
 /// The events a source returned that the observer already kept (or left out), by fingerprint, so it writes none of them
 /// twice however long the source keeps returning it: the ring buffer holds an event until 5,000 newer ones or its memory
-/// push it out. Forgetting keeps the memory bounded, and nothing at or before the newest forgotten event is new again.
+/// push it out. Forgetting keeps the memory bounded: an event before the newest forgotten one is never new again, nor one
+/// forgotten in that same millisecond, while another event of that millisecond still is.
 /// </summary>
 internal sealed class SeenEvents
 {
     private readonly Dictionary<string, DateTimeOffset> seen = new(StringComparer.Ordinal);
 
-    /// <summary>The newest time of an event forgotten so far: an event at or before it is never taken as new.</summary>
+    // The fingerprints forgotten at exactly ForgottenThrough: the only events of that millisecond that aren't new.
+    private readonly HashSet<string> boundary = new(StringComparer.Ordinal);
+
+    /// <summary>The newest time of an event forgotten so far: an event before it is never taken as new, nor one forgotten at it.</summary>
     public DateTimeOffset ForgottenThrough { get; private set; } = DateTimeOffset.MinValue;
 
     public int Count => seen.Count;
 
-    /// <summary>True the first time an event is offered; false when it was offered before, or isn't after what was forgotten.</summary>
-    public bool Add(XeEvent item) => item.At > ForgottenThrough && seen.TryAdd(item.Fingerprint, item.At);
+    /// <summary>True the first time an event is offered; false when it was offered before, or was forgotten, or is older than what was.</summary>
+    public bool Add(XeEvent item) =>
+        (item.At > ForgottenThrough || (item.At == ForgottenThrough && !boundary.Contains(item.Fingerprint)))
+        && seen.TryAdd(item.Fingerprint, item.At);
 
     /// <summary>Forgets the events <paramref name="forget"/> picks, by fingerprint and event time.</summary>
     public void Forget(Func<string, DateTimeOffset, bool> forget)
@@ -53,6 +59,12 @@ internal sealed class SeenEvents
             if (at > ForgottenThrough)
             {
                 ForgottenThrough = at;
+                boundary.Clear();
+            }
+
+            if (at == ForgottenThrough)
+            {
+                boundary.Add(fingerprint);
             }
         }
     }
@@ -60,6 +72,7 @@ internal sealed class SeenEvents
     public void Clear()
     {
         seen.Clear();
+        boundary.Clear();
         ForgottenThrough = DateTimeOffset.MinValue;
     }
 }

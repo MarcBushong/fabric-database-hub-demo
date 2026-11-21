@@ -403,8 +403,9 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         }
 
         // The ring buffer drops its oldest events first and never returns one again, so an event a complete read left out
-        // is gone for good. A truncated read leaves out whatever didn't fit, which the buffer may still hold, so then only
-        // events older than EventMemory are forgotten. An event the buffer still returns is never written twice.
+        // is gone for good. A truncated read leaves out whatever didn't fit, from whichever end (Learn doesn't say), and
+        // the buffer may still hold it, so then only events older than EventMemory are forgotten. An event the buffer
+        // still returns is never written twice.
         bufferEvents.Forget((fingerprint, at) => !returned.Contains(fingerprint) && (!read.Truncated || at < now - EventMemory));
 
         EvaluateErrors(now);
