@@ -8,6 +8,7 @@
 //   REPL-SHIPPING         the WAL isn't reaching the replica (send gap, write or flush lag)
 //   REPL-IDLE-PRIMARY     nothing to replay: the primary committed nothing, so "time since the last replay" grows
 //   REPL-REPLAY-STALLED   replay stood still, and nothing captured says why
+//   REPL-NO-LAG           the lag stayed under 5 s in the window: nothing to explain
 // https://www.postgresql.org/docs/18/hot-standby.html#HOT-STANDBY-CONFLICT, https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
 
 import { recommend } from "./catalog";
@@ -25,8 +26,8 @@ export interface LagRise {
     start: Date;
     peak: LagPoint;
     recovered?: LagPoint;
-    /** Seconds of lag added per second of clock while it rose: 1.0 means replay stood still. */
-    slope: number;
+    /** Seconds of lag added per second of clock while it rose: 1.0 means replay stood still. Null with fewer than two rising points. */
+    slope: number | null;
     points: LagPoint[];
     /** Where the points come from: Azure Monitor's metric, or the observer's own samples on the replica. */
     source: "Telemetry Snapshots" | "RCA Replica";
@@ -48,25 +49,41 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
     return { points: own, source: "RCA Replica" };
 }
 
-/** The rise around `at`: back to where the lag was last under `floor`, forward to its peak and its recovery. */
+/**
+ * The rise around `at`: back to where the lag was last under `floor`, forward to its peak and its recovery. When the lag at
+ * `at` is under the floor, the rise is the last one in the series before it at the floor or above, else the first after
+ * it; with none, there's no lag to explain, and this returns null (the review of 34a9732: it once called a 0.6 s point,
+ * minutes after the real spike, a rise).
+ */
 export function lagRise(series: { points: LagPoint[]; source: LagRise["source"] }, at: Date, floor = 5): LagRise | null {
     const lag = series.points;
     if (lag.length === 0) return null;
     let i = lag.findIndex((p) => p.at.getTime() >= at.getTime() - 60_000);
     if (i < 0) i = lag.length - 1;
+    if (lag[i].value < floor) {
+        let before = i;
+        while (before >= 0 && lag[before].value < floor) before--;
+        const after = lag.findIndex((p, k) => k > i && p.value >= floor);
+        if (before >= 0) i = before;
+        else if (after >= 0) i = after;
+        else return null;
+    }
     let s = i;
     while (s > 0 && lag[s - 1].value >= floor) s--;
     let p = s;
-    for (let k = s; k < lag.length && (lag[k].value >= floor || k <= i); k++) if (lag[k].value > lag[p].value) p = k;
+    for (let k = s; k < lag.length && lag[k].value >= floor; k++) if (lag[k].value > lag[p].value) p = k;
     const recoveredIndex = lag.findIndex((pt, k) => k > p && pt.value < floor);
     const points = lag.slice(Math.max(0, s - 1), recoveredIndex >= 0 ? recoveredIndex + 1 : p + 1);
+    // A rate needs two points that rise: one point, or a flat run, says nothing about how fast replay fell behind.
     const rising = lag.slice(s, p + 1);
-    const slope = rising.length >= 2 ? (rising[rising.length - 1].value - rising[0].value) / ((rising[rising.length - 1].at.getTime() - rising[0].at.getTime()) / 1000) : 1;
+    const first = rising[0];
+    const last = rising[rising.length - 1];
+    const slope = rising.length >= 2 && last.value > first.value ? (last.value - first.value) / ((last.at.getTime() - first.at.getTime()) / 1000) : null;
     return {
         start: lag[s].at,
         peak: lag[p],
         recovered: recoveredIndex >= 0 ? lag[recoveredIndex] : undefined,
-        slope: Math.round(slope * 100) / 100,
+        slope: slope === null ? null : Math.round(slope * 100) / 100,
         points,
         source: series.source,
     };
@@ -103,15 +120,29 @@ export interface ReplicaAnalysis {
 export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoint[]; samples: readonly ReplicaSample[]; events: readonly EventRow[] }): ReplicaAnalysis {
     const notCaptured: string[] = [];
     const series = lagSeries(input.metrics, input.samples);
+    if (series.points.length === 0) {
+        return { rise: null, findings: [], rootCause: null, recommendations: [], nextSteps: ["Run the control notebook's Run all with the read replica (it's created for each session)."], notCaptured: ["Neither Read Replica Lag nor the replica's own samples are in the history for this time."] };
+    }
+    const metricName = series.source === "Telemetry Snapshots" ? "Read Replica Lag" : "The replica's time since its last replay";
+    const ev = (table: string, at: Date, text: string): EvidenceRef => ({ table, at: iso(at), target: "T4-replica", text });
     const rise = lagRise(series, input.at);
     if (!rise) {
-        return { rise, findings: [], rootCause: null, recommendations: [], nextSteps: ["Run the control notebook's Run all with the read replica (it's created for each session)."], notCaptured: ["Neither Read Replica Lag nor the replica's own samples are in the history for this time."] };
+        // Every point under the floor: the replica kept up, and there's no rise to explain.
+        const top = series.points.reduce((a, b) => (b.value > a.value ? b : a));
+        const refs = perMinute(series.points).map((p) => ev(series.source, p.at, `${metricName} ${round1(p.value)} s`));
+        const statement = `${metricName} stayed under 5 s in these minutes, at most ${round1(top.value)} s at ${hhmmss(top.at)} UTC: the replica kept up, so there's no lag to explain.`;
+        return {
+            rise: null,
+            findings: [{ ruleId: "REPL-NO-LAG", target: "T4-replica", severity: "info", title: "No read replica lag", detail: statement, evidence: refs }],
+            rootCause: { statement, confidence: "high", ruleIds: ["REPL-NO-LAG"], evidence: refs },
+            recommendations: [],
+            nextSteps: ["Ask about the minutes when Database Hub's Read replica lag chart rose, or widen the window."],
+            notCaptured,
+        };
     }
-    const metricName = rise.source === "Telemetry Snapshots" ? "Read Replica Lag" : "The replica's time since its last replay";
-    const ev = (table: string, at: Date, text: string): EvidenceRef => ({ table, at: iso(at), target: "T4-replica", text });
     const shown = perMinute(rise.points);
     const lagRefs = shown.map((p) => ev(rise.source, p.at, `${metricName} ${round1(p.value)} s`));
-    const shape = `${metricName} rose from ${hhmmss(rise.start)} to ${round1(rise.peak.value)} s at ${hhmmss(rise.peak.at)} UTC (${shown.map((p) => `${round1(p.value)} s`).join(", ")})${rise.recovered ? ` and was back to ${round1(rise.recovered.value)} s at ${hhmmss(rise.recovered.at)} UTC` : ""}; it grew ${rise.slope} s per second`;
+    const shape = `${metricName} rose from ${hhmmss(rise.start)} to ${round1(rise.peak.value)} s at ${hhmmss(rise.peak.at)} UTC (${shown.map((p) => `${round1(p.value)} s`).join(", ")})${rise.recovered ? ` and was back to ${round1(rise.recovered.value)} s at ${hhmmss(rise.recovered.at)} UTC` : ""}${rise.slope !== null ? `; it grew ${rise.slope} s per second` : ""}`;
 
     if (isRestartCatchUp(rise, series.points)) {
         const statement = `${shape}, right after a gap in the series: the replica was stopped, and the metric counts the time since its last replayed transaction from before the stop. This is its catch-up, not replication lag.`;
@@ -171,8 +202,9 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
         confidence = "medium";
         ids = ["RPL-SHORT-REPORTS"];
     } else {
-        ruleId = rise.slope >= 0.8 ? "REPL-REPLAY-STALLED" : "REPL-UNEXPLAINED";
-        statement = `${shape}. ${rise.slope >= 0.8 ? "Replay stood still" : "Replay slowed"}, and nothing captured says why.`;
+        const stood = rise.slope !== null && rise.slope >= 0.8;
+        ruleId = stood ? "REPL-REPLAY-STALLED" : "REPL-UNEXPLAINED";
+        statement = `${shape}. ${rise.slope === null ? "One point can't say whether replay stood still or slowed" : stood ? "Replay stood still" : "Replay slowed"}, and nothing captured says why.`;
         confidence = "low";
     }
     return {

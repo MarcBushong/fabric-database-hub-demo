@@ -382,7 +382,10 @@ export function episodesFromEvents(evidence: Evidence): Episode[] {
     const targets = [...new Set(evidence.events.map((e) => e.target))];
     for (const target of targets) {
         const own = evidence.events.filter((e) => e.target === target);
-        const deadlocks = perMinute(own.filter((e) => e.kind === "deadlock" || e.code === "1205" || e.code === "40P01"));
+        // One deadlock can show as its graph and as its victim's error (1205, 40P01): count the graphs when the target has
+        // any, as analyzeDeadlocks does, so a SQL Server deadlock counts once (the review of 34a9732).
+        const graphs = own.filter((e) => e.kind === "deadlock");
+        const deadlocks = perMinute(graphs.length > 0 ? graphs : own.filter((e) => e.code === "1205" || e.code === "40P01"));
         const errors = perMinute(own.filter((e) => e.kind === "error" || e.kind === "attention"));
         const minutes = [...new Set([...deadlocks.keys(), ...errors.keys()])].sort((a, b) => a - b);
         if (minutes.length === 0) continue;
@@ -426,15 +429,22 @@ export interface DetectorInput {
     cosmos?: CosmosCapture | null;
 }
 
-/** Whether the observer captured a target over the window (an rca_coverage row says so). */
+/** Whether the observer captured a target over these minutes (an rca_coverage row says so). */
 function captured(evidence: Evidence, target: RcaTarget, from: Date, to: Date): boolean {
     return evidence.coverage.some((c) => c.target === target && c.captured && c.from <= to && c.to >= from);
+}
+
+/** Whether T3's 15-second resource rows (RCA-AZ-01) cover a target's minutes: then its CPU comes from them. */
+function rowsCover(evidence: Evidence, target: RcaTarget, from: Date, to: Date): boolean {
+    return evidence.resource.some((r) => r.target === target && r.metric === "avg_cpu_percent" && r.at >= from && r.at <= to);
 }
 
 /**
  * Every episode overlapping the window, oldest first. For each target and signal, the densest source that has it: the
  * capture's own episodes where the observer captured the target, T3's 15-second resource rows before Database Hub's
- * bins, Database Hub's bins otherwise, and Azure Monitor for T4, its replica, and T5.
+ * bins, Database Hub's bins otherwise, and Azure Monitor for T4, its replica, and T5. Each source gives way only for the
+ * minutes a denser one covers, each episode's own (the review of 34a9732: a capture anywhere in the window hid Database
+ * Hub's episodes everywhere in it).
  */
 export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episode[] {
     const { evidence } = input;
@@ -443,18 +453,17 @@ export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episod
     const byEvents = episodesFromEvents(evidence);
     const byBins = episodesFromBins(input.bins ?? []);
     const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null);
-    const has = (list: readonly Episode[], target: RcaTarget, family: string) => list.some((e) => e.target === target && e.family === family);
     const overlaps = (a: Episode, b: Episode) => a.target === b.target && a.family === b.family && a.start <= (b.end ?? b.last) && b.start <= (a.end ?? a.last);
     // The events count deadlocks and errors themselves: the capture's own episode for the same minutes would only repeat them.
     const chosen: Episode[] = [...byCapture.filter((c) => !byEvents.some((e) => overlaps(c, e))), ...byRows, ...byEvents];
     for (const e of byBins) {
-        // The capture's blocking episodes replace Database Hub's where the observer captured the target; its CPU rows replace the bins'.
-        if (e.family === "blocking" && captured(evidence, e.target, from, to)) continue;
-        if (e.family === "cpu" && has(byRows, e.target, "cpu")) continue;
+        // The capture's blocking episodes replace Database Hub's in the minutes the observer captured; the CPU rows, the bins' in the minutes they cover.
+        if (e.family === "blocking" && captured(evidence, e.target, e.start, e.end ?? e.last)) continue;
+        if (e.family === "cpu" && rowsCover(evidence, e.target, e.start, e.end ?? e.last)) continue;
         chosen.push(e);
     }
     for (const e of byMonitor) {
-        if (e.family === "replica_lag" && has(byCapture, e.target, "replica_lag")) continue;
+        if (e.family === "replica_lag" && byCapture.some((c) => overlaps(c, e))) continue;
         chosen.push(e);
     }
     return chosen.filter((e) => e.start <= to && (e.end ?? e.last) >= from).sort((a, b) => a.start.getTime() - b.start.getTime() || a.target.localeCompare(b.target));

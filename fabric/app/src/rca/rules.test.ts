@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { analyzeErrorsResult } from "./errors";
-import { analyzeLocking } from "./locking";
+import { analyzeLocking, blockingEpisodes, chainsOf } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
-import type { MetricPoint } from "./types";
+import type { MetricPoint, RcaTarget, SessionSample } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 
@@ -43,6 +43,32 @@ describe("blocking (INV-01) on T1's chain", () => {
 
     it("says nothing the workload planned", () => {
         expect(namesAScenario(JSON.stringify(a))).toEqual([]);
+    });
+});
+
+/** A session in one blocking sample: what the chain needs, nothing else. */
+const sample = (target: RcaTarget, capturedAt: Date, session: number, blockedBy: number[]): SessionSample => ({ target, capturedAt, session, blockedBy, status: blockedBy.length ? "suspended" : "sleeping", openTransactions: 1, isDemo: true });
+
+describe("blocking chains, the review of 34a9732", () => {
+    it("counts one formation per target when two targets block at once, with interleaved samples", () => {
+        // T1 sampled every 10 s at :00, T4 every 10 s at :05: together, one sample every 5 s.
+        const rows: SessionSample[] = [];
+        for (let s = 0; s < 60; s += 10) {
+            const t1 = new Date(Date.UTC(2026, 10, 20, 17, 0, s));
+            const t4 = new Date(Date.UTC(2026, 10, 20, 17, 0, s + 5));
+            rows.push(sample("T1", t1, 51, []), sample("T1", t1, 52, [51]), sample("T4", t4, 61, []), sample("T4", t4, 62, [61]));
+        }
+        const episodes = blockingEpisodes(rows);
+        expect(episodes.map((e) => [e.target, e.cycles, e.samples])).toEqual(expect.arrayContaining([["T1", 1, 6], ["T4", 1, 6]]));
+    });
+
+    it("puts a session that waits on a special owner under it, never as a head of its own", () => {
+        // Session 10 waits on -2 (an orphaned distributed transaction), and session 11 waits on 10.
+        const t = at("17:00:00");
+        const chains = chainsOf([sample("T1", t, 10, [-2]), sample("T1", t, 11, [10])]);
+        expect(chains).toHaveLength(1);
+        expect(chains[0]).toMatchObject({ headKind: "special", blocked: 2, depth: 3 });
+        expect(chains[0].head.session).toBe(-2);
     });
 });
 
@@ -101,5 +127,34 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         ];
         const a = analyzeReplicaLag({ at: at("16:30:00"), metrics: restart, samples: [], events: [] });
         expect(a.rootCause?.ruleIds).toEqual(["REPL-CATCHUP"]);
+    });
+
+    // The review of 34a9732: asked about 12:20 with the 166 s spike at 12:14, it answered that the lag "rose … to 0.6 s"
+    // and "grew 1 s per second", a rise that never happened.
+    it("explains the window's rise before the asked minute, never a sub-floor point after it", () => {
+        const a = analyzeReplicaLag({ at: at("17:20:00"), metrics: LIVE_LAG, samples: [], events: [] });
+        expect(a.rootCause?.statement).toMatch(/^Read Replica Lag rose from 17:12:00 to 166 s at 17:14:00 UTC .* and was back to 1 s at 17:15:00 UTC; it grew 1\.0\d s per second\./);
+        expect(a.rise?.peak.value).toBe(166);
+    });
+
+    it("says there's no lag when nothing in the window reached the floor", () => {
+        const calm = LIVE_LAG.filter((p) => (p.value ?? 0) < 5);
+        const a = analyzeReplicaLag({ at: at("17:16:00"), metrics: calm, samples: [], events: [] });
+        expect(a.rise).toBeNull();
+        expect(a.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-NO-LAG"] });
+        expect(a.rootCause?.statement).toMatch(/^Read Replica Lag stayed under 5 s in these minutes, at most 1 s at 17:15:00 UTC/);
+        expect(a.rootCause?.statement).not.toMatch(/rose|grew/);
+    });
+
+    it("gives a rate only from two rising points", () => {
+        const one: MetricPoint[] = [
+            { target: "T4-replica", at: at("16:59:00"), metric: LAG_METRIC, value: 0.5 },
+            { target: "T4-replica", at: at("17:00:00"), metric: LAG_METRIC, value: 30 },
+            { target: "T4-replica", at: at("17:01:00"), metric: LAG_METRIC, value: 0.7 },
+        ];
+        const a = analyzeReplicaLag({ at: at("17:00:00"), metrics: one, samples: [], events: [] });
+        expect(a.rise?.slope).toBeNull();
+        expect(a.rootCause?.statement).not.toMatch(/per second/);
+        expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
     });
 });

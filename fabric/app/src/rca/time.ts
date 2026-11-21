@@ -11,9 +11,10 @@ export function offsetMs(at: Date, timeZone: string): number {
 
 /**
  * The UTC instant of a time the viewer typed: "11:56", "11:56:30", "12:14 UTC", or an ISO timestamp. Bare times are on
- * `day` (the newest day in the history, as the system message anchors "today") in `timeZone`.
+ * `day` (the newest day in the history, as the system message anchors "today") in `timeZone`; UTC times are on the UTC
+ * day of `newest`, the history's newest time, since the viewer's own date can be a day off from it (the review of 34a9732).
  */
-export function resolveTime(text: string, day: Date, timeZone: string): Date | null {
+export function resolveTime(text: string, day: Date, timeZone: string, newest?: Date): Date | null {
     const t = text.trim();
     if (/^\d{4}-\d{2}-\d{2}T/.test(t)) {
         const d = new Date(t);
@@ -26,8 +27,11 @@ export function resolveTime(text: string, day: Date, timeZone: string): Date | n
     const second = Number(m[3] ?? 0);
     if (m[4]) hour = (hour % 12) + (m[4].toLowerCase() === "pm" ? 12 : 0);
     if (hour > 23 || minute > 59 || second > 59) return null;
+    if (m[5]) {
+        const d = newest ?? day;
+        return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour, minute, second));
+    }
     const guess = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour, minute, second);
-    if (m[5]) return new Date(guess);
     // Two passes settle the offset across a daylight-saving change.
     let at = guess - offsetMs(new Date(guess), timeZone);
     at = guess - offsetMs(new Date(at), timeZone);

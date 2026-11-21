@@ -102,12 +102,12 @@ function windowOf(args: Record<string, unknown>, deps: InvestigationDeps): { fro
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
     const num = (k: string, d: number) => (typeof args[k] === "number" && Number.isFinite(args[k]) ? Math.max(0, Math.min(120, args[k] as number)) : d);
     if (str("from") && str("to")) {
-        const from = resolveTime(str("from")!, deps.latestDay, deps.timeZone);
-        const to = resolveTime(str("to")!, deps.latestDay, deps.timeZone);
+        const from = resolveTime(str("from")!, deps.latestDay, deps.timeZone, deps.latest);
+        const to = resolveTime(str("to")!, deps.latestDay, deps.timeZone, deps.latest);
         if (!from || !to || to <= from) return "from and to must be times, with from before to.";
         return { from, to };
     }
-    const at = str("at") ? resolveTime(str("at")!, deps.latestDay, deps.timeZone) : null;
+    const at = str("at") ? resolveTime(str("at")!, deps.latestDay, deps.timeZone, deps.latest) : null;
     if (!at && !str("at") && deps.latest) return { from: new Date(deps.latest.getTime() - NEWEST_MINUTES * MIN), to: deps.latest };
     if (!at) return "Give at (a time), or from and to.";
     return { ...windowAround(at, num("minutesBefore", 5), num("minutesAfter", 5)), at };

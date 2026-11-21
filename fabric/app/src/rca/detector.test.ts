@@ -101,6 +101,34 @@ describe("the blind detector on the contract's fixtures", () => {
         expect(deadlocks[0].peak).toBe(1);
     });
 
+    // The review of 34a9732: a SQL Server deadlock shows as its graph and as its victim's 1205, and both were counted.
+    it("counts a SQL Server deadlock once, by its graph, never again by its victim's error", () => {
+        const evidence = emptyEvidence();
+        const t = at("16:55:00");
+        evidence.events.push(
+            { target: "T1", at: t, kind: "deadlock", name: "xml_deadlock_report", count: 1, detail: "A deadlock graph." },
+            { target: "T1", at: t, kind: "error", name: "error_reported", code: "1205", count: 1, detail: "Transaction was deadlocked: chosen as the victim." },
+        );
+        const deadlocks = findEpisodes({ evidence }, at("16:50:00"), at("17:00:00")).filter((e) => e.family === "deadlock");
+        expect(deadlocks).toHaveLength(1);
+        expect(deadlocks[0].peak).toBe(1);
+        // Without a graph, the victim's error stands for the deadlock.
+        const errorsOnly = emptyEvidence();
+        errorsOnly.events.push({ target: "T3", at: t, kind: "error", name: "error_reported", code: "1205", count: 1, detail: "Transaction was deadlocked." });
+        expect(findEpisodes({ evidence: errorsOnly }, at("16:50:00"), at("17:00:00")).filter((e) => e.family === "deadlock").map((e) => e.peak)).toEqual([1]);
+    });
+
+    // The review of 34a9732: a capture anywhere in the window hid Database Hub's episodes everywhere in it.
+    it("keeps Database Hub's blocking episodes outside the minutes the observer captured", () => {
+        const evidence = emptyEvidence();
+        evidence.coverage.push({ target: "T1", from: at("14:00:00"), to: at("14:10:00"), captured: true, sources: ["RCA-SQL-01"], gaps: [] });
+        // T1's bins, a minute apart from 13:30: blocked at 14:03 to 14:07, inside the capture, and at 14:40 to 14:44, outside it.
+        const bins: Bin[] = Array.from({ length: 90 }, (_, i) => ({ at: m(i), target: "T1", cpu: 5, blocked: (i >= 33 && i < 38) || (i >= 70 && i < 75) ? 3 : 0, lockWaitS: 0, bufferIoS: 0, logRateS: 0, waitS: 0, ioMb: 0, batch: 0, sessions: 0 }));
+        expect(episodesFromBins(bins).filter((e) => e.family === "blocking")).toHaveLength(2);
+        const blocking = findEpisodes({ evidence, bins }, at("13:30:00"), at("15:00:00")).filter((e) => e.family === "blocking");
+        expect(blocking.map((e) => e.start.toISOString().slice(11, 16))).toEqual(["14:40"]);
+    });
+
     it("prefers T3's 15-second resource rows to Database Hub's bins for its CPU", () => {
         const evidence = emptyEvidence();
         for (let s = 0; s < 40 * 4; s++) {

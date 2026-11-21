@@ -26,10 +26,10 @@ export const ERROR_CLASSES: ErrorClass[] = [
     { id: "service-unavailable", title: "Timeouts and unavailability (408, 503)", codes: ["408", "503"], cause: "Requests timed out or the service couldn't be reached.", followUp: "triage_window", recommendationIds: ["RU-RETRY"] },
 ];
 
-/** PostgreSQL's SQLSTATE classes (the first two characters), for codes no class above lists. */
 /** The event name of an error count that comes from Azure Monitor's metrics (Telemetry Snapshots), not the event session. */
 export const AZURE_MONITOR = "Azure Monitor";
 
+/** PostgreSQL's SQLSTATE classes (the first two characters), for codes no class above lists. */
 export const PG_SQLSTATE_CLASS: Record<string, string> = {
     "08": "Connection exception",
     "22": "Data exception",
@@ -43,11 +43,14 @@ export const PG_SQLSTATE_CLASS: Record<string, string> = {
     "58": "System error",
 };
 
+const POSTGRES_TARGETS: readonly RcaTarget[] = ["T4", "T4-replica"];
+
 export function classOf(e: EventRow): ErrorClass | { id: string; title: string; codes: string[]; cause: string; followUp: string; recommendationIds: string[] } {
     const code = e.kind === "attention" ? "attention" : e.code === "40001" && e.target === "T4-replica" ? "40001-replica" : e.code ?? "";
     const known = ERROR_CLASSES.find((c) => c.codes.includes(code));
     if (known) return known;
-    if (/^[0-9A-Z]{5}$/.test(code) && PG_SQLSTATE_CLASS[code.slice(0, 2)]) {
+    // SQLSTATE classes are PostgreSQL's: on SQL Server, 40197 or 40552 is an error number, not class 40 (the review of 34a9732).
+    if (POSTGRES_TARGETS.includes(e.target) && /^[0-9A-Z]{5}$/.test(code) && PG_SQLSTATE_CLASS[code.slice(0, 2)]) {
         return { id: `sqlstate-${code.slice(0, 2)}`, title: `SQLSTATE class ${code.slice(0, 2)}: ${PG_SQLSTATE_CLASS[code.slice(0, 2)]}`, codes: [code], cause: "See PostgreSQL's error codes appendix.", followUp: "triage_window", recommendationIds: [] };
     }
     return { id: "other", title: "Other errors", codes: [code], cause: "Unclassified.", followUp: "triage_window", recommendationIds: [] };

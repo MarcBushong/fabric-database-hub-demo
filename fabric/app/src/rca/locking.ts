@@ -51,7 +51,8 @@ export function chainsOf(rows: readonly SessionSample[]): Chain[] {
     }
     const isBlocked = (s: number) => {
         const r = bySession.get(s);
-        return !!r && r.blockedBy.some((b) => b !== 0 && b > 0 && bySession.has(b));
+        // Any blocker counts, a special owner (a negative ID) too, so a session waiting on one sits under it, never as a head of its own (the review of 34a9732).
+        return !!r && r.blockedBy.some((b) => b !== 0);
     };
     const heads = [...children.keys()].filter((s) => s < 0 || !isBlocked(s));
     const chains: Chain[] = [];
@@ -126,12 +127,16 @@ export interface BlockingEpisode {
 }
 
 /** Chains across samples, per target and head blocker: when they formed, how often, and their peak. The capture keeps no
- *  rows while no chain exists, so a formation ends where its samples stop for more than 1.5 sample intervals. */
+ *  rows while no chain exists, so a formation ends where its samples stop for more than 1.5 of its target's sample
+ *  intervals: each target's own, since two targets sampled at once would otherwise halve it (the review of 34a9732). */
 export function blockingEpisodes(rows: readonly SessionSample[]): BlockingEpisode[] {
     const samples = [...groupSamples(rows).values()].sort((a, b) => a[0].capturedAt.getTime() - b[0].capturedAt.getTime());
-    const times = samples.map((s) => s[0].capturedAt.getTime());
-    const gaps = times.slice(1).map((t, i) => t - times[i]).sort((a, b) => a - b);
-    const interval = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 10000;
+    const intervals = new Map<RcaTarget, number>();
+    for (const target of new Set(samples.map((s) => s[0].target))) {
+        const times = samples.filter((s) => s[0].target === target).map((s) => s[0].capturedAt.getTime());
+        const gaps = times.slice(1).map((t, i) => t - times[i]).sort((a, b) => a - b);
+        intervals.set(target, gaps.length ? gaps[Math.floor(gaps.length / 2)] : 10000);
+    }
     const episodes = new Map<string, BlockingEpisode & { lastSeen: number }>();
     samples.forEach((sample) => {
         for (const chain of chainsOf(sample)) {
@@ -146,7 +151,7 @@ export function blockingEpisodes(rows: readonly SessionSample[]): BlockingEpisod
                 });
                 continue;
             }
-            if (now - known.lastSeen > 1.5 * interval) known.cycles += 1;
+            if (now - known.lastSeen > 1.5 * (intervals.get(chain.target) ?? 10000)) known.cycles += 1;
             known.lastSeen = now;
             if (chain.head.row?.idleMs !== undefined) known.maxIdleMs = Math.max(known.maxIdleMs ?? 0, chain.head.row.idleMs);
             known.last = chain.at;
