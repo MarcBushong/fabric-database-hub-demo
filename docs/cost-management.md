@@ -19,7 +19,7 @@ Without Defender for Cloud:
 | T4's read replica, during a session only | $0.36 | Nothing: it's deleted |
 | T5's container (400 RU/s), during a session only | $0.03 | $7.80: the account's private endpoint and DNS zone |
 | Ask's chat relay, only while someone uses the chat | $0.11 | Nothing: it scales to zero |
-| The session control and the nightly safety stop | Nothing | $0.03 in vault operations (their job minutes fit in the 500 free) |
+| The session control and the nightly safety stop | Nothing | $0.03 in vault operations (a light-use month's job minutes fit in the 500 free) |
 | **Total** | **$3.11** | **$42.69** |
 | Bastion, only with `start-demo.ps1 -Interactive` | $0.20 | Nothing: `stop-demo.ps1` removes it |
 
@@ -205,7 +205,7 @@ Ask, the Copilot chat in the Insights app, runs its relay in an Azure Container 
 The session control behind **Run all** is part of every deployment ([ADR 0026](adr/0026-one-run-all-session.md)); `control.enabled: false` doesn't turn it off. Its resources in `rg-<prefix>-control` bill until `destroy.ps1` deletes them, or `setup-activity-control.ps1 -Remove` deletes the control alone. List prices in USD for West US 3, with no Defender plan counted:
 
 - **Key Vault (Standard),** per 10,000 operations, for the webhook's URL and the session's status and metrics: one block a month in the estimate, $0.03 (2026-11-19).
-- **Azure Automation (Basic),** per job minute after the 500 a month that are included. A session's `DbHub-Control` job takes 2 to 20 minutes and `DbHub-Stop` 1 to 3, so about 25 to 50 sessions a month fit; past them, about $0.04 a session (2026-11-03). The estimate prices 60 job minutes, $0.
+- **Azure Automation (Basic),** per job minute after the 500 a month that are included. A session's `DbHub-Control` job takes 2 to 20 minutes, plus up to 51 while it follows T2's Run Command after a cold start (since 2026-11-20, [ADR 0026](adr/0026-one-run-all-session.md#2026-11-20-amendment-a-target-whose-activity-is-set-after-the-sessions-start)), and `DbHub-Stop` 1 to 3. Beside the nightly safety stop's 60 to 120 minutes ([below](#dated-example-the-nightly-safety-stop-2026-11-05)), about 5 sessions a month fit when each follows T2 for the full 51 minutes, and about 20 to 45 otherwise; past them, $0.002 a minute (2026-11-03): about $0.04 a session, up to about $0.15 after a cold start. The estimate prices 80 job minutes a session for the sessions of its light-use month (2 at the defaults: 160 minutes, $0), and what passes the 500 included, less the nightly stop's 120, at the next tier.
 - **No charge:** the webhook, the schedules, the identity, and the role assignments. Fabric's managed private endpoints and virtual networks have no separate meter; the control notebook uses the Fabric capacity like any notebook.
 
 ## Dated example: the nightly safety stop (2026-11-05)

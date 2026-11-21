@@ -757,12 +757,27 @@ Describe 'Get-DemoCostEstimate' {
         $operations.Meter | Should -Be 'Key Vault / Standard / Operations'
         $operations.Quantity | Should -Be 1
         $operations.Basis | Should -Be 'idle'
-        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced.
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. Two sessions in the
+        # light-use month (10 hours of 5), at 80 minutes each, with the nightly stop's 120, stay within them.
         $minutes = $with.Components | Where-Object { $_.Name -like 'Activity control job minutes*' }
+        @($minutes).Count | Should -Be 1
         $minutes.UnitPrice | Should -Be 0
-        $minutes.Quantity | Should -Be 60
+        $minutes.Quantity | Should -Be 160
         $operations.Cost | Should -Be 0.03
         $with.MissingPrices | Should -BeNullOrEmpty
+    }
+
+    It 'prices the session control''s job minutes past the 500 included at the next tier, 80 a session, with the time it follows T2 after a cold start (2026-11-20)' {
+        # Business hours: 176 hours of 5 are 36 sessions, 2,880 minutes; the nightly stop's 120 leave 380 of the 500.
+        $busy = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 176 -BastionHours 1 -NetworkMode public
+        $included = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes (the first 500 a month are included)' }
+        $included.Quantity | Should -Be 380
+        $included.Cost | Should -Be 0
+        $paid = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }
+        $paid.Quantity | Should -Be 2500
+        $paid.UnitPrice | Should -Be 0.002
+        $paid.Cost | Should -Be 5
+        $busy.MissingPrices | Should -BeNullOrEmpty
     }
 
     It 'subtracts the free-offer allowance from the light-use month and keeps the session at list price' {

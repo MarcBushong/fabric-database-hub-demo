@@ -509,13 +509,23 @@ function Get-DemoCostEstimate {
     # 2 to 4 minutes, more on a night it waits up to 10 minutes for a T4 that's starting. A ceiling: 120 job minutes a month.
     Add-Component 'Nightly safety stop job minutes (the first 500 a month are included)' 'idle' $automationItem 120 'minute'
 
-    # The optional on-demand activity control (ADR 0020), in rg-<prefix>-control: the vault bills per 10,000 operations
-    # and an on-demand run reads its one secret once, and Automation includes the first 500 job minutes a month, while
-    # a run's jobs take a few minutes. So these are ceilings: one block of operations, and 60 job minutes a month.
+    # The session control (ADR 0020, ADR 0026), in rg-<prefix>-control: the vault bills per 10,000 operations and a session
+    # reads its few secrets a few times, so one block of operations is a ceiling. Automation includes the first 500 job
+    # minutes a month. A session's jobs: DbHub-Control's start, 2 to 20 minutes, plus up to 51 while it follows T2's Run
+    # Command after a cold start (2026-11-20, ADR 0026), its stop or DbHub-Stop, up to 3, and DbHub-Monitor's re-checks, a
+    # few: a ceiling of 80 minutes a session, for the light-use month's sessions. What the nightly stop's 120 leave of the
+    # 500 is priced at the included tier, and the rest at the next one.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
-        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem 60 'minute'
+        $sessionsPerMonth = [System.Math]::Ceiling($LightUseHoursPerMonth / [System.Math]::Max(1.0, [double]$DemoHours))
+        $controlMinutes = $sessionsPerMonth * 80
+        $includedMinutes = [System.Math]::Min($controlMinutes, [System.Math]::Max(0, 500 - 120))
+        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem $includedMinutes 'minute'
+        if ($controlMinutes -gt $includedMinutes) {
+            $paidItem = $automationItems | Where-Object { [double]$_.tierMinimumUnits -gt 0 } | Sort-Object -Property { [double]$_.tierMinimumUnits } | Select-Object -First 1
+            Add-Component 'Activity control job minutes past the 500 included' 'idle' $paidItem ($controlMinutes - $includedMinutes) 'minute'
+        }
     }
 
     # Microsoft Defender for Cloud, from the subscription's plans.
