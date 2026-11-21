@@ -852,6 +852,25 @@ Describe 'Cost area' {
         ($results | Where-Object { $_.checkId -eq 'COST.BUDGET' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }).status | Should -Be 'Warning'
     }
+
+    It 'names an auto-shutdown that deploy.ps1 moved for a deferred nightly stop, with the commands that put it back (F27)' {
+        # Live (dbhubfr at bf010ed): after a Run all session in the grace of a run the nightly stop waited for, both VMs still
+        # shut down at 22:15, and validate.ps1 said only to deploy again.
+        $script:schedule.properties.dailyRecurrence.time = '2215'
+        $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
+        $context = New-TestContext
+        $context.Results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'estimate'))
+        $context.Tags['DbHubAutoShutdownMoved'] = '2215'
+        $moved = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X }) | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }
+        $moved.status | Should -Be 'Warning'
+        $moved.message | Should -Match 'sqlvm01 shuts down at 2215 Pacific Standard Time, not 1900 Pacific Standard Time, where deploy\.ps1 moved it for a run the nightly stop waited for'
+        $moved.remediation | Should -Be 'Run ./scripts/stop-demo.ps1 or ./scripts/start-demo.ps1, which put it back at 1900, as the next ./scripts/deploy.ps1 does; until then, a Run all session ends before it (ADR 0024).'
+        # A time nothing recorded is still the configuration's to restore.
+        $context.Tags.Remove('DbHubAutoShutdownMoved')
+        $other = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X }) | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }
+        $other.message | Should -Not -Match 'moved it'
+        $other.remediation | Should -Be 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.'
+    }
 }
 
 Describe 'Security area' {

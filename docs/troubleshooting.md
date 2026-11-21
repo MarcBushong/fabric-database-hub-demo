@@ -568,6 +568,7 @@ Every `deploy.ps1` sets it up. Each evening it deallocates the VMs, stops T4 and
 | `STATUS.NIGHTLYSTOP` **Warning**: "The VMs' auto-shutdown is moved ... No run keeps it there" | `start-demo.ps1`, `stop-demo.ps1`, or `deploy.ps1` puts it back at `autoShutdownTime`; until then a Run all session ends before it (since 2026-11-21) |
 | Run all's **Plan** step: "This session runs 30 of the 90 minutes asked ... before the VMs' auto-shutdown at 22:15 ..., where deploy.ps1 moved it for a run the nightly stop waited for" (since 2026-11-21): the session control can't move the VMs' auto-shutdown, so a session ends before it rather than lose its VMs there | Run all after that time for a full session, or `./scripts/stop-demo.ps1` first, which puts it back ([ADR 0024](adr/0024-nightly-safety-stop.md#amendment-a-run-all-session-and-a-moved-auto-shutdown-f25-2026-11-21)) |
 | `START.NIGHTLYSTOP` or `STOP.NIGHTLYSTOP` **Warning**: "not all of it was put back" | Run the script again |
+| `COST.AUTOSHUTDOWN` **Warning**: "sqlvm01 shuts down at 2215 ..., not 1900 ..., where deploy.ps1 moved it for a run the nightly stop waited for" (since 2026-11-21): a Run all session ran in that run's grace, and nothing has put the auto-shutdown back since | `./scripts/stop-demo.ps1` or `./scripts/start-demo.ps1` puts it back, and so does the next `./scripts/deploy.ps1`; until then, a Run all session ends before it. The nightly safety stop still runs at `autoShutdownTime`, so nothing bills longer |
 
 ### Set the safety stop up alone
 

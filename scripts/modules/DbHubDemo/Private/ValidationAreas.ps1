@@ -744,6 +744,10 @@ function Invoke-DemoValidationCost {
     $problems = [System.Collections.Generic.List[string]]::new()
     $missing = [System.Collections.Generic.List[string]]::new()
     $checked = [System.Collections.Generic.List[string]]::new()
+    # A time that deploy.ps1 moved for a run the nightly stop waited for, recorded in DbHubAutoShutdownMoved (F25, F27):
+    # start-demo.ps1 and stop-demo.ps1 put it back, even after a Run all session cleared the busy marker.
+    $movedClocks = @(([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Context -Name 'Tags') -Name (Get-DemoDeploymentStateTagName)['AutoShutdownMoved'])) -split ',' | Where-Object { $_ })
+    $otherwise = $false
     foreach ($vmName in @($Context.VmNames.Values)) {
         # Named, not --ids: Invoke-DemoAz adds --subscription to every call (as Invoke-DemoArcMonitoringUpdate does).
         $schedule = Read-DemoValidationAzJson -SubscriptionId $Context.SubscriptionId -ArgumentList @('resource', 'show', '--resource-group', $group, '--name', ('shutdown-computevm-{0}' -f $vmName), '--resource-type', 'Microsoft.DevTestLab/schedules')
@@ -758,17 +762,26 @@ function Invoke-DemoValidationCost {
         $checked.Add(('{0} {1} {2} ({3})' -f $vmName, $scheduleTime, $scheduleZone, $scheduleStatus))
         if ($scheduleStatus -ne 'Enabled') {
             $problems.Add(('{0}''s schedule is {1}' -f $vmName, $scheduleStatus))
+            $otherwise = $true
         }
         elseif ($scheduleTime -ne $time -or $scheduleZone -ne $zone) {
-            $problems.Add(('{0} shuts down at {1} {2}, not {3} {4}' -f $vmName, $scheduleTime, $scheduleZone, $time, $zone))
+            $recorded = $scheduleZone -eq $zone -and $scheduleTime -in $movedClocks
+            $problems.Add(('{0} shuts down at {1} {2}, not {3} {4}{5}' -f $vmName, $scheduleTime, $scheduleZone, $time, $zone, $(if ($recorded) { ', where deploy.ps1 moved it for a run the nightly stop waited for' } else { '' })))
+            if (-not $recorded) {
+                $otherwise = $true
+            }
         }
     }
-    $evidence = [ordered]@{ schedules = $checked.ToArray(); configured = ('{0} {1}' -f $time, $zone) }
+    $evidence = [ordered]@{ schedules = $checked.ToArray(); configured = ('{0} {1}' -f $time, $zone); autoShutdownMoved = $movedClocks }
     if ($missing.Count -gt 0) {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Fail' -Message ('No auto-shutdown schedule for {0}, so it runs until someone stops it.' -f ($missing -join ', ')) -Evidence $evidence -Remediation 'Deploy again (deploy.ps1 -Resume); the template creates the schedules (ADR 0016).' -DocUrl $scheduleDoc))
     }
     elseif ($problems.Count -gt 0) {
-        $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Warning' -Message ('The auto-shutdown schedules differ from the configuration: {0}.' -f ($problems -join '; ')) -Evidence $evidence -Remediation 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.' -DocUrl $scheduleDoc))
+        $fix = 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.'
+        if (-not $otherwise) {
+            $fix = 'Run ./scripts/stop-demo.ps1 or ./scripts/start-demo.ps1, which put it back at {0}, as the next ./scripts/deploy.ps1 does; until then, a Run all session ends before it (ADR 0024).' -f $time
+        }
+        $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Warning' -Message ('The auto-shutdown schedules differ from the configuration: {0}.' -f ($problems -join '; ')) -Evidence $evidence -Remediation $fix -DocUrl $scheduleDoc))
     }
     elseif ($checked.Count -gt 0) {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Pass' -Message ('Auto-shutdown is enabled at {0} {1} for {2}.' -f $time, $zone, (@($Context.VmNames.Values) -join ' and ')) -Evidence $evidence -DocUrl $scheduleDoc))

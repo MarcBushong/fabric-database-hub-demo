@@ -4494,3 +4494,21 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - The other workers also pause for 7 seconds 20 and 40 seconds after the switch, whether or not a second switch comes, since the workers don't talk to each other. The dip is too short to see on 1-minute charts.
 - The live view's 30% floor fits T3's 2 vCores under the beat's six sessions: 99% with the regression in the session of 2026-11-19, and 6% without it in F26.
 - A plan that can't be read (no permission, or none cached) is `plan-switch-unverified` with the reason, and the live view's CPU check still tells the presenter.
+
+### stop-demo.ps1 settles a deferred night after a Run all session (F27, 2026-11-21)
+
+**Why.** Found live on `dbhubfr`'s net-new deployment at bf010ed:
+
+- DONE at 21:08 had deferred the nightly stop and moved the VMs' auto-shutdown to 22:15.
+- A Run all session from 21:13 to 21:48, in the grace, replaced the `deploy-grace` busy marker with its own and cleared it at its end.
+- `stop-demo.ps1 -SaveHistory` at 22:03 settles the nightly stop only when the marker holds something, so it printed no `STOP.NIGHTLYSTOP`.
+- At 22:25, both VMs' auto-shutdown was still 22:15, and `dbhub-safety-deferred` ran hourly until 07:30.
+- `validate.ps1`'s `COST.AUTOSHUTDOWN` warned that the time differs, with only "deploy again" as the fix.
+
+**Work summary.** Item 12 (f9d1597) already keeps the moved time in the demo resource group's `DbHubAutoShutdownMoved` tag. `Resolve-DemoBusyNightlyStop` acts on that tag when the marker is empty, so `stop-demo.ps1` and `start-demo.ps1` now settle this case. This change adds the live repro as a test, with the deferred pass still there: `STOP.NIGHTLYSTOP` is a **Pass** that removes the pass and puts both auto-shutdowns back. It also makes `COST.AUTOSHUTDOWN` name a time the tag recorded ("where deploy.ps1 moved it for a run the nightly stop waited for"). Its fix then names `./scripts/stop-demo.ps1` or `./scripts/start-demo.ps1` and the next `./scripts/deploy.ps1`, and says that a Run all session ends before it until then. Any other difference keeps "deploy again". The session itself still can't put the auto-shutdown back, since the control's role has no DevTest Labs action.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ValidationAreas.ps1`; `tests/unit/DbHubDemo.SafetyStop.Tests.ps1` and `DbHubDemo.Validation.Tests.ps1`; ADR 0024, `docs/deployment.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.SafetyStop` and `DbHubDemo.Validation`. The repro test fails on the code before item 12 (no `STOP.NIGHTLYSTOP`), and the `COST.AUTOSHUTDOWN` test fails without this change. Not run live.
+
+**Risks.** An environment that bf010ed's code left in this state has no tag, so `stop-demo.ps1` can't see the move there; the update's `./scripts/deploy.ps1` puts it back (its template, then its end). The deferred pass, while it's there, finds nothing running once the session has stopped everything.
