@@ -19,6 +19,7 @@ import { FIXTURES, renderWithApp } from "@/test/render";
 import { answerKeyInContext } from "@/test/blind";
 import { findIncidentsAsk, triageAsk } from "@/rca/entry";
 import type { AskContext } from "./contract";
+import { checkDax } from "./tools";
 
 // ADR 0031, decision 7 (the coordinator's call, 2026-11-20): the chat is blind, so no page hands it the demo's answer
 // key. Every "Ask Copilot", "Ask why", and Copilot draft passes measured data only, never an answer-key table or a
@@ -102,10 +103,16 @@ async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>;
 
 const leaksIn = (contexts: readonly AskContext[]) => contexts.map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", leak: answerKeyInContext(ctx) })).filter((x) => x.leak !== null);
 
+/** The contexts whose DAX run_dax would refuse to run again: none may end in a refusal (decision 7), plain ASCII included (the hardening of 9f3d35f). */
+const refusedIn = (contexts: readonly AskContext[]) =>
+    contexts.filter((ctx) => ctx.dax).map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", refusal: checkDax(ctx.dax) })).filter((x) => x.refusal !== null);
+
 describe("every Ask is blind (ADR 0031)", () => {
     for (const { name, Page, view, postmortem, live } of CASES) {
-        it(`${name}: hands the chat measured data only`, async () => {
-            expect(leaksIn(await askAll(Page, { view, postmortem, live }))).toEqual([]);
+        it(`${name}: hands the chat measured data only, and DAX that run_dax runs`, async () => {
+            const contexts = await askAll(Page, { view, postmortem, live });
+            expect(leaksIn(contexts)).toEqual([]);
+            expect(refusedIn(contexts)).toEqual([]);
         });
     }
 

@@ -9,14 +9,32 @@ export const ANSWER_KEY_TABLES = ["Scenario Runs", "Incident Windows", "RCA Answ
 /** The analyses that grade the demo against what it injected: their rows describe the key, not the telemetry. */
 export const ANSWER_KEY_ANALYSES = ["correlation", "database_agent", "blocking"] as const;
 
+/**
+ * Text as the answer-key checks compare names, as leniently as the engine's collation might (the coordinator's hardening
+ * of 9f3d35f). Compatibility forms are folded (fullwidth letters, a long s, ligatures), and accents, invisible characters
+ * (a soft hyphen, zero-width characters), and controls are dropped. Whitespace is flattened, and case is folded, so a
+ * sharp s reads as ss. Analysis Services may compare object names with a collation that's width-insensitive, or that gives
+ * such characters no weight. This fold can't list every character an older collation leaves unweighted, so run_dax also
+ * refuses any character outside plain ASCII in a query's code (tools.ts).
+ */
+export function foldNames(text: string): string {
+    return text
+        .normalize("NFKD")
+        .replace(/\s+/g, " ")
+        .replace(/[\p{M}\p{C}\p{Default_Ignorable_Code_Point}]/gu, "")
+        .replace(/ {2,}/g, " ")
+        .toUpperCase()
+        .toLowerCase();
+}
+
 /** The answer-key table or measure a DAX query names, as the query wrote it, or null when it names none. */
 export function answerKeyIn(dax: string, measures: readonly string[], tables: readonly string[] = ANSWER_KEY_TABLES): string | null {
-    const flat = dax.replace(/\s+/g, " ").toLowerCase();
-    const table = tables.find((t) => flat.includes(t.toLowerCase()));
+    const flat = foldNames(dax);
+    const table = tables.find((t) => flat.includes(foldNames(t)));
     if (table) return table;
     // [ Injected Faults ] too: the check doesn't rely on DAX reading a bracketed name as written.
     const names = flat.replace(/\[ /g, "[").replace(/ \]/g, "]");
-    const measure = measures.find((m) => names.includes(`[${m.toLowerCase()}]`));
+    const measure = measures.find((m) => names.includes(`[${foldNames(m)}]`));
     return measure ? `[${measure}]` : null;
 }
 
@@ -55,7 +73,7 @@ export const WHOLE_MODEL_FUNCTIONS: readonly { name: string; called: RegExp; ref
     },
 ];
 
-/** What run_dax says about the whole-model function a query calls, or null. `code` has its comments, strings, and names blanked. */
+/** What run_dax says about the whole-model function a query calls, or null. `code` has its comments, strings, and names blanked, and its names folded (foldNames). */
 export function wholeModelRefusal(code: string): string | null {
     return WHOLE_MODEL_FUNCTIONS.find((f) => f.called.test(code))?.refusal ?? null;
 }

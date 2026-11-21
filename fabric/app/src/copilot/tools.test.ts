@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ALLOWED_ROUTES, readEstate, type EstateScope, type EstateView } from "../../rayfin/functions/src/estate-core";
+import { catalogForCheck } from "@/data/queries";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
-import { checkDax, createToolRunner, daxCode, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
+import { checkDax, createToolRunner, daxCode, ESTATE_VIEWS, LIVE_NO_ANSWER, LIVE_UNAVAILABLE, plainCodeRefusal, resultForModel, stripDaxComments, toolSpecs, type DaxRun } from "./tools";
 
 // Every route path the estate function can call, as text Copilot must never get (R925 review).
 const ROUTE_TEXT = new RegExp(ALLOWED_ROUTES.map((r) => r.split(" ")[1].replace(/[/.]/g, "\\$&")).join("|"));
+
+/** ASCII text in its fullwidth forms (U+FF01 to U+FF5E), spaces kept: what a lookalike name looks like. */
+const fullwidth = (text: string) => text.replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0));
 
 const rows = [
     { "Bucket UTC": "2026-11-17T10:00:00.000Z", "Target Key": "T1", CpuPct: 41.23456 },
@@ -80,6 +84,71 @@ describe("checkDax", () => {
         expect(checkDax("EVALUATE TOPN ( 5, TABLEOF ( 'Telemetry Snapshots'[Metric] ) )")).toBeNull();
         expect(checkDax(`EVALUATE ROW ( "note", "INFO.VIEW and COLUMNSTATISTICS () aren't run" ) // CALENDARAUTO ()`)).toBeNull();
         expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], \"Info\", [Wait Time (s)] )")).toBeNull();
+    });
+
+    // The coordinator's hardening of 9f3d35f: a key name spelled with lookalike or invisible characters passed the name
+    // check, and the engine may compare names with a collation that doesn't tell them apart (width, a long s, a sharp s,
+    // accents, or characters it gives no weight).
+    it("refuses a key table or measure spelled with lookalike or invisible characters", () => {
+        for (const [what, query, refusal] of [
+            ["fullwidth", `EVALUATE TOPN ( 1, '${fullwidth("Incident Windows")}' )`, /^Incident Windows holds/],
+            ["long s", "EVALUATE TOPN ( 1, 'Analy\u017Fis Findings' )", /^Analysis Findings holds/],
+            ["zero-width joiner", "EVALUATE TOPN ( 1, 'Inci\u200Ddent Windows' )", /^Incident Windows holds/],
+            ["soft hyphen", "EVALUATE TOPN ( 1, 'Scena\u00ADrio Runs' )", /^Scenario Runs holds/],
+            ["an accent", "EVALUATE TOPN ( 1, 'Inc\u00EDdent Windows' )", /^Incident Windows holds/],
+            ["a control inside", "EVALUATE TOPN ( 1, 'Incident\u0000 Windows' )", /^Incident Windows holds/],
+            ["fullwidth measure", `EVALUATE ROW ( "n", [${fullwidth("Injected Faults")}] )`, /^\[Injected Faults\] reads/],
+            ["long s measure", 'EVALUATE ROW ( "n", [Scenario Reque\u017Fts] )', /^\[Scenario Requests\] reads/],
+            ["zero-width joiner measure", 'EVALUATE ROW ( "n", [Injec\u200Dted Faults] )', /^\[Injected Faults\] reads/],
+            ["soft hyphen measure", 'EVALUATE ROW ( "n", [Injected Fa\u00ADults] )', /^\[Injected Faults\] reads/],
+            ["sharp s measure", 'EVALUATE ROW ( "n", [History Freshne\u00DF Label] )', /^\[History Freshness Label\] reads/],
+        ] as const) {
+            expect(checkDax(query), what).toMatch(refusal);
+        }
+        // A whole-model function's name, too, folded before that check.
+        expect(checkDax(`EVALUATE ${fullwidth("COLUMNSTATISTICS")} ()`)).toMatch(/^COLUMNSTATISTICS returns/);
+        expect(checkDax("EVALUATE COLUMN\u200BSTATISTICS ()")).toMatch(/^COLUMNSTATISTICS returns/);
+        expect(checkDax("EVALUATE INFO.VIEW.MEA\u00ADSURES ()")).toMatch(/^INFO functions return/);
+    });
+
+    // Every name in the model is plain ASCII (guide.test.ts), so the fold needn't know every character a collation ignores.
+    it("refuses any other character outside plain ASCII in a query's code, and lets strings and comments hold any text", () => {
+        for (const [what, query, char] of [
+            ["a zero-width joiner for the space", "EVALUATE TOPN ( 1, 'Incident\u200DWindows' )", "U+200D"],
+            ["an emoji, which an older collation may give no weight", "EVALUATE TOPN ( 1, 'Incident \u{1F600}Windows' )", "U+1F600 (\u{1F600})"],
+            ["a Cyrillic I", "EVALUATE TOPN ( 1, '\u0406ncident Windows' )", "U+0406 (\u0406)"],
+            ["a no-break space", "EVALUATE TOPN ( 1, 'Telemetry\u00A0Snapshots' )", "U+00A0"],
+            ["a bell", "EVALUATE TOPN ( 1, 'Telemetry\u0007 Snapshots' )", "U+0007"],
+            ["curly quotes", "EVALUATE TOPN ( 1, \u2018Telemetry Snapshots\u2019 )", "U+2018 (\u2018)"],
+            ["an em dash for a minus", 'EVALUATE ROW ( "n", [CPU (%)] \u2014 1 )', "U+2014 (\u2014)"],
+            // A column the query names itself, too: the rule can't tell it from the model's names, and says to rename it.
+            ["a column the query names", "EVALUATE SUMMARIZECOLUMNS ( 'Target'[Target Key], \"\u0394 CPU\", [CPU (%)] ) ORDER BY [\u0394 CPU]", "U+0394 (\u0394)"],
+        ] as const) {
+            expect(checkDax(query), what).toMatch(/^The query has the character U\+[0-9A-F]{4,5}\b.*plain ASCII/);
+            expect(checkDax(query), what).toContain(`the character ${char} outside a string`);
+        }
+        for (const query of [
+            'EVALUATE ROW ( "Note", "Caf\u00E9 \u00B7 12 \u00B0C \u2014 \u{1F600}\u200B" )',
+            "// R\u00E9sum\u00E9 \u2014 CPU per target\r\nEVALUATE SUMMARIZECOLUMNS ( 'Target'[Target Key], \"\u0394 CPU\", [CPU (%)] )",
+            '/* \u00A0\u200B\u2028 */ EVALUATE ROW ( "a", 1 ) -- fin \u2713',
+        ]) {
+            expect(checkDax(query), query).toBeNull();
+        }
+    });
+
+    // The same hardening: a line comment that ran past a line break the engine honors hid the code after it.
+    it("ends a line comment at any line break the engine might honor, so no code hides behind one", () => {
+        for (const [name, lineBreak] of [["CR", "\r"], ["NEL", "\u0085"], ["LS", "\u2028"], ["PS", "\u2029"]] as const) {
+            expect(checkDax(`EVALUATE ROW ( "a", 1 ) // note${lineBreak}EVALUATE COLUMNSTATISTICS ()`), name).toMatch(/^COLUMNSTATISTICS returns/);
+            expect(checkDax(`EVALUATE ROW ( "a", 1 ) -- note${lineBreak}EVALUATE INFO.VIEW.MEASURES ()`), name).toMatch(/^INFO functions return/);
+        }
+        expect(stripDaxComments('EVALUATE ROW ( "a", 1 ) // note\r\nEVALUATE ROW ( "b", 2 )')).toBe('EVALUATE ROW ( "a", 1 ) \r\nEVALUATE ROW ( "b", 2 )');
+    });
+
+    it("refuses none of the app's own queries for a character: the catalog's code is plain ASCII outside its strings", () => {
+        const catalog = catalogForCheck(new Date(Date.UTC(2026, 10, 17)));
+        expect(catalog.length).toBeGreaterThan(15);
+        for (const spec of catalog) expect(plainCodeRefusal(spec.dax), spec.id).toBeNull();
     });
 
     it("reads strings and names whole when it strips comments, with their doubled quotes", () => {

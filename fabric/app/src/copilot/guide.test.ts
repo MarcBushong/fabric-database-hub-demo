@@ -113,6 +113,15 @@ describe("the model guide", () => {
         expect(calculated.map((t) => t.name)).toEqual(expect.arrayContaining(["Analysis", "Date", "Signal", "Status", "Target"]));
     });
 
+    // The coordinator's hardening of 9f3d35f: run_dax refuses any character outside plain ASCII in a query's code, which
+    // costs the chat no query only while every name it may query is plain ASCII.
+    it("names every table, column, measure, and hierarchy the chat may query in plain ASCII", () => {
+        const blind = readModel().tables.filter((t) => !(ANSWER_KEY_TABLES as readonly string[]).includes(t.name));
+        const names = blind.flatMap((t) => [t.name, ...[...t.text.matchAll(/^\s*(?:column|measure|hierarchy|level|calculationItem|calendar)\s+('(?:[^']|'')+'|[^\s=]+)/gm)].map((m) => m[1])]);
+        expect(names.length).toBeGreaterThan(250);
+        expect(names.filter((name) => /[^\x20-\x7E]/.test(name))).toEqual([]);
+    });
+
     it("finds each way a model change could let a query reach the key without naming it", () => {
         const table = (name: string, ...lines: string[]) => ({ name, text: [`table '${name}'`, ...lines].join("\n") });
         const relationship = (from: string, to: string, ...properties: string[]) =>
@@ -135,6 +144,8 @@ describe("the model guide", () => {
             ["a calculation item", { tables: [table("Lens", "    calculationGroup", "        calculationItem Key = CALCULATE ( SELECTEDMEASURE (), [ Injected Faults ] > 0 )")] }, /'Lens' calculationGroup reads \[Injected Faults\]/],
             ["a measure the refused list missed", { tables: [table("Facts", "    measure Leak = COUNTROWS ( 'Analysis Findings' )")] }, /'Facts' measure Leak = .* reads Analysis Findings/],
             ["a model function", { other: [{ file: "functions.tmdl", text: "function Faults = () => 'RCA Answer Key'" }] }, /functions\.tmdl reads RCA Answer Key/],
+            // The coordinator's hardening of 9f3d35f: a name in lookalike or invisible characters reads the key too.
+            ["a lookalike name", { tables: [table("Facts", "    column Leak = RELATED ( 'Scena\u00ADrio Runs'[Scenario] )", "        dataType: string")] }, /'Facts' column Leak = RELATED .* reads Scenario Runs/],
         ];
         for (const [what, change, problem] of broken) expect(denylistProblems({ ...clean, ...change }, ["Injected Faults"]).join("\n"), what).toMatch(problem);
         expect(denylistProblems(clean, ["Injected Faults"], ["Scenario Runs", "Runs"])).toEqual(["'Runs' has no space in its name, so DAX could name it without quotes."]);

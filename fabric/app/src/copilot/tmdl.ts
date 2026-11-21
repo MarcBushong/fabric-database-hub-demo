@@ -2,6 +2,8 @@
 // measures, and the rows of its small calculated tables, plus the relationships. scripts/build-model-guide.ts
 // writes it to model-guide.generated.ts, and a test keeps that file in step with the TMDL.
 
+import { foldNames } from "./answer-key";
+
 export interface TmdlColumn {
     name: string;
     dataType: string;
@@ -166,8 +168,8 @@ export function tableMembers(text: string): TmdlMember[] {
     return out;
 }
 
-/** DAX as the answer-key checks compare it: whitespace flattened, lowercase, and [ name ] read as [name] (answer-key.ts). */
-const comparable = (dax: string) => dax.replace(/\s+/g, " ").toLowerCase().replace(/\[ /g, "[").replace(/ \]/g, "]");
+/** DAX as the answer-key checks compare it (answer-key.ts, foldNames), with [ name ] read as [name]. */
+const comparable = (dax: string) => foldNames(dax).replace(/\[ /g, "[").replace(/ \]/g, "]");
 
 /** A column or measure reference in DAX form: 'Table'[Name]. */
 const ref = (table: string, name: string) => `'${table.replace(/'/g, "''")}'[${name}]`;
@@ -178,12 +180,12 @@ const ref = (table: string, name: string) => `'${table.replace(/'/g, "''")}'[${n
  */
 export function reachesAnswerKey(tables: TmdlTable[], keyTables: readonly string[]): string[] {
     const measures = tables.flatMap((t) => t.measures.map((m) => ({ table: t.name, name: m.name, body: comparable(m.body) })));
-    const reached = new Set(measures.filter((m) => keyTables.includes(m.table) || keyTables.some((k) => m.body.includes(k.toLowerCase()))).map((m) => m.name));
+    const reached = new Set(measures.filter((m) => keyTables.includes(m.table) || keyTables.some((k) => m.body.includes(foldNames(k)))).map((m) => m.name));
     for (let grew = true; grew; ) {
         grew = false;
         for (const m of measures) {
             if (reached.has(m.name)) continue;
-            if ([...reached].some((name) => m.body.includes(`[${name.toLowerCase()}]`))) {
+            if ([...reached].some((name) => m.body.includes(`[${foldNames(name)}]`))) {
                 reached.add(m.name);
                 grew = true;
             }
