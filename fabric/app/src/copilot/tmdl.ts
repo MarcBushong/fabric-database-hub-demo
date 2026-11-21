@@ -137,33 +137,58 @@ export function tableOfRef(tmdlRef: string): string {
 }
 
 export interface TmdlMember {
-    /** column, measure, partition, calculationGroup, and so on, or the name of a property of the table itself. */
+    /** column, measure, partition, expression, calculationGroup, and so on, or the name of a property of the table itself. */
     kind: string;
     /** Its name, unquoted, when it has one. */
     name: string;
-    /** Its line and every line under it, without the /// descriptions. */
+    /** Its line and every line under it, its ``` blocks included, without the /// descriptions. */
     text: string;
 }
 
 /** A TMDL table file's members and the table's own properties, each with every line under it: all the DAX it holds. */
 export function tableMembers(text: string): TmdlMember[] {
-    const lines = text
-        .replace(/\r\n/g, "\n")
-        .split("\n")
-        .filter((l) => l.trim() && !l.trim().startsWith("///"));
-    const levels = lines.map(indentOf).filter((n) => n > 0);
-    const level = levels.length > 0 ? Math.min(...levels) : 0;
+    return splitObjects(text, null, /^table\s/);
+}
+
+/** A model-level TMDL file's objects (expressions.tmdl, for one), each with every line under it. */
+export function modelObjects(text: string): TmdlMember[] {
+    return splitObjects(text, 0);
+}
+
+/**
+ * Splits TMDL into objects, each with its line, every deeper line, and every line of a ``` block it opens. TMDL reads a
+ * block verbatim, whatever its indentation, and the block's closing delimiter, not the file's indentation, sets its left
+ * edge (learn.microsoft.com/analysis-services/tmdl/tmdl-overview#expressions; the review of 9f3d35f: a block at column 0,
+ * or one that closed left of the members, escaped the model guard). Objects start at `level`, or, when it's null, at
+ * the first indented line's indentation. A line before the first object that `skip` matches (a table's own line) is
+ * skipped; any other line at column 0 outside a block belongs to the object above it.
+ */
+function splitObjects(text: string, level: number | null, skip?: RegExp): TmdlMember[] {
     const out: TmdlMember[] = [];
-    for (const raw of lines) {
-        const indent = indentOf(raw);
+    let at = level;
+    let inBlock = false;
+    const add = (line: string) => {
+        if (out.length === 0) out.push({ kind: "", name: "", text: line });
+        else out[out.length - 1].text += `\n${line}`;
+    };
+    for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
         const line = raw.trim();
-        if (indent === 0) continue;
-        if (indent <= level || out.length === 0) {
+        if (inBlock) {
+            add(line);
+            inBlock = line !== "```";
+            continue;
+        }
+        if (!line || line.startsWith("///")) continue;
+        const indent = indentOf(raw);
+        if (out.length === 0 && indent === 0 && skip?.test(line)) continue;
+        if (at === null && indent > 0) at = indent;
+        if (at !== null && indent <= at && (indent > 0 || at === 0)) {
             const m = /^(\w+)(?:\s+('(?:[^']|'')+'|[^\s=:]+))?/.exec(line);
             out.push({ kind: m?.[1] ?? "", name: m?.[2] ? unquote(m[2]) : "", text: line });
         } else {
-            out[out.length - 1].text += `\n${line}`;
+            add(line);
         }
+        inBlock = /=\s*```$/.test(line);
     }
     return out;
 }

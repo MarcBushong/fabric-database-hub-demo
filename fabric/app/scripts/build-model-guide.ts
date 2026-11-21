@@ -8,7 +8,7 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES, answerKeyIn } from "../src/copilot/answer-key";
-import { formatGuide, parseRelationships, parseTable, reachesAnswerKey, tableMembers, tableOfRef, type Relationship, type TmdlTable } from "../src/copilot/tmdl";
+import { formatGuide, modelObjects, parseRelationships, parseTable, reachesAnswerKey, tableMembers, tableOfRef, type Relationship, type TmdlMember, type TmdlTable } from "../src/copilot/tmdl";
 
 export const MODEL_DIR = resolve(import.meta.dirname, "../../powerbi/SM_DatabaseHub_History.SemanticModel/definition");
 export const OUTPUT = resolve(import.meta.dirname, "../src/copilot/model-guide.generated.ts");
@@ -53,10 +53,12 @@ export function blindTables(all: TmdlTable[]): { tables: TmdlTable[]; answerKeyM
     return { tables, answerKeyMeasures };
 }
 
-/** The model as the denylist's checks read it: each table's TMDL, the relationships, and the model's other DAX. */
+/** The model as the denylist's checks read it: each table's TMDL, the relationships, the shared expressions, and the model's other DAX. */
 export interface ModelFiles {
     tables: { name: string; text: string }[];
     relationships: Relationship[];
+    /** Its shared expressions (expressions.tmdl), which a partition can read its rows through. */
+    expressions: TmdlMember[];
     /** Its functions (functions.tmdl) and its roles' filters (roles/), when it has them. */
     other: { file: string; text: string }[];
 }
@@ -70,12 +72,26 @@ export function readModel(modelDir: string = MODEL_DIR): ModelFiles {
             return { name: parseTable(text).name, text };
         }),
         relationships: parseRelationships(read("relationships.tmdl")),
+        expressions: existsSync(join(modelDir, "expressions.tmdl")) ? modelObjects(read("expressions.tmdl")).filter((o) => o.kind === "expression") : [],
         other: [
             ...(existsSync(join(modelDir, "functions.tmdl")) ? [{ file: "functions.tmdl", text: read("functions.tmdl") }] : []),
             ...tmdlIn("roles").map((f) => ({ file: `roles/${f}`, text: read("roles", f) })),
         ],
     };
 }
+
+/** The lakehouse tables that hold the answer key (rca/blind-detection.json, answerKey.lakehouseTables). */
+export const ANSWER_KEY_LAKEHOUSE_TABLES: readonly string[] = (
+    JSON.parse(readFileSync(resolve(import.meta.dirname, "../../../rca/blind-detection.json"), "utf8")) as { answerKey: { lakehouseTables: string[] } }
+).answerKey.lakehouseTables;
+
+/** The key lakehouse tables a source names as whole names, in any case: a Direct Lake entityName, or an M source's Item, Id, or path. */
+export function lakehouseTablesIn(text: string, tables: readonly string[] = ANSWER_KEY_LAKEHOUSE_TABLES): string[] {
+    return tables.filter((t) => new RegExp(`(?<![A-Za-z0-9_])${t.replace(/[^A-Za-z0-9_]/g, "\\$&")}(?![A-Za-z0-9_])`, "i").test(text));
+}
+
+/** Whether TMDL or M text names an object, as written ('Key Rows', #"Key Rows", or KeyRows), in any case. */
+const namesObject = (text: string, name: string) => new RegExp(`(?<![A-Za-z0-9_])${name.replace(/[^A-Za-z0-9_ ]/g, "\\$&")}(?![A-Za-z0-9_])`, "i").test(text);
 
 /**
  * What in the model would let a DAX query reach the answer key without naming it, which run_dax's denylist rules out
@@ -86,9 +102,17 @@ export function readModel(modelDir: string = MODEL_DIR): ModelFiles {
  *   (learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.crossfilteringbehavior);
  * - DAX outside the key's own tables and the refused measures that names a key table or a refused measure: a calculated
  *   column or table, a calculation item, detail rows, a model function, or a role's filter would read the key under a
- *   name run_dax doesn't refuse.
+ *   name run_dax doesn't refuse, in a ``` block at any indentation too (tableMembers);
+ * - a partition of another table that reads a lakehouse table holding the key, by its entityName, its M source, or a
+ *   shared expression that names one: that table would hold the key's rows under a name run_dax doesn't refuse (the
+ *   review of 9f3d35f).
  */
-export function denylistProblems(model: ModelFiles, refused: readonly string[], keyTables: readonly string[] = ANSWER_KEY_TABLES): string[] {
+export function denylistProblems(
+    model: ModelFiles,
+    refused: readonly string[],
+    keyTables: readonly string[] = ANSWER_KEY_TABLES,
+    lakehouseTables: readonly string[] = ANSWER_KEY_LAKEHOUSE_TABLES,
+): string[] {
     const problems: string[] = [];
     const isKey = (name: string) => keyTables.some((k) => k.toLowerCase() === name.toLowerCase());
     const isRefused = (name: string) => refused.some((m) => m.toLowerCase() === name.toLowerCase());
@@ -103,11 +127,16 @@ export function denylistProblems(model: ModelFiles, refused: readonly string[], 
         if ((p.crossFilteringBehavior ?? "oneDirection") !== "oneDirection") problems.push(`${what} filters ${p.crossFilteringBehavior}: it must filter one way.`);
         if ((p.fromCardinality ?? "many") !== "many" || (p.toCardinality ?? "one") !== "one") problems.push(`${what} isn't many-to-one.`);
     }
+    const keyExpressions = model.expressions.map((e) => ({ name: e.name, reads: lakehouseTablesIn(e.text, lakehouseTables) })).filter((e) => e.reads.length > 0);
     for (const table of model.tables.filter((t) => !isKey(t.name))) {
         for (const member of tableMembers(table.text)) {
             if (member.kind === "measure" && isRefused(member.name)) continue;
+            const first = member.text.split("\n")[0];
             const named = answerKeyIn(member.text, refused, keyTables);
-            if (named) problems.push(`'${table.name}' ${member.text.split("\n")[0]} reads ${named}.`);
+            if (named) problems.push(`'${table.name}' ${first} reads ${named}.`);
+            if (member.kind !== "partition") continue;
+            for (const source of lakehouseTablesIn(member.text, lakehouseTables)) problems.push(`'${table.name}' ${first} reads the lakehouse table ${source}, which holds the answer key.`);
+            for (const e of keyExpressions.filter((x) => namesObject(member.text, x.name))) problems.push(`'${table.name}' ${first} reads ${e.name}, which reads the lakehouse table ${e.reads.join(", ")}.`);
         }
     }
     for (const { file, text } of model.other) {

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { buildGuideSource, denylistProblems, MODEL_DIR, OUTPUT, readModel, withoutScenarioClauses, type ModelFiles } from "../../scripts/build-model-guide";
+import { ANSWER_KEY_LAKEHOUSE_TABLES, buildGuideSource, denylistProblems, lakehouseTablesIn, MODEL_DIR, OUTPUT, readModel, withoutScenarioClauses, type ModelFiles } from "../../scripts/build-model-guide";
 import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
 import { readContract, namesAScenario } from "@/rca/testdata/contract";
 import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "./answer-key";
@@ -111,6 +111,19 @@ describe("the model guide", () => {
         expect(keyed.length).toBeGreaterThanOrEqual(12);
         const calculated = model.tables.filter((t) => tableMembers(t.text).some((m) => m.kind === "partition" && /=\s*calculated/.test(m.text)));
         expect(calculated.map((t) => t.name)).toEqual(expect.arrayContaining(["Analysis", "Date", "Signal", "Status", "Target"]));
+        // And each key table's partition reads its own key lakehouse table, which the guard flags in any other table.
+        const keySources = model.tables
+            .filter((t) => (ANSWER_KEY_TABLES as readonly string[]).includes(t.name))
+            .flatMap((t) => lakehouseTablesIn(tableMembers(t.text).filter((m) => m.kind === "partition").map((m) => m.text).join("\n")));
+        expect(keySources.sort()).toEqual([...ANSWER_KEY_LAKEHOUSE_TABLES].sort());
+        expect(model.expressions.map((e) => e.name)).toEqual(["DirectLake - LH_DatabaseHub"]);
+    });
+
+    // The review of 9f3d35f: TMDL reads a ``` block verbatim, whatever its indentation, so the guard does too.
+    it("reads a table's members with their ``` blocks, whatever the blocks' indentation", () => {
+        const members = tableMembers(["table T", "    measure M = ```", "SUM ( 1 )", "  ```", "    column C", "        dataType: int64"].join("\n"));
+        expect(members.map((m) => [m.kind, m.name])).toEqual([["measure", "M"], ["column", "C"]]);
+        expect(members[0].text.split("\n")).toEqual(["measure M = ```", "SUM ( 1 )", "```"]);
     });
 
     // The coordinator's hardening of 9f3d35f: run_dax refuses any character outside plain ASCII in a query's code, which
@@ -122,17 +135,18 @@ describe("the model guide", () => {
         expect(names.filter((name) => /[^\x20-\x7E]/.test(name))).toEqual([]);
     });
 
-    it("finds each way a model change could let a query reach the key without naming it", () => {
+    describe("finds each way a model change could let a query reach the key without naming it", () => {
         const table = (name: string, ...lines: string[]) => ({ name, text: [`table '${name}'`, ...lines].join("\n") });
         const relationship = (from: string, to: string, ...properties: string[]) =>
             parseRelationships(["relationship r", `    fromColumn: ${from}`, `    toColumn: ${to}`, ...properties.map((p) => `    ${p}`)].join("\n"))[0];
         const clean: ModelFiles = {
             tables: [table("Facts", "    measure Rows = COUNTROWS ( 'Facts' )", "    measure 'Injected Faults' = COUNTROWS ( 'RCA Answer Key' )")],
             relationships: [relationship("'Scenario Runs'.'Target Key'", "Target.'Target Key'")],
+            expressions: [{ kind: "expression", name: "DirectLake - LH_DatabaseHub", text: "expression 'DirectLake - LH_DatabaseHub' =\nlet\nSource = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/w/l\")\nin\nSource" }],
             other: [],
         };
         // A refused measure may read the key, wherever it's hosted: run_dax refuses it by name.
-        expect(denylistProblems(clean, ["Injected Faults"])).toEqual([]);
+        it("passes a model that keeps the shape", () => expect(denylistProblems(clean, ["Injected Faults"])).toEqual([]));
         const broken: Array<[string, Partial<ModelFiles>, RegExp]> = [
             ["both ways", { relationships: [relationship("'Scenario Runs'.'Target Key'", "Target.'Target Key'", "crossFilteringBehavior: bothDirections")] }, /filters bothDirections: it must filter one way/],
             ["automatic", { relationships: [relationship("'Incident Windows'.'Report Date UTC'", "Date.Date", "crossFilteringBehavior: automatic")] }, /filters automatic/],
@@ -146,9 +160,41 @@ describe("the model guide", () => {
             ["a model function", { other: [{ file: "functions.tmdl", text: "function Faults = () => 'RCA Answer Key'" }] }, /functions\.tmdl reads RCA Answer Key/],
             // The coordinator's hardening of 9f3d35f: a name in lookalike or invisible characters reads the key too.
             ["a lookalike name", { tables: [table("Facts", "    column Leak = RELATED ( 'Scena\u00ADrio Runs'[Scenario] )", "        dataType: string")] }, /'Facts' column Leak = RELATED .* reads Scenario Runs/],
+            // The review of 9f3d35f: TMDL reads a ``` block verbatim, whatever its indentation, column 0 included, and its
+            // closing delimiter sets its left edge (learn.microsoft.com/analysis-services/tmdl/tmdl-overview#expressions).
+            ["a calculated column's block at column 0", { tables: [table("Facts", "    column Leak = ```", "CALCULATE ( MAX ( 'Scenario Runs'[Profile] ) )", "```", "        dataType: string")] }, /'Facts' column Leak = ``` reads Scenario Runs/],
+            ["a calculated table's block at column 0", { tables: [table("Copy", "    partition Copy = calculated", "        source = ```", "FILTER ( 'Incident Windows', TRUE () )", "```")] }, /'Copy' partition Copy = calculated reads Incident Windows/],
+            [
+                "a block that closes left of the members, after a refused measure",
+                { tables: [table("Facts", "    measure 'Injected Faults' = COUNTROWS ( 'RCA Answer Key' )", "    column Leak = ```", "        CALCULATE ( MAX ( 'Scenario Runs'[Profile] ) )", "  ```")] },
+                /'Facts' column Leak = ``` reads Scenario Runs/,
+            ],
+            // The review of 9f3d35f: a blind table's rows can come from a lakehouse table that holds the key.
+            [
+                "a Direct Lake partition on a key lakehouse table",
+                { tables: [table("Copy", "    partition Copy = entity", "        mode: directLake", "        source", "            entityName: scenario_runs", "            schemaName: dbo", "            expressionSource: 'DirectLake - LH_DatabaseHub'")] },
+                /'Copy' partition Copy = entity reads the lakehouse table scenario_runs, which holds the answer key/,
+            ],
+            [
+                "an M partition on one",
+                { tables: [table("Copy", "    partition Copy = m", "        mode: import", "        source =", "            let", '                Source = Lakehouse.Contents(null){[workspaceId = "w"]}[Data]{[lakehouseId = "l"]}[Data],', '                Rows = Source{[Id = "Incident_Windows", ItemKind = "Table"]}[Data]', "            in", "                Rows")] },
+                /'Copy' partition Copy = m reads the lakehouse table incident_windows/,
+            ],
+            [
+                "a shared expression that reads one",
+                {
+                    tables: [table("Copy", "    partition Copy = m", "        mode: import", "        source = #\"Key Rows\"")],
+                    expressions: [{ kind: "expression", name: "Key Rows", text: 'expression \'Key Rows\' =\nlet\nSource = Sql.Database("s", "d"),\nRows = Source{[Schema = "dbo", Item = "rca_answer_key"]}[Data]\nin\nRows' }],
+                },
+                /'Copy' partition Copy = m reads Key Rows, which reads the lakehouse table rca_answer_key/,
+            ],
         ];
-        for (const [what, change, problem] of broken) expect(denylistProblems({ ...clean, ...change }, ["Injected Faults"]).join("\n"), what).toMatch(problem);
-        expect(denylistProblems(clean, ["Injected Faults"], ["Scenario Runs", "Runs"])).toEqual(["'Runs' has no space in its name, so DAX could name it without quotes."]);
+        it.each(broken)("finds %s", (_what, change, problem) => {
+            expect(denylistProblems({ ...clean, ...change }, ["Injected Faults"]).join("\n")).toMatch(problem);
+        });
+        it("finds a key table's name without a space", () => {
+            expect(denylistProblems(clean, ["Injected Faults"], ["Scenario Runs", "Runs"])).toEqual(["'Runs' has no space in its name, so DAX could name it without quotes."]);
+        });
     });
 
     it("writes no guide for a model that breaks that shape", () => {

@@ -63,7 +63,7 @@ A new lane in the runner's `profile run`: on T1's VM for T1, T3, T4, and T4's re
 
 - **Found by testing, and designed in:** on a hot standby, `pg_blocking_pids()` returns nothing for the waiting startup process while `pg_locks` shows the wait and its holder, so replay conflicts are read from `pg_locks`. Azure SQL Database has no system_health, and Learn says not to read its built-in `dl` session, so T3's deadlocks come from a database-scoped session. Learn has no field reference for `error_reported`, so the observer reads the fields from `sys.dm_xe_object_columns` first (RCA-XE-00) and records a missing one as not captured. A `transactionid` wait names no table, so RCA-PG-11 reads the head's relation locks.
 - **The event session is the one object the observer creates:** `ContosoCare_RCA`, in memory only, filtered to ContosoCare, created at the observer's start and dropped at the session's end. On T1 and T2 it's server-scoped, outside ADR 0010's "nothing outside ContosoCare": [the amendment](0010-workload-generator-technology.md#amendment-the-incident-rca-observers-extended-events-session-2026-11-20) allows it, with its limits.
-- **Kept on the VM until the export:** `C:\ProgramData\DbHubDemo\rca\<session>\` (SYSTEM and Administrators only), at most 20 MB per target, deleted 7 days after its export.
+- **Kept on the VM until the export:** `C:\ProgramData\DbHubDemo\rca\<session>\` (SYSTEM and Administrators only), at most 20 MB per target, deleted 7 days after the export that took all of it, and, when no export took any of it, 30 days after it started (`EvidenceStore.cs`).
 
 ### 2. Names
 
@@ -167,7 +167,8 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 - **The model's shape, checked every time the guide is built** (the final review of 9b1896c): the denylist also rests on how the model is built, so `npm run guide:build` writes no guide, and the app's tests fail, when a model change would weaken it:
   - a key table's name without a space;
   - a relationship that puts a key table on its one side, filters both ways or automatically, or isn't many-to-one. Each key table's relationships have it on the many side and filter one way, from the dimension to the key ([cross-filter direction](https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.crossfilteringbehavior)), so a filter on the key reaches no other table;
-  - DAX outside the key's own tables and the refused measures that names a key table or a refused measure: a calculated column or table, a calculation item, detail rows, a model function, or a role's filter would read the key under a name `run_dax` doesn't refuse.
+  - DAX outside the key's own tables and the refused measures that names a key table or a refused measure: a calculated column or table, a calculation item, detail rows, a model function, or a role's filter would read the key under a name `run_dax` doesn't refuse. The check reads a ``` block whole, at any indentation, as TMDL does ([expressions](https://learn.microsoft.com/analysis-services/tmdl/tmdl-overview#expressions)); before the review of 9f3d35f, a block at column 0, or one that closed left of the members, escaped it;
+  - a partition of another table that reads a lakehouse table holding the key (`rca/blind-detection.json`'s `answerKey.lakehouseTables`), by its `entityName`, its M source, or a shared expression that names one: that table would hold the key's rows under a name `run_dax` doesn't refuse (the review of 9f3d35f).
 - **Sample questions,** with the owner's live session of 2026-11-20 (ET):
   - "Why was ContosoCare slow at 11:56?" T3's CPU at 100 % from 11:56 to 12:17, and T5 at 100 % normalized RU with about 1,300 to 2,100 429s a minute. In Phase 2 also the cause: Query Store's regressed plan, `FORCE_LAST_GOOD_PLAN` off from 11:52, and the last good plan forced at 12:18:00, after which CPU averaged 42.5 % at 12:18 and 7 % at 12:19 to 12:20.
   - "Who blocked whom at 12:05, and what should we do?" The chain, head blocker first, with its procedure, program, login, idle time, open transaction, and lock; its depth and width; the escalation; the recommendations.
@@ -234,7 +235,7 @@ Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answ
 |---|---|---|---|---|
 | **Database Hub's SQL telemetry** (T1, T2, T3) | A Microsoft-managed Azure Data Explorer cluster: the `ArcSqlTelemetry` database at `https://adx.centralus.arcdataservices.com/kusto/` ([connect](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#connect-to-the-telemetry)). Not in the customer's Fabric workspace, capacity, or Azure subscription | Up to 7 days; Learn's Query 2 shows the window a tenant actually has ([query 2](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#query-2-estate-summary-and-available-time-range)) | No: no retention, size, or location setting, and it's a preview. What the customer controls is which resources send it | The customer: "You can't change retention or add tables. To keep data longer, export query results to your own store" ([limitations](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry#limitations)) |
 | **T4's, its replica's, and T5's metrics** | Azure Monitor platform metrics, Microsoft-managed | 93 days ([retention of metrics](https://learn.microsoft.com/azure/azure-monitor/metrics/data-platform-metrics#retention-of-metrics)); a deleted replica's metrics go with it ([ADR 0025](0025-t4-read-replica.md)) | No | The customer |
-| **The RCA's own capture** | On T1's VM and in T2's guest (`C:\ProgramData\DbHubDemo\rca\`) until its export | Deleted 7 days after its export | No | It goes into the demo's history |
+| **The RCA's own capture** | On T1's VM and in T2's guest (`C:\ProgramData\DbHubDemo\rca\`) until its export | Deleted 7 days after the export that took all of it; 30 days after it started when no export took any of it | No | It goes into the demo's history |
 | **The RCA's bundles in transit** | Earlier versions of `dbhub-session-metrics` in the control vault (Azure Key Vault, in the demo's subscription) | Until `./scripts/destroy.ps1` deletes and purges the vault ([transport](#4-transport-into-the-history)) | No | It goes into the demo's history |
 | **The demo's history** | `LH_DatabaseHub`'s Delta tables, in the demo's Fabric workspace, in OneLake: the customer's own store | Until `./scripts/destroy.ps1` without `-KeepFabric`, or the deployment notebook's purge (`PURGE_DEMO_TABLES` and `CONFIRM`) | Yes: it's the customer's lakehouse | The demo does it for them |
 
@@ -254,7 +255,7 @@ flowchart LR
         am["Azure Monitor platform metrics<br/>T4, its replica, T5: 93 days"]
     end
     subgraph vms["On the demo's VMs"]
-        obs["The RCA observer's capture<br/>T1 to T4 and the replica<br/>deleted 7 days after its export"]
+        obs["The RCA observer's capture<br/>T1 to T4 and the replica<br/>deleted 7 days after its export,<br/>or 30 days if never exported"]
     end
     vault["The control vault<br/>dbhub-session-metrics versions"]
     nb["NB_DatabaseHub_LiveActivity<br/>at each session's end"]
