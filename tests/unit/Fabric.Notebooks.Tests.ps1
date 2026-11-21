@@ -1952,6 +1952,20 @@ for name in (old, recent, "Files/rca/inbox/notes.txt"):
 report["sweep"] = run(Lake(), files)[0]
 report["sweep"]["old"], report["sweep"]["recent"] = old, recent
 
+# Both parameters (review of 15ad76d): their parts merged, each document written once; one that can't be used is skipped
+# and named, and the other's documents are still written; a staged file that couldn't be read stays for a later run.
+t1_parts = [part for part in PARAMETER["parts"] if t1 in part]
+t4_parts = [part for part in PARAMETER["parts"] if t4 in part]
+files = Files()
+files.add(staged, evidence(t1_parts))
+report["both"] = run(Lake(), files, evidence_file=staged, evidence=evidence(t4_parts + t1_parts[:1]))[0]
+files = Files()
+files.add(staged, json.dumps(PARAMETER))
+report["bothInlineNewer"] = run(Lake(), files, evidence_file=staged, evidence=evidence(t4_parts, version=2))[0]
+missing_file = "Files/rca/inbox/20261120T172500Z-5f1c0e7a-0002.json"
+report["bothFileUnread"] = run(Lake(), Files(), evidence_file=missing_file, evidence=json.dumps(PARAMETER))[0]
+report["bothFileUnread"]["file"] = missing_file
+
 # RCA_ONLY: an earlier session's evidence alone, under its session's run ID, with SAVE_RESULTS False as the control passes
 # it (so a copy from before the Incident RCA saves nothing); nothing else is written, and the run ends.
 lake, files = Lake(), Files()
@@ -2125,6 +2139,36 @@ print(json.dumps(report, default=str))
         @($sweep['left']) | Should -Not -Contain $sweep['old']
         @($sweep['left']) | Should -Contain $sweep['recent']
         @($sweep['left']) | Should -Contain 'Files/rca/inbox/notes.txt'
+    }
+
+    It 'merges the staged file''s parts with the inline RCA_EVIDENCE when both are passed, and writes each document once (review of 15ad76d)' {
+        if ($rcaSkip) {
+            Set-ItResult -Skipped -Because $rcaSkip
+            return
+        }
+        $ids = @('20261120T165000Z-sqlvm01-0001', '20261120T170000Z-sqlvm01-0002')
+        # T1's document staged, T4's inline (with one of T1's parts again): both written, the file deleted.
+        $both = $rcaReport['both']
+        $both['status'] | Should -Be 'Pass' -Because $both['message']
+        @($both['documents']) | Should -Be $ids
+        @($both['skipped']) | Should -BeNullOrEmpty
+        @($both['left']) | Should -BeNullOrEmpty
+        $both['counts']['rca_coverage'] | Should -BeGreaterThan 0
+        foreach ($name in $both['counts'].Keys) {
+            $both['counts'][$name] | Should -Be $rcaReport['fixtures']['expectedCounts'][$name] -Because "$name holds both documents' rows once"
+        }
+        # The inline document can't be used: the staged file's documents are still written, and the Warning names it.
+        $newer = $rcaReport['bothInlineNewer']
+        $newer['status'] | Should -Be 'Warning'
+        @($newer['documents']) | Should -Be $ids
+        $newer['message'] | Should -Match 'RCA_EVIDENCE: not used, because its version 2 is newer than this notebook''s 1'
+        @($newer['left']) | Should -BeNullOrEmpty
+        # The staged file can't be read: the inline documents are written, and the file isn't deleted.
+        $unread = $rcaReport['bothFileUnread']
+        $unread['status'] | Should -Be 'Warning'
+        @($unread['documents']) | Should -Be $ids
+        @($unread['reads']) | Should -Be @($unread['file'])
+        $unread['message'] | Should -Match ('{0}: not used, because the staged file couldn''t be read' -f [regex]::Escape($unread['file']))
     }
 
     It 'writes only the RCA evidence with RCA_ONLY, under its session''s run ID, and ends the run with RCA.EVIDENCE' {
