@@ -4533,3 +4533,23 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 Until then, deployments keep the pinned image, which works as before.
 
 **Risks.** None for viewers: the page they're sent to is the same.
+
+### Arc data records that outlive their resource group (item 9, F21, 2026-11-21, read-only)
+
+**Why.** The owner's follow-up after the release: Resource Graph still listed `microsoft.azurearcdata/sqlserverinstances/databases` records in four resource groups that no longer exist (rg-dbhubal-demo 10, rg-dbhubask-demo 10, rg-dbhubvn-demo 10, rg-dbhubvu-demo 5).
+
+**Findings (read-only; nothing changed in Azure).**
+
+- On 2026-11-21 at about 00:37 UTC, Resource Graph (through `az rest`) listed 10 such rows each in rg-dbhubal-demo and rg-dbhubask-demo: five databases under `arcsql01`, and five under `sqlvm01`'s instance. Those in rg-dbhubvn-demo and rg-dbhubvu-demo had aged out.
+- A GET of a listed row's ID answers `ResourceGroupNotFound`.
+- The activity log shows the two groups deleted on 2026-11-19, at about 21:28 and 04:05 UTC, so the rows outlived their groups by about 27 and 20 hours.
+- `destroy.ps1` already deletes the Arc SQL Server instances, T1's included, and the Arc machines before the group, in the order Learn gives. `TEARDOWN.RESIDUAL.RECORDS` already confirms such rows with Azure Resource Manager and passes them.
+- **The documented cause:** Learn's [Disconnect SQL Server instances from Azure Arc](https://learn.microsoft.com/sql/sql-server/azure-arc/delete-from-azure-arc) says a deleted Arc-enabled SQL Server resource can still show for a while because of caching, needs no action, and isn't billed.
+
+**Proposal and change.** No change to `destroy.ps1`: it already removes the instances and machines first, and nothing it could do (nothing documented) clears another service's cached index. The docs said "more than 30 minutes"; `docs/cleanup.md` (Resource Graph lags behind deletes) and `docs/troubleshooting.md` now say a day or more, with the Learn page.
+
+**Changed files.** `docs/cleanup.md`, `docs/troubleshooting.md`, and this report.
+
+**Validation.** markdownlint. Docs only.
+
+**Risks.** None.
