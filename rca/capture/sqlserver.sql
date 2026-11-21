@@ -500,8 +500,11 @@ ORDER BY o.name, c.name;
 -- T1, T2: the observer's Extended Events session, created when the observer starts and dropped at the session's end
 -- (RCA-XE-05), so errors and deadlocks are seen whenever they happen. Errors raised in ContosoCare (severity 11 and up,
 -- including the ones a TRY...CATCH intercepts: is_intercepted), client attentions (cancels and timeouts), lock
--- escalations, and deadlock graphs. Events stay in memory (ring_buffer), at most 4 MB and 5,000 events, and losing one
--- under pressure is allowed. A session left behind by a runner that stopped is dropped by the next one's start.
+-- escalations, and deadlock graphs. Events stay in memory (ring_buffer), at most 1,024 KB and 5,000 events, and losing one
+-- under pressure is allowed: a read returns the target as one XML document of at most 4 MB, so Learn recommends a
+-- ring_buffer MAX_MEMORY of 1,024 KB or less, and a full buffer is then never truncated on read
+-- (https://learn.microsoft.com/sql/relational-databases/extended-events/targets-for-extended-events-in-sql-server#ring_buffer-target).
+-- A session left behind by a runner that stopped is dropped by the next one's start.
 IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')
     CREATE EVENT SESSION [ContosoCare_RCA] ON SERVER
     ADD EVENT sqlserver.error_reported (
@@ -514,7 +517,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCar
         ACTION (sqlserver.client_app_name, sqlserver.session_id, sqlserver.sql_text)
         WHERE ([sqlserver].[database_name] = N'ContosoCare')),
     ADD EVENT sqlserver.xml_deadlock_report
-    ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (4096))
+    ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (1024))
     WITH (MAX_MEMORY = 8 MB, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, MAX_DISPATCH_LATENCY = 5 SECONDS,
           TRACK_CAUSALITY = OFF, STARTUP_STATE = OFF);
 IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
@@ -546,7 +549,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.database_event_sessions WHERE name = N'ContosoC
     ADD EVENT sqlserver.lock_escalation (
         ACTION (sqlserver.client_app_name, sqlserver.session_id, sqlserver.sql_text)),
     ADD EVENT sqlserver.database_xml_deadlock_report
-    ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (4096))
+    ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (1024))
     WITH (MAX_MEMORY = 8 MB, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, MAX_DISPATCH_LATENCY = 5 SECONDS,
           TRACK_CAUSALITY = OFF, STARTUP_STATE = OFF);
 IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_database_sessions WHERE name = N'ContosoCare_RCA')
