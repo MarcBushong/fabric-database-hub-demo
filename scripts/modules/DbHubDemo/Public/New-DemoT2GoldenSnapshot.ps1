@@ -11,9 +11,11 @@ function New-DemoT2GoldenSnapshot {
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
        Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
        DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
-       deallocates archost01; otherwise nothing changes (review, 2026-11-04). Nor may this PC's pending list of the
-       Incident RCA's evidence (out/history-pending, Read-DemoRcaPending) hold documents from T2, which Prepare would delete
-       before a history save took them (GOLDEN.CAPTURE.RCA, with the command that saves them; ADR 0031).
+       deallocates archost01; otherwise nothing changes (review, 2026-11-04). Nor may the Incident RCA's evidence that a
+       history save didn't take be listed for T2, which Prepare would delete: this PC's pending list (out/history-pending,
+       Read-DemoRcaPending), or the session control's status (its variable DbHubSessionStatus, read through Azure Resource
+       Manager: Get-DemoGoldenControlRcaPending). GOLDEN.CAPTURE.RCA names the list and the way to save them: the
+       scripts' history save for the first, a Run all session for the second (ADR 0031).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -200,20 +202,49 @@ function New-DemoT2GoldenSnapshot {
         return $results.ToArray()
     }
 
-    # 2c. T2's Incident RCA evidence that a history save didn't take (ADR 0031): the scripts fetch such documents again
-    # from the runner, which keeps them in T2's guest, and Prepare deletes what the guest keeps, so a capture now would
-    # lose them (the review of 3f6cd14). This PC's pending list (out/history-pending) names each document's VM.
+    # 2c. T2's Incident RCA evidence that a history save didn't take (ADR 0031): Prepare deletes what T2's guest keeps,
+    # where the runner keeps such documents to be fetched again, so a capture now would lose them (the review of 3f6cd14).
+    # Two lists name them, each with its VM, and each has its own way to fetch them: this PC's (out/history-pending),
+    # which the scripts' next history save fetches, and the session control's status, whose next start fetches the
+    # documents its runbooks exported but couldn't fetch (Get-DemoGoldenControlRcaPending). A status that can't be read
+    # captures nothing, as GOLDEN.CAPTURE.CONTROL does.
     $pending = Read-DemoRcaPending -Config $Config
     $t2Pending = @(@($pending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
-    if ($t2Pending.Count -gt 0) {
+    $controlPending = Get-DemoGoldenControlRcaPending -Config $Config -NowUtc $NowUtc
+    if ($controlPending.Error) {
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) ([ordered]@{ status = $controlPending.Variable }) 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        return $results.ToArray()
+    }
+    $t2Control = @(@($controlPending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
+    if ($t2Pending.Count -gt 0 -or $t2Control.Count -gt 0) {
         $shown = [string]$pending.Path
         $root = $script:RepoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
         if ($shown.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
             $shown = './' + $shown.Substring($root.Length).Replace('\', '/')
         }
-        $hostPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
-        $save = if ($hostPower -eq 'PowerState/running') { './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' } else { './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
-        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists them), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f $t2Pending.Count, $shown) ([ordered]@{ path = $shown; documents = @($t2Pending | ForEach-Object { [string]$_['documentId'] }); hostPower = [string]$hostPower }) ('Save the history first: {0}, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.' -f $save)
+        $evidence = [ordered]@{ path = $shown; documents = @($t2Pending | ForEach-Object { [string]$_['documentId'] }); status = $controlPending.Variable; statusDocuments = @($t2Control | ForEach-Object { [string]$_['documentId'] }) }
+        $save = ''
+        if ($t2Pending.Count -gt 0) {
+            $hostPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
+            $evidence['hostPower'] = [string]$hostPower
+            $save = if ($hostPower -eq 'PowerState/running') { './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' } else { './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+        }
+        $lose = 'and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $runAll = 'run a session with Run all in {0} once: its start fetches them from T2, and its end saves them with its history.' -f $controlPending.Notebook
+        $again = 'Then run ./scripts/capture-t2-golden.ps1 again.'
+        if ($t2Control.Count -eq 0) {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists them), {2}' -f $t2Pending.Count, $shown, $lose
+            $fix = 'Save the history first: {0}, which fetches them from T2. {1}' -f $save, $again
+        }
+        elseif ($t2Pending.Count -eq 0) {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in {1}), {2}' -f $t2Control.Count, $controlPending.Variable, $lose
+            $fix = 'First, {0} {1}' -f $runAll, $again
+        }
+        else {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists {2}, and the session control''s status, in {3}, lists {4}), {5}' -f ($t2Pending.Count + $t2Control.Count), $shown, $t2Pending.Count, $controlPending.Variable, $t2Control.Count, $lose
+            $fix = 'Save the history first: {0}, which fetches the ones {1} lists. For the ones the status lists, {2} {3}' -f $save, $shown, $runAll, $again
+        }
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' $message $evidence $fix
         return $results.ToArray()
     }
 

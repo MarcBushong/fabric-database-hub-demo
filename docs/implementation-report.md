@@ -4408,7 +4408,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - ADR 0031 (new), ADR 0010's amendment, and the ADR index;
   - with this entry: `AGENTS.md`, `CHANGELOG.md`, `README.md`, `docs/cost-management.md`, and this report;
   - and the estimate, `Get-DemoCostEstimate.ps1`, with `tests/unit/DbHubDemo.Cost.Tests.ps1`.
-- **The golden snapshot (the docs review of 0189a4b):** `vm/bootstrap/Invoke-DemoGoldenGuest.ps1` and `New-DemoT2GoldenSnapshot.ps1`, with `tests/unit/Vm.GoldenGuest.Tests.ps1` and `DbHubDemo.Golden.Tests.ps1`, and `docs/deployment.md`'s golden snapshot section.
+- **The golden snapshot (the docs review of 0189a4b):** `vm/bootstrap/Invoke-DemoGoldenGuest.ps1`, `New-DemoT2GoldenSnapshot.ps1`, and `Private/GoldenHelpers.ps1`, with `tests/unit/Vm.GoldenGuest.Tests.ps1` and `DbHubDemo.Golden.Tests.ps1`, and `docs/deployment.md`'s golden snapshot section.
 
 **Validation, before the live run.**
 
@@ -4487,6 +4487,7 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - **Low:** the merge note below listed neither this branch's own figures in cost management nor the follow-ups' newer figures (fae05b4). It lists both now.
 
   The new tests (`Vm.GoldenGuest.Tests.ps1`, `DbHubDemo.Golden.Tests.ps1`) fail without their fixes.
+- **The coordinator's follow-up of c059878:** documents that the session control's runbooks exported but couldn't fetch are listed in the control's status, not on this PC, and only the control's next start fetches them. The capture reads that status too, from the control account's variable `DbHubSessionStatus`. The variable is unencrypted, so Azure Resource Manager returns its value with the read access the scripts already use on the control's account, and nothing is granted (`Get-DemoGoldenControlRcaPending`). The capture refuses while the status lists T2's documents, whether the status's own, a re-check's handoff, or an earlier session's not yet expired; the fix it names is a Run all session. A status that can't be read captures nothing, as `GOLDEN.CAPTURE.CONTROL` does. With the step as c059878 had it, the 3 new capture tests fail; leaving out the handoff, the expiry, or the second JSON decoding fails the helper's test.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 

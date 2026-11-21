@@ -987,3 +987,84 @@ function Get-DemoGoldenCaptureControlResult {
     }
     return (& $new 'Pass' ('No on-demand run is active: no {0} or {1} job is queued or running, and no auto-stop is pending.' -f $name.ControlRunbook, $name.StopRunbook) $evidence)
 }
+
+function Get-DemoGoldenControlRcaPending {
+    <#
+    .SYNOPSIS
+    The Incident RCA's documents that the session control's runbooks exported on a VM but couldn't fetch, as the session's
+    status lists them, for capture-t2-golden.ps1 (ADR 0031; the review of 3f6cd14): the status's own (rca.pending, and
+    rcaHandoff, what a re-check found while a stop ran) and earlier sessions' (rcaEarlierPending), each with its VM. Only
+    the control's next start fetches them, from the IDs the status keeps. Read from the control account's variable
+    DbHubSessionStatus, the runbooks' copy of the status, which infra/control/control.bicep creates unencrypted, through Azure
+    Resource Manager with the read access the scripts already use on the control's account: no new grant, and the vault's
+    copy isn't read. Documents past the 7 days the runner keeps them are left out, since no start fetches them any more.
+    Returns Read (a status was read), Documents, Error (a read that failed), Variable, and Notebook. Never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/variable/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $name = Get-DemoActivityControlName -Config $Config
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+        return $answer
+    }
+    $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
+    if (-not $read.Ok) {
+        # A control from before 2026-11-16 has no such variable, and so no session that listed any.
+        if (-not $read.Missing) {
+            $answer.Error = [string]$read.Error
+        }
+        return $answer
+    }
+    # A variable's value is its JSON, so the status's JSON comes as a JSON string ('""' until the runbooks write one).
+    $text = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $read.Value -Name 'properties') -Name 'value')
+    $status = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $status = $text | ConvertFrom-Json -AsHashtable -Depth 64
+            if ($status -is [string]) {
+                $status = if ($status.TrimStart().StartsWith('{')) { $status | ConvertFrom-Json -AsHashtable -Depth 64 } else { $null }
+            }
+        }
+    }
+    catch {
+        $answer.Error = 'its value isn''t the JSON of a status'
+        return $answer
+    }
+    $answer.Read = $true
+    if ($status -isnot [System.Collections.IDictionary]) {
+        return $answer
+    }
+    $documents = [System.Collections.Generic.List[object]]::new()
+    $add = {
+        param([object] $Items)
+        foreach ($item in @($Items)) {
+            $id = [string](Get-DemoMemberValue -InputObject $item -Name 'documentId')
+            $vm = [string](Get-DemoMemberValue -InputObject $item -Name 'vm')
+            if ($id -and $vm) {
+                $documents.Add([ordered]@{ documentId = $id; vm = $vm })
+            }
+        }
+    }
+    # The status's own: kept from its last write, as the next start reads them (Get-DbHubRcaBacklog).
+    $updated = ConvertTo-DemoUtcDateTime -Value $status['updatedUtc']
+    if ($null -eq $updated -or $updated.AddDays(7) -gt $NowUtc) {
+        & $add (Get-DemoMemberValue -InputObject $status['rca'] -Name 'pending')
+        & $add $status['rcaHandoff']
+    }
+    foreach ($carry in @($status['rcaEarlierPending'])) {
+        $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $carry -Name 'expiresUtc')
+        if ($null -eq $expires -or $expires -gt $NowUtc) {
+            & $add (Get-DemoMemberValue -InputObject $carry -Name 'pending')
+        }
+    }
+    $answer.Documents = $documents.ToArray()
+    return $answer
+}
