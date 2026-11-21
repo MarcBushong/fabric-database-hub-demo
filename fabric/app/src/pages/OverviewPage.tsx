@@ -30,7 +30,7 @@ import {
 } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { buildAskContext } from "@/lib/ask";
-import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
+import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth } from "@/lib/health";
 import { coverageInsight, dominantWaitInsight, familySignal, freshnessInsight, lagInsight } from "@/lib/insights";
 import { worstStatus } from "@/lib/status";
@@ -196,7 +196,7 @@ export default function OverviewPage() {
                         />
                         <KpiTile
                             label="Demo readiness"
-                            value={hasRun && readiness !== null ? `${Math.round(readiness * 100)} %` : "–"}
+                            value={hasRun && readiness !== null ? percent(readiness) : "–"}
                             status={hasRun ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null}
                             sub={hasRun ? `${summary.failed} failed · ${summary.manual} manual · ${summary.warnings} warnings` : "Run all in NB_DatabaseHub_Control fills this"}
                             onOpen={() => navigate("readiness")}

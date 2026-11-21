@@ -19,6 +19,7 @@ import {
     timesShort,
     timesText,
     baselineText,
+    waitFamilyInsight,
 } from "./insights";
 import { mean, quantile, density } from "./stats";
 import { statusBySort, statusClass, statusColor, statusMeta, worstStatus } from "./status";
@@ -202,6 +203,18 @@ describe("insights", () => {
         expect(readinessInsight(summary, [])?.metric).toBe("less than 1 %");
         expect(readinessInsight({ ...summary, warnings: 1, passed: 299 }, [])?.metric).toBe("more than 99 %");
         expect(readinessInsight({ ...summary, warnings: 0, passed: 300 }, [])?.metric).toBe("100 %");
+    });
+
+    it("never writes the largest wait family's or the busiest hour's share as 100 % when it isn't (2026-11-21)", () => {
+        // 99.6 % of all wait time, which a whole percent alone writes as 100 %.
+        const family = waitFamilyInsight([
+            { category: "CPU", target: "T3", seconds: 996 },
+            { category: "Buffer IO (PAGEIOLATCH)", target: "T3", seconds: 4 },
+        ]);
+        expect(family?.metric).toBe("more than 99 %");
+        expect(family?.title).toBe("CPU and scheduling is the largest wait family: more than 99 % of all wait time.");
+        expect(busiestHourInsight([bin(9, 0, 4), bin(14, 0, 996)])?.detail).toBe("996 s in that hour across the window, more than 99 % of the total.");
+        expect(busiestHourInsight([bin(14, 0, 50), bin(14, 15, 50)])?.detail).toBe("100 s in that hour across the window, 100 % of the total.");
     });
 
     it("asks for a notebook run when there is no snapshot, and warns when it's old", () => {

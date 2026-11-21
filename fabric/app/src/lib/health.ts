@@ -15,7 +15,7 @@ import {
     type PostgresFinding,
     type TargetSummary,
 } from "@/data/model";
-import { formatAgo, formatNumber } from "./format";
+import { formatAgo, formatLevel, formatNumber } from "./format";
 import { REPLICA_LAG_WARNING_SECONDS } from "./insights";
 import { statusBySort, worstStatus, type StatusName } from "./status";
 import type { EstateTarget } from "./view-state";
@@ -122,9 +122,10 @@ export function cosmosHealth(capture: CosmosCapture | null, findings: readonly P
         status: worst?.name ?? "Pass",
         reporting: true,
         metrics: [
-            { label: "Norm. RU peak", value: formatNumber(postgresPeak(ru)?.value ?? null, "percent") },
+            // A peak or a lowest just under 100 % never reads 100.0 % (formatLevel), as T5's page writes them.
+            { label: "Norm. RU peak", value: formatLevel(postgresPeak(ru)?.value ?? null, "percent") },
             { label: "429s", value: formatNumber(throttled, "int") },
-            { label: "Availability", value: availability.length > 0 ? formatNumber(Math.min(...availability), "percent") : "\u2013" },
+            { label: "Availability", value: availability.length > 0 ? formatLevel(Math.min(...availability), "percent") : "\u2013" },
         ],
         note: `Captured ${formatAgo(capture.capturedAt)}${throttled > 0 ? (recovered ? "; throttled, then recovered" : "; throttled") : ""}`,
         spark: ru.map((p) => p.value),

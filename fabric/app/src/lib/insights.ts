@@ -212,8 +212,8 @@ export function waitFamilyInsight(flows: readonly WaitFlow[]): Insight | null {
     return {
         id: "wait-family",
         status: null,
-        metric: `${Math.round((seconds / total) * 100)} %`,
-        title: `${family} is the largest wait family: ${Math.round((seconds / total) * 100)} % of all wait time.`,
+        metric: percent(seconds / total),
+        title: `${family} is the largest wait family: ${percent(seconds / total)} of all wait time.`,
         detail: `${formatNumber(seconds, "seconds")} of ${formatNumber(total, "seconds")} across ${byFamily.size} families.`,
         page: "incidents",
     };
@@ -237,7 +237,7 @@ export function busiestHourInsight(bins: readonly Bin[], field: "batch" | "waitS
         status: null,
         metric: `${String(hour).padStart(2, "0")}:00`,
         title: `The estate's busiest hour for ${label} is ${String(hour).padStart(2, "0")}:00 to ${String((hour + 1) % 24).padStart(2, "0")}:00 UTC.`,
-        detail: `${formatNumber(byHour[hour], field === "waitS" ? "seconds" : "int")} in that hour across the window, ${Math.round((byHour[hour] / byHour.reduce((a, v) => a + v, 0)) * 100)} % of the total.`,
+        detail: `${formatNumber(byHour[hour], field === "waitS" ? "seconds" : "int")} in that hour across the window, ${percent(byHour[hour] / byHour.reduce((a, v) => a + v, 0))} of the total.`,
         page: "estate",
     };
 }

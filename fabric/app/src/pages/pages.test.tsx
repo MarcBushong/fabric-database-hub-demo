@@ -128,6 +128,17 @@ describe("Overview", () => {
         expect(navigate).toHaveBeenCalledWith("findings", { category: "security" });
     });
 
+    it("writes Live now's Cosmos DB peak and lowest availability just under 100 % as they are, beside its Pass (2026-11-21)", async () => {
+        const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        const data = liveDataOf(sample.health);
+        if (!data?.cosmosDb) throw new Error("The sample has Cosmos DB's health.");
+        const health = { ...sample.health, data: { ...data, cosmosDb: { ...data.cosmosDb, maximumNormalizedRu: 99.96, minimumServiceAvailability: 99.996 } } };
+        renderWithApp(<OverviewPage />, { live: (view) => Promise.resolve((view === "health" ? health : sample[view]) as never) });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Cosmos DB, last 24 hours: 99\.96 %\./ })).toBeInTheDocument());
+        expect(within(live).getByText("peak normalized RU · lowest availability 99.996 %")).toBeInTheDocument();
+    });
+
     it("says in one line when nothing is read live, with a neutral badge and one period per sentence", async () => {
         renderWithApp(<OverviewPage />);
         const line = await screen.findByText(/^The live estate function isn't deployed in this app\. Every page shows the history; Database Hub has the live view\.$/);
@@ -328,6 +339,17 @@ describe("Estate", () => {
         renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
         const glance = await screen.findByRole("region", { name: "T5 at a glance" });
         await waitFor(() => expect(within(glance).getByText("less than 0.1 % of 7,710 requests")).toBeInTheDocument());
+    });
+
+    it("writes T5's normalized RU peak just under 100 % as it is: the tile beside its Pass, the summary, and the chart's marker (2026-11-21)", async () => {
+        // A peak of 99.96 % with no 429s, which one decimal alone writes as 100.0 %, the throttling line.
+        const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "NormalizedRUConsumption" ? { ...r, Value: Math.min(Number(r.Value), 99.96) } : r.Metric === "ThrottledRequests" ? { ...r, Value: 0 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("99.96 %")).toBeInTheDocument());
+        const chart = screen.getByRole("region", { name: "Normalized RU, and when it throttled" });
+        expect(within(chart).getByText(/^Normalized RU peaked at 99\.96 %;/)).toBeInTheDocument();
+        await waitFor(() => expect(within(chart).getByText("peak 99.96 %")).toBeInTheDocument());
     });
 
     it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
@@ -589,6 +611,17 @@ describe("Readiness", () => {
         expect(await screen.findByRole("button", { name: "Demo readiness: –. Open readiness" })).toBeInTheDocument();
         expect(screen.getByText("Run all in NB_DatabaseHub_Control fills this")).toBeInTheDocument();
         expect(screen.queryByText(/0 failed · 0 manual · 0 warnings/)).not.toBeInTheDocument();
+    });
+
+    it("never writes readiness as 100 % until every check passes: the Ready tile and Overview's tile (2026-11-21)", async () => {
+        // 249 of 250 checks pass: 99.6 %, which a whole percent alone writes as 100 %.
+        const nearlyAll = { "readiness-summary": [{ Checks: 250, Failed: 0, Manual: 0, Warnings: 1, Passed: 249, NotSupported: 0, NotSelected: 0, Readiness: 0.996, RunLabel: "Run 20261121T090000Z" }] };
+        const { unmount } = renderWithApp(<ReadinessPage />, { client: fakeQueryClient(nearlyAll) });
+        const glance = await screen.findByRole("region", { name: "Readiness at a glance" });
+        await waitFor(() => expect(within(glance).getByText("more than 99 %")).toBeInTheDocument());
+        unmount();
+        renderWithApp(<OverviewPage />, { client: fakeQueryClient(nearlyAll) });
+        expect(await screen.findByRole("button", { name: "Demo readiness: more than 99 %. Open readiness" })).toBeInTheDocument();
     });
 });
 

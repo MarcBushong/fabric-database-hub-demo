@@ -7,7 +7,7 @@ import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionR
 import type { Row } from "@/data/query-client";
 import { sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
-import { postgresHealth } from "@/lib/health";
+import { cosmosHealth, postgresHealth } from "@/lib/health";
 import { buildPostmortem, postmortemAsk, postmortemFileName } from "@/lib/postmortem";
 import {
     aggregate,
@@ -478,6 +478,24 @@ describe("the service map's nodes", () => {
         expect(dr(capture([]))?.status).toBeNull();
         expect(dr(capture([6, 241.4, 80, 30, 2]))?.status).toBe("Warning");
         expect(dr(capture([2, 3, 4, 3, 2]))?.status).toBe("Pass");
+    });
+
+    it("writes T5's normalized RU peak and lowest availability just under 100 % as they are, never 100.0 % (2026-11-21)", () => {
+        // One decimal alone writes 99.96 % as 100.0 %, the throttling line, for a peak that didn't throttle.
+        const capture: CosmosCapture = {
+            account: "cosmos01-test",
+            capturedAt: at(10),
+            windowStart: at(0),
+            windowEnd: at(3),
+            intervalMinutes: 1,
+            points: [
+                ...[10, 99.96, 30].map((value, m) => ({ at: at(m), metric: "NormalizedRUConsumption", value })),
+                ...[100, 99.996, 100].map((value, m) => ({ at: at(m), metric: "ServiceAvailability", value })),
+            ],
+        };
+        const health = cosmosHealth(capture, []);
+        expect(health.metrics.map((m) => m.value)).toEqual(["99.96 %", "0", "99.996 %"]);
+        expect(mapNodes([health], [], [], null).find((n) => n.target === "T5")?.metric).toBe("Norm. RU peak 99.96 %");
     });
 });
 describe("the postmortem", () => {

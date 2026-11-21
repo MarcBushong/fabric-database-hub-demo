@@ -4553,3 +4553,21 @@ Until then, deployments keep the pinned image, which works as before.
 **Validation.** markdownlint. Docs only.
 
 **Risks.** None.
+
+### The app's remaining roundings (item 10, 2026-11-21)
+
+**Why.** The coordinator's addition after the release froze its app text: numbers that read 100 % when they aren't. None shows a wrong number with the release tests' data, but each can.
+
+**Work summary.** Each now uses the release's helpers in `fabric/app/src/lib/format.ts`: `percent(share)` for a share, which never rounds some to none or nearly all to all, and `formatLevel(value, "percent")` for a level, which never writes a percentage under 100 as 100.
+
+- **Readiness:** the Readiness page's **Ready** tile and the Overview's **Demo readiness** tile used `Math.round`, so 249 of 250 checks read "100 %". They read "more than 99 %".
+- **The Performance page's insights:** the largest wait family's share (its number and its title) and the busiest hour's share of the total, the same way: "100 % of all wait time" when one family held 99.5 % or more.
+- **T5's normalized RU peak:** `formatNumber(..., "percent")` writes 99.95 to 99.99 % as "100.0 %", the throttling line, beside a **Pass**. The Estate page's tile, the chart's summary, and its peak marker; the service map's T5 key number (`cosmosHealth`'s first metric); and Live now's Cosmos DB tile now write it with `formatLevel`: "99.96 %", or "just under 100 %".
+- **Beyond the list, the same defect:** T5's lowest availability (the Estate tile, whose **Warning** starts below 99.99 %, `cosmosHealth`, and Live now's line), which read "100.0 %" beside a **Warning**.
+- **Left as they are:** the SQL targets' and T4's CPU peaks (`health.ts`), where 100 % isn't a status line, and the kiosk's progress bar, which is a width.
+
+**Changed files.** `fabric/app/src/pages/ReadinessPage.tsx`, `OverviewPage.tsx`, `EstatePage.tsx`, `fabric/app/src/lib/insights.ts`, `health.ts`, `fabric/app/src/components/LiveNow.tsx`; tests in `fabric/app/src/lib/insights.test.ts`, `mission.test.ts`, and `fabric/app/src/pages/pages.test.tsx`; the CHANGELOG, and this report.
+
+**Validation.** Five new tests, one per place: the wait family and busiest hour, the service map's T5 node and `cosmosHealth`, Estate's T5 tile, summary, and marker, the Ready and Demo readiness tiles, and Live now's Cosmos DB tile. All five fail with the source changes stashed and pass with them; the three test files pass (102 tests). `./tests/Invoke-StaticValidation.ps1 -Check FabricApp, Markdown` with Node.js 24.22.2: both **Pass** (typecheck, lint, 19 test files with 339 tests, license check, and build; markdownlint).
+
+**Risks.** None found: a value that is exactly 100, or whole, reads as before, and the Overview's live test with the sample's 100 still passes.
