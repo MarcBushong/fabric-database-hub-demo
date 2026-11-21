@@ -1902,7 +1902,12 @@ function Get-DemoActivityControlNotebook {
         [string] $DemoLakehouseId = '',
 
         [AllowEmptyString()]
-        [string] $DemoLakehouseName = ''
+        [string] $DemoLakehouseName = '',
+
+        # What deploy.ps1 found missing in the session control, with its fix (F29, 2026-11-21): the notebook says it when a
+        # read of the vault or the webhook fails, rather than the vault's permissions. '' for none.
+        [AllowEmptyString()]
+        [string] $ControlProblem = ''
     )
 
     $path = Join-Path -Path $script:RepoRoot -ChildPath 'fabric/control/NB_DatabaseHub_Control.ipynb'
@@ -1924,6 +1929,7 @@ function Get-DemoActivityControlNotebook {
         DEMO_LAKEHOUSE_ID   = $(if ($bind) { $DemoLakehouseId.ToLowerInvariant() } else { '' })
         CATALOG_JSON        = (ConvertTo-Json -InputObject $catalog -Depth 8 -Compress)
         SHOWCASE_JSON       = (ConvertTo-Json -InputObject (Get-DemoActivityControlShowcase) -Depth 8 -Compress)
+        CONTROL_PROBLEM     = $ControlProblem
     }
     $cell = @($notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' }) | Select-Object -First 1
     if ($null -eq $cell) {
@@ -2121,13 +2127,18 @@ function Set-DemoActivityControlFabric {
         [securestring] $Token,
 
         [ValidateRange(0, 60)]
-        [int] $ApprovalWaitMinutes = 10
+        [int] $ApprovalWaitMinutes = 10,
+
+        # What deploy.ps1 found missing in the session control, with its fix, for the notebook's CONTROL_PROBLEM (F29,
+        # 2026-11-21); '' clears what an earlier run put there.
+        [AllowEmptyString()]
+        [string] $ControlProblem = ''
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     $base = $script:FabricApiBaseUri
     $add = { param([string] $CheckId, [string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence, [string] $Remediation, [string] $DocUrl) $results.Add((New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl)) }
-    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId'])
+    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -ControlProblem $ControlProblem
     if ($WhatIfPreference -or -not $Token) {
         $plan = if ($Mode -eq 'public') { ('the folder "{0}" in the existing workspace, with {1} in it' -f $Name.FabricFolder, $Name.Notebook) } else { ('the workspace "{0}" on the existing workspace''s capacity, a managed private endpoint to {1} approved on the vault, and {2} in it' -f $Name.FabricWorkspace, $Name.KeyVault, $Name.Notebook) }
         & $add 'CONTROL.FABRIC.NOTEBOOK' 'Not selected' ('What if: {0} would be created through the Fabric REST API; the capacity is never resumed, paused, or scaled.' -f $plan) ([ordered]@{ mode = $Mode; notebookSha256 = $notebook.Sha256 }) '' 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'
@@ -2148,7 +2159,7 @@ function Set-DemoActivityControlFabric {
     }
     $lakehouseName = [string]$resolution.LakehouseName
     # The notebook runs the activity notebook in the demo's workspace and links to its report (2026-11-14).
-    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -DemoWorkspaceId $sharedId -DemoLakehouseId $lakehouseId -DemoLakehouseName $lakehouseName
+    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -DemoWorkspaceId $sharedId -DemoLakehouseId $lakehouseId -DemoLakehouseName $lakehouseName -ControlProblem $ControlProblem
     $Config = $resolution.Config
     $workspaceCheck = @(Test-DemoFabricWorkspace -Config $Config -Token $Token)
     $capacity = @($workspaceCheck | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1

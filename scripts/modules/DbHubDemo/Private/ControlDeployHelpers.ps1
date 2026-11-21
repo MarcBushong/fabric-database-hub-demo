@@ -289,7 +289,7 @@ function Invoke-DemoControlDeployStep {
             $mode = if ($access -eq 'Disabled') { 'private' } else { 'public' }
             $runbookSetting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $name -IdentityClientId $clientId
             $token = Get-DemoFabricToken -SubscriptionId $name.SubscriptionId
-            $fabric = @(Set-DemoActivityControlFabric -Config $Config -Name $name -Mode $mode -Setting $runbookSetting -Token $token -Confirm:$false)
+            $fabric = @(Set-DemoActivityControlFabric -Config $Config -Name $name -Mode $mode -Setting $runbookSetting -Token $token -ControlProblem $gap.Problem -Confirm:$false)
         }
     }
     catch {

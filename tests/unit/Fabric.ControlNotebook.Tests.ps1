@@ -49,8 +49,9 @@ BeforeAll {
         (@($lines | Where-Object { $_.Trim() -and $_ -notmatch '^\s*//' }) -join "`n").Trim()
     }
 
-    # The notebook as deploy.ps1 imports it, for a demo whose VMs shut down at 19:00 in the zone given.
-    function Get-FilledNotebook([string] $Zone = 'UTC', [string] $Prefix = '') {
+    # The notebook as deploy.ps1 imports it, for a demo whose VMs shut down at 19:00 in the zone given; -ControlProblem is
+    # what deploy.ps1 found missing in the session control (F29).
+    function Get-FilledNotebook([string] $Zone = 'UTC', [string] $Prefix = '', [string] $ControlProblem = '') {
         $filledConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $filledConfig['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $filledConfig['autoShutdownTime'] = '1900'
@@ -58,12 +59,12 @@ BeforeAll {
         if ($Prefix) {
             $filledConfig['prefix'] = $Prefix
         }
-        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig } {
+        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig; Problem = $ControlProblem } {
             $controlName = Get-DemoActivityControlName -Config $Config
             $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $controlName -IdentityClientId '99999999-9999-9999-9999-999999999999'
-            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub'
+            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub' -ControlProblem $Problem
         }
-        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix)
+        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}{2}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix, $(if ($ControlProblem) { '-problem' } else { '' }))
         [System.IO.File]::WriteAllBytes($file, [System.Convert]::FromBase64String($definition.Definition['parts'][0]['payload']))
         return $file
     }
@@ -353,8 +354,16 @@ def vault_read(name):
     return VAULT[name]
 
 
+class Py4JJavaError(Exception):
+    """What notebookutils raises when Key Vault refuses a read (live on dbhubra, 2026-11-21)."""
+
+
 class Credentials:
     def getSecret(self, vault, name):
+        # "nocontrol", "nocontrolstop", and "novault": the vault refuses every read (F29: on dbhubra, the session control's
+        # setup stopped at its template, so nobody was given its secrets).
+        if scenario in ("nocontrol", "nocontrolstop", "novault"):
+            raise Py4JJavaError("An error occurred while calling z:notebookutils.credentials.getSecret: Forbidden")
         return vault_read(name)
 
     def getToken(self, audience):
@@ -461,7 +470,7 @@ with contextlib.redirect_stdout(buffer):
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
-                          "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True},
+                          "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
@@ -1121,6 +1130,41 @@ print(json.dumps(out))
         @($again.sent | ForEach-Object action) | Should -Be @('stop')
         $again.sent[0].PSObject.Properties.Name | Should -Not -Contain 'sessionId'
         $again.printed | Should -Match 'No session runs \(its status says stopped\), so Stop now stops whatever runs\.'
+    }
+
+    It 'says Run all starts nothing because the session control isn''t set up, with deploy.ps1''s fix, not the vault''s permissions (F29, live 2026-11-21)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # What deploy.ps1 found on dbhubra (Get-DemoControlGap's Problem), filled into CONTROL_PROBLEM at import.
+        $problem = './scripts/deploy.ps1 found on 2026-11-21 11:40 UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up. Fix: Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two. Then run ./scripts/deploy.ps1 again. Meanwhile ./scripts/start-demo.ps1 runs a session from a PC, and ./scripts/stop-demo.ps1 stops the demo.'
+        $path = Get-FilledNotebook -Zone 'UTC' -ControlProblem $problem
+        $report = Invoke-Simulation -Path $path -Scenario 'nocontrol' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.sent | Should -BeNullOrEmpty
+        $report.printed | Should -Match ('Manual action required: Run all starts nothing: the secret dbhub-session-status couldn''t be read \(Py4JJavaError\): the session control isn''t set up\. {0}' -f [regex]::Escape($problem))
+        $report.printed | Should -Not -Match 'Key Vault Secrets User|the control vault didn''t answer|managed private endpoint'
+        @($report.refs).Count | Should -Be 0
+        # Stop now: the webhook's URL can't be read either, and it says why once, with the same fix.
+        $stop = Invoke-Simulation -Path $path -Scenario 'nocontrolstop' -Start '2026-11-14T14:00:00Z'
+        $stop.error | Should -BeNullOrEmpty
+        $stop.sent | Should -BeNullOrEmpty
+        $stop.printed | Should -Match 'The session''s status couldn''t be read, so Stop now asks the session control to stop whatever runs\.'
+        $stop.printed | Should -Match ('Manual action required: the webhook URL couldn''t be read from Key Vault \(Py4JJavaError\): the session control isn''t set up\. {0}' -f [regex]::Escape($problem))
+        $stop.printed | Should -Not -Match 'Key Vault Secrets User|No session runs'
+        ([regex]::Matches($stop.printed, [regex]::Escape($problem))).Count | Should -Be 1
+        # Without what deploy.ps1 found (a control that's set up), the vault's answer, as before.
+        $vault = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'novault' -Start '2026-11-14T14:00:00Z'
+        $vault.error | Should -BeNullOrEmpty
+        $vault.sent | Should -BeNullOrEmpty
+        $vault.printed | Should -Match 'Manual action required: the control vault didn''t answer: the secret dbhub-session-status couldn''t be read \(Py4JJavaError\): you need Key Vault Secrets User on it'
+        $vault.printed | Should -Not -Match 'isn''t set up'
+        # And a problem that a later fix made stale changes nothing when the vault answers (it only explains a failure).
+        $fixed = Invoke-Simulation -Path $path -Scenario 'session' -Start '2026-11-14T14:00:00Z'
+        $fixed.error | Should -BeNullOrEmpty
+        @($fixed.sent | ForEach-Object action) | Should -Contain 'session'
+        $fixed.printed | Should -Not -Match 'isn''t set up'
     }
 
     It 'saves the history of another environment''s session with that environment''s names, not the activity notebook''s defaults' {
@@ -2059,7 +2103,8 @@ class Credentials:
 notebookutils = types.SimpleNamespace(credentials=Credentials())
 
 namespace = {"notebookutils": notebookutils, "KEY_VAULT_URL": "https://kv-test-ctl-abc123.vault.azure.net/", "WEBHOOK_SECRET_NAME": "dbhub-activity-webhook",
-             "RESOURCE_GROUP": "rg-dbhub-demo", "DEMO_DATABASE": "ContosoCare", "T1_VM_NAME": "sqlvm01", "T2_MACHINE_NAME": "arcsql01", "T3_SERVER_PREFIX": "azuresql01-"}
+             "RESOURCE_GROUP": "rg-dbhub-demo", "DEMO_DATABASE": "ContosoCare", "T1_VM_NAME": "sqlvm01", "T2_MACHINE_NAME": "arcsql01", "T3_SERVER_PREFIX": "azuresql01-",
+             "CONTROL_PROBLEM": ""}
 exec(open(sys.argv[1], encoding="utf-8").read(), namespace)
 exec(open(sys.argv[2], encoding="utf-8").read(), namespace)
 report = {}
@@ -2136,6 +2181,20 @@ Describe 'The notebook deploy.ps1 imports' {
         # Without the demo's lakehouse, the copy names none, and the history runs as a job (the fallback).
         $source | Should -Match '(?m)^DEMO_LAKEHOUSE_ID = ""'
         $filled['metadata'].Contains('dependencies') | Should -BeFalse
+        # Nothing missing in the session control: no problem, which also clears one an earlier run put there (F29).
+        $source | Should -Match '(?m)^CONTROL_PROBLEM = ""\s+#'
+    }
+
+    It 'fills CONTROL_PROBLEM with what deploy.ps1 found missing in the session control, as a Python string (F29)' {
+        $problem = './scripts/deploy.ps1 found on 2026-11-21 11:40 UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up. Fix: Free an Automation account in westus3 ("destroy.ps1" on an old environment). Then run ./scripts/deploy.ps1 again.'
+        $notebookDefinition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $script:config; Json = $script:settingsJson; Problem = $problem } {
+            Get-DemoActivityControlNotebook -Name (Get-DemoActivityControlName -Config $Config) -Setting ($Json | ConvertFrom-Json -AsHashtable) -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -ControlProblem $Problem
+        }
+        $filled = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($notebookDefinition.Definition['parts'][0]['payload'])) | ConvertFrom-Json -AsHashtable -Depth 64
+        $source = (@(@($filled['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join '')
+        $line = [regex]::Match($source, '(?m)^CONTROL_PROBLEM = (".*?[^\\]")\s+# what deploy\.ps1 found missing').Groups[1].Value
+        $line | Should -Not -BeNullOrEmpty
+        ($line | ConvertFrom-Json) | Should -BeExactly $problem
     }
 
     It 'attaches the demo''s lakehouse as the copy''s default lakehouse, so its history can run in the notebook''s own session' {

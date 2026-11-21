@@ -1159,6 +1159,8 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
             $note | Should -Not -Match 'Run all is ready|In Azure:'
             ([regex]::Matches($note, 'is used up')).Count | Should -Be 1
             $note | Should -Match 'Meanwhile \./scripts/start-demo\.ps1 runs a session from this PC\.$'
+            # The notebook says it too, at Run all (F29): what deploy.ps1 found goes into its CONTROL_PROBLEM.
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 1 -Exactly -ParameterFilter { $ControlProblem -match '^\./scripts/deploy\.ps1 found on \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up\. Fix: Free an Automation account in westus3: .* Then run \./scripts/deploy\.ps1 again\. Meanwhile \./scripts/start-demo\.ps1 runs a session from a PC, and \./scripts/stop-demo\.ps1 stops the demo\.$' }
         }
 
         It 'names a missing <Case>, with this run''s step that says why' -ForEach @(
@@ -1224,6 +1226,8 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
                 $control.message | Should -BeExactly 'Run all is ready: open NB_DatabaseHub_Control in the workspace "Database Hub Demo Control" and select Run all. It runs the whole session and stops it.'
                 $control.evidence['ready'] | Should -BeTrue
             }
+            # The notebook's CONTROL_PROBLEM is cleared, so a problem an earlier run put there goes (F29).
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 2 -Exactly -ParameterFilter { $ControlProblem -eq '' }
         }
 
         It 'counts CONTROL.MODE as where the setup stopped only when nothing after it ran' {

@@ -4708,3 +4708,22 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live.** The reads are the ones `validate.ps1`'s `Test-DemoActivityControl` already makes (the account, the webhooks, the secrets' metadata), four or five more `az rest` GETs per run.
 - **A webhook that expires within 14 days** still counts as there; the setup replaces it on the same run.
+
+### Run all names a session control that isn't set up (F29, 2026-11-22)
+
+**Why.** On `dbhubra` (F28), Run all ended in 76 seconds with "Manual action required: the control vault didn't answer: the secret dbhub-session-status couldn't be read (Py4JJavaError): you need Key Vault Secrets User on it ...". The vault existed, but the setup had stopped at its template, before the roles, so nobody could read it; and the real cause, the missing Automation account, can't be fixed with a role.
+
+**Work summary.**
+
+- **What the notebook can know:** a Fabric notebook gets no Azure Resource Manager token through a documented `notebookutils` audience key, so it can't read the Automation account itself. `deploy.ps1` already knows (F28's `Get-DemoControlGap`), so it says so at import: the notebook's parameters cell has a new `CONTROL_PROBLEM` (`Get-DemoActivityControlNotebook -ControlProblem`, through `Set-DemoActivityControlFabric`), filled with the gap's `Problem` ("./scripts/deploy.ps1 found on &lt;time&gt; UTC that Run all can't start a session: &lt;what&gt;&lt;why&gt;. Fix: &lt;fix&gt; Meanwhile ./scripts/start-demo.ps1 runs a session from a PC, and ./scripts/stop-demo.ps1 stops the demo."), and emptied on every run that finds nothing missing.
+- **The notebook** (`fabric/control/NB_DatabaseHub_Control.ipynb`): with `CONTROL_PROBLEM` set, a secret it can't read is "couldn't be read (&lt;type&gt;): the session control isn't set up. &lt;problem&gt;" (`read_secret_json`); the pre-check prints "Manual action required: Run all starts nothing: ..."; the webhook's URL it can't read is "Manual action required: the webhook URL couldn't be read from Key Vault (&lt;type&gt;): the session control isn't set up. ..."; an HTTP 400 or 404 from the webhook adds the problem; and **Stop now** without the session's status says it asks the control to stop whatever runs, then the webhook's read says why, once. None of these ask for Key Vault Secrets User. It only explains a read that fails, so a stale value blocks nothing. Without it, every message is as before. The notebook stays nbformat 4.5 with no outputs.
+- **Docs:** the control's README, troubleshooting (Run all's and Stop now's messages), ADR 0026's amendment, the CHANGELOG, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb`; `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`, `ControlDeployHelpers.ps1`; tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1` (the simulator's vault refuses every read in `nocontrol`, `nocontrolstop`, and `novault`, as `notebookutils` raises `Py4JJavaError`; the helpers' own harness gets the new parameter) and `DbHubDemo.ActivityControl.Tests.ps1`; `fabric/control/README.md`, `docs/troubleshooting.md`, `docs/adr/0026-one-run-all-session.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Fabric.ControlNotebook (Python 3.11 with pandas, none skipped) and ActivityControl, 205 passed; 0 failed, 0 az calls. With HEAD's behavior cells and only the new parameter line, the Run all test fails on its message: the notebook printed "the control vault didn't answer: ... you need Key Vault Secrets User on it", the live finding. With HEAD's `ControlDeployHelpers.ps1`, the two deploy-step assertions fail (the problem passed for a missing account, and cleared when nothing is missing). The import test (the problem as a Python string literal, quotes included) fails without `-ControlProblem`. PSScriptAnalyzer: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The notebook runs offline against stand-ins for `notebookutils` and the webhook.
+- **The Insights app's Manage still shows "completed"** for a notebook run that started nothing, here as for any other "Manual action required" in the notebook: the app reads the Fabric job's status, and the notebook ends normally. Pre-existing; not changed here.
