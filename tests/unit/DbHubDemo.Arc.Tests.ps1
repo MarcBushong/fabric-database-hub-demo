@@ -404,6 +404,8 @@ Describe 'Invoke-DemoVmRunCommand' {
             $result.Succeeded | Should -BeTrue
             $result.UsedName | Should -Be 'DbHubDemo-HealthRead'
             ($script:logs -join ' ') | Should -Match 'archost01 already has 24 Run Commands, close to Azure''s limit of 25, so DbHubDemo-HealthRead runs under its own name'
+            # The skip risk, so a later "didn't start" doesn't read as extension work (the review of 8ff25e95).
+            ($script:logs -join ' ') | Should -Match 'The VM''s Run Command handler can skip a name it ran before until that name''s delete reaches it \(F31\), so if DbHubDemo-HealthRead then doesn''t start, that''s why, not extension work\.'
         }
 
         It 'deletes a read that hasn''t started after -PendingRetrySeconds and runs it once more under a fresh name, only once' {
@@ -502,6 +504,33 @@ Describe 'Invoke-DemoVmRunCommand' {
             $script:runCommands.Keys | Should -Contain $young
         }
 
+        It 'records a fixed name Azure keeps in Deleting as stuck, as a run under its own name does: the same action waits 30 seconds at most next time, and DEPLOY.RUNCOMMAND.STUCK_ARCHOST01 says so (the review of 8ff25e95)' {
+            # bf010ed's DbHubDemo-Golden, which Azure keeps in Deleting for hours (2026-11-13); every other delete finishes.
+            $script:deletes = [System.Collections.Generic.List[object]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Remove-DemoRunCommand -MockWith {
+                $name = if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
+                $script:deletes.Add([pscustomobject]@{ Name = $name; WaitSeconds = $WaitSeconds })
+                $name -cne 'DbHubDemo-Golden'
+            }
+            $first = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-Golden' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshAction
+            $second = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-Golden' -Script 'Write-Output 1' -PollIntervalSeconds 0 -FreshAction
+
+            $first.Succeeded | Should -BeTrue
+            $second.Succeeded | Should -BeTrue
+            $first.UsedName | Should -Match '^DbHubDemo-Golden-\d{14}$'
+            @($script:deletes | Where-Object Name -CEQ 'DbHubDemo-Golden' | ForEach-Object WaitSeconds) | Should -Be @(300, 30) -Because 'a name known to be stuck isn''t waited for again'
+            InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuckName.Contains('archost01/DbHubDemo-Golden') } | Should -BeTrue
+            $stuck = @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult -Clear })
+            $stuck.Count | Should -Be 1
+            $stuck[0].checkId | Should -Be 'DEPLOY.RUNCOMMAND.STUCK_ARCHOST01'
+            $stuck[0].status | Should -Be 'Warning'
+            $stuck[0].message | Should -BeLike ('Azure kept DbHubDemo-Golden on archost01 in Deleting for more than 5m 00s, so 2 Run Command run(s) used a fresh name instead of waiting (the last: {0}).*' -f $second.UsedName)
+            @($stuck[0].evidence['freshNames']) | Should -Be @($first.UsedName, $second.UsedName)
+            $log = $script:logs -join ' '
+            $log | Should -Match ('archost01: Azure still lists DbHubDemo-Golden after 5m 00s \(its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete\), so the step runs as {0} without waiting longer\. Nothing to do: Azure deletes the stuck one on its own \(DEPLOY\.RUNCOMMAND\.STUCK_ARCHOST01\)\.' -f [regex]::Escape($first.UsedName))
+            $log | Should -Not -Match 'STATUS\.RUNCOMMANDS lists it' -Because 'status.ps1 leaves out a Run Command Azure is deleting on sqlvm01'
+        }
+
         It 'never sends an action twice: -PendingRetrySeconds is only for a read, and a read is no action' {
             { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'x' -PollIntervalSeconds 0 -FreshAction -PendingRetrySeconds 90 } | Should -Throw '*only for a read-only script (-FreshName): a script that changes something, sent again, could run twice*'
             { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HostPassword' -Script 'x' -PollIntervalSeconds 0 -PendingRetrySeconds 90 } | Should -Throw '*only for a read-only script*'
@@ -547,7 +576,8 @@ Describe 'Invoke-DemoVmRunCommand' {
 
         It 'runs every Run Command the scripts create and delete under a fresh name: the reads with -FreshName, the rest with -FreshAction' {
             # A new caller must be added here on purpose. DbHubDemo-Profile and the template's DbHubDemo-Bootstrap aren't
-            # Invoke-DemoVmRunCommand's: both are updated in place, never deleted, and keep their names.
+            # Invoke-DemoVmRunCommand's, and keep their names: each profile change updates DbHubDemo-Profile in place, and the
+            # template updates DbHubDemo-Bootstrap in place, which the parallel tracks' loader deletes first.
             $expected = @{
                 'DbHubDemo-HealthRead'        = 'FreshName'
                 'DbHubDemo-SqlModeRead'       = 'FreshName'

@@ -230,6 +230,10 @@ Describe 'Send-DemoBootstrapBundle' {
         Set-Content -LiteralPath (Join-Path -Path $sendRepository -ChildPath 'database/common/020-seed.sql') -Value ((1..200 | ForEach-Object { "SELECT $_;" }) -join "`n")
         $sendBundle = New-DemoBootstrapBundle -RepositoryRoot $sendRepository -OutputDirectory (Join-Path -Path $TestDrive -ChildPath 'send')
         $expectedChunks = @(New-DemoBootstrapChunk -Path $sendBundle.Path -ChunkSizeKiB 1)
+        # The names a send gives its chunks: one suffix for all of them, new for each send (the review of 8ff25e95). The tests
+        # fix it, so the fake can name a chunk before it's sent; one test uses the real suffix.
+        $sentNames = @($expectedChunks | ForEach-Object { '{0}-s5e0d01' -f $_.Name })
+        $script:realSendSuffix = & (Get-Module -Name DbHubDemo) { ${function:Get-DemoChunkSendSuffix} }
         $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
         $apiVersion = $versions.apiVersions['Microsoft.Compute/virtualMachines/runCommands']
     }
@@ -255,6 +259,8 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:deleteLag = 0
         $script:pendingDeletes = @{}
         InModuleScope DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+        $script:sendSuffix = 's5e0d01'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoChunkSendSuffix -MockWith { if ($script:sendSuffix) { $script:sendSuffix } else { & $script:realSendSuffix } }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
@@ -351,9 +357,9 @@ Describe 'Send-DemoBootstrapBundle' {
         $sequence = @('get') + @(foreach ($chunk in $expectedChunks) { 'put', 'get', 'delete' }) + @('get')
         $script:calls.Method | Should -Be $sequence
         $puts = @($script:calls | Where-Object Method -eq 'put')
-        $puts.Name | Should -Be $expectedChunks.Name
+        $puts.Name | Should -Be $sentNames
         for ($i = 0; $i -lt $puts.Count; $i++) {
-            $puts[$i].Url | Should -Be ('https://management.azure.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01/runCommands/{0}?api-version={1}' -f $expectedChunks[$i].Name, $apiVersion)
+            $puts[$i].Url | Should -Be ('https://management.azure.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01/runCommands/{0}?api-version={1}' -f $sentNames[$i], $apiVersion)
             $puts[$i].Body.location | Should -Be $config['location']
             $puts[$i].Body.properties.source.script | Should -Be $expectedChunks[$i].Script
             $puts[$i].Body.properties.asyncExecution | Should -BeFalse
@@ -382,8 +388,8 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:stuckDeletes = $true
         { InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 -DeleteWaitSeconds 30 } } | Should -Throw ('archost01: Azure didn''t delete the Run Command of chunk 1 of {0}, twice in 30s, so the transfer stops before more chunks stay on archost01*R871*' -f $expectedChunks.Count)
         @($script:calls | Where-Object Method -EQ 'put').Count | Should -Be 1 -Because 'no second chunk goes while the first stays'
-        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $expectedChunks[0].Name }).Count | Should -BeGreaterOrEqual 2
-        @($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name -eq $expectedChunks[0].Name }).Count | Should -Be 5 -Because 'its result, then 2 reads 15 seconds apart in each of the two rounds'
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $sentNames[0] }).Count | Should -BeGreaterOrEqual 2
+        @($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name -eq $sentNames[0] }).Count | Should -Be 5 -Because 'its result, then 2 reads 15 seconds apart in each of the two rounds'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like ('archost01: Azure didn''t delete the Run Command of chunk 1 of {0} within 30s, so it''s deleted once more.' -f $expectedChunks.Count) } -Times 1 -Exactly
     }
 
@@ -395,18 +401,18 @@ Describe 'Send-DemoBootstrapBundle' {
     It 'retries a PUT that hits 409 Conflict, with backoff' {
         $script:conflictsLeft = 2
         Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'archost01' -ChunkSizeKiB 1 | Out-Null
-        @($script:calls | Where-Object { $_.Method -eq 'put' -and $_.Name -eq $expectedChunks[0].Name }).Count | Should -Be 3
+        @($script:calls | Where-Object { $_.Method -eq 'put' -and $_.Name -eq $sentNames[0] }).Count | Should -Be 3
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 10 } -Times 1 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 20 } -Times 1 -Exactly
         $script:runCommands.Count | Should -Be 0
     }
 
     It 'stops at a chunk whose script exits non-zero, reports its error, and deletes the leftover Run Command' {
-        $script:failName = $expectedChunks[1].Name
+        $script:failName = $sentNames[1]
         { Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'sqlvm01' -ChunkSizeKiB 1 } | Should -Throw ('*chunk 2 of {0} failed on the VM*exit code 1*SHA-256 mismatch*' -f $expectedChunks.Count)
-        @($script:calls | Where-Object Method -eq 'put').Name | Should -Be @($expectedChunks[0].Name, $expectedChunks[1].Name)
+        @($script:calls | Where-Object Method -eq 'put').Name | Should -Be @($sentNames[0], $sentNames[1])
         # The finally block listed the VM's Run Commands and deleted the failed chunk.
-        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $expectedChunks[1].Name }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $sentNames[1] }).Count | Should -Be 1
         $script:runCommands.Count | Should -Be 0
     }
 
@@ -477,7 +483,7 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:stuckDeletes = $true
         $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'sqlvm01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
         $sent[0].ChunkCount | Should -Be $expectedChunks.Count
-        @($sent[0].LeftoverRunCommands) | Should -Be @($expectedChunks.Name)
+        @($sent[0].LeftoverRunCommands) | Should -Be @($sentNames)
         # Each chunk's Run Command is read only for its result, never polled after its delete.
         @($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name }).Count | Should -Be $expectedChunks.Count
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'Azure is still deleting' }
@@ -495,8 +501,10 @@ Describe 'Send-DemoBootstrapBundle' {
     }
 
     It 'sends a chunk whose name Azure keeps marked for deletion under a fresh name at once, with the same script, and its cleanup still finds it (2026-11-16 live finding)' {
-        # Live on archost01, the refused PUT failed the transfer, and the watchdog restarted the VM, which Azure then hung.
-        $held = $expectedChunks[0].Name
+        # Live on archost01, the refused PUT failed the transfer, and the watchdog restarted the VM, which Azure then hung. A
+        # send's suffix is new each time since the review of 8ff25e95, so this is the fallback behind it: Azure holds the very
+        # name this send uses.
+        $held = $sentNames[0]
         $script:runCommands[$held] = @{}
         $null = $script:held.Add($held)
         $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
@@ -507,7 +515,7 @@ Describe 'Send-DemoBootstrapBundle' {
         $puts[0].Name | Should -Be $held
         $puts[1].Name | Should -Match ('^{0}-\d{{14}}$' -f [regex]::Escape($held))
         $puts[1].Body.properties.source.script | Should -Be $expectedChunks[0].Script -Because 'the VM writes the same chunk-001 file, whatever the Run Command is called'
-        @($puts | Select-Object -Skip 2).Name | Should -Be @($expectedChunks | Select-Object -Skip 1).Name
+        @($puts | Select-Object -Skip 2).Name | Should -Be @($sentNames | Select-Object -Skip 1)
         @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $puts[1].Name }).Count | Should -Be 1 -Because 'it''s deleted once it finished, like any chunk'
         $script:runCommands.Keys | Should -Be @($held)
         @($sent[0].LeftoverRunCommands) | Should -Be @($held) -Because 'the cleanup at the end still reports the one Azure holds'
@@ -522,14 +530,14 @@ Describe 'Send-DemoBootstrapBundle' {
 
     It 'leaves the other chunks of its set alone while one gets a fresh name, so each is still read back (2026-11-16)' {
         $expectedChunks.Count | Should -BeGreaterOrEqual 3
-        $held = $expectedChunks[2].Name
+        $held = $sentNames[2]
         $script:runCommands[$held] = @{}
         $null = $script:held.Add($held)
         $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -Parallelism 4 -CleanupWaitSeconds 0 })
 
         $sent[0].ChunkCount | Should -Be $expectedChunks.Count
         # Chunks 1 and 2 had finished, unread, when chunk 3's fresh name was resolved: only their own finish deletes them.
-        foreach ($name in $expectedChunks[0].Name, $expectedChunks[1].Name) {
+        foreach ($name in $sentNames[0], $sentNames[1]) {
             @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $name }).Count | Should -Be 1
         }
         $script:runCommands.Keys | Should -Be @($held)
@@ -537,7 +545,7 @@ Describe 'Send-DemoBootstrapBundle' {
 
     It 'gives a held name a fresh name at once when Azure''s answer reads Conflict too, with no backoff (2026-11-16)' {
         $script:heldStatus = 'Conflict'
-        $held = $expectedChunks[0].Name
+        $held = $sentNames[0]
         $script:runCommands[$held] = @{}
         $null = $script:held.Add($held)
         $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
@@ -548,7 +556,7 @@ Describe 'Send-DemoBootstrapBundle' {
     }
 
     It 'stops with Azure''s limit of 25, not the refused PUT, when the VM has no room for a fresh name (2026-11-16)' {
-        $held = $expectedChunks[0].Name
+        $held = $sentNames[0]
         $script:runCommands[$held] = @{}
         $null = $script:held.Add($held)
         foreach ($i in 1..23) {
@@ -565,7 +573,7 @@ Describe 'Send-DemoBootstrapBundle' {
         foreach ($i in 1..9) {
             $script:runCommands[('DbHubDemo-Chunk-4e8f3641cbfc-{0:d3}' -f $i)] = @{}
         }
-        $held = $expectedChunks[0].Name
+        $held = $sentNames[0]
         foreach ($name in @($held) + @(2..8 | ForEach-Object { 'DbHubDemo-Chunk-a8a10d93133c-{0:d3}' -f $_ })) {
             $script:runCommands[$name] = @{}
             $null = $script:held.Add($name)
@@ -629,6 +637,43 @@ Describe 'Send-DemoBootstrapBundle' {
         $methods = @($script:calls.Method)
         @($script:calls | Where-Object Method -eq 'put').Count | Should -Be ($sent[0].ChunkCount + $sent[1].ChunkCount)
         [array]::LastIndexOf($methods, 'put') | Should -BeLessThan ([array]::IndexOf($methods, 'delete'))
+        $script:runCommands.Count | Should -Be 0
+    }
+
+    It 'names every chunk of a send with one suffix, and the same content sent again with another, whose scripts write the same files (the review of 8ff25e95)' {
+        # A resend after a stalled or interrupted transfer, or the loader's missing-chunk recovery: the VM's Run Command handler
+        # can skip a name it ran before (F31), and a chunk's state is read without -NotBeforeUtc (2026-10-21).
+        $script:sendSuffix = ''
+        $secondRepository = New-FakeRepository
+        Set-Content -LiteralPath (Join-Path -Path $secondRepository -ChildPath 'database/common/020-seed.sql') -Value ((1..150 | ForEach-Object { "SELECT $_ + 2;" }) -join "`n")
+        $second = New-DemoBootstrapBundle -RepositoryRoot $secondRepository -OutputDirectory (Join-Path -Path $TestDrive -ChildPath 'send-suffix')
+        # The caller's own chunks, as Send-DemoBootstrapBundle passes them: a send leaves their names as they are.
+        $given = @(New-DemoBootstrapChunk -Path $sendBundle.Path -ChunkSizeKiB 1)
+        $files = @(
+            [pscustomobject]@{ Path = $sendBundle.Path; Sha256 = $sendBundle.Sha256; SizeBytes = $sendBundle.SizeBytes; Description = 'bootstrap bundle'; Chunks = $given }
+            [pscustomobject]@{ Path = $second.Path; Sha256 = $second.Sha256; SizeBytes = $second.SizeBytes; Description = 'workload runner' }
+        )
+        $baseNames = @(@($expectedChunks.Name) + @(New-DemoBootstrapChunk -Path $second.Path -ChunkSizeKiB 1).Name)
+        $send = {
+            $script:calls.Clear()
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Files = $files } { Send-DemoChunkSet -Config $Config -File $Files -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 }
+            @($script:calls | Where-Object Method -eq 'put')
+        }
+        $first = @(& $send)
+        $again = @(& $send)
+
+        $suffix = ($first[0].Name -split '-')[-1]
+        $suffix | Should -Match '^s[0-9a-f]{6}$' -Because 'no 14-digit time, which status.ps1 would read as a delete in flight'
+        @($first.Name) | Should -Be @($baseNames | ForEach-Object { '{0}-{1}' -f $_, $suffix }) -Because 'every chunk of a send, both files'', carries its one suffix'
+        $suffixAgain = ($again[0].Name -split '-')[-1]
+        $suffixAgain | Should -Match '^s[0-9a-f]{6}$'
+        $suffixAgain | Should -Not -Be $suffix
+        @($again.Name) | Should -Be @($baseNames | ForEach-Object { '{0}-{1}' -f $_, $suffixAgain })
+        @($again.Name | Where-Object { $first.Name -contains $_ }) | Should -BeNullOrEmpty -Because 'no name is used twice'
+        for ($i = 0; $i -lt $first.Count; $i++) {
+            $again[$i].Body.properties.source.script | Should -Be $first[$i].Body.properties.source.script -Because 'the VM writes downloads\<sha12>\chunk-<nnn> whatever the name'
+        }
+        @($given.Name) | Should -Be @($expectedChunks.Name)
         $script:runCommands.Count | Should -Be 0
     }
 

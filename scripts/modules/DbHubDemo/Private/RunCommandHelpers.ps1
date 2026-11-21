@@ -402,7 +402,7 @@ function Get-DemoRunCommandRunName {
         }
     }
     if ($listed -ge $Limit) {
-        Write-DemoLog -Level Warning -Message ('{0} already has {1} Run Commands, close to Azure''s limit of 25, so {2} runs under its own name. Azure deletes the earlier ones on its own (STATUS.RUNCOMMANDS lists them).' -f $VmName, $listed, $RunCommandName)
+        Write-DemoLog -Level Warning -Message ('{0} already has {1} Run Commands, close to Azure''s limit of 25, so {2} runs under its own name, as before. The VM''s Run Command handler can skip a name it ran before until that name''s delete reaches it (F31), so if {2} then doesn''t start, that''s why, not extension work. Azure deletes the earlier ones on its own; ./scripts/status.ps1 lists those that aren''t being deleted (STATUS.RUNCOMMANDS).' -f $VmName, $listed, $RunCommandName)
         return $RunCommandName
     }
     return $fresh
@@ -809,6 +809,16 @@ function Wait-DemoChunkRunCommandGone {
     }
 }
 
+function Get-DemoChunkSendSuffix {
+    # The suffix every chunk of one Send-DemoChunkSet call carries, s and 6 hex digits (the review of 8ff25e95): new for each
+    # call, and never a 14-digit time, which STATUS.RUNCOMMANDS would read as a delete in flight. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return ('s{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
+}
+
 function Send-DemoChunkSet {
     <#
     .SYNOPSIS
@@ -819,7 +829,8 @@ function Send-DemoChunkSet {
     Each file is split with New-DemoBootstrapChunk (or brings its chunks in a Chunks property), and the
     chunks of every file share one queue, so deploy.ps1's tracks send the bootstrap bundle (1 chunk) and the
     workload runner (7) in one wave of 8 instead of one after the other (ADR 0018). For each chunk: PUT the
-    managed Run Command DbHubDemo-Chunk-<sha12>-<nnn> with 'az rest' (the body in a temporary file; a 409
+    managed Run Command DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>, with one suffix for every chunk of the call, so a
+    resend never reuses a name (the review of 8ff25e95), with 'az rest' (the body in a temporary file; a 409
     Conflict is retried with backoff; a name Azure keeps marked for deletion runs at once under a fresh one,
     <name>-yyyyMMddHHmmss, through Resolve-DemoRunCommandFreshName, 2026-11-16 live finding), read its
     instance view until the script is terminal (exit code 0 required), then DELETE it without waiting for
@@ -891,6 +902,12 @@ function Send-DemoChunkSet {
     if (-not $ResourceGroupName) {
         $ResourceGroupName = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
     }
+    # One suffix for every chunk this call sends, DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits> (Get-DemoChunkSendSuffix; the
+    # review of 8ff25e95), so the same content sent to the same VM again, after a stalled or interrupted transfer or the
+    # loader's missing-chunk recovery, never reuses a name: the VM's Run Command handler can skip a name it ran before (F31),
+    # and a chunk's state is read without -NotBeforeUtc, so a reused name could report an earlier run's result (2026-10-21).
+    # The VM writes downloads\<sha12>\chunk-<nnn> whatever the name, and every cleanup matches DbHubDemo-Chunk-*.
+    $sendSuffix = Get-DemoChunkSendSuffix
     $entries = [System.Collections.Generic.List[object]]::new()
     $pending = [System.Collections.Generic.Queue[object]]::new()
     foreach ($item in @($File)) {
@@ -911,7 +928,10 @@ function Send-DemoChunkSet {
         $entry = [pscustomobject]@{ Description = $description; Sha256 = $sha; SizeBytes = [long](Get-DemoMemberValue -InputObject $item -Name 'SizeBytes'); ChunkCount = $chunks.Count; Left = $chunks.Count; Seconds = 0.0 }
         $entries.Add($entry)
         foreach ($chunk in $chunks) {
-            $pending.Enqueue([pscustomobject]@{ Chunk = $chunk; Entry = $entry })
+            # This send's name for the chunk; the caller's chunk is left as it is.
+            $named = $chunk.PSObject.Copy()
+            $named.Name = '{0}-{1}' -f [string]$chunk.Name, $sendSuffix
+            $pending.Enqueue([pscustomobject]@{ Chunk = $named; Entry = $entry })
         }
     }
 
@@ -1289,7 +1309,8 @@ function Get-DemoVmRunCommandLeftover {
     are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go with a VM agent
     that isn't working (R871). Except a delete in flight (the review of F31): one whose name ends in a time
     (-yyyyMMddHHmmss: a fresh-named read, whose delete nobody waits for, or the control's) less than -RecentDeleteMinutes
-    old is a name in RecentDeletes instead, as status.ps1's own health read is seconds after it. Older ones are items.
+    old is a name in RecentDeletes instead, as status.ps1's own health read is seconds after it. Older ones are items, and
+    so is every chunk (DbHubDemo-Chunk-*), whatever its name (the review of 8ff25e95).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1338,8 +1359,10 @@ function Get-DemoVmRunCommandLeftover {
                 continue
             }
             # A time-stamped name that Azure began deleting minutes ago is a delete in flight, not a stuck one (the review of
-            # F31: status.ps1's own fresh-named health read, whose delete isn't waited for, listed seconds later).
-            $stamp = Get-DemoRunCommandNameTime -Name $name
+            # F31: status.ps1's own fresh-named health read, whose delete isn't waited for, listed seconds later). Never a
+            # chunk: one in Deleting on the T2 host is R871's sign whatever its name, and a chunk's fresh name ends in a time
+            # too (the review of 8ff25e95).
+            $stamp = if ($name.StartsWith('DbHubDemo-Chunk-', [System.StringComparison]::Ordinal)) { $null } else { Get-DemoRunCommandNameTime -Name $name }
             if ($null -ne $stamp -and $stamp -gt $recentSince) {
                 $recent.Add($name)
                 continue
@@ -1451,7 +1474,8 @@ function Get-DemoRunCommandStatus {
     On the T2 host, archost01 (2026-11-17), the demo's Run Commands that Azure is still deleting come first, as a Warning
     whose fix is deploy.ps1: ones that stay there go with a VM agent that isn't working (R871), which deploy.ps1 recovers,
     or rebuilds the host for (R872). A time-stamped one Azure began deleting less than 15 minutes ago is a delete in
-    flight, such as status.ps1's own health read (the review of F31): it's only in the evidence (deletingRecently).
+    flight, such as status.ps1's own health read (the review of F31): it's only in the evidence (deletingRecently). A
+    chunk never is (the review of 8ff25e95).
     -RunInProgress names a run the busy marker says is going on, whose own deletes show for a few minutes. Internal.
     #>
     [CmdletBinding()]

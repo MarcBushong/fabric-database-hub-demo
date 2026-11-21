@@ -10,7 +10,8 @@ function New-DemoBootstrapChunk {
     sends the scripts one at a time.
 
     - Name is the deterministic Run Command name DbHubDemo-Chunk-<first 12 hex digits of the bundle
-      SHA-256>-<index, 3 digits>, so a VM can't confuse two bundles.
+      SHA-256>-<index, 3 digits>, so a VM can't confuse two bundles. Send-DemoChunkSet adds one suffix for each send,
+      -s<6 hex digits>, so a resend never reuses a Run Command name (the review of 8ff25e95).
     - Script is an ASCII-only Windows PowerShell 5.1 script with the chunk's Base64 data and expected hashes
       inlined; it takes no Run Command parameters. It creates <Root>\downloads\<sha12> (restricting <Root>
       to SYSTEM and Administrators when it creates it, like the loader), decodes the data, checks its

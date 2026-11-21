@@ -98,7 +98,8 @@ function Invoke-DemoVmRunCommand {
     run again seconds after its delete, never started. Otherwise as before: the name itself, left by an earlier version
     (or, for DbHubDemo-Bootstrap, the template's loader), is deleted first and that delete waited for, at most
     -LeftoverWaitSeconds, so its script never runs beside this one; and its own delete is waited for, so nothing piles up
-    toward Azure's 25. Earlier copies whose owner stopped waiting go too. -PendingRetrySeconds isn't for it: a script that
+    toward Azure's 25. A fixed name whose delete Azure doesn't finish is recorded as stuck, as a run under its own name
+    records it: DEPLOY.RUNCOMMAND.STUCK_<VM> reports it, and the same action later in the process waits 30 seconds at most. Earlier copies whose owner stopped waiting go too. -PendingRetrySeconds isn't for it: a script that
     changes something, sent again, could run twice. Not with -FreshName.
 
     .PARAMETER PendingRetrySeconds
@@ -263,10 +264,14 @@ function Invoke-DemoVmRunCommand {
             elseif (-not $fixedCleared) {
                 # An action's fixed name, left by an earlier version or, for DbHubDemo-Bootstrap, the template's loader, goes
                 # first, and its delete is waited for, as before, so its script never runs beside this one (the review of
-                # F31). The fresh name doesn't need the name, so a delete Azure doesn't finish only gets a log line.
+                # F31). The fresh name doesn't need the name, so a delete Azure doesn't finish is recorded the way
+                # Resolve-DemoRunCommandFreshName records a stuck name: the same action later in this process waits 30
+                # seconds at most for it, and DEPLOY.RUNCOMMAND.STUCK_<VM> reports it (the review of 8ff25e95).
                 $fixedCleared = $true
                 if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url ('{0}/{1}?api-version={2}' -f $baseUrl, $RunCommandName, $apiVersion) -WaitSeconds $leftoverWait -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
-                    Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} after {2}; {3} runs under its own name anyway, and Azure deletes the earlier one on its own (STATUS.RUNCOMMANDS lists it until then).' -f $VmName, $RunCommandName, (Format-DemoProgressDuration -Seconds ([long]$leftoverWait)), $usedName)
+                    $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = $VmName; Name = $RunCommandName; FreshName = $usedName; AtUtc = [DateTime]::UtcNow; WaitedSeconds = $leftoverWait; Refused = $false })
+                    $null = $script:DemoRunCommandStuckName.Add(('{0}/{1}' -f $VmName, $RunCommandName))
+                    Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} after {2} (its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete), so the step runs as {3} without waiting longer. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_{4}).' -f $VmName, $RunCommandName, (Format-DemoProgressDuration -Seconds ([long]$leftoverWait)), $usedName, $VmName.ToUpperInvariant())
                 }
             }
 

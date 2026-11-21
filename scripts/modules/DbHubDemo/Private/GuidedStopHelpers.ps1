@@ -226,9 +226,9 @@ function Wait-DemoT2HostBuild {
         $checking = [bool](Get-DemoMemberValue -InputObject $health -Name 'generationPending')
         $what = if ($rebuilding) { 'makes T2 again from Arc Jumpstart''s image (about 27 minutes in all, measured on 2026-11-06, with the 34 GiB download at about 51 MiB/s)' } elseif ($stale) { 'starts this run''s bootstrap (its last report is from the bundle before)' } elseif ($checking) { 'checks every step again for this run''s bootstrap generation' } else { 'builds its guest' }
         $message = 'archost01 {5}: step {0} ({1} of {2}), {3} minutes so far.{4}' -f $(if ($phase.Step) { $phase.Step } else { 'starting' }), $phase.Index, $phase.Count, $elapsed, $estimate, $what
-        # 2026-11-13 live finding: while Azure keeps DbHubDemo-HealthRead in Deleting, the reads run under a fresh name.
+        # A Run Command name Azure keeps in Deleting (2026-11-13 live finding): the step that uses it runs under a fresh name.
         if (@(Get-DemoRunCommandStuckResult -VmName 'archost01').Count -gt 0) {
-            $message += ' Azure keeps a Run Command name on archost01 in Deleting, so its health reads run under a fresh name (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01; nothing to do).'
+            $message += ' Azure keeps a Run Command name on archost01 in Deleting, so the step that uses it ran under a fresh name (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01; nothing to do).'
         }
         Set-DemoProgressStep -Path $ProgressPath -Id 'T2.HostBuild' -State 'Running' -Message $message
         Write-DemoLog -Message ('T2: {0}' -f $message)

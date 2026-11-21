@@ -3256,6 +3256,25 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         @($result.evidence.deletingRecently).Count | Should -Be 2
     }
 
+    It 'status.ps1 counts every chunk Azure is deleting on the T2 host, whatever its name, even one that ends in a time minutes old (the review of 8ff25e95: R871''s sign)' {
+        $now = [DateTime]::UtcNow
+        $recent = $now.AddMinutes(-2).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+        # A chunk whose name Azure held runs under <name>-<time> (2026-11-16); a send's own suffix is no time.
+        $heldChunk = 'DbHubDemo-Chunk-a8a10d93133c-001-s5e0d01-{0}' -f $recent
+        $sentChunk = 'DbHubDemo-Chunk-a8a10d93133c-002-s5e0d01'
+        $read = 'DbHubDemo-HealthRead-{0}' -f $recent
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $heldChunk 'Succeeded' 'Deleting'
+            New-RunCommand $sentChunk 'Succeeded' 'Deleting'
+            New-RunCommand $read 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Warning'
+        @($result.evidence.markedForDeletion) | Should -Be @(('archost01/{0}' -f $heldChunk), ('archost01/{0}' -f $sentChunk))
+        @($result.evidence.deletingRecently) | Should -Be @(('archost01/{0}' -f $read)) -Because 'a read''s delete in flight is still left out'
+    }
+
     It 'status.ps1 counts an action''s finished copy under a fresh name as left over, not as the loader that stays by design, and leaves one that runs (the review of F31)' {
         $now = [DateTime]::UtcNow
         $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }

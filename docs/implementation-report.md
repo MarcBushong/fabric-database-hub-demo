@@ -4850,7 +4850,7 @@ Until then, deployments keep the pinned image, which works as before.
   - It's never sent twice: `-PendingRetrySeconds` is refused without `-FreshName`, and `-FreshName` with `-FreshAction`.
   - At 24 Run Commands on the VM, it runs under its fixed name, as before.
 - **The callers:** the twelve actions pass `-FreshAction`, two through their splats, and the three reads keep `-FreshName`. A test parses the module and pins each call's kind, so a new caller has to choose.
-- **Kept:** `DbHubDemo-Profile` and the template's `DbHubDemo-Bootstrap`, which are updated in place, never deleted.
+- **Kept:** `DbHubDemo-Profile` and the template's `DbHubDemo-Bootstrap`, which keep their names: each profile change updates `DbHubDemo-Profile` in place, and the template updates `DbHubDemo-Bootstrap` in place, which the parallel tracks' loader deletes first (corrected by the review of 8ff25e95; this said "never deleted").
 - **By prefix:** `Wait-DemoBootstrapLoader` reads the newest `DbHubDemo-Bootstrap-<time>` when `DbHubDemo-Bootstrap` isn't there (`Get-DemoRunCommandCopyName`). That covers `INFRA.BOOTSTRAP.LOADER_<vm>`, validation's loader read, and the `-Sequential` Bootstraps stage. `STATUS.RUNCOMMANDS` already listed every `DbHubDemo-` copy by its prefix, and its fix now says when a fresh copy goes. Nothing else reads an action by its name: `destroy.ps1` deletes the resource group, `stop-demo.ps1` and `deploy.ps1` clean only the chunks, by their prefix, and `start-demo.ps1` and the session control's runbooks only the `DbHubControl-` ones.
 - **Existing deployments:** an update from bf010ed changes nothing on the VMs until an action runs. Its first run deletes the fixed-name leftover, waited for, then runs under its fresh name; a leftover of an action that doesn't run stays in `STATUS.RUNCOMMANDS`, as before.
 - **`DEPLOY.ARTIFACTS.STALL_SQLVM01`, checked: not this.** In fz, fn, fu, rb (twice), and ra, it came on a new `sqlvm01`, or, in rb's update, with a new bundle and runner. Either way the VM had never run those chunk names, and Azure was installing or finishing its SQL IaaS Agent and Defender for SQL extensions. A chunk set never deletes and creates a name again; chunk names repeat only when the same content goes to the same VM again, which this leaves as it is.
@@ -4908,3 +4908,40 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live.** The notes are matched by their text; a note reworded on the VM side reads as unexpected, as before F32.
 - **The Warning stays,** so a new deployment still ends with these Warnings. Calling them a **Pass** would differ from health.json's own status; that's the owner's call.
+
+### The review of 8ff25e95: a stuck action name is reported, and each chunk send has names of its own (2026-11-22)
+
+**Why.** The review of 8ff25e95 found one Low and a doc nit, asked for one log line, and approved a per-send suffix for chunk Run Commands:
+
+- **An action's stuck fixed-name leftover wasn't recorded as stuck.** With `-FreshAction`, a fixed-name leftover whose delete Azure didn't finish got only a log line, never `$script:DemoRunCommandStuckName` or `$script:DemoRunCommandStuck`, which `Resolve-DemoRunCommandFreshName` fills. So each later call of that action in the run waited the whole 300 seconds again (before, 30 at most), and `DEPLOY.RUNCOMMAND.STUCK_<VM>` was never reported. The log's "STATUS.RUNCOMMANDS lists it until then" was false on `sqlvm01`, where `status.ps1` leaves out what Azure is deleting. For example, a `DbHubDemo-Golden` from bf010ed that Azure keeps in Deleting for hours (2026-11-13) would cost each golden action 300 seconds, with nothing on the status page.
+- **ADR 0012 said the template's `DbHubDemo-Bootstrap` is never deleted;** every parallel-track loader deletes it first.
+- **The 24-of-25 fallback's log** named the count and the fixed name, but not that the handler can skip that name, so a later "didn't start" read as extension work.
+- **Chunks were the only Run Commands still read without `-NotBeforeUtc`,** and the same content sent to the same VM again reused each chunk's name: after a stalled or interrupted transfer, or the loader's missing-chunk recovery. A reused name could be skipped (a wait of 600 + 300 seconds, then a failure), or report an earlier run's **Succeeded** (the 2026-10-21 case), after which the loader finds the chunk missing. A rebuilt host isn't exposed: its rebuild deletes the VM and its disks.
+
+**Work summary.**
+
+- **The stuck name:** when an action's fixed-name delete doesn't finish, `Invoke-DemoVmRunCommand -FreshAction` records it as `Resolve-DemoRunCommandFreshName` does: the VM and name in `$script:DemoRunCommandStuckName`, and an entry in `$script:DemoRunCommandStuck` with the fresh name the step used. `DEPLOY.RUNCOMMAND.STUCK_<VM>` reports it, and the same action later in the process waits 30 seconds at most. The log says so, as the stuck path's does, without the claim about `STATUS.RUNCOMMANDS`. The guided stop's progress note, which said a stuck name on `archost01` meant its health reads ran under a fresh name, now says the step that uses it did.
+- **The fallback's log** adds that the VM's Run Command handler can skip a name it ran before until that name's delete reaches it, so a step that then doesn't start has that cause, not extension work. Its last sentence now says what `status.ps1` lists: those not being deleted.
+- **Chunk names:** `Send-DemoChunkSet` gives every chunk of a call one suffix (`Get-DemoChunkSendSuffix`), on a copy of the caller's chunk: `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`, which is no 14-digit time.
+  - The VM writes `downloads\<sha12>\chunk-<nnn>` whatever the name and skips a chunk already there, and the loader verifies the bundle.
+  - Resuming goes by `BundleSentTo` and `RunnerSentTo`, and every cleanup matches `DbHubDemo-Chunk-*`.
+  - A name Azure keeps marked for deletion still runs as `<name>-yyyyMMddHHmmss`.
+- **c191a4c0's 15-minute rule leaves chunks out:** `STATUS.RUNCOMMANDS` counts every chunk Azure is deleting on the T2 host, whatever its name, since that's R871's sign, and a held chunk's fresh name ends in a time.
+- **Docs:** ADR 0012 (the "never deleted" correction, the stuck record, the fallback's log, and chunks in the 15-minute rule), a new ADR 0003 amendment, `vm/bootstrap/README.md`, troubleshooting (the action's log row, a row for the 24-of-25 log, and the host's Deleting row), the CHANGELOG's F31 entry, and this report, whose 8ff25e95 section said "never deleted" too.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/New-DemoBootstrapChunk.ps1`, `Private/RunCommandHelpers.ps1`, `Private/GuidedStopHelpers.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1` (a fixed suffix, so the fake can name a chunk before it's sent; one test uses the real one), and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0003-t2-host-size-security-type-bootstrap.md`, `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, `vm/bootstrap/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Arc, Bundle, Validation, Lifecycle, Tracks, OneCommand, OneClick, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, KeyVault, Progress, and FirstRun: 1,358 passed, 0 failed, 0 az calls.
+- With HEAD's four source files and the tests kept, the 4 new or extended tests fail:
+  - the stuck fixed name: waits of 300, then 30 seconds, `DEPLOY.RUNCOMMAND.STUCK_ARCHOST01`, and the log;
+  - the fallback's log;
+  - one suffix for every chunk of a send, both files', another for a resend, the same scripts, and the caller's chunks unchanged;
+  - a chunk Azure is deleting on the host, with a recent time in its name, still counted.
+- PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live: the chunk names need a live proof before they ship,** with 8ff25e95's. On a net-new deployment and an update from bf010ed, `./scripts/deploy.ps1` delivers each VM's chunks as `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`, `INFRA.BOOTSTRAP.LOADER_*` pass, and `./scripts/status.ps1` shows no chunk left once its deletes finish.
+- **Longer chunk names:** 40 characters, and 55 for a held chunk's fresh name, the fallback. Learn names no length rule for a Run Command's name; the longest chunk name that ran live had 47 (2026-11-16).
