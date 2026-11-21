@@ -29,7 +29,7 @@ param tags object
 @description('Golden snapshot boot test only (ADR 0018, guardrail 8): deny every outbound flow from snet-archost before the restored host first boots. The main template never sets it.')
 param quarantineHostOutbound bool = false
 
-@description('In public mode, add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm, for a T5 reached from T1\'s subnet without a private endpoint (ADR 0027, 2026-11-21). False, the default, leaves snet-sqlvm\'s service endpoints as they were.')
+@description('Add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm: in public mode for a T5 reached from T1\'s subnet without a private endpoint (ADR 0027, 2026-11-21), and in either mode while an account that\'s public now moves to its private endpoint (2026-11-22). False, the default, leaves snet-sqlvm\'s service endpoints as they were.')
 param cosmosServiceEndpoint bool = false
 
 var addressSpace = '10.42.0.0/24'
@@ -607,6 +607,7 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.2' = {
         // Public mode: T3 through Microsoft.Sql, and T5 through Microsoft.AzureCosmosDB when it has no private endpoint
         // (https://learn.microsoft.com/azure/virtual-network/virtual-network-service-endpoints-overview). T1 reaches both on
         // their public endpoints, which their virtual network rules limit to this subnet; Allow-HTTPS-Outbound covers T5.
+        // Either mode keeps Microsoft.AzureCosmosDB while a T5 that's public now moves to its private endpoint (2026-11-22).
         serviceEndpoints: networkMode == 'public'
           ? (cosmosServiceEndpoint
               ? [
@@ -616,7 +617,11 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.2' = {
               : [
                   'Microsoft.Sql'
                 ])
-          : []
+          : (cosmosServiceEndpoint
+              ? [
+                  'Microsoft.AzureCosmosDB'
+                ]
+              : [])
         privateEndpointNetworkPolicies: 'Disabled'
         defaultOutboundAccess: useDefaultOutbound
         natGatewayResourceId: natGatewayId

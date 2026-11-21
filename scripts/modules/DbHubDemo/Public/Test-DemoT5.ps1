@@ -121,7 +121,23 @@ function Test-DemoT5 {
         & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is off, but its private endpoint {0} isn''t approved, so T1 can''t reach it.' -f $names.PrivateEndpointName) $networkEvidence 'Run ./scripts/deploy.ps1, which creates the private endpoint and its DNS zone group.' $docs['privateEndpoint']
     }
     elseif ($viaRule) {
-        & $add 'T5.NETWORK' 'Pass' 'T5 is reachable from T1''s subnet only: its public network access is on, limited to snet-sqlvm by a virtual network rule through that subnet''s service endpoint, with no IP rule and no private endpoint, as T3 in public mode, since no policy needs one. Database Hub''s Security page lists T5''s public network access, as it does T3''s.' $networkEvidence
+        # The rule admits T1's subnet only through its Azure Cosmos DB service endpoint, which sends the subnet's identity;
+        # without it T1's requests get 403 (the review of 31ccf40, 2026-11-22).
+        $subnetEndpoint = Get-DemoT5SubnetServiceEndpoint -Config $Config -SubnetId $ruleIds[0]
+        $networkEvidence['subnetServiceEndpoint'] = $subnetEndpoint.Present
+        $networkEvidence['subnetServiceEndpointState'] = $subnetEndpoint.State
+        if ($subnetEndpoint.Present -eq $true -and $subnetEndpoint.State -in '', 'Succeeded') {
+            & $add 'T5.NETWORK' 'Pass' 'T5 is reachable from T1''s subnet only: its public network access is on, limited to snet-sqlvm by a virtual network rule through that subnet''s Azure Cosmos DB service endpoint, with no IP rule and no private endpoint, as T3 in public mode, since no policy needs one. Database Hub''s Security page lists T5''s public network access, as it does T3''s.' $networkEvidence
+        }
+        elseif ($subnetEndpoint.Present -eq $true) {
+            & $add 'T5.NETWORK' 'Warning' ('T5 is limited to T1''s subnet by a virtual network rule, and snet-sqlvm''s Azure Cosmos DB service endpoint is {0}, so T1 may not reach T5 until Azure finishes it.' -f $subnetEndpoint.State) $networkEvidence 'Check again in a few minutes (validate.ps1 -Area T5); if it stays, run ./scripts/deploy.ps1.' $docs['vnetServiceEndpoint']
+        }
+        elseif ($subnetEndpoint.Present -eq $false) {
+            & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is limited to {0} by a virtual network rule, but {0} has no Azure Cosmos DB service endpoint, so T1 can''t reach T5: Azure Cosmos DB answers its requests with 403 (Forbidden).' -f $subnetEndpoint.Subnet) $networkEvidence 'Run ./scripts/deploy.ps1, which gives snet-sqlvm its Microsoft.AzureCosmosDB service endpoint again; a new service endpoint can take up to 15 minutes to apply.' $docs['vnetServiceEndpoint']
+        }
+        else {
+            & $add 'T5.NETWORK' 'Warning' ('T5 is limited to T1''s subnet by a virtual network rule, but snet-sqlvm couldn''t be read to confirm its Azure Cosmos DB service endpoint, which that rule needs: {0}' -f $subnetEndpoint.Error) $networkEvidence 'Check again in a few minutes (validate.ps1 -Area T5).' $docs['vnetServiceEndpoint']
+        }
     }
     else {
         & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is {0}, and not limited to T1''s subnet alone by a virtual network rule (subnets: {1}; IP rules: {2}), so it''s open wider than the demo sets it.' -f $(if ($public) { $public } else { 'not set' }), $(if ($subnets.Count -gt 0) { $subnets -join ', ' } else { 'none' }), $ipRules.Count) $networkEvidence 'Run ./scripts/deploy.ps1, which sets T5''s network again: a private endpoint with public network access off, or T1''s subnet alone (DEPLOY.T5.NETWORK says which).' $docs['vnetServiceEndpoint']

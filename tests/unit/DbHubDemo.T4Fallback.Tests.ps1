@@ -2210,7 +2210,7 @@ Describe 'A public T5 under a policy preflight didn''t find gets its private end
             $script:currentSize = 'Standard_D4ds_v5'
             $script:sizes.Add($script:currentSize)
             $script:sentZones.Add('')
-            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; t5PrivateAccess = @{ value = $(if ($PesterBoundParameters.ContainsKey('T5PrivateAccess')) { [bool]$PesterBoundParameters['T5PrivateAccess'] } else { $true }) }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; t5Enabled = @{ value = (-not ($Config.Contains('t5Enabled') -and $null -ne $Config['t5Enabled'] -and -not [bool]$Config['t5Enabled'])) }; t5FreeTier = @{ value = [bool]$T5FreeTier }; t5PrivateAccess = @{ value = $(if ($PesterBoundParameters.ContainsKey('T5PrivateAccess')) { [bool]$PesterBoundParameters['T5PrivateAccess'] } else { $true }) }; t5WasPublic = @{ value = $(if ($PesterBoundParameters.ContainsKey('T5WasPublic')) { [bool]$PesterBoundParameters['T5WasPublic'] } else { $false }) }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
         }
         $script:policyDenial = 'ERROR: {"error":{"code":"InvalidTemplateDeployment","message":"The template deployment failed because of policy violation.","details":[{"code":"RequestDisallowedByPolicy","target":"cosmos01-abc123","message":"Resource ''cosmos01-abc123'' was disallowed by policy. Policy identifiers: ''[{\"policyAssignment\":{\"name\":\"Deny public Cosmos DB (example)\"}}]''."}]}}'
         function Invoke-PublicTemplate([System.Collections.IDictionary] $Config) {
@@ -2232,6 +2232,10 @@ Describe 'A public T5 under a policy preflight didn''t find gets its private end
         $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
         $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
         $script:deployCalls[1]['parameters']['t5Enabled']['value'] | Should -BeTrue
+        # An account that's public now keeps snet-sqlvm's service endpoint while it moves (the review of 31ccf40, 2026-11-22).
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t5WasPublic']['value'] | Should -Be $Existed
+        }
         $deployment.T5Enabled | Should -BeTrue
         $deployment.T5LeftOut | Should -Be ''
         @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5') | Should -BeNullOrEmpty
@@ -2245,6 +2249,10 @@ Describe 'A public T5 under a policy preflight didn''t find gets its private end
         $network[0].evidence['existed'] | Should -Be $Existed
         $network[0].message | Should -Match '^T5 \(cosmos01-abc123\) is reached through its private endpoint pe-dbhub-demo-cosmos01 in snet-pe, with public network access off: Azure Policy denied it with public network access \(RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123\)'
         $network[0].message | Should -Match 'bill all month'
+        $network[0].evidence.Contains('subnetServiceEndpointKept') | Should -Be $Existed
+        if ($Existed) {
+            $network[0].message | Should -Match 'snet-sqlvm keeps its Azure Cosmos DB service endpoint until the next \./scripts/deploy\.ps1, which drops it once T5 reads public network access off'
+        }
         (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE'))[0].status | Should -Be 'Pass'
     }
 
@@ -2264,6 +2272,41 @@ Describe 'A public T5 under a policy preflight didn''t find gets its private end
         @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK') | Should -BeNullOrEmpty
     }
 
+    It 'keeps snet-sqlvm''s Azure Cosmos DB service endpoint when Azure refuses an existing public T5 behind its endpoint too, so T5 stays reachable (the review of 31ccf40, 2026-11-22)' {
+        $config = New-TestConfig
+        $config['t5Enabled'] = $true
+        $script:t5Before = 'Public'
+        # A denial the endpoint doesn't cure (allowed locations, customer-managed keys, a tag rule): every attempt with T5.
+        $script:t5CreateFails = $script:policyDenial
+        $deployment = Invoke-PublicTemplate -Config $config
+        $deployment.Succeeded | Should -BeFalse -Because 'the run ends NOT DONE, as before 31ccf40'
+        $script:deployCalls.Count | Should -Be 2 -Because 'one retry behind the endpoint, and an existing account is never left out'
+        $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        foreach ($call in $script:deployCalls) {
+            $call['parameters']['t5WasPublic']['value'] | Should -BeTrue -Because 'the account is public now'
+        }
+        $deployment.T5Enabled | Should -BeTrue
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5') | Should -BeNullOrEmpty
+        $template = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE')
+        $template[0].status | Should -Be 'Fail'
+        $template[0].remediation | Should -Match 'Every failed operation is T5''s \(Azure Cosmos DB\): to deploy the rest without T5, set "t5Enabled": false'
+        (@($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK'))[0].evidence['subnetServiceEndpointKept'] | Should -BeTrue -Because 'the status page says why snet-sqlvm keeps it'
+        # What the refused attempt sent, in the compiled template: snet-sqlvm keeps Microsoft.AzureCosmosDB, which the account's
+        # rule for it needs, so T1 still reaches T5 as it was.
+        . (Join-Path -Path $PSScriptRoot -ChildPath 'Infra.Helpers.ps1')
+        $compiled = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw | ConvertFrom-Json -AsHashtable -Depth 200
+        $demo = (Get-TemplateNode -Root $compiled | Where-Object { $_['type'] -eq 'Microsoft.Resources/deployments' -and [string]$_['name'] -like '*demo-*' } | Select-Object -First 1)['properties']['template']
+        $network = Get-NestedDeployment -Root $demo -Name 'network'
+        $sent = $script:deployCalls[1]['parameters']
+        $keep = [bool](Resolve-ArmValue -Value $network['properties']['parameters']['cosmosServiceEndpoint']['value'] -Context @{ Template = $demo; Parameters = @{ t5PrivateAccess = $sent['t5PrivateAccess']['value']; t5WasPublic = $sent['t5WasPublic']['value']; t5Enabled = $sent['t5Enabled']['value']; networkMode = 'public' }; VariableCache = @{} })
+        $keep | Should -BeTrue
+        $subnet = Get-TemplateNode -Root $network['properties']['template'] | Where-Object { $_['name'] -eq 'snet-sqlvm' -and $_.Contains('serviceEndpoints') } | Select-Object -First 1
+        # Assigned first: the evaluator returns its array as one object.
+        $endpoints = Resolve-ArmValue -Value $subnet['serviceEndpoints'] -Context @{ Template = $network['properties']['template']; Parameters = @{ networkMode = 'public'; cosmosServiceEndpoint = $keep }; VariableCache = @{} }
+        (@($endpoints) -join ',') | Should -Be 'Microsoft.Sql,Microsoft.AzureCosmosDB'
+    }
+
     It 'deploys <Case> again with its private endpoint when a policy turned its public network access off (Modify), instead of ending NOT DONE' -ForEach @(
         @{ Case = 'a new T5'; Before = 'NotFound'; Existed = $false }
         @{ Case = 'an existing public T5'; Before = 'Public'; Existed = $true }
@@ -2277,6 +2320,7 @@ Describe 'A public T5 under a policy preflight didn''t find gets its private end
         $script:deployCalls.Count | Should -Be 2
         $script:deployCalls[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
         $script:deployCalls[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $script:deployCalls[1]['parameters']['t5WasPublic']['value'] | Should -Be $Existed -Because 'an account that was public before this run keeps snet-sqlvm''s service endpoint until the next run reads it private'
         $deployment.T5Enabled | Should -BeTrue
         $network = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T5.NETWORK')
         $network.Count | Should -Be 1

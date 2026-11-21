@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "3651125032619119901"
+      "templateHash": "5437124903875747299"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -486,6 +486,13 @@
       "metadata": {
         "description": "T5 keeps a private endpoint and its DNS zone, with public network access off (true, the default, and always in private mode). deploy.ps1 passes false only in public mode, for a new account (or one with public network access already on) when no policy turns Azure Cosmos DB public network access off or denies it and the policies could all be read: public network access is then limited to T1's subnet through its Microsoft.AzureCosmosDB service endpoint, as T3 in public mode, which saves the endpoint and its zone. An account that has its endpoint keeps it (DEPLOY.T5.NETWORK; ADR 0027, 2026-11-21)."
       }
+    },
+    "t5WasPublic": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "T5's account has public network access on before this deployment, which deploy.ps1 reads. snet-sqlvm then keeps its Microsoft.AzureCosmosDB service endpoint, in either network mode, even when the account moves to its private endpoint, so T1 still reaches T5 if Azure refuses the move; the next deployment drops it once the account reads public network access off. False, the default, changes nothing (ADR 0027, 2026-11-22)."
+      }
     }
   },
   "variables": {
@@ -670,6 +677,9 @@
           },
           "t5PrivateAccess": {
             "value": "[parameters('t5PrivateAccess')]"
+          },
+          "t5WasPublic": {
+            "value": "[parameters('t5WasPublic')]"
           }
         },
         "template": {
@@ -680,7 +690,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "14067272236895514447"
+              "templateHash": "7166381970085252130"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -1021,6 +1031,13 @@
               "defaultValue": true,
               "metadata": {
                 "description": "T5 keeps a private endpoint in snet-pe, with public network access off (true, the default; always in private mode). False, which deploy.ps1 passes only in public mode, for a new account or one without an endpoint, when no policy needs one and the policies could all be read: public network access limited to T1's subnet through its service endpoint, as T3 (ADR 0027, 2026-11-21)."
+              }
+            },
+            "t5WasPublic": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "T5's account has public network access on before this deployment: snet-sqlvm keeps its Azure Cosmos DB service endpoint, in either network mode, while the account moves to its private endpoint, so T1 reaches T5 until that move succeeds (ADR 0027, 2026-11-22)."
               }
             }
           },
@@ -1435,7 +1452,7 @@
                     "value": "[parameters('tags')]"
                   },
                   "cosmosServiceEndpoint": {
-                    "value": "[and(parameters('t5Enabled'), not(variables('t5Private')))]"
+                    "value": "[and(parameters('t5Enabled'), or(not(variables('t5Private')), parameters('t5WasPublic')))]"
                   }
                 },
                 "template": {
@@ -1446,7 +1463,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "605850779924178053"
+                      "templateHash": "6840453450869620926"
                     },
                     "description": "Virtual network, subnets, and NSGs (ADR 0007), with the outbound mode from ADR 0017."
                   },
@@ -1506,7 +1523,7 @@
                       "type": "bool",
                       "defaultValue": false,
                       "metadata": {
-                        "description": "In public mode, add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm, for a T5 reached from T1's subnet without a private endpoint (ADR 0027, 2026-11-21). False, the default, leaves snet-sqlvm's service endpoints as they were."
+                        "description": "Add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm: in public mode for a T5 reached from T1's subnet without a private endpoint (ADR 0027, 2026-11-21), and in either mode while an account that's public now moves to its private endpoint (2026-11-22). False, the default, leaves snet-sqlvm's service endpoints as they were."
                       }
                     }
                   },
@@ -5325,7 +5342,7 @@
                                 "name": "snet-sqlvm",
                                 "addressPrefix": "[variables('subnetPrefixes').sqlvm]",
                                 "networkSecurityGroupResourceId": "[reference('nsgSqlvm').outputs.resourceId.value]",
-                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.Sql', 'Microsoft.AzureCosmosDB'), createArray('Microsoft.Sql')), createArray())]",
+                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.Sql', 'Microsoft.AzureCosmosDB'), createArray('Microsoft.Sql')), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.AzureCosmosDB'), createArray()))]",
                                 "privateEndpointNetworkPolicies": "Disabled",
                                 "defaultOutboundAccess": "[variables('useDefaultOutbound')]",
                                 "natGatewayResourceId": "[variables('natGatewayId')]"

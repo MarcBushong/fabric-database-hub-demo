@@ -779,7 +779,13 @@ Describe 'Invoke-DemoPreflight' {
     It 'checks the T5 the template step deploys, and moves it behind its endpoint when a policy the inventory doesn''t read denies it with public network access (the review of fae05b4, 2026-11-22)' {
         Set-HappyAzMock
         $script:t5StateRead = 'NotFound'
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }; Exists = $false; State = $script:t5StateRead; FreeTier = $false; Account = $null; Error = $(if ($script:t5StateRead -eq 'NotFound') { '' } else { 'AuthorizationFailed' }) } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith {
+            $names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }
+            if ($script:t5StateRead -eq 'Public') {
+                return [pscustomobject]@{ Names = $names; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = [pscustomobject]@{ properties = [pscustomobject]@{ publicNetworkAccess = 'Enabled' } }; Error = '' }
+            }
+            [pscustomobject]@{ Names = $names; Exists = $false; State = $script:t5StateRead; FreeTier = $false; Account = $null; Error = $(if ($script:t5StateRead -eq 'NotFound') { '' } else { 'AuthorizationFailed' }) }
+        }
         # A policy assigned to the existing demo resource group, which the inventory doesn't read, as Azure refuses it.
         $script:whatIfSent = [System.Collections.Generic.List[object]]::new()
         $script:whatIfDenies = @('cosmos01-abc123')
@@ -802,6 +808,7 @@ Describe 'Invoke-DemoPreflight' {
         $script:whatIfSent.Count | Should -Be 2
         $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse -Because 'the what-if checks the public T5 the template step would deploy'
         $script:whatIfSent[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        @($script:whatIfSent | ForEach-Object { [bool]$_['parameters']['t5WasPublic']['value'] }) | Should -Be @($false, $false) -Because 'a new T5 isn''t public yet'
         $whatIf = $results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF'
         $whatIf.status | Should -Be 'Pass'
         $whatIf.message | Should -Match 'with T5 behind its private endpoint, because Azure Policy denies it with public network access'
@@ -842,6 +849,17 @@ Describe 'Invoke-DemoPreflight' {
         $results = @(Invoke-DemoPreflight -Config $public)
         $script:whatIfSent.Count | Should -Be 1
         $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Pass'
+
+        # An existing public T5 under such a policy (2026-11-22): both what-ifs keep snet-sqlvm's Azure Cosmos DB service
+        # endpoint, as the template step does while the account moves.
+        $script:whatIfSent.Clear()
+        $script:t5StateRead = 'Public'
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 2
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:whatIfSent[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        @($script:whatIfSent | ForEach-Object { [bool]$_['parameters']['t5WasPublic']['value'] }) | Should -Be @($true, $true)
         ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Pass'
     }
 

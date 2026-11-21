@@ -173,6 +173,9 @@ param t5FreeTier bool = false
 @description('T5 keeps a private endpoint in snet-pe, with public network access off (true, the default; always in private mode). False, which deploy.ps1 passes only in public mode, for a new account or one without an endpoint, when no policy needs one and the policies could all be read: public network access limited to T1\'s subnet through its service endpoint, as T3 (ADR 0027, 2026-11-21).')
 param t5PrivateAccess bool = true
 
+@description('T5\'s account has public network access on before this deployment: snet-sqlvm keeps its Azure Cosmos DB service endpoint, in either network mode, while the account moves to its private endpoint, so T1 reaches T5 until that move succeeds (ADR 0027, 2026-11-22).')
+param t5WasPublic bool = false
+
 // Single sources: profile sizing and disk tiers (config/profiles.json) and images (config/versions.json).
 var catalogProfile = loadJsonContent('../../config/profiles.json', '$.profiles')[profile]
 var diskTiers = loadJsonContent('../../config/profiles.json', '$.diskTiers')
@@ -247,7 +250,10 @@ module network 'network.bicep' = {
     networkMode: networkMode
     outboundMode: outboundMode
     tags: tags
-    cosmosServiceEndpoint: t5Enabled && !t5Private
+    // T1's subnet's Azure Cosmos DB service endpoint: for a T5 without a private endpoint, and while an account that's public
+    // now moves to its endpoint, so a move that Azure refuses (a policy the endpoint doesn't satisfy, say) never leaves the
+    // account's virtual network rule without the endpoint it needs (the review of 31ccf40, 2026-11-22).
+    cosmosServiceEndpoint: t5Enabled && (!t5Private || t5WasPublic)
   }
 }
 

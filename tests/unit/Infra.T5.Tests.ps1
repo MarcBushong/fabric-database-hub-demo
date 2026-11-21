@@ -15,10 +15,10 @@ BeforeAll {
     $cosmosTemplate = $cosmosModule['properties']['template']
     $subnetIds = @('sqlvm', 'archost', 'pe') | ForEach-Object { '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/virtualNetworks/vnet-dbhub-demo/subnets/snet-{0}' -f $_ }
 
-    # What the demo module passes on for deploy.ps1's t5PrivateAccess in a network mode.
+    # What the demo module passes on for deploy.ps1's t5PrivateAccess and t5WasPublic in a network mode.
     function Get-T5Wiring {
-        param([bool] $T5PrivateAccess, [string] $NetworkMode, [bool] $T5Enabled = $true)
-        $context = @{ Template = $demoTemplate; Parameters = @{ t5PrivateAccess = $T5PrivateAccess; networkMode = $NetworkMode; t5Enabled = $T5Enabled }; VariableCache = @{} }
+        param([bool] $T5PrivateAccess, [string] $NetworkMode, [bool] $T5Enabled = $true, [bool] $T5WasPublic = $false)
+        $context = @{ Template = $demoTemplate; Parameters = @{ t5PrivateAccess = $T5PrivateAccess; networkMode = $NetworkMode; t5Enabled = $T5Enabled; t5WasPublic = $T5WasPublic }; VariableCache = @{} }
         [pscustomobject]@{
             CosmosServiceEndpoint = [bool](Resolve-ArmValue -Value $networkModule['properties']['parameters']['cosmosServiceEndpoint']['value'] -Context $context)
             PrivateAccess         = [bool](Resolve-ArmValue -Value $cosmosModule['properties']['parameters']['privateAccess']['value'] -Context $context)
@@ -109,5 +109,22 @@ Describe 'T5''s network in the compiled template (azuredeploy.json, 2026-11-21, 
 
     It 'adds no service endpoint with T5 off' {
         (Get-T5Wiring -T5PrivateAccess $false -NetworkMode public -T5Enabled $false).CosmosServiceEndpoint | Should -BeFalse
+        (Get-T5Wiring -T5PrivateAccess $true -NetworkMode public -T5Enabled $false -T5WasPublic $true).CosmosServiceEndpoint | Should -BeFalse
+    }
+
+    It 'keeps snet-sqlvm''s Azure Cosmos DB service endpoint, in either network mode, while a T5 that''s public now moves to its private endpoint (the review of 31ccf40, 2026-11-22)' {
+        # A move that Azure refuses (a policy the endpoint doesn't satisfy) leaves the account public with its rule for
+        # snet-sqlvm, which needs that service endpoint; the next deploy.ps1 drops it once the account reads public access off.
+        foreach ($mode in 'public', 'private') {
+            $wiring = Get-T5Wiring -T5PrivateAccess $true -NetworkMode $mode -T5WasPublic $true
+            $wiring.PrivateAccess | Should -BeTrue -Because 'the account still moves to its private endpoint'
+            $wiring.CosmosServiceEndpoint | Should -BeTrue -Because $mode
+            Get-SqlvmServiceEndpoint -NetworkMode $mode -CosmosServiceEndpoint $true | Should -Be $(if ($mode -eq 'public') { 'Microsoft.Sql,Microsoft.AzureCosmosDB' } else { 'Microsoft.AzureCosmosDB' })
+        }
+        # The default sends nothing new: a template deployed without it, and every T5 that has its endpoint, as before.
+        $template['parameters']['t5WasPublic']['defaultValue'] | Should -BeFalse
+        $demoTemplate['parameters']['t5WasPublic']['defaultValue'] | Should -BeFalse
+        $demoDeployment['properties']['parameters']['t5WasPublic']['value'] | Should -Be "[parameters('t5WasPublic')]"
+        Get-SqlvmServiceEndpoint -NetworkMode private -CosmosServiceEndpoint $false | Should -Be ''
     }
 }

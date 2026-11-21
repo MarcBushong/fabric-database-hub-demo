@@ -338,10 +338,25 @@ function Invoke-DemoTemplateDeployment {
         }
         catch {
             $t5State = $null
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5''s network couldn''t be decided ({0}), so it keeps, or gets, a private endpoint, which works in every case.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do: the next ./scripts/deploy.ps1 decides again.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])))
+            $t5NetworkResult = New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5''s network couldn''t be decided ({0}), so it keeps, or gets, a private endpoint, which works in every case.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do: the next ./scripts/deploy.ps1 decides again.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])
+            $results.Add($t5NetworkResult)
         }
     }
     $t5EndpointCost = if (Test-DemoT5Enabled -Config $effective) { $t5PrivateAccess } else { $null }
+    # Whether T5's account is public now (the review of 31ccf40, 2026-11-22): snet-sqlvm then keeps its Azure Cosmos DB service
+    # endpoint in every attempt, also one that moves the account to its private endpoint, because a move that Azure refuses
+    # (a policy the endpoint doesn't satisfy, say) leaves the account public, with its rule for that subnet. The next
+    # deploy.ps1 drops it once the account reads public network access off.
+    $t5WasPublic = Test-DemoT5WasPublic -Config $effective -AccountState $t5State
+    # DEPLOY.T5.NETWORK says so when this run moves such an account to its endpoint, on the console and the status page.
+    $noteKept = {
+        param([object] $Result)
+        if ($null -ne $Result -and $t5WasPublic -and $t5PrivateAccess) {
+            $Result.evidence['subnetServiceEndpointKept'] = $true
+            $Result.message = '{0} snet-sqlvm keeps its Azure Cosmos DB service endpoint until the next ./scripts/deploy.ps1, which drops it once T5 reads public network access off, so T1 reaches T5 whether or not Azure lets it move now.' -f $Result.message
+        }
+    }
+    & $noteKept $t5NetworkResult
     # An existing server keeps its own size unless the configuration sets one, or it moves to the default (below): the
     # fallback never resizes a server, so a redeploy never sends another size to a server the fallback created, whatever
     # the record says (Phase 28 follow-up). A record that doesn't match the server that exists no longer holds, and is
@@ -567,6 +582,7 @@ function Invoke-DemoTemplateDeployment {
         param([string] $Found, [string] $Text, [object] $State, [object] $Replaces)
         $switched = (Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $State -PolicyFound $Found -PolicyFoundText $Text).Result
         $switched.evidence['existed'] = [bool](Get-DemoMemberValue -InputObject $t5State -Name 'Exists')
+        & $noteKept $switched
         if ($null -ne $Replaces) {
             [void]$results.Remove($Replaces)
         }
@@ -780,6 +796,7 @@ function Invoke-DemoTemplateDeployment {
             T3UseFreeLimit            = $useFreeLimit
             T5FreeTier                = $t5FreeTier
             T5PrivateAccess           = $t5PrivateAccess
+            T5WasPublic               = $t5WasPublic
         }
         if ($budgetStart) {
             $parameterArguments['BudgetStartDate'] = $budgetStart

@@ -263,6 +263,9 @@ param t5FreeTier bool = false
 @description('T5 keeps a private endpoint and its DNS zone, with public network access off (true, the default, and always in private mode). deploy.ps1 passes false only in public mode, for a new account (or one with public network access already on) when no policy turns Azure Cosmos DB public network access off or denies it and the policies could all be read: public network access is then limited to T1\'s subnet through its Microsoft.AzureCosmosDB service endpoint, as T3 in public mode, which saves the endpoint and its zone. An account that has its endpoint keeps it (DEPLOY.T5.NETWORK; ADR 0027, 2026-11-21).')
 param t5PrivateAccess bool = true
 
+@description('T5\'s account has public network access on before this deployment, which deploy.ps1 reads. snet-sqlvm then keeps its Microsoft.AzureCosmosDB service endpoint, in either network mode, even when the account moves to its private endpoint, so T1 still reaches T5 if Azure refuses the move; the next deployment drops it once the account reads public network access off. False, the default, changes nothing (ADR 0027, 2026-11-22).')
+param t5WasPublic bool = false
+
 var resourceGroupName = 'rg-${prefix}-${environment}'
 
 var commonTags = {
@@ -338,6 +341,7 @@ module demo 'modules/demo.bicep' = {
     t5Enabled: t5Enabled
     t5FreeTier: t5FreeTier
     t5PrivateAccess: t5PrivateAccess
+    t5WasPublic: t5WasPublic
   }
 }
 

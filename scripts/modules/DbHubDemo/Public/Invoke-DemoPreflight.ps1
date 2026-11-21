@@ -674,7 +674,20 @@ function Invoke-DemoPreflight {
     # (PREFLIGHT.POLICY.COSMOSPUBLIC): the what-if checks the T5 this run deploys, and the estimate below prices its endpoint
     # and DNS zone only when it's kept. $null, T5 off or not known, is the endpoint, the template's default.
     $t5PolicyCheck = $results | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.POLICY.COSMOSPUBLIC' } | Select-Object -First 1
-    $t5PrivateEndpoint = Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode $effectiveNetworkMode -Policy $(if ($null -ne $t5PolicyCheck) { $t5PolicyCheck.evidence } else { $null })
+    # T5's account, read once (2026-11-22): what the template step keeps or creates, and whether the account is public now, so
+    # the what-if keeps snet-sqlvm's Azure Cosmos DB service endpoint while it moves, as the template step does
+    # (Test-DemoT5WasPublic). A read that fails leaves both to their own fallbacks.
+    $t5Account = $null
+    if (Test-DemoT5Enabled -Config $Config) {
+        try {
+            $t5Account = Get-DemoT5State -Config $Config
+        }
+        catch {
+            $t5Account = $null
+        }
+    }
+    $t5PrivateEndpoint = Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode $effectiveNetworkMode -Policy $(if ($null -ne $t5PolicyCheck) { $t5PolicyCheck.evidence } else { $null }) -AccountState $t5Account
+    $t5WasPublic = Test-DemoT5WasPublic -Config $Config -AccountState $t5Account
     if ($SkipWhatIf) {
         Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Not selected' 'The what-if policy check was skipped.'
     }
@@ -691,7 +704,7 @@ function Invoke-DemoPreflight {
             try {
                 # The same budget start date the deployment sends: the budget's own, which Azure never changes (Phase 28 live
                 # finding, 2026-11-02).
-                $whatIfParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; ExistingVmName = $existingVms; T1SecurityType = $t1Security.SecurityType; T3UseFreeLimit = $t3UseFreeLimit; T3AdminGroupDisplayName = $groupDisplayName; T5PrivateAccess = $T5Private }
+                $whatIfParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; ExistingVmName = $existingVms; T1SecurityType = $t1Security.SecurityType; T3UseFreeLimit = $t3UseFreeLimit; T3AdminGroupDisplayName = $groupDisplayName; T5PrivateAccess = $T5Private; T5WasPublic = $t5WasPublic }
                 $budgetStart = Get-DemoBudgetStartDate -Config $Config
                 if ($budgetStart) {
                     $whatIfParameters['BudgetStartDate'] = $budgetStart

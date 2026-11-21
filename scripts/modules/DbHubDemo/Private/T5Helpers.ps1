@@ -541,6 +541,96 @@ function Get-DemoT5PrivateEndpointStatus {
     }
 }
 
+function Get-DemoT5SubnetServiceEndpoint {
+    <#
+    .SYNOPSIS
+    Whether T1's subnet, snet-sqlvm, has the Microsoft.AzureCosmosDB service endpoint now (the review of 31ccf40, 2026-11-22),
+    which a T5 without a private endpoint needs: only the service endpoint sends the subnet's identity to Azure Cosmos DB,
+    and the account's virtual network rule refuses every other source (403). Returns Present ($true, $false, or $null when
+    it can't be read), State (the endpoint's provisioningState), Subnet, and Error. -SubnetId names the subnet, a T5 virtual
+    network rule's; without it, the demo's own snet-sqlvm. A read. Never throws. Internal.
+    Sources: https://learn.microsoft.com/cli/azure/network/vnet/subnet#az-network-vnet-subnet-show and
+    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint (checked 2026-11-22).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $SubnetId = ''
+    )
+
+    $group = Get-DemoResourceGroupName -Config $Config
+    $network = 'vnet-{0}-{1}' -f $Config['prefix'], $Config['environment']
+    $subnet = 'snet-sqlvm'
+    if ($SubnetId -match '(?i)^/subscriptions/[^/]+/resourceGroups/(?<group>[^/]+)/providers/Microsoft\.Network/virtualNetworks/(?<network>[^/]+)/subnets/(?<subnet>[^/]+)$') {
+        $group = $Matches['group']
+        $network = $Matches['network']
+        $subnet = $Matches['subnet']
+    }
+    $make = {
+        param([object] $Present, [string] $State = '', [string] $Problem = '')
+        [pscustomobject]@{ Present = $Present; State = $State; Subnet = $subnet; Error = $Problem }
+    }
+    try {
+        $read = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('network', 'vnet', 'subnet', 'show', '--resource-group', $group, '--vnet-name', $network, '--name', $subnet, '--output', 'json') -AllowFailure
+        if ($read.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$read.StdOut)) {
+            $problem = Protect-DemoText -Text ([string]$read.StdErr).Trim()
+            if ($problem -match '(?i)ResourceNotFound|ParentResourceNotFound|ResourceGroupNotFound|\(404\)') {
+                return (& $make $false '' $problem)
+            }
+            return (& $make $null '' $(if ($problem) { $problem } else { 'no answer' }))
+        }
+        $value = [string]$read.StdOut | ConvertFrom-Json -Depth 32
+        # Assigned first: Get-DemoMemberList returns its array as one object.
+        $endpoints = Get-DemoMemberList -InputObject $value -Name 'serviceEndpoints'
+        $cosmos = $endpoints | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'service') -ieq 'Microsoft.AzureCosmosDB' } | Select-Object -First 1
+        if ($null -eq $cosmos) {
+            return (& $make $false)
+        }
+        return (& $make $true ([string](Get-DemoMemberValue -InputObject $cosmos -Name 'provisioningState')))
+    }
+    catch {
+        return (& $make $null '' (Protect-DemoText -Text $_.Exception.Message))
+    }
+}
+
+function Test-DemoT5WasPublic {
+    <#
+    .SYNOPSIS
+    Whether T5's account has public network access on now, before this deployment (the review of 31ccf40, 2026-11-22): the
+    template's t5WasPublic, which keeps snet-sqlvm's Azure Cosmos DB service endpoint, in either network mode, while the
+    account moves to its private endpoint. A move that Azure refuses (a policy the endpoint doesn't satisfy, say) then
+    leaves T5 as it was, reachable, and the next deployment drops the service endpoint once the account reads public
+    network access off. -AccountState is Get-DemoT5State's answer, $null when it couldn't be read: then snet-sqlvm decides,
+    because the demo gives it that service endpoint only for a public T5, so a T5 with its private endpoint never gets one
+    (Get-DemoT5SubnetServiceEndpoint; a subnet that can't be read counts as without). False with T5 off and for a new
+    account. Never throws. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $AccountState = $null
+    )
+
+    if (-not (Test-DemoT5Enabled -Config $Config)) {
+        return $false
+    }
+    if ([bool](Get-DemoMemberValue -InputObject $AccountState -Name 'Exists')) {
+        $public = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $AccountState -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+        return ($public -ieq 'Enabled')
+    }
+    if ([string](Get-DemoMemberValue -InputObject $AccountState -Name 'State') -eq 'NotFound') {
+        return $false
+    }
+    return ((Get-DemoT5SubnetServiceEndpoint -Config $Config).Present -eq $true)
+}
+
 function Test-DemoT5FreeTierRefusal {
     <#
     .SYNOPSIS
