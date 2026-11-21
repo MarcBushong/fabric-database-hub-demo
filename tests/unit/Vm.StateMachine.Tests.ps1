@@ -241,6 +241,50 @@ Describe 'VM step runner' {
         @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.')
     }
 
+    It 'keeps a lasting warning when its step''s Set runs again but <Case>, until a Set that runs to its end says what holds (F24 re-review)' -ForEach @(
+        @{ Case = 'throws (PowerShell Direct broke, #65)'; Again = { throw 'The guest arcsql01 did not answer over PowerShell Direct.' } }
+        @{ Case = 'returns InProgress (the guest is restarting)'; Again = { New-DemoVmStepResult -Outcome 'InProgress' -Message 'The guest arcsql01 is restarting.' } }
+    ) {
+        $root = New-TestRoot
+        $script:phase = 'first'
+        $script:again = $Again
+        $steps = @(@{ Name = 'GuestFirstBoot'; MaxAttempts = 3; Test = { $script:phase -in 'done', 'reachable' }; Set = {
+                    if ($script:phase -eq 'first') { $script:phase = 'done'; return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed").') }
+                    & $script:again
+                } })
+        $lasting = 'GuestFirstBoot: Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed").'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @($lasting)
+        # The next deploy.ps1's generation finds the guest unreachable: the Test fails, and the Set runs but can't finish.
+        $script:phase = 'unreachable'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Out-Null
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @($lasting) -Because 'SQL Server Analysis and Integration Services are still installed'
+        # Five minutes later, the guest answers, and the Test passes again: the warning stays.
+        $script:phase = 'reachable'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.warnings) | Should -Be @($lasting)
+        $health.status | Should -Be 'Warning'
+    }
+
+    It 'names the step of a lasting warning that a bundle from before the step names left, so it goes once its step''s Set ends without it, and shows once while it holds (F24 re-review)' {
+        $legacy = 'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.'
+        foreach ($case in @(
+                @{ Holds = $false; Expect = @() }
+                @{ Holds = $true; Expect = @('GuestFirstBoot: ' + $legacy) }
+            )) {
+            $root = New-TestRoot
+            $state = Get-DemoVmState
+            $state['generation'] = 'old'
+            $state['warnings'] = @($legacy, 'Some other note an older bundle wrote.')
+            Save-DemoVmState -State $state
+            $script:holds = $case.Holds
+            $script:legacy = $legacy
+            $steps = @(@{ Name = 'GuestFirstBoot'; Test = { $false }; Set = { if ($script:holds) { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage $script:legacy } else { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' } } })
+            Invoke-DemoVmStateMachine -Step $steps -Generation 'new' | Should -Be 'Ready'
+            @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be (@('Some other note an older bundle wrote.') + @($case.Expect)) -Because 'a text no step gives stays as it was, and the step''s Set adds its own last'
+        }
+    }
     It 'writes health.json that matches vm/health/health.schema.json' {
         $root = New-TestRoot
         $steps = @(@{ Name = 'A'; Test = { $true }; Set = { } })

@@ -117,8 +117,9 @@ function Add-DemoVmWarning {
 }
 
 function Remove-DemoVmStepWarning {
-    # A step's own warnings ("<Step>: ..."), dropped just before its Set runs again (the F24 review, 2026-11-20): the Set
-    # says again what still holds.
+    # A step's own warnings ("<Step>: ..."), dropped once its Set has run to its end, Done or NotSelected, which says again
+    # what still holds (the F24 reviews, 2026-11-20). A Set that throws, or stops early (InProgress, Waiting, a restart),
+    # leaves them: the guest it couldn't reach may still have the cause.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the in-memory state only.')]
     [CmdletBinding()]
     param(
@@ -145,16 +146,36 @@ $script:DemoVmLegacyNotePattern = @(
     '^The image has no Content-MD5 here'
 )
 
+# The lasting warnings of bundles from before 2026-11-20, which named no step, and the step that gives each (the F24
+# re-review): a new generation names it, so the warning follows its step's lifecycle like the ones that name it.
+$script:DemoVmLegacyWarningStep = [ordered]@{
+    '^The SQL IaaS Agent service .+ couldn''t be restarted'                  = 'AssociatedServices'
+    '^The image has no SQL Server setup media at '                           = 'AssociatedServices'
+    '^SQL Server setup was still uninstalling '                              = 'AssociatedServices'
+    '^Uninstalling .+ didn''t pass \(exit code '                             = 'AssociatedServices'
+    '^Uninstalling .+ in .+ didn''t pass \(setup '                           = 'GuestFirstBoot'
+    '^T[1-5] \(.+\) (does not resolve|was not updated)'                      = 'WorkloadRunner'
+    '^T[1-5]: '                                                              = 'WorkloadRunner'
+    '^Jumpstart published another ArcBox SQL Server Standard image'          = 'GuestImage'
+    '^EVALUATION ONLY: this Azure VM is prepared for Azure Arc'              = 'ArcEvaluationPrep'
+    '^EVALUATION ONLY: the Azure guest agent is disabled'                    = 'DisableAzureGuestAgent'
+}
+
 function Clear-DemoVmTransientWarning {
-    # At a new bootstrap generation (the F24 review, 2026-11-20): the one-off notes go (Add-DemoVmWarning -Transient), and
-    # so do the same notes from a bundle before then. Every other warning stays until its step's Set runs again
+    # At a new bootstrap generation (the F24 reviews, 2026-11-20): the one-off notes go (Add-DemoVmWarning -Transient), and
+    # so do the same notes from a bundle before then. Every other warning stays until its step's Set runs again to its end
     # (Remove-DemoVmStepWarning): a step whose cause lasts, such as features that setup couldn't uninstall, passes its Test
-    # at the next generation, so its Set wouldn't say it again.
+    # at the next generation, so its Set wouldn't say it again. A lasting warning from a bundle before then, which names no
+    # step, gets its step's name ($script:DemoVmLegacyWarningStep), when that step is one of StepName, the steps this
+    # VM runs, so it goes the same way; one that's there already that way isn't added twice.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the in-memory state only.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $State
+        [System.Collections.IDictionary] $State,
+
+        [AllowEmptyCollection()]
+        [string[]] $StepName = @()
     )
 
     $transient = @($State['transientWarnings'] | Where-Object { $_ })
@@ -171,7 +192,26 @@ function Clear-DemoVmTransientWarning {
                 break
             }
         }
-        if (-not $legacy) {
+        if ($legacy) {
+            continue
+        }
+        $named = $false
+        foreach ($name in $StepName) {
+            if ($name -and $text.StartsWith(('{0}: ' -f $name), [System.StringComparison]::Ordinal)) {
+                $named = $true
+                break
+            }
+        }
+        if (-not $named) {
+            foreach ($pattern in $script:DemoVmLegacyWarningStep.Keys) {
+                $step = [string]$script:DemoVmLegacyWarningStep[$pattern]
+                if ($text -match $pattern -and $StepName -contains $step) {
+                    $text = '{0}: {1}' -f $step, $text
+                    break
+                }
+            }
+        }
+        if (-not $kept.Contains($text)) {
             $kept.Add($text)
         }
     }

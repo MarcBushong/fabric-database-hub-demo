@@ -106,7 +106,7 @@ function Invoke-DemoVmStateMachine {
         # The one-off notes go with a new generation, such as a restart that has happened since (F24, 2026-11-20). Every
         # other warning stays until its step's Set runs again: a step whose cause lasts passes its Test now, so its Set
         # wouldn't say it again (the F24 review).
-        Clear-DemoVmTransientWarning -State $state
+        Clear-DemoVmTransientWarning -State $state -StepName @($Step | ForEach-Object { [string]$_['Name'] })
     }
     if ($state['pendingReboot']) {
         Write-DemoVmLog -Message 'Resuming after a restart.'
@@ -166,9 +166,12 @@ function Invoke-DemoVmStateMachine {
                 Write-DemoVmLog -Step $name -Level 'Warning' -Message ('Could not write the in-progress health.json: {0}' -f $_.Exception.Message)
             }
             Write-DemoVmLog -Step $name -Message 'Converging.'
-            # The step's Set says again what still holds, so its earlier warnings go first (the F24 review, 2026-11-20).
-            Remove-DemoVmStepWarning -State $state -Step $name
             $result = Get-DemoVmStepOutcome -Output @(& $definition['Set'] $definition)
+            # A Set that ran to its end says again what still holds, so the step's earlier warnings go then (the F24
+            # reviews, 2026-11-20); one that threw, or stopped early, leaves them.
+            if ($result.Outcome -in 'Done', 'NotSelected') {
+                Remove-DemoVmStepWarning -State $state -Step $name
+            }
             foreach ($warning in @($result.WarningMessage)) {
                 Add-DemoVmWarning -State $state -Message $warning -Step $name
             }
