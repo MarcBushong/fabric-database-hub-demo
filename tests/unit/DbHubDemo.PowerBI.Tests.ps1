@@ -433,6 +433,41 @@ Describe 'Test-DemoSemanticModelData' {
         $summary.evidence['blank'] | Should -Be 1
     }
 
+    It 'never warns of a blank Incident RCA measure: Not selected while no capture is recorded, and Pass when the evidence holds none of what it counts (review of 15ad76d)' {
+        $rcaMeasures = @('Blocked Sessions (captured)', 'Head Blocker Idle (s)', 'Deadlocks (captured)', 'Errors (captured)', 'Lock Escalations (captured)', 'Replica Replay Stall (s)', 'Injected Faults')
+        $empty = @{}
+        foreach ($table in 'RCA Sessions', 'RCA Waits', 'RCA Events', 'RCA Queries', 'RCA Resource', 'RCA Replica', 'RCA Coverage', 'RCA Answer Key') {
+            $empty[$table] = 0
+        }
+        # The history has rows, and the eight RCA tables are there, empty, as the activity notebook creates them.
+        Set-WebMock @(@{ Method = 'Post'; Match = $script:queriesUri; Respond = (Get-DaxResponder -Blank $rcaMeasures -Rows $empty) })
+        $results = @(Test-DemoSemanticModelData -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Token $script:token)
+        @($results | Where-Object { $_.status -in 'Warning', 'Fail' } | ForEach-Object checkId) | Should -BeNullOrEmpty
+        $rca = @($results | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.RCA_*' })
+        $rca.Count | Should -Be 7
+        @($rca.status | Select-Object -Unique) | Should -Be @('Not selected')
+        ($rca | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.RCA_SESSIONS.BLOCKED_SESSIONS_CAPTURED' }).message | Should -Be "'RCA Sessions'[Blocked Sessions (captured)] is blank: no Incident RCA capture is recorded yet (rca_sessions has no rows). A session with the capture fills it (ADR 0031)."
+        @($script:requests | Where-Object { [string]$_.Body -match 'NOT ISBLANK' }) | Should -BeNullOrEmpty -Because 'an empty table gives no grain a value'
+        $summary = $results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' }
+        $summary.status | Should -Be 'Pass'
+        $summary.evidence['rcaBlank'] | Should -Be 7
+        $summary.evidence['blank'] | Should -Be 0
+        $summary.message | Should -Match '7 of the Incident RCA''s measures are blank because no capture is recorded yet'
+        # Once a capture is recorded: no lock escalation and no replica stall in it is an answer, not a Warning.
+        Set-WebMock @(@{ Method = 'Post'; Match = $script:queriesUri; Respond = (Get-DaxResponder -Blank @('Lock Escalations (captured)', 'Replica Replay Stall (s)', 'Scenario Requests') -Rows @{ 'Scenario Runs' = 0 }) })
+        $results = @(Test-DemoSemanticModelData -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Token $script:token)
+        $escalations = $results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.RCA_EVENTS.LOCK_ESCALATIONS_CAPTURED' }
+        $escalations.status | Should -Be 'Pass'
+        $escalations.message | Should -Match 'is blank: the Incident RCA evidence in rca_events holds none of what it counts'
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.RCA_REPLICA.REPLICA_REPLAY_STALL_S' }).status | Should -Be 'Pass'
+        # A blank measure outside the RCA's tables is still a Warning.
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURE.SCENARIO_RUNS.SCENARIO_REQUESTS' }).status | Should -Be 'Warning'
+        $summary = $results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' }
+        $summary.evidence['rcaBlank'] | Should -Be 2
+        $summary.evidence['blank'] | Should -Be 1
+        $summary.evidence['withValue'] | Should -Be 118
+    }
+
     It 'reports Manual action required when the tenant setting blocks Execute Queries' {
         Set-WebMock @(@{ Method = 'Post'; Match = $script:queriesUri; Responses = @(New-WebResponse 403 @{ error = @{ code = 'PowerBINotAuthorized' } }) })
         $results = @(Test-DemoSemanticModelData -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Token $script:token)
@@ -587,6 +622,49 @@ Describe 'configure-powerbi.ps1' {
         (Get-SentDefinition $update 'definition/relationships.tmdl') | Should -Not -Match 'RCA '
         # The data check evaluates the model it deployed: no RCA measure.
         @($records | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.RCA_*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'updates an environment from the current release whose lakehouse has the RCA tables, empty: the model reads them, and nothing new is a Warning (review of 15ad76d)' {
+        $modelList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=SemanticModel")
+        $reportList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=Report")
+        $refreshes = "$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/refreshes"
+        $pages = $script:pages
+        # The current release's lakehouse with its history, after the update's run of the activity notebook, which creates
+        # the eight RCA tables empty. Its model and report exist already.
+        $rcaTables = [ordered]@{ rca_sessions = 'RCA Sessions'; rca_waits = 'RCA Waits'; rca_events = 'RCA Events'; rca_queries = 'RCA Queries'; rca_resource = 'RCA Resource'; rca_replica = 'RCA Replica'; rca_coverage = 'RCA Coverage'; rca_answer_key = 'RCA Answer Key' }
+        $tables = @{ paths = @(foreach ($table in @('scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows', 'validation_results') + @($rcaTables.Keys)) { @{ name = "$script:lakehouseId/Tables/dbo/$table"; isDirectory = 'true' } }) }
+        $empty = @{}
+        foreach ($name in $rcaTables.Values) {
+            $empty[$name] = 0
+        }
+        $blank = @('Blocked Sessions (captured)', 'Head Blocker Idle (s)', 'Deadlocks (captured)', 'Errors (captured)', 'Lock Escalations (captured)', 'Replica Replay Stall (s)', 'Injected Faults')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [System.Net.NetworkCredential]::new('', ('tok' + ('s' * 40))).SecurePassword }
+        Set-WebMock @(
+            @{ Method = 'Get'; Match = '^https://onelake\.dfs\.fabric\.microsoft\.com/'; Responses = @(New-WebResponse 200 $tables) }
+            @{ Method = 'Get'; Match = $modelList; Responses = @(New-WebResponse 200 @{ value = @(@{ id = $script:modelId; displayName = 'SM_DatabaseHub_History'; type = 'SemanticModel' }) }) }
+            @{ Method = 'Get'; Match = $reportList; Responses = @(New-WebResponse 200 @{ value = @(@{ id = $script:reportId; displayName = 'RPT_DatabaseHub_History'; type = 'Report' }) }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items/$script:modelId/updateDefinition"); Responses = @(New-WebResponse 200 $null) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items/$script:reportId/updateDefinition"); Responses = @(New-WebResponse 200 $null) }
+            @{ Method = 'Post'; Match = ('^' + [regex]::Escape($refreshes) + '$'); Responses = @(New-WebResponse 202 $null @{ 'x-ms-request-id' = @($script:refreshId) }) }
+            @{ Method = 'Get'; Match = [regex]::Escape("$refreshes/$script:refreshId"); Responses = @(New-WebResponse 200 @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/executeQueries"); Respond = (Get-DaxResponder -Blank $blank -Rows $empty) }
+            @{ Method = 'Get'; Match = ('^' + [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId") + '$'); Responses = @(New-WebResponse 200 @{ datasetId = $script:modelId }) }
+            @{ Method = 'Get'; Match = [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId/pages"); Responses = @(New-WebResponse 200 @{ value = @(for ($i = 0; $i -lt 4; $i++) { @{ name = "p$i"; displayName = $pages[$i]; order = $i } }) }) }
+        )
+        $output = Join-Path -Path $TestDrive -ChildPath 'update-current.jsonl'
+        $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token -PowerBIToken $script:token 6>&1
+        $LASTEXITCODE | Should -Be 0
+        $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+        @($records | Where-Object { $_.status -in 'Warning', 'Fail' } | ForEach-Object checkId) | Should -BeNullOrEmpty -Because 'an update adds no Warning'
+        foreach ($checkId in 'FABRIC.SEMANTICMODEL.RCA', 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY', 'FABRIC.SEMANTICMODEL.REFRESH', 'FABRIC.SEMANTICMODEL.DATA', 'FABRIC.REPORT.BINDING', 'FABRIC.REPORT.PAGES') {
+            ($records | Where-Object { $_.checkId -eq $checkId }).status | Should -Be 'Pass' -Because $checkId
+        }
+        $update = $script:requests | Where-Object { $_.Uri -match "items/$script:modelId/updateDefinition" } | Select-Object -First 1
+        $sent = @(($update.Body | ConvertFrom-Json -AsHashtable -Depth 64)['definition']['parts'] | ForEach-Object { $_['path'] })
+        @($sent | Where-Object { $_ -like 'definition/tables/RCA *' }).Count | Should -Be 8
+        $rca = @($records | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.RCA_*' })
+        $rca.Count | Should -Be 7
+        @($rca.status | Select-Object -Unique) | Should -Be @('Not selected')
     }
 
     It 'checks the deployed model alone with -CheckModelData: finds it by name with public functions and imports nothing' {
