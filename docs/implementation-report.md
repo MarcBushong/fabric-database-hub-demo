@@ -4791,3 +4791,26 @@ Until then, deployments keep the pinned image, which works as before.
 - **Not run live.** The handler's behavior is from its own logs on `archost01`; a fresh name avoiding it is how the RCA export's unique names behaved there.
 - **More Run Command names on a VM for a moment:** each read's copy goes when its delete finishes. Where Azure's deletes stall (2026-11-13), copies stay until they're an hour old, and at 24 a read falls back to its fixed name, as before.
 - **A read that waits behind the VM's extension work** (a policy's `MDE.Windows` update) is deleted after 90 seconds and created again, which waits as long as before plus one delete.
+
+### The review of F30: a deployment's own accounts count once, and an offer's default is called that (2026-11-22)
+
+**Why.** The review of F30 (a6b8c2bc) found two Low false-**Fail** paths in `PREFLIGHT.P3.AUTOMATION`:
+
+- **A rebuild right after `./scripts/destroy.ps1` counted its own deleted accounts twice.** The check added the accounts Resource Manager answered 404 for to a Resource Graph count of the region with no name filter, and Resource Graph can list a deleted account for a few minutes. In a subscription with 2 per region, `destroy.ps1 -KeepFabric` then `deploy.ps1` read 2 + 2 > 2, a **Fail** for a deployment that fits.
+- **A quota above the offer's default was missed unless the count already showed it.** An Enterprise or internal subscription can have more than 10, raised on request or kept from before Learn's limits ("would be honored and then considered as your new limit", [Learn's FAQ](https://learn.microsoft.com/azure/automation/automation-subscription-limits-faq)). With 9 or 10 accounts, 9 + 2 > 10 was a **Fail** that called 10 "its quota", though Azure would take them.
+
+**Work summary.**
+
+- **The count:** Resource Graph's query leaves out this deployment's account names (`name !in~ (...)`, [Kusto](https://learn.microsoft.com/kusto/query/not-in-operator)), and each of them counts once: the ones Resource Manager answered 404 for, which it's authoritative on, and the ones it couldn't read, which count the same whether they're there or not. So the sum is the region's count after the deployment, and the evidence adds `needed`. Before, an account it couldn't read made a best and worst case; now a new deployment that doesn't fit either way is a **Fail**, and when only such an account would be over, a **Warning** that says nothing is added if it's there.
+- **The wording:** the offer's number is "Learn's default quota of &lt;n&gt; for &lt;offer&gt;", never "its quota", and a **Fail** for an offer whose default can be raised adds "unless the subscription's quota there is higher". Its fix starts with "Learn's default quota for &lt;offer&gt; is &lt;n&gt; per region. If the subscription's quota for Automation accounts in &lt;region&gt; is higher (the Azure portal's Quotas page, provider Automation accounts, shows it), set automationAccountQuota ...", then frees an account, raises the quota, or moves the region, as before. [Manage Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-limits-quotas) documents the Quotas page's current usage and limit. A quota from `automationAccountQuota` is the quota, and Free Trial's 1 can't be raised, so those keep their fixes.
+- **Microsoft's internal offer** (`Internal_2014-09-01`) isn't on Learn: its 10 was observed live, and its messages say "as observed (Learn doesn't list this offer)". The offer table records whether Learn documents each offer, and `Get-DemoAutomationAccountLimit` returns it (`Documented`).
+- **Docs:** troubleshooting's three `PREFLIGHT.P3.AUTOMATION` rows, the CHANGELOG's F30 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/AutomationQuotaHelpers.ps1`; tests in `tests/unit/DbHubDemo.Preflight.Tests.ps1` (Resource Graph's fake lists accounts by name and leaves out the names a query excludes); `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: the F30 tests, 17 passed, 0 failed, 0 az calls. With HEAD's `AutomationQuotaHelpers.ps1` and the tests kept, 14 fail, among them both review cases: the rebuild after `destroy.ps1` (a **Pass**, `existing` 0), and an Enterprise subscription with 9 (a **Fail** whose fix starts with `automationAccountQuota`); the 3 that pass at HEAD are an update whose accounts are there, an offer with no documented default, and the check's place in preflight.
+
+**Risks.**
+
+- **Not run live.**
+- **Another environment's account deleted minutes ago still counts,** because Resource Graph can still list it; the fix says so, as before.
