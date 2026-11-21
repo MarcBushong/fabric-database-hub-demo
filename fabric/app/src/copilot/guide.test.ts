@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { buildGuideSource, OUTPUT, withoutScenarioClauses } from "../../scripts/build-model-guide";
 import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
-import { readContract } from "@/rca/testdata/contract";
+import { readContract, namesAScenario } from "@/rca/testdata/contract";
 import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "./answer-key";
 import { contextPrompt, endedWithoutAnswer, hasAnswer, NO_ANSWER, recap, reduceConversation, retryPrompt, toMarkdown, type AssistantTurn, type Turn } from "./conversation";
 import { buildSystemMessage } from "./guide";
@@ -59,6 +59,15 @@ describe("the model guide", () => {
             "Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance.",
         );
         expect(withoutScenarioClauses("CPU per bin. Shows the injected scenario. Per target.")).toBe("CPU per bin. Per target.");
+    });
+
+    // The review of 34a9732: the guide still named two scenarios by their IDs ("missing-index", "ru-storm", and "IO-pressure"
+    // in another case), with or without the RCA tables.
+    it("names no scenario by its ID, in any case, in the guide or a description it keeps", () => {
+        expect(namesAScenario(MODEL_GUIDE)).toEqual([]);
+        expect(namesAScenario(MODEL_GUIDE.toLowerCase())).toEqual([]);
+        expect(withoutScenarioClauses("The IO-pressure and missing-index signal. Buffer IO waits.")).toBe("Buffer IO waits.");
+        expect(withoutScenarioClauses("Normalized RU per minute, 0 to 100 %, an ru-storm leaves it at 100 %.")).toBe("Normalized RU per minute, 0 to 100 %.");
     });
 
     it("parses a table's description, columns, measures, and calculated rows", () => {

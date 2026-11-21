@@ -14,17 +14,23 @@ export const OUTPUT = resolve(import.meta.dirname, "../src/copilot/model-guide.g
 
 const isAnswerKey = (name: string) => (ANSWER_KEY_TABLES as readonly string[]).includes(name);
 const touchesAnswerKey = (ref: string) => ANSWER_KEY_TABLES.some((table) => ref.includes(table));
-const NAMES_SCENARIO = /scenario|inject/i;
+/** The scenario catalog's IDs (the folders of scenarios/): a description that names one tells the chat what the demo runs. */
+export const SCENARIO_IDS: readonly string[] = readdirSync(resolve(import.meta.dirname, "../../../scenarios"), { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+const SCENARIO_TOKEN = new RegExp(`(?<![A-Za-z0-9_./-])(?:${SCENARIO_IDS.map((id) => id.replace(/[-]/g, "\\-")).join("|")})(?![A-Za-z0-9_./-])`, "i");
+/** Text that names a scenario: the word, what was injected, or a scenario's ID in any case ("IO-pressure" too; the review of 34a9732). */
+const namesScenario = (text: string) => /scenario|inject/i.test(text) || SCENARIO_TOKEN.test(text);
 
 /** The text without the sentences or comma clauses that name a scenario: the model's descriptions are written for the presenter. */
 export function withoutScenarioClauses(text: string): string {
-    if (!NAMES_SCENARIO.test(text)) return text;
+    if (!namesScenario(text)) return text;
     return text
         .split(/(?<=[.!?])\s+/)
         .map((sentence) => {
-            if (!NAMES_SCENARIO.test(sentence)) return sentence;
+            if (!namesScenario(sentence)) return sentence;
             const clauses = sentence.replace(/[.!?]$/, "").split(/,\s+/);
-            const kept = clauses.filter((clause) => !NAMES_SCENARIO.test(clause));
+            const kept = clauses.filter((clause) => !namesScenario(clause));
             return kept.length > 0 ? `${kept.join(", ")}.` : "";
         })
         .filter(Boolean)
@@ -41,7 +47,7 @@ export function blindTables(all: TmdlTable[]): { tables: TmdlTable[]; answerKeyM
             description: withoutScenarioClauses(t.description),
             columns: t.columns.map((c) => ({ ...c, description: withoutScenarioClauses(c.description) })),
             measures: t.measures.filter((m) => !answerKeyMeasures.includes(m.name)).map((m) => ({ ...m, description: withoutScenarioClauses(m.description) })),
-            rows: t.rows.filter((r) => !NAMES_SCENARIO.test(r) && !ANSWER_KEY_ANALYSES.some((a) => r.startsWith(`{ "${a}"`))),
+            rows: t.rows.filter((r) => !namesScenario(r) && !ANSWER_KEY_ANALYSES.some((a) => r.startsWith(`{ "${a}"`))),
         }));
     return { tables, answerKeyMeasures };
 }

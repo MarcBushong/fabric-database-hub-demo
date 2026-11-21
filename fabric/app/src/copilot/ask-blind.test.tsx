@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import EstatePage from "@/pages/EstatePage";
 import FindingsPage from "@/pages/FindingsPage";
 import IncidentsPage from "@/pages/IncidentsPage";
+import LinksPage from "@/pages/LinksPage";
 import ManagePage from "@/pages/ManagePage";
 import MissionControlPage from "@/pages/MissionControlPage";
 import OverviewPage, { OVERVIEW_PROMPT } from "@/pages/OverviewPage";
@@ -24,23 +25,58 @@ import type { AskContext } from "./contract";
 // measure that reads one (run_dax would refuse to query it again), never a scenario's name or what was injected. The
 // drill-downs count too, and so does the postmortem's draft.
 const injected = FIXTURES["incident-windows"].find((r) => r.Scenario) ?? FIXTURES["incident-windows"][0];
-const CASES: Array<{ name: string; Page: ComponentType; view?: Partial<ViewState>; postmortem?: boolean }> = [
+type Case = { name: string; Page: ComponentType; view?: Partial<ViewState>; postmortem?: boolean; live?: "sample" };
+const CASES: Case[] = [
     { name: "Overview", Page: OverviewPage },
+    { name: "Overview, with Database Hub live", Page: OverviewPage, live: "sample" },
     { name: "Estate", Page: EstatePage },
     { name: "Estate, T1", Page: EstatePage, view: { page: "estate", target: "T1" } },
+    { name: "Estate, T2 and its migration assessment", Page: EstatePage, view: { page: "estate", target: "T2" }, live: "sample" },
     { name: "Estate, T4 and its replica", Page: EstatePage, view: { page: "estate", target: "T4" } },
     { name: "Estate, T5", Page: EstatePage, view: { page: "estate", target: "T5" } },
     { name: "Performance", Page: PerformancePage },
     { name: "Incidents", Page: IncidentsPage },
     { name: "Incidents, one selected", Page: IncidentsPage, view: { page: "incidents", incident: String(injected.Key) } },
     { name: "Findings", Page: FindingsPage },
+    { name: "Findings, security, live", Page: FindingsPage, view: { page: "findings", category: "security" }, live: "sample" },
+    { name: "Findings, optimization, live", Page: FindingsPage, view: { page: "findings", category: "optimization" }, live: "sample" },
     { name: "Readiness", Page: ReadinessPage },
     { name: "Trends", Page: TrendsPage },
     { name: "Manage", Page: ManagePage },
+    { name: "Live views", Page: LinksPage },
     { name: "Mission Control", Page: MissionControlPage, postmortem: true },
     { name: "Scoreboard", Page: ScoreboardPage, postmortem: true },
     { name: "Session replay", Page: ReplayPage, postmortem: true },
 ];
+
+/**
+ * Every file that renders a visual with its Ask (a VisualCard's Ask defaults to its own queries and rows), an Ask why, or
+ * an agent card, or hands Copilot a context itself, with the cases above that click its Asks (the review of 34a9732: Live
+ * views' card had no case).
+ */
+const COVERED: Record<string, string[]> = {
+    "/src/components/AgentPrompts.tsx": ["Incidents, one selected", "Readiness"],
+    "/src/components/AskWhy.tsx": ["Estate, T1", "Incidents, one selected"],
+    "/src/components/Insights.tsx": ["Overview", "Incidents", "Performance", "Readiness"],
+    "/src/components/LiveNow.tsx": ["Overview, with Database Hub live"],
+    "/src/components/MigrationCard.tsx": ["Estate, T2 and its migration assessment", "Findings, optimization, live"],
+    "/src/components/VisualCard.tsx": ["Overview", "Live views"],
+    "/src/mission/PostmortemDialog.tsx": ["Mission Control", "Scoreboard", "Session replay"],
+    "/src/pages/EstatePage.tsx": ["Estate", "Estate, T1", "Estate, T2 and its migration assessment", "Estate, T4 and its replica", "Estate, T5"],
+    "/src/pages/FindingsPage.tsx": ["Findings", "Findings, security, live", "Findings, optimization, live"],
+    "/src/pages/IncidentsPage.tsx": ["Incidents", "Incidents, one selected"],
+    "/src/pages/LinksPage.tsx": ["Live views"],
+    "/src/pages/ManagePage.tsx": ["Manage"],
+    "/src/pages/MissionControlPage.tsx": ["Mission Control"],
+    "/src/pages/OverviewPage.tsx": ["Overview"],
+    "/src/pages/PerformancePage.tsx": ["Performance"],
+    "/src/pages/ReadinessPage.tsx": ["Readiness"],
+    "/src/pages/ReplayPage.tsx": ["Session replay"],
+    "/src/pages/ScoreboardPage.tsx": ["Scoreboard"],
+    "/src/pages/TrendsPage.tsx": ["Trends"],
+    // The Root cause view's own Ask reads only the capture: rca-view.test.tsx clicks it, and the contract's blind scan checks its code.
+    "/src/pages/RcaPage.tsx": [],
+};
 
 /** Every button that hands Copilot a context: "Ask Copilot", "Ask why", the agent cards' "Ask Copilot prompt …", and Overview's own question. */
 const ASKS = new RegExp(`^(Ask\\b|${OVERVIEW_PROMPT.replace(/[?.]/g, "\\$&")}$)`);
@@ -48,8 +84,8 @@ const ASKS = new RegExp(`^(Ask\\b|${OVERVIEW_PROMPT.replace(/[?.]/g, "\\$&")}$)`
 afterEach(() => cleanup());
 
 /** Renders a page, waits for its data, and clicks every Ask on it (the postmortem's draft too, when asked): the contexts it handed the chat. */
-async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>; rca?: boolean; postmortem?: boolean } = {}): Promise<AskContext[]> {
-    const { copilot } = renderWithApp(<Page />, { view: options.view, rca: options.rca });
+async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>; rca?: boolean; postmortem?: boolean; live?: "sample" } = {}): Promise<AskContext[]> {
+    const { copilot } = renderWithApp(<Page />, { view: options.view, rca: options.rca, live: options.live });
     await waitFor(() => expect(document.querySelectorAll('[aria-busy="true"]').length).toBe(0), { timeout: 4000 });
     for (const button of screen.queryAllByRole("button", { name: ASKS })) {
         if (!(button as HTMLButtonElement).disabled) fireEvent.click(button);
@@ -67,30 +103,22 @@ async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>;
 const leaksIn = (contexts: readonly AskContext[]) => contexts.map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", leak: answerKeyInContext(ctx) })).filter((x) => x.leak !== null);
 
 describe("every Ask is blind (ADR 0031)", () => {
-    for (const { name, Page, view, postmortem } of CASES) {
+    for (const { name, Page, view, postmortem, live } of CASES) {
         it(`${name}: hands the chat measured data only`, async () => {
-            expect(leaksIn(await askAll(Page, { view, postmortem }))).toEqual([]);
+            expect(leaksIn(await askAll(Page, { view, postmortem, live }))).toEqual([]);
         });
     }
 
-    it("covers every place the app hands Copilot a context", () => {
-        // A new call site needs a case above (or its own blind test) before it joins this list.
+    it("covers every file that hands Copilot a context, with cases that click its Asks", () => {
+        // A new visual, Ask why, agent card, or call site needs a case above (or its own blind test) before it joins this list.
         const sources = import.meta.glob(["/src/**/*.{ts,tsx}", "!/src/**/*.test.{ts,tsx}"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
-        const callers = Object.entries(sources)
-            .filter(([, text]) => /copilot\.ask\(/.test(text))
+        const askers = Object.entries(sources)
+            .filter(([, text]) => /<VisualCard\b|<AskWhy\b|<AgentCard\b|<Insights\b|copilot\.ask\(/.test(text))
             .map(([path]) => path)
             .sort();
-        expect(callers).toEqual([
-            "/src/components/AgentPrompts.tsx",
-            "/src/components/AskWhy.tsx",
-            "/src/components/LiveNow.tsx",
-            "/src/components/MigrationCard.tsx",
-            "/src/components/VisualCard.tsx",
-            "/src/mission/PostmortemDialog.tsx",
-            "/src/pages/OverviewPage.tsx",
-            // The Root cause view's own Ask reads only the capture, which the contract's blind scan checks.
-            "/src/pages/RcaPage.tsx",
-        ]);
+        expect(askers).toEqual(Object.keys(COVERED).sort());
+        const names = new Set(CASES.map((c) => c.name));
+        for (const [file, cases] of Object.entries(COVERED)) for (const name of cases) expect(names.has(name), `${file}: ${name}`).toBe(true);
     });
 });
 

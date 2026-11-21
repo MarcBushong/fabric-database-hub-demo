@@ -180,13 +180,40 @@ export function toolSpecs(options: { estate: boolean; rca?: boolean }): ToolSpec
     return specs;
 }
 
-/** Removes DAX comments, so the statement check sees the first real keyword. */
+/**
+ * Removes DAX comments (`//` and `--` to the line's end, and `/* … *\/`), so the statement check sees the first real keyword.
+ * A comment marker inside a string ("…"), a quoted name ('…'), or a bracketed name ([…]) is text, not a comment: each is
+ * read whole, with its doubled closing character as an escape, so no string can hide the rest of a query (the review of 34a9732).
+ */
 export function stripDaxComments(query: string): string {
-    return query
-        .replace(/\/\*[\s\S]*?\*\//g, " ")
-        .replace(/(^|[^:])\/\/.*$/gm, "$1")
-        .replace(/--.*$/gm, "")
-        .trim();
+    let out = "";
+    let i = 0;
+    while (i < query.length) {
+        const c = query[i];
+        const next = query[i + 1];
+        if (c === '"' || c === "'" || c === "[") {
+            const close = c === "[" ? "]" : c;
+            let j = i + 1;
+            for (; j < query.length; j++) {
+                if (query[j] !== close) continue;
+                if (query[j + 1] === close) j++;
+                else break;
+            }
+            out += query.slice(i, j + 1);
+            i = j + 1;
+        } else if (c === "/" && next === "*") {
+            const end = query.indexOf("*/", i + 2);
+            out += " ";
+            i = end < 0 ? query.length : end + 2;
+        } else if ((c === "/" && next === "/") || (c === "-" && next === "-")) {
+            const end = query.indexOf("\n", i);
+            i = end < 0 ? query.length : end;
+        } else {
+            out += c;
+            i++;
+        }
+    }
+    return out.trim();
 }
 
 /** Plain-language reason a query isn't accepted, or null when it is. */
@@ -196,7 +223,9 @@ export function checkDax(query: unknown): string | null {
     const body = stripDaxComments(query);
     if (!/^(DEFINE|EVALUATE)\b/i.test(body)) return "The query must start with EVALUATE (or DEFINE ... EVALUATE).";
     if (!/\bEVALUATE\b/i.test(body)) return "The query has no EVALUATE statement.";
-    const key = answerKeyIn(body, ANSWER_KEY_MEASURES);
+    // The text that runs is the query as written, so the answer key is looked for there too, comments and strings included:
+    // naming a table in a comment or a string is refused with it, which never hides a real reference.
+    const key = answerKeyIn(query, ANSWER_KEY_MEASURES) ?? answerKeyIn(body, ANSWER_KEY_MEASURES);
     if (key) return answerKeyRefusal(key);
     return null;
 }

@@ -36,6 +36,28 @@ describe("checkDax", () => {
         expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], \"c\", [cpu in incident window] )")).toMatch(/^\[CPU In Incident Window\] reads/);
         expect(checkDax("EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], \"CpuPct\", [CPU (%)], \"Blocked\", [Blocked Processes (peak)] )")).toBeNull();
     });
+
+    // The review of 34a9732: a comment marker inside a string hid the rest of the query from the check, which then ran it.
+    it("refuses the answer key behind a string that holds a comment marker", () => {
+        for (const query of [
+            `EVALUATE VAR s = "--" RETURN 'Scenario Runs'`,
+            `EVALUATE VAR s = "a//" RETURN 'Scenario Runs'`,
+            `EVALUATE VAR s = "/*"\nRETURN 'Scenario Runs'\n// */`,
+            `EVALUATE VAR s = "--" RETURN ROW ( "n", [Injected Faults] )`,
+            `EVALUATE VAR s = 'a--b' RETURN 'Incident Windows'`,
+        ]) {
+            expect(checkDax(query), query).toMatch(/answer key/);
+        }
+    });
+
+    it("reads strings and names whole when it strips comments, with their doubled quotes", () => {
+        expect(stripDaxComments(`EVALUATE ROW ( "a", "--x" ) // tail`)).toBe(`EVALUATE ROW ( "a", "--x" )`);
+        expect(stripDaxComments(`EVALUATE ROW ( "a", "say ""//"" here" ) -- tail`)).toBe(`EVALUATE ROW ( "a", "say ""//"" here" )`);
+        expect(stripDaxComments(`EVALUATE 'a--b'[c /* d ]]] -- e`)).toBe(`EVALUATE 'a--b'[c /* d ]]]`);
+        expect(stripDaxComments(`EVALUATE /* "a */ ROW ( "b", 1 )`)).toBe(`EVALUATE   ROW ( "b", 1 )`);
+        // Naming a table in a comment is refused with it: the query runs as written.
+        expect(checkDax(`EVALUATE ROW ( "a", 1 ) // not 'Scenario Runs'`)).toMatch(/^Scenario Runs holds/);
+    });
 });
 
 describe("the tool runner", () => {
