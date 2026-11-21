@@ -511,6 +511,53 @@ Describe 'configure-fabric.ps1' {
         $output | Should -Not -Match ([regex]::Escape($plainToken))
     }
 
+    It 'runs the updated live-activity notebook once when the lakehouse doesn''t have the Incident RCA''s tables yet, and only then (2026-11-20)' {
+        # An environment from the release before the Incident RCA: deploy.ps1 updates its notebooks, and the history model
+        # that follows reads eight tables its lakehouse doesn't have until the updated notebook runs.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoStorageToken -MockWith { [securestring]::new() }
+        $script:lakeTables = @('incident_windows', 'telemetry_snapshots', 'validation_results', 'analysis_findings', 'scenario_runs')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoOneLakeRequest -MockWith {
+            if ($Method -ne 'Get' -or $Query -notlike 'resource=filesystem&recursive=false&directory=*Tables%2Fdbo*') {
+                throw ('unexpected OneLake request: {0} {1} {2}' -f $Method, $Path, $Query)
+            }
+            # Unqualified, as Set-FabricMock's: the mock runs inside configure-fabric.ps1, whose script scope isn't this file's.
+            if ($null -eq $lakeTables) {
+                return [pscustomobject]@{ StatusCode = 403; Headers = @{}; Content = '{"error":{"code":"Forbidden","message":"no access"}}' }
+            }
+            $paths = @($lakeTables | ForEach-Object { @{ name = ('lakehouse/Tables/dbo/{0}' -f $_); isDirectory = 'true' } })
+            [pscustomobject]@{ StatusCode = 200; Headers = @{}; Content = (ConvertTo-Json -InputObject @{ paths = $paths } -Depth 5 -Compress) }
+        }
+        $fabricRoutes = @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }, @{ id = $operationId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+            @{ Method = 'Post'; Match = '/updateDefinition$'; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$operationId/jobs/instances/$operationId" }) }
+        )
+        Set-FabricMock -Routes $fabricRoutes
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        $results = Read-ImportResult
+        $results.checkId | Should -Be @('FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT', 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY', 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY')
+        $results.status | Should -Be @('Pass', 'Pass', 'Pass')
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        $run.Count | Should -Be 1
+        $sent = (Get-RequestBody -Request $run[0]).executionData.parameters
+        $sent.SAVE_RESULTS.value | Should -Be 'true'
+        $sent.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE' -Because 'a run that creates the tables takes no evidence'
+
+        # The lakehouse has them already, or its tables can't be listed: nothing more runs (the model's step leaves out what
+        # it can't read, FABRIC.SEMANTICMODEL.RCA).
+        foreach ($tables in @(@($script:lakeTables + @(InModuleScope DbHubDemo { Get-DemoRcaHistoryTable } | ForEach-Object Name)), $null)) {
+            $script:lakeTables = $tables
+            Set-FabricMock -Routes $fabricRoutes
+            $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+            $LASTEXITCODE | Should -Be 0
+            (Read-ImportResult).checkId | Should -Be @('FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT', 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY')
+            @($requests | Where-Object { $_.Uri -like '*jobType=RunNotebook' }).Count | Should -Be 0
+        }
+    }
+
     It 'points the uploaded deployment notebook at github.repository, but not at the example''s placeholder, and adds no GitHub parameter to the live-activity notebook' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
         $gitHubConfig = Get-Content -LiteralPath $idConfigPath -Raw | ConvertFrom-Json -AsHashtable
@@ -731,6 +778,56 @@ Describe 'configure-fabric.ps1' {
         $sent.STOP_ACTIVITY.value | Should -Be 'false'
         $sent.SAVE_RESULTS.value | Should -Be 'true'
         $sent.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS' -Because 'with -FabricToken no subscription guard runs, so Azure Monitor isn''t read'
+        $sent.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE' -Because 'nor are the VMs'' Run Commands'
+    }
+
+    It 'with -RunLiveActivity and the Azure CLI''s sign-in, exports the Incident RCA''s evidence and stages it as RCA_EVIDENCE_FILE (2026-11-20)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        Mock -CommandName Assert-DemoAzContext -MockWith { New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Get-DemoFabricToken -MockWith { [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoPostgresHistoryCapture -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $true; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith {
+            [pscustomobject]@{ Evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'; Documents = @([ordered]@{ documentId = 'd'; vm = 'sqlvm01' }); Pending = @(); PendingFound = $false; Results = @(New-DemoResult -CheckId 'FABRIC.RCA.EXPORT' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message '1 RCA evidence document(s), 1 part(s), for the history run.') }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $null }
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+        )
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        $results = Read-ImportResult
+        ($results | Where-Object checkId -EQ 'FABRIC.RCA.EXPORT').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        $run.Count | Should -Be 1
+        (Get-RequestBody -Request $run[0]).executionData.parameters.RCA_EVIDENCE_FILE.value | Should -Be 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'FABRIC' -and -not $Final }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { $Saved -and $CheckPrefix -eq 'FABRIC' }
+
+        # The workspace's notebook is from before the Incident RCA: nothing is staged, the run goes on, and a Warning says
+        # how the evidence follows; the documents stay pending.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $false; Error = '' } }
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1
+        $withheld = Read-ImportResult | Where-Object checkId -EQ 'FABRIC.RCA.EVIDENCE'
+        $withheld.status | Should -Be 'Warning'
+        $withheld.message | Should -Be 'The RCA evidence wasn''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA (2026-11-20), so it would ignore it.'
+        $withheld.remediation | Should -Match 'without -SkipNotebookImport, which updates the notebook'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -match 'from before the Incident RCA' }
+
+        # A run that throws (review of 3b1348a): the documents the export took from the runner, which lists each once, are
+        # still kept for the next save before the error goes on.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $true; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaNotebookRun -MockWith { throw 'The Fabric API didn''t answer.' }
+        { $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1 } | Should -Throw '*didn''t answer*'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -eq 'the run didn''t complete' -and $CheckPrefix -eq 'FABRIC' }
     }
 
     It 'adds the PostgreSQL metrics stop-demo.ps1 kept for a paused capacity with -PostgresMetricsPath, then moves the file aside (ADR 0025)' {

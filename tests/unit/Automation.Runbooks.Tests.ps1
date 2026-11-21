@@ -140,8 +140,19 @@ BeforeAll {
         $script:rcaCommands = [System.Collections.Generic.List[object]]::new()
         $script:rcaDeleted = [System.Collections.Generic.List[string]]::new()
         $script:rcaRunner = { New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.' }
+        # How many reads a deleted Rca Run Command stays listed for, by VM (Azure's deletes take a while; R871), and the reads
+        # left for each one being deleted. By default a delete is done at once.
+        $script:rcaDeleteDelay = @{}
+        $script:rcaDeleteReads = @{}
+        # The most Rca Run Commands a VM listed at once, a deleting one included, by VM.
+        $script:rcaMostOpen = @{}
+        # Whether a VM's list of Run Commands has its Rca ones too, with their instance views, as Azure lists them (review
+        # of 93243d6). Off by default, so the other tests count only the Run Commands they set.
+        $script:rcaListOpen = $false
         # Key Vault versions of the secrets the runbook writes, counted (Secrets - Create Or Update returns secretUriWithVersion).
         $script:secretVersions = 0
+        # A script block each secret write runs first, given the secret's name and the request's body (review of 15ad76d).
+        $script:secretWriteHook = $null
     }
 
     # An Rca Run Command's instance view (Invoke-DemoControlRca): its result line, then the runner's own line, if any.
@@ -222,6 +233,7 @@ BeforeAll {
             '/vaults/kv-dbhub-ctl-[0-9a-f]{6}/secrets/(dbhub-session-status|dbhub-session-metrics)$' {
                 if ($script:secretsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.KeyVault/vaults/secrets/write."}}') }
                 $name = $Matches[1]
+                if ($null -ne $script:secretWriteHook) { & $script:secretWriteHook $name $Body }
                 if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
                 $script:secretVersions++
                 $version = '{0:x32}' -f $script:secretVersions
@@ -389,11 +401,21 @@ BeforeAll {
                     # A Run Command created again under its name is a new one.
                     $null = $script:rcaDeleted.Remove($name)
                     $script:rcaCommands.Add([pscustomobject]@{ Vm = $vmName; Name = $name; Request = (ConvertFrom-TestRcaScript -Script ([string]$Body.properties.source.script)); At = $script:clock })
+                    $open = @($script:rcaCommands | Where-Object { $_.Vm -eq $vmName -and ($script:rcaDeleted -notcontains $_.Name -or ($script:rcaDeleteReads.ContainsKey($_.Name) -and $script:rcaDeleteReads[$_.Name] -gt 0)) }).Count
+                    $script:rcaMostOpen[$vmName] = [System.Math]::Max([int]$script:rcaMostOpen[$vmName], $open)
                     return (New-Response 201 '{}')
                 }
                 if ($Method -eq 'DELETE') {
                     $script:rcaDeleted.Add($name)
+                    if ($script:rcaDeleteDelay.ContainsKey($vmName) -and -not $script:rcaDeleteReads.ContainsKey($name)) {
+                        $script:rcaDeleteReads[$name] = [int]$script:rcaDeleteDelay[$vmName]
+                    }
                     return (New-Response 200)
+                }
+                if ($script:rcaDeleted -contains $name -and $script:rcaDeleteReads.ContainsKey($name) -and $script:rcaDeleteReads[$name] -gt 0) {
+                    # Still being deleted: Azure lists it, and it counts toward the VM's 25.
+                    $script:rcaDeleteReads[$name]--
+                    return (New-Response 200 '{"properties":{"provisioningState":"Deleting"}}')
                 }
                 return (New-Response 404)
             }
@@ -410,10 +432,24 @@ BeforeAll {
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $name; properties = @{ instanceView = $view } } -Depth 6))
             }
             '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
-                if ($script:runCommands.ContainsKey($Matches[1])) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:runCommands[$Matches[1]]) } -Depth 8))
+                $listed = $Matches[1]
+                $open = @()
+                if ($script:rcaListOpen) {
+                    $open = @($script:rcaCommands | Where-Object { $_.Vm -eq $listed -and $script:rcaDeleted -notcontains $_.Name } | ForEach-Object {
+                            $view = & $script:rcaRunner $_
+                            if ($null -eq $view) {
+                                $view = @{ executionState = 'Running' }
+                            }
+                            @{ name = $_.Name; properties = @{ instanceView = $view } }
+                        })
                 }
-                return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $Matches[1]))
+                if ($script:runCommands.ContainsKey($listed)) {
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@($script:runCommands[$listed]) + $open) } -Depth 8))
+                }
+                if ($open.Count -gt 0) {
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@(@{ name = ('DbHubControl-{0}-20261026000000' -f $listed) }, @{ name = 'DbHubDemo-Other' }) + $open) } -Depth 8))
+                }
+                return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $listed))
             }
             '/runCommands/([A-Za-z0-9-]+)\?\$expand=instanceView$' {
                 if ($script:runCommandViews.ContainsKey($Matches[1])) {
@@ -3059,6 +3095,86 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             }
             return $documents
         }
+
+        # The runner when nothing new was captured: every export lists nothing, and 'rca part' prints a fixture's part on
+        # either VM, as the runner keeps an exported document there (review of 3b1348a).
+        function Set-PartsRunner {
+            $script:rcaRunner = {
+                param($Command)
+                $request = $Command.Request
+                if ($request.command -eq 'export') {
+                    return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+                }
+                $line = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $request.documentId -and $_.Split(' ')[3].StartsWith(('{0}/' -f $request.part)) }) | Select-Object -First 1
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+            }
+        }
+
+        # A session's start from deallocated VMs, as after the nightly stop: nothing runs, and no run is active.
+        function Set-TestSessionStart {
+            $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+            $script:t4 = 'Stopped'
+            $script:replica = ''
+            $script:autostop = ''
+            $script:groupTags = @{ DbHubT4Replica = 'Session' }
+            $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        }
+
+        # A document reference as a status keeps it, on a VM.
+        function New-TestPending([string] $DocumentId, [string] $Vm) {
+            $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $DocumentId)[0]
+            return [ordered]@{ documentId = $reference.documentId; parts = [int]$reference.parts; sha256 = $reference.sha256; vm = $Vm }
+        }
+
+        # A runner whose export on -Vm lists documents built from the T1 fixture with the IDs and sessions -Case gives (each
+        # @{ Id; Session }), once per VM unless -EveryExport, and whose 'rca part' prints their parts, or a fixture's, on
+        # any VM (review of 93243d6: the fixtures' documents are all one session's).
+        function Set-ServedRunner([object[]] $Case, [string[]] $Vm = @('sqlvm01'), [switch] $EveryExport) {
+            $template = Get-Content -LiteralPath (Join-Path -Path $script:rcaRoot -ChildPath 'fixtures/t1-blocking-chain.evidence.json') -Raw | ConvertFrom-Json
+            $script:servedParts = @{}
+            $references = foreach ($item in $Case) {
+                $template.documentId = $item.Id
+                $template.sessionId = $item.Session
+                $plain = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $template -Depth 30 -Compress))
+                $memory = [System.IO.MemoryStream]::new()
+                $gzip = [System.IO.Compression.GZipStream]::new($memory, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                $gzip.Write($plain, 0, $plain.Length)
+                $gzip.Dispose()
+                $bytes = $memory.ToArray()
+                $sha = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+                $count = [int][System.Math]::Ceiling($bytes.Length / 2400.0)
+                $script:servedParts[$item.Id] = @(for ($i = 0; $i -lt $count; $i++) { 'DBHUBDEMO-RCA 1 {0} {1}/{2} {3} {4}' -f $item.Id, ($i + 1), $count, $sha, [System.Convert]::ToBase64String($bytes, $i * 2400, [System.Math]::Min(2400, $bytes.Length - $i * 2400)) })
+                [ordered]@{ documentId = $item.Id; parts = $count; sha256 = $sha }
+            }
+            $script:servedIndex = 'DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject ([ordered]@{ kind = 'ContosoCare.RcaExportIndex'; version = 1; documents = @($references); status = 'Pass'; message = ('{0} documents.' -f @($references).Count) }) -Depth 5 -Compress)
+            $script:servedVms = $Vm
+            $script:servedEvery = [bool]$EveryExport
+            $script:servedTo = [System.Collections.Generic.List[string]]::new()
+            $script:rcaRunner = {
+                param($Command)
+                $request = $Command.Request
+                if ($request.command -eq 'export') {
+                    if ($null -eq $Command.PSObject.Properties['Answer']) {
+                        $answer = ''
+                        if ($Command.Vm -in $script:servedVms -and ($script:servedEvery -or -not $script:servedTo.Contains($Command.Vm))) {
+                            $script:servedTo.Add($Command.Vm)
+                            $answer = $script:servedIndex
+                        }
+                        $Command | Add-Member -NotePropertyName 'Answer' -NotePropertyValue $answer
+                    }
+                    if (-not $Command.Answer) {
+                        return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+                    }
+                    return (New-TestRcaView -Status 'Pass' -Message 'runner rca export: its line follows.' -Line $Command.Answer)
+                }
+                $parts = @($script:servedParts[[string]$request.documentId]) + @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $request.documentId })
+                $line = @($parts | Where-Object { $_ -and $_.Split(' ')[3].StartsWith(('{0}/' -f $request.part)) }) | Select-Object -First 1
+                if (-not $line) {
+                    return (New-TestRcaView -Status 'Fail' -Message 'runner rca part: exit code 1. The document or part doesn''t exist.')
+                }
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+            }
+        }
     }
 
     BeforeEach {
@@ -3173,6 +3289,61 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $script:most | Should -Be 5
     }
 
+    It 'fetches the T2 host''s parts one Run Command at a time, each gone before the next, and stops sending when Azure doesn''t delete one (R871)' {
+        # archost01's runner exports T1's fixture document, two parts; Azure takes two reads to delete each Run Command there.
+        $first = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $script:fixtureIds[0] })
+        $index = [ordered]@{ kind = 'ContosoCare.RcaExportIndex'; version = 1; documents = @([ordered]@{ documentId = $script:fixtureIds[0]; parts = $first.Count; sha256 = $first[0].Split(' ')[4] }); status = 'Pass'; message = '1 document.' }
+        $script:hostIndex = 'DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject $index -Depth 5 -Compress)
+        $script:hostParts = $first
+        $script:rcaDeleteDelay = @{ archost01 = 2 }
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca export: its line follows.' -Line $script:hostIndex)
+            }
+            $line = @($script:hostParts | Where-Object { $_.Split(' ')[3].StartsWith(('{0}/' -f $Command.Request.part)) })[0]
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('archost01')
+        $script:rcaMostOpen['archost01'] | Should -Be 1
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }).Count | Should -Be $first.Count
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] }) | Should -Be @($script:fixtureIds[0])
+        $done.State['status'] | Should -Be 'Pass'
+
+        # Azure never finishes a delete there: asked twice, then the host gets no more parts, which wait for the next export.
+        $runner = $script:rcaRunner
+        Reset-TestAzure
+        $script:rcaRunner = $runner
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:rcaDeleteDelay = @{ archost01 = 100000 }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('archost01')
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/runCommands/DbHubControl-rca-archost01-x-' }).Count | Should -Be 2
+        @($done.State['pending'] | ForEach-Object { '{0}@{1}' -f $_['documentId'], $_['vm'] }) | Should -Be @(('{0}@archost01' -f $script:fixtureIds[0]))
+        $line = @($done.Lines | Where-Object { $_.Step -eq 'RCA.EXPORT' })[0]
+        $line.Status | Should -Be 'Warning'
+        $line.Message | Should -Match 'Azure didn''t delete a Run Command on archost01 twice, so it got no more parts in this export \(R871\)\.'
+    }
+
+    It 'takes a document of no session with the session''s evidence, as the notebook writes it, and hands another session''s to that session (review of 93243d6)' {
+        # The operator's scripts export with --session none: a span they bound keeps no session for its later documents.
+        Set-ServedRunner -Case @(@{ Id = '20261120T180000Z-sqlvm01-0003'; Session = $null }, @{ Id = '20261120T181500Z-sqlvm01-0004'; Session = ('a' * 32) }) -EveryExport
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] }) | Should -Be @('20261120T180000Z-sqlvm01-0003')
+        $line = @($done.Lines | Where-Object { $_.Step -eq 'RCA.EXPORT' })[0]
+        $line.Status | Should -Be 'Pass' -Because 'the runner keeps a span bound to the session of the first export that took from it, so its later documents are that session''s'
+        $line.Message | Should -Match '1 document\(s\) of another session go with that session''s evidence \(RCA\.EARLIER\)\.$'
+        @($done.Others | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_['documentId'], $_['sessionId'], $_['vm'], $_['parts'] }) | Should -Be @(('20261120T181500Z-sqlvm01-0004|{0}|sqlvm01|{1}' -f ('a' * 32), @($script:servedParts['20261120T181500Z-sqlvm01-0004']).Count))
+        @(Get-RcaBundle | ForEach-Object { ($_.Value | ConvertFrom-Json).parts } | ForEach-Object { $_.Split(' ')[2] } | Select-Object -Unique) | Should -Be @('20261120T180000Z-sqlvm01-0003') -Because 'another session''s document isn''t written under this one'
+        # A stop of no session (start-demo.ps1's auto-stop through the control) takes any session's.
+        $runner = $script:rcaRunner
+        Reset-TestAzure
+        $script:rcaRunner = $runner
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId '' -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] } | Sort-Object) | Should -Be @('20261120T180000Z-sqlvm01-0003', '20261120T181500Z-sqlvm01-0004')
+    }
+
     It 'stops at its time, deletes what''s still running, and keeps the documents it didn''t fetch whole for the next export' {
         Set-FixtureRunner
         $fixture = $script:rcaRunner
@@ -3190,7 +3361,8 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         @($status.rca.documents.documentId) | Should -Be @('20261120T165000Z-sqlvm01-0001')
         @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261120T170000Z-sqlvm01-0002@sqlvm01')
         ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '1 document\(s\) weren''t fetched whole in time; they stay on sqlvm01 for the next export'
-        ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').fix | Should -Match 'the next session''s start exports it'
+        ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').fix | Should -Be 'What''s still on the VMs stays there, and a later session''s start exports it, one earlier session''s per start; that start''s RCA.EARLIER lines say until when.'
+        $status.rca.finalRan | Should -BeTrue -Because 'its final export ran on every VM, so the next start sends none: it fetches the document''s parts'
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
         $index = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json).rca
         @($index.documents.documentId) | Should -Be @('20261120T165000Z-sqlvm01-0001')
@@ -3289,6 +3461,82 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $script:secrets.ContainsKey('dbhub-session-status') | Should -BeFalse -Because 'nothing new was exported, and a VM that doesn''t run is the host check''s to report'
     }
 
+    It 'writes no re-check bundle once the session''s stop has begun, and the next start exports what the re-check found (review of 15ad76d)' {
+        # DbHub-Monitor's re-check exports while the session runs, and Stop now ends the session while it fetches the parts.
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0], $script:fixtureIds[1])
+        $script:fixtureRunner = $script:rcaRunner
+        $script:stopFired = $false
+        $script:rcaRunner = {
+            param($Command)
+            if (-not $script:stopFired -and $Command.Request.command -eq 'part') {
+                $script:stopFired = $true
+                $script:stopped = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+            }
+            return (& $script:fixtureRunner $Command)
+        }
+        $check = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $check.Outcome | Should -Be 'Changed'
+        $script:stopped.status | Should -Be 'Stopped'
+        $versions = @($script:secrets['dbhub-session-metrics'])
+        [string]$versions[-1].Tags['rca'] | Should -Not -Be 'bundle' -Because 'nothing is written after the stop''s final version of the metrics'
+        @(Get-RcaBundle).Count | Should -Be 1 -Because 'the stop''s own bundle only'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'stopped'
+        $status.metrics.version | Should -Be $versions[-1].Version
+        $final = $versions[-1].Value | ConvertFrom-Json
+        @($final.series).Count | Should -BeGreaterThan 0
+        @($final.rca.documents.documentId) | Should -Be @($script:fixtureIds[1])
+        # The re-check's document goes to the stop's status, still to export.
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@sqlvm01' -f $script:fixtureIds[0]))
+        $status.rca.final | Should -BeFalse
+        $status.PSObject.Properties.Name | Should -Not -Contain 'stopBegunUtc'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        # The next session's start exports it, and Run all saves it with that session's history.
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:rcaRunner = $script:fixtureRunner
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext -NowUtc $script:clock)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        $earlier = (Get-SessionStatus).rcaEarlier
+        $earlier.sessionId | Should -Be $script:fixtureSession
+        @($earlier.documents.documentId | Sort-Object) | Should -Be $script:fixtureIds
+    }
+
+    It 'names the metrics'' final version in the stop''s status, so a re-check bundle written right after it changes nothing the notebook reads (review of 15ad76d)' {
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0], $script:fixtureIds[1])
+        # The whole stop runs between the re-check's last look at the status and its bundle's write.
+        $script:stopFired = $false
+        $script:secretWriteHook = {
+            param($Name, $Body)
+            if (-not $script:stopFired -and $Name -eq 'dbhub-session-metrics' -and [string]$Body['tags']['rca'] -eq 'bundle') {
+                $script:stopFired = $true
+                $script:stopped = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+            }
+        }
+        $check = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $check.Outcome | Should -Be 'Changed'
+        $script:stopped.status | Should -Be 'Stopped'
+        $versions = @($script:secrets['dbhub-session-metrics'])
+        [string]$versions[-1].Tags['rca'] | Should -Be 'bundle' -Because 'the re-check''s write came right after the stop''s'
+        $status = Get-SessionStatus
+        $pinned = @($versions | Where-Object { $_.Version -eq $status.metrics.version })
+        $pinned.Count | Should -Be 1
+        $final = $pinned[0].Value | ConvertFrom-Json
+        @($final.series).Count | Should -BeGreaterThan 0 -Because 'T4''s metrics are in the version the notebook reads'
+        $final.rca.kind | Should -Be 'ContosoCare.RcaBundleIndex'
+        @($final.rca.documents.documentId) | Should -Be @($script:fixtureIds[1])
+        # That bundle is in no index, so its document goes to the next start, which exports it again.
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@sqlvm01' -f $script:fixtureIds[0]))
+    }
+
     It 'exports at the next session''s start what an earlier session''s stop didn''t, right before each VM''s activity, and keeps its index for Run all' {
         # The earlier session: the nightly stop ended it, after a re-check had exported part of it.
         $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
@@ -3300,6 +3548,9 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $script:groupTags = @{ DbHubT4Replica = 'Session' }
         $script:t4ReadyAt = $script:clock.AddMinutes(4)
         Set-FixtureRunner
+        # Azure lists the export's Run Commands with their instance views (review of 93243d6: at 93243d6, the start's own
+        # listing deleted the finished exports it had sent before it read them).
+        $script:rcaListOpen = $true
         $next = 'fedcba9876543210fedcba9876543210'
         $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $next; requestedBy = 'presenter' }) -Context (New-TestContext)
         $started.status | Should -BeIn 'Started', 'Partial'
@@ -3323,15 +3574,369 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
     }
 
+    It 'fetches at the next start an earlier session''s pending document on a VM whose final export ran, not only on the VMs it left (review of 15ad76d)' {
+        # Its stop's export didn't run on sqlvm01, and left one document on archost01 that it didn't fetch whole.
+        $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $script:fixtureIds[1])[0]
+        $pending = [ordered]@{ documentId = $reference.documentId; parts = [int]$reference.parts; sha256 = $reference.sha256; vm = 'archost01' }
+        $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @($pending); leftVms = @('sqlvm01'); final = $false; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        # Neither VM has anything new to export; archost01 still has the document.
+        $script:rcaRunner = {
+            param($Command)
+            $request = $Command.Request
+            if ($request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+            }
+            $line = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $request.documentId -and $_.Split(' ')[3].StartsWith(('{0}/' -f $request.part)) }) | Select-Object -First 1
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        # sqlvm01 gets its final export; archost01 only has its document's parts fetched, which an export listed before
+        # (review of 3b1348a: an export there would take the T2 host's one Run Command at a time for nothing).
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object Vm | Sort-Object) | Should -Be @('sqlvm01')
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }).Count | Should -Be ([int]$reference.parts)
+        $status = Get-SessionStatus
+        @($status.rcaEarlier.documents.documentId) | Should -Be @($reference.documentId)
+        @($status.rcaEarlier.bundles).Count | Should -Be 1
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending' -Because 'nothing of it is left on the VMs'
+    }
+
+    It 'carries an earlier session''s documents that a start doesn''t fetch in time, through the next stop, to the start after it, which fetches them (review of 3b1348a)' {
+        # Session A's stop left a 2-part document on archost01, where Azure deletes Run Commands slowly (R871): B's start
+        # fetches one part in its 6 minutes.
+        $pending = New-TestPending -DocumentId $script:fixtureIds[1] -Vm 'archost01'
+        $a = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @($pending); leftVms = @(); final = $false; finalRan = $true; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $a -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-PartsRunner
+        $script:rcaDeleteDelay['archost01'] = 40
+        $b = 'b' * 32
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $b; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' }) | Should -BeNullOrEmpty -Because 'A''s final export ran on both VMs'
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }).Count | Should -Be 1
+        $status = Get-SessionStatus
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlier' -Because 'no document was fetched whole'
+        @($status.rcaEarlierPending).Count | Should -Be 1
+        $status.rcaEarlierPending[0].sessionId | Should -Be $script:fixtureSession
+        @($status.rcaEarlierPending[0].pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@archost01' -f $script:fixtureIds[1]))
+        ([datetime]$status.rcaEarlierPending[0].expiresUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-03T13:00:00Z' -Because 'the runner keeps an exported document 7 days'
+        @($status.steps | Where-Object step -EQ 'RCA.EARLIER' | ForEach-Object message) | Should -Be @('Session 5f1c0e7a''s evidence still on the VMs: 1 document(s) on archost01 that an export listed but didn''t fetch whole, which the next session''s start fetches, or the start after it when this session ends without its stop''s export, until 2026-11-03 13:00 UTC, when the runner deletes them.')
+        ($status.steps | Where-Object step -EQ 'RCA.EXPORT').fix | Should -Be 'What''s still on the VMs stays there, and a later session''s start exports it, one earlier session''s per start; that start''s RCA.EARLIER lines say until when.'
+        # B's stop keeps it.
+        $script:rcaDeleteDelay.Clear()
+        $stop = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $b }) -Context (New-TestContext -NowUtc $script:clock)
+        $stop.status | Should -BeIn 'Stopped', 'Partial'
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        @($stopped.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($script:fixtureSession)
+        # C's start fetches both parts, and Run all saves the document with A's history.
+        $script:rcaCommands.Clear()
+        Set-TestSessionStart
+        $next = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $next.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }).Count | Should -Be 2
+        $status = Get-SessionStatus
+        $status.rcaEarlier.sessionId | Should -Be $script:fixtureSession
+        @($status.rcaEarlier.documents.documentId) | Should -Be @($script:fixtureIds[1])
+        $bundles = @($script:secrets['dbhub-session-metrics'] | Where-Object { $_.Version -in @($status.rcaEarlier.bundles) } | ForEach-Object Value)
+        @((Expand-TestBundle -Json $bundles).Keys) | Should -Be @($script:fixtureIds[1])
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+        ($status.steps | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match 'Run all saves it with that session''s history at this session''s end\.$'
+    }
+
+    It 'says an earlier session''s capture that a VM couldn''t export at a start can''t be told apart from the new session''s any more, and never exports it under the wrong session later (review of 93243d6)' {
+        # The nightly stop ended session A after a re-check, so its final export never ran. At B's start archost01 already
+        # has 24 managed Run Commands, so it can't take A's export, and B's T2 activity goes there anyway: the runner gives
+        # what no export took to the first export that takes it, which is B's now.
+        $a = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $a -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-FixtureRunner
+        $script:runCommands['archost01'] = @(1..24 | ForEach-Object { @{ name = ('Other-{0:d2}' -f $_) } })
+        $b = 'b' * 32
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $b; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Vm, $_.Request.sessionId }) | Should -Be @(('sqlvm01:{0}' -f $script:fixtureSession))
+        $status = Get-SessionStatus
+        @($status.rcaEarlier.documents.documentId) | Should -Be $script:fixtureIds -Because 'sqlvm01''s export went out'
+        @($status.rcaEarlier.bundles).Count | Should -Be 2 -Because 'A''s re-check bundle, and this start''s'
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending' -Because 'no later export can tell A''s capture on archost01 from B''s'
+        $apart = @($status.steps | Where-Object { $_.step -eq 'RCA.EARLIER' -and $_.state -eq 'Warning' })
+        @($apart | ForEach-Object message) | Should -Be @('Session 5f1c0e7a''s capture on archost01 that no export took can''t be told apart from session bbbbbbbb''s any more: bbbbbbbb''s activity ran there before it was exported (no room for another managed Run Command there, or Azure refused its export), and the runner gives such capture to the first export that takes it, so it''s in session bbbbbbbb''s history, not 5f1c0e7a''s.')
+        $apart[0].fix | Should -Match '^Nothing separates it now\.'
+        # The nightly stop ends B too, so its own final export never runs. C's start exports B's capture on both VMs with
+        # B's ID, before C's activity there, and never A's (at 93243d6, A's export on archost01 took B's capture there too).
+        $script:runCommands.Remove('archost01')
+        $script:rcaCommands.Clear()
+        Set-TestSessionStart
+        $next = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $next.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}:{2}' -f $_.Vm, $_.Request.sessionId, $_.Request.final } | Sort-Object) | Should -Be @(('archost01:{0}:True' -f $b), ('sqlvm01:{0}:True' -f $b))
+        $status = Get-SessionStatus
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+        ($status.steps | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '^The evidence that session bbbbbbbb''s stop didn''t export: '
+    }
+
+    It 'exports each VM''s capture that no export took with the ID of the session that holds it, before the new session''s activity there, whichever session''s documents the start fetches (review of 93243d6)' {
+        # Session B's stop exported on sqlvm01 but not on archost01, where its T2 activity ran, and it carried session A's
+        # document on sqlvm01, which the runner deletes sooner. At 93243d6, A went first and B's capture got no export.
+        $a = [ordered]@{ sessionId = $script:fixtureSession; pending = @(New-TestPending -DocumentId $script:fixtureIds[0] -Vm 'sqlvm01'); leftVms = @(); finalRan = $true; expiresUtc = '2026-10-30T13:00:00Z' }
+        $b = 'b' * 32
+        $previous = [ordered]@{ schemaVersion = 1; sessionId = $b; phase = 'stopped'; acceptedUtc = '2026-10-27T11:00:00Z'; updatedUtc = '2026-10-27T13:00:00Z'; dispatchUtc = [ordered]@{ T1 = '2026-10-27T11:05:00Z'; T2 = '2026-10-27T11:06:00Z' }; metrics = [ordered]@{ status = 'Pass'; message = '' }; rca = [ordered]@{ sessionId = $b; bundles = @(); documents = @(); pending = @(); leftVms = @('archost01'); final = $false; finalRan = $true; status = 'Warning'; message = '' }; rcaEarlierPending = @($a) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+        Set-TestSessionStart
+        # archost01's runner has what its observer captured for B since B's last export there; Azure lists the export
+        # Run Commands with their instance views, as it does.
+        Set-ServedRunner -Case @(@{ Id = '20261027T123000Z-archost01-0007'; Session = $b }) -Vm @('archost01')
+        $script:rcaListOpen = $true
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}:{2}' -f $_.Vm, $_.Request.sessionId, $_.Request.final }) | Should -Be @(('archost01:{0}:True' -f $b)) -Because 'B holds archost01''s capture, and A''s documents need no export'
+        $export = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-' }) | Select-Object -First 1))
+        $dispatch = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1))
+        $export | Should -BeLessThan $dispatch -Because 'C''s activity on archost01 starts once B''s capture there is exported'
+        $status = Get-SessionStatus
+        $status.rcaEarlier.sessionId | Should -Be $script:fixtureSession -Because 'one session''s documents per start: A''s, which the runner deletes first'
+        @($status.rcaEarlier.documents.documentId) | Should -Be @($script:fixtureIds[0])
+        @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($b)
+        @($status.rcaEarlierPending[0].pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261027T123000Z-archost01-0007@archost01')
+        @($status.rcaEarlierPending[0].leftVms) | Should -BeNullOrEmpty -Because 'its export ran, so the runner gave that capture to B'
+        $until = ([datetime]$status.rcaEarlierPending[0].expiresUtc).ToUniversalTime()
+        $until | Should -BeGreaterOrEqual ([datetime]::new(2026, 11, 3, 15, 0, 0, [System.DateTimeKind]::Utc))
+        $until | Should -BeLessOrEqual ([datetime]::new(2026, 11, 3, 16, 0, 0, [System.DateTimeKind]::Utc)) -Because 'the runner deletes an exported document 7 days after its export'
+        $earlier = @($status.steps | Where-Object step -EQ 'RCA.EARLIER')
+        @($earlier | ForEach-Object state) | Should -Be @('Info', 'Info')
+        $earlier[0].message | Should -Be 'Session bbbbbbbb''s capture on archost01 that no export had taken was exported with its own ID before this session''s activity there: 1 document(s).'
+        $earlier[1].message | Should -Match '^Session bbbbbbbb''s evidence still on the VMs: 1 document\(s\) on archost01 that an export listed but didn''t fetch whole, which the next session''s start fetches, or the start after it when this session ends without its stop''s export, until 2026-11-03 1\d:\d\d UTC, when the runner deletes them\.$'
+        # D's start fetches B's document, and Run all saves it with B's history.
+        $script:rcaCommands.Clear()
+        Set-TestSessionStart
+        $later = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('d' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $later.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { $_.Request.sessionId } | Select-Object -Unique) | Should -Be @(('c' * 32)) -Because 'C''s own capture on the VMs goes with C''s ID'
+        $status = Get-SessionStatus
+        $status.rcaEarlier.sessionId | Should -Be $b
+        @($status.rcaEarlier.documents.documentId) | Should -Be @('20261027T123000Z-archost01-0007')
+        $bundles = @($script:secrets['dbhub-session-metrics'] | Where-Object { $_.Version -in @($status.rcaEarlier.bundles) } | ForEach-Object Value)
+        (Expand-TestBundle -Json $bundles)['20261027T123000Z-archost01-0007'].sessionId | Should -Be $b
+    }
+
+    It 'says which earlier session''s capture on a VM can''t be told apart any more when two sessions hold it, and exports it with the later one''s ID (review of 93243d6)' {
+        # Session A still held archost01's capture when B's T2 activity ran there, and B's stop didn't export there either:
+        # whichever export comes first takes both, so it goes with B's. At 93243d6, A's export took it.
+        $a = [ordered]@{ sessionId = $script:fixtureSession; pending = @(); leftVms = @('archost01'); heldUntilUtc = '2026-11-20T13:00:00Z' }
+        $b = 'b' * 32
+        $previous = [ordered]@{ schemaVersion = 1; sessionId = $b; phase = 'stopped'; acceptedUtc = '2026-10-27T11:00:00Z'; updatedUtc = '2026-10-27T13:00:00Z'; dispatchUtc = [ordered]@{ T2 = '2026-10-27T11:06:00Z' }; metrics = [ordered]@{ status = 'Pass'; message = '' }; rca = [ordered]@{ sessionId = $b; bundles = @(); documents = @(); pending = @(); leftVms = @('archost01'); final = $false; finalRan = $true; status = 'Warning'; message = '' }; rcaEarlierPending = @($a) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+        Set-TestSessionStart
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Vm, $_.Request.sessionId }) | Should -Be @(('archost01:{0}' -f $b))
+        $status = Get-SessionStatus
+        $apart = @($status.steps | Where-Object { $_.step -eq 'RCA.EARLIER' -and $_.state -eq 'Warning' })
+        @($apart | ForEach-Object message) | Should -Be @('Session 5f1c0e7a''s capture on archost01 that no export took can''t be told apart from session bbbbbbbb''s any more: bbbbbbbb''s activity ran there before it was exported, and the runner gives such capture to the first export that takes it, so it''s in session bbbbbbbb''s history, not 5f1c0e7a''s.')
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+    }
+
+    It 'leaves a VM that an earlier session holds out of the session''s re-checks and its stop, so that capture isn''t taken under this session (review of 93243d6)' {
+        $a = 'a' * 32
+        $held = [ordered]@{ sessionId = $a; pending = @(); leftVms = @('archost01'); heldUntilUtc = '2026-11-20T13:00:00Z' }
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession); rcaEarlierPending = @($held) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0], $script:fixtureIds[1])
+        (Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }).Outcome | Should -Be 'Exported'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object Vm) | Should -Be @('sqlvm01')
+        $status = Get-SessionStatus
+        @($status.rcaEarlierPending | ForEach-Object { '{0}:{1}' -f $_.sessionId, (@($_.leftVms) -join ',') }) | Should -Be @(('{0}:archost01' -f $a))
+        # The stop exports on sqlvm01 only too, and A still holds archost01 for the next start.
+        $stop = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+        $stop.status | Should -BeIn 'Stopped', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object Vm) | Should -Be @('sqlvm01', 'sqlvm01')
+        $stopped = Get-SessionStatus
+        $stopped.rca.status | Should -Be 'Pass' -Because 'a VM an earlier session holds is no problem of this session''s export'
+        @($stopped.rca.documents.documentId) | Should -Be $script:fixtureIds
+        @($stopped.rca.leftVms) | Should -Be @('archost01') -Because 'had this session''s activity gone there, the next start would export it with this session''s ID'
+        @($stopped.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($a)
+    }
+
+    It 'hands another session''s documents that a re-check or the stop finds to that session''s entry, for a later start (review of 93243d6)' {
+        # The runner keeps a span bound to the session of the first export that took from it, so what's left of session A's
+        # comes with this session's exports, under A's ID. At 93243d6 they were skipped, and lost.
+        $a = 'a' * 32
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-ServedRunner -Case @(@{ Id = '20261027T150500Z-sqlvm01-0005'; Session = $a })
+        $null = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $status = Get-SessionStatus
+        @($status.rca.documents) | Should -BeNullOrEmpty
+        @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($a)
+        @($status.rcaEarlierPending[0].pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261027T150500Z-sqlvm01-0005@sqlvm01')
+        ([datetime]$status.rcaEarlierPending[0].expiresUtc).ToUniversalTime() | Should -BeGreaterOrEqual ([datetime]::new(2026, 11, 3, 15, 0, 0, [System.DateTimeKind]::Utc))
+        # The stop finds another, and its status keeps both for the next start.
+        Set-ServedRunner -Case @(@{ Id = '20261027T153000Z-sqlvm01-0006'; Session = $a })
+        $stop = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+        $stop.status | Should -BeIn 'Stopped', 'Partial'
+        $stopped = Get-SessionStatus
+        @($stopped.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($a)
+        @($stopped.rcaEarlierPending[0].pending | ForEach-Object documentId) | Should -Be @('20261027T150500Z-sqlvm01-0005', '20261027T153000Z-sqlvm01-0006')
+        ($stopped.rcaLines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '1 document\(s\) of another session go with that session''s evidence \(RCA\.EARLIER\)\.$'
+    }
+
+    It 'reads the export a start sent before its VM stopped again, when nothing could be dispatched, and keeps what it listed for the next start (review of 93243d6)' {
+        # Session B's stop didn't finish its export on sqlvm01, where its activity went.
+        $b = 'b' * 32
+        $previous = [ordered]@{ schemaVersion = 1; sessionId = $b; phase = 'stopped'; acceptedUtc = '2026-10-27T11:00:00Z'; updatedUtc = '2026-10-27T13:00:00Z'; dispatchUtc = [ordered]@{ T1 = '2026-10-27T11:05:00Z' }; metrics = [ordered]@{ status = 'Pass'; message = '' }; rca = [ordered]@{ sessionId = $b; bundles = @(); documents = @(); pending = @(); leftVms = @('sqlvm01'); final = $false; finalRan = $true; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-ServedRunner -Case @(@{ Id = '20261027T125500Z-sqlvm01-0003'; Session = $b })
+        # No dispatch is accepted, so the run deallocates the VMs it started (#27) before the start reads B's export.
+        $accepted = $script:runCommandStatus
+        $script:runCommandStatus = 409
+        $failed = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $failed.status | Should -Be 'Failed'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Vm, $_.Request.sessionId }) | Should -Be @(('sqlvm01:{0}' -f $b))
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }) | Should -BeNullOrEmpty -Because 'sqlvm01 stopped before its parts could be fetched'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'failed'
+        @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($b)
+        @($status.rcaEarlierPending[0].pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261027T125500Z-sqlvm01-0003@sqlvm01') -Because 'the runner lists a document only once'
+        @($status.rcaEarlierPending[0].leftVms) | Should -BeNullOrEmpty -Because 'its export ran, so the runner gave that capture to B'
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+        # The next start fetches it.
+        $script:runCommandStatus = $accepted
+        $script:rcaCommands.Clear()
+        Set-TestSessionStart
+        $next = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('d' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $next.status | Should -BeIn 'Started', 'Partial'
+        $status = Get-SessionStatus
+        $status.rcaEarlier.sessionId | Should -Be $b
+        @($status.rcaEarlier.documents.documentId) | Should -Be @('20261027T125500Z-sqlvm01-0003')
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+    }
+
+    It 'keeps another job''s export Run Command until its name is an hour old, finished or not, so that job can still read it (review of 93243d6)' {
+        # A start's export sent before the VM's activity, and finished: at 93243d6 the next listing deleted it unread.
+        $script:runCommands['sqlvm01'] = @(
+            @{ name = 'DbHubControl-rca-sqlvm01-x-20261027145500'; properties = @{ instanceView = @{ executionState = 'Succeeded' } } }
+            @{ name = 'DbHubControl-rca-sqlvm01-0101-20261027135500'; properties = @{ instanceView = @{ executionState = 'Running' } } }
+            @{ name = 'DbHubControl-sqlvm01-20261027140000'; properties = @{ instanceView = @{ executionState = 'Succeeded' } } }
+        )
+        Get-DbHubRcaRoom -Context (New-TestContext) -VmName 'sqlvm01' | Should -Be 23
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' } | ForEach-Object { ($_.Path -split '/')[-1] }) | Should -Be @('DbHubControl-rca-sqlvm01-0101-20261027135500')
+        # A session's end clears this control's other finished Run Commands too, as before.
+        $script:calls.Clear()
+        Get-DbHubRcaRoom -Context (New-TestContext) -VmName 'sqlvm01' -ClearFinished | Should -Be 24
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' } | ForEach-Object { ($_.Path -split '/')[-1] }) | Should -Be @('DbHubControl-rca-sqlvm01-0101-20261027135500', 'DbHubControl-sqlvm01-20261027140000')
+    }
+
+    It 'counts an earlier session''s documents that a start''s export listed 7 days from that export, even for an entry whose capture waited 30 days (review of 93243d6)' {
+        # A carry from 93243d6: session A's final export never ran on sqlvm01, so it was asked for 30 days.
+        $a = [ordered]@{ sessionId = $script:fixtureSession; pending = @(); leftVms = @('sqlvm01'); finalRan = $false; expiresUtc = '2026-11-25T13:00:00Z' }
+        $previous = [ordered]@{ schemaVersion = 1; sessionId = ('f' * 32); phase = 'refused'; updatedUtc = '2026-10-27T13:00:00Z'; rcaEarlierPending = @($a) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-FixtureRunner -Batches @($script:fixtureIds[1])
+        $script:partFixture = $script:rcaRunner
+        # The document's second part fails, so it isn't fetched whole.
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'part' -and $Command.Request.part -eq 2) {
+                return (New-TestRcaView -Status 'Fail' -Message 'runner rca part: exit code 3.')
+            }
+            return (& $script:partFixture $Command)
+        }
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Vm, $_.Request.sessionId }) | Should -Be @(('sqlvm01:{0}' -f $script:fixtureSession))
+        $status = Get-SessionStatus
+        @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($script:fixtureSession)
+        @($status.rcaEarlierPending[0].pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@sqlvm01' -f $script:fixtureIds[1]))
+        @($status.rcaEarlierPending[0].leftVms) | Should -BeNullOrEmpty
+        $until = ([datetime]$status.rcaEarlierPending[0].expiresUtc).ToUniversalTime()
+        $until | Should -BeGreaterOrEqual ([datetime]::new(2026, 11, 3, 15, 0, 0, [System.DateTimeKind]::Utc))
+        $until | Should -BeLessOrEqual ([datetime]::new(2026, 11, 3, 16, 0, 0, [System.DateTimeKind]::Utc)) -Because 'the runner deletes an exported document 7 days after its export, not 30'
+    }
+
+    It 'keeps the earlier sessions'' evidence through a start that''s refused, for the start after it (review of 3b1348a)' {
+        $pending = New-TestPending -DocumentId $script:fixtureIds[0] -Vm 'sqlvm01'
+        $a = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @($pending); leftVms = @(); final = $false; finalRan = $true; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $a -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-PartsRunner
+        # Too close to the VMs' auto-shutdown (19:00 Eastern, 23:00 UTC that day): refused.
+        $script:clock = [datetime]::new(2026, 10, 27, 22, 45, 0, [System.DateTimeKind]::Utc)
+        $refused = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('b' * 32); requestedBy = 'presenter' }) -Context (New-TestContext -NowUtc $script:clock)
+        $refused.status | Should -Be 'Refused'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'refused'
+        @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($script:fixtureSession)
+        @($script:rcaCommands) | Should -BeNullOrEmpty
+        # The next day's start fetches A's document; the refused session had no activity, so it has nothing to export.
+        $script:clock = [datetime]::new(2026, 10, 28, 15, 0, 0, [System.DateTimeKind]::Utc)
+        Set-TestSessionStart
+        $next = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext -NowUtc $script:clock)
+        $next.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' }) | Should -BeNullOrEmpty
+        $status = Get-SessionStatus
+        $status.rcaEarlier.sessionId | Should -Be $script:fixtureSession
+        @($status.rcaEarlier.documents.documentId) | Should -Be @($script:fixtureIds[0])
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+    }
+
+    It 'stops asking for an earlier session''s evidence 7 days after its export, and keeps at most 4 earlier sessions'', saying which (review of 3b1348a)' {
+        $stale = [ordered]@{ sessionId = ('e' * 32); pending = @(New-TestPending -DocumentId $script:fixtureIds[1] -Vm 'archost01'); leftVms = @(); finalRan = $true; expiresUtc = '2026-10-20T13:00:00Z' }
+        $fresh = [ordered]@{ sessionId = $script:fixtureSession; pending = @(New-TestPending -DocumentId $script:fixtureIds[0] -Vm 'sqlvm01'); leftVms = @(); finalRan = $true; expiresUtc = '2026-11-02T13:00:00Z' }
+        $b = [ordered]@{ schemaVersion = 1; sessionId = ('b' * 32); phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = ('b' * 32); bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; finalRan = $true; status = 'Pass'; message = '' }; rcaEarlierPending = @($stale, $fresh) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $b -Depth 8 -Compress
+        Set-TestSessionStart
+        Set-PartsRunner
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('c' * 32); requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.documentId -eq $script:fixtureIds[1] }) | Should -BeNullOrEmpty -Because 'the runner deleted it'
+        $status = Get-SessionStatus
+        $expired = @($status.steps | Where-Object { $_.step -eq 'RCA.EARLIER' -and $_.state -eq 'Warning' })
+        $expired.Count | Should -Be 1
+        $expired[0].message | Should -Be 'Session eeeeeeee''s 1 document(s) on archost01 that an export listed but didn''t fetch whole aren''t asked for any more, so they aren''t in its history: the runner deletes an exported document 7 days after its export, which for these was by 2026-10-20 13:00 UTC.'
+        $status.rcaEarlier.sessionId | Should -Be $script:fixtureSession
+        $status.PSObject.Properties.Name | Should -Not -Contain 'rcaEarlierPending'
+        # At most 4 earlier sessions in a status: the first to expire goes, and the others keep their order.
+        $carried = @(1..5 | ForEach-Object { [ordered]@{ sessionId = ([string]$_ * 32); pending = @(New-TestPending -DocumentId $script:fixtureIds[0] -Vm 'sqlvm01'); leftVms = @(); finalRan = $true; expiresUtc = ('2026-11-0{0}T13:00:00Z' -f (6 - $_)) } })
+        $backlog = Get-DbHubRcaBacklog -Settings $script:settings -Previous ([ordered]@{ sessionId = ('f' * 32); phase = 'refused'; rcaEarlierPending = $carried }) -SessionId ('c' * 32) -NowUtc $script:clock
+        @($backlog.Entries | ForEach-Object { $_['sessionId'].Substring(0, 1) }) | Should -Be @('1', '2', '3', '4')
+        @($backlog.Dropped | ForEach-Object { $_['sessionId'].Substring(0, 1) }) | Should -Be @('5')
+        @($backlog.Expired) | Should -BeNullOrEmpty
+    }
+
+    It 'lets a session''s re-checks go on once a stop''s mark is older than a stop takes, so a stop that failed doesn''t block them (review of 3b1348a)' {
+        $status = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T14:50:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession); stopBegunUtc = '2026-10-27T14:55:00Z' }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $status -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0])
+        (Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }).Outcome | Should -Be 'NoSession' -Because 'a stop began 5 minutes ago'
+        @($script:rcaCommands) | Should -BeNullOrEmpty
+        # The stop began 20 minutes ago and wrote no stopped status: its job failed, and the session runs on.
+        $status['stopBegunUtc'] = '2026-10-27T14:40:00Z'
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $status -Depth 8 -Compress
+        (Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }).Outcome | Should -Be 'Exported'
+        @((Get-SessionStatus).rca.documents.documentId) | Should -Be @($script:fixtureIds[0])
+    }
+
     It 'exports nothing at a start after a session whose stop exported everything, or one from before the export' {
         foreach ($rca in @([ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; status = 'Pass'; message = '' }, $null)) {
             $previous = [ordered]@{ sessionId = $script:fixtureSession; phase = 'stopped' }
             if ($null -ne $rca) {
                 $previous['rca'] = $rca
             }
-            Get-DbHubRcaEarlier -Previous $previous -SessionId 'fedcba9876543210fedcba9876543210' | Should -BeNullOrEmpty
+            Get-DbHubRcaEarlier -Settings $script:settings -Previous $previous -SessionId 'fedcba9876543210fedcba9876543210' | Should -BeNullOrEmpty
         }
-        Get-DbHubRcaEarlier -Previous ([ordered]@{ sessionId = $script:fixtureSession; rca = [ordered]@{ sessionId = $script:fixtureSession; final = $false } }) -SessionId $script:fixtureSession | Should -BeNullOrEmpty -Because 'a session is never its own earlier session'
+        Get-DbHubRcaEarlier -Settings $script:settings -Previous ([ordered]@{ sessionId = $script:fixtureSession; rca = [ordered]@{ sessionId = $script:fixtureSession; final = $false } }) -SessionId $script:fixtureSession | Should -BeNullOrEmpty -Because 'a session is never its own earlier session'
     }
 
     It 'packs at most 6 parts in a bundle, each within 24,000 bytes, and reads the version each write created' {
@@ -3365,6 +3970,21 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             }
             $out += @(New-DbHubRcaBundle -SessionId '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21' -Line $Parts)
             $out += (ConvertTo-Json -InputObject (New-DbHubRcaIndex -State ([ordered]@{ sessionId = 'abc'; bundles = @('0123456789abcdef0123456789abcdef'); documents = @([ordered]@{ documentId = 'x'; parts = 2; sha256 = 'y' }); status = 'Pass'; message = 'ok' })) -Depth 5 -Compress)
+            # The earlier sessions' evidence still on the VMs (reviews of 3b1348a and 93243d6): a carried session's
+            # documents, then the replaced status's own capture that no export took, as a status carries them.
+            $previous = [ordered]@{ sessionId = ('b' * 32); phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = ('b' * 32); bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $false }; rcaEarlierPending = @([ordered]@{ sessionId = ('a' * 32); pending = @([ordered]@{ documentId = '20261120T170000Z-sqlvm01-0002'; parts = 2; sha256 = ('0' * 64); vm = 'archost01' }); leftVms = @(); finalRan = $true; expiresUtc = '2026-11-03T13:00:00Z' }) }
+            $backlog = Get-DbHubRcaBacklog -Settings ([pscustomobject]@{ sqlVmName = 'sqlvm01'; hostVmName = 'archost01' }) -Previous $previous -SessionId ('c' * 32) -NowUtc ([datetime]::new(2026, 10, 28, 15, 0, 0, [System.DateTimeKind]::Utc))
+            $out += (ConvertTo-Json -InputObject @(foreach ($entry in @($backlog.Entries)) { ConvertTo-DbHubRcaCarry -Entry $entry }) -Depth 6 -Compress)
+            # Two sessions holding one VM, another session's document handed to its entry, and the VMs a session's activity
+            # went to (review of 93243d6).
+            $hosts = [pscustomobject]@{ sqlVmName = 'sqlvm01'; hostVmName = 'archost01' }
+            $conflict = [ordered]@{ sessionId = ('b' * 32); phase = 'stopped'; acceptedUtc = '2026-10-27T11:00:00Z'; updatedUtc = '2026-10-27T13:00:00Z'; dispatchUtc = [ordered]@{ T2 = '2026-10-27T11:06:00Z' }; metrics = [ordered]@{ status = 'Pass' }; rca = [ordered]@{ sessionId = ('b' * 32); leftVms = @('archost01'); finalRan = $true }; rcaEarlierPending = @([ordered]@{ sessionId = ('a' * 32); pending = @(); leftVms = @('archost01'); heldUntilUtc = '2026-11-20T13:00:00Z' }) }
+            $split = Get-DbHubRcaBacklog -Settings $hosts -Previous $conflict -SessionId ('c' * 32) -NowUtc ([datetime]::new(2026, 10, 28, 15, 0, 0, [System.DateTimeKind]::Utc))
+            $out += (ConvertTo-Json -InputObject ([ordered]@{ entries = @(@($split.Entries) | ForEach-Object { ConvertTo-DbHubRcaCarry -Entry $_ }); inseparable = @($split.Inseparable) }) -Depth 6 -Compress)
+            $handed = [ordered]@{ sessionId = ('c' * 32) }
+            $null = Add-DbHubRcaElsewhere -Status $handed -Document @([ordered]@{ documentId = '20261120T170000Z-sqlvm01-0002'; parts = 2; sha256 = ('0' * 64); vm = 'sqlvm01'; sessionId = ('a' * 32) }) -NowUtc ([datetime]::new(2026, 10, 28, 15, 0, 0, [System.DateTimeKind]::Utc))
+            $out += (ConvertTo-Json -InputObject $handed -Depth 6 -Compress)
+            $out += ((Get-DbHubRcaActivityVm -Settings $hosts -Status ([ordered]@{ dispatchUtc = [ordered]@{ T5 = '2026-10-27T11:05:00Z'; T2 = '2026-10-27T11:06:00Z' }; runCommands = @() })) -join ',')
             return $out
         }
         $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
@@ -3378,6 +3998,10 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $there | Should -Be $here
         $here[0] | Should -Be '20261120T165000Z-sqlvm01-0001|True|20261120T165000Z-sqlvm01-0001|T1:True:16:50-17:05'
         $here[1] | Should -Be '20261120T170000Z-sqlvm01-0002|True|20261120T170000Z-sqlvm01-0002|T4:True:17:00-17:20,T4-replica:True:17:00-17:20'
+        $here[-4] | Should -Be ('[{{"sessionId":"{0}","pending":[{{"documentId":"20261120T170000Z-sqlvm01-0002","parts":2,"sha256":"{1}","vm":"archost01"}}],"leftVms":[],"expiresUtc":"2026-11-03T13:00:00Z"}},{{"sessionId":"{2}","pending":[],"leftVms":["sqlvm01","archost01"],"heldUntilUtc":"2026-11-26T13:00:00Z"}}]' -f ('a' * 32), ('0' * 64), ('b' * 32))
+        $here[-3] | Should -Be ('{{"entries":[{{"sessionId":"{1}","pending":[],"leftVms":["archost01"],"heldUntilUtc":"2026-11-26T11:00:00Z"}}],"inseparable":[{{"sessionId":"{0}","vm":"archost01","with":"{1}","why":""}}]}}' -f ('a' * 32), ('b' * 32))
+        $here[-2] | Should -Be ('{{"sessionId":"{0}","rcaEarlierPending":[{{"sessionId":"{1}","pending":[{{"documentId":"20261120T170000Z-sqlvm01-0002","parts":2,"sha256":"{2}","vm":"sqlvm01"}}],"leftVms":[],"expiresUtc":"2026-11-04T15:00:00Z"}}]}}' -f ('c' * 32), ('a' * 32), ('0' * 64))
+        $here[-1] | Should -Be 'sqlvm01,archost01'
     }
 }
 

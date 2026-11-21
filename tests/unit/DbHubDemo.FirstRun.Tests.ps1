@@ -1599,6 +1599,57 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved.StillRunning | Should -BeTrue
     }
 
+    It 'stages the RCA evidence only for a notebook that knows RCA_EVIDENCE_FILE; the current release''s copy runs as before, with a Warning and its fix (2026-11-20)' {
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
+        $evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
+        $saved.Result.status | Should -Be 'Pass'
+        $saved.RcaSaved | Should -BeTrue
+        $saved.Result.message | Should -Match 'The RCA evidence went with it \(RCA_EVIDENCE_FILE\)\.$'
+        $saved.Result.evidence['rcaEvidence'] | Should -Be 'sent'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly -ParameterFilter { $Evidence -eq $evidence -and $Config['fabric']['lakehouseId'] -eq '14141414-1414-1414-1414-141414141414' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['RCA_EVIDENCE_FILE'] -eq 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -Times 1 -Exactly -ParameterFilter { $Path -eq 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json' }
+
+        # An environment from the release before the Incident RCA: its notebook knows T4's and T5's parameters, not
+        # RCA_EVIDENCE_FILE. The history is saved as before; the evidence isn't staged, and the Warning says how it follows.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = ($Parameter -ne 'RCA_EVIDENCE_FILE'); Error = '' } }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E -PostgresMetrics '{"version":1}' }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.RcaSaved | Should -BeFalse
+        $saved.PostgresDropped | Should -BeFalse
+        $saved.RcaNote | Should -Be 'the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA (2026-11-20), so it would ignore it'
+        $saved.Result.message | Should -Match 'The RCA evidence wasn''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA \(2026-11-20\), so it would ignore it; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$'
+        $saved.Result.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); the next history save then sends the RCA evidence.'
+        $saved.Result.evidence['rcaEvidence'] | Should -Be 'withheld'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly -Because 'only the first run staged it'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['POSTGRES_METRICS'] -eq '{"version":1}' -and -not $Parameter.Contains('RCA_EVIDENCE_FILE') }
+
+        # A paused capacity runs nothing, so nothing is staged either.
+        $script:capacityStatus = 'Manual action required'
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
+        $saved.RcaSaved | Should -BeFalse
+        $saved.RcaNote | Should -Be 'the history run didn''t start'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly
+    }
+
+    It 'says the RCA evidence went with the run but wasn''t written, and keeps it pending, when the notebook left the staged file (review of 3b1348a)' {
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
+        # The job completed, but the notebook left the file: its write failed, or Spark or the lakehouse wasn't available.
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $true } }
+        $evidence = '{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":null,"parts":["x"]}'
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig; E = $evidence } { Save-DemoFabricHistory -Config $C -RcaEvidence $E }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.RcaSaved | Should -BeFalse
+        $saved.RcaNote | Should -Be 'NB_DatabaseHub_LiveActivity didn''t write it, and left the staged file, as it does when it can''t read or write the evidence (its RCA.EVIDENCE finding in analysis_findings says why)'
+        $saved.Result.message | Should -Match ('The RCA evidence went with it, but {0}; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$' -f [regex]::Escape($saved.RcaNote))
+        $saved.Result.remediation | Should -Be 'The next history save sends the RCA evidence again: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity while the VMs run.'
+        $saved.Result.evidence['rcaEvidence'] | Should -Be 'sent'
+        $saved.Result.evidence['rcaWritten'] | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -Times 1 -Exactly
+    }
+
     Context 'in Stop-DemoEnvironment' {
         BeforeEach {
             $script:order = [System.Collections.Generic.List[string]]::new()
@@ -1650,6 +1701,33 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:stopConfig['fabric']['saveHistoryOnStop'] = $true
             Stop-DemoEnvironment -Config $script:stopConfig -SkipFabric -Confirm:$false | Out-Null
             $script:order | Should -Be @('Deallocate:archost01', 'Deallocate:sqlvm01')
+        }
+
+        It 'exports the RCA evidence before the VMs stop, passes it with the history run, and keeps what that run didn''t take (2026-11-20)' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:order.Add('RcaExport:' + [bool]$Final + ':' + $CheckPrefix); [pscustomobject]@{ Evidence = 'EVIDENCE'; Documents = @(); Pending = @(); PendingFound = $false; Results = @(New-DemoResult -CheckId 'STOP.RCA.EXPORT' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'exported') } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $RcaEvidence); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false; RcaSaved = $script:rcaSaved; RcaNote = $script:rcaNote } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $script:order.Add('Pending:' + [bool]$Saved + ':' + $Why); if ($Saved) { return $null }; New-DemoResult -CheckId 'STOP.RCA.PENDING' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'kept' }
+            $script:rcaSaved = $true
+            $script:rcaNote = ''
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Be @('RcaExport:True:STOP', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'SaveHistory:EVIDENCE', 'Pending:True:', 'Pause')
+            ($results | Where-Object { $_.checkId -eq 'STOP.RCA.EXPORT' }).status | Should -Be 'Pass'
+            $results | Where-Object { $_.checkId -eq 'STOP.RCA.PENDING' } | Should -BeNullOrEmpty
+
+            # Not saved: the documents' list is kept, with why.
+            $script:order.Clear()
+            $script:rcaSaved = $false
+            $script:rcaNote = 'the history run didn''t complete'
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Contain 'Pending:False:the history run didn''t complete'
+            ($results | Where-Object { $_.checkId -eq 'STOP.RCA.PENDING' }).status | Should -Be 'Warning'
+
+            # Without a history save, or with -ParkT2 or -SkipFabric, nothing is exported: it stays on the VMs.
+            foreach ($case in @(@{}, @{ SaveHistory = $true; ParkT2 = $true }, @{ SaveHistory = $true; SkipFabric = $true })) {
+                $script:order.Clear()
+                Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false @case | Out-Null
+                @($script:order | Where-Object { $_ -like 'RcaExport:*' -or $_ -like 'Pending:*' }) | Should -BeNullOrEmpty
+            }
         }
 
         It 'keeps T4''s and its read replica''s captured metrics when the history run didn''t save them, and only then (ADR 0025)' {

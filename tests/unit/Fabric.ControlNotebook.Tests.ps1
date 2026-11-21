@@ -167,7 +167,7 @@ LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob") else "cccccccc-
 # The Incident RCA (ADR 0031): the metrics secret's earlier versions, which hold the bundles the runbook wrote; the demo
 # lakehouse's files (notebookutils.fs); what the activity notebook found staged; and the versions read.
 VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
-RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail")
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail")
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
 DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
@@ -344,6 +344,37 @@ def runbook(body):
             if scenario in RCA_SCENARIOS and scenario != "leftoverrca":
                 document["rca"] = rca_bundle_index(session, ["1" * 32, "2" * 32])
             VAULT["dbhub-session-metrics"] = json.dumps(document, separators=(",", ":"))
+            if scenario in ("sessionrcalate", "sessionrcapinfail"):
+                # A runbook from 2026-11-20 on names the metrics' final version in the stop's status (review of 15ad76d) ...
+                pin_metrics("4" * 32)
+                if scenario == "sessionrcalate":
+                    # ... because a re-check's bundle, written right after it, can be the secret's latest version.
+                    late_bundle(session)
+
+
+def pin_metrics(version):
+    """The stop's status names the metrics' version that the stop wrote (metrics.version), which Get Secret reads by its ID."""
+    VERSIONS[version] = VAULT["dbhub-session-metrics"]
+    stopped = json.loads(VAULT["dbhub-session-status"])
+    stopped["metrics"]["version"] = version
+    VAULT["dbhub-session-status"] = json.dumps(stopped)
+
+
+def late_bundle(session):
+    """A re-check's evidence bundle written after the stop's version of the metrics: the secret's latest."""
+    VAULT["dbhub-session-metrics"] = json.dumps({"kind": "ContosoCare.RcaBundle", "version": 1, "sessionId": session, "parts": FIXTURE["parts"][:2]}, separators=(",", ":"))
+
+
+if scenario in ("stoppedlate", "leftoverlate"):
+    # A stopped session whose status names its metrics' version, and a re-check's bundle after it as the latest: Stop now
+    # when no session runs ("stoppedlate"), and the next Run all's pre-check ("leftoverlate").
+    session = ("b" if scenario == "stoppedlate" else "e") * 32
+    ended = Clock.now - (real_dt.timedelta(minutes=5) if scenario == "stoppedlate" else real_dt.timedelta(days=1))
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status(session, ended, running_status(session, ended - real_dt.timedelta(minutes=90), 90)))
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=100)),
+                                                 "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+    pin_metrics("5" * 32)
+    late_bundle(session)
 
 
 # The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
@@ -462,6 +493,8 @@ def request(method, url, json=None, headers=None, timeout=None):
         VAULTREADS.append("%s/%s" % (name, version[:8]))
         if scenario == "bundlefail" and version == "2" * 32:
             return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
+        if scenario == "sessionrcapinfail" and version == "4" * 32:
+            return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
         return Response(200, {"value": VERSIONS[version], "id": url.split("?")[0]})
     # No capacity call: the control never checks, starts, or pauses the capacity (the user, 2026-11-14).
     assert url.startswith(FABRIC + "/"), url
@@ -502,6 +535,7 @@ with contextlib.redirect_stdout(buffer):
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
+                          "stoppedlate": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
@@ -1439,6 +1473,49 @@ print(json.dumps(out))
                 @($report.staged[0].document.parts) | Should -Be @($fixture.parts[0..1])
                 $report.staged[0].document.status | Should -Be 'Warning'
                 $report.printed | Should -Match ('Session {0}''s RCA evidence: 1 document\(s\) in 2 part\(s\), passed to its history \(bundle 22222222: the control vault answered HTTP 403; 20261120T170000Z-sqlvm01-0002: its bundles don''t hold all its parts\)\.' -f $session.Substring(0, 8))
+            }
+        }
+    }
+
+    It 'reads the metrics'' version that the stop wrote, by its ID, when a re-check''s bundle is the latest, in <Case> (review of 15ad76d)' -ForEach @(
+        @{ Case = 'a session''s end'; Scenario = 'sessionrcalate'; Refs = 1; Session = '' }
+        @{ Case = 'a session''s end whose version the vault refuses: the latest, with a Warning'; Scenario = 'sessionrcapinfail'; Refs = 1; Session = '' }
+        @{ Case = 'Stop now after a session that already stopped'; Scenario = 'stoppedlate'; Refs = 1; Session = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+        @{ Case = 'the next Run all''s pre-check of an earlier session'; Scenario = 'leftoverlate'; Refs = 2; Session = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        @($report.refs).Count | Should -Be $Refs
+        $expected = $(if ($Session) { $Session } else { $report.sent[0].sessionId })
+        $report.refs[0].args.SESSION_ID | Should -Be $expected
+        # T4's metrics, from the version the stop wrote, not the re-check's bundle after it.
+        $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
+        ($report.refs[0].args.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $expected
+        $report.printed | Should -Not -Match 'Bearer|simulated-keyvault'
+        switch ($Scenario) {
+            'sessionrcalate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/44444444', 'dbhub-session-metrics/11111111', 'dbhub-session-metrics/22222222')
+                $fixture = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-evidence.parameter.json') -Raw | ConvertFrom-Json
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+                @($report.staged[0].document.parts) | Should -Be @($fixture.parts)
+                $report.printed | Should -Not -Match 'Warning: the history''s metrics version'
+            }
+            'sessionrcapinfail' {
+                $report.printed | Should -Match 'Warning: the history''s metrics version 44444444, which the stop wrote, couldn''t be read \(the control vault answered HTTP 403\), so the vault''s latest is used\.'
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+            }
+            'stoppedlate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555')
+                @($report.order) | Should -Be @('sent:stop', 'history:bbbbbbbb')
+            }
+            'leftoverlate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555')
+                $report.printed | Should -Match 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent'
             }
         }
     }

@@ -255,7 +255,8 @@ function Remove-DemoOneLakeFile {
     <#
     .SYNOPSIS
     Deletes a file in a lakehouse's Files: Path - Delete. One that's gone already counts as deleted. Returns Status
-    ('Pass' or 'Fail') and Error. Internal.
+    ('Pass' or 'Fail'), Found ($true when the file was there and this deleted it, $false when it was gone already: HTTP
+    404; review of 3b1348a), and Error. Internal.
     - Path - Delete: https://learn.microsoft.com/rest/api/storageservices/datalakestoragegen2/path/delete
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Deletes one staged file in the demo lakehouse; its callers gate it.')]
@@ -279,10 +280,13 @@ function Remove-DemoOneLakeFile {
     )
 
     $deleted = Invoke-DemoOneLakeRequest -Method Delete -WorkspaceId $WorkspaceId -Path ('{0}/{1}' -f $LakehouseId.ToLowerInvariant(), $Path) -Token $Token
-    if ($deleted.StatusCode -in 200, 202, 204, 404) {
-        return [pscustomobject]@{ Status = 'Pass'; Error = '' }
+    if ($deleted.StatusCode -in 200, 202, 204) {
+        return [pscustomobject]@{ Status = 'Pass'; Found = $true; Error = '' }
     }
-    return [pscustomobject]@{ Status = 'Fail'; Error = ('deleting {0}: {1}' -f $Path, (Get-DemoOneLakeError -Response $deleted)) }
+    if ($deleted.StatusCode -eq 404) {
+        return [pscustomobject]@{ Status = 'Pass'; Found = $false; Error = '' }
+    }
+    return [pscustomobject]@{ Status = 'Fail'; Found = $false; Error = ('deleting {0}: {1}' -f $Path, (Get-DemoOneLakeError -Response $deleted)) }
 }
 
 function Get-DemoRcaHistoryTable {

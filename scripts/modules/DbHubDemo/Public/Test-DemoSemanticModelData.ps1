@@ -16,7 +16,10 @@ function Test-DemoSemanticModelData {
       history is evaluated once more per -Grain (a telemetry bin, an incident, a signal: what its visual puts in
       context), and passes when it returns a value for any of them. Warning when it's blank for every grain too, which
       is expected until a scenario runs or an incident window exists (Phase 20's end-to-end run checks again); Fail
-      when the measure raises a DAX error.
+      when the measure raises a DAX error. A blank measure on one of the Incident RCA's tables (ADR 0031) is never a
+      Warning (review of 15ad76d): Not selected while its table has no rows (no capture is recorded yet, as in an
+      environment the update just gave the tables), and Pass once it has rows, because its evidence can hold none of
+      what the measure counts (no lock escalation, no read replica).
     - FABRIC.SEMANTICMODEL.INFOMEASURES: EVALUATE INFO.MEASURES(), for measure errors the engine reports. Execute
       Queries doesn't support INFO functions, so a refusal is Not supported, and the per-measure queries are the check.
     - FABRIC.SEMANTICMODEL.DATA: the summary, with the worst status of the records above.
@@ -72,6 +75,9 @@ function Test-DemoSemanticModelData {
 
     $docUrl = 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
     $measures = @(Get-DemoTmdlMeasure -DefinitionPath $DefinitionPath)
+    # The Incident RCA's tables (ADR 0031), by their model names: their measures are blank until a session's capture is
+    # recorded, and can be blank after it, so a blank one is never a Warning (review of 15ad76d).
+    $rcaTables = @(Get-DemoRcaHistoryTable | ForEach-Object { $_.Model })
     $sources = [ordered]@{}
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path -Path $DefinitionPath -ChildPath 'tables') -Filter '*.tmdl' -File | Sort-Object -Property Name) {
         $text = [System.IO.File]::ReadAllText($file.FullName)
@@ -186,6 +192,11 @@ function Test-DemoSemanticModelData {
         if ($Grain.Count -eq 0 -or $null -eq $outcome -or $outcome.Error -or -not [string]::IsNullOrEmpty([string]$outcome.Value)) {
             continue
         }
+        $entity = if ($sources.Contains($measure.Table)) { [string]$sources[$measure.Table] } else { '' }
+        if ($measure.Table -in $rcaTables -and $entity -and $rowCounts.Contains($entity) -and $rowCounts[$entity] -eq 0) {
+            # An RCA table with no rows yet: no grain can give its measure a value.
+            continue
+        }
         $reference = ConvertTo-DemoDaxName -Table $measure.Table -Name $measure.Name
         $parts = @(for ($index = 0; $index -lt $Grain.Count; $index++) {
                 '"g{0}", COUNTROWS ( FILTER ( VALUES ( {1} ), NOT ISBLANK ( {2} ) ) )' -f $index, $Grain[$index], $reference
@@ -240,6 +251,22 @@ function Test-DemoSemanticModelData {
                             -Message ('{0} is blank over the whole history and returns a value in the context its visual sets, for {1} value(s).' -f $label, $perGrain) -Evidence $evidence -DocUrl $docUrl))
                 continue
             }
+            if ($measure.Table -in $rcaTables -and $entity -and $rowCounts.Contains($entity)) {
+                # The Incident RCA's measures (review of 15ad76d): an environment that hasn't recorded a capture yet, an
+                # updated one included, gets no Warning for them; one with evidence that holds none of what a measure
+                # counts (no read replica, no lock escalation) has its answer.
+                if ($rowCounts[$entity] -eq 0) {
+                    $evidence['rcaBlank'] = 'noCapture'
+                    $results.Add((New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Not selected' `
+                                -Message ('{0} is blank: no Incident RCA capture is recorded yet ({1} has no rows). A session with the capture fills it (ADR 0031).' -f $label, $entity) -Evidence $evidence -DocUrl $docUrl))
+                }
+                else {
+                    $evidence['rcaBlank'] = 'noneCounted'
+                    $results.Add((New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Pass' `
+                                -Message ('{0} is blank: the Incident RCA evidence in {1} holds none of what it counts (for example, no lock escalation, or no read replica), which is its answer.' -f $label, $entity) -Evidence $evidence -DocUrl $docUrl))
+                }
+                continue
+            }
             $why = if ($entity -and $rowCounts.Contains($entity) -and $rowCounts[$entity] -eq 0) {
                 '{0} has no rows yet' -f $entity
             }
@@ -291,14 +318,18 @@ function Test-DemoSemanticModelData {
     $measureResults = @($results | Where-Object { $_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' })
     $counts = [ordered]@{
         measures  = $measureResults.Count
-        withValue = @($measureResults | Where-Object { $_.status -eq 'Pass' }).Count
+        withValue = @($measureResults | Where-Object { $_.status -eq 'Pass' -and -not $_.evidence.Contains('rcaBlank') }).Count
         perGrain  = @($measureResults | Where-Object { $_.status -eq 'Pass' -and $_.evidence.Contains('valuesPerGrain') }).Count
         blank     = @($measureResults | Where-Object { $_.status -eq 'Warning' }).Count
         errors    = @($measureResults | Where-Object { $_.status -eq 'Fail' }).Count
+        rcaBlank  = @($measureResults | Where-Object { $_.evidence.Contains('rcaBlank') }).Count
     }
     $statuses = @($results | Where-Object { $_.checkId -ne 'FABRIC.SEMANTICMODEL.INFOMEASURES' } | ForEach-Object { $_.status })
     $status = if ($statuses -contains 'Fail') { 'Fail' } elseif ($statuses -contains 'Warning') { 'Warning' } else { 'Pass' }
     $message = '{0} of {1} measures returned a value ({2} of them only in the context their visual sets), {3} returned blank, and {4} raised an error.' -f $counts['withValue'], $counts['measures'], $counts['perGrain'], $counts['blank'], $counts['errors']
+    if ($counts['rcaBlank'] -gt 0) {
+        $message += ' {0} of the Incident RCA''s measures are blank because no capture is recorded yet, or its evidence holds none of what they count.' -f $counts['rcaBlank']
+    }
     if ($absent.Count -gt 0) {
         $counts['notInModel'] = $absent
         $message += ' The deployed model doesn''t read {0} yet (FABRIC.SEMANTICMODEL.RCA says why), so their measures weren''t evaluated.' -f ($absent -join ', ')

@@ -468,8 +468,14 @@ function Save-DemoFabricHistory {
     doesn't have (ADR 0026). It writes only the lakehouse's history tables. T4's metrics go with the run only when the
     workspace's notebook knows POSTGRES_METRICS (Test-DemoFabricNotebookParameter, 2026-11-16); otherwise it's a Warning
     that says so, with PostgresDropped. T5's (2026-11-18, ADR 0027) go only when it knows COSMOS_METRICS; otherwise the
-    message says so, and they stay in Azure Monitor for a later run (CosmosDropped). Returns Result, StillRunning (the run
-    hadn't finished when the wait ended, so the capacity mustn't be paused under it), PostgresDropped, and CosmosDropped.
+    message says so, and they stay in Azure Monitor for a later run (CosmosDropped). The Incident RCA's evidence
+    (2026-11-20, ADR 0031; -RcaEvidence, from Invoke-DemoRcaScriptExport) is staged in the lakehouse and passed as
+    RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun), only to a copy of the notebook that knows it; otherwise the run is a
+    Warning that says why, and the caller keeps the documents' list for the next save (Save-DemoRcaPending); so is a run
+    that completed without writing it (the notebook left the staged file; review of 3b1348a). Returns Result,
+    StillRunning (the run hadn't finished when the wait ended, so the capacity mustn't be paused under it),
+    PostgresDropped, CosmosDropped, RcaSaved (the evidence was passed, the run completed, and the notebook wrote it), and
+    RcaNote (why not).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -491,7 +497,12 @@ function Save-DemoFabricHistory {
         # T5's Azure Monitor metrics as JSON (2026-11-18, ADR 0027; Get-DemoCosmosHistoryCapture), for the notebook's
         # COSMOS_METRICS parameter; '' sends none.
         [AllowEmptyString()]
-        [string] $CosmosMetrics = ''
+        [string] $CosmosMetrics = '',
+
+        # One RCA_EVIDENCE document (2026-11-20, ADR 0031; Invoke-DemoRcaScriptExport), staged for the notebook's
+        # RCA_EVIDENCE_FILE; '' stages none.
+        [AllowEmptyString()]
+        [string] $RcaEvidence = ''
     )
 
     $checkId = 'STOP.FABRIC.SAVEHISTORY'
@@ -501,13 +512,21 @@ function Save-DemoFabricHistory {
     $postgresWithheld = ''
     # T5's, for a copy from before 2026-11-18: Azure Monitor keeps them, so nothing needs keeping.
     $cosmosWithheld = ''
+    # The RCA evidence's run (Invoke-DemoRcaNotebookRun), once it ran; until then, nothing was passed.
+    $rcaRun = $null
     $answer = {
         param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '', [bool] $StillRunning = $false)
+        $rcaNote = ''
+        if ($RcaEvidence) {
+            $rcaNote = if ($null -eq $rcaRun) { 'the history run didn''t start' } else { [string]$rcaRun.RcaNote }
+        }
         [pscustomobject]@{
             Result          = (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $doc['NotebookRun'])
             StillRunning    = $StillRunning
             PostgresDropped = [bool]$postgresWithheld
             CosmosDropped   = [bool]$cosmosWithheld
+            RcaSaved        = ($null -ne $rcaRun -and [bool]$rcaRun.RcaSaved)
+            RcaNote         = $rcaNote
         }
     }
     # Since 2026-11-14 the notebook changes no activity (ADR 0026), so its Run all only analyzes and saves.
@@ -568,7 +587,8 @@ function Save-DemoFabricHistory {
             $parameters['COSMOS_METRICS'] = $CosmosMetrics
         }
     }
-    $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name 'NB_DatabaseHub_LiveActivity' -Parameter $parameters -Token $token -TimeoutMinutes $TimeoutMinutes
+    $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $parameters -Token $token -Evidence $RcaEvidence -TimeoutMinutes $TimeoutMinutes
+    $run = $rcaRun.Run
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')
     $stillRunning = $run.status -eq 'Warning' -and $jobStatus -notin 'Completed', 'Failed', 'Cancelled', 'Deduped', ''
     $evidence = [ordered]@{ windowMinutes = $WindowMinutes; jobStatus = $jobStatus; seconds = (Get-DemoMemberValue -InputObject $run.evidence -Name 'seconds') }
@@ -578,19 +598,47 @@ function Save-DemoFabricHistory {
     if ($cosmosWithheld) {
         $evidence['cosmosMetrics'] = 'withheld'
     }
-    $cosmosNote = if ($cosmosWithheld) { ' T5''s metrics weren''t sent: {0}.' -f $cosmosWithheld } else { '' }
-    if ($run.status -eq 'Pass' -and $postgresWithheld) {
-        # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
-        # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
-        $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
-        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}' -f $WindowMinutes, $postgresWithheld, $cosmosNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
+    # The RCA evidence that wasn't passed: a copy of the notebook from before the Incident RCA, or a file that couldn't be
+    # staged. The documents' list is kept for the next save (STOP.RCA.PENDING).
+    $rcaWithheld = if ($RcaEvidence -and -not $rcaRun.RcaSent) { [string]$rcaRun.RcaNote } else { '' }
+    # Passed, and the run completed, but the notebook didn't write it: it left the staged file (review of 3b1348a).
+    $rcaUnwritten = if ($RcaEvidence -and $rcaRun.RcaSent -and -not $rcaRun.RcaSaved -and $run.status -eq 'Pass') { [string]$rcaRun.RcaNote } else { '' }
+    if ($RcaEvidence) {
+        $evidence['rcaEvidence'] = if ($rcaRun.RcaSent) { 'sent' } else { 'withheld' }
+        if ($rcaRun.RcaSent) {
+            $evidence['rcaWritten'] = [bool]$rcaRun.RcaSaved
+        }
     }
-    if ($run.status -eq 'Pass' -and $cosmosWithheld) {
-        $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' }
-        return (& $answer 'Warning' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}{2}' -f $WindowMinutes, $run.message, $cosmosNote) $evidence ('{0}; then ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor.' -f $updateFix))
+    $cosmosNote = if ($cosmosWithheld) { ' T5''s metrics weren''t sent: {0}.' -f $cosmosWithheld } else { '' }
+    $rcaNote = if ($rcaWithheld) { ' The RCA evidence wasn''t sent: {0}; it stays on the VMs for the next save (STOP.RCA.PENDING).' -f $rcaWithheld } elseif ($rcaUnwritten) { ' The RCA evidence went with it, but {0}; it stays on the VMs for the next save (STOP.RCA.PENDING).' -f $rcaUnwritten } else { '' }
+    # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
+    # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
+    $importing = [bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')
+    if ($run.status -eq 'Pass' -and $postgresWithheld) {
+        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
+        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}{3}' -f $WindowMinutes, $postgresWithheld, $cosmosNote, $rcaNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
+    }
+    if ($run.status -eq 'Pass' -and ($cosmosWithheld -or $rcaWithheld -or $rcaUnwritten)) {
+        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' }
+        $oldNotebook = $cosmosWithheld -or $rcaWithheld -match 'from before the Incident RCA'
+        $steps = [System.Collections.Generic.List[string]]::new()
+        if ($oldNotebook) {
+            $steps.Add($updateFix)
+        }
+        if ($cosmosWithheld) {
+            $steps.Add('then ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor')
+        }
+        if ($rcaWithheld) {
+            $steps.Add($(if ($oldNotebook) { 'the next history save then sends the RCA evidence' } else { 'The next history save sends the RCA evidence: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity while the VMs run' }))
+        }
+        elseif ($rcaUnwritten) {
+            $steps.Add($(if ($steps.Count -gt 0) { 'the next history save sends the RCA evidence again' } else { 'The next history save sends the RCA evidence again: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity while the VMs run' }))
+        }
+        return (& $answer 'Warning' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}{2}{3}' -f $WindowMinutes, $run.message, $cosmosNote, $rcaNote) $evidence (($steps -join '; ') + '.'))
     }
     if ($run.status -eq 'Pass') {
-        return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}' -f $WindowMinutes, $run.message) $evidence)
+        $rcaSaved = if ($rcaRun.RcaSent) { ' The RCA evidence went with it (RCA_EVIDENCE_FILE).' } else { '' }
+        return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}{2}' -f $WindowMinutes, $run.message, $rcaSaved) $evidence)
     }
     if ($stillRunning) {
         return (& $answer 'Warning' ('The history run was still {0} after {1} minutes; it keeps running in Fabric, so the capacity wasn''t paused under it.' -f $jobStatus, $TimeoutMinutes) $evidence 'Check the run in the workspace (Monitor hub); once it''s done, run stop-demo.ps1 again to pause the capacity the demo resumed.' $true)
