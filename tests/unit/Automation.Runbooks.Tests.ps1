@@ -3622,7 +3622,7 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         @($status.rcaEarlierPending[0].leftVms) | Should -Be @('archost01')
         $status.rcaEarlierPending[0].finalRan | Should -BeTrue
         ($status.steps | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match 'Run all saves it with that session''s history at this session''s end\.$'
-        @($status.steps | Where-Object step -EQ 'RCA.EARLIER' | ForEach-Object message) | Should -Be @('Session 5f1c0e7a''s evidence still on the VMs: what the observer captured on archost01 since its last export; the next session''s start exports it, until 2026-11-03 13:00 UTC, when the runner has deleted it.')
+        @($status.steps | Where-Object step -EQ 'RCA.EARLIER' | ForEach-Object message) | Should -Be @('Session 5f1c0e7a''s evidence still on the VMs: what the observer captured on archost01 since its last export; the next session''s start exports it, until 2026-11-26 13:00 UTC, when the runner has deleted it.') -Because 'the runner keeps what it captured but never exported 30 days'
         # The nightly stop ends B too, so its own export never runs either. C's start exports A's on archost01 first,
         # and B's waits its turn.
         $script:runCommands.Remove('archost01')
@@ -3635,7 +3635,7 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $status = Get-SessionStatus
         @($status.rcaEarlierPending | ForEach-Object sessionId) | Should -Be @($b)
         $status.rcaEarlierPending[0].finalRan | Should -BeFalse
-        ($status.steps | Where-Object step -EQ 'RCA.EARLIER').message | Should -Match ('^Other earlier sessions'' evidence is still on the VMs; the next sessions'' starts export it in this order, one session''s per start: session bbbbbbbb \(until 2026-11-03 1\d:\d\d UTC\)\.$')
+        ($status.steps | Where-Object step -EQ 'RCA.EARLIER').message | Should -Match ('^Other earlier sessions'' evidence is still on the VMs; the next sessions'' starts export it in this order, one session''s per start: session bbbbbbbb \(until 2026-11-26 1\d:\d\d UTC\)\.$')
     }
 
     It 'keeps the earlier sessions'' evidence through a start that''s refused, for the start after it (review of 3b1348a)' {
@@ -3761,7 +3761,7 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $there | Should -Be $here
         $here[0] | Should -Be '20261120T165000Z-sqlvm01-0001|True|20261120T165000Z-sqlvm01-0001|T1:True:16:50-17:05'
         $here[1] | Should -Be '20261120T170000Z-sqlvm01-0002|True|20261120T170000Z-sqlvm01-0002|T4:True:17:00-17:20,T4-replica:True:17:00-17:20'
-        $here[-1] | Should -Be ('[{{"sessionId":"{0}","pending":[{{"documentId":"20261120T170000Z-sqlvm01-0002","parts":2,"sha256":"{1}","vm":"archost01"}}],"leftVms":[],"finalRan":true,"expiresUtc":"2026-11-03T13:00:00Z"}},{{"sessionId":"{2}","pending":[],"leftVms":[],"finalRan":false,"expiresUtc":"2026-11-03T13:00:00Z"}}]' -f ('a' * 32), ('0' * 64), ('b' * 32))
+        $here[-1] | Should -Be ('[{{"sessionId":"{0}","pending":[{{"documentId":"20261120T170000Z-sqlvm01-0002","parts":2,"sha256":"{1}","vm":"archost01"}}],"leftVms":[],"finalRan":true,"expiresUtc":"2026-11-03T13:00:00Z"}},{{"sessionId":"{2}","pending":[],"leftVms":[],"finalRan":false,"expiresUtc":"2026-11-26T13:00:00Z"}}]' -f ('a' * 32), ('0' * 64), ('b' * 32))
     }
 }
 

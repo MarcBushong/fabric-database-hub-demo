@@ -7293,6 +7293,7 @@ function Send-DbHubRcaEarlierExport {
 }
 
 $script:DbHubRcaCarryDays = 7
+$script:DbHubRcaCapturedDays = 30
 $script:DbHubRcaCarryMost = 4
 $script:DbHubRcaCarryBytes = 6000
 $script:DbHubRcaRanPhases = @('starting', 'replica', 'running', 'stopped')
@@ -7325,9 +7326,10 @@ function ConvertTo-DbHubRcaCarry {
     .SYNOPSIS
     One earlier session's evidence that's still on the VMs, as a status carries it in rcaEarlierPending (review of 3b1348a):
     sessionId; pending, the documents an export listed but didn't fetch whole, each with its vm; leftVms, the VMs whose final
-    export didn't run; finalRan, whether it ran on the others; and expiresUtc, when the runner has deleted what was exported
-    (7 days after the export, rca/README.md). Not its bundles or documents: each start's bundle index of what it fetched
-    is in that start's status (rcaEarlier), which Run all saves with that session's history. $null when nothing is left.
+    export didn't run; finalRan, whether it ran on the others; and expiresUtc, when the runner has deleted what's left of it
+    (an exported document 7 days after its export, and what it captured but never exported 30 days after the capture:
+    EvidenceStore.cs). Not its bundles or documents: each start's bundle index of what it fetched is in that start's status
+    (rcaEarlier), which Run all saves with that session's history. $null when nothing is left.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -7366,9 +7368,9 @@ function Get-DbHubRcaBacklog {
     it ran (its phase is starting, replica, running, or stopped), and its RCA state isn't final. A session's start exports
     the first (Invoke-DbHubRcaEarlier) and puts what's left of it last, so each waits its turn. Returns Entries (each
     [ordered]@{ sessionId; rca, its RCA state for Invoke-DbHubRcaSessionExport; expiresUtc }), Expired (past expiresUtc,
-    when the runner has deleted what was exported 7 days before), and Dropped (past the 4 sessions or 6,000 bytes a status
-    keeps, the first to expire going first). -KeepAll (a stop, whose status has no steps) keeps every one, so the next
-    start says which expired.
+    when the runner has deleted what's left: 7 days after an export, or 30 days after a capture no export took), and
+    Dropped (past the 4 sessions or 6,000 bytes a status keeps, the first to expire going first). -KeepAll (a stop, whose
+    status has no steps) keeps every one, so the next start says which expired.
     #>
     param(
         [AllowNull()]
@@ -7401,7 +7403,13 @@ function Get-DbHubRcaBacklog {
             if ($null -eq $since -or $since -gt $NowUtc) {
                 $since = $NowUtc
             }
-            $own = [ordered]@{ sessionId = $ownId; rca = $state; expiresUtc = $since.AddDays($script:DbHubRcaCarryDays) }
+            # The runner keeps an exported document 7 days, and what it captured but never exported 30 days
+            # (EvidenceStore.cs): while an export still has to run (Get-DbHubRcaExportVm), the evidence is asked for 30 days.
+            $days = $script:DbHubRcaCarryDays
+            if (@($state['leftVms']).Count -gt 0 -or -not $state['finalRan']) {
+                $days = $script:DbHubRcaCapturedDays
+            }
+            $own = [ordered]@{ sessionId = $ownId; rca = $state; expiresUtc = $since.AddDays($days) }
         }
     }
     $all = New-Object -TypeName 'System.Collections.Generic.List[object]'
@@ -7521,7 +7529,11 @@ function Set-DbHubRcaBacklog {
     }
     $lost = 'Nothing brings it back. A session that ends with its auto-stop or Stop now exports its evidence before the VMs stop; the nightly stop and the VMs'' auto-shutdown leave it on the VMs for the next session''s start.'
     foreach ($entry in @($Backlog.Expired)) {
-        Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Warning' -Message ('Session {0}''s evidence that its stop didn''t export ({1}) isn''t asked for any more, so it isn''t in that session''s history: the runner deletes an exported document 7 days after its export, which for this evidence was by {2} UTC.' -f ([string]$entry['sessionId']).Substring(0, 8), (Get-DbHubRcaCarryText -Settings $Context.Settings -State $entry['rca']), ([datetime]$entry['expiresUtc']).ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)) -Fix $lost
+        $kept = 'the runner deletes an exported document 7 days after its export'
+        if (@($entry['rca']['leftVms']).Count -gt 0 -or -not $entry['rca']['finalRan']) {
+            $kept = 'the runner deletes what it captured 30 days after the capture, or 7 days after an export took it'
+        }
+        Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Warning' -Message ('Session {0}''s evidence that its stop didn''t export ({1}) isn''t asked for any more, so it isn''t in that session''s history: {2}, which for this evidence was by {3} UTC.' -f ([string]$entry['sessionId']).Substring(0, 8), (Get-DbHubRcaCarryText -Settings $Context.Settings -State $entry['rca']), $kept, ([datetime]$entry['expiresUtc']).ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)) -Fix $lost
     }
     foreach ($entry in @($Backlog.Dropped)) {
         Add-DbHubSessionStep -Status $Status -Step 'RCA.EARLIER' -State 'Warning' -Message ('Session {0}''s evidence that its stop didn''t export ({1}) isn''t asked for any more, so it isn''t in that session''s history: a session''s status keeps at most {2} earlier sessions'' evidence still on the VMs, and it was the first to expire.' -f ([string]$entry['sessionId']).Substring(0, 8), (Get-DbHubRcaCarryText -Settings $Context.Settings -State $entry['rca']), $script:DbHubRcaCarryMost) -Fix $lost
