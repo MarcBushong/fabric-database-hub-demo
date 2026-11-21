@@ -1,7 +1,12 @@
 import { defineConfig } from "vitest/config";
+import { searchForWorkspaceRoot } from "vite";
 import { resolve } from "path";
 
 export default defineConfig({
+    // The preview's sample RCA data reads the contract's fixtures (ADR 0031), as vite.config.ts allows the dev server to.
+    server: {
+        fs: { allow: [searchForWorkspaceRoot(import.meta.dirname), resolve(import.meta.dirname, "../../rca/fixtures")] },
+    },
     test: {
         environment: "jsdom",
         setupFiles: ["src/test/setup.ts"],

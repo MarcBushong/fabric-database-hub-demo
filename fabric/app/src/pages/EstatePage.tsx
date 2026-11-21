@@ -49,6 +49,7 @@ import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber, percent } f
 import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
 import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
+import { findIncidentsAsk } from "@/rca/entry";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
 
@@ -270,7 +271,7 @@ function TargetDetail({ target }: { target: EstateTarget }) {
 }
 
 function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<{ label: string; onClick?: () => void }> }) {
-    const { navigate, filters, runtime, meta, view } = useApp();
+    const { navigate, filters, runtime, meta, view, rca } = useApp();
     const info = TARGETS[target];
     const d = useEstateData();
     const incidentsSpec = useMemo(() => incidentsQuery({ ...filters, targets: [target] }), [filters, target]);
@@ -421,7 +422,8 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 table={incidentsState.data ? { columns: incidentsSpec.columns, rows: incidentsState.data.rows, caption: `${target}'s incident windows` } : null}
                 summary={`${incidents.length} incidents.`}
                 quiet
-                ask={false}
+                // The incident windows are the answer key: with the RCA tables, the chat finds this target's incidents itself (ADR 0031).
+                ask={rca === true ? findIncidentsAsk({ targets: [target] }) : false}
             >
                 <ol className="feed">
                     {incidents.map((i) => (

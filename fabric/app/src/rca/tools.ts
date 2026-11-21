@@ -11,7 +11,7 @@ import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
+import { emptyEvidence, hhmmss, iso, NEWEST_MINUTES, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -22,8 +22,6 @@ export interface ToolSpec {
 
 const TIME = { type: "string", description: "A time as the viewer said it: 'HH:MM' (the viewer's time zone, on the history's newest day), 'HH:MM UTC', or an ISO timestamp." };
 const TARGETS = { type: "array", items: { type: "string", enum: RCA_TARGETS }, description: "The targets to look at; all of them when omitted." };
-/** With no time, the window is the history's newest minutes: a session's length. */
-const NEWEST_MINUTES = 90;
 const WINDOW_PROPS = {
     at: { ...TIME, description: `${TIME.description} Without at, or from and to: the history's newest ${NEWEST_MINUTES} minutes.` },
     from: { ...TIME, description: "The window's start, instead of at." },

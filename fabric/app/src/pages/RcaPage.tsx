@@ -38,7 +38,7 @@ const asResult = (value: InvestigationResult | string): InvestigationResult => {
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 export default function RcaPage() {
-    const { view, setView, navigate, provenance, meta, rca } = useApp();
+    const { view, setView, provenance, meta, rca } = useApp();
     const queryClient = useContext(QueryClientContext);
     const copilot = useCopilot();
     const client = useMemo(() => (queryClient ? createRcaClient(queryClient) : null), [queryClient]);
@@ -220,9 +220,6 @@ export default function RcaPage() {
                     <div className="mc-actions">
                         <Button size="small" appearance="primary" icon={<Sparkle20Filled />} disabled={!shown?.value} onClick={explain}>
                             Explain this incident
-                        </Button>
-                        <Button size="small" onClick={() => navigate("incidents")}>
-                            Incidents
                         </Button>
                     </div>
                 </header>

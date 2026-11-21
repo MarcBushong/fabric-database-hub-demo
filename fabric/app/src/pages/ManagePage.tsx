@@ -24,7 +24,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { toSessions } from "@/data/model";
+import { newestSessionWindow, toSessions } from "@/data/model";
 import { sessionsQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { copyText } from "@/lib/clipboard";
@@ -33,6 +33,7 @@ import { parameterCellText, type ManageJobAnswer } from "@/lib/manage-client";
 import { clause, formatAgo, formatDateTimeUtc, formatDuration } from "@/lib/format";
 import { profileLabel, SCENARIOS, SESSION_MINUTES } from "@/lib/scenarios";
 import type { FilterTarget } from "@/lib/view-state";
+import { triageAsk } from "@/rca/entry";
 import { PageHeader } from "@/shell/PageHeader";
 
 interface ActionInfo {
@@ -313,7 +314,7 @@ const DEFAULTS: Record<ControlAction, ControlRequest> = {
 };
 
 export default function ManagePage() {
-    const { filters, manage, runtime } = useApp();
+    const { filters, manage, runtime, rca } = useApp();
     const [pending, setPending] = useState<ControlRequest | null>(null);
     // The run this page follows: the one it just started, else the control's run in progress.
     const [started, setStarted] = useState<{ id: string; title: string } | null>(null);
@@ -322,6 +323,7 @@ export default function ManagePage() {
     const sessionsSpec = useMemo(() => sessionsQuery(filters), [filters]);
     const sessionsState = useQuery(sessionsSpec);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
+    const sessionWindow = useMemo(() => newestSessionWindow(sessions), [sessions]);
     const last = sessions[0] ?? null;
     // Each action reads the control's run in progress again first: the state read when the page opened may be old.
     const openAction = (action: ControlAction) => {
@@ -400,8 +402,9 @@ export default function ManagePage() {
                 table={sessionsState.data ? { columns: sessionsSpec.columns, rows: sessionsState.data.rows, caption: "Sessions and activity requests" } : null}
                 summary={last ? `The last request was ${formatAgo(last.requestedAt)}.` : "No session yet."}
                 askPrompt="Summarize what the session control ran recently and whether anything failed."
-                // What the control ran is the demo's plan, the answer key: no Ask (ADR 0031).
-                ask={false}
+                // What the control ran is the demo's plan, the answer key: with the RCA tables, the chat triages the newest session's
+                // minutes blind; without them, no Ask (ADR 0031).
+                ask={rca === true && sessionWindow ? triageAsk({ title: "The newest session's minutes", ...sessionWindow }) : false}
             >
                 <ol className="feed">
                     {sessions.slice(0, 12).map((s) => (

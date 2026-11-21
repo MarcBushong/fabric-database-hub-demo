@@ -8,7 +8,7 @@
 // Hub shows the telemetry 3 to 15 minutes after its sample time. Pure, so the tests pin every number.
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
-import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, throttledRuns } from "@/data/model";
+import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, SESSION_PROFILES, throttledRuns } from "@/data/model";
 import type { Row } from "@/data/query-client";
 import { impactOf, type Impact } from "./business";
 import { engineOf } from "./estate";
@@ -170,8 +170,6 @@ export interface Plan {
     /** Its incident requests, by start. */
     faults: SessionRun[];
 }
-
-const SESSION_PROFILES = new Set(["session", "showcase"]);
 
 /** The short session ID: the first 8 characters after "session:". */
 export function shortSessionId(key: string): string {

@@ -18,6 +18,7 @@ import { formatTimeUtc } from "@/lib/format";
 import { isEmbedded, toHash } from "@/lib/view-state";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { EVENT_LABEL, planEvents } from "@/lib/scoreboard";
+import { triageAsk } from "@/rca/entry";
 import { CinematicReplay } from "@/mission/CinematicReplay";
 import { LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
 import { PostmortemDialog } from "@/mission/PostmortemDialog";
@@ -60,7 +61,7 @@ const EVENT_SPEC_COLUMNS: ColumnSpec[] = [
 ];
 
 export default function ReplayPage() {
-    const { view, setView, navigate, reducedMotion, provenance, meta, notify } = useApp();
+    const { view, setView, navigate, reducedMotion, provenance, meta, notify, rca } = useApp();
     const data = useMission();
     const [lens, setLens] = useState<Lens>("technical");
     const [postmortem, setPostmortem] = useState<PostmortemInput | null>(null);
@@ -157,8 +158,9 @@ export default function ReplayPage() {
                 table={{ columns: EVENT_SPEC_COLUMNS, rows, caption: "The session's moments" }}
                 summary={`${rows.length} moments.`}
                 askPrompt="Walk me through this session's replay: what happened first, what followed, and how fast each signal showed and recovered?"
-                // Every moment is timed from what was injected, the answer key: nothing measured is left to ask about (ADR 0031).
-                ask={false}
+                // Every moment is timed from what was injected, the answer key. With the RCA tables, the chat triages a whole
+                // session's minutes blind instead; a lone incident request's window is its fault's, so it gets none (ADR 0031).
+                ask={rca === true && plan?.kind === "session" ? triageAsk({ title: "The session's minutes", from: plan.start, to: plan.end }) : false}
             >
                 <DataGrid
                     columns={EVENT_COLUMNS}

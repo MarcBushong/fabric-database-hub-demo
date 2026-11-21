@@ -233,6 +233,8 @@ export interface RenderOptions {
     live?: "sample" | "off" | EstateReader;
     /** What dbhub-app.json adds to the runtime, such as t2Migration. */
     runtime?: Partial<AppRuntime>;
+    /** Whether the history model has the Incident RCA's tables (ADR 0031); unknown when absent, as before the model answers. */
+    rca?: boolean | null;
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
@@ -259,6 +261,7 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
         reducedMotion: true,
         notify,
         manage: options.manage ?? MANAGE_READ_ONLY,
+        ...(options.rca !== undefined ? { rca: options.rca } : {}),
     };
     const copilot: CopilotApi = { open: vi.fn(), ask: vi.fn() };
     const client = options.client ?? fakeQueryClient();

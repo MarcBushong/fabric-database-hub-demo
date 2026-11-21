@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import { Button } from "@fluentui/react-components";
-import { Replay20Regular, HeartPulse20Regular } from "@fluentui/react-icons";
+import { Replay20Regular, HeartPulse20Regular, TextBulletListTree16Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { DataGrid, type GridColumn } from "@/components/DataGrid";
@@ -26,11 +26,16 @@ import type { Lens } from "@/mission/ServiceMap";
 import { SessionRibbon } from "@/mission/SessionRibbon";
 import { Stage } from "@/mission/Stage";
 import { useMission } from "@/mission/use-mission";
+import { triageAsk } from "@/rca/entry";
+import { isRcaTarget } from "@/rca/types";
+import { windowKey } from "@/rca/view/selection";
 
 import "@/mission/mission.css";
 
 /** The newest sessions besides the one in focus whose faults the aggregates measure. */
 const ACROSS = 3;
+/** The minutes either side of a picked fault that its Root cause link covers. */
+const RCA_PAD_MS = 5 * 60000;
 
 interface FaultRow extends Record<string, unknown> {
     key: string;
@@ -91,7 +96,7 @@ function aggChart(rows: readonly Aggregate[], title: string) {
 }
 
 export default function ScoreboardPage() {
-    const { view, setView, navigate, provenance, meta } = useApp();
+    const { view, setView, navigate, provenance, meta, rca } = useApp();
     const data = useMission(ACROSS);
     const [lens, setLens] = useState<Lens>("technical");
     const [selected, setSelected] = useState<string | null>(null);
@@ -124,6 +129,13 @@ export default function ScoreboardPage() {
     );
     const csvRows = useMemo(() => postmortemRows(scores, episodes), [scores, episodes]);
     const picked = rows.find((r) => r.key === selected) ?? null;
+    // The picked fault's minutes, a few either side, for the Root cause view: its target and times only.
+    const pickedRca = useMemo(() => {
+        if (!picked || !isRcaTarget(picked.target)) return null;
+        const s = picked.score;
+        const end = Math.max(s.injectedEnd.getTime(), s.recoveredAt?.getTime() ?? 0);
+        return { target: picked.target, from: new Date(s.injectedAt.getTime() - RCA_PAD_MS), to: new Date(end + RCA_PAD_MS) };
+    }, [picked]);
     const sessions = data.scored.size;
 
     return (
@@ -173,6 +185,12 @@ export default function ScoreboardPage() {
                                 <StatusBadge status={picked.status} short />
                                 <strong>{`${picked.target} ${picked.fault}`}</strong>
                                 <span>{picked.score.impact?.sentence ?? picked.score.note}</span>
+                                {rca === true && pickedRca ? (
+                                    // One way only: the Root cause view gets the target and the minutes, and investigates them blind (ADR 0031).
+                                    <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { incident: windowKey(pickedRca.target, pickedRca.from, pickedRca.to) })}>
+                                        Root cause
+                                    </Button>
+                                ) : null}
                             </p>
                         ) : null}
                     </>
@@ -200,8 +218,9 @@ export default function ScoreboardPage() {
                     table={{ columns: POSTMORTEM_COLUMNS, rows: csvRows, caption: "Every injected fault" }}
                     summary={`${summary.visible} of ${summary.faults} faults had their signal visible in the telemetry.`}
                     askPrompt="Did we catch every fault in this session? Which ones were slowest to show their signal or to recover, and why?"
-                    // The scoreboard grades the session against its answer key: shown here, labeled, and never handed to the chat (ADR 0031).
-                    ask={false}
+                    // The scoreboard grades the session against its answer key: shown here, labeled, and never handed to the chat. With
+                    // the RCA tables, the chat triages a whole session's minutes blind instead (ADR 0031).
+                    ask={rca === true && plan.kind === "session" ? triageAsk({ title: "The session's minutes", from: plan.start, to: plan.end }) : false}
                 >
                     <DataGrid columns={columns(lens)} rows={rows} caption="Every injected fault" exportName="scoreboard" onRowClick={(r) => setSelected(r.key)} rowLabel={(r) => `Select ${r.target} ${r.fault}`} />
                 </VisualCard>

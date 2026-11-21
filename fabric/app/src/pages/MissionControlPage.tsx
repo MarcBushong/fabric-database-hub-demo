@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import { Button, Link, MessageBar, MessageBarBody } from "@fluentui/react-components";
-import { Replay20Regular, Open16Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
+import { Replay20Regular, Open16Regular, TextBulletListTree20Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { EmptyState } from "@/components/EmptyState";
@@ -44,7 +44,7 @@ const SERVICE_COLUMNS: ColumnSpec[] = [
 ];
 
 export default function MissionControlPage() {
-    const { view, setView, navigate, runtime, meta, provenance, reducedMotion, manage } = useApp();
+    const { view, setView, navigate, runtime, meta, provenance, reducedMotion, manage, rca } = useApp();
     const data = useMission();
     const [lens, setLens] = useState<Lens>("technical");
     const [postmortem, setPostmortem] = useState<PostmortemInput | null>(null);
@@ -96,6 +96,12 @@ export default function MissionControlPage() {
                         <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: view.session })}>
                             Scoreboard
                         </Button>
+                        {rca === true ? (
+                            // The blind investigation of the history's newest minutes (ADR 0031): one way, it never links back.
+                            <Button size="small" icon={<TextBulletListTree20Regular />} onClick={() => navigate("rca")}>
+                                Root cause
+                            </Button>
+                        ) : null}
                         <PostmortemButton ready={Boolean(plan) && !data.loading} scoreError={data.scoreError} onClick={openPostmortem} />
                         <Button
                             size="small"

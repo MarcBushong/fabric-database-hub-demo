@@ -12,7 +12,7 @@ import { LiveNow } from "@/components/LiveNow";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { FAMILY_LABEL, toBins, toCaptureFindings, toChecks, toCosmosCapture, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
+import { FAMILY_LABEL, newestSessionWindow, toBins, toCaptureFindings, toChecks, toCosmosCapture, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
 import {
     cosmosFindingsQuery,
     cosmosSeriesQuery,
@@ -33,6 +33,7 @@ import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber } from 
 import { cosmosHealth, postgresHealth, sqlHealth } from "@/lib/health";
 import { coverageInsight, dominantWaitInsight, freshnessInsight, lagInsight } from "@/lib/insights";
 import { worstStatus } from "@/lib/status";
+import { findIncidentsAsk, triageAsk } from "@/rca/entry";
 import { PageHeader } from "@/shell/PageHeader";
 
 export const OVERVIEW_PROMPT = "Which databases need attention this week, and why?";
@@ -62,7 +63,7 @@ export function FirstRun() {
 }
 
 export default function OverviewPage() {
-    const { filters, view, navigate, meta, metaLoading, metaError, provenance } = useApp();
+    const { filters, view, navigate, meta, metaLoading, metaError, provenance, rca } = useApp();
     const copilot = useCopilot();
     const estateSpec = useMemo(() => (filters.targets.length ? estateQuery(filters) : null), [filters]);
     const seriesSpec = useMemo(() => (filters.targets.length ? seriesQuery(filters) : null), [filters]);
@@ -101,6 +102,7 @@ export default function OverviewPage() {
     const summary = useMemo(() => toReadinessSummary(summaryState.data?.rows ?? []), [summaryState.data]);
     const checks = useMemo(() => toChecks(checksState.data?.rows ?? []), [checksState.data]);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
+    const sessionWindow = useMemo(() => newestSessionWindow(sessions), [sessions]);
     const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
     const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
@@ -243,8 +245,9 @@ export default function OverviewPage() {
                         table={incidentsState.data && incidentsSpec ? { columns: incidentsSpec.columns, rows: incidentsState.data.rows, caption: "Incident windows in the period" } : null}
                         summary={`${incidents.length} incident windows.`}
                         askPrompt="Which of these incidents matters most, what caused it, and is it resolved?"
-                        // The incident windows are the demo's answer key, with nothing measured beside them here: no Ask (ADR 0031).
-                        ask={false}
+                        // The incident windows are the demo's answer key: with the RCA tables, the chat finds the incidents itself, from
+                        // the signals; without them, nothing measured is beside the windows here, so no Ask (ADR 0031).
+                        ask={rca === true ? findIncidentsAsk() : false}
                         quiet
                     >
                         <ol className="feed">
@@ -354,8 +357,9 @@ export default function OverviewPage() {
                         emptyText="No session in this period. Run all in NB_DatabaseHub_Control starts one."
                         table={sessionsState.data ? { columns: sessionsSpec.columns, rows: sessionsState.data.rows, caption: "Sessions and activity requests" } : null}
                         summary={`${sessions.length} activity requests.`}
-                        // What the control ran is the demo's plan, the answer key: no Ask (ADR 0031).
-                        ask={false}
+                        // What the control ran is the demo's plan, the answer key: with the RCA tables, the chat triages the newest
+                        // session's minutes blind; without them, no Ask (ADR 0031).
+                        ask={rca === true && sessionWindow ? triageAsk({ title: "The newest session's minutes", ...sessionWindow }) : false}
                         quiet
                     >
                         <ol className="feed">

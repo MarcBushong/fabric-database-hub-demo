@@ -9,6 +9,9 @@ export const RCA_TARGETS: readonly RcaTarget[] = ["T1", "T2", "T3", "T4", "T4-re
 
 export const isRcaTarget = (value: unknown): value is RcaTarget => typeof value === "string" && (RCA_TARGETS as readonly string[]).includes(value);
 
+/** Without a time, an investigation reads the history's newest minutes: a session's length. */
+export const NEWEST_MINUTES = 90;
+
 /** 'RCA Sessions': one session in one blocking sample. SQL Server and PostgreSQL share it. */
 export interface SessionSample {
     target: RcaTarget;
