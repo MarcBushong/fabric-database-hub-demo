@@ -4336,6 +4336,8 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 
 **Risks.** The ending takes about 3 to 4 more minutes on that one update (one `rayfin up` and the app's checks), after the VMs are stopped, so it bills nothing more. A Ctrl+C during it keeps the earlier records; the next deploy reads the readiness again.
 
+**After the review (2026-11-20).** A Ctrl+C during that deploy left the status page's Insights app and Ask rows **Running** on a DONE page: `Invoke-DemoInsightsAppStep` sets both to Running first and lets a stop of the run through. `Complete-DemoInsightsAppMigration` now calls it in `try`/`finally`, and when it didn't return, the rows show the app as this run deployed it earlier (`Restore-DemoInsightsAppRow`, which the failure branch uses too), whose records the results keep. A test in `DbHubDemo.OneCommand.Tests.ps1` (the stop simulated in a pipeline of the same runspace) fails without the change.
+
 ### The scenario bounds during a session (F20, 2026-11-20)
 
 **Why.** The final tests (dbhubfu, 2026-11-20): on a running demo, `validate.ps1`'s `WORKLOAD.T1.BOUNDS` to `WORKLOAD.T5.BOUNDS` were each a **Warning**, "The runner's status ... couldn't be parsed (a Run Command keeps only the last 4,096 bytes of output)" (R346). The VM's relay keeps the last 1,800 characters of the runner's output, and `status --json --runs 5` writes its runs near its top: a status with two runs is about 2,100 characters, five about 3,600, so after any session the runs were cut off, and the bounds were never checked during one.

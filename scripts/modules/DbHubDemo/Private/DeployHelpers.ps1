@@ -1464,7 +1464,18 @@ function Complete-DemoInsightsAppMigration {
         return @()
     }
     Write-DemoLog -Message $reason
-    $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Result -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    $earlier = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    $records = $null
+    try {
+        $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Result -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    }
+    finally {
+        if ($null -eq $records) {
+            # Stopped (Ctrl+C) during the deploy once more (the review of 2026-11-20): the step set both rows to Running and
+            # let the stop through, so they show the app as this run deployed it earlier, whose records the results keep.
+            Restore-DemoInsightsAppRow -Record $earlier -ProgressPath $ProgressPath
+        }
+    }
     $deploy = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
     if ($null -ne $deploy -and [string]$deploy.status -eq 'Pass') {
         # The script's records come back through JSON, so their evidence is an object; a test's may be a dictionary.
@@ -1480,13 +1491,33 @@ function Complete-DemoInsightsAppMigration {
     $why = if ($null -ne $deploy) { '{0}: {1}' -f [string]$deploy.checkId, [string]$deploy.message } else { (Get-DemoInsightsAppSummary -Result $records).Reason }
     $warning = ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.MIGRATION' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('{0} But the app''s deploy once more didn''t pass ({1}), so its Migration card shows the Azure portal''s path to T2''s assessment until the next deploy. The app deployed earlier in this run works as before.' -f $reason, $why.TrimEnd('.')) -Evidence ([ordered]@{ t2AssessmentUploadedAt = (Get-DemoEndStopUploadText -EndStop $EndStop) }) -Remediation 'Run ./scripts/configure-fabric-app.ps1: it deploys the app with T2''s readiness as Azure has it now, without the rest of the deployment.' -DocUrl 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment')
     # The status page shows the app as this run deployed it, with the Warning, not the deploy once more that didn't pass.
+    Restore-DemoInsightsAppRow -Record (@($earlier) + @($warning)) -ProgressPath $ProgressPath
+    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $warning.message, $warning.remediation)
+    return @($warning)
+}
+
+function Restore-DemoInsightsAppRow {
+    <#
+    .SYNOPSIS
+    The status page's Insights app and Ask rows from Record, the app's records as this run deployed it earlier, after the
+    app's step once more at the end of an update didn't pass or was stopped (Complete-DemoInsightsAppMigration, F18,
+    2026-11-20): that step sets both rows to Running first. Never throws. Internal.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Record = @(),
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
     try {
-        $earlier = @(@($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) }) + @($warning))
-        $app = Get-DemoInsightsAppSummary -Result $earlier
+        $app = Get-DemoInsightsAppSummary -Result $Record
         if ($null -ne $app) {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage -MaxLength 1200
         }
-        $ask = Get-DemoAskSummary -Result $earlier
+        $ask = Get-DemoAskSummary -Result $Record
         if ($null -ne $ask) {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State $ask.State -Status $ask.Status -Message $ask.StepMessage -MaxLength 1200
         }
@@ -1494,8 +1525,6 @@ function Complete-DemoInsightsAppMigration {
     catch {
         Write-DemoLog -Level Warning -Message ('The Insights app''s rows couldn''t be shown again on the status page: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
-    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $warning.message, $warning.remediation)
-    return @($warning)
 }
 
 function Get-DemoResolvedWorkspaceId {

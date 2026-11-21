@@ -2426,6 +2426,39 @@ Describe 'The stop at the end of an update: an update leaves the demo as it foun
             $row['status'] | Should -Be 'Warning'
             $row['message'] | Should -Match 'FABRIC\.APP\.MIGRATION'
         }
+
+        It 'shows the app''s and Ask''s rows as this run deployed them, not Running, when deploy.ps1 is stopped (Ctrl+C) during the deploy once more (the review of 2026-11-20)' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+                $script:order.Add('AppStep')
+                # The step sets both rows to Running first, then lets a stop of the run through.
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message 'Creating or updating the Insights app (it doesn''t block DONE).'
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Running' -Message 'Setting up the app''s Copilot chat relay with the app (it doesn''t block DONE).'
+                # What Ctrl+C does to the command that runs: every catch block is skipped, and finally blocks still run.
+                throw [System.Management.Automation.PipelineStoppedException]::new()
+            }
+            $run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            # In a pipeline of this runspace, which the stop ends alone, as Ctrl+C ends deploy.ps1's.
+            $shell = [powershell]::Create([System.Management.Automation.RunspaceMode]::CurrentRunspace)
+            try {
+                $null = $shell.AddScript('param($Run, $Config, $Result, $State) Complete-DemoDeploymentRun -Run $Run -Config $Config -Result $Result -State $State').AddArgument($run).AddArgument($script:config).AddArgument(@(New-UpdateResult)).AddArgument((New-FinishedState -WithT4))
+                try {
+                    $null = $shell.Invoke()
+                }
+                catch {
+                    $null = $_
+                }
+            }
+            finally {
+                $shell.Dispose()
+            }
+            $script:order | Should -Contain 'AppStep'
+            $app = Get-ModelStep -Path $run.ProgressPath -Id 'Fabric.App'
+            $app['state'] | Should -Be 'Done' -Because 'the app deployed earlier in this run works, and its records stay in the results'
+            $app['message'] | Should -Not -Match 'Creating or updating'
+            $ask = Get-ModelStep -Path $run.ProgressPath -Id 'Fabric.Ask'
+            $ask['state'] | Should -Not -Be 'Running'
+            $ask['message'] | Should -Not -Match 'Setting up the app'
+        }
     }
 }
 
