@@ -958,6 +958,68 @@ print(json.dumps(out))
         @($out.none).Count | Should -Be 0
     }
 
+    It 'says whether T3''s regression started, from T3''s CPU after the agent beat''s switch, once and before the response (F26)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $filled = Get-FilledNotebook -Zone 'UTC'
+        $driver = Join-Path -Path $TestDrive -ChildPath 'agent-regression.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import contextlib, datetime as dt, io, json, sys, types
+fake_requests = types.ModuleType("requests")
+fake_requests.RequestException = Exception
+sys.modules["requests"], sys.modules["pandas"] = fake_requests, types.ModuleType("pandas")
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+for index in range(3):
+    exec(cells[index], ns)
+ns["CATALOG"] = ns["load_catalog"](ns["CATALOG_JSON"])
+regress = dt.datetime(2026, 11, 21, 21, 17, 0, tzinfo=dt.timezone.utc)
+beat = {"agent": True, "regressUtc": regress, "respondUtc": regress + dt.timedelta(minutes=22.5)}
+
+def run(cpu, minutes, telemetry=True):
+    calls = []
+    def fake(start, end):
+        calls.append([(start - regress).total_seconds() / 60, (end - regress).total_seconds() / 60])
+        return cpu
+    ns["t3_cpu"] = fake
+    state, buffer = {}, io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        for minute in minutes:
+            ns["agent_regression"](beat, regress + dt.timedelta(minutes=minute), state, telemetry)
+    return {"printed": buffer.getvalue(), "result": list(state.get("regression") or []), "calls": calls,
+            "summary": ns["agent_summary"](beat, state, regress + dt.timedelta(minutes=40))}
+
+out = {"flat": run((6.0, ""), [5, 9, 10, 12]),
+       "runs": run((97.0, ""), [9]),
+       "late": run((None, ""), [9, 15, 20, 21]),
+       "noTelemetry": run((6.0, ""), [9], telemetry=False),
+       "afterResponse": run((6.0, ""), [23])}
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $filled 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $out = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        # Live (dbhubfn at bf010ed): the switch didn't hold and T3's CPU stayed at 6%. Its telemetry is read once, for the 5
+        # minutes from a minute after the switch, as soon as it can be in.
+        ($out.flat.calls | ForEach-Object { $_ -join '..' }) | Should -Be @('1..6')
+        $out.flat.result[0] | Should -Be 'Warning'
+        $out.flat.result[1] | Should -Be 'T3''s regression didn''t start: its CPU was 6% in the 5 minutes after the switch at 21:17, so Database Agents has no issue to raise this session, and the response at 21:39 has nothing to fix. T3''s run says why: its plan-switch-unverified event in demo.scenario_run_events. Fix: the next session runs the beat again.'
+        ($out.flat.printed.Trim() -split "`n").Count | Should -Be 1
+        $out.flat.summary[0] | Should -Be ('The Database Agent loop''s regression: Warning: ' + $out.flat.result[1])
+        $out.flat.summary[1] | Should -Match '^The Database Agent loop: T3''s response ran at 21:39 '
+        $out.runs.result | Should -Be @('Pass', 'T3''s regression runs: its CPU was 97% in the 5 minutes after the switch at 21:17, and Database Agents raises its issue about 15 minutes after it started.')
+        @($out.runs.summary).Count | Should -Be 1
+        # Telemetry that doesn't come: asked again until 20 minutes after the switch, then nothing, since the response says so.
+        @($out.late.calls).Count | Should -Be 3
+        $out.late.printed | Should -BeNullOrEmpty
+        @($out.late.result).Count | Should -Be 0
+        @($out.noTelemetry.calls).Count | Should -Be 0
+        @($out.afterResponse.calls).Count | Should -Be 0
+    }
+
     It 'runs a whole session on Run all: the start, the guide, the end, the stop, and its history, with one session ID' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'

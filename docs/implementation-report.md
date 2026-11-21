@@ -4463,3 +4463,34 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - A Run all during that hour is shorter than asked, and says so, until the moved time has passed or `./scripts/stop-demo.ps1` has put it back. A full session would need `Microsoft.DevTestLab/schedules/read` and `/write` in the control's role, which is the owner's call.
 - The control notebook's estimate before it sends can't know the moved time, since it reads no Azure; the runbook's **Plan** step corrects it.
 - A moved time from code before this change has no tag, so Run all doesn't see it until the next `deploy.ps1`, whose template puts the auto-shutdown back anyway.
+
+### The Database Agent beat's switch is checked (item 13, F26, 2026-11-21)
+
+**Why.** Found live on `dbhubfn` at bf010ed, by the final tests. At the switch of the 30-minute `incident:plan-regression` beat (`holdAutoCorrection`, with `FORCE_LAST_GOOD_PLAN` held off and confirmed), worker 1 compiled the scanning plan B, which Query Store shows ran 10 times. In the same second, the lookup's cached plan was the seek plan A again, compiled then, with 251,539 executions at about 100 µs. T3's CPU stayed at 6%, so there was no regression and no agent issue. Statistics hadn't changed, and nothing in the repository clears plans; the 15:09 beat's switch had held.
+
+**Cause.** `sp_recompile` only drops the cached plan, and the procedure's next run compiles it with that run's own parameter values ([sp_recompile](https://learn.microsoft.com/sql/relational-databases/system-stored-procedures/sp-recompile-transact-sql)). The other workers stayed out of the lookup only once they saw the switch's time. One of the six, already past that check and calling the lookup with a few patients, could compile around worker 1's switch and leave plan A in the cache. With 6 sessions at a 5 ms pause, one is almost always in flight, which makes it intermittent.
+
+**Work summary.**
+
+- **The procedure** (`demo.usp_scenario_plan_regression`):
+  - The other workers stay out from 2 seconds before the switch until 5 seconds after it.
+  - 7 seconds after the switch, worker 1 reads the lookup's cached plan (`sys.dm_exec_procedure_stats`, `sys.dm_exec_text_query_plan`), inside a TRY block. Plan A names `ix_appointments_patient`, and plan B scans and names no other index.
+  - A seek plan is switched again 20 and then 40 seconds after the first, in the other workers' fixed quiet windows then; at most 3 switches, never after the response. A plan that automatic tuning forced back already counts as the regression having run.
+  - Events `plan-switch`, `plan-switch-retry`, or `plan-switch-unverified`, and results `switch_attempts` and `switch_verified`.
+- **The control notebook:** `agent_regression` reads T3's CPU over the 5 minutes from a minute after the beat's switch, once that telemetry can be in and before the response, once. Below 30%, it prints a **Warning** that the regression didn't start; otherwise a **Pass**. `agent_summary` repeats the Warning at the session's end. Without telemetry it says nothing, since the response's check says so.
+- **Unchanged:** every way back for `FORCE_LAST_GOOD_PLAN` (the plan read can't end the run before its release), and the runner itself.
+
+**Changed files.** `database/common/120-scenario-procedures.sql`; `fabric/control/NB_DatabaseHub_Control.ipynb`; `scenarios/plan-regression/scenario.json` and `README.md`; `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs` and `tests/unit/Fabric.ControlNotebook.Tests.ps1`; ADR 0013, `fabric/control/README.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.**
+
+- The workload generator's tests, with the .NET SDK 10.0.403: 714 total, 695 passed, 19 skipped (they need a SQL Server), 0 failed. Among them, the new `SqlScriptTests` case and the ScriptDom parse of every demo script.
+- Pester under StrictMode: `Fabric.ControlNotebook`, 61 passed. `Automation.Runbooks`, `DbHubDemo.ActivityControl`, `Fabric.Notebooks`, and `Repo.Conventions`, 636 passed.
+- The new C# and notebook tests fail on the code before this change.
+- Not run live: whether the race is gone, and the plan read's permissions on T3, are next week's live checks.
+
+**Risks.**
+
+- The other workers also pause for 7 seconds 20 and 40 seconds after the switch, whether or not a second switch comes, since the workers don't talk to each other. The dip is too short to see on 1-minute charts.
+- The live view's 30% floor fits T3's 2 vCores under the beat's six sessions: 99% with the regression in the session of 2026-11-19, and 6% without it in F26.
+- A plan that can't be read (no permission, or none cached) is `plan-switch-unverified` with the reason, and the live view's CPU check still tells the presenter.
