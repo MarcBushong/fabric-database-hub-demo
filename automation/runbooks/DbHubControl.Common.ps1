@@ -6094,13 +6094,15 @@ function Get-DbHubRcaSetting {
     }
     $template = [string](Get-DbHubMember -InputObject $Settings -Name 'rcaScriptTemplate')
     return [pscustomobject]@{
-        Supported      = ($template.Contains('__REQUEST__') -and (Test-DbHubSessionCapable -Settings $Settings))
-        StopMinutes    = (& $read 'stopMinutes' 6 1 30)
-        RecheckMinutes = (& $read 'recheckMinutes' 8 1 30)
-        StartMinutes   = (& $read 'startMinutes' 6 1 30)
-        MaxParallel    = (& $read 'maxParallel' 10 1 20)
-        ExportSeconds  = (& $read 'exportSeconds' 600 60 900)
-        PartSeconds    = (& $read 'partSeconds' 120 30 900)
+        Supported         = ($template.Contains('__REQUEST__') -and (Test-DbHubSessionCapable -Settings $Settings))
+        StopMinutes       = (& $read 'stopMinutes' 6 1 30)
+        RecheckMinutes    = (& $read 'recheckMinutes' 8 1 30)
+        StartMinutes      = (& $read 'startMinutes' 6 1 30)
+        MaxParallel       = (& $read 'maxParallel' 10 1 20)
+        ExportSeconds     = (& $read 'exportSeconds' 600 60 900)
+        PartSeconds       = (& $read 'partSeconds' 120 30 900)
+        # How long the T2 host's export waits for a Run Command's delete before it asks again (R871).
+        HostDeleteSeconds = (& $read 'hostDeleteSeconds' 300 0 1800)
     }
 }
 
@@ -6113,8 +6115,8 @@ function Get-DbHubRcaHost {
     )
 
     return @(
-        [pscustomobject]@{ Vm = [string]$Settings.sqlVmName; Targets = @('T1', 'T3', 'T4', 'T4-replica') }
-        [pscustomobject]@{ Vm = [string]$Settings.hostVmName; Targets = @('T2') }
+        [pscustomobject]@{ Vm = [string]$Settings.sqlVmName; Targets = @('T1', 'T3', 'T4', 'T4-replica'); OneAtATime = $false }
+        [pscustomobject]@{ Vm = [string]$Settings.hostVmName; Targets = @('T2'); OneAtATime = $true }
     )
 }
 
@@ -6422,11 +6424,23 @@ function Invoke-DbHubRcaExport {
             $State.Queue.Add([pscustomobject]@{ DocumentId = $id; Part = $part })
         }
     }
+    # Deletes a Run Command once it's read, or its time is up. On the T2 host its slot stays taken until Azure no longer
+    # lists it (R871: there, parallel Run Commands' deletes failed, and the host's next start didn't get its goal state).
+    $release = {
+        param([object] $State, [string] $Name)
+        Clear-DbHubRcaRunCommand -Context $Context -VmName $State.Vm -Name $Name
+        if ($State.OneAtATime -and $bounds.HostDeleteSeconds -gt 0) {
+            $State.Deleting.Add([pscustomobject]@{ Name = $Name; SinceUtc = (Get-DbHubUtcNow); Round = 1 })
+        }
+        else {
+            $State.Free++
+        }
+    }
     foreach ($entry in (Get-DbHubRcaHost -Settings $settings)) {
         if (@($OnlyVm).Count -gt 0 -and $entry.Vm -notin $OnlyVm) {
             continue
         }
-        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Free = 0; Sequence = 0; Listed = 0 }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0 }
         $hosts.Add($state)
         $earlier = @($Pending | Where-Object { $null -ne $_ -and [string](Get-DbHubMember -InputObject $_ -Name 'vm') -eq $entry.Vm })
         $power = Get-DbHubVmState -Context $Context -VmName $entry.Vm
@@ -6490,8 +6504,7 @@ function Invoke-DbHubRcaExport {
                 $view = Read-DbHubRunCommandView -Context $Context -VmName $state.Vm -Name $state.Export
                 if ($view.Found -and $view.ExecutionState -in $script:DbHubRcaTerminal) {
                     $state.ExportDone = $true
-                    Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $state.Export
-                    $state.Free++
+                    & $release $state $state.Export
                     $out = ConvertFrom-DbHubRcaOutput -Output $view.Output
                     if ($out.OldBundle) {
                         $state.Outcome = 'OldBundle'
@@ -6539,14 +6552,33 @@ function Invoke-DbHubRcaExport {
                     $state.Message = '{0}''s export didn''t end in time, so what its observer captured stays on it until the next export.' -f $state.Vm
                 }
             }
+            # The T2 host's deletes, one Run Command at a time there (R871): a slot comes back once Azure no longer lists it;
+            # a delete Azure doesn't finish in time is asked for once more, and after a second one the host gets no more.
+            foreach ($item in @($state.Deleting.ToArray())) {
+                $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}' -f (Get-DbHubDemoPath -Settings $settings), $state.Vm, $item.Name) -ApiVersion (Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands')
+                if ($read.StatusCode -eq 404) {
+                    $null = $state.Deleting.Remove($item)
+                    $state.Free++
+                    continue
+                }
+                if (((Get-DbHubUtcNow) - $item.SinceUtc).TotalSeconds -lt $bounds.HostDeleteSeconds) {
+                    continue
+                }
+                $null = $state.Deleting.Remove($item)
+                if ($item.Round -lt 2) {
+                    Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $item.Name
+                    $state.Deleting.Add([pscustomobject]@{ Name = $item.Name; SinceUtc = (Get-DbHubUtcNow); Round = 2 })
+                    continue
+                }
+                $state.Blocked = $true
+            }
             foreach ($flight in @($state.InFlight.ToArray())) {
                 $view = Read-DbHubRunCommandView -Context $Context -VmName $state.Vm -Name $flight.Name
                 $ended = $view.Found -and $view.ExecutionState -in $script:DbHubRcaTerminal
                 if (-not $ended -and -not $late) {
                     continue
                 }
-                Clear-DbHubRcaRunCommand -Context $Context -VmName $state.Vm -Name $flight.Name
-                $state.Free++
+                & $release $state $flight.Name
                 $null = $state.InFlight.Remove($flight)
                 if (-not $ended) {
                     continue
@@ -6561,7 +6593,15 @@ function Invoke-DbHubRcaExport {
                     $document.Gone = $true
                 }
             }
-            while (-not $late -and $state.Queue.Count -gt 0 -and $state.InFlight.Count -lt $bounds.MaxParallel -and $state.Free -gt 0) {
+            $limit = $bounds.MaxParallel
+            if ($state.OneAtATime) {
+                $limit = 1
+            }
+            $taken = $state.InFlight.Count + $state.Deleting.Count
+            if ($state.OneAtATime -and -not $state.ExportDone) {
+                $taken++
+            }
+            while (-not $late -and -not $state.Blocked -and $state.Queue.Count -gt 0 -and $taken -lt $limit -and $state.Free -gt 0) {
                 $item = $state.Queue[0]
                 $state.Queue.RemoveAt(0)
                 $document = $documents[$item.DocumentId]
@@ -6573,9 +6613,10 @@ function Invoke-DbHubRcaExport {
                 if (Send-DbHubRunCommand -Context $Context -VmName $state.Vm -Name $name -Script (Get-DbHubRcaScript -Settings $settings -Request $request) -TimeoutSeconds ($bounds.PartSeconds + 60) -ConflictDelaySeconds 10) {
                     $state.InFlight.Add([pscustomobject]@{ Name = $name; DocumentId = $item.DocumentId; Part = $item.Part })
                     $state.Free--
+                    $taken++
                 }
             }
-            if (-not $state.ExportDone -or $state.InFlight.Count -gt 0 -or ($state.Queue.Count -gt 0 -and -not $late)) {
+            if (-not $state.ExportDone -or $state.InFlight.Count -gt 0 -or ($state.Queue.Count -gt 0 -and -not $late -and -not $state.Blocked)) {
                 $busy = $true
             }
         }
@@ -6621,6 +6662,9 @@ function Invoke-DbHubRcaExport {
             }
             if ($gone -gt 0) {
                 $message = '{0} {1} document(s) that its export listed weren''t on {2} any more.' -f $message, $gone, $state.Vm
+            }
+            if ($state.Blocked) {
+                $message = '{0} Azure didn''t delete a Run Command on {1} twice, so it got no more parts in this export (R871).' -f $message, $state.Vm
             }
         }
         $answers.Add([pscustomobject]@{ Vm = $state.Vm; Targets = $state.Targets; Outcome = $outcome; Message = $message })
@@ -6944,7 +6988,9 @@ function Invoke-DbHubRcaSessionExport {
     foreach ($item in @($state['documents'])) {
         $null = $known.Add([string]$item['documentId'])
     }
-    # Each document fetched whole, checked: its SHA-256, and that it's this session's.
+    # Each document fetched whole, checked: its SHA-256, and that it's this session's, or that either has no session (the
+    # operator's scripts export with --session none, and NB_DatabaseHub_LiveActivity writes a document when its session is
+    # the run's, or either is empty; rca/README.md, RCA_EVIDENCE).
     $notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $good = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $parsed = New-Object -TypeName 'System.Collections.Generic.List[object]'
@@ -6956,7 +7002,7 @@ function Invoke-DbHubRcaSessionExport {
             continue
         }
         $documentSession = [string](Get-DbHubMember -InputObject $expanded.Document -Name 'sessionId')
-        if ($documentSession -ne $SessionId) {
+        if ($documentSession -and $SessionId -and $documentSession -ne $SessionId) {
             $notes.Add(('{0} was skipped: it''s another session''s.' -f $id))
             continue
         }

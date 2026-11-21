@@ -140,6 +140,12 @@ BeforeAll {
         $script:rcaCommands = [System.Collections.Generic.List[object]]::new()
         $script:rcaDeleted = [System.Collections.Generic.List[string]]::new()
         $script:rcaRunner = { New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.' }
+        # How many reads a deleted Rca Run Command stays listed for, by VM (Azure's deletes take a while; R871), and the reads
+        # left for each one being deleted. By default a delete is done at once.
+        $script:rcaDeleteDelay = @{}
+        $script:rcaDeleteReads = @{}
+        # The most Rca Run Commands a VM listed at once, a deleting one included, by VM.
+        $script:rcaMostOpen = @{}
         # Key Vault versions of the secrets the runbook writes, counted (Secrets - Create Or Update returns secretUriWithVersion).
         $script:secretVersions = 0
     }
@@ -389,11 +395,21 @@ BeforeAll {
                     # A Run Command created again under its name is a new one.
                     $null = $script:rcaDeleted.Remove($name)
                     $script:rcaCommands.Add([pscustomobject]@{ Vm = $vmName; Name = $name; Request = (ConvertFrom-TestRcaScript -Script ([string]$Body.properties.source.script)); At = $script:clock })
+                    $open = @($script:rcaCommands | Where-Object { $_.Vm -eq $vmName -and ($script:rcaDeleted -notcontains $_.Name -or ($script:rcaDeleteReads.ContainsKey($_.Name) -and $script:rcaDeleteReads[$_.Name] -gt 0)) }).Count
+                    $script:rcaMostOpen[$vmName] = [System.Math]::Max([int]$script:rcaMostOpen[$vmName], $open)
                     return (New-Response 201 '{}')
                 }
                 if ($Method -eq 'DELETE') {
                     $script:rcaDeleted.Add($name)
+                    if ($script:rcaDeleteDelay.ContainsKey($vmName) -and -not $script:rcaDeleteReads.ContainsKey($name)) {
+                        $script:rcaDeleteReads[$name] = [int]$script:rcaDeleteDelay[$vmName]
+                    }
                     return (New-Response 200)
+                }
+                if ($script:rcaDeleted -contains $name -and $script:rcaDeleteReads.ContainsKey($name) -and $script:rcaDeleteReads[$name] -gt 0) {
+                    # Still being deleted: Azure lists it, and it counts toward the VM's 25.
+                    $script:rcaDeleteReads[$name]--
+                    return (New-Response 200 '{"properties":{"provisioningState":"Deleting"}}')
                 }
                 return (New-Response 404)
             }
@@ -3171,6 +3187,83 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         }
         $null = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('sqlvm01')
         $script:most | Should -Be 5
+    }
+
+    It 'fetches the T2 host''s parts one Run Command at a time, each gone before the next, and stops sending when Azure doesn''t delete one (R871)' {
+        # archost01's runner exports T1's fixture document, two parts; Azure takes two reads to delete each Run Command there.
+        $first = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $script:fixtureIds[0] })
+        $index = [ordered]@{ kind = 'ContosoCare.RcaExportIndex'; version = 1; documents = @([ordered]@{ documentId = $script:fixtureIds[0]; parts = $first.Count; sha256 = $first[0].Split(' ')[4] }); status = 'Pass'; message = '1 document.' }
+        $script:hostIndex = 'DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject $index -Depth 5 -Compress)
+        $script:hostParts = $first
+        $script:rcaDeleteDelay = @{ archost01 = 2 }
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca export: its line follows.' -Line $script:hostIndex)
+            }
+            $line = @($script:hostParts | Where-Object { $_.Split(' ')[3].StartsWith(('{0}/' -f $Command.Request.part)) })[0]
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('archost01')
+        $script:rcaMostOpen['archost01'] | Should -Be 1
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }).Count | Should -Be $first.Count
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] }) | Should -Be @($script:fixtureIds[0])
+        $done.State['status'] | Should -Be 'Pass'
+
+        # Azure never finishes a delete there: asked twice, then the host gets no more parts, which wait for the next export.
+        $runner = $script:rcaRunner
+        Reset-TestAzure
+        $script:rcaRunner = $runner
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:rcaDeleteDelay = @{ archost01 = 100000 }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('archost01')
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'part' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/runCommands/DbHubControl-rca-archost01-x-' }).Count | Should -Be 2
+        @($done.State['pending'] | ForEach-Object { '{0}@{1}' -f $_['documentId'], $_['vm'] }) | Should -Be @(('{0}@archost01' -f $script:fixtureIds[0]))
+        $line = @($done.Lines | Where-Object { $_.Step -eq 'RCA.EXPORT' })[0]
+        $line.Status | Should -Be 'Warning'
+        $line.Message | Should -Match 'Azure didn''t delete a Run Command on archost01 twice, so it got no more parts in this export \(R871\)\.'
+    }
+
+    It 'takes a document of no session with the session''s evidence, as the notebook writes it, and skips another session''s' {
+        # The operator's scripts export with --session none: a span they bound keeps no session for its later documents.
+        $template = Get-Content -LiteralPath (Join-Path -Path $script:rcaRoot -ChildPath 'fixtures/t1-blocking-chain.evidence.json') -Raw | ConvertFrom-Json
+        $script:servedParts = @{}
+        $references = foreach ($case in @(@{ Id = '20261120T180000Z-sqlvm01-0003'; Session = $null }, @{ Id = '20261120T181500Z-sqlvm01-0004'; Session = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })) {
+            $template.documentId = $case.Id
+            $template.sessionId = $case.Session
+            $plain = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $template -Depth 30 -Compress))
+            $memory = [System.IO.MemoryStream]::new()
+            $gzip = [System.IO.Compression.GZipStream]::new($memory, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+            $gzip.Write($plain, 0, $plain.Length)
+            $gzip.Dispose()
+            $bytes = $memory.ToArray()
+            $sha = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+            $count = [int][System.Math]::Ceiling($bytes.Length / 2400.0)
+            $script:servedParts[$case.Id] = @(for ($i = 0; $i -lt $count; $i++) { 'DBHUBDEMO-RCA 1 {0} {1}/{2} {3} {4}' -f $case.Id, ($i + 1), $count, $sha, [System.Convert]::ToBase64String($bytes, $i * 2400, [System.Math]::Min(2400, $bytes.Length - $i * 2400)) })
+            [ordered]@{ documentId = $case.Id; parts = $count; sha256 = $sha }
+        }
+        $script:servedIndex = 'DBHUBDEMO-RCA-INDEX ' + (ConvertTo-Json -InputObject ([ordered]@{ kind = 'ContosoCare.RcaExportIndex'; version = 1; documents = @($references); status = 'Pass'; message = '2 documents.' }) -Depth 5 -Compress)
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Pass' -Message 'runner rca export: its line follows.' -Line $script:servedIndex)
+            }
+            $line = @($script:servedParts[[string]$Command.Request.documentId] | Where-Object { $_.Split(' ')[3].StartsWith(('{0}/' -f $Command.Request.part)) })[0]
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] }) | Should -Be @('20261120T180000Z-sqlvm01-0003')
+        $line = @($done.Lines | Where-Object { $_.Step -eq 'RCA.EXPORT' })[0]
+        $line.Status | Should -Be 'Warning'
+        $line.Message | Should -Match '20261120T181500Z-sqlvm01-0004 was skipped: it''s another session''s\.'
+        # A stop of no session (start-demo.ps1's auto-stop through the control) takes any session's.
+        $runner = $script:rcaRunner
+        Reset-TestAzure
+        $script:rcaRunner = $runner
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $done = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId '' -Final -Minutes 30 -OnlyVm @('sqlvm01')
+        @($done.State['documents'] | ForEach-Object { $_['documentId'] } | Sort-Object) | Should -Be @('20261120T180000Z-sqlvm01-0003', '20261120T181500Z-sqlvm01-0004')
     }
 
     It 'stops at its time, deletes what''s still running, and keeps the documents it didn''t fetch whole for the next export' {
