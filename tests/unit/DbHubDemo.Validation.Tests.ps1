@@ -306,7 +306,7 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
         $health.status | Should -Be 'Warning'
         $health.message | Should -Be 'sqlvm01 reports Ready: Every step is in the desired state. Its bootstrap has 3 warnings: AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it; SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure (1 more).'
-        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it and says what happens next\. It stays until the next bootstrap generation, which the next \./scripts/deploy\.ps1 that sends sqlvm01 a new bundle starts, checks its step again'
+        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it and says what happens next\. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next \./scripts/deploy\.ps1 that sends sqlvm01 a new bundle starts; any other warning stays while its cause does, until its step runs again\.'
         $health.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists them all\.$'
         $health.remediation | Should -Not -Match 'still working' -Because 'a Ready bootstrap isn''t working or waiting'
         $health.evidence['warningCount'] | Should -Be 3

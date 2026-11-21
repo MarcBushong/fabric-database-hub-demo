@@ -215,28 +215,30 @@ function Get-DemoJumpstartImageDecision {
     )
 
     if ($Length -ne $Remote.ContentLength) {
-        return [pscustomobject]@{ Outcome = 'Incomplete'; Pinned = $false; Message = ('The download has {0:N0} of {1:N0} bytes.' -f $Length, $Remote.ContentLength); Warning = @() }
+        return [pscustomobject]@{ Outcome = 'Incomplete'; Pinned = $false; Message = ('The download has {0:N0} of {1:N0} bytes.' -f $Length, $Remote.ContentLength); Warning = @(); Note = @() }
     }
     if ($Remote.ContentMd5 -and $Hash.Md5Base64 -and $Hash.Md5Base64 -ne $Remote.ContentMd5) {
-        return [pscustomobject]@{ Outcome = 'Fail'; Pinned = $false; Message = ('The download doesn''t match the image''s own Content-MD5 (expected {0}, got {1}).' -f $Remote.ContentMd5, $Hash.Md5Base64); Warning = @() }
+        return [pscustomobject]@{ Outcome = 'Fail'; Pinned = $false; Message = ('The download doesn''t match the image''s own Content-MD5 (expected {0}, got {1}).' -f $Remote.ContentMd5, $Hash.Md5Base64); Warning = @(); Note = @() }
     }
     $pinned = ([string]$Remote.ETag -eq [string]$Pin['etag'] -and $Remote.ContentLength -eq [long]$Pin['sizeBytes'])
     $warnings = @()
+    # How this download was checked: one-off notes, which the next bootstrap generation clears (the F24 review, 2026-11-20).
+    $notes = @()
     if ($pinned -and $Pin['sha256'] -and $Hash.Sha256 -ne ([string]$Pin['sha256']).ToLowerInvariant()) {
-        return [pscustomobject]@{ Outcome = 'Fail'; Pinned = $true; Message = ('The tested image doesn''t match its pinned SHA-256 (expected {0}, got {1}).' -f ([string]$Pin['sha256']).ToLowerInvariant(), $Hash.Sha256); Warning = @() }
+        return [pscustomobject]@{ Outcome = 'Fail'; Pinned = $true; Message = ('The tested image doesn''t match its pinned SHA-256 (expected {0}, got {1}).' -f ([string]$Pin['sha256']).ToLowerInvariant(), $Hash.Sha256); Warning = @(); Note = @() }
     }
     if (-not $Remote.ContentMd5 -or -not $Hash.Md5Base64) {
         if ($pinned -and $Pin['sha256']) {
-            $warnings += 'The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256.'
+            $notes += 'The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256.'
         }
         else {
-            $warnings += 'The image has no Content-MD5 here and no pinned SHA-256, so only its length was checked; the image checks run next.'
+            $notes += 'The image has no Content-MD5 here and no pinned SHA-256, so only its length was checked; the image checks run next.'
         }
     }
     if (-not $pinned) {
         $warnings += ('Jumpstart published another ArcBox SQL Server Standard image than the one this repository was tested with (etag {0}, Last-Modified {1}; tested: etag {2}, {3}). T2 uses it once the guest passes the image checks (JumpstartImageCheck); config/versions.json media.jumpstartArcBoxSqlStd records the tested one.' -f $Remote.ETag, $Remote.LastModified, $Pin['etag'], $Pin['lastModified'])
     }
-    return [pscustomobject]@{ Outcome = $(if ($pinned) { 'Pinned' } else { 'Newer' }); Pinned = $pinned; Message = ''; Warning = $warnings }
+    return [pscustomobject]@{ Outcome = $(if ($pinned) { 'Pinned' } else { 'Newer' }); Pinned = $pinned; Message = ''; Warning = $warnings; Note = $notes }
 }
 
 function Test-DemoJumpstartImage {
@@ -414,8 +416,8 @@ function Save-DemoJumpstartImage {
     Remove-Item -LiteralPath $sidecar -Force -ErrorAction SilentlyContinue
     Set-DemoHostGuestSource -Context $Context -Source 'JumpstartImage'
     Write-DemoVmLog -Message ('The Jumpstart image is in place: {0:N1} GiB, etag {1}, SHA-256 {2}, {3}.' -f ($length / 1GB), $remote.ETag, $hash.Sha256, $(if ($decision.Pinned) { 'the tested image' } else { 'another image than the tested one' }))
-    if (@($decision.Warning).Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage @($decision.Warning))
+    if (@($decision.Warning).Count -gt 0 -or @($decision.Note).Count -gt 0) {
+        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage @($decision.Warning) -TransientWarningMessage @($decision.Note))
     }
 }
 

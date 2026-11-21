@@ -179,7 +179,8 @@ function Grant-DemoSqlVmSysadmin {
         Start-Service -Name $sql.ServiceName
         Start-Service -Name $sql.AgentService -ErrorAction SilentlyContinue
     }
-    return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage ('SYSTEM was not a sysadmin, so {0} was made one with the documented lockout-recovery procedure.' -f $sql.AdminLogin))
+    # A one-off recovery: the next bootstrap generation clears its note (the F24 review, 2026-11-20).
+    return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage ('SYSTEM was not a sysadmin, so {0} was made one with the documented lockout-recovery procedure.' -f $sql.AdminLogin))
 }
 
 function Get-DemoSqlVmDatabaseStatus {
@@ -577,11 +578,13 @@ function Disable-DemoSqlVmAssociatedService {
         return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage (@('Uninstalling {0} didn''t pass (exit code {1}, final result "{2}", {3} service(s) left; see {4}). {5}' -f $settings.Features, $exitCode, $final, $left.Count, $settings.SummaryPath, $keep) + $warnings))
     }
     Write-DemoVmLog -Message ('Uninstalled {0} with SQL Server setup (exit code {1}, final result {2}).' -f $settings.Features, $exitCode, $final)
+    # The restart setup asked for is a one-off note, which the next bootstrap generation clears (the F24 review, 2026-11-20).
+    $notes = @()
     if ($exitCode -eq 3010) {
-        $warnings = @('SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.') + $warnings
+        $notes = @('SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
     }
-    if ($warnings.Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings)
+    if ($warnings.Count -gt 0 -or $notes.Count -gt 0) {
+        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings -TransientWarningMessage $notes)
     }
 }
 
@@ -639,7 +642,8 @@ function Clear-DemoSqlVmAutoLogonSecret {
     Write-DemoVmJsonFile -Path (Join-Path -Path $Context.Root -ChildPath 'sign-in-secret.json') -InputObject ([ordered]@{ schemaVersion = 1; found = $kind; note = $note; updatedUtc = (Get-DemoVmUtcNow) })
     Write-DemoVmLog -Message $note
     if ($kind -eq 'Armed') {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $note)
+        # What the cleanup did, once: the next bootstrap generation clears the note (the F24 review, 2026-11-20).
+        return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage $note)
     }
 }
 

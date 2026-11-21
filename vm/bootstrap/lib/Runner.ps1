@@ -103,9 +103,10 @@ function Invoke-DemoVmStateMachine {
         }
         $state['generation'] = $Generation
         $state['completedUtc'] = $null
-        # The warnings are this generation's (F24, 2026-11-20): every step is checked again, and one whose cause is still
-        # there says it again, so a note an earlier pass left, such as a restart that has happened since, goes away.
-        $state['warnings'] = @()
+        # The one-off notes go with a new generation, such as a restart that has happened since (F24, 2026-11-20). Every
+        # other warning stays until its step's Set runs again: a step whose cause lasts passes its Test now, so its Set
+        # wouldn't say it again (the F24 review).
+        Clear-DemoVmTransientWarning -State $state
     }
     if ($state['pendingReboot']) {
         Write-DemoVmLog -Message 'Resuming after a restart.'
@@ -165,9 +166,16 @@ function Invoke-DemoVmStateMachine {
                 Write-DemoVmLog -Step $name -Level 'Warning' -Message ('Could not write the in-progress health.json: {0}' -f $_.Exception.Message)
             }
             Write-DemoVmLog -Step $name -Message 'Converging.'
+            # The step's Set says again what still holds, so its earlier warnings go first (the F24 review, 2026-11-20).
+            Remove-DemoVmStepWarning -State $state -Step $name
             $result = Get-DemoVmStepOutcome -Output @(& $definition['Set'] $definition)
             foreach ($warning in @($result.WarningMessage)) {
                 Add-DemoVmWarning -State $state -Message $warning -Step $name
+            }
+            if ($result.PSObject.Properties['TransientWarningMessage']) {
+                foreach ($warning in @($result.TransientWarningMessage)) {
+                    Add-DemoVmWarning -State $state -Message $warning -Step $name -Transient
+                }
             }
 
             if ($result.Outcome -eq 'Done') {

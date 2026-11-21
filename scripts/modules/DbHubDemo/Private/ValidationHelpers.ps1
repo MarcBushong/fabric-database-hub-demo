@@ -439,8 +439,8 @@ function Get-DemoHealthWarningNote {
     health.json's status is a Warning when the state is Ready and it has warnings (vm/health/README.md). Before, the
     validator's INFRA.HEALTH.<vm> and status.ps1's STATUS.VM_<vm> said only "<vm> reports Ready: Every step is in the
     desired state." with "The bootstrap is still working or waiting" as the fix (dbhubfn and dbhubfu, 2026-11-20). Since
-    2026-11-20 the bootstrap names each warning's step, a new bootstrap generation starts its list again, and the summary
-    view prints the first two (warnings, warningCount).
+    2026-11-20 the bootstrap names each warning's step, a new bootstrap generation clears its one-off notes (the others
+    stay while their cause does), and the summary view prints the first two (warnings, warningCount).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -474,7 +474,7 @@ function Get-DemoHealthWarningNote {
         Count       = $total
         Known       = $true
         Text        = ('Its bootstrap has {0}: {1}{2}.' -f $noun, $list, $more)
-        Remediation = ('Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. It stays until the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts, checks its step again; one whose cause is gone then goes away. {1}' -f $VmName, $full)
+        Remediation = ('Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts; any other warning stays while its cause does, until its step runs again. {1}' -f $VmName, $full)
     }
 }
 function Test-DemoValidationWorkloadBound {

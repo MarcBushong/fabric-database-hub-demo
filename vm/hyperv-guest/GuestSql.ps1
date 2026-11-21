@@ -251,7 +251,8 @@ function Get-DemoSignInStepResult {
         return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message $steps[0] -Instruction $steps)
     }
     if ($cleared.Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage ('The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')))
+        # What the cleanup did, once: the next bootstrap generation clears the note (the F24 review, 2026-11-20).
+        return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage ('The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')))
     }
     return $null
 }

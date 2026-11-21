@@ -21,6 +21,7 @@ function Get-DemoVmState {
         message            = 'The bootstrap has not run yet.'
         instructions       = @()
         warnings           = @()
+        transientWarnings  = @()
         pendingReboot      = $false
         rebootRequestedUtc = $null
         rebootCount        = 0
@@ -39,6 +40,7 @@ function Get-DemoVmState {
     }
     $state['instructions'] = @($state['instructions'] | Where-Object { $_ })
     $state['warnings'] = @($state['warnings'] | Where-Object { $_ })
+    $state['transientWarnings'] = @($state['transientWarnings'] | Where-Object { $_ })
     return $state
 }
 
@@ -84,7 +86,10 @@ function Get-DemoVmStepRecord {
 
 function Add-DemoVmWarning {
     # Adds a non-blocking warning to health.json's list, once. With -Step, it names the step it came from ("<Step>: ..."),
-    # so validate.ps1 and status.ps1 can say which step warned (F24, 2026-11-20).
+    # so validate.ps1 and status.ps1 can say which step warned (F24, 2026-11-20). With -Transient, it's a one-off note (a
+    # restart that's pending, media trusted on first use, a recovery or a cleanup the step did), which the next bootstrap
+    # generation clears (Clear-DemoVmTransientWarning); any other warning stays until its step's Set runs again
+    # (Remove-DemoVmStepWarning), so a lasting cause keeps its warning while its step passes its Test.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -95,7 +100,9 @@ function Add-DemoVmWarning {
         [string] $Message,
 
         [AllowEmptyString()]
-        [string] $Step = ''
+        [string] $Step = '',
+
+        [switch] $Transient
     )
 
     if ($Message -and $Step -and -not $Message.StartsWith(('{0}: ' -f $Step), [System.StringComparison]::Ordinal)) {
@@ -104,6 +111,72 @@ function Add-DemoVmWarning {
     if ($Message -and @($State['warnings']) -notcontains $Message) {
         $State['warnings'] = @(@($State['warnings']) + $Message)
     }
+    if ($Message -and $Transient -and @($State['transientWarnings']) -notcontains $Message) {
+        $State['transientWarnings'] = @(@($State['transientWarnings']) + $Message)
+    }
+}
+
+function Remove-DemoVmStepWarning {
+    # A step's own warnings ("<Step>: ..."), dropped just before its Set runs again (the F24 review, 2026-11-20): the Set
+    # says again what still holds.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the in-memory state only.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $State,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Step
+    )
+
+    $prefix = '{0}: ' -f $Step
+    $State['warnings'] = @(@($State['warnings']) | Where-Object { $_ -and -not ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
+    $State['transientWarnings'] = @(@($State['transientWarnings']) | Where-Object { $_ -and -not ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
+}
+
+# The one-off notes of bundles from before 2026-11-20, which named no step and weren't marked transient: the restart that
+# SQL Server setup asked for, T1's sysadmin recovery, the sign-in cleanups, and media trusted on first use.
+$script:DemoVmLegacyNotePattern = @(
+    '^SQL Server setup asked for a restart',
+    '^SYSTEM was not a sysadmin, so ',
+    '^Windows automatic sign-in was armed on ',
+    '^The sign-in cleanup cleared ',
+    '^No SHA-256 is pinned for .+; its first download was trusted',
+    '^The image has no Content-MD5 here'
+)
+
+function Clear-DemoVmTransientWarning {
+    # At a new bootstrap generation (the F24 review, 2026-11-20): the one-off notes go (Add-DemoVmWarning -Transient), and
+    # so do the same notes from a bundle before then. Every other warning stays until its step's Set runs again
+    # (Remove-DemoVmStepWarning): a step whose cause lasts, such as features that setup couldn't uninstall, passes its Test
+    # at the next generation, so its Set wouldn't say it again.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the in-memory state only.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $State
+    )
+
+    $transient = @($State['transientWarnings'] | Where-Object { $_ })
+    $kept = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    foreach ($warning in @($State['warnings'])) {
+        $text = [string]$warning
+        if (-not $text -or $transient -contains $text) {
+            continue
+        }
+        $legacy = $false
+        foreach ($pattern in $script:DemoVmLegacyNotePattern) {
+            if ($text -match $pattern) {
+                $legacy = $true
+                break
+            }
+        }
+        if (-not $legacy) {
+            $kept.Add($text)
+        }
+    }
+    $State['warnings'] = @($kept.ToArray())
+    $State['transientWarnings'] = @()
 }
 
 function Enter-DemoVmLock {
@@ -176,16 +249,21 @@ function New-DemoVmStepResult {
 
         [string[]] $Instruction = @(),
 
-        [string[]] $WarningMessage = @()
+        [string[]] $WarningMessage = @(),
+
+        # One-off notes, which the next bootstrap generation clears (Add-DemoVmWarning -Transient; the F24 review,
+        # 2026-11-20); WarningMessage stays until the step's Set runs again.
+        [string[]] $TransientWarningMessage = @()
     )
 
     [pscustomobject]@{
-        PSTypeName     = 'DbHubDemo.VmStepResult'
-        Outcome        = $Outcome
-        WaitState      = $WaitState
-        Message        = $Message
-        Instruction    = @($Instruction)
-        WarningMessage = @($WarningMessage)
+        PSTypeName              = 'DbHubDemo.VmStepResult'
+        Outcome                 = $Outcome
+        WaitState               = $WaitState
+        Message                 = $Message
+        Instruction             = @($Instruction)
+        WarningMessage          = @($WarningMessage)
+        TransientWarningMessage = @($TransientWarningMessage)
     }
 }
 

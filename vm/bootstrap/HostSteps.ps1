@@ -235,7 +235,8 @@ function Save-DemoHostMedia {
     $media = Get-DemoHostMediaFile -Context $Context -MediaName $MediaName
     $download = Save-DemoVmDownload -Uri $media.Url -Path $media.Path -ExpectedSha256 $media.Sha256 -Name $media.Name
     if ($download.Warning) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $download.Warning)
+        # Media trusted on first use: a one-off note, which the next bootstrap generation clears (the F24 review, 2026-11-20).
+        return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage $download.Warning)
     }
 }
 

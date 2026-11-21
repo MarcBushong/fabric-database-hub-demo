@@ -199,23 +199,46 @@ Describe 'VM step runner' {
         $health.warnings | Should -Contain 'Media: Trusted on first use.' -Because 'validate.ps1 says which step warned (F24)'
     }
 
-    It 'starts the warnings again with a new generation, so a step whose cause is gone no longer warns (F24)' {
+    It 'keeps a lasting cause''s warning across a generation while its step passes its Test, and lets a one-off note and a fixed cause go (F24 review)' {
         $root = New-TestRoot
         $script:restartDone = $false
+        $script:cleanupRan = $false
+        $script:agentFixed = $false
         $steps = @(
-            @{ Name = 'Restart'; Test = { $script:restartDone }; Set = { $script:restartDone = $true; New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Setup asked for a restart; the next start completes it.' } }
-            @{ Name = 'Media'; Test = { $false }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } }
+            # A one-off note: the restart has happened by the next generation.
+            @{ Name = 'Restart'; Test = { $script:restartDone }; Set = { $script:restartDone = $true; New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage 'Setup asked for a restart; the next start completes it.' } }
+            # A lasting cause (GuestFirstBoot: SSAS and SSIS still installed), whose step passes its Test from then on.
+            @{ Name = 'Cleanup'; Test = { $script:cleanupRan }; Set = { $script:cleanupRan = $true; New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.' } }
+            # A cause its step's Set fixes when it runs again: its Test fails until then.
+            @{ Name = 'Agent'; Test = { $script:agentFixed }; Set = { if ($script:agentFixed -eq $false -and $script:agentRuns -ge 1) { $script:agentFixed = $true; return }; $script:agentRuns = 1; New-DemoVmStepResult -Outcome 'InProgress' -WarningMessage 'The agent didn''t restart yet.' } }
         )
-        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
-        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Restart: Setup asked for a restart; the next start completes it.', 'Media: Trusted on first use.')
-        # The same generation keeps them: its steps aren't checked again.
-        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
-        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings).Count | Should -Be 2
-        # A new generation checks every step again: Restart is in its desired state now, and Media still warns.
+        $script:agentRuns = 0
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Out-Null
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Restart: Setup asked for a restart; the next start completes it.', 'Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.', 'Agent: The agent didn''t restart yet.')
+        # A new generation checks every step again: Restart's and Cleanup's Tests pass, and Agent's Set runs again.
         Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
         $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
-        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+        @($health.warnings) | Should -Be @('Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.') -Because 'the cause is still there, though Cleanup''s Set didn''t run again'
         $health.status | Should -Be 'Warning'
+        # The same generation keeps it, and so does the next one.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g3' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.')
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'state.json')).transientWarnings).Count | Should -Be 0
+    }
+
+    It 'lets a one-off note of a bundle from before the step names go at a new generation, and keeps its other warnings (F24 review)' {
+        $root = New-TestRoot
+        $state = Get-DemoVmState
+        $state['generation'] = 'old'
+        $state['warnings'] = @(
+            'SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.',
+            'SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.',
+            'No SHA-256 is pinned for SQL2022-SSEI-Dev.exe; its first download was trusted and recorded as abc. Pin it in config/versions.json.',
+            'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.'
+        )
+        Save-DemoVmState -State $state
+        Invoke-DemoVmStateMachine -Step @(@{ Name = 'A'; Test = { $true }; Set = { } }) -Generation 'new' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.')
     }
 
     It 'writes health.json that matches vm/health/health.schema.json' {
