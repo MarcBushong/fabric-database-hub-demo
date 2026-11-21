@@ -125,6 +125,11 @@ function Get-DemoDeploymentStateTagName {
         # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
         BusyUntilUtc             = 'DbHubBusyUntilUtc'
         BusyBy                   = 'DbHubBusyBy'
+        # 2026-11-21 (F25): the times (HHmm, comma-separated) the VMs' auto-shutdown is at when the busy marker's steps left
+        # it away from autoShutdownTime (Sync-DemoAutoShutdownForBusy), empty once it's back. The control's runbook reads it
+        # (Get-DbHubMovedShutdownUtc): its role has no DevTest Labs action, so a session ends before the earliest. It outlives
+        # the marker, which a session overwrites, so start-demo.ps1, stop-demo.ps1, and status.ps1 still see it.
+        AutoShutdownMoved        = 'DbHubAutoShutdownMoved'
         # 2026-11-17: the Fabric workspaces this environment uses, by ID: the demo's, and the one with the control notebook
         # (its own workspace, or the demo's when the notebook is in its folder). destroy.ps1 in another environment keeps a
         # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).

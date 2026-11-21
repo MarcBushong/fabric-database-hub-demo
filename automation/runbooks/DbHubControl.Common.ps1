@@ -580,16 +580,22 @@ function Test-DbHubControlRequest {
 
 function Get-DbHubNextShutdownUtc {
     # The VMs' next auto-shutdown in UTC from autoShutdownTime (HHmm) and autoShutdownTimeZone (a Windows time zone
-    # ID): the same schedule as the VMs' DevTest Labs auto-shutdown and the module's Get-DemoNextShutdownUtc.
+    # ID): the same schedule as the VMs' DevTest Labs auto-shutdown and the module's Get-DemoNextShutdownUtc. -Time takes
+    # another daily time in the same zone instead (a moved auto-shutdown, Get-DbHubMovedShutdownUtc).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Settings,
 
         [Parameter(Mandatory = $true)]
-        [datetime] $NowUtc
+        [datetime] $NowUtc,
+
+        [string] $Time = ''
     )
 
-    $time = [string]$Settings.autoShutdownTime
+    $time = $Time
+    if (-not $time) {
+        $time = [string]$Settings.autoShutdownTime
+    }
     if ($time -notmatch '^([01]\d|2[0-3])([0-5]\d)$') {
         throw ('autoShutdownTime ''{0}'' isn''t HHmm.' -f $time)
     }
@@ -607,6 +613,41 @@ function Get-DbHubNextShutdownUtc {
     return [System.TimeZoneInfo]::ConvertTimeToUtc($candidate, $zone)
 }
 
+function Get-DbHubMovedShutdownUtc {
+    <#
+    .SYNOPSIS
+    The VMs' next auto-shutdown that deploy.ps1 moved away from autoShutdownTime and nothing has put back yet (F25,
+    2026-11-21): the demo resource group's DbHubAutoShutdownMoved tag holds the times (HHmm in autoShutdownTimeZone,
+    comma-separated) the module last set on the VMs' DevTest Labs schedules, for a run the nightly stop waited for. The
+    control's role has no DevTest Labs action (the coordinator's decision of 2026-11-14), so a session can't move it, and
+    plans to end before it. Returns the earliest next one after NowUtc in UTC, or $null when the tag holds none. Pure,
+    apart from the time zone.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $earliest = $null
+    foreach ($part in @(([string](Get-DbHubMember -InputObject $Tags -Name 'DbHubAutoShutdownMoved')) -split ',')) {
+        $clock = $part.Trim()
+        if ($clock -notmatch '^([01]\d|2[0-3])[0-5]\d$') {
+            continue
+        }
+        $next = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc -Time $clock
+        if ($null -eq $earliest -or $next -lt $earliest) {
+            $earliest = $next
+        }
+    }
+    return $earliest
+}
+
 function Get-DbHubRunPlan {
     <#
     .SYNOPSIS
@@ -614,7 +655,12 @@ function Get-DbHubRunPlan {
     baseline, the profile's maxMinutes for a profile such as showcase) and so that it ends before the VMs' next
     auto-shutdown minus shutdownMarginMinutes; off takes no minutes and doesn't count toward the run's end. Returns
     Valid, Reason, Activities (with Minutes, and Tier, VCores, and NotAfterUtc for the dispatch to fill), RunEndUtc,
-    AutoStopUtc (the run's end plus autoStopBufferMinutes), and ShutdownUtc.
+    AutoStopUtc (the run's end plus autoStopBufferMinutes), ShutdownUtc, NightlyUtc, and ShutdownMoved.
+
+    .DESCRIPTION
+    The VMs' next auto-shutdown is autoShutdownTime's (NightlyUtc, when the nightly safety stop runs too), or, with -Tags,
+    an earlier one that deploy.ps1 moved for a run the nightly stop waited for (F25, 2026-11-21; Get-DbHubMovedShutdownUtc):
+    ShutdownUtc is the earlier, and ShutdownMoved says it's the moved one, which the session can't move.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -624,14 +670,28 @@ function Get-DbHubRunPlan {
         [object] $Settings,
 
         [Parameter(Mandatory = $true)]
-        [datetime] $NowUtc
+        [datetime] $NowUtc,
+
+        [AllowNull()]
+        [object] $Tags = $null
     )
 
-    $shutdown = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc
+    $nightly = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc
+    $shutdown = $nightly
+    $moved = $false
+    $movedUtc = Get-DbHubMovedShutdownUtc -Tags $Tags -Settings $Settings -NowUtc $NowUtc
+    if ($null -ne $movedUtc -and $movedUtc -lt $nightly) {
+        $shutdown = $movedUtc
+        $moved = $true
+    }
     $latestEnd = $shutdown.AddMinutes(-1 * [int]$Settings.shutdownMarginMinutes)
     $available = [int][System.Math]::Floor(($latestEnd - $NowUtc).TotalMinutes)
     if ($available -lt [int]$Settings.minDurationMinutes) {
-        return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC, too soon for a run of at least {1} minutes.' -f $shutdown, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown }
+        $where = ''
+        if ($moved) {
+            $where = ', where deploy.ps1 moved it for a run the nightly stop waited for'
+        }
+        return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC{1}, too soon for a run of at least {2} minutes.' -f $shutdown, $where, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown; NightlyUtc = $nightly; ShutdownMoved = $moved }
     }
     $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
     $planned = @()
@@ -662,7 +722,7 @@ function Get-DbHubRunPlan {
             $item.NotAfterUtc = $end.AddMinutes(2)
         }
     }
-    return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown }
+    return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown; NightlyUtc = $nightly; ShutdownMoved = $moved }
 }
 
 function Get-DbHubAccountPath {
@@ -3523,7 +3583,7 @@ function Start-DbHubActivityRun {
             $result.message = $active.Reason
             return [pscustomobject]$result
         }
-        $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+        $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
     }
     if (-not $plan.Valid) {
         $result.message = $plan.Reason
@@ -6190,7 +6250,11 @@ function Start-DbHubSession {
     2. The plan (Get-DbHubRunPlan): the showcase on every target for the session's minutes, ending before the VMs' next
        auto-shutdown, as a run does: the profile hosts on the VMs end their activity there. A shorter session than asked
        ends after its last whole showcase cycle (cycleMinutes), so no beat is cut off, and says so, with when it ends and
-       why; one with less than minSessionMinutes left is refused.
+       why; one with less than minSessionMinutes left is refused. An auto-shutdown that deploy.ps1 moved for a run the
+       nightly stop waited for (the group's DbHubAutoShutdownMoved, F25, 2026-11-21) counts too, since the session can't
+       move it back: the Plan step says so, and that a full session runs once it has passed, or after
+       ./scripts/stop-demo.ps1 has put it back. The deferred nightly pass that stands with it needs nothing: it honors the
+       session's busy marker (3.), as every nightly pass does.
     3. The busy marker (DbHubBusyUntilUtc, DbHubBusyBy session) until busyMarginMinutes after the auto-stop, with the
        session's ID and start (DbHubSessionId, DbHubSessionStartUtc): the nightly stop's passes and the control's T4 stop
        leave the session to its own auto-stop, which saves the metrics and deletes the replica.
@@ -6259,15 +6323,28 @@ function Start-DbHubSession {
         param([datetime] $Utc)
         [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($Utc, [System.DateTimeKind]::Utc), $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
     }
-    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
     $minimum = [int](Get-DbHubMember -InputObject $settings -Name 'minSessionMinutes')
     if ($minimum -le 0) {
         $minimum = 30
     }
     $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
     $status['autoShutdownUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
+    # An auto-shutdown that deploy.ps1 moved for a run the nightly stop waited for (F25, 2026-11-21): the session can't move
+    # it back, since the control's role has no DevTest Labs action, so it ends before it, says why, and says how to get a
+    # full session: once that time has passed, or after ./scripts/stop-demo.ps1 has put it back.
+    $movedWhere = ''
+    $movedFix = ''
+    if ($plan.ShutdownMoved) {
+        $movedWhere = ', where deploy.ps1 moved it for a run the nightly stop waited for, and which a session can''t move'
+        $movedFix = 'Run all after {0}, once that auto-shutdown has passed; or run ./scripts/stop-demo.ps1, which puts it back at {1}, and then Run all.' -f (& $clock $plan.ShutdownUtc), (& $clock $plan.NightlyUtc)
+    }
     if (-not $plan.Valid -or $planned -lt $minimum) {
-        return (& $refuse ('The VMs shut down at {0} ({1}), too soon for a session of at least {2} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $minimum) 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        $refuseFix = 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        if ($movedFix) {
+            $refuseFix = $movedFix
+        }
+        return (& $refuse ('The VMs shut down at {0} ({1}){2}, too soon for a session of at least {3} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $movedWhere, $minimum) $refuseFix)
     }
     # A session that the auto-shutdown cuts short ends after its last whole showcase cycle (2026-11-14), so no beat stops
     # midway when the VMs' activity ends.
@@ -6277,7 +6354,7 @@ function Start-DbHubSession {
         if (($planned % $cycle) -ne 0) {
             $shorter = $Request.PSObject.Copy()
             $shorter.DurationMinutes = [int]([System.Math]::Floor($planned / $cycle) * $cycle)
-            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc
+            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
             $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
         }
         $wholeCycles = $true
@@ -6293,7 +6370,13 @@ function Start-DbHubSession {
             }
             $cycleText = ' It ends after {0} whole {1}-minute showcase {2}, so no beat is cut off.' -f $count, $cycle, $noun
         }
-        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}), when the activity on the VMs ends.{5}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $cycleText) -Fix 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        $why = ', when the activity on the VMs ends'
+        $planFix = 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        if ($movedWhere) {
+            $why = $movedWhere
+            $planFix = 'For a full session, {0}' -f $movedFix
+        }
+        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}){5}.{6}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $why, $cycleText) -Fix $planFix
     }
     else {
         Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Pass' -Message ('The showcase runs {0} minutes on every target, until {1} ({2}).' -f $planned, (& $clock $plan.RunEndUtc), $settings.autoShutdownTimeZone)
@@ -6310,9 +6393,10 @@ function Start-DbHubSession {
         $status['busy']['marked'] = $true
         $status['busy']['untilUtc'] = ConvertTo-DbHubTimeText -Value $busyUntil
         $text = 'The demo is marked busy until {0} ({1}).' -f (& $clock $busyUntil), $settings.autoShutdownTimeZone
-        if ($plan.ShutdownUtc -le $busyUntil) {
-            $status['busy']['nightlyStopUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
-            $text = '{0} The nightly stop at {1} waits for it: the session''s own auto-stop at {2} saves its metrics, deletes T4''s read replica, and stops everything.' -f $text, (& $clock $plan.ShutdownUtc), (& $clock $plan.AutoStopUtc)
+        # The nightly safety stop runs at autoShutdownTime, whether or not deploy.ps1 moved the VMs' own auto-shutdown (F25).
+        if ($plan.NightlyUtc -le $busyUntil) {
+            $status['busy']['nightlyStopUtc'] = ConvertTo-DbHubTimeText -Value $plan.NightlyUtc
+            $text = '{0} The nightly stop at {1} waits for it: the session''s own auto-stop at {2} saves its metrics, deletes T4''s read replica, and stops everything.' -f $text, (& $clock $plan.NightlyUtc), (& $clock $plan.AutoStopUtc)
         }
         $status['busy']['note'] = $text
         Add-DbHubSessionStep -Status $status -Step 'Busy' -State 'Pass' -Message $text

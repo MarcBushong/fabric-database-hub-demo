@@ -1089,6 +1089,8 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         # The VMs' own auto-shutdown at 19:00 would cut the run: it moves to a quarter hour about an hour after the marker.
         $script:shutdowns['sqlvm01'] | Should -Be '2015'
         $script:shutdowns['archost01'] | Should -Be '2015'
+        # And the group says where it is, for the control notebook's Run all, which can't read it (F25).
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2015'
         $body = $script:shutdownBodies[0].Body
         $body['location'] | Should -Be 'westus3'
         $body['tags']['solution'] | Should -Be 'fabric-database-hub-demo'
@@ -1111,6 +1113,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:30:00Z'
         $script:shutdowns['sqlvm01'] | Should -Be '2030'
         $script:shutdowns['archost01'] | Should -Be '2015' -Because 'its 20:15 is past the marker and its margin'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2015,2030'
     }
 
     It 'only marks the group busy while no nightly pass falls inside the run' {
@@ -1150,6 +1153,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         @($script:links | Where-Object Schedule -EQ 'dbhub-safety-deferred').Count | Should -Be 1 -Because 'it replaces the pass the run scheduled'
         $script:shutdowns['sqlvm01'] | Should -Be '2135'
         $script:shutdowns['archost01'] | Should -Be '2135'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2135'
         # Once only.
         InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig); Run = $end.Run } { Complete-DemoBusyMarkerRun -Run $Run -Config $Config -Confirm:$false } | Should -BeNullOrEmpty
         # DONE stays DONE and says it, with both commands.
@@ -1173,6 +1177,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $script:shutdowns['sqlvm01'] | Should -Be '1900'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty
         $script:groupTags['DbHubBusyBy'] | Should -BeNullOrEmpty
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
     }
 
     It 'adds nothing, and only clears the marker, when no nightly pass came near the run' {
@@ -1292,6 +1297,59 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $left.status | Should -Be 'Warning'
         $left.message | Should -Match 'No run keeps it there'
         $left.remediation | Should -Be './scripts/start-demo.ps1, ./scripts/stop-demo.ps1, and ./scripts/deploy.ps1 put it back at 19:00.'
+    }
+
+    It 'puts back an auto-shutdown that''s still moved after a Run all session cleared the marker, and status.ps1 warns until then (F25)' {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $null = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z'
+        # A Run all session overwrote the marker with its own and cleared it at its end; the deferred pass has expired since.
+        $script:groupTags['DbHubBusyUntilUtc'] = ''
+        $script:groupTags['DbHubBusyBy'] = ''
+        $script:schedules.Remove('dbhub-safety-deferred')
+        $status = Get-TestBusyStatus -Now '2026-11-07T02:00:00Z'
+        $status.status | Should -Be 'Warning'
+        $status.message | Should -Match 'sqlvm01 at 21:35, archost01 at 21:35\. No run keeps it there: a Run all session took over from the run it was moved for\. Until it''s put back, a Run all session ends before it\.$'
+        $script:tagWrites.Clear()
+        $settled = Invoke-TestSettle -Purpose Stop -Now '2026-11-07T02:00:00Z'
+        $settled.Count | Should -Be 1
+        $settled[0].checkId | Should -Be 'STOP.NIGHTLYSTOP'
+        $settled[0].status | Should -Be 'Pass'
+        $settled[0].message | Should -Be 'The VMs'' auto-shutdown was still where deploy.ps1 had moved it for a run the nightly stop waited for, after a Run all session: sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00.'
+        $script:shutdowns['sqlvm01'] | Should -Be '1900'
+        $script:shutdowns['archost01'] | Should -Be '1900'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
+        @($script:tagWrites | Where-Object { $_ -like 'DbHubBusy*' }) | Should -BeNullOrEmpty -Because 'there''s no marker to clear'
+        Get-TestBusyStatus -Now '2026-11-07T02:05:00Z' | Should -BeNullOrEmpty
+    }
+
+    It 'start-demo.ps1, taking over from a Run all session, removes the deferred stop and puts the auto-shutdown back, and keeps the session''s marker (F25)' {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $null = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z'
+        # A Run all session started at 20:40, during the grace: its marker lasts until its auto-stop's margin.
+        $script:groupTags['DbHubBusyBy'] = 'session'
+        $script:groupTags['DbHubBusyUntilUtc'] = '2026-11-06T05:30:00Z'
+        $settled = Invoke-TestSettle -Purpose Start -Now '2026-11-06T04:45:00Z'
+        $settled.Count | Should -Be 1
+        $settled[0].checkId | Should -Be 'START.NIGHTLYSTOP'
+        $settled[0].status | Should -Be 'Pass'
+        $settled[0].message | Should -Be 'This session takes over from the Run all session, and from the run the nightly stop waited for before it: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00. The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at 19:00 (Pacific Standard Time).'
+        $script:schedules.Contains('dbhub-safety-deferred') | Should -BeFalse
+        $script:shutdowns['archost01'] | Should -Be '1900'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:groupTags['DbHubBusyUntilUtc'] | Should -Be '2026-11-06T05:30:00Z'
+    }
+
+    It 'tells DONE what Run all does before the deferred stop only when this run published the control''s runbooks: <Case> (F25)' -ForEach @(
+        @{ Case = 'published'; Status = 'Pass'; Says = $true }
+        @{ Case = 'an older DbHub-Control, which plans as if the auto-shutdown weren''t moved'; Status = 'Fail'; Says = $false }
+    ) {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $runbooks = New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status $Status -Message 'The control''s runbooks.'
+        $end = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z' -Result @($runbooks)
+        $sentence = ' Run all in NB_DatabaseHub_Control before 21:35 ends its session before then, since a session can''t move the VMs'' auto-shutdown; from 21:35 on, Run all runs a full session.'
+        $end.Results[0].remediation.EndsWith($sentence, [System.StringComparison]::Ordinal) | Should -Be $Says
+        $end.Results[0].remediation | Should -Match '^To keep the demo running tonight, run \./scripts/start-demo\.ps1'
     }
 
     It 'takes a Deferred stop and a Deferred T3 check as no failure (STATUS.SAFETYSTOP and the T4 restart reading)' {

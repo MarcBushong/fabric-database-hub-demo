@@ -569,6 +569,33 @@ Describe 'DbHub-Control run planning (Get-DbHubRunPlan)' {
         $plan.Reason | Should -Match 'auto-shutdown'
     }
 
+    It 'ends before an earlier auto-shutdown that deploy.ps1 moved (DbHubAutoShutdownMoved, F25), and not before a later one' {
+        $request = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 90 }) -Settings $script:settings
+        # 20:20 Eastern daylight time (00:20 UTC): the 19:00 auto-shutdown comes tomorrow, the one moved to 21:15 tonight.
+        $now = [datetime]::new(2026, 10, 28, 0, 20, 0, [System.DateTimeKind]::Utc)
+        $tonight = [datetime]::new(2026, 10, 28, 1, 15, 0, [System.DateTimeKind]::Utc)
+        $plan = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $plan.Valid | Should -BeTrue
+        $plan.ShutdownMoved | Should -BeTrue
+        $plan.ShutdownUtc | Should -Be $tonight
+        $plan.NightlyUtc | Should -Be ([datetime]::new(2026, 10, 28, 23, 0, 0, [System.DateTimeKind]::Utc))
+        $plan.Activities[0].Minutes | Should -Be 53
+        (Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags @{ DbHubAutoShutdownMoved = '2230,2115,soon' }).ShutdownUtc | Should -Be $tonight -Because 'the earliest counts'
+        foreach ($tags in @($null, @{ DbHubAutoShutdownMoved = '' }, @{ DbHubAutoShutdownMoved = 'soon' }, @{ DbHubAutoShutdownMoved = '1915' })) {
+            # None, or one that comes after tomorrow's 19:00.
+            $other = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags $tags
+            $other.ShutdownMoved | Should -BeFalse
+            $other.Activities[0].Minutes | Should -Be 90
+        }
+        # Before 19:00, the nightly auto-shutdown comes first; a run too close to the moved one is refused, and says why.
+        $day = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 27, 22, 30, 0, [System.DateTimeKind]::Utc)) -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $day.ShutdownMoved | Should -BeFalse
+        $day.Activities[0].Minutes | Should -Be 28
+        $late = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 28, 1, 10, 0, [System.DateTimeKind]::Utc)) -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $late.Valid | Should -BeFalse
+        $late.Reason | Should -Be 'The VMs'' auto-shutdown is at 2026-10-28 01:15 UTC, where deploy.ps1 moved it for a run the nightly stop waited for, too soon for a run of at least 5 minutes.'
+    }
+
     It 'gives the showcase its minutes up to its 120, off none, and ends the showcase with the run' {
         $request = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }, @{ target = 'T3'; scenario = 'capacity-max' }); durationMinutes = 90 }) -Settings $script:settings
         $now = [datetime]::new(2026, 10, 27, 14, 0, 0, [System.DateTimeKind]::Utc)
@@ -1438,6 +1465,41 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $late.message | Should -Match 'too soon for a session of at least 30 minutes'
         (Get-SessionStatus).phase | Should -Be 'refused'
         @($script:calls | Where-Object { $_.Method -in 'POST', 'PATCH' }) | Should -BeNullOrEmpty -Because 'nothing starts and the demo isn''t marked busy'
+    }
+
+    It 'ends before the VMs'' auto-shutdown that deploy.ps1 moved for a deferred nightly stop, runs in full once it has passed, and the deferred pass waits for the session (F25)' {
+        # Live, dbhubfr at bf010ed: deploy.ps1 ended at 20:10 Eastern after the nightly stop waited for it, so its deferred
+        # pass and the VMs' auto-shutdown are at 21:15 (01:15 UTC), and the session control can't move the auto-shutdown.
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-28T01:10:00Z'; DbHubBusyBy = 'deploy-grace'; DbHubAutoShutdownMoved = '2115' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 0, 20, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -BeIn @('Started', 'Partial')
+        $status = Get-SessionStatus
+        $status.plannedMinutes | Should -Be 30
+        ([datetime]$status.runEndUtc).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 28, 0, 50, 0, [System.DateTimeKind]::Utc))
+        $plan = @($status.steps) | Where-Object step -EQ 'Plan'
+        $plan.state | Should -Be 'Warning'
+        $plan.message | Should -Be 'This session runs 30 of the 90 minutes asked: it ends at 20:50, before the VMs'' auto-shutdown at 21:15 (Eastern Standard Time), where deploy.ps1 moved it for a run the nightly stop waited for, and which a session can''t move. It ends after 1 whole 30-minute showcase cycle, so no beat is cut off.'
+        $plan.fix | Should -Be 'For a full session, Run all after 21:15, once that auto-shutdown has passed; or run ./scripts/stop-demo.ps1, which puts it back at 19:00, and then Run all.'
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2115' -Because 'only the module, which can move the auto-shutdown back, clears it'
+        # From 21:15 on, a session runs in full: the moved auto-shutdown comes next tomorrow, after the nightly 19:00.
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubAutoShutdownMoved = '2115' }
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 1, 20, 0, [System.DateTimeKind]::Utc)))
+        $full = Get-SessionStatus
+        $full.plannedMinutes | Should -Be 90
+        (@($full.steps) | Where-Object step -EQ 'Plan').state | Should -Be 'Pass'
+        # The deferred pass, hourly until the morning, waits for the session's busy marker, and the session's own auto-stop
+        # stops everything at its end.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:calls.Clear()
+        $deferred = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 2, 15, 0, [System.DateTimeKind]::Utc)))
+        $deferred.status | Should -Be 'Deferred'
+        $deferred.busyBy | Should -Be 'session'
+        @($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty
+        $stopped = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 3, 0, 0, [System.DateTimeKind]::Utc)))
+        $stopped.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Path -match '/(sqlvm01|archost01)/deallocate$' }).Count | Should -Be 2
     }
 
     It 'refuses a session while another run is active, and says how to end it' {

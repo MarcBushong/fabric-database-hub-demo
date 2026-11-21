@@ -109,6 +109,10 @@ The owner's follow-up after the release: T2's session times after a cold start r
 - **Mixed versions:** runbooks from before write no `dispatchPending`, so a newer notebook runs as before. A notebook from before ignores `dispatchPending` and prints the `Times` steps as any other step. `./scripts/deploy.ps1` republishes the runbooks and imports the notebook.
 - **Validation:** unit-tested (`tests/unit/Automation.Runbooks.Tests.ps1`: the start's pending targets and its follow-up's move; DbHub-Monitor's `Moved` after the start stopped following; a warm start unchanged. `tests/unit/Fabric.ControlNotebook.Tests.ps1`: T2's beats held, then announced and saved from the moved time). Not run live.
 
+### 2026-11-21 amendment: an auto-shutdown that deploy.ps1 moved
+
+F25 (live, `dbhubfr` at bf010ed): a Run all during the hour after a `deploy.ps1` that the nightly stop waited for lost its VMs at that run's deferred stop's time. `deploy.ps1` had moved the VMs' DevTest Labs auto-shutdown there, and the session planned from `autoShutdownTime` alone. The session can't move it back (no DevTest Labs action, [below](#the-permissions-one-time-by-an-owner)), so it ends before it: the demo resource group's `DbHubAutoShutdownMoved` tag says where it is, and the **Plan** step says so, with the fix (Run all once it has passed, or `./scripts/stop-demo.ps1` first). The deferred pass already waits for the session's busy marker. [ADR 0024's amendment](0024-nightly-safety-stop.md#amendment-a-run-all-session-and-a-moved-auto-shutdown-f25-2026-11-21) has the whole change, including `start-demo.ps1` taking over from a Run all session on such a night.
+
 ### Nothing beyond Azure and Fabric
 
 A demo session needs nothing beyond Azure and Fabric (the user, 2026-11-14: "We really just care about the deployment of the assets, and running the notebooks and activity"):

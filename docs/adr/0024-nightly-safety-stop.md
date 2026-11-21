@@ -224,6 +224,37 @@ It has no `NotActions` and no data actions. It can't start, create, or change an
 
 **Validation:** `tests/unit/DbHubDemo.SafetyStop.Tests.ps1` (DONE's note for a stale role, from the fake Azure and from each kind of missing action; `STATUS.SAFETYSTOP` for an older runbook's nightly run) and `tests/unit/DbHubDemo.T4.Tests.ps1` (the nightly run, the auto-stop, and the daily T4 job from older runbooks, with T5's container alone and with something else too; the control counted with `"enabled": false`). Each test fails without its change, except the case of an older configuration with `"enabled": false` and the real setting, which passed before too, because the branch couldn't run. Not run live.
 
+## Amendment: a Run all session and a moved auto-shutdown (F25, 2026-11-21)
+
+**Decision source:** the coordinator's item 12, 2026-11-21, from F25 (live, `dbhubfr`'s net-new deployment at bf010ed).
+
+**Why:** a `deploy.ps1` run that the nightly stop waited for leaves the VMs' auto-shutdown moved to its deferred stop's time, say 22:15. A Run all started before then planned its session from `autoShutdownTime` alone, so a session that spanned 22:15 lost its VMs mid-session to the DevTest Labs auto-shutdown, which no busy marker holds back. The control's role has no DevTest Labs action ([ADR 0026](0026-one-run-all-session.md#the-permissions-one-time-by-an-owner), the coordinator's decision of 2026-11-14), so a session can't move it back. The session then overwrote the marker and cleared it at its end, so `start-demo.ps1`, `stop-demo.ps1`, and `status.ps1` no longer saw the moved time, and it stayed moved, every evening, until the next `deploy.ps1`.
+
+**Decision:**
+
+1. **Where the auto-shutdown is, in a tag of its own:** `DbHubAutoShutdownMoved` on the demo resource group holds the times (HHmm, comma-separated) the VMs' auto-shutdown is at when it isn't `autoShutdownTime`, and nothing otherwise. Each step that moves or puts it back writes it (`Sync-DemoAutoShutdownForBusy`, `Save-DemoAutoShutdownMoved`): a busy run's move, the end of a run the stop waited for, and each put-back. It's written only when every VM's schedule could be read, and only when it changes. Contributor can write it, as the marker (`az tag update`).
+2. **A session ends before it:** the control's runbook reads the tag with the group's other tags (`Get-DbHubMovedShutdownUtc`) and plans a run or a session to end before the earliest of those times when it comes before `autoShutdownTime`'s next. The session's **Plan** step says so (the time, that `deploy.ps1` moved it, and that a session can't move it), with the fix: Run all once it has passed, or `./scripts/stop-demo.ps1`, which puts it back, and then Run all. No new action, setting, or status field.
+3. **The deferred pass stays as the net behind the session:** it already waits for a session, since `Scope Nightly` honors the session's busy marker. That marker ends at most 145 minutes ahead (a 120-minute session, its auto-stop 10 minutes later, and 15 more), within the 180-minute maximum. The pass's first run comes at the moved time, after such a session's planned end. Kept, it stops whatever the session's auto-stop and its second left, once the marker has ended.
+4. **Put back after a session too:** `start-demo.ps1`, `stop-demo.ps1` (and the stop at the end of an update), and `status.ps1` act on the tag when the marker is empty. `STATUS.NIGHTLYSTOP`'s **Warning** says a Run all session ends before it until then. `start-demo.ps1`, taking over from a Run all session that's still going on (ADR 0026, 2026-11-20), now also removes the deferred pass and puts the auto-shutdown back, which would stop its own session, and leaves the session's marker for the session's end.
+5. **DONE says what Run all does:** `DEPLOY.NIGHTLYSTOP`'s **Warning** adds that a Run all before the stop's time ends its session before then, and runs in full from then on. It says so only when this run published the control's runbooks (`CONTROL.RUNBOOKS` **Pass**), since an older `DbHub-Control` plans as before.
+
+**Not done:** a session that moves the auto-shutdown back itself, which needs `Microsoft.DevTestLab/schedules/read` and `/write` in the control's role (the owner's approval). With them, a Run all during the grace would get its whole session. The control notebook's estimate before it sends a session can't know the moved time, since it reads no Azure; the runbook's **Plan** step, which its live view prints, corrects it.
+
+**Validation:** `tests/unit/Automation.Runbooks.Tests.ps1`:
+
+- the plan ends before an earlier moved time and never before a later one, the earliest of several, with malformed values ignored and a refusal that says why;
+- a session at 20:20 with the auto-shutdown moved to 21:15 runs 30 minutes, with the Plan step's Warning and fix, and leaves the tag alone;
+- one at 21:20 runs its full 90 minutes, while the deferred pass at 22:15 is `Deferred` by the session's marker and the session's auto-stop deallocates both VMs.
+
+`tests/unit/DbHubDemo.SafetyStop.Tests.ps1`:
+
+- the tag after a refresh's move, after a template reset, at the end of a run the stop waited for, and after everything was put back;
+- `stop-demo.ps1` and `status.ps1` after a Run all session cleared the marker;
+- `start-demo.ps1` taking over from a Run all session;
+- DONE's sentence with the runbooks published, and none with an older `DbHub-Control`.
+
+Each test fails without the change. Not run live.
+
 ## Validation
 
 - **Static (2026-11-05):** `tests/unit/Automation.Runbooks.Tests.ps1` (the Nightly scope: running VMs deallocated and T4 stopped through Azure Resource Manager only, deallocated and deallocating VMs and a stopped T4 left alone, a guest-stopped VM deallocated, a 409 while the auto-shutdown deallocates counted as done, a 409 that lasts tried three times then reported, a starting T4 waited for and stopped, one still starting after 10 minutes reported and never started, NotGranted without the role; the T3Check scope: each verdict from one Databases - Get and nothing else; the published content and its settings), `tests/unit/DbHubDemo.SafetyStop.Tests.ps1` (names, the role against this ADR, the times, the setup as an Owner, a Contributor, and a Role Based Access Control Administrator, a rerun that writes nothing but the template, a disabled schedule, a changed runbook or role, a failed template, `-WhatIf`, `-GrantRole`, the state, the last runs and the status, `Get-DemoT4RestartStopState`, a DONE with only the role missing, and `grant-safety-stop.ps1`), `tests/unit/DbHubDemo.T4.Tests.ps1` and `DbHubDemo.Cost.Tests.ps1` (the restart worst case and the texts), and the template's build and lint in `./tests/Invoke-StaticValidation.ps1`.

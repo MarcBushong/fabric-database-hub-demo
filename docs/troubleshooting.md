@@ -564,7 +564,8 @@ Every `deploy.ps1` sets it up. Each evening it deallocates the VMs, stops T4 and
 | The **Stop at the end** row says the run waited for T2's first migration assessment, or that it "hadn't uploaded" (the stop waits at most 15 minutes in all) | Nothing: the next `./scripts/deploy.ps1` or `./scripts/configure-arc.ps1` starts it again, and then it runs every week on its own |
 | A job's result is `Deferred`: "deploy.ps1 is still running (busy until ...)" (`DbHubBusyUntilUtc`) | Nothing: it stops that night |
 | The Nightly stop row: "no step of deploy.ps1 has changed for 60 minutes ..." (or "more than 6 hours") | If nothing moves, stop the run (Ctrl+C) and `./scripts/deploy.ps1` again |
-| `STATUS.NIGHTLYSTOP` **Warning**: "The VMs' auto-shutdown is moved ... No run keeps it there" | `start-demo.ps1`, `stop-demo.ps1`, or `deploy.ps1` puts it back at `autoShutdownTime` |
+| `STATUS.NIGHTLYSTOP` **Warning**: "The VMs' auto-shutdown is moved ... No run keeps it there" | `start-demo.ps1`, `stop-demo.ps1`, or `deploy.ps1` puts it back at `autoShutdownTime`; until then a Run all session ends before it (since 2026-11-21) |
+| Run all's **Plan** step: "This session runs 30 of the 90 minutes asked ... before the VMs' auto-shutdown at 22:15 ..., where deploy.ps1 moved it for a run the nightly stop waited for" (since 2026-11-21): the session control can't move the VMs' auto-shutdown, so a session ends before it rather than lose its VMs there | Run all after that time for a full session, or `./scripts/stop-demo.ps1` first, which puts it back ([ADR 0024](adr/0024-nightly-safety-stop.md#amendment-a-run-all-session-and-a-moved-auto-shutdown-f25-2026-11-21)) |
 | `START.NIGHTLYSTOP` or `STOP.NIGHTLYSTOP` **Warning**: "not all of it was put back" | Run the script again |
 
 ### Set the safety stop up alone

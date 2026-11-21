@@ -321,8 +321,9 @@ function Set-DemoAutoShutdownTime {
     <#
     .SYNOPSIS
     Moves a VM's auto-shutdown to -Time (HHmm) and changes nothing else (Global Schedules - Create Or Update, with the
-    schedule as -Schedule read it): Global Schedules - Update changes only tags. Contributor can, and so can the control's
-    identity (Microsoft.DevTestLab/schedules/write at the demo resource group). Returns Ok and Error. Internal.
+    schedule as -Schedule read it): Global Schedules - Update changes only tags. Contributor can; the control's identity
+    can't, since its role has no DevTest Labs action (2026-11-14), so a Run all session ends before a moved one instead
+    (DbHubAutoShutdownMoved, F25). Returns Ok and Error. Internal.
     https://learn.microsoft.com/rest/api/dtl/global-schedules/create-or-update
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -381,6 +382,12 @@ function Sync-DemoAutoShutdownForBusy {
     - With -Restore: autoShutdownTime.
     A schedule that's missing (a first deployment before its template) or disabled is left alone. The schedules are
     shutdown-computevm-sqlvm01 and that of the T2 host (infra/modules/windows-vm.bicep).
+
+    Then, when every VM's schedule could be read, the group's DbHubAutoShutdownMoved tag says where they are (F25,
+    2026-11-21; Save-DemoAutoShutdownMoved): the times of the enabled ones that aren't autoShutdownTime, or nothing. The
+    control's runbook reads it, since its role has no DevTest Labs action: a Run all session ends before the earliest. A
+    busy run's check (-UntilUtc) writes it only when it moved one; -Tags, the group's tags as the caller read them, saves a
+    write that changes nothing.
     #>
     [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Busy')]
     [OutputType([object[]])]
@@ -398,20 +405,28 @@ function Sync-DemoAutoShutdownForBusy {
         [Parameter(Mandatory, ParameterSetName = 'Restore')]
         [switch] $Restore,
 
-        [datetime] $NowUtc = [DateTime]::UtcNow
+        [datetime] $NowUtc = [DateTime]::UtcNow,
+
+        [AllowNull()]
+        [object] $Tags = $null
     )
 
     $setting = Get-DemoAutoShutdownSetting -Config $Config
     $changes = [System.Collections.Generic.List[object]]::new()
+    # Where each VM's auto-shutdown is after this call ('' when it doesn't shut the VM down), and whether all are known.
+    $final = [ordered]@{}
+    $known = $true
     foreach ($vm in @('sqlvm01', (Get-DemoHostVmName -Config $Config))) {
         try {
             $schedule = Read-DemoAutoShutdown -Config $Config -VmName $vm
             if (-not $schedule.Ok) {
                 if (-not $schedule.Missing) {
+                    $known = $false
                     $changes.Add([pscustomobject]@{ VmName = $vm; From = ''; To = ''; Ok = $false; Error = ('its auto-shutdown couldn''t be read: {0}' -f $schedule.Error) })
                 }
                 continue
             }
+            $final[$vm] = if ($schedule.Enabled) { [string]$schedule.Time } else { '' }
             $wanted = if ($Restore) {
                 $setting.Time
             }
@@ -436,12 +451,62 @@ function Sync-DemoAutoShutdownForBusy {
             }
             $set = Set-DemoAutoShutdownTime -Config $Config -Schedule $schedule -Time $wanted -Confirm:$false
             $changes.Add([pscustomobject]@{ VmName = $vm; From = $schedule.Time; To = $wanted; Ok = [bool]$set.Ok; Error = [string]$set.Error })
+            if ($set.Ok -and $schedule.Enabled) {
+                $final[$vm] = $wanted
+            }
         }
         catch {
+            $known = $false
             $changes.Add([pscustomobject]@{ VmName = $vm; From = ''; To = ''; Ok = $false; Error = (Protect-DemoText -Text $_.Exception.Message) })
         }
     }
+    if ($known -and ($PSCmdlet.ParameterSetName -ne 'Busy' -or @($changes | Where-Object { $_.Ok }).Count -gt 0)) {
+        Save-DemoAutoShutdownMoved -Config $Config -Clock @($final.Values) -Tags $Tags -Confirm:$false
+    }
     return $changes.ToArray()
+}
+
+function Save-DemoAutoShutdownMoved {
+    <#
+    .SYNOPSIS
+    Writes the group's DbHubAutoShutdownMoved tag (F25, 2026-11-21): the -Clock times (HHmm) that aren't autoShutdownTime,
+    distinct and sorted, comma-separated, or nothing. With -Tags (the group's tags as the caller read them), only when that
+    changes it. Never throws: a failed write is a warning, since a Run all session could then plan as if the auto-shutdown
+    weren't moved. Internal.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]] $Clock = @(),
+
+        [AllowNull()]
+        [object] $Tags = $null
+    )
+
+    $setting = Get-DemoAutoShutdownSetting -Config $Config
+    $text = @($Clock | Where-Object { $_ -match '^([01]\d|2[0-3])[0-5]\d$' -and $_ -ne $setting.Time } | Sort-Object -Unique) -join ','
+    if ($null -ne $Tags -and [string](Get-DemoMemberValue -InputObject $Tags -Name (Get-DemoDeploymentStateTagName)['AutoShutdownMoved']) -ceq $text) {
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), ('Record where the VMs'' auto-shutdown is: {0}' -f $(if ($text) { $text } else { 'at autoShutdownTime' })))) {
+        return
+    }
+    try {
+        Set-DemoDeploymentState -Config $Config -Value @{ AutoShutdownMoved = $text } -Confirm:$false
+    }
+    catch {
+        $why = Protect-DemoText -Text $_.Exception.Message
+        if ($text) {
+            Write-DemoLog -Level Warning -Message ('The VMs'' auto-shutdown at {0} wasn''t recorded for the control notebook ({1}), so a Run all session that spans it could lose its VMs then. ./scripts/stop-demo.ps1 puts the auto-shutdown back at {2}.' -f ((@($text -split ',') | ForEach-Object { Format-DemoClockText -Clock $_ }) -join ', '), $why, (Format-DemoClockText -Clock $setting.Time))
+        }
+        else {
+            Write-DemoLog -Level Warning -Message ('The VMs'' auto-shutdown is back at {0}, but that wasn''t recorded for the control notebook ({1}), so a Run all session may still end before the time it was moved to, until the next ./scripts/deploy.ps1, start-demo.ps1, or stop-demo.ps1 records it.' -f (Format-DemoClockText -Clock $setting.Time), $why)
+        }
+    }
 }
 
 function Format-DemoClockText {
@@ -1180,10 +1245,16 @@ function Complete-DemoBusyMarkerRun {
             $stopAt = Get-DemoBusyLocalTime -Utc $graceEnd.AddMinutes([int]$setting['passMarginMinutes']) -Zone $shutdown.Zone -StepMinutes 5
             $expiry = if ($null -ne $pass) { $pass.Utc.AddHours([int]$setting['expiryHours']) } else { [datetime]$deferred.ExpiryUtc }
             $scheduled = Set-DemoBusyDeferredPass -Config $Config -StartUtc $stopAt.Utc -ExpiryUtc $expiry -Confirm:$false
-            $changes = @(Sync-DemoAutoShutdownForBusy -Config $Config -TargetClock $stopAt.Clock -NowUtc $NowUtc -Confirm:$false)
+            $changes = @(Sync-DemoAutoShutdownForBusy -Config $Config -TargetClock $stopAt.Clock -NowUtc $NowUtc -Tags $state.Tags -Confirm:$false)
             $shutdownSet = @($changes | Where-Object { -not $_.Ok }).Count -eq 0
             $message = Get-DemoBusyMarkerEndText -Pass $pass -StopText $stopAt.Text -TimeZone $shutdown.TimeZoneId -GraceMinutes ([int]$setting['graceMinutes']) -PassScheduled ([bool]$scheduled.Ok) -PassError ([string]$scheduled.Error) -ShutdownSet $shutdownSet
             $remediation = 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and then its session stops by itself 4 hours after that start (-Hours sets them; since 2026-11-19), or at the next nightly stop, tomorrow at {0}, if that comes first. To stop the demo now, run ./scripts/stop-demo.ps1.' -f (Format-DemoClockText -Clock $shutdown.Time)
+            # Run all, the one action users take (F25, 2026-11-21): a session can't move the VMs' auto-shutdown, so one that
+            # starts before it ends before it. Said only when this run published the control's runbooks (CONTROL.RUNBOOKS),
+            # since an older DbHub-Control plans as if the auto-shutdown weren't moved.
+            if ($shutdownSet -and @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'CONTROL.RUNBOOKS' -and [string]$_.status -eq 'Pass' }).Count -gt 0) {
+                $remediation = '{0} Run all in NB_DatabaseHub_Control before {1} ends its session before then, since a session can''t move the VMs'' auto-shutdown; from {1} on, Run all runs a full session.' -f $remediation, $stopAt.Text
+            }
             $evidence = [ordered]@{ pass = $(if ($null -ne $pass) { [string]$pass.Run } else { 'EarlierRun' }); passLocalTime = $(if ($null -ne $pass) { [string]$pass.LocalTime } else { '' }); waited = (Get-DemoBusyMarkerWaitText -Pass $pass); timeZone = $shutdown.TimeZoneId; busyUntilUtc = (ConvertTo-DemoBusyTimeText -Utc $graceEnd); stopsAtUtc = (ConvertTo-DemoBusyTimeText -Utc $stopAt.Utc); stopsAt = $stopAt.Text; graceMinutes = [int]$setting['graceMinutes']; deferredPass = $(if ($scheduled.Ok) { 'Scheduled' } else { 'Failed' }); deferredPassError = [string]$scheduled.Error; autoShutdown = @($changes | ForEach-Object { '{0}: {1} -> {2}{3}' -f $_.VmName, $_.From, $_.To, $(if ($_.Ok) { '' } else { ' (failed: {0})' -f $_.Error }) }) }
             if ($ProgressPath) {
                 Set-DemoProgressStep -Path $ProgressPath -Id 'NightlyStop' -State 'Done' -Status 'Warning' -Message ('{0} {1}' -f $message, $remediation)
@@ -1206,7 +1277,7 @@ function Complete-DemoBusyMarkerRun {
         elseif ($deferred.Error) {
             $left = $true
         }
-        foreach ($change in @(Sync-DemoAutoShutdownForBusy -Config $Config -Restore -NowUtc $NowUtc -Confirm:$false)) {
+        foreach ($change in @(Sync-DemoAutoShutdownForBusy -Config $Config -Restore -NowUtc $NowUtc -Tags $state.Tags -Confirm:$false)) {
             if ($change.Ok) {
                 $put.Add(('{0}''s auto-shutdown is back at {1}' -f $change.VmName, (Format-DemoClockText -Clock $change.To)))
             }
@@ -1268,9 +1339,12 @@ function Resolve-DemoBusyNightlyStop {
     .SYNOPSIS
     start-demo.ps1 and stop-demo.ps1 settle the nightly stop (2026-11-14): a session that starts takes over from a run the
     nightly stop waited for, and a stop stops everything now. Only when the busy marker's tag holds anything (a run that's
-    going on, its grace, or 'ended' with something left to settle): the deferred pass is removed, the VMs' auto-shutdown
-    goes back to autoShutdownTime, and then the marker is cleared, or kept expired as 'ended' when part of it failed, so the
-    next run tries again. start-demo.ps1 leaves alone the marker of a deploy.ps1 or a session that's still going on.
+    going on, its grace, or 'ended' with something left to settle), or the VMs' auto-shutdown is recorded as moved
+    (DbHubAutoShutdownMoved, F25: a Run all session overwrites the marker and clears it at its end): the deferred pass is
+    removed, the VMs' auto-shutdown goes back to autoShutdownTime, and then the marker is cleared, or kept expired as 'ended'
+    when part of it failed, so the next run tries again. start-demo.ps1 leaves alone the marker of a deploy.ps1 that's still
+    going on, and of a Run all session that's still going on, which it takes over from: then it removes the deferred pass and
+    puts the auto-shutdown back, which would stop its own session, but the marker stays the Run all session's.
     Returns START.NIGHTLYSTOP or STOP.NIGHTLYSTOP: a Pass when it changed something, a Warning when part of it failed;
     nothing otherwise. Never throws. Internal.
     #>
@@ -1292,13 +1366,21 @@ function Resolve-DemoBusyNightlyStop {
 
     $checkId = '{0}.NIGHTLYSTOP' -f $Purpose.ToUpperInvariant()
     $shutdown = Get-DemoAutoShutdownSetting -Config $Config
-    $marker = ConvertTo-DemoBusyMarker -Tags (Get-DemoMemberValue -InputObject $State -Name 'Tags') -NowUtc $NowUtc
-    if (-not $marker.Text) {
+    $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+    $marker = ConvertTo-DemoBusyMarker -Tags $tags -NowUtc $NowUtc
+    # F25 (2026-11-21): the VMs' auto-shutdown that a run moved is recorded apart from the marker, which a Run all session
+    # overwrites with its own and clears at its end, so it's put back after such a session too.
+    $moved = [string](Get-DemoMemberValue -InputObject $tags -Name (Get-DemoDeploymentStateTagName)['AutoShutdownMoved'])
+    if (-not $marker.Text -and -not $moved) {
         return @()
     }
-    if ($Purpose -eq 'Start' -and $marker.Active -and $marker.By -in 'deploy', 'session') {
+    if ($Purpose -eq 'Start' -and $marker.Active -and $marker.By -eq 'deploy') {
         return @()
     }
+    # A Run all session that's still going on: this start-demo.ps1 session takes over from it (2026-11-20), so the night's
+    # deferred stop and a moved auto-shutdown, which would stop this session, go too, but the marker stays the Run all
+    # session's, for its end to clear.
+    $keepMarker = $Purpose -eq 'Start' -and $marker.Active -and $marker.By -eq 'session'
     if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), 'Settle the nightly stop for this session')) {
         return @()
     }
@@ -1311,7 +1393,7 @@ function Resolve-DemoBusyNightlyStop {
     elseif ($removed.Error) {
         $failed.Add(('the deferred nightly pass couldn''t be removed: {0}' -f $removed.Error))
     }
-    foreach ($change in @(Sync-DemoAutoShutdownForBusy -Config $Config -Restore -NowUtc $NowUtc -Confirm:$false)) {
+    foreach ($change in @(Sync-DemoAutoShutdownForBusy -Config $Config -Restore -NowUtc $NowUtc -Tags $tags -Confirm:$false)) {
         if ($change.Ok) {
             $done.Add(('{0}''s auto-shutdown is back at {1}' -f $change.VmName, (Format-DemoClockText -Clock $change.To)))
         }
@@ -1320,10 +1402,13 @@ function Resolve-DemoBusyNightlyStop {
         }
     }
     try {
-        if ($failed.Count -gt 0) {
+        if ($keepMarker) {
+            Write-DemoLog -Level Debug -Message 'The Run all session''s busy marker stays: its own end clears it.'
+        }
+        elseif ($failed.Count -gt 0) {
             Set-DemoBusyMarker -Config $Config -By 'ended' -UntilUtc $NowUtc -Confirm:$false
         }
-        else {
+        elseif ($marker.Text) {
             # Cleared without a word when nothing else needed putting back (a run stopped before anything moved).
             Clear-DemoBusyMarker -Config $Config -Confirm:$false
             if ($done.Count -gt 0) {
@@ -1338,8 +1423,14 @@ function Resolve-DemoBusyNightlyStop {
         return @()
     }
     $why = if ($Purpose -eq 'Start') { 'This session takes over from a run the nightly stop waited for' } else { 'Everything stops now, so nothing waits for the nightly stop' }
+    if ($keepMarker) {
+        $why = 'This session takes over from the Run all session, and from the run the nightly stop waited for before it'
+    }
+    elseif (-not $marker.Text) {
+        $why = 'The VMs'' auto-shutdown was still where deploy.ps1 had moved it for a run the nightly stop waited for, after a Run all session'
+    }
     $next = if ($Purpose -eq 'Start') { ' The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at {0} ({1}).' -f (Format-DemoClockText -Clock $shutdown.Time), $shutdown.TimeZoneId } else { '' }
-    $evidence = [ordered]@{ done = $done.ToArray(); failed = $failed.ToArray(); marker = $marker.Text; markerBy = $marker.By }
+    $evidence = [ordered]@{ done = $done.ToArray(); failed = $failed.ToArray(); marker = $marker.Text; markerBy = $marker.By; autoShutdownMoved = $moved }
     if ($failed.Count -gt 0) {
         return @(New-DemoResult -CheckId $checkId -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('{0}, but not all of it was put back: {1}.{2}' -f $why, ($failed -join '; '), $next) -Evidence $evidence -Remediation ('Run ./scripts/{0}-demo.ps1 again; ./scripts/status.ps1 shows what''s left (STATUS.NIGHTLYSTOP).' -f $Purpose.ToLowerInvariant()) -DocUrl $script:BusyMarkerDoc)
     }
@@ -1349,10 +1440,11 @@ function Resolve-DemoBusyNightlyStop {
 function Get-DemoBusyMarkerStatus {
     <#
     .SYNOPSIS
-    STATUS.NIGHTLYSTOP for status.ps1 (2026-11-14), read-only, when the busy marker's tag holds anything: the marker while
-    it's ahead, the deferred pass while it's to come, and the VMs' auto-shutdown when it isn't at autoShutdownTime. A Pass
-    while a run or the pass explains it; a Warning for an auto-shutdown that's moved with neither, with the commands that
-    put it back. $null when the tag is empty. Never throws. Internal.
+    STATUS.NIGHTLYSTOP for status.ps1 (2026-11-14), read-only, when the busy marker's tag holds anything, or the VMs'
+    auto-shutdown is recorded as moved (DbHubAutoShutdownMoved, F25): the marker while it's ahead, the deferred pass while
+    it's to come, and the VMs' auto-shutdown when it isn't at autoShutdownTime. A Pass while a run or the pass explains it;
+    a Warning for an auto-shutdown that's moved with neither, which a Run all session ends before, with the commands that
+    put it back. $null when both tags are empty. Never throws. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -1368,9 +1460,12 @@ function Get-DemoBusyMarkerStatus {
 
     try {
         $shutdown = Get-DemoAutoShutdownSetting -Config $Config
-        $marker = ConvertTo-DemoBusyMarker -Tags (Get-DemoMemberValue -InputObject $State -Name 'Tags') -NowUtc $NowUtc
-        if (-not $marker.Text) {
-            # Nothing a run moved is left without its marker (Complete-DemoBusyMarkerRun, Resolve-DemoBusyNightlyStop).
+        $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+        $marker = ConvertTo-DemoBusyMarker -Tags $tags -NowUtc $NowUtc
+        $recorded = [string](Get-DemoMemberValue -InputObject $tags -Name (Get-DemoDeploymentStateTagName)['AutoShutdownMoved'])
+        if (-not $marker.Text -and -not $recorded) {
+            # Nothing a run moved is left without its marker (Complete-DemoBusyMarkerRun, Resolve-DemoBusyNightlyStop), or,
+            # once a Run all session has cleared the marker, without DbHubAutoShutdownMoved (F25).
             return $null
         }
         $deferred = Get-DemoBusyDeferredPass -Config $Config
@@ -1406,7 +1501,9 @@ function Get-DemoBusyMarkerStatus {
             return $null
         }
         if ($moved.Count -gt 0 -and -not $marker.Active -and -not $passPending) {
-            return (New-DemoResult -CheckId 'STATUS.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message (($parts -join ' ') + ' No run keeps it there: a run was abandoned, or it ended without the safety stop''s role.') -Evidence $evidence -Remediation ('./scripts/start-demo.ps1, ./scripts/stop-demo.ps1, and ./scripts/deploy.ps1 put it back at {0}.' -f (Format-DemoClockText -Clock $shutdown.Time)) -DocUrl $script:AutoShutdownDoc)
+            # F25: Run all's sessions end before a moved auto-shutdown, since a session can't move it back.
+            $why = if ($marker.Text) { ' No run keeps it there: a run was abandoned, or it ended without the safety stop''s role.' } else { ' No run keeps it there: a Run all session took over from the run it was moved for.' }
+            return (New-DemoResult -CheckId 'STATUS.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message (($parts -join ' ') + $why + ' Until it''s put back, a Run all session ends before it.') -Evidence $evidence -Remediation ('./scripts/start-demo.ps1, ./scripts/stop-demo.ps1, and ./scripts/deploy.ps1 put it back at {0}.' -f (Format-DemoClockText -Clock $shutdown.Time)) -DocUrl $script:AutoShutdownDoc)
         }
         return (New-DemoResult -CheckId 'STATUS.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ($parts -join ' ') -Evidence $evidence -DocUrl $script:BusyMarkerDoc)
     }
