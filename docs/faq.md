@@ -42,7 +42,7 @@ Not for Database Hub's own views (a Fabric Free license). Copilot, Run all, the 
 ## Cost and lifecycle
 
 **What does it cost?**
-`./scripts/estimate-cost.ps1` prices it from Azure's list prices. Ceilings: $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). Not included: the Fabric capacity, Fabric and Power BI licenses, and each viewer's GitHub Copilot plan.
+`./scripts/estimate-cost.ps1` prices it from Azure's list prices. Ceilings: $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 or more a month for a new configuration, from its region's worst case (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). Not included: the Fabric capacity, Fabric and Power BI licenses, and each viewer's GitHub Copilot plan.
 
 **How do I stop paying between demos?**
 `./scripts/stop-demo.ps1` deallocates the VMs, stops T4, deletes T4's read replica and T5's container, and lets T3 auto-pause; Run all does it at a session's end, and the nightly safety stop every evening ([what stops on its own](../README.md#what-stops-or-pauses-on-its-own)). Pause the capacity too.

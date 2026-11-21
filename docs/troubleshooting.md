@@ -573,7 +573,7 @@ Every `deploy.ps1` sets it up. Each evening it deallocates the VMs, stops T4 and
 
 ## Cost
 
-- **Ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). `./scripts/estimate-cost.ps1` prices yours.
+- **Ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 or more a month for a new configuration, from its region's worst case (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). `./scripts/estimate-cost.ps1` prices yours.
 - **Outside every estimate:** the Fabric capacity ([cost management](cost-management.md#microsoft-fabric-capacity)), Fabric and Power BI licenses, and each viewer's GitHub Copilot plan.
 - **A budget alert:** `./scripts/status.ps1` (`STATUS.COST`); usually a forgotten Bastion, an evening start left running, or a T3 profile left on.
 - **Long breaks:** `stop-demo.ps1 -RemoveT3` stops T3's Defender and private-endpoint charges; the next start recreates it, and `HUB.AGENT.T3` is needed again.

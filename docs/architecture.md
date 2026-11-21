@@ -272,7 +272,7 @@ sequenceDiagram
 
 ## Cost
 
-- **Ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 a month for a new configuration (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). Every default stays the cheapest working option, except T4's 4-vCore size.
+- **Ceilings:** $20 a session (`sessionCeilingUsd`, a **Warning** above it) and $415 or more a month for a new configuration, from its region's worst case (`monthlyCeilingUsd`, a hard ceiling: preflight fails above it; a configuration keeps its own value); [cost management](cost-management.md#at-a-glance). Every default stays the cheapest working option, except T4's 4-vCore size.
 - **Estimates:** `estimate-cost.ps1` prices everything at run time from the Azure Retail Prices API. The Fabric capacity, Fabric and Power BI licenses, and each viewer's GitHub Copilot plan are outside every estimate.
 - **Between sessions** the disks, storage, private endpoints, and DNS zones bill, with T5's container while the session control's role can't create it again; an environment deployed before 2026-11-19 keeps that container until its next `./scripts/deploy.ps1` ([what it costs](../README.md#what-it-costs), [T5's cost](cost-management.md#t5-azure-cosmos-db-2026-11-18)).
 

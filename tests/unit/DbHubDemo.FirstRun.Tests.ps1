@@ -80,7 +80,11 @@ BeforeAll {
             # What the other demo environments record (Get-DemoFabricWorkspaceClaim, 2026-11-19): nobody else's workspace
             # unless a test says so (New-InitClaim).
             Claim        = (New-InitClaim)
+            # A new configuration's monthly ceiling (decision 8b, 2026-11-20): what this region's prices give, with no
+            # Retail Prices API call here.
+            Ceiling      = [pscustomobject]@{ Ceiling = 415; WorstCase = 398.23; Priced = $true; DefenderIncluded = $true; Note = 'The monthly ceiling is 415 USD, the default: it holds this region''s worst case for a Contributor''s new deployment, 398.23 USD a month.' }
         }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -MockWith { $script:init.Ceiling }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoAzProfileSubscription -MockWith { $script:calls.Add('Profile'); $script:init.Profile }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoInteractiveSession -MockWith { $script:init.Interactive }
@@ -226,6 +230,17 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         Test-Path -LiteralPath (Join-Path -Path $location -ChildPath 'config/proof.local.json') -PathType Leaf | Should -BeTrue
         Test-Path -LiteralPath (Join-Path -Path $elsewhere -ChildPath 'config/proof.local.json') | Should -BeFalse
         (Get-InitResult $init 'INIT.CONFIG').evidence.path | Should -Be ([System.IO.Path]::Combine($location, 'config', 'proof.local.json'))
+    }
+
+    It 'writes a new configuration''s monthly ceiling from its region''s worst case, and says so (decision 8b, 2026-11-20)' {
+        $script:init.Ceiling = [pscustomobject]@{ Ceiling = 470; WorstCase = 451.88; Priced = $true; DefenderIncluded = $true; Note = 'The monthly ceiling is 470 USD, not the default 415: this region''s worst case for a Contributor''s new deployment is 451.88 USD a month.' }
+        $init = Initialize-DemoConfig -Path $script:path -Location 'westeurope' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Written | Should -BeTrue
+        (Get-DemoConfig -Path $script:path)['monthlyCeilingUsd'] | Should -Be 470
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -Times 1 -Exactly -ParameterFilter { $Config['location'] -eq 'westeurope' -and $Floor -eq 415 -and $SubscriptionId -eq $script:subA }
+        $config = Get-InitResult $init 'INIT.CONFIG'
+        $config.message | Should -Match 'matches the schema\. The monthly ceiling is 470 USD, not the default 415: this region''s worst case for a Contributor''s new deployment is 451\.88 USD a month\.'
+        @($config.evidence.keys) | Should -Contain 'monthlyCeilingUsd'
     }
 
     It 'writes a schema-valid configuration from the sign-in, with the notebooks imported into a new workspace and the capacity never managed' {
@@ -461,6 +476,55 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
     }
 }
 
+Describe 'The monthly ceiling init.ps1 writes for a new configuration (Get-DemoInitialMonthlyCeiling, decision 8b, 2026-11-20)' {
+    BeforeEach {
+        $script:example = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable -Depth 32
+        $script:worst = 451.88
+        $script:plansThrow = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDefenderPlan -MockWith { if ($script:plansThrow) { throw 'AuthorizationFailed: no read on Microsoft.Security/pricings.' }; @([pscustomobject]@{ name = 'VirtualMachines'; pricingTier = 'Standard'; subPlan = 'P2' }) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
+            if ($script:worst -lt 0) { throw 'Too many requests at this point. Please retry after some time.' }
+            [pscustomobject]@{ MonthlyWorstCase = $script:worst; DefenderIncluded = $PesterBoundParameters.ContainsKey('DefenderPlans'); MissingPrices = @() }
+        }
+    }
+
+    It 'gives <Location> <Expected> USD for a worst case of <Worst> USD: 4% headroom, rounded up to 5 USD, never below 415' -ForEach @(
+        @{ Location = 'westus3'; Worst = 398.23; Expected = 415 }
+        @{ Location = 'centralus'; Worst = 435.86; Expected = 455 }
+        @{ Location = 'westeurope'; Worst = 451.88; Expected = 470 }
+        @{ Location = 'australiaeast'; Worst = 510.75; Expected = 535 }
+        @{ Location = 'westus3'; Worst = 353.36; Expected = 415 }
+    ) {
+        $script:worst = $Worst
+        $config = $script:example.Clone()
+        $config['location'] = $Location
+        $ceiling = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $ceiling.Ceiling | Should -Be $Expected
+        $ceiling.Priced | Should -BeTrue
+        $ceiling.WorstCase | Should -Be $Worst
+        $ceiling.Note | Should -Match ('^The monthly ceiling is {0} USD' -f $Expected)
+        $ceiling.Note | Should -Match 'with your subscription''s Defender for Cloud plans'
+        # A Contributor's first deployment: T4's restart for the rest of the month, T5's container all month, no free offer.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter {
+            $T5ContainerLifecycle -eq 'AlwaysOn' -and $T5ManualDeleteOnly -and $null -eq $T4RestartCoverage -and -not $PesterBoundParameters.ContainsKey('T3UseFreeLimit') -and -not $PesterBoundParameters.ContainsKey('T5FreeTier') -and -not $PesterBoundParameters.ContainsKey('T4RestartCoverage') -and @($DefenderPlans).Count -eq 1
+        }
+    }
+
+    It 'keeps 415 and says why when the prices can''t be read, and prices without the Defender plans it can''t read' {
+        $script:worst = -1
+        $config = $script:example.Clone()
+        $failed = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $failed.Ceiling | Should -Be 415
+        $failed.Priced | Should -BeFalse
+        $failed.Note | Should -Match '^The monthly ceiling is 415 USD, the example''s: this region''s worst case couldn''t be priced now \(Too many requests'
+        $script:worst = 398.23
+        $script:plansThrow = $true
+        $without = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $without.Ceiling | Should -Be 415
+        $without.Note | Should -Match 'without your subscription''s Defender for Cloud plans, which couldn''t be read: AuthorizationFailed'
+    }
+}
+
 Describe 'A first run in a subscription that already has the environment (issue 60)' {
     BeforeEach {
         Set-InitMock
@@ -483,6 +547,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $written['ownerEmail'] | Should -Be 'budget@contoso.example'
         $written['costCenter'] | Should -Be 'contoso-demo'
         $written['monthlyCeilingUsd'] | Should -Be 250
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -Times 0 -Exactly -Because 'a ceiling the deployment recorded keeps its value (decision 8b)'
         $written['autoShutdownTime'] | Should -Be '2000'
         $written['autoShutdownTimeZone'] | Should -Be 'W. Europe Standard Time' -Because 'the schedule stays, whatever this machine''s time zone is'
         $written['securityType']['t1'] | Should -Be 'Standard'

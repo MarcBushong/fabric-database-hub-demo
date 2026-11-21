@@ -875,10 +875,19 @@ function Initialize-DemoConfig {
     $runNote = (@([string]$report.Note, $(if ($null -ne $claimOutcome) { [string]$claimOutcome.Line } else { '' })) | Where-Object { $_ }) -join ' '
     $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = $effectivePrefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = [string]$existing.Signal; Note = $runNote }
 
+    # The hard monthly ceiling (decision 8b, 2026-11-20): a new configuration's comes from its region's worst case for a
+    # Contributor's new deployment, so preflight passes it in every region; one recovered from a deployment keeps its value.
+    $ceiling = $null
+    if (-not ($recovered -and @($existing.Values.Keys) -contains 'monthlyCeilingUsd')) {
+        $ceiling = Get-DemoInitialMonthlyCeiling -Config $config -SubscriptionId $subscription -Floor ([double]$config['monthlyCeilingUsd'])
+        $config['monthlyCeilingUsd'] = [int]$ceiling.Ceiling
+    }
+    $ceilingNote = if ($null -ne $ceiling) { ' ' + [string]$ceiling.Note } else { '' }
+
     $json = $config | ConvertTo-Json -Depth 32
     $validationErrors = @()
     $valid = Test-Json -Json $json -SchemaFile $SchemaPath -ErrorVariable validationErrors -ErrorAction SilentlyContinue
-    $written = @(@('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', $(if ($keptEnvironment) { 'environment' }), 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', 'fabric') + @($(if ($recovered) { @($existing.Values.Keys | ForEach-Object { ([string]$_).Split('.')[0] }) })) + @($(if ($controlWorkspace) { 'control' })) | Where-Object { $_ } | Select-Object -Unique)
+    $written = @(@('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', $(if ($keptEnvironment) { 'environment' }), 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', $(if ($null -ne $ceiling) { 'monthlyCeilingUsd' }), 'fabric') + @($(if ($recovered) { @($existing.Values.Keys | ForEach-Object { ([string]$_).Split('.')[0] }) })) + @($(if ($controlWorkspace) { 'control' })) | Where-Object { $_ } | Select-Object -Unique)
     $summary = 'subscription "{0}", region {1}, prefix {2}, network {3}, T2 {4}, the workspace "{5}" on "{6}", and the P6 group {7}' -f $chosen.Name, $config['location'], $effectivePrefix, $config['networkMode'], $mode, $workspace, $(if ($capacityChosen) { $capacityChosen } else { '(none yet)' }), $(if ($groupId -ne $zeroGuid) { '"' + $groupName + '"' } else { '(none yet)' })
     # What the run kept from the file it overwrites, so it's still that environment's (the final tests' F7).
     $keptWhat = @($(if ($keptPrefix) { 'the prefix ' + $keptPrefix }), $(if ($keptEnvironment) { 'the environment ' + $keptEnvironment }) | Where-Object { $_ }) -join ' and '
@@ -890,7 +899,7 @@ function Initialize-DemoConfig {
     }
     $backupPath = ''
     if ($dryRun -or -not $PSCmdlet.ShouldProcess($fullPath, 'Write the demo configuration')) {
-        & $add 'INIT.CONFIG' 'preflight' 'repo' 'Not selected' ('What if: {0} would be written ({1}){2}, validated against the schema.{3}{4}' -f $fullPath, $summary, $(if ($exists -and -not $Force) { '; it exists, so init.ps1 needs -Force to replace it' } else { '' }), $zoneNote, $keptNote) ([ordered]@{ path = $fullPath; keys = @($written) }) '' ''
+        & $add 'INIT.CONFIG' 'preflight' 'repo' 'Not selected' ('What if: {0} would be written ({1}){2}, validated against the schema.{5}{3}{4}' -f $fullPath, $summary, $(if ($exists -and -not $Force) { '; it exists, so init.ps1 needs -Force to replace it' } else { '' }), $zoneNote, $keptNote, $ceilingNote) ([ordered]@{ path = $fullPath; keys = @($written) }) '' ''
     }
     else {
         try {
@@ -910,7 +919,7 @@ function Initialize-DemoConfig {
             & $add 'INIT.CONFIG' 'preflight' 'repo' 'Fail' ('The configuration couldn''t be written: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) @{} 'Check that the folder is writable, then run init.ps1 again.' ''
             return (& $finish $false $backupPath $config)
         }
-        $message = 'Wrote {0}: {1}. It''s Git-ignored and holds no secrets, and it matches the schema.{2}{3}{4}' -f $fullPath, $summary, $(if ($backupPath) { ' The old file is in ' + $backupPath + '.' } else { '' }), $zoneNote, $keptNote
+        $message = 'Wrote {0}: {1}. It''s Git-ignored and holds no secrets, and it matches the schema.{5}{2}{3}{4}' -f $fullPath, $summary, $(if ($backupPath) { ' The old file is in ' + $backupPath + '.' } else { '' }), $zoneNote, $keptNote, $ceilingNote
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Pass' $message ([ordered]@{ path = $fullPath; backupPath = $backupPath; keys = @($written) }) '' ''
     }
     #endregion 9. The configuration

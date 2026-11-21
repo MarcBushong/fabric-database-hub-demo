@@ -6,6 +6,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 **The release's follow-ups.** Small fixes found during the 2026-11-20 release tests. **How to update:** run `./scripts/deploy.ps1`; your configuration needs no edit.
 
+### Changed
+
+- `init.ps1` sets a new configuration's hard monthly ceiling (`monthlyCeilingUsd`) from its region's worst case for a Contributor's new deployment, priced then as preflight prices it, with 4% headroom, rounded up to 5 USD, and never below 415, so preflight passes it in every region: before, 415 fit only West US 3 and East US 2. `INIT.CONFIG` says the ceiling and why. A value already in your configuration doesn't change.
+
 ### Fixed
 
 - On the first update that turns on T2's migration assessment, the Insights app's **Ready to migrate** linked the Azure portal until the next `./scripts/deploy.ps1`, because the app deployed a few minutes before the assessment's first upload (F18). The stop at the end of an update already waits for that upload; the app now deploys once more after it, so the card shows T2's readiness from that update on (`FABRIC.APP.ESTATE`'s `t2MigrationReadAt`). When that deploy doesn't pass, the app deployed earlier in the run stays, and `FABRIC.APP.MIGRATION` (a **Warning**) says how to add the readiness.
