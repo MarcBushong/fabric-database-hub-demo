@@ -352,6 +352,15 @@ describe("Estate", () => {
         await waitFor(() => expect(within(chart).getByText("peak 99.96 %")).toBeInTheDocument());
     });
 
+    it("writes T5's lowest availability just under its 99.99 % line as it is, beside its Warning (2026-11-21)", async () => {
+        // Two decimals alone write 99.989 % as 99.99 %, the line under which the tile warns.
+        const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "ServiceAvailability" ? { ...r, Value: 99.989 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("99.989 %")).toBeInTheDocument());
+        expect(within(glance).getByText("99.989 %").closest(".kpi")).toHaveClass("kpi-warning");
+    });
+
     it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
         const empty = { "cosmos-series": [], "cosmos-findings": [] };
         const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient(empty) });

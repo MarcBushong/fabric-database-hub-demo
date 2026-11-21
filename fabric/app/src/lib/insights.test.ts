@@ -297,6 +297,18 @@ describe("T4's insights (ADR 0025)", () => {
         expect(postgresCpuInsight(capture([point("T4-replica", "cpu_percent", 0, 99)]))).toBeNull();
     });
 
+    it("never writes a peak just under its warning line as the line, beside a Pass (2026-11-21)", () => {
+        // One decimal alone writes 79.996 % as 80.0 %, and 59.96 s as 60.0 s: the lines where they'd warn.
+        const cpu = postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 20), point("T4", "cpu_percent", 5, 79.996)]));
+        expect(cpu?.status).toBe("Pass");
+        expect(cpu?.metric).toBe("79.996 %");
+        expect(cpu?.title).toBe("T4's CPU peaked at 79.996 % at 17:05 UTC on 13 Nov.");
+        expect(postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 80)]))?.metric).toBe("80.0 %");
+        const lag = replicaLagInsight(capture([point("T4-replica", "physical_replication_delay_in_seconds", 0, 6), point("T4-replica", "physical_replication_delay_in_seconds", 5, 59.96)]));
+        expect(lag?.status).toBe("Pass");
+        expect(lag?.metric).toBe("59.96 s");
+    });
+
     it("counts T4's failed connections: a warning above 0, a pass at 0", () => {
         const failed = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0), point("T4", "connections_failed", 5, 3), point("T4", "connections_failed", 10, 1)]));
         expect(failed?.status).toBe("Warning");

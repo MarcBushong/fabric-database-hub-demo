@@ -63,6 +63,50 @@ export function formatLevel(value: unknown, kind: NumberKind): string {
     return text;
 }
 
+/** The decimals formatNumber writes a value of a kind with (compact has none of its own: -1). */
+function numberDigits(value: number, kind: NumberKind): number {
+    switch (kind) {
+        case "int":
+            return 0;
+        case "percent":
+            return 1;
+        case "compact":
+            return -1;
+        case "seconds":
+        case "minutes":
+        case "mb":
+        case "ms":
+            return value >= 100 ? 0 : 1;
+        default:
+            return Math.abs(value) >= 100 ? 0 : 1;
+    }
+}
+
+/**
+ * A value beside the status line it's judged by (a Warning at 80 % CPU or more, at 60 s of replica lag or more, under 99.99 %
+ * availability), as formatNumber writes it, with more decimals, 4 at most, only while that text would put it on the line's
+ * other side: 79.996 against 80 reads "79.996 %", never "80.0 %" beside a Pass, and 99.989 against 99.99 reads "99.989 %",
+ * never "99.99 %" beside a Warning; a value at or over the line never reads under it. A percentage under 100 never reads
+ * 100 either, as with formatLevel. Past 4 decimals, "just under 80 %".
+ */
+export function formatBeside(value: unknown, kind: NumberKind, line: number): string {
+    if (!isNumber(value) || !Number.isFinite(line)) return formatNumber(value, kind);
+    const start = numberDigits(value, kind);
+    if (start < 0) return formatNumber(value, kind);
+    const lines = kind === "percent" && line !== 100 ? [line, 100] : [line];
+    const sideOf = (digits: number) => {
+        const shown = Number(new Intl.NumberFormat("en-US", { maximumFractionDigits: digits, useGrouping: false }).format(value));
+        return lines.find((l) => (value < l ? shown >= l : shown < l));
+    };
+    if (sideOf(start) === undefined) return formatNumber(value, kind);
+    for (let digits = start + 1; digits <= 4; digits++) {
+        if (sideOf(digits) === undefined) return formatNumberDigits(value, kind, digits);
+    }
+    const crossed = sideOf(4) as number;
+    const lineText = `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(crossed)}${UNIT[kind] ?? ""}`;
+    return value < crossed ? `just under ${lineText}` : `at least ${lineText}`;
+}
+
 /**
  * A share (0 to 1) in percent, whole or with `digits` decimals, that never rounds some to none, or nearly all to all:
  * "less than 1 %" ("less than 0.1 %" with one decimal), "more than 99 %" ("more than 99.9 %").

@@ -44,7 +44,7 @@ import { useQuery } from "@/data/use-query";
 import { hubUrlOf, libraryPrompts, type AgentSurface } from "@/lib/agent-prompts";
 import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
-import { formatAgo, formatDateTimeUtc, formatDuration, formatLevel, formatNumber, percent } from "@/lib/format";
+import { formatAgo, formatBeside, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
 import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
@@ -305,7 +305,7 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
             />
 
             <section className="kpis" aria-label={`${target} at a glance`}>
-                <KpiTile label="CPU, average · peak" value={`${formatNumber(t?.cpuAvg ?? null, "percent")}`} sub={`peak ${formatNumber(t?.cpuPeak ?? null, "percent")}${peak ? ` at ${formatDateTimeUtc(peak.at)}` : ""}`} status={t && (t.cpuPeak ?? 0) >= 80 ? "Warning" : t ? "Pass" : null} actions={
+                <KpiTile label="CPU, average · peak" value={`${formatNumber(t?.cpuAvg ?? null, "percent")}`} sub={`peak ${formatBeside(t?.cpuPeak ?? null, "percent", 80)}${peak ? ` at ${formatDateTimeUtc(peak.at)}` : ""}`} status={t && (t.cpuPeak ?? 0) >= 80 ? "Warning" : t ? "Pass" : null} actions={
                     peak && median && peak.value >= 2 * median ? (
                         <AskWhy
                             title={`${target} CPU`}
@@ -525,7 +525,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         <KpiTile label="Read replica" value={capture?.servers["T4-replica"] ?? "Not in this capture"} sub={skus["T4-replica"] ?? "It exists only during a session"} />
                         <KpiTile
                             label="Read replica lag, peak"
-                            value={lagPeak ? formatNumber(lagPeak.value, "seconds") : "–"}
+                            value={lagPeak ? formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS) : "–"}
                             status={lagPeak ? (lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass") : null}
                             sub={lagPeak ? `at ${formatDateTimeUtc(lagPeak.at)} · warning at ${REPLICA_LAG_WARNING_SECONDS} s` : "No lag in this capture"}
                             actions={
@@ -541,7 +541,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                                 ) : undefined
                             }
                         />
-                        <KpiTile label="T4 CPU, peak" value={formatNumber(cpuPeak?.value ?? null, "percent")} status={cpuPeak ? (cpuPeak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass") : null} sub={cpuPeak ? `at ${formatDateTimeUtc(cpuPeak.at)}` : ""} />
+                        <KpiTile label="T4 CPU, peak" value={formatBeside(cpuPeak?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT)} status={cpuPeak ? (cpuPeak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass") : null} sub={cpuPeak ? `at ${formatDateTimeUtc(cpuPeak.at)}` : ""} />
                         <KpiTile label="Failed connections" value={formatNumber(failedTotal, "int")} status={failedTotal > 0 ? "Warning" : "Pass"} sub="On T4 in the capture" />
                     </section>
 
@@ -556,7 +556,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         empty={!d.pgSeries.loading && lagRows.length === 0}
                         emptyText="No Read replica lag in this capture: T4's read replica exists only during a session."
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "T4-replica", label: "Read replica lag (s)", kind: "seconds" }], rows: lagRows, caption: "Read replica lag per interval" }}
-                        summary={lagPeak ? `Read replica lag peaked at ${formatNumber(lagPeak.value, "seconds")}.` : "No lag."}
+                        summary={lagPeak ? `Read replica lag peaked at ${formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)}.` : "No lag."}
                         askPrompt="Explain the read replica's lag in this capture: what caused the peak, and is it a problem?"
                     >
                         <ChartView
@@ -690,7 +690,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         <KpiTile label="Account" value={capture?.account || "\u2013"} sub={provisioned !== null ? `Azure Cosmos DB for NoSQL \u00b7 ${formatNumber(provisioned, "int")} RU/s provisioned` : "Azure Cosmos DB for NoSQL"} />
                         <KpiTile
                             label="Normalized RU, peak"
-                            value={formatLevel(ruPeak?.value ?? null, "percent")}
+                            value={formatBeside(ruPeak?.value ?? null, "percent", 100)}
                             status={ruPeak ? (ruPeak.value >= 100 ? "Warning" : "Pass") : null}
                             sub={ruPeak ? `at ${formatDateTimeUtc(ruPeak.at)} \u00b7 100 % throttles` : ""}
                             actions={
@@ -713,7 +713,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             sub={requests > 0 ? `${percent(throttled / requests, 1)} of ${formatNumber(requests, "int")} requests` : "No requests in the capture"}
                         />
                         <KpiTile label="Recovery" value={recovery ? (recovery.status === "Pass" ? "Recovered" : "Not yet") : throttled > 0 ? "\u2013" : "No throttling"} status={recovery?.status ?? (throttled > 0 ? null : "Pass")} sub={recovery ? recovery.text : "Back at baseline before the capture ended"} />
-                        <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatLevel(lowest, "percent")} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
+                        <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatBeside(lowest, "percent", 99.99)} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
                         <KpiTile label="Gateway latency" value={latencyAvg === null ? "\u2013" : formatNumber(latencyAvg, "ms")} sub={latencyPeak ? `average \u00b7 peak ${formatNumber(latencyPeak.value, "ms")}` : "average"} />
                     </section>
 
@@ -728,7 +728,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         empty={!d.cosmosSeriesState.loading && ruRows.length === 0}
                         emptyText="No normalized RU in this capture."
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "Normalized RU", label: "Normalized RU (%)", kind: "percent" }], rows: ruRows, caption: "Normalized RU per interval" }}
-                        summary={ruPeak ? `Normalized RU peaked at ${formatLevel(ruPeak.value, "percent")}; ${throttledRuns(capture).length} throttled stretches in ${episodes.length} episodes.` : "No normalized RU."}
+                        summary={ruPeak ? `Normalized RU peaked at ${formatBeside(ruPeak.value, "percent", 100)}; ${throttledRuns(capture).length} throttled stretches in ${episodes.length} episodes.` : "No normalized RU."}
                         askPrompt="Explain T5's normalized RU in this capture: when did it throttle, why, and did it recover?"
                     >
                         <ChartView
@@ -738,7 +738,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             annotations={{
                                 bands: throttledRuns(capture).map((r) => ({ from: r.from, to: r.to, tone: "incident" as const })),
                                 thresholds: [{ value: 100, label: "100 %: throttling", tone: "warning" }],
-                                markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatLevel(ruPeak.value, "percent")}` }] : [],
+                                markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatBeside(ruPeak.value, "percent", 100)}` }] : [],
                             }}
                         />
                     </VisualCard>

@@ -7,7 +7,7 @@ import { ArrowClockwise16Regular, Code16Regular, Sparkle16Filled } from "@fluent
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
 import { liveDataOf, liveOffOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type UsageSummary } from "@/data/live-estate";
-import { formatLevel, sentence } from "@/lib/format";
+import { formatBeside, sentence } from "@/lib/format";
 import { inventoryMix, isDown, liveSecurityRows, targetOfResource, uniqueInventory } from "@/lib/live-findings";
 import { KpiTile } from "./KpiTile";
 import { ProvenanceBadge } from "./ProvenanceBadge";
@@ -153,8 +153,8 @@ export function LiveNow() {
                 {cosmos ? (
                     <KpiTile
                         label="Cosmos DB, last 24 hours"
-                        value={cosmos.maximumNormalizedRu === null ? "\u2013" : formatLevel(cosmos.maximumNormalizedRu, "percent")}
-                        sub={`peak normalized RU \u00b7 lowest availability ${cosmos.minimumServiceAvailability === null ? "n/a" : formatLevel(cosmos.minimumServiceAvailability, "percent")}`}
+                        value={cosmos.maximumNormalizedRu === null ? "\u2013" : formatBeside(cosmos.maximumNormalizedRu, "percent", 100)}
+                        sub={`peak normalized RU \u00b7 lowest availability ${cosmos.minimumServiceAvailability === null ? "n/a" : formatBeside(cosmos.minimumServiceAvailability, "percent", 99.99)}`}
                         status={(cosmos.maximumNormalizedRu ?? 0) >= 100 ? "Warning" : "Pass"}
                         onOpen={() => navigate("estate", { target: "T5" })}
                         openLabel="Open T5"

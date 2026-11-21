@@ -15,8 +15,8 @@ import {
     type PostgresFinding,
     type TargetSummary,
 } from "@/data/model";
-import { formatAgo, formatLevel, formatNumber } from "./format";
-import { REPLICA_LAG_WARNING_SECONDS } from "./insights";
+import { formatAgo, formatBeside, formatNumber } from "./format";
+import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "./insights";
 import { statusBySort, worstStatus, type StatusName } from "./status";
 import type { EstateTarget } from "./view-state";
 
@@ -55,7 +55,7 @@ export function sqlHealth(targets: readonly TargetSummary[], findings: readonly 
             reporting: Boolean(t && t.bins > 0),
             metrics: t
                 ? [
-                      { label: "CPU peak", value: formatNumber(t.cpuPeak, "percent") },
+                      { label: "CPU peak", value: formatBeside(t.cpuPeak, "percent", 80) },
                       { label: "Waits", value: formatNumber(t.waitS, "seconds") },
                       { label: "Sessions", value: formatNumber(t.sessionsPeak, "int") },
                   ]
@@ -95,8 +95,8 @@ export function postgresHealth(capture: PostgresCapture | null, findings: readon
         status: worst?.name ?? "Pass",
         reporting: true,
         metrics: [
-            { label: "CPU peak", value: formatNumber(postgresPeak(cpu)?.value ?? null, "percent") },
-            { label: "Replica lag", value: lagPeak ? formatNumber(lagPeak.value, "seconds") : "–" },
+            { label: "CPU peak", value: formatBeside(postgresPeak(cpu)?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT) },
+            { label: "Replica lag", value: lagPeak ? formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS) : "–" },
             { label: "Failed conn.", value: formatNumber(failed, "int") },
         ],
         note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}`,
@@ -122,10 +122,10 @@ export function cosmosHealth(capture: CosmosCapture | null, findings: readonly P
         status: worst?.name ?? "Pass",
         reporting: true,
         metrics: [
-            // A peak or a lowest just under 100 % never reads 100.0 % (formatLevel), as T5's page writes them.
-            { label: "Norm. RU peak", value: formatLevel(postgresPeak(ru)?.value ?? null, "percent") },
+            // Each beside the line T5's page judges it by (formatBeside): 100 % throttles, under 99.99 % availability warns.
+            { label: "Norm. RU peak", value: formatBeside(postgresPeak(ru)?.value ?? null, "percent", 100) },
             { label: "429s", value: formatNumber(throttled, "int") },
-            { label: "Availability", value: availability.length > 0 ? formatLevel(Math.min(...availability), "percent") : "\u2013" },
+            { label: "Availability", value: availability.length > 0 ? formatBeside(Math.min(...availability), "percent", 99.99) : "\u2013" },
         ],
         note: `Captured ${formatAgo(capture.capturedAt)}${throttled > 0 ? (recovered ? "; throttled, then recovered" : "; throttled") : ""}`,
         spark: ru.map((p) => p.value),

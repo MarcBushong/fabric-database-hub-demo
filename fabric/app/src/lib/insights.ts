@@ -1,7 +1,7 @@
 // Rule-based insights: plain sentences computed from the query results in the browser. No external AI service.
 
 import { SQL_TARGETS, type TargetKey } from "./dax";
-import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
+import { formatBeside, formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
 import { mean } from "./stats";
 import type { StatusName } from "./status";
 import type { EstateTarget, PageId } from "./view-state";
@@ -376,8 +376,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
     return {
         id: "replica-lag",
         status: peak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass",
-        metric: formatNumber(peak.value, "seconds"),
-        title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        metric: formatBeside(peak.value, "seconds", REPLICA_LAG_WARNING_SECONDS),
+        title: `Read replica lag peaked at ${formatBeside(peak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.${left}`,
         page: "estate",
         target: "T4",
@@ -393,8 +393,8 @@ export function postgresCpuInsight(capture: PostgresCapture | null): Insight | n
     return {
         id: "postgres-cpu",
         status: peak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass",
-        metric: formatNumber(peak.value, "percent"),
-        title: `T4's CPU peaked at ${formatNumber(peak.value, "percent")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        metric: formatBeside(peak.value, "percent", POSTGRES_CPU_WARNING_PERCENT),
+        title: `T4's CPU peaked at ${formatBeside(peak.value, "percent", POSTGRES_CPU_WARNING_PERCENT)} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(cpu.map((p) => p.value)), "percent")} on average${connections ? `; active connections peaked at ${formatNumber(connections.value, "int")} at ${formatTimeUtc(connections.at)} UTC` : ""}. ${POSTGRES_CPU_WARNING_PERCENT} % or more is a warning.`,
         page: "estate",
         target: "T4",
