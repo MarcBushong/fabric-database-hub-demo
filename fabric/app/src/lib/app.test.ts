@@ -61,6 +61,35 @@ describe("themes", () => {
         }
     });
 
+    it("marks the current page with the system's selection colors under Windows forced colors, where the theme's colors give way, and keeps its name legible (F22)", () => {
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8");
+        const forced = css.match(/@media \(forced-colors: active\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+        const rule = (selector: string) => forced.match(new RegExp(`^\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m"))?.[1] ?? "";
+        const value = (body: string, property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`))?.[1]?.trim() ?? "missing";
+        const selected = rule('.nav-item[aria-current="page"]');
+        // Every other item takes the system's text on its canvas; the current one, its selection colors, like Windows's own lists.
+        expect([value(selected, "background"), value(selected, "color")]).toEqual(["Highlight", "HighlightText"]);
+        expect(value(rule('.nav-item[aria-current="page"] .nav-icon'), "color")).toBe("HighlightText");
+        expect(value(rule('.nav-item[aria-current="page"]::before'), "background")).toBe("HighlightText");
+        // Without it, Edge paints its readability backplate (Canvas) behind the HighlightText name: black on black, 1:1, as
+        // the final tests found in headless Edge; with it, 14.11:1 on the dark palette and 14.83:1 on the light one. Its focus
+        // ring then keeps the theme's color, which can be the Canvas's: CanvasText, as forced colors paint one.
+        expect(value(selected, "forced-color-adjust")).toBe("none");
+        expect(value(selected, "outline-color")).toBe("CanvasText");
+    });
+
+    it("marks the kiosk's current scene with the system's selection colors under Windows forced colors, as the current page, legibly (F22)", () => {
+        const css = readFileSync(join(process.cwd(), "src", "mission", "mission.css"), "utf8");
+        const forced = css.match(/@media \(forced-colors: active\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+        const body = forced.match(/^\s*\.kiosk-scenes button\[aria-current="step"\]\s*\{([^}]*)\}/m)?.[1] ?? "";
+        const value = (property: string) => body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`))?.[1]?.trim() ?? "missing";
+        // Its marks on the stage, a border's color and an inset shadow, give way in forced colors: the system's selection colors don't.
+        expect([value("background"), value("color")]).toEqual(["Highlight", "HighlightText"]);
+        // Without it, its name was painted at 1.89:1 over Edge's backplate; with it, at 14.11:1. Then nothing is forced: no
+        // shadow from the stage, and a CanvasText focus ring.
+        expect([value("forced-color-adjust"), value("box-shadow"), value("outline-color")]).toEqual(["none", "none", "CanvasText"]);
+    });
+
     it("uses Fluent 2's Microsoft blue as the brand, not Fabric's teal, from one set of tokens (ADR 0030, the owner's choice)", () => {
         expect(APP_BRAND).toBe(MICROSOFT_BRAND);
         // The same ramp Fluent's own web themes are made from: their brand tokens come out the same.

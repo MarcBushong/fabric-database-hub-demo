@@ -1,7 +1,7 @@
 // Rule-based insights: plain sentences computed from the query results in the browser. No external AI service.
 
 import { SQL_TARGETS, type TargetKey } from "./dax";
-import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, type NumberKind } from "./format";
+import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
 import { mean } from "./stats";
 import type { StatusName } from "./status";
 import type { EstateTarget, PageId } from "./view-state";
@@ -200,8 +200,8 @@ export function dominantWaitInsight(flows: readonly WaitFlow[]): Insight | null 
     return {
         id: "dominant-wait",
         status: null,
-        metric: `${Math.round(share * 100)} %`,
-        title: `${busiest} carries ${Math.round(share * 100)} % of the estate's wait time; its biggest category is ${top.category}.`,
+        metric: percent(share),
+        title: `${busiest} carries ${percent(share)} of the estate's wait time; its biggest category is ${top.category}.`,
         detail: `${formatNumber(top.seconds, "seconds")} of ${top.category} out of ${formatNumber(busiestSeconds, "seconds")} on ${busiest}, and ${formatNumber(total, "seconds")} across the selected targets.`,
         page: "incidents",
     };
@@ -309,7 +309,7 @@ export function readinessInsight(summary: ReadinessSummary | null, checks: reado
     return {
         id: "readiness",
         status,
-        metric: `${Math.round(share * 100)} %`,
+        metric: percent(share),
         title: `${summary.passed} of ${applicable} applicable checks pass; ${summary.failed} failed, ${summary.manual} need a manual step, and ${summary.warnings} carry warnings.`,
         detail: next ? `Next step (${next.checkId}): ${next.remediation}` : summary.runLabel,
         page: "readiness",

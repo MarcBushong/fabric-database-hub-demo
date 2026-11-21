@@ -49,7 +49,7 @@ The Fabric data agent is out of scope: it works over OneLake data, not Database 
 | Reader or higher on the subscription. Contributors have it; others need P8 | A subscription Owner or RBAC administrator | [Monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql) |
 | `Microsoft.Sql` registered (P2) and performance monitoring enabled on each target (Phase 9) | `preflight.ps1` and the deployment | [Add SQL](https://learn.microsoft.com/fabric/database/hub/add-sql) |
 | Copilot enabled for the presenter by the tenant and capacity settings, on a workspace's Fabric capacity | A Fabric administrator | [Copilot in Fabric](https://learn.microsoft.com/fabric/fundamentals/copilot-enable-fabric) |
-| Database Agents turned on, with T3 selected in **Manage agents** > **Database agent settings**, once per deployment (`HUB.AGENT.T3`); T3 in the region associated with the Fabric tenant's home region | The account that deployed the demo: saving needs Azure write access on T3 (`T3.AGENT`) | [Enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents) |
+| Database Agents turned on, with T3 selected in **Manage agents** > **Database agent settings**, once per deployment (`HUB.AGENT.T3`; [step by step](../../docs/database-agents.md)); T3 in the region associated with the Fabric tenant's home region | The account that deployed the demo: saving needs Azure write access on T3 (`T3.AGENT`) | [Enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents) |
 
 ### Use it safely: approval rules for presenters
 

@@ -1,3 +1,8 @@
+# The golden boot test's disposable environment, rg-<prefix>-<TestEnvironment> (Test-DemoT2GoldenSnapshot), carries this
+# purpose tag: test-t2-golden.ps1 deletes only a group that has it, and destroy.ps1 knows the group has no T3, though it has
+# a deploymentId tag (Get-DemoDestroyExtraPlan; review of 5d1f4b0, 2026-11-20). ADR 0002.
+$script:GoldenTestPurpose = 't2-golden-boot-test'
+
 function Get-DemoGoldenResourceGroupName {
     # rg-<prefix>-golden: the T2 golden snapshots, shared by every environment of the prefix (ADR 0018). Internal.
     [CmdletBinding()]

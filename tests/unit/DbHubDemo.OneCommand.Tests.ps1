@@ -1663,7 +1663,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
             $note = @($second.Notes | Where-Object { $_ -match '^From the earlier run at \d\d:\d\d.*\(.+\), since this run didn''t check them again: Database Agents on T3 and the Insights app\.$' })
             $note.Count | Should -Be 1
             $banner = (InModuleScope DbHubDemo -Parameters @{ Outcome = $second } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
-            $banner | Should -Match 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment'
+            $banner | Should -Match 'Required once for the Database Agent beat; everything else works without it\. Once per deployment'
             $banner | Should -Match ([regex]::Escape($note[0]))
             @(Get-CarriedId $second) | Should -Be @('HUB.AGENT.T3', 'FABRIC.APP.DEPLOY', 'FABRIC.APP.CONNECTOR')
             @($second.Added | Where-Object { $_.checkId -eq 'DEPLOY.CARRIED' })[0].status | Should -Be 'Pass'
@@ -1671,7 +1671,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
             # The status page: "Please confirm", the reason with the note, and the app's row with its earlier state.
             $model = Get-Content -LiteralPath $script:carryRun.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
             $model['run']['state'] | Should -Be 'Done'
-            @($model['confirm'] | Where-Object { $_ -match '^Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment' }).Count | Should -Be 1
+            @($model['confirm'] | Where-Object { $_ -match '^Required once for the Database Agent beat; everything else works without it\. Once per deployment' }).Count | Should -Be 1
             $model['run']['reason'] | Should -Match 'the Insights app'
             $model['run']['reason'] | Should -Match 'From the earlier run at'
             $row = Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.App'
@@ -1680,7 +1680,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
             (Get-ModelStep -Path $script:carryRun.ProgressPath -Id 'Fabric.Items')['message'] | Should -Be 'Finished in an earlier run.' -Because 'only the app''s and Ask''s rows show an earlier state'
             $page = Get-Content -LiteralPath $script:carryRun.PagePath -Raw
             $page | Should -Match 'Please confirm'
-            $page | Should -Match 'Optional, for the Database Agent loop: select T3 in Database Agents, once per deployment'
+            $page | Should -Match 'Required once for the Database Agent beat; everything else works without it\. Once per deployment'
         }
 
         It 'shows an Insights app that run 1 couldn''t create as what didn''t work, on DONE and its row' {

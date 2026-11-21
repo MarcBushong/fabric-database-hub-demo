@@ -217,7 +217,8 @@ Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answ
 **Open for the owner, numbered after the decisions:**
 
 - **6. Names** ([§2](#2-names)): **recommended,** (a′) and (c) as a Wave 2 follow-up; Phase 1 does (b).
-- **8. The release's wording** that reads as blind detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)): one-line fixes, for the release's owner. Wave 2's detector then makes "caught" true as written.
+
+**Done in the release:** 8, the wording that read as blind detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)), fixed by the release's own commits (R927). Wave 2's detector then makes "caught" true as written.
 
 ## Where the data lives, how long it's kept, and who keeps it
 
@@ -274,12 +275,12 @@ Wave 1 is built as verification against the plan, by design ([ADR 0030](0030-ins
 | [`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163 | Scenario Runs | The Cause is what was injected |
 | [`pages/IncidentsPage.tsx`](../../fabric/app/src/pages/IncidentsPage.tsx), lines 50 and 290; the agent loop, lines 112 to 168 | Incident Windows' scenario; the beat's run events | Shows the scenario; Respond and Verify read the workload's own events |
 
-**Release wording that reads as blind detection,** with one-line fixes:
+**Release wording that read as blind detection,** with the one-line fixes the release then made (R927; lines at a8d51ac):
 
-| Where | Today | Fix |
+| Where | Before | Now |
 |---|---|---|
 | `pages/ScoreboardPage.tsx`, line 57 | Column "Caught?" | "Signal seen?" |
-| `pages/ScoreboardPage.tsx`, lines 137 and 166; `pages/KioskPage.tsx`, line 132 | "Did we catch it? 17 of 19"; "Caught: signal visible" | Keep the title, and add the subtitle "Verified against the injected faults: each one's expected signal, in its own window" |
+| `pages/ScoreboardPage.tsx`, lines 137 and 166; `pages/KioskPage.tsx`, line 132 | "Did we catch it? 17 of 19"; "Caught: signal visible" | The title kept, "Signal seen", and a subtitle that says it's verified against the injected faults |
 | `pages/ScoreboardPage.tsx`, lines 64 and 167; `pages/MissionControlPage.tsx`, line 153; `pages/KioskPage.tsx`, line 125; `lib/postmortem.ts`, lines 121 and 180 | "Time to detect", "Median time to detect" | "Time to signal", "Median time to signal" (the sub-line "injected → signal visible" already says what it is) |
 | `lib/view-state.ts`, line 47 | "Every injected fault, detected and recovered" | "Every injected fault: its signal in its window, and its recovery" |
 | `pages/IncidentsPage.tsx`, line 290 | "detected in the telemetry" beside "scenario …" | Unchanged; label recorded rows "Injected (answer key)" when Wave 2 adds blind episodes beside them |

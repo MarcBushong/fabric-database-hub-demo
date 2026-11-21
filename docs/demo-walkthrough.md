@@ -2,7 +2,7 @@
 
 How to present the demo: the presenter's path with one **Run all**, the DBA moments it carries, a 15-minute and a 30-minute script, a cheat sheet for every scenario, then the rehearsal, the fallbacks, and a recovery playbook. How the demo is built, and what's automated, are in the [architecture](architecture.md) and the [automation support matrix](automation-support-matrix.md).
 
-**Where to show it:** **Database Hub** is the live product view, and the product you're demonstrating. The **Insights app** is the demo's own operations product: what each session ran and what it caught, from the saved history. Which surface suits which audience, and what each viewer needs, is in [presentation surfaces](presentation.md).
+**Where to show it:** **Database Hub** is the live product view, and the product you're demonstrating. The **Insights app** is the demo's own operations product: what each session ran and whether each fault's signal was seen, from the saved history. Which surface suits which audience, and what each viewer needs, is in [presentation surfaces](presentation.md).
 
 > **Preview disclosure:** Database Hub is generally available. Copilot in Database Hub, Database Agents, alerts, SQL Server on Azure VM monitoring, unified inventory, the Arc SQL monitoring setting, the telemetry endpoint, and Fabric Apps, which the Insights app is built on, are previews, so their behavior and UI can change ([what's generally available, and what's a preview](limitations.md#preview-disclosures)). This walkthrough never promises what an AI will answer: it names the signals to look for, and every beat that depends on a preview has a fallback.
 
@@ -13,7 +13,7 @@ One **Run all** in the control notebook runs a whole session, and both scripts b
 **Once per deployment:**
 
 1. **Deploy:** `./scripts/deploy.ps1`, until it ends **DONE** ([demo it yourself](../README.md#demo-it-yourself)).
-2. **Optional, about 30 seconds:** select T3 in Database Hub's **Manage agents** for [the Database Agent loop](#the-database-agent-loop-on-t3). Everything else runs without it.
+2. **Required once for the Database Agent beat, a minute or two:** select T3 for Database Agents in Database Hub ([step by step](database-agents.md)), for [the Database Agent loop](#the-database-agent-loop-on-t3). Everything else works without it.
 3. **For Ask, the Copilot chat in the Insights app:** each viewer signs in with GitHub once per browser, on their own GitHub Copilot plan ([the Copilot chat](../README.md#the-copilot-chat-in-the-insights-app)).
 
 **Each session:**
@@ -53,7 +53,7 @@ To show the Database Agent loop live, start Run all about 50 to 60 minutes befor
 
 ## The DBA moments in a Run all session
 
-**Run all** in `NB_DatabaseHub_Control` carries four moments a DBA audience remembers. They need nothing beyond the session (the Database Agent loop also needs T3's optional selection), and the guide gives each one's time.
+**Run all** in `NB_DatabaseHub_Control` carries four moments a DBA audience remembers. They need nothing beyond the session (the Database Agent loop also needs T3 selected for Database Agents, required once for the Database Agent beat: [step by step](database-agents.md)), and the guide gives each one's time.
 
 ### Open at Overview
 
@@ -75,11 +75,13 @@ Database Hub's **Optimization** insights list resources whose migration assessme
 
 The agent's issue, Copilot's analysis of it, a manual response, and the issue closing, in one session. Database Agents detects and investigates without an LLM, explains with Copilot, and applies no change itself ("All scenarios require a manual response"), so the showcase makes the response, the way a DBA would ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents)).
 
-**Optional, once per deployment, about 30 seconds.** Database Agents has no API, so no script can do it; `deploy.ps1` lists it under **Please confirm**, with the link and the exact database (`HUB.AGENT.T3`). Without it, the regression, the response, and T3's CPU drop still run, but Database Agents raises no issue:
+**Required once for the Database Agent beat; everything else works without it.** Database Agents has no API, so no script can do it; `deploy.ps1` lists it under **Please confirm**, with the link and the exact database (`HUB.AGENT.T3`), and [Database Agents for T3](database-agents.md) has every step. Without it, the regression, the response, and T3's CPU drop still run, but Database Agents raises no issue. In short:
 
-1. Open Database Hub, select **Manage agents** (upper left), then **Database agent settings**, and turn **Enabled** on.
-2. Select T3's database, `azuresql01-<deploymentId>/ContosoCare`; under **Agent policy**, turn on **Flag long-running queries**, **Force last known good plans**, and **Flag high CPU**; select **Apply**, then **Save**. The green **Database agent is active** message confirms it ([enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents)).
-3. Do it while T3 is awake: right after `deploy.ps1`, or during a session. Saving needs Azure write access on T3 (the account that deployed the demo has it, and `T3.AGENT` checks yours), and T3 must be in the region associated with your Fabric tenant's home region. The selection stays across sessions and upgrades; recreating T3 (`stop-demo.ps1 -RemoveT3`) needs it again.
+1. Open Database Hub, select **Agent (preview)**, then **Manage agents** (upper left), then **Database agent settings**, and turn **Enabled** on. Every database you can see starts selected ("All databases are included by default"), and the selection is saved for your whole tenant.
+2. **If only you use Database Agents in this tenant** (a demo or lab tenant), reset the selection: clear it, and select **Save** with nothing selected; then check T3's row and **Save**. Rows show only `ContosoCare`, with no server and an empty **Owner** column, so with several, check one at a time and **Save**, keeping each that saves: a deleted database's row fails. **If others use it in your tenant,** don't clear or uncheck their databases, since unchecking one stops the agent watching it: check T3 in addition, and **Save**.
+3. Open T3's **Agent policy** (the gear), turn on **Flag long-running queries**, **Force last known good plans**, and **Flag high CPU**, and select **Apply**, then **Save**. A save that completes says T3 is enrolled; the green **Database agent is active** message is about the agent, not each database ([enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents#verify-the-outcome)).
+4. Saving works while T3 is paused (observed 2026-11-20), and needs Azure write access on T3 (the account that deployed the demo has it, and `T3.AGENT` checks yours); T3 must be in your Fabric tenant's home region. The agent raises issues on T3 only while it's awake, during a session. The selection stays across sessions and updates; redo it after `stop-demo.ps1 -RemoveT3` or a new deployment, and when you delete the demo, uncheck only its T3, which `destroy.ps1` says (`DESTROY.HUB.AGENT.T3`).
+5. **A save that fails** ("Database agent changes couldn't be saved") **or is "temporarily limited":** [troubleshooting](troubleshooting.md#database-agent-settings).
 
 **In every session** (in a 90-minute session the beat runs from about 30 to 60 minutes after T3's activity starts; a session of 60 minutes or more has the whole beat):
 
@@ -92,7 +94,7 @@ The agent's issue, Copilot's analysis of it, a manual response, and the issue cl
 
 - **What it looked like live** (2026-11-19, `lowest-cost`, T3 at 2 vCores): the lookup regressed 3 minutes into the beat, and T3's CPU in Azure Monitor went from 8% to 99% and stayed there for 21 minutes, with no automatic correction. At 85%, the response forced the plan automatic tuning recommended, and T3's CPU fell to 7% the next minute. Database Hub's telemetry shows the same drop 3 to 15 minutes later.
 - **Say:** "That's the whole loop: the agent detects and investigates, Copilot explains, a person decides the response, and the agent tracks the issue to its close."
-- **If it isn't there:** no issue after about 20 minutes means T3 isn't selected or the agent isn't active: check the green message, and `./scripts/validate.ps1 -Area T3` (`T3.AGENT`). **Explain why** and **Analyze slow query** need the capacity's Copilot. The regression still shows on **Performance**, and [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md)'s prompts work in Copilot.
+- **If it isn't there:** no issue after about 20 minutes means T3 isn't enrolled or the agent isn't active: check that T3's save completed and the green message, and `./scripts/validate.ps1 -Area T3` (`T3.AGENT`) ([Database agent settings](troubleshooting.md#database-agent-settings)). **Explain why** and **Analyze slow query** need the capacity's Copilot. The regression still shows on **Performance**, and [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md)'s prompts work in Copilot.
 - **Afterward:** `./scripts/status.ps1` shows `FORCE_LAST_GOOD_PLAN` (`STATUS.T3.AUTOTUNING`). Every way a session ends puts it back: the response, the beat's end, reset, a cancel, a newer Run all, Stop now, `stop-demo.ps1`, and, after the nightly safety stop, the next run on T3; `deploy.ps1` does too ([plan regression](../scenarios/plan-regression/README.md)). Once the history is saved, the history report and the Insights app have the beat's `database_agent` finding: T3's CPU before and after the response, **Pass** when it fell.
 
 ### T5: Azure Cosmos DB's RU storm
@@ -128,9 +130,9 @@ The app knows what the session injected; Database Hub sees the symptoms. Open it
 
 1. **Mission Control (0:00–0:30):** ContosoCare's map, each database as the service it runs (Billing, Front desk, Scheduling, Reporting and its DR copy, Patient events), with the session's plan as recorded at its end and its big numbers. **Say:** "This is ContosoCare. The app knows the plan: what we injected, where, and when."
 2. **Database Hub beside it (0:30–1:00):** **Database Hub, live** opens it: the same target's symptom in its charts, or its issue while it's open (Database Hub keeps 7 days of telemetry or less). **Say:** "Database Hub sees the symptom."
-3. **The scoreboard (1:00–1:45):** **Scoreboard**, "Did we catch it?": each fault, when its signal was visible in the telemetry, the response (T3's Database Agent loop), and the recovery, with the times to detect and recover. **Say:** "The app knows what really happened." "Signal visible" is measured in the telemetry; don't say Database Hub detected it at that time.
+3. **The scoreboard (1:00–1:45):** **Scoreboard**, "Did we catch it?": each fault, when its signal was visible in the telemetry, the response (T3's Database Agent loop), and the recovery, with the times to signal and recover. **Say:** "The app knows what really happened." "Signal visible" is measured in the telemetry; don't say Database Hub detected it at that time.
 4. **The business lens (1:45–2:00):** **Business impact**: for example "Patient events: 35 % of requests throttled for 9 min", next to the measured normalized RU and 429s behind it.
-5. **The postmortem (2:00–2:30):** **Write the postmortem**: the timeline, impact, cause, response, and times to detect and recover, with every query. **Download Markdown** needs no sign-in; **Draft with Copilot** drafts it on your own GitHub Copilot.
+5. **The postmortem (2:00–2:30):** **Write the postmortem**: the timeline, impact, cause, response, and times to signal and recover, with every query. **Download Markdown** needs no sign-in; **Draft with Copilot** drafts it on your own GitHub Copilot.
 6. **Replay (2:30–3:00):** **Replay**: drag the scrubber, and the map's shockwave plays again with every engine's chart; the ribbon says what's next. **Say:** "Database Hub watches your estate. A Fabric app turns it into your team's own operations product."
 
 - **At a booth:** **Kiosk** on Mission Control rotates the map, the scoreboard, and the replay without the app's chrome: Space pauses, Esc leaves, and F11 goes full screen where the frame doesn't allow it.

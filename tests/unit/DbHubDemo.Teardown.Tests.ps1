@@ -615,6 +615,67 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
     }
 
+    It 'says once T3 is gone to remove it from Database agent settings (DESTROY.HUB.AGENT.T3), and changes nothing else, the exit code included (2026-11-20)' {
+        # Live, 2026-11-20: T3s that earlier destroys had deleted stayed selected, and every later Save failed.
+        # The manifest names T3: the one recorded while the group exists, and once it's gone, the one that run kept.
+        $manifestPath = Join-Path -Path $TestDrive -ChildPath 'agent/destroy-manifest-demo.json'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith {
+            $script:order.Add('Manifest')
+            if ($script:groupExists) {
+                $recorded = New-TestManifest
+                $recorded | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+                return $recorded
+            }
+            # Once the group is gone, its deploymentId tag can't be read, nor, here, the deployment record's output.
+            [pscustomobject]@{ ResourceGroupName = 'rg-dbhub-demo'; ResourceGroupExisted = $false; DeploymentId = ''; Principals = @() }
+        }
+        $results = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        $ids = @($results | ForEach-Object { $_.checkId })
+        $agent = @($results | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' })
+        $agent.Count | Should -Be 1
+        $agent[0].status | Should -Be 'Manual action required'
+        $agent[0].evidence.database | Should -Be 'azuresql01-abc123/ContosoCare' -Because 'the manifest''s deploymentId names T3'
+        [array]::IndexOf($ids, 'DESTROY.HUB.AGENT.T3') | Should -Be ([array]::IndexOf($ids, 'DESTROY.RESOURCEGROUP') + 1)
+        Get-DemoExitCode -Result $results | Should -Be 0
+
+        # A run after the group is gone (review of 5d1f4b0): its fresh manifest knows no deploymentId, so T3's name comes
+        # from the manifest the run above recorded while the group existed (Resolve-DemoTeardownManifest).
+        $script:groupExists | Should -BeFalse -Because 'the run above deleted the group'
+        $rerun = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        ($rerun | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
+        $again = @($rerun | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' })
+        $again.Count | Should -Be 1
+        $again[0].evidence.database | Should -Be 'azuresql01-abc123/ContosoCare'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'rg-dbhub-demo is already gone, so the residual check uses the manifest recorded while it existed*' }
+    }
+
+    It 'says nothing about Database agent settings when <Case>' -ForEach @(
+        @{ Case = 'T3 has no name (no deploymentId)'; NoId = $true; DeleteFails = $false; NoT3 = $false }
+        @{ Case = 'T3 is still there (the group''s delete failed)'; NoId = $false; DeleteFails = $true; NoT3 = $false }
+        # Review of 5d1f4b0: test-t2-golden.ps1 deletes its own group, which has a deploymentId tag but never a T3, this way.
+        @{ Case = 'the group never had a T3 (the golden boot test''s)'; NoId = $false; DeleteFails = $false; NoT3 = $true }
+    ) {
+        if ($NoId) {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { [pscustomobject]@{ ResourceGroupName = 'rg-dbhub-demo'; DeploymentId = ''; Principals = @() } }
+        }
+        if ($DeleteFails) {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -ParameterFilter { ($ArgumentList -join ' ') -like 'group delete --name rg-dbhub-demo *' } -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (ScopeLocked) The scope is locked.' } }
+        }
+        if ($NoT3) {
+            # The manifest still has the group's deploymentId, abc123; only the plan knows the group has no T3.
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; T3Agent = ''; NoT3 = $true; Delete = @(); Keep = @() } }
+        }
+        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        @($results | Where-Object { $_.checkId -eq 'DESTROY.HUB.AGENT.T3' }).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Message -like '*Database agent settings*' }
+        if ($DeleteFails) {
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Fail'
+        }
+        else {
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
+        }
+    }
+
     It 'says that a golden group that doesn''t exist doesn''t exist, on the console and in DESTROY.GOLDEN, and never that it stays (2026-11-19)' {
         # Live while destroying dbhubask: with no rg-dbhubask-golden, the console said "destroy.ps1 keeps rg-dbhubask-golden
         # and its golden snapshots", and DESTROY.GOLDEN that it "stays with 0 golden snapshot(s)".

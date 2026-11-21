@@ -552,6 +552,20 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like '*keeps rg-dbhub-golden*' } -Times 0 -Exactly
     }
 
+    It 'says before it asks to remove T3 from Database agent settings and Save, and why, with Learn''s page; nothing without T3''s name (2026-11-20)' {
+        # Live, 2026-11-20: T3s that earlier destroys had deleted stayed in the tenant's selection, and every Save failed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith {
+            [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; T3Agent = 'azuresql01-abc123'; Delete = @(); Keep = @('the Fabric capacity and your licenses, which you manage') }
+        }
+        $result = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        $result.checkId | Should -Be @('PREFLIGHT.GUARD.CONTEXT', 'DESTROY.RESOURCEGROUP') -Because 'a what-if deletes nothing, so DESTROY.HUB.AGENT.T3 comes only once T3 is gone'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'If you selected T3 for Database Agents, uncheck only it, azuresql01-abc123/ContosoCare, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while*DESTROY.HUB.AGENT.T3 at the end says how (https://learn.microsoft.com/fabric/database/hub/enable-database-agents).' }
+
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like '*Database agent settings*' } -Because 'a plan without T3''s name, as when the group''s tag can''t be read, adds no line to the first run''s one'
+    }
+
     It 'pauses a capacity it resumed (fabric.manageCapacity) only after the Fabric workspaces, whose deletes need it, and before the group' {
         $script:order = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { throw 'no manifest in this test' }
@@ -564,5 +578,50 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcSetting -MockWith { $script:order.Add('Arc'); throw 'the order is known' }
         { Remove-DemoEnvironment -Config $config -Confirm:$false } | Should -Throw '*the order is known*'
         ($script:order -join ' > ') | Should -Be 'fabric, control, and group > capacity > Arc'
+    }
+}
+
+Describe 'Get-DemoDestroyExtraPlan keeps T3''s selection in Database agent settings, named from the group''s tag (2026-11-20)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyControlPlan -MockWith { [pscustomobject]@{ Name = $null; State = 'None'; ServedGroup = ''; Resources = @(); Reason = 'none' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyGroupPlan -MockWith { [pscustomobject]@{ Id = ''; Name = ''; State = 'None'; Reason = 'none' } }
+    }
+
+    It 'names T3 from the deploymentId tag, and lists its selection as kept; none when the tag is <Case>' -ForEach @(
+        @{ Case = 'read'; Tags = @{ deploymentId = 'abc123' }; Server = 'azuresql01-abc123' }
+        @{ Case = 'missing (the group is gone)'; Tags = @{}; Server = '' }
+        @{ Case = 'not a deploymentId'; Tags = @{ deploymentId = 'ABC 12' }; Server = '' }
+    ) {
+        $script:tags = $Tags
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { $script:tags }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be $Server
+        $plan.NoT3 | Should -BeFalse -Because 'only the golden boot test''s group is known to have no T3'
+        $line = @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' })
+        if ($Server) {
+            $line | Should -Be @('T3''s selection in Database Hub''s Database agent settings (azuresql01-abc123/ContosoCare), if you made it: no API removes it')
+        }
+        else {
+            $line.Count | Should -Be 0
+        }
+    }
+
+    It 'names no T3 for the golden boot test''s group, which has a deploymentId tag but never a T3, and says so in NoT3 (review of 5d1f4b0)' {
+        # test-t2-golden.ps1 deletes rg-<prefix>-gtest through this path. Its group has a random deploymentId tag, but
+        # infra/golden-test.bicep deploys only the network and archost01, so every run, -CleanupOnly too, ended with "1 item(s)
+        # need you: ... uncheck azuresql01-<random>/ContosoCare" for a database that never existed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'k3x9q2'; purpose = 't2-golden-boot-test'; environment = 'gtest' } }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be ''
+        $plan.NoT3 | Should -BeTrue
+        @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' }).Count | Should -Be 0
+    }
+
+    It 'goes on without T3''s name when the tag can''t be read' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { throw 'the Azure CLI isn''t answering' }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be ''
+        $plan.Keep | Should -Contain 'the Fabric capacity and your licenses, which you manage'
     }
 }

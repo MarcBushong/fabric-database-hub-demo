@@ -322,6 +322,14 @@ describe("Estate", () => {
         expect(client.ran).toEqual(expect.arrayContaining(["cosmos-series", "cosmos-findings"]));
     });
 
+    it("never writes T5's throttled share as 0.0 % when a request was throttled", async () => {
+        // 3 of the capture's 7,710 requests answered 429: 0.04 %, which one decimal alone writes as 0.0 %.
+        const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "ThrottledRequests" ? { ...r, Value: r.Bucket === "2026-11-13T17:02:00" ? 3 : 0 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("less than 0.1 % of 7,710 requests")).toBeInTheDocument());
+    });
+
     it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
         const empty = { "cosmos-series": [], "cosmos-findings": [] };
         const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient(empty) });

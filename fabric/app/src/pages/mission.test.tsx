@@ -5,8 +5,9 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it, vi } from "vitest";
 
 import type { QuerySpec } from "@/data/queries";
-import { createSourceClient, type QueryResult } from "@/data/query-client";
+import { createSourceClient, type QueryResult, type Row } from "@/data/query-client";
 import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/mission/kiosk";
+import { SCOREBOARD_SUBTITLE } from "@/lib/scoreboard";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
 import { sampleRows } from "@/preview/sample-data";
 import { SESSION_KEY } from "@/preview/sample-session";
@@ -18,8 +19,8 @@ import ScoreboardPage from "./ScoreboardPage";
 
 const SLOW = 30000;
 
-/** The preview's sample, with its latest session, answering every query by its ID and parameters; `failing` queries throw. */
-function sampleClient(failing: Record<string, string> = {}): FakeQueryClient {
+/** The preview's sample, with its latest session, answering every query by its ID and parameters; `failing` queries throw, and `rows` replace a query's answer. */
+function sampleClient(failing: Record<string, string> = {}, rows: Record<string, Row[]> = {}): FakeQueryClient {
     const ran: string[] = [];
     return {
         ran,
@@ -28,7 +29,7 @@ function sampleClient(failing: Record<string, string> = {}): FakeQueryClient {
         run: vi.fn(async (spec: QuerySpec): Promise<QueryResult> => {
             ran.push(spec.id);
             if (failing[spec.id]) throw new Error(failing[spec.id]);
-            return { spec, columns: spec.columns, rows: sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
+            return { spec, columns: spec.columns, rows: rows[spec.id] ?? sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
         }),
     };
 }
@@ -43,6 +44,7 @@ describe("Mission Control", () => {
             const numbers = await screen.findByRole("complementary", { name: "The session in numbers" });
             await waitFor(() => expect(within(numbers).getByText("34 of 35")).toBeInTheDocument());
             expect(within(numbers).getByText("35")).toBeInTheDocument();
+            expect(within(numbers).getByText("Median time to signal")).toBeInTheDocument();
             expect(within(numbers).getByText("84 % → 22 %")).toBeInTheDocument();
             expect(within(numbers).getByText(/% throttled$/)).toBeInTheDocument();
             const scheduling = screen.getByRole("button", { name: /^Scheduling, T3 Azure SQL Database: / });
@@ -70,6 +72,30 @@ describe("Mission Control", () => {
     );
 
     it(
+        "never rounds T5's throttled share to none in its numbers: 3 of 1,000 requests are less than 1 %, as on the map (the re-review of 2056a53)",
+        async () => {
+            const throttle: Row = {
+                FindingId: "cosmosdb.T5.throttle.20261117T1400",
+                TargetKey: "T5",
+                Status: "Warning",
+                StatusSort: 3,
+                Finding: "Normalized RU consumption on T5 reached 100% with 3 throttled requests (429s) of 1,000 requests between 14:00 and 14:05 UTC.",
+                Evidence: JSON.stringify({ throttled: 3, requests: 1000, peakNormalizedRuPercent: 100, stopped: true, recoveredAtUtc: "2026-11-17T14:05:00Z" }),
+                WindowStart: "2026-11-17T14:00:00",
+                WindowEnd: "2026-11-17T14:05:00",
+                CapturedAt: "2026-11-17T15:06:00",
+            };
+            renderWithApp(<MissionControlPage />, { client: sampleClient({}, { "cosmos-findings": [throttle] }) });
+            const numbers = await screen.findByRole("complementary", { name: "The session in numbers" }, { timeout: 15000 });
+            await waitFor(() => expect(within(numbers).getByText("less than 1 % throttled")).toBeInTheDocument(), { timeout: 15000 });
+            expect(within(numbers).getByText("3 of 1,000 requests answered 429 in 1 episode")).toBeInTheDocument();
+            fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
+            expect(await screen.findByRole("button", { name: /^Patient events, T5 Azure Cosmos DB: .*less than 1 % of requests throttled for 5 min/i })).toBeInTheDocument();
+        },
+        SLOW,
+    );
+
+    it(
         "writes the session's postmortem from the data alone, downloads it as Markdown, and drafts it with the viewer's own Copilot",
         async () => {
             URL.createObjectURL = vi.fn(() => "blob:postmortem");
@@ -81,7 +107,7 @@ describe("Mission Control", () => {
             const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
             // jsdom keeps no focus in the dialog, so Fluent's modal may mark it hidden after it opens; a browser keeps focus in it.
             // Its own Markdown, rendered: the sections in order, each a heading.
-            expect([...dialog.querySelectorAll(".pm-view h4")].map((h) => h.textContent)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "Response", "Times to detect and recover", "Follow-ups", "How this was measured", "Queries"]);
+            expect([...dialog.querySelectorAll(".pm-view h4")].map((h) => h.textContent)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
             expect(within(dialog).getByText(/^The Database Agent loop on T3: the plan regressed at 14:03 UTC, and the run forced the last good plan at 14:26 UTC/)).toBeInTheDocument();
             fireEvent.click(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true }));
             expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Downloaded contosocare-postmortem-7f3a9c21-\d{8}T\d{4}Z\.md$/), "success");
@@ -180,7 +206,15 @@ describe("Scoreboard", () => {
         async () => {
             const { navigate } = renderWithApp(<ScoreboardPage />, { client: sampleClient() });
             expect(await screen.findByRole("heading", { level: 1, name: "Did we catch it? 34 of 35" }, { timeout: 15000 })).toBeInTheDocument();
+            // It says what it verifies, never that it caught anything blind: each injected fault's expected signal, in its window.
+            expect(screen.getByText(SCOREBOARD_SUBTITLE)).toBeInTheDocument();
+            const stats = screen.getByLabelText("The session in numbers");
+            expect(within(stats).getByText("Signal seen")).toBeInTheDocument();
+            expect(within(stats).getByText("Median time to signal")).toBeInTheDocument();
+            expect(within(stats).queryByText(/Caught|detect/)).toBeNull();
             const table = screen.getByRole("table", { name: "Every injected fault" });
+            expect(within(table).getByRole("columnheader", { name: /^Signal seen\?/ })).toBeInTheDocument();
+            expect(within(table).getByRole("columnheader", { name: /^Time to signal/ })).toBeInTheDocument();
             const rows = within(table).getAllByRole("row").slice(1);
             expect(rows).toHaveLength(35);
             const missed = rows.filter((r) => /Warning/.test(r.textContent ?? ""));
@@ -190,12 +224,48 @@ describe("Scoreboard", () => {
             expect(agent?.textContent).toMatch(/14:03.*14:03.*14:26.*14:27.*24 min/);
             expect(screen.getByRole("heading", { name: "Times per engine" })).toBeInTheDocument();
             expect(screen.getByRole("heading", { name: "Times per fault type" })).toBeInTheDocument();
+            for (const name of ["Times per engine", "Times per fault type"]) {
+                // The card's own body, described by its summary (the chart inside has the same name and its own description).
+                const card = screen.getAllByRole("group", { name }).find((g) => g.classList.contains("vcard-body"));
+                expect(card).toBeDefined();
+                expect(card).toHaveAccessibleDescription(/: time to signal .+, time to recover /);
+                expect(card).not.toHaveAccessibleDescription(/detect/);
+            }
             expect(screen.getByRole("heading", { name: "T4 and T5: what their metrics show" })).toBeInTheDocument();
             fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
             expect(within(screen.getByRole("table", { name: "Every injected fault" })).getByRole("columnheader", { name: /Business impact \(measured\)/ })).toBeInTheDocument();
             // No session was picked, so Mission Control keeps following the latest.
             fireEvent.click(screen.getByRole("button", { name: "Mission Control" }));
             expect(navigate).toHaveBeenLastCalledWith("mission", { session: null });
+        },
+        SLOW,
+    );
+
+    it(
+        "writes the T4 and T5 card's peaks as measured, never 100 % for a peak under 100, in both lenses",
+        async () => {
+            const episode = (from: string, to: string, peak: number): Row => ({
+                FindingId: `cosmosdb.T5.throttle.20261117T${from.replace(":", "")}`,
+                TargetKey: "T5",
+                Status: "Warning",
+                StatusSort: 3,
+                Finding: `Throttling from ${from} to ${to} UTC.`,
+                Evidence: JSON.stringify({ throttled: 520, requests: 1000, peakNormalizedRuPercent: peak, stopped: true, recoveredAtUtc: `2026-11-17T${to}:00Z` }),
+                WindowStart: `2026-11-17T${from}:00`,
+                WindowEnd: `2026-11-17T${to}:00`,
+                CapturedAt: "2026-11-17T15:06:00",
+            });
+            renderWithApp(<ScoreboardPage />, { client: sampleClient({}, { "cosmos-findings": [episode("14:00", "14:05", 99.6), episode("14:20", "14:25", 99.996)] }) });
+            await screen.findByRole("heading", { level: 1, name: /^Did we catch it\?/ }, { timeout: 15000 });
+            // The card's own body (a VisualCard's group, named by its title).
+            const card = () => screen.getAllByRole("group", { name: "T4 and T5: what their metrics show" }).find((g) => g.classList.contains("vcard-body"));
+            await waitFor(() => expect(card()?.textContent).toContain("normalized RU and 429s: peak 99.6 %."), { timeout: 15000 });
+            expect(card()?.textContent).toContain("normalized RU and 429s: peak 99.996 %.");
+            expect(card()?.textContent).not.toMatch(/normalized RU and 429s: peak 100/);
+            fireEvent.click(screen.getByRole("button", { name: "Business impact" }));
+            await waitFor(() => expect(card()?.textContent).toContain("(normalized RU 99.6 %, 429s on 520 of 1,000 requests)"));
+            expect(card()?.textContent).toContain("(normalized RU 99.996 %, 429s on 520 of 1,000 requests)");
+            expect(card()?.textContent).not.toMatch(/normalized RU 100/);
         },
         SLOW,
     );
@@ -323,6 +393,7 @@ describe("Kiosk", () => {
             expect(within(screen.getByText("Faults injected").parentElement as HTMLElement).getByText("35")).toBeInTheDocument();
             fireEvent.keyDown(window, { key: "ArrowRight" });
             expect(screen.getByRole("heading", { level: 2, name: "Did we catch it?" })).toBeInTheDocument();
+            expect(screen.getByText(SCOREBOARD_SUBTITLE)).toBeInTheDocument();
             expect(screen.getByText(`The telemetry didn't load, so none of the 35 faults is measured yet: the kiosk tries again every ${RETRY_SECONDS} s.`)).toBeInTheDocument();
             expect(screen.queryByText(/\b0 of 0\b/)).toBeNull();
         },

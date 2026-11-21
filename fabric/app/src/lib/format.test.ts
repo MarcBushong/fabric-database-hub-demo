@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { csvFileName, toCsv } from "./csv";
-import { clause, formatAgo, formatCell, formatDateTimeUtc, formatDuration, formatNumber, sentence, toDate } from "./format";
+import { clause, formatAgo, formatCell, formatDateTimeUtc, formatDuration, formatLevel, formatNumber, percent, sentence, toDate } from "./format";
 
 describe("formatNumber", () => {
     it("formats each kind with its unit", () => {
@@ -16,6 +16,15 @@ describe("formatNumber", () => {
         expect(formatNumber(null)).toBe("–");
         expect(formatNumber("12")).toBe("–");
         expect(formatNumber(Number.NaN)).toBe("–");
+    });
+});
+
+describe("formatLevel and percent at their ends", () => {
+    it("never writes a percentage under 100 as 100, or a share as none or all when it isn't", () => {
+        expect([99.6, 99.996, 99.99996, 100].map((v) => formatLevel(v, "percent"))).toEqual(["99.6 %", "99.996 %", "just under 100 %", "100.0 %"]);
+        expect(formatLevel(99.996, "seconds")).toBe("100.0 s");
+        expect([3 / 7710, 1560 / 7710, 7709 / 7710, 0, 1].map((s) => percent(s, 1))).toEqual(["less than 0.1 %", "20.2 %", "more than 99.9 %", "0.0 %", "100.0 %"]);
+        expect([3 / 1000, 520 / 1000, 999 / 1000, 0, 1].map((s) => percent(s))).toEqual(["less than 1 %", "52 %", "more than 99 %", "0 %", "100 %"]);
     });
 });
 

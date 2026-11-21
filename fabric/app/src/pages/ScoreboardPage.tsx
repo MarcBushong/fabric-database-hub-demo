@@ -1,5 +1,5 @@
 // "Did we catch it?" (ADR 0030): every fault the demo injected, when its signal showed in the telemetry, when it was
-// answered, and when it recovered, with the times to detect and recover per engine and fault type across sessions. Only
+// answered, and when it recovered, with the times to signal and recover per engine and fault type across sessions. Only
 // the app can show this: Database Hub doesn't know what was injected. "Signal visible in telemetry" is measured from the
 // history's bins; what Database Hub itself detected isn't in the history, so the page never says it.
 
@@ -15,9 +15,9 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { serviceOf } from "@/lib/business";
-import { formatTimeUtc } from "@/lib/format";
+import { formatLevel, formatTimeUtc } from "@/lib/format";
 import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/postmortem";
-import { aggregate, boundText, minutesText, RECOVERED_BINS, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
+import { aggregate, howMeasured, minutesText, RECOVERED_BINS, SCOREBOARD_SUBTITLE, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { ChartView } from "@/visuals/ChartView";
 import { BigStat, LensSwitch, LoadNotice, MissingSession, PlanPicker, PostmortemButton } from "@/mission/parts";
@@ -54,14 +54,14 @@ const time = (d: Date | null) => (d ? formatTimeUtc(d) : "–");
 
 function columns(lens: Lens): GridColumn<FaultRow>[] {
     return [
-        { key: "status", label: "Caught?", render: (r) => <StatusBadge status={r.status === "Pass" ? "Pass" : r.status} short />, sortValue: (r) => (r.status === "Pass" ? 0 : 1) },
+        { key: "status", label: "Signal seen?", render: (r) => <StatusBadge status={r.status === "Pass" ? "Pass" : r.status} short />, sortValue: (r) => (r.status === "Pass" ? 0 : 1) },
         { key: "injected", label: "Injected (UTC)", render: (r) => time(r.injected), sortValue: (r) => r.injected.getTime() },
         { key: "target", label: "Target", render: (r) => <TargetChip target={r.target} /> },
         { key: "service", label: "Service" },
         { key: "fault", label: "Fault" },
         { key: "signal", label: "Signal" },
         { key: "visible", label: "Signal visible", render: (r) => time(r.visible), sortValue: (r) => r.visible?.getTime() ?? null },
-        { key: "ttd", label: "Time to detect", render: (r) => minutesText(r.ttd, r.score.binMinutes), sortValue: (r) => r.ttd, numeric: true },
+        { key: "ttd", label: "Time to signal", render: (r) => minutesText(r.ttd, r.score.binMinutes), sortValue: (r) => r.ttd, numeric: true },
         { key: "answered", label: "Answered", render: (r) => time(r.answered), sortValue: (r) => r.answered?.getTime() ?? null },
         { key: "recovered", label: "Recovered", render: (r) => (r.recovered ? time(r.recovered) : r.score.recoveryWord || "–"), sortValue: (r) => r.recovered?.getTime() ?? null },
         { key: "ttr", label: "Time to recover", render: (r) => minutesText(r.ttr), sortValue: (r) => r.ttr, numeric: true },
@@ -73,7 +73,7 @@ const AGG_COLUMNS: ColumnSpec[] = [
     { key: "label", label: "Group", kind: "text" },
     { key: "faults", label: "Faults", kind: "int" },
     { key: "visible", label: "Signal visible", kind: "int" },
-    { key: "ttdMedian", label: "Median time to detect (min)", kind: "minutes" },
+    { key: "ttdMedian", label: "Median time to signal (min)", kind: "minutes" },
     { key: "ttdN", label: "Faults behind it", kind: "int" },
     { key: "ttrMedian", label: "Median time to recover (min)", kind: "minutes" },
     { key: "ttrN", label: "Faults behind it", kind: "int" },
@@ -85,8 +85,8 @@ function aggChart(rows: readonly Aggregate[], title: string) {
         title,
         unit: "min",
         x: "Group",
-        y: ["Time to detect", "Time to recover"],
-        rows: rows.map((a) => ({ Group: a.label, "Time to detect": a.ttdMedian === null ? null : Math.round(a.ttdMedian * 10) / 10, "Time to recover": a.ttrMedian === null ? null : Math.round(a.ttrMedian * 10) / 10 })),
+        y: ["Time to signal", "Time to recover"],
+        rows: rows.map((a) => ({ Group: a.label, "Time to signal": a.ttdMedian === null ? null : Math.round(a.ttdMedian * 10) / 10, "Time to recover": a.ttrMedian === null ? null : Math.round(a.ttrMedian * 10) / 10 })),
     };
 }
 
@@ -117,9 +117,7 @@ export default function ScoreboardPage() {
                 recovered: s.recoveredAt,
                 ttr: s.ttrMin,
                 impact: s.impact?.sentence ?? (s.status === "Pass" ? "" : s.note),
-                how: s.bound
-                    ? `${boundText(s.bound, s.kind)} (${s.bound.short})${s.bound.minBins > 1 ? `, ${s.bound.minBins} bins` : ""}${s.status === "Pass" ? "" : `. ${s.note}`}`
-                    : s.note,
+                how: howMeasured(s),
                 score: s,
             })),
         [scores],
@@ -135,6 +133,7 @@ export default function ScoreboardPage() {
                     <div className="mc-titles">
                         <p className="mc-kicker">ContosoCare · Scoreboard</p>
                         <h1>{plan && summary.faults ? `Did we catch it? ${summary.visible} of ${summary.faults}` : "Did we catch it?"}</h1>
+                        <p className="mc-subtitle">{SCOREBOARD_SUBTITLE}</p>
                         <p className="mc-asof">
                             <span>The app knows what was injected; Database Hub sees the symptoms. "Signal visible" is measured from the telemetry, by its sample time.</span>
                         </p>
@@ -163,8 +162,8 @@ export default function ScoreboardPage() {
                     <>
                         <div className="sb-stats" aria-label="The session in numbers">
                             <BigStat label="Faults injected" value={String(plan.faults.length)} sub="by the plan (Scenario Runs)" />
-                            <BigStat label="Caught: signal visible" value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"} sub={data.scoreError ? "the telemetry didn't load, so nothing is measured" : "in the telemetry, by sample time"} tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined} />
-                            <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
+                            <BigStat label="Signal seen" value={summary.faults ? `${summary.visible} of ${summary.faults}` : "–"} sub={data.scoreError ? "the telemetry didn't load, so nothing is measured" : "in the telemetry, by sample time"} tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined} />
+                            <BigStat label="Median time to signal" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
                             <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} sub="injected → back under its bound" />
                             <BigStat label="Answered" value={String(summary.answered)} sub={summary.answered ? "a response step: the Database Agent loop, or a reset" : "every fault ended at its time limit"} />
                         </div>
@@ -200,7 +199,7 @@ export default function ScoreboardPage() {
                     emptyText="This session injected no fault on the targets in the filter."
                     table={{ columns: POSTMORTEM_COLUMNS, rows: csvRows, caption: "Every injected fault" }}
                     summary={`${summary.visible} of ${summary.faults} faults had their signal visible in the telemetry.`}
-                    askPrompt="Did we catch every fault in this session? Which ones were slowest to detect or recover, and why?"
+                    askPrompt="Did we catch every fault in this session? Which ones were slowest to show their signal or to recover, and why?"
                     // The scoreboard grades the session against its answer key: shown here, labeled, and never handed to the chat (ADR 0031).
                     ask={false}
                 >
@@ -217,12 +216,12 @@ export default function ScoreboardPage() {
                         subtitle={`Median minutes, across the ${sessions} newest session${sessions === 1 ? "" : "s"} in the period (each median rests on the faults it could measure).`}
                         specs={data.specs}
                         loading={false}
-                        table={{ columns: AGG_COLUMNS, rows: engines.map((a) => ({ ...a })), caption: "Times to detect and recover per engine" }}
-                        summary={engines.map((a) => `${a.label}: detect ${minutesText(a.ttdMedian)}, recover ${minutesText(a.ttrMedian)}`).join("; ")}
+                        table={{ columns: AGG_COLUMNS, rows: engines.map((a) => ({ ...a })), caption: "Times to signal and recover per engine" }}
+                        summary={engines.map((a) => `${a.label}: time to signal ${minutesText(a.ttdMedian)}, time to recover ${minutesText(a.ttrMedian)}`).join("; ")}
                         askPrompt="Which engine was slowest to show and to recover from the injected faults, and what would make it faster?"
                         ask={false}
                     >
-                        <ChartView hideHeader height={220} spec={aggChart(engines, "Times per engine")} colors={{ "Time to detect": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
+                        <ChartView hideHeader height={220} spec={aggChart(engines, "Times per engine")} colors={{ "Time to signal": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
                     </VisualCard>
                     <VisualCard
                         id="scoreboard.types"
@@ -231,12 +230,12 @@ export default function ScoreboardPage() {
                         subtitle={`Median minutes, across the same ${sessions} session${sessions === 1 ? "" : "s"}.`}
                         specs={data.specs}
                         loading={false}
-                        table={{ columns: AGG_COLUMNS, rows: types.map((a) => ({ ...a })), caption: "Times to detect and recover per fault type" }}
-                        summary={types.map((a) => `${a.label}: detect ${minutesText(a.ttdMedian)}, recover ${minutesText(a.ttrMedian)}`).join("; ")}
-                        askPrompt="Which kinds of fault take longest to detect and to recover from?"
+                        table={{ columns: AGG_COLUMNS, rows: types.map((a) => ({ ...a })), caption: "Times to signal and recover per fault type" }}
+                        summary={types.map((a) => `${a.label}: time to signal ${minutesText(a.ttdMedian)}, time to recover ${minutesText(a.ttrMedian)}`).join("; ")}
+                        askPrompt="Which kinds of fault take longest to show their signal and to recover?"
                         ask={false}
                     >
-                        <ChartView hideHeader height={220} spec={aggChart(types, "Times per fault type")} colors={{ "Time to detect": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
+                        <ChartView hideHeader height={220} spec={aggChart(types, "Times per fault type")} colors={{ "Time to signal": "var(--chart-2)", "Time to recover": "var(--chart-6)" }} />
                     </VisualCard>
                 </>
             ) : null}
@@ -260,7 +259,7 @@ export default function ScoreboardPage() {
                             <li key={e.key}>
                                 <TargetChip target={e.target} />
                                 <span className="sb-ep-time">{`${time(e.visibleAt)}–${time(e.recoveredAt ?? e.endAt)} UTC`}</span>
-                                <span>{lens === "business" ? e.impact.sentence : `${e.signal}: peak ${e.peak === null ? "–" : e.kind === "percent" ? `${Math.round(e.peak)} %` : `${Math.round(e.peak)} s`}. ${e.note}`}</span>
+                                <span>{lens === "business" ? e.impact.sentence : `${e.signal}: peak ${formatLevel(e.peak, e.kind)}. ${e.note}`}</span>
                             </li>
                         ))}
                     </ul>

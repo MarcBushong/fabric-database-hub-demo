@@ -1,5 +1,5 @@
 // "Did we catch it?" (ADR 0030): every fault the demo injected (Scenario Runs), when its signal first showed in the
-// telemetry, when it was answered (the response step, where one exists), and when it recovered; and the times to detect
+// telemetry, when it was answered (the response step, where one exists), and when it recovered; and the times to signal
 // and recover per engine and fault type, across sessions. Only the app can say this: it knows what was injected.
 //
 // "Signal visible in telemetry" is measured here from the history's bins, by their sample time, with the analysis
@@ -12,7 +12,7 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replica
 import type { Row } from "@/data/query-client";
 import { impactOf, type Impact } from "./business";
 import { engineOf } from "./estate";
-import { formatNumber, formatTimeUtc, toDate, type NumberKind } from "./format";
+import { formatLevel, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
 import { FAMILY_SIGNAL, REPLICA_LAG_WARNING_SECONDS, signalValue } from "./insights";
 import { SCENARIOS } from "./scenarios";
 import { quantile } from "./stats";
@@ -21,6 +21,8 @@ import { isEstateTarget, type EstateTarget } from "./view-state";
 
 /** The notebook's: telemetry arrives 3 to 15 minutes after the activity, so a fault's signal is looked for this long after its window. */
 export const TELEMETRY_LAG_MINUTES = 15;
+/** What "Did we catch it?" means: the scoreboard verifies the injected faults, it doesn't detect blind (the owner's rule). */
+export const SCOREBOARD_SUBTITLE = "Verified against the injected faults: each one's expected signal, in its own window";
 /** How long after a fault's window its recovery is looked for. */
 export const RECOVERY_SLACK_MINUTES = 30;
 /** Why a visible signal has no recovery, in a sentence and in a table's few words. */
@@ -28,6 +30,8 @@ const NO_RECOVERY = {
     ongoing: { note: "Still visible when the telemetry ends.", word: "Still visible" },
     next: { note: "The next fault with this signal began first.", word: "Next fault first" },
     late: { note: `Not back under its bound ${RECOVERY_SLACK_MINUTES} min after its window.`, word: `Not in ${RECOVERY_SLACK_MINUTES} min` },
+    unconfirmed: { note: "Back under its bound, but its telemetry ends before its recovery is confirmed.", word: "Unconfirmed" },
+    brokeOff: { note: "Its telemetry breaks off after its last bin at its bound, so its recovery isn't measured.", word: "Telemetry breaks off" },
 } as const;
 /** Bins under the detection bound, in a row, that make a recovery. */
 export const RECOVERED_BINS = 2;
@@ -113,11 +117,11 @@ export function detectionBound(family: string, baseline: number | null): Bound |
     if (family === "cpu") {
         const relative = baseline === null ? null : Math.max(baseline * 1.5, baseline + 10);
         return relative !== null && relative < rule.floor
-            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatNumber(baseline, "percent")}`, short: `baseline ${formatNumber(baseline, "percent")}` }
+            ? { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times and 10 points above its baseline of ${formatLevel(baseline, "percent")}`, short: `baseline ${formatLevel(baseline, "percent")}` }
             : { value: rule.floor, strict: false, minBins: rule.minBins, ...episode };
     }
     const relative = baseline === null ? 0 : baseline * 1.5;
-    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatNumber(baseline)}`, short: `baseline ${formatNumber(baseline)}` };
+    if (relative > rule.floor) return { value: relative, strict: false, minBins: rule.minBins, basis: `1.5 times its baseline of ${formatLevel(baseline, "decimal")}`, short: `baseline ${formatLevel(baseline, "decimal")}` };
     return { value: rule.floor, strict: rule.strict, minBins: rule.minBins, ...episode };
 }
 
@@ -125,8 +129,15 @@ function meets(value: number | null, bound: Bound): boolean {
     return value !== null && (bound.strict ? value > bound.value : value >= bound.value);
 }
 
+/** The bound in words, its level written as it is: "at least 0.45" for 1.5 times a baseline of 0.3, never "at least 0". */
 export function boundText(bound: Bound, kind: NumberKind): string {
-    return `${bound.strict ? "above" : "at least"} ${formatNumber(bound.value, kind)}`;
+    return `${bound.strict ? "above" : "at least"} ${formatLevel(bound.value, kind)}`;
+}
+
+/** The scoreboard's "How it was measured": the bound in short, and why the signal wasn't visible when it wasn't. */
+export function howMeasured(s: Pick<FaultScore, "bound" | "kind" | "status" | "note">): string {
+    if (!s.bound) return s.note;
+    return `${boundText(s.bound, s.kind)} (${s.bound.short})${s.bound.minBins > 1 ? `, ${s.bound.minBins} bins` : ""}${s.status === "Pass" ? "" : `. ${s.note}`}`;
 }
 
 /** A family's signal in a bin: its column, or its wait category (null when the bin has no categories). */
@@ -247,7 +258,7 @@ export interface FaultScore {
     answeredAt: Date | null;
     answer: string;
     recoveredAt: Date | null;
-    /** True when the signal was still above its bound at the end of the telemetry. */
+    /** True when the signal was still above its bound at the end of the telemetry; false when its telemetry only breaks off there. */
     ongoing: boolean;
     /** Injected to visible, in minutes. */
     ttdMin: number | null;
@@ -259,7 +270,7 @@ export interface FaultScore {
     status: StatusName;
     /** One line: how it was measured, or why it wasn't. */
     note: string;
-    /** Why a visible signal has no recovery: still visible at the telemetry's end, or the next fault came first; empty otherwise. */
+    /** Why a visible signal has no recovery: still visible at the telemetry's end, the next fault came first, not back under in time, or back under too late in the telemetry to confirm; empty otherwise. */
     recoveryNote: string;
     /** The same reason in two or three words, for a table's Recovered column; empty when it recovered or wasn't visible. */
     recoveryWord: string;
@@ -383,6 +394,85 @@ function firstRun(bins: readonly Bin[], signal: Signal, bound: Bound, from: numb
     return null;
 }
 
+/** What a signal measured from `from` to `to`, in the bins firstRun reads. */
+interface LevelSeen {
+    peak: number | null;
+    peakAt: Date | null;
+    /** The bins in the window, and those with a value for the signal. */
+    bins: number;
+    valued: number;
+    /** The bins that met the bound, and the longest run of them in a row (one bin apart at most), as firstRun counts it. */
+    atBound: number;
+    longest: number;
+}
+
+function levelOf(bins: readonly Bin[], signal: Signal, bound: Bound, from: number, to: number, stepMs: number): LevelSeen {
+    const seen: LevelSeen = { peak: null, peakAt: null, bins: 0, valued: 0, atBound: 0, longest: 0 };
+    let run = 0;
+    let previous: number | null = null;
+    for (const b of bins) {
+        const t = b.at.getTime();
+        if (t + stepMs <= from || t >= to) continue;
+        const v = signal.read(b);
+        seen.bins++;
+        if (v !== null) {
+            seen.valued++;
+            if (seen.peak === null || v > seen.peak) {
+                seen.peak = v;
+                seen.peakAt = b.at;
+            }
+        }
+        if (meets(v, bound)) {
+            run = previous !== null && t - previous <= stepMs * 1.5 ? run + 1 : 1;
+            seen.atBound++;
+            seen.longest = Math.max(seen.longest, run);
+        } else {
+            run = 0;
+        }
+        previous = t;
+    }
+    return seen;
+}
+
+/**
+ * The level a signal stayed under and its peak, as text that never writes them alike: as formatLevel writes them, or with
+ * more decimals where that rounds the peak to the level (0.999 s under 1 s). Null when they're alike even at 4 decimals.
+ */
+function levelAndPeak(level: number, peak: number, kind: NumberKind): { level: string; peak: string } | null {
+    const texts = { level: formatLevel(level, kind), peak: formatLevel(peak, kind) };
+    for (let digits = 1; texts.level === texts.peak; digits++) {
+        if (digits > 4) return null;
+        texts.level = formatNumberDigits(level, kind, digits);
+        texts.peak = formatNumberDigits(peak, kind, digits);
+    }
+    return texts;
+}
+
+/**
+ * Why a fault's signal wasn't visible, from what its bins measured, never from its bound alone (F23): "stayed under" only
+ * when no bin reached the bound, with the measured peak, written apart from the level; otherwise how many bins reached it,
+ * never as many in a row as the rule asks.
+ */
+function notVisibleNote(signal: Signal, bound: Bound, seen: LevelSeen, until: string, yet: boolean): string {
+    const lead = `Not visible${yet ? " yet" : ""}`;
+    // The level as boundText writes it, so this note and the bound beside it in a table read alike.
+    const level = formatLevel(bound.value, signal.kind);
+    if (seen.peak === null || !seen.peakAt) return `${lead}: no bin had a value for ${signal.label} from its injection ${until}.`;
+    const at = `at ${formatTimeUtc(seen.peakAt)} UTC`;
+    if (seen.atBound === 0) {
+        // A strict bound (the floor of 0) reads "at or under", which its peak may equal; "under" never sits beside an equal peak.
+        if (bound.strict) return `${lead}: ${signal.label} stayed at or under ${level} ${until}; its peak was ${formatLevel(seen.peak, signal.kind)} ${at}.`;
+        const apart = levelAndPeak(bound.value, seen.peak, signal.kind);
+        if (!apart) return `${lead}: ${signal.label} stayed under ${level} ${until}; its peak, ${at}, was just under it.`;
+        return `${lead}: ${signal.label} stayed under ${apart.level} ${until}; its peak was ${apart.peak} ${at}.`;
+    }
+    // The peak as its level is written (formatLevel), so a bin at 23.33 % never reads 23.3 % beside a level of 23.32 %.
+    const peak = `its peak was ${formatLevel(seen.peak, signal.kind)} ${at}`;
+    const reached = bound.strict ? `went above ${level}` : `reached ${level} or more`;
+    const blank = seen.bins - seen.valued;
+    return `${lead} by its rule: ${signal.label} ${reached} in ${seen.atBound} bin${seen.atBound === 1 ? "" : "s"}, never ${bound.minBins} in a row${blank > 0 ? ` (${blank} of its ${seen.bins} bins had no value)` : ""}, ${until}; ${peak}.`;
+}
+
 /** The end of the telemetry that runs on from `from` without a gap of more than one and a half bins. */
 function contiguousEnd(bins: readonly Bin[], from: number, stepMs: number): number {
     let end = from;
@@ -395,26 +485,40 @@ function contiguousEnd(bins: readonly Bin[], from: number, stepMs: number): numb
     return end;
 }
 
+interface Recovery {
+    at: Date | null;
+    /** The telemetry ends, or breaks off, while its last bin is still at the bound. */
+    ongoing: boolean;
+    /** Its last bins were back under the bound from this time, too few to confirm a recovery before the telemetry ends. */
+    backUnder: Date | null;
+    /** The telemetry breaks off there (a gap, or a bin without a value), rather than ends. */
+    brokeOff: boolean;
+    /** The start of its last bin at the bound. */
+    lastHot: number;
+}
+
 /**
  * The recovery after the signal showed: the first bin after its last bin at the bound (before `to`), with RECOVERED_BINS
- * bins under it in a row, with no gap. Null with `ongoing` when the telemetry ends (or breaks off) first.
+ * bins under it in a row, with no gap. When the telemetry ends (or breaks off) first: `ongoing` only if its last bin was
+ * still at the bound; if it was already back under, `backUnder`, since too few bins confirm the recovery.
  */
-function recoveryOf(bins: readonly Bin[], signal: Signal, bound: Bound, visible: number, to: number, stepMs: number): { at: Date | null; ongoing: boolean } {
+function recoveryOf(bins: readonly Bin[], signal: Signal, bound: Bound, visible: number, to: number, stepMs: number): Recovery {
     const window = bins.filter((b) => b.at.getTime() >= visible && b.at.getTime() < to);
     let lastHot = visible;
     for (const b of window) if (meets(signal.read(b), bound)) lastHot = b.at.getTime();
     const under: Bin[] = [];
     let previous = lastHot;
+    const ends = (brokeOff: boolean): Recovery => ({ at: null, ongoing: under.length === 0, backUnder: under[0]?.at ?? null, brokeOff, lastHot });
     for (const b of bins) {
         const t = b.at.getTime();
         if (t <= lastHot) continue;
-        if (t - previous > stepMs * 1.5 || signal.read(b) === null) return { at: null, ongoing: true };
-        if (meets(signal.read(b), bound)) return { at: null, ongoing: false };
+        if (t - previous > stepMs * 1.5 || signal.read(b) === null) return ends(true);
+        if (meets(signal.read(b), bound)) return { at: null, ongoing: false, backUnder: null, brokeOff: false, lastHot };
         under.push(b);
         previous = t;
-        if (under.length >= RECOVERED_BINS) return { at: under[0].at, ongoing: false };
+        if (under.length >= RECOVERED_BINS) return { at: under[0].at, ongoing: false, backUnder: null, brokeOff: false, lastHot };
     }
-    return { at: null, ongoing: true };
+    return ends(false);
 }
 
 const minutesBetween = (a: Date | null, b: Date | null) => (a && b ? Math.max(0, (b.getTime() - a.getTime()) / MIN) : null);
@@ -506,17 +610,9 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     }
 
     const { signal, bound, baseline } = chosen;
-    let peak: number | null = null;
-    let peakAt: Date | null = null;
-    for (const b of targetBins) {
-        const t = b.at.getTime();
-        if (t + stepMs <= injectedAt.getTime() || t >= chosen.searchEnd) continue;
-        const v = signal.read(b);
-        if (v !== null && (peak === null || v > peak)) {
-            peak = v;
-            peakAt = b.at;
-        }
-    }
+    // What its signal measured over the window it was looked for in: the bins firstRun read.
+    const seen = levelOf(targetBins, signal, bound, injectedAt.getTime(), chosen.searchEnd, stepMs);
+    const { peak, peakAt } = seen;
 
     // The response step, where one exists: the Database Agent beat's run forcing the last good plan, or a reset of the target.
     let answeredAt: Date | null = null;
@@ -547,45 +643,66 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     };
     if (!found) {
         const lastBin = covered[covered.length - 1].at.getTime() + stepMs;
-        const stays = `${signal.label} stayed ${bound.strict ? "at or under" : "under"} ${formatNumber(bound.value, signal.kind)}`;
+        const yet = lastBin < chosen.searchEnd;
         const capped = chosen.searchEnd < injectedEnd.getTime() + lagMs;
-        return {
-            ...common,
-            status: "Warning",
-            note:
-                lastBin < chosen.searchEnd
-                    ? `Not visible yet: ${stays} until the telemetry ends, ${formatTimeUtc(new Date(lastBin))} UTC.`
-                    : capped
-                      ? `Not visible: ${stays} until the next fault that raises it began, at ${formatTimeUtc(new Date(chosen.searchEnd))} UTC.`
-                      : `Not visible: ${stays} until ${formatTimeUtc(new Date(chosen.searchEnd))} UTC, ${TELEMETRY_LAG_MINUTES} minutes after its window.`,
-        };
+        const until = yet
+            ? `until the telemetry ends, ${formatTimeUtc(new Date(lastBin))} UTC`
+            : capped
+              ? `until the next fault that raises it began, at ${formatTimeUtc(new Date(chosen.searchEnd))} UTC`
+              : `until ${formatTimeUtc(new Date(chosen.searchEnd))} UTC, ${TELEMETRY_LAG_MINUTES} minutes after its window`;
+        return { ...common, status: "Warning", note: notVisibleNote(signal, bound, seen, until, yet) };
     }
 
     const nextRaising = successorOf(chosen.family);
     const recoveryEnd = Math.min(injectedEnd.getTime() + RECOVERY_SLACK_MINUTES * MIN, nextRaising ?? Number.POSITIVE_INFINITY);
     const recovery = recoveryOf(targetBins, signal, bound, found.at.getTime(), recoveryEnd, stepMs);
     const telemetryEnd = contiguousEnd(targetBins, found.at.getTime(), stepMs);
-    const visibleMin = recovery.at ? minutesBetween(found.at, recovery.at) : recovery.ongoing ? minutesBetween(found.at, new Date(telemetryEnd)) : null;
+    // The telemetry breaks off (a gap, or a bin without a value) right after its last bin at the bound: what's measured ends
+    // there, though the telemetry may go on after the hole, so it's never "still visible when the telemetry ends".
+    const heldToBreak = recovery.ongoing && recovery.brokeOff;
+    const visibleMin = recovery.at
+        ? minutesBetween(found.at, recovery.at)
+        : heldToBreak
+          ? minutesBetween(found.at, new Date(recovery.lastHot + stepMs))
+          : recovery.ongoing
+            ? minutesBetween(found.at, new Date(telemetryEnd))
+            : recovery.backUnder
+              ? minutesBetween(found.at, recovery.backUnder)
+              : null;
     const how = `${signal.label} ${boundText(bound, signal.kind)} (${bound.basis})${bound.minBins > 1 ? ` for ${bound.minBins} bins in a row` : ""}`;
     const why: keyof typeof NO_RECOVERY | null = recovery.at
         ? null
-        : recovery.ongoing
-          ? "ongoing"
-          : nextRaising !== undefined && nextRaising < injectedEnd.getTime() + RECOVERY_SLACK_MINUTES * MIN
-            ? "next"
-            : "late";
+        : heldToBreak
+          ? "brokeOff"
+          : recovery.ongoing
+            ? "ongoing"
+            : recovery.backUnder
+              ? "unconfirmed"
+              : nextRaising !== undefined && nextRaising < injectedEnd.getTime() + RECOVERY_SLACK_MINUTES * MIN
+                ? "next"
+                : "late";
+    // Back under in its last bins, too few to confirm the recovery: when it went under, measured, never "still visible".
+    const recoveryNote = !why
+        ? ""
+        : why === "unconfirmed" && recovery.backUnder
+          ? `Back under its bound at ${formatTimeUtc(recovery.backUnder)} UTC, but its telemetry ${recovery.brokeOff ? "breaks off" : "ends"} before ${RECOVERED_BINS} bins in a row under it.`
+          : why === "brokeOff"
+            ? `Its telemetry breaks off after ${formatTimeUtc(new Date(recovery.lastHot))} UTC, its last bin at its bound, so its recovery isn't measured.`
+            : NO_RECOVERY[why].note;
     return {
         ...common,
         visibleAt: found.at,
         recoveredAt: recovery.at,
-        ongoing: recovery.ongoing,
+        // At its bound when the telemetry ends; one whose telemetry only breaks off isn't known to be (its note says so).
+        ongoing: recovery.ongoing && !recovery.brokeOff,
         ttdMin: minutesBetween(injectedAt, found.at),
         ttrMin: recovery.at ? minutesBetween(injectedAt, recovery.at) : null,
         visibleMin,
         status: "Pass",
-        note: `Visible: ${how}.${why ? ` ${NO_RECOVERY[why].note}` : ""}`,
-        recoveryNote: why ? NO_RECOVERY[why].note : "",
+        note: `Visible: ${how}.${recoveryNote ? ` ${recoveryNote}` : ""}`,
+        recoveryNote,
         recoveryWord: why ? NO_RECOVERY[why].word : "",
+        // "At least" its visible time when the telemetry ends, or breaks off, while it's at its bound.
         impact: impactOf({ target, family: chosen.family === "deadlock" ? "blocking" : chosen.family, durationMin: visibleMin, ongoing: recovery.ongoing, peak, baseline }),
     };
 }
@@ -821,7 +938,7 @@ export interface Aggregate {
     ttrN: number;
 }
 
-/** Times to detect and recover per engine (SQL Server, Azure SQL Database, ...) or per fault type, with how many faults each median rests on. */
+/** Times to signal and recover per engine (SQL Server, Azure SQL Database, ...) or per fault type, with how many faults each median rests on. */
 export function aggregate(scores: readonly FaultScore[], by: "engine" | "type"): Aggregate[] {
     const groups = new Map<string, { label: string; items: FaultScore[] }>();
     for (const s of scores) {

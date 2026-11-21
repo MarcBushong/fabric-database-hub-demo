@@ -8,7 +8,7 @@
 // integration's events (docs/architecture.md). Which of T1 and T2 is billing and which the front desk is this file's
 // choice: change it here, in one place.
 
-import { formatDuration, formatNumber, type NumberKind } from "./format";
+import { formatDuration, formatLevel, formatNumber, percent, type NumberKind } from "./format";
 import { timesText } from "./insights";
 import type { EstateTarget } from "./view-state";
 
@@ -83,8 +83,6 @@ const WORDING: Record<string, Wording> = {
     connections: { what: "connections refused", signal: "failed connections", kind: "int" },
 };
 
-const percent = (share: number) => `${Math.round(share * 100)} %`;
-
 function forDuration(input: Pick<ImpactInput, "durationMin" | "ongoing">): string {
     if (input.durationMin === null || !Number.isFinite(input.durationMin) || input.durationMin < 0) return "";
     return ` for ${input.ongoing ? "at least " : ""}${formatDuration(Math.max(1, input.durationMin))}`;
@@ -100,7 +98,7 @@ export function impactOf(input: ImpactInput): Impact {
         const { throttled, requests } = input;
         const share = throttled !== null && throttled !== undefined && requests ? throttled / requests : null;
         headline = share !== null ? `${service}: ${percent(share)} of requests throttled${span}` : `${service}: requests throttled${span}`;
-        const peak = input.peak !== null ? `normalized RU ${formatNumber(input.peak, "percent")}, ` : "";
+        const peak = input.peak !== null ? `normalized RU ${formatLevel(input.peak, "percent")}, ` : "";
         evidence = share !== null ? `${peak}429s on ${formatNumber(throttled, "int")} of ${formatNumber(requests, "int")} requests` : `${peak}429s`;
     } else if (input.family === "replica_lag") {
         const minutes = input.peak !== null ? input.peak / 60 : null;
@@ -113,12 +111,14 @@ export function impactOf(input: ImpactInput): Impact {
         const wording = WORDING[input.family] ?? { what: "a signal above its baseline", signal: input.family.replace(/_/g, " "), kind: "decimal" as NumberKind };
         headline = `${service}: ${wording.what}${span}`;
         const ratio = input.peak !== null && input.baseline ? input.peak / input.baseline : null;
+        // A peak is written as its level is (formatLevel), so it never reads lower than a level it reached; a bin's blocked
+        // processes are its highest sample, and a fraction of them is never rounded to a whole count.
         const peak =
             input.peak === null
                 ? wording.signal
                 : input.family === "blocking"
-                  ? `up to ${formatNumber(input.peak, "int")} ${wording.signal}`
-                  : `${wording.signal} peak ${formatNumber(input.peak, wording.kind)}${wording.kind === "seconds" ? " per bin" : ""}`;
+                  ? `up to ${formatLevel(input.peak, "int")} ${input.peak === 1 ? "blocked process" : wording.signal}`
+                  : `${wording.signal} peak ${formatLevel(input.peak, wording.kind)}${wording.kind === "seconds" ? " per bin" : ""}`;
         evidence = ratio !== null && Number.isFinite(ratio) && ratio >= 1.05 ? `${peak}, ${timesText(ratio)} its baseline` : peak;
     }
     return { service, headline, evidence, sentence: `${headline} (${evidence})` };

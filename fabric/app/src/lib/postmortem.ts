@@ -92,6 +92,19 @@ const faultTitle = (run: SessionRun) => scenarioTitle(scenarioOf(run));
 
 const NOT_MEASURED = "Not measured: the telemetry didn't load.";
 
+/**
+ * Why the impact table is empty, from what was measured (F23), said of every fault only when it's so of every fault: the
+ * notebook's own check, when it saw every one; "not visible by its rule", when every one was measured and wasn't;
+ * otherwise what the follow-ups give each fault.
+ */
+function noImpactText(scores: readonly FaultScore[], unscored: boolean): string {
+    if (unscored) return NOT_MEASURED;
+    if (scores.length === 0) return "No measured impact: nothing was injected or measured in this window.";
+    if (scores.every((s) => s.status === "Pass" && !s.bound)) return "No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.";
+    if (scores.every((s) => s.status === "Warning" && s.bound)) return "No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.";
+    return "No measured impact in this view; the follow-ups say what was measured for each fault, or why it wasn't.";
+}
+
 /** The postmortem's file name: letters, digits, and dashes only. */
 export function postmortemFileName(plan: Plan, generatedAt: Date): string {
     const id = (plan.kind === "session" ? shortSessionId(plan.key) : plan.key).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "plan";
@@ -120,7 +133,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         lines.push(
             `- ${scores.length} fault${scores.length === 1 ? "" : "s"} injected by the demo's session control on ${targets} (Scenario Runs); ${summary.visible} had their signal visible in the telemetry${summary.notVisible ? `, ${summary.notVisible} didn't` : ""}${summary.unmeasured ? `, and ${summary.unmeasured} had no signal the history measures` : ""}.`,
         );
-        lines.push(`- Median time to detect: ${minutesText(summary.ttdMedian)}. Median time to recover: ${minutesText(summary.ttrMedian)}.`);
+        lines.push(`- Median time to signal: ${minutesText(summary.ttdMedian)}. Median time to recover: ${minutesText(summary.ttrMedian)}.`);
     }
     if (unscored.length > 0) {
         const targets = [...new Set(unscored.map((r) => r.target))].sort().join(", ");
@@ -151,7 +164,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         ...episodes.map((e) => ({ at: e.visibleAt, target: e.target, impact: e.impact })),
     ].sort((a, b) => a.at.getTime() - b.at.getTime());
     lines.push("## Impact on ContosoCare", "");
-    if (impacts.length === 0) lines.push(unscored.length > 0 ? NOT_MEASURED : "No measured impact: no signal showed in this window.");
+    if (impacts.length === 0) lines.push(noImpactText(scores, unscored.length > 0));
     else lines.push(...table(["Service", "Target", "What it felt", "Measured signal"], impacts.map((i) => [i.impact.service, i.target, i.impact.headline.replace(/^[^:]+:\s*/, ""), i.impact.evidence])));
     lines.push("");
 
@@ -174,19 +187,19 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     else if (scores.length === 0) lines.push("- No response step in this window.");
     lines.push("");
 
-    lines.push("## Times to detect and recover", "");
+    lines.push("## Times to signal and recover", "");
     if (unscored.length > 0) lines.push(NOT_MEASURED, "");
     if (scores.length > 0) {
         lines.push(
             ...table(
-                ["Fault", "Target", "Injected", "Signal visible", "Time to detect", "Answered", "Recovered", "Time to recover", "Status"],
+                ["Fault", "Target", "Injected", "Signal visible", "Time to signal", "Answered", "Recovered", "Time to recover", "Status"],
                 scores.map((s) => [s.title, s.target, time(s.injectedAt), time(s.visibleAt), minutesText(s.ttdMin, s.binMinutes), time(s.answeredAt), s.recoveredAt ? time(s.recoveredAt) : s.recoveryWord || "–", minutesText(s.ttrMin), s.status]),
             ),
             "",
         );
     }
     lines.push(
-        `Time to detect runs from the injection to the signal visible in the telemetry, by its sample time; time to recover, from the injection to the signal back under its bound for ${RECOVERED_BINS} bins in a row. Database Hub shows the telemetry 3 to 15 minutes after its sample time; what Database Hub itself detected isn't in the history, so this postmortem doesn't say.`,
+        `Time to signal runs from the injection to the signal visible in the telemetry, by its sample time; time to recover, from the injection to the signal back under its bound for ${RECOVERED_BINS} bins in a row. Database Hub shows the telemetry 3 to 15 minutes after its sample time; what Database Hub itself detected isn't in the history, so this postmortem doesn't say.`,
         "",
     );
 
@@ -209,7 +222,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## How this was measured", "");
     lines.push(
         "- **What was injected:** Scenario Runs, which the analysis notebook writes at the session's end from the control's plan.",
-        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to detect is 0, written as at most one bin, and the timeline tells the injection first.`,
+        `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to signal is 0, written as at most one bin, and the timeline tells the injection first.`,
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
         "",
@@ -233,7 +246,7 @@ export const POSTMORTEM_COLUMNS: ColumnSpec[] = [
     { key: "fault", label: "Fault or episode", kind: "text" },
     { key: "injected", label: "Injected (UTC)", kind: "datetime" },
     { key: "visible", label: "Signal visible in telemetry (UTC)", kind: "datetime" },
-    { key: "ttdMin", label: "Time to detect (min)", kind: "minutes" },
+    { key: "ttdMin", label: "Time to signal (min)", kind: "minutes" },
     { key: "answered", label: "Answered (UTC)", kind: "datetime" },
     { key: "answer", label: "Response", kind: "text" },
     { key: "recovered", label: "Recovered (UTC)", kind: "datetime" },

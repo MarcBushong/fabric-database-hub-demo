@@ -570,6 +570,21 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         $script:calls | Should -Not -Contain 'teardown gtest'
     }
 
+    It 'leaves out DESTROY.HUB.AGENT.T3, which a group that never has a T3 doesn''t need, from what the destroy path returns (review of 5d1f4b0)' {
+        # destroy.ps1 gives the boot test's group none (Get-DemoDestroyExtraPlan's NoT3); this keeps it out regardless.
+        $script:testGroupExists = 'true'
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoEnvironment -MockWith {
+            $script:calls.Add('teardown ' + $Config['environment'])
+            @((New-TestResult 'DESTROY.RESOURCEGROUP'), (New-TestResult 'DESTROY.HUB.AGENT.T3' 'Manual action required'), (New-TestResult 'DESTROY.RESIDUAL'))
+        }
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -CleanupOnly -Confirm:$false)
+        $script:calls | Should -Contain 'teardown gtest'
+        ($results | Where-Object checkId -EQ 'DESTROY.RESOURCEGROUP').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST.TEARDOWN').status | Should -Be 'Pass'
+        @($results | Where-Object checkId -EQ 'DESTROY.HUB.AGENT.T3').Count | Should -Be 0
+        @($results | Where-Object status -EQ 'Manual action required').Count | Should -Be 0
+    }
+
     It 'proves the copy in quarantine in the test group, then deletes the group through the destroy path' {
         $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
         ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'

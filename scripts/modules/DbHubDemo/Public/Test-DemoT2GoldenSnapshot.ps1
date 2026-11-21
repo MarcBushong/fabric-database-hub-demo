@@ -149,7 +149,7 @@ function Test-DemoT2GoldenSnapshot {
         & $add 'GOLDEN.TEST.ENVIRONMENT' 'Fail' ('The test environment ''{0}'' would use {1}, which belongs to the demo, the golden snapshots, or the control identity.' -f $TestEnvironment, $testGroup) @{} 'Pick another -TestEnvironment (the default is gtest).'
         return $results.ToArray()
     }
-    $purpose = 't2-golden-boot-test'
+    $purpose = $script:GoldenTestPurpose
 
     # Deletes the test group through the destroy path, only when it's the boot test's own group.
     $teardown = {
@@ -166,8 +166,10 @@ function Test-DemoT2GoldenSnapshot {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         # The copy holds nothing of its own (it came from the snapshot), so the wizard-state guard doesn't apply.
         $removed = @(Remove-DemoEnvironment -Config $testConfig -WaitMinutes 45 -ResidueWaitMinutes 10 -WithoutGolden -Confirm:$false)
+        # The test group never has a T3, so DESTROY.HUB.AGENT.T3 never applies to it; destroy.ps1 leaves it out too
+        # (review of 5d1f4b0).
         foreach ($item in $removed) {
-            if ([string]$item.checkId -notin 'PREFLIGHT.GUARD.CONTEXT', 'DESTROY.GOLDEN.GUARD') {
+            if ([string]$item.checkId -notin 'PREFLIGHT.GUARD.CONTEXT', 'DESTROY.GOLDEN.GUARD', 'DESTROY.HUB.AGENT.T3') {
                 $results.Add($item)
             }
         }

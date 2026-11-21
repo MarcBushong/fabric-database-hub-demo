@@ -44,7 +44,7 @@ export interface PageInfo {
 
 export const PAGES: readonly PageInfo[] = [
     { id: "mission", label: "Mission Control", description: "ContosoCare's services, the latest session, and what happened" },
-    { id: "scoreboard", label: "Scoreboard", description: "Did we catch it? Every injected fault, detected and recovered" },
+    { id: "scoreboard", label: "Scoreboard", description: "Did we catch it? Every injected fault: its signal in its window, and its recovery" },
     { id: "replay", label: "Session replay", description: "Play a session back across every engine" },
     { id: "overview", label: "Overview", description: "What needs attention now" },
     { id: "estate", label: "Estate", description: "Every engine and target" },

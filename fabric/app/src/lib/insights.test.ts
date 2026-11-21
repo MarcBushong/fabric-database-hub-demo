@@ -191,6 +191,19 @@ describe("insights", () => {
         expect(insight?.detail).toBe("Next step (hub-setting): Turn it on.");
     });
 
+    it("never rounds a share to 100 % or 0 % when it isn't exactly that", () => {
+        const dominant = dominantWaitInsight([
+            { category: "CPU", target: "T3", seconds: 996 },
+            { category: "CPU", target: "T1", seconds: 4 },
+        ]);
+        expect(dominant?.metric).toBe("more than 99 %");
+        expect(dominant?.title).toBe("T3 carries more than 99 % of the estate's wait time; its biggest category is CPU.");
+        const summary = { checks: 300, failed: 0, manual: 0, warnings: 299, passed: 1, notSupported: 0, notSelected: 0, readiness: 0.003, runLabel: "run" };
+        expect(readinessInsight(summary, [])?.metric).toBe("less than 1 %");
+        expect(readinessInsight({ ...summary, warnings: 1, passed: 299 }, [])?.metric).toBe("more than 99 %");
+        expect(readinessInsight({ ...summary, warnings: 0, passed: 300 }, [])?.metric).toBe("100 %");
+    });
+
     it("asks for a notebook run when there is no snapshot, and warns when it's old", () => {
         const empty = { latestCapture: null, latestDay: null, earliestDay: null, hoursSince: null, freshness: "", notebookRuns: 0, scenarioRequests: 0, incidents: 0, hasBins: false };
         expect(freshnessInsight(empty)?.status).toBe("Manual action required");

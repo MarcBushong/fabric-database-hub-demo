@@ -16,7 +16,7 @@ import type { ColumnSpec } from "@/data/queries";
 import { hubUrlOf } from "@/lib/agent-prompts";
 import { withoutColumns } from "@/lib/ask";
 import { serviceOf } from "@/lib/business";
-import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc } from "@/lib/format";
+import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc, percent } from "@/lib/format";
 import type { PostmortemInput } from "@/lib/postmortem";
 import { minutesText, summarize } from "@/lib/scoreboard";
 import { statusMeta } from "@/lib/status";
@@ -151,7 +151,7 @@ export default function MissionControlPage() {
                             sub={data.scoreError ? "The telemetry didn't load, so nothing is measured" : summary.notVisible ? `${summary.notVisible} not visible: see the scoreboard` : "by the telemetry's sample time"}
                             tone={summary.notVisible ? "alert" : summary.visible ? "good" : undefined}
                         />
-                        <BigStat label="Median time to detect" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
+                        <BigStat label="Median time to signal" value={minutesText(summary.ttdMedian)} sub="injected → signal visible" />
                         <BigStat label="Median time to recover" value={minutesText(summary.ttrMedian)} sub="injected → back under its bound" />
                         {beat?.cpuBefore !== null && beat?.cpuBefore !== undefined && beat.cpuAfter !== null ? (
                             <BigStat label="Database Agent loop, T3" value={`${Math.round(beat.cpuBefore)} % → ${Math.round(beat.cpuAfter)} %`} sub={`CPU before and after the last good plan, forced at ${formatTimeUtc(beat.respondAt)} UTC`} tone="good" />
@@ -159,7 +159,7 @@ export default function MissionControlPage() {
                         {t5.length > 0 ? (
                             <BigStat
                                 label="Patient events, T5"
-                                value={t5Requests ? `${Math.round((t5Throttled / t5Requests) * 100)} % throttled` : `${t5.length} episode${t5.length === 1 ? "" : "s"}`}
+                                value={t5Requests ? `${percent(t5Throttled / t5Requests)} throttled` : `${t5.length} episode${t5.length === 1 ? "" : "s"}`}
                                 sub={t5Requests ? `${formatNumber(t5Throttled, "int")} of ${formatNumber(t5Requests, "int")} requests answered 429 in ${t5.length} episode${t5.length === 1 ? "" : "s"}` : "throttling in its Azure Monitor metrics"}
                                 tone="alert"
                             />

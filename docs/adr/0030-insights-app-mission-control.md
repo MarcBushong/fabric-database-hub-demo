@@ -20,20 +20,21 @@ Six additions, frontend and read-only only: no new Azure resource, permission, r
 
 - **The service map:** ContosoCare, with each target as the service it serves, its health from the history, a pulse, and a count of the session's events; a node opens its target's page. **Technical** shows each target's peak signal; **Business impact** the same in ContosoCare's words.
 - **The session:** the latest session's plan, or the one picked, "as recorded at its end, as of" the newest capture. It's never presented as live: **Database Hub, live** opens Database Hub, and while Manage's function sees a session running, the page says so and links Database Hub. A session the address asks for that isn't in the period shows as missing, with **Show all history** and **Show the latest session**, never as another session in its place. The pages carry a session to each other only when the viewer picked one (the session picker, or **Link to this moment**); otherwise each follows the latest, so a later visit never opens on a session nobody chose.
-- **The ribbon and the numbers:** every injected fault on its target's lane (injected, signal visible, answered, recovered), T4's and T5's measured episodes dotted, and the big numbers: faults injected, signal visible, median times to detect and recover, the Database Agent loop's before and after, and T5's throttled share.
+- **The ribbon and the numbers:** every injected fault on its target's lane (injected, signal visible, answered, recovered), T4's and T5's measured episodes dotted, and the big numbers: faults injected, signal visible, median times to signal and recover, the Database Agent loop's before and after, and T5's throttled share.
 - **Overview stays** as a page, one below it in the navigation.
 
 ### 2. "Did we catch it?": the scoreboard
 
-For each fault in `Scenario Runs`: when its signal was visible in the telemetry, when it was answered, and when it recovered, with the times to detect (injected to visible) and recover (injected to recovered), per engine and per fault type across the newest sessions (3, and the one picked).
+For each fault in `Scenario Runs`: when its signal was visible in the telemetry, when it was answered, and when it recovered, with the times to signal (injected to visible) and recover (injected to recovered), per engine and per fault type across the newest sessions (3, and the one picked).
 
 - **"Signal visible in telemetry,"** never "detected by Database Hub": the app can't read what Database Hub raised, and Database Hub shows telemetry 3 to 15 minutes after its sample time. The time is the first bin's sample time.
+- **It says what it verifies (2026-11-20):** it checks each injected fault for that fault's expected signal, in its own window, so it never reads as blind detection. "Did we catch it?" has the subtitle "Verified against the injected faults: each one's expected signal, in its own window"; the column and the count say **Signal seen**, not "Caught"; and the times are **time to signal**, not "time to detect", in the app and its postmortem. The owner can change the words back.
 - **Measured per signal, with the analysis notebook's own rules** (`src/lib/scoreboard.ts`): the families each scenario raises (`SCENARIO_SIGNALS`), the episode levels (`EPISODE_RULES`), the CPU correlation's 1.5 times and 10 points, and its 15 minutes of telemetry lag. A bin shows the signal at its episode level, or at 1.5 times its baseline when that's higher (for CPU, at 1.5 times and 10 points above its baseline when that's lower than 80 %), for the rule's bins in a row. The baseline is the median of the target's bins within 2 hours, outside the windows of faults that raise the same signal; with fewer than 5 such bins, the level alone. Each row says how it was measured.
 - **Each fault in its own bins' step:** the history mixes bin sizes (the notebook bins a window of 120 minutes or less by the minute, 720 by 5, and longer by 15: a session of about 110 minutes or more, `stop-demo.ps1 -SaveHistory`, and deploy's snapshot), so a fault's step is the median gap between the target's bins in its window (or the hour around it), and its baseline reads bins of that size only, since a wait sums over its bin.
 - **Recovered:** the first of 2 bins in a row under the bound, within 30 minutes of the fault's window. When the next fault with the same signal starts first, or the telemetry ends, the row says so instead of a time. A T5 episode recovers only at the notebook's measured recovery (one whose 429s only stopped has no recovery time), and a T4 episode whose metrics break off ends there, with its recovery unknown, never "still at the capture's end".
 - **A query that fails** is named on the page with **Retry**, beside what still shows; when the telemetry fails, nothing is scored, rather than every fault "not visible", and the faults injected still count from the plan.
 - **Answered:** the Database Agent beat's response (the run forces the last good plan; its documented times), or a reset. Other faults have no response step, and the scoreboard says so rather than inventing one.
-- **T4 and T5:** their beats aren't in `Scenario Runs`, so they show as measured episodes in their own metrics (CPU and read replica lag; normalized RU and 429s), without a time to detect.
+- **T4 and T5:** their beats aren't in `Scenario Runs`, so they show as measured episodes in their own metrics (CPU and read replica lag; normalized RU and 429s), without a time to signal.
 - **Not visible:** a fault whose signal didn't show is a **Warning** with why (ADR 0012); one with no telemetry for its window is a **Warning** too, unless the notebook's own check of its incident window passed (then it's visible, without times), and a scenario with no signal in the history is **Not supported**.
 
 ### 3. The business impact lens
@@ -43,7 +44,7 @@ For each fault in `Scenario Runs`: when its signal was visible in the telemetry,
 
 ### 4. The postmortem
 
-- **Write the postmortem** on a session (Mission Control, the scoreboard, the replay): **Download Markdown** writes a deterministic postmortem from the data alone (summary, timeline, impact, cause, response, times to detect and recover, follow-ups, how it was measured, and the queries behind it), so it works without a GitHub sign-in. **Copy** copies it.
+- **Write the postmortem** on a session (Mission Control, the scoreboard, the replay): **Download Markdown** writes a deterministic postmortem from the data alone (summary, timeline, impact, cause, response, times to signal and recover, follow-ups, how it was measured, and the queries behind it), so it works without a GitHub sign-in. **Copy** copies it.
 - **Draft with Copilot** asks the viewer's own GitHub Copilot through the existing `useCopilot().ask` contract, with the same rows and queries and a structured template (`src/lib/postmortem.ts`); nothing in `src/copilot/` changes. No OneLake storage in Wave 1.
 - **It waits for the telemetry:** while the telemetry hasn't loaded, nothing is measured, so **Write the postmortem** says why and waits for **Retry**. What was injected always comes from the plan: a session's faults are never "nothing injected" for want of their scores.
 
@@ -77,7 +78,7 @@ The owner's choice (2026-11-20); until then, ContosoCare's navy with cyan and ma
 
 - **Easier:** the app opens on what only it knows, in a look that's clearly its own, with Database Hub one click away for the live view. The same numbers serve the map, the scoreboard, the replay, the postmortem, and Copilot.
 - **Harder:** the scoreboard mirrors the notebook's rules (`SCENARIO_SIGNALS`, `EPISODE_RULES`), so a change there needs the same change in `scoreboard.ts`; the tests pin both sides' numbers on the app's side only.
-- **Accepted:** the plan is never live, only "as of" the session's end. T4's and T5's beats have no time to detect until the notebook records them (Wave 2). The scoreboard reads only the catalog's existing queries and the incident waits' queries, so the deploy-time check (`FABRIC.APP.QUERIES`, 21 queries) is unchanged.
+- **Accepted:** the plan is never live, only "as of" the session's end. T4's and T5's beats have no time to signal until the notebook records them (Wave 2). The scoreboard reads only the catalog's existing queries and the incident waits' queries, so the deploy-time check (`FABRIC.APP.QUERIES`, 21 queries) is unchanged.
 
 ## Validation
 

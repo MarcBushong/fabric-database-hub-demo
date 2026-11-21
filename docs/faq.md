@@ -17,7 +17,7 @@ No: every call names the configured subscription, and the scripts never sign in 
 About 1.5 hours in the default mode, with nobody needed: 91 minutes, measured on 2026-11-06, before T4's read replica, T5, and Ask joined ([expected duration](deployment.md#expected-duration)).
 
 **Can an AI assistant run it?**
-Yes, as [AGENTS.md](../AGENTS.md) says ([deployment](deployment.md#running-it-with-an-ai-assistant)). People keep `az login`, the optional Database Agents selection, each viewer's GitHub sign-in, an Owner's grant, and, only if Fabric refuses the Azure CLI's token, `./scripts/configure-fabric-app.ps1 -SignIn`.
+Yes, as [AGENTS.md](../AGENTS.md) says ([deployment](deployment.md#running-it-with-an-ai-assistant)). People keep `az login`, the Database Agents selection (required once for the Database Agent beat; [step by step](database-agents.md)), each viewer's GitHub sign-in, an Owner's grant, and, only if Fabric refuses the Azure CLI's token, `./scripts/configure-fabric-app.ps1 -SignIn`.
 
 ## During a demo
 
@@ -25,7 +25,7 @@ Yes, as [AGENTS.md](../AGENTS.md) says ([deployment](deployment.md#running-it-wi
 Resume the Fabric capacity, open `NB_DatabaseHub_Control`, and select **Run all**: it starts everything, runs the 90-minute showcase, stops everything, and saves the history ([the session control notebook](../fabric/control/README.md)).
 
 **Does the repo automate Database Agents?**
-Almost: it has no API, so once per deployment you select T3 in Database Hub's **Manage agents**, about 30 seconds (`HUB.AGENT.T3`, under **Please confirm**). It's optional, for the Database Agent loop on T3; the agent never changes a database, and Run all makes the manual response ([demo it yourself](../README.md#demo-it-yourself)).
+Almost: it has no API, so once per deployment you select T3 in Database Hub's **Manage agents**, a minute or two (`HUB.AGENT.T3`, under **Please confirm**). It's required for the Database Agent beat, and everything else works without it; the agent never changes a database, and Run all makes the manual response ([step by step](database-agents.md)).
 
 **Which targets does Database Agents cover?**
 Azure SQL Database, so T3 ([the loop](demo-walkthrough.md#the-database-agent-loop-on-t3)); PostgreSQL (T4) only in a Visual Studio Code preview, and not T1, T2, or T5 ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents)). Copilot in Database Hub investigates every target's incidents ([live coverage](../fabric/agent/README.md#live-coverage-record)).
