@@ -968,7 +968,9 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the files its actions dot-source (live
         Mock -CommandName Write-DemoControlLine -MockWith { $script:lines.Add($Line) }
     }
 
-    It 'exports T2''s evidence on archost01 with the credential GuestVm.ps1 reads, mocking only PowerShell Direct' {
+    # DPAPI (ProtectedData) exists only on Windows, so the static checks' ubuntu-latest leg skips this test; the path check
+    # below runs everywhere.
+    It 'exports T2''s evidence on archost01 with the credential GuestVm.ps1 reads, mocking only PowerShell Direct' -Skip:($IsWindows -eq $false) {
         Test-Path -LiteralPath 'function:\Get-DemoGuestCredential' | Should -BeFalse -Because 'the action must load GuestVm.ps1 itself, the way the bundle does'
         $root = Join-Path -Path $TestDrive -ChildPath ('archost-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'protected') -Force | Out-Null
