@@ -148,6 +148,8 @@ BeforeAll {
         $script:rcaMostOpen = @{}
         # Key Vault versions of the secrets the runbook writes, counted (Secrets - Create Or Update returns secretUriWithVersion).
         $script:secretVersions = 0
+        # A script block each secret write runs first, given the secret's name and the request's body (review of 15ad76d).
+        $script:secretWriteHook = $null
     }
 
     # An Rca Run Command's instance view (Invoke-DemoControlRca): its result line, then the runner's own line, if any.
@@ -228,6 +230,7 @@ BeforeAll {
             '/vaults/kv-dbhub-ctl-[0-9a-f]{6}/secrets/(dbhub-session-status|dbhub-session-metrics)$' {
                 if ($script:secretsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.KeyVault/vaults/secrets/write."}}') }
                 $name = $Matches[1]
+                if ($null -ne $script:secretWriteHook) { & $script:secretWriteHook $name $Body }
                 if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
                 $script:secretVersions++
                 $version = '{0:x32}' -f $script:secretVersions
@@ -3382,6 +3385,82 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $script:secrets.ContainsKey('dbhub-session-status') | Should -BeFalse -Because 'nothing new was exported, and a VM that doesn''t run is the host check''s to report'
     }
 
+    It 'writes no re-check bundle once the session''s stop has begun, and the next start exports what the re-check found (review of 15ad76d)' {
+        # DbHub-Monitor's re-check exports while the session runs, and Stop now ends the session while it fetches the parts.
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0], $script:fixtureIds[1])
+        $script:fixtureRunner = $script:rcaRunner
+        $script:stopFired = $false
+        $script:rcaRunner = {
+            param($Command)
+            if (-not $script:stopFired -and $Command.Request.command -eq 'part') {
+                $script:stopFired = $true
+                $script:stopped = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+            }
+            return (& $script:fixtureRunner $Command)
+        }
+        $check = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $check.Outcome | Should -Be 'Changed'
+        $script:stopped.status | Should -Be 'Stopped'
+        $versions = @($script:secrets['dbhub-session-metrics'])
+        [string]$versions[-1].Tags['rca'] | Should -Not -Be 'bundle' -Because 'nothing is written after the stop''s final version of the metrics'
+        @(Get-RcaBundle).Count | Should -Be 1 -Because 'the stop''s own bundle only'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'stopped'
+        $status.metrics.version | Should -Be $versions[-1].Version
+        $final = $versions[-1].Value | ConvertFrom-Json
+        @($final.series).Count | Should -BeGreaterThan 0
+        @($final.rca.documents.documentId) | Should -Be @($script:fixtureIds[1])
+        # The re-check's document goes to the stop's status, still to export.
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@sqlvm01' -f $script:fixtureIds[0]))
+        $status.rca.final | Should -BeFalse
+        $status.PSObject.Properties.Name | Should -Not -Contain 'stopBegunUtc'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        # The next session's start exports it, and Run all saves it with that session's history.
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:rcaRunner = $script:fixtureRunner
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext -NowUtc $script:clock)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        $earlier = (Get-SessionStatus).rcaEarlier
+        $earlier.sessionId | Should -Be $script:fixtureSession
+        @($earlier.documents.documentId | Sort-Object) | Should -Be $script:fixtureIds
+    }
+
+    It 'names the metrics'' final version in the stop''s status, so a re-check bundle written right after it changes nothing the notebook reads (review of 15ad76d)' {
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner -Batches @($script:fixtureIds[0], $script:fixtureIds[1])
+        # The whole stop runs between the re-check's last look at the status and its bundle's write.
+        $script:stopFired = $false
+        $script:secretWriteHook = {
+            param($Name, $Body)
+            if (-not $script:stopFired -and $Name -eq 'dbhub-session-metrics' -and [string]$Body['tags']['rca'] -eq 'bundle') {
+                $script:stopFired = $true
+                $script:stopped = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+            }
+        }
+        $check = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $check.Outcome | Should -Be 'Changed'
+        $script:stopped.status | Should -Be 'Stopped'
+        $versions = @($script:secrets['dbhub-session-metrics'])
+        [string]$versions[-1].Tags['rca'] | Should -Be 'bundle' -Because 'the re-check''s write came right after the stop''s'
+        $status = Get-SessionStatus
+        $pinned = @($versions | Where-Object { $_.Version -eq $status.metrics.version })
+        $pinned.Count | Should -Be 1
+        $final = $pinned[0].Value | ConvertFrom-Json
+        @($final.series).Count | Should -BeGreaterThan 0 -Because 'T4''s metrics are in the version the notebook reads'
+        $final.rca.kind | Should -Be 'ContosoCare.RcaBundleIndex'
+        @($final.rca.documents.documentId) | Should -Be @($script:fixtureIds[1])
+        # That bundle is in no index, so its document goes to the next start, which exports it again.
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@sqlvm01' -f $script:fixtureIds[0]))
+    }
+
     It 'exports at the next session''s start what an earlier session''s stop didn''t, right before each VM''s activity, and keeps its index for Run all' {
         # The earlier session: the nightly stop ended it, after a re-check had exported part of it.
         $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
@@ -3414,6 +3493,37 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $status.rca.sessionId | Should -Be $next
         @($status.rca.bundles) | Should -BeNullOrEmpty -Because 'the new session''s own state starts empty'
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'fetches at the next start an earlier session''s pending document on a VM whose final export ran, not only on the VMs it left (review of 15ad76d)' {
+        # Its stop's export didn't run on sqlvm01, and left one document on archost01 that it didn't fetch whole.
+        $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $script:fixtureIds[1])[0]
+        $pending = [ordered]@{ documentId = $reference.documentId; parts = [int]$reference.parts; sha256 = $reference.sha256; vm = 'archost01' }
+        $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @($pending); leftVms = @('sqlvm01'); final = $false; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        # Neither VM has anything new to export; archost01 still has the document.
+        $script:rcaRunner = {
+            param($Command)
+            $request = $Command.Request
+            if ($request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+            }
+            $line = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $request.documentId -and $_.Split(' ')[3].StartsWith(('{0}/' -f $request.part)) }) | Select-Object -First 1
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object Vm | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }).Count | Should -Be ([int]$reference.parts)
+        $status = Get-SessionStatus
+        @($status.rcaEarlier.documents.documentId) | Should -Be @($reference.documentId)
+        @($status.rcaEarlier.bundles).Count | Should -Be 1
     }
 
     It 'exports nothing at a start after a session whose stop exported everything, or one from before the export' {
