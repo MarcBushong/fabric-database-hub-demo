@@ -1,5 +1,12 @@
-// Times in questions: "11:56" means the viewer's wall-clock time on the history's newest day, in the viewer's time zone
-// (the browser's, Intl), and answers say both. The history is UTC.
+// Times in questions: "11:56" means the viewer's wall-clock time, in the viewer's time zone (the browser's, Intl), at its
+// latest occurrence up to the history's newest data; "11:56 UTC" likewise in UTC; a date and time is taken as written.
+// Answers say both local and UTC. The history is UTC.
+
+/**
+ * A clock time up to this long after the history's newest data stays on that data's day: the capture can run past the
+ * newest telemetry bin, and Database Hub's telemetry arrives minutes late.
+ */
+export const LATER_THAN_NEWEST_MS = 60 * 60_000;
 
 /** The time zone's offset from UTC at an instant, in milliseconds (positive east of UTC). */
 export function offsetMs(at: Date, timeZone: string): number {
@@ -9,18 +16,48 @@ export function offsetMs(at: Date, timeZone: string): number {
     return wall - Math.floor(at.getTime() / 1000) * 1000;
 }
 
+/** The UTC instant of a wall-clock time on a date (month 1 to 12) in `timeZone`; two passes settle the offset across a daylight-saving change. */
+function localToUtc(year: number, month: number, day: number, hour: number, minute: number, second: number, timeZone: string): Date {
+    const guess = Date.UTC(year, month - 1, day, hour, minute, second);
+    let at = guess - offsetMs(new Date(guess), timeZone);
+    at = guess - offsetMs(new Date(at), timeZone);
+    return new Date(at);
+}
+
 /**
- * The UTC instant of a time the viewer typed: "11:56", "11:56:30", "12:14 UTC", or an ISO timestamp. Bare times are on
- * `day` (the newest day in the history, as the system message anchors "today") in `timeZone`; UTC times are on the UTC
- * day of `newest`, the history's newest time, since the viewer's own date can be a day off from it (the review of 34a9732).
+ * The latest of a clock time on the day before, its day, and the day after that's no later than the newest data allows.
+ * Across UTC midnight, "23:15 UTC" fell on the newest bin's day, 22 hours after it (the re-review of 817b81c).
+ */
+function latestUpTo(on: (days: number) => Date, newest?: Date): Date {
+    if (!newest) return on(0);
+    const limit = newest.getTime() + LATER_THAN_NEWEST_MS;
+    return [on(1), on(0)].find((at) => at.getTime() <= limit) ?? on(-1);
+}
+
+const DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})(?:t|\s+)(\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?\s*(utc|z|[+-]\d{2}:?\d{2})?$/i;
+const CLOCK = /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?\s*(utc|z)?$/i;
+
+/**
+ * The UTC instant of a time the viewer typed. A date and time ("2026-11-17T13:30:00Z", "2026-11-17 13:30 UTC", or with an
+ * offset; without a zone, the viewer's time zone) is taken as written. A clock time ("11:56", "11:56:30", "1:30 pm", or
+ * "12:14 UTC") is the latest such time up to `newest`, the history's newest time, plus LATER_THAN_NEWEST_MS: bare times
+ * in `timeZone` from `day` (the newest day in the history there, as the system message anchors "today"), UTC times from
+ * newest's UTC day, since the viewer's own date can be a day off from it (the review of 34a9732).
  */
 export function resolveTime(text: string, day: Date, timeZone: string, newest?: Date): Date | null {
     const t = text.trim();
-    if (/^\d{4}-\d{2}-\d{2}T/.test(t)) {
-        const d = new Date(t);
-        return Number.isNaN(d.getTime()) ? null : d;
+    const full = DATE_TIME.exec(t);
+    if (full) {
+        const [year, month, date, hour, minute, second] = full.slice(1, 7).map((v) => Number(v ?? 0));
+        if (month < 1 || month > 12 || date < 1 || hour > 23 || minute > 59 || second > 59) return null;
+        if (new Date(Date.UTC(year, month - 1, date)).getUTCDate() !== date) return null;
+        const zone = full[7];
+        if (!zone) return localToUtc(year, month, date, hour, minute, second, timeZone);
+        const offset = /^([+-])(\d{2}):?(\d{2})$/.exec(zone);
+        const offsetMinutes = offset ? (offset[1] === "-" ? -1 : 1) * (Number(offset[2]) * 60 + Number(offset[3])) : 0;
+        return new Date(Date.UTC(year, month - 1, date, hour, minute, second) - offsetMinutes * 60_000);
     }
-    const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?\s*(utc|z)?$/i.exec(t);
+    const m = CLOCK.exec(t);
     if (!m) return null;
     let hour = Number(m[1]);
     const minute = Number(m[2]);
@@ -29,13 +66,9 @@ export function resolveTime(text: string, day: Date, timeZone: string, newest?: 
     if (hour > 23 || minute > 59 || second > 59) return null;
     if (m[5]) {
         const d = newest ?? day;
-        return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour, minute, second));
+        return latestUpTo((days) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + days, hour, minute, second)), newest);
     }
-    const guess = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour, minute, second);
-    // Two passes settle the offset across a daylight-saving change.
-    let at = guess - offsetMs(new Date(guess), timeZone);
-    at = guess - offsetMs(new Date(at), timeZone);
-    return new Date(at);
+    return latestUpTo((days) => localToUtc(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate() + days, hour, minute, second, timeZone), newest);
 }
 
 /** "12:14 EST (17:14 UTC)": how answers state a time. */

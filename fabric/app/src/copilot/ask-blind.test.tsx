@@ -160,7 +160,7 @@ describe("the chat's entry points come back blind with the RCA tables (ADR 0031)
             title: "The session's minutes",
             specs: [],
             table: null,
-            prompt: expect.stringMatching(/^Triage ContosoCare's databases from 2026-11-17 13:30 UTC to 2026-11-17 15:00 UTC: call triage_window for those minutes, then explain/),
+            prompt: expect.stringMatching(/^Triage ContosoCare's databases from 2026-11-17 13:30 UTC to 2026-11-17 15:00 UTC: call triage_window with from 2026-11-17T13:30:00Z and to 2026-11-17T15:00:00Z, then explain/),
         });
         expect(findIncidentsAsk({ targets: ["T1"] })).toMatchObject({ title: "The history's newest 90 minutes on T1", prompt: expect.stringMatching(/^Find the incidents in ContosoCare's databases in the history's newest 90 minutes on T1 from the signals themselves: call find_incidents/) });
     });

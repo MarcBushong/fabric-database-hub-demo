@@ -20,7 +20,11 @@ export interface ToolSpec {
     parameters: Record<string, unknown>;
 }
 
-const TIME = { type: "string", description: "A time as the viewer said it: 'HH:MM' (the viewer's time zone, on the history's newest day), 'HH:MM UTC', or an ISO timestamp." };
+const TIME = {
+    type: "string",
+    description:
+        "A time as the viewer said it: 'HH:MM' (the viewer's time zone) or 'HH:MM UTC', which is the latest such time up to the history's newest data, or a date and time, taken as written: '2026-11-17T13:30:00Z' or '2026-11-17 13:30 UTC'.",
+};
 const TARGETS = { type: "array", items: { type: "string", enum: RCA_TARGETS }, description: "The targets to look at; all of them when omitted." };
 const WINDOW_PROPS = {
     at: { ...TIME, description: `${TIME.description} Without at, or from and to: the history's newest ${NEWEST_MINUTES} minutes.` },
@@ -87,7 +91,7 @@ export interface InvestigationDeps {
     /** The telemetry of a window, when the app has it. */
     telemetry?: (from: Date, to: Date, targets: readonly RcaTarget[]) => Promise<Telemetry>;
     timeZone: string;
-    /** The history's newest day, which bare times are on. */
+    /** The history's newest day in the viewer's time zone, from which bare times are read. */
     latestDay: Date;
     /** The history's newest telemetry time: without a time, a window is the NEWEST_MINUTES before it. */
     latest?: Date;
