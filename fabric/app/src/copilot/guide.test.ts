@@ -1,8 +1,9 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { buildGuideSource, MODEL_DIR, OUTPUT, withoutScenarioClauses } from "../../scripts/build-model-guide";
+import { buildGuideSource, denylistProblems, MODEL_DIR, OUTPUT, readModel, withoutScenarioClauses, type ModelFiles } from "../../scripts/build-model-guide";
 import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
 import { readContract, namesAScenario } from "@/rca/testdata/contract";
 import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "./answer-key";
@@ -12,7 +13,7 @@ import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
 import { ANSWER_KEY_MEASURES, MODEL_GUIDE } from "./model-guide.generated";
 import { COSMOS_PROBE_DAX } from "./starters";
-import { parseTable, reachesAnswerKey, toDaxRef } from "./tmdl";
+import { parseRelationships, parseTable, reachesAnswerKey, tableMembers, tableOfRef, toDaxRef } from "./tmdl";
 
 describe("the model guide", () => {
     it("matches the history model's TMDL (run npm run guide:build after changing the model)", () => {
@@ -97,6 +98,60 @@ describe("the model guide", () => {
         expect(hosted).toEqual(expect.arrayContaining(["Injected Faults", "Scenario Requests", "Throttling Episodes"]));
         expect(ANSWER_KEY_MEASURES).toEqual(expect.arrayContaining(hosted));
         for (const file of files.filter(isKey)) expect(readFileSync(join(tableDir, file), "utf8"), file).not.toMatch(/^\s*calendar\s/m);
+    });
+
+    // The final review of 9b1896c: run_dax's denylist rests on the model's shape, which a later model change could weaken
+    // quietly. The generator writes no guide for a model that breaks it, and these pin each rule.
+    it("keeps the shape the denylist rests on: key names with a space, one-way many-to-one relationships with the key on the many side, and no other DAX that reads the key", () => {
+        const model = readModel();
+        expect(denylistProblems(model, ANSWER_KEY_MEASURES)).toEqual([]);
+        // Not vacuous: every key table's relationships were read, and so was every calculated table.
+        const keyed = model.relationships.filter((r) => (ANSWER_KEY_TABLES as readonly string[]).includes(tableOfRef(r.from)));
+        expect(new Set(keyed.map((r) => tableOfRef(r.from)))).toEqual(new Set(ANSWER_KEY_TABLES));
+        expect(keyed.length).toBeGreaterThanOrEqual(12);
+        const calculated = model.tables.filter((t) => tableMembers(t.text).some((m) => m.kind === "partition" && /=\s*calculated/.test(m.text)));
+        expect(calculated.map((t) => t.name)).toEqual(expect.arrayContaining(["Analysis", "Date", "Signal", "Status", "Target"]));
+    });
+
+    it("finds each way a model change could let a query reach the key without naming it", () => {
+        const table = (name: string, ...lines: string[]) => ({ name, text: [`table '${name}'`, ...lines].join("\n") });
+        const relationship = (from: string, to: string, ...properties: string[]) =>
+            parseRelationships(["relationship r", `    fromColumn: ${from}`, `    toColumn: ${to}`, ...properties.map((p) => `    ${p}`)].join("\n"))[0];
+        const clean: ModelFiles = {
+            tables: [table("Facts", "    measure Rows = COUNTROWS ( 'Facts' )", "    measure 'Injected Faults' = COUNTROWS ( 'RCA Answer Key' )")],
+            relationships: [relationship("'Scenario Runs'.'Target Key'", "Target.'Target Key'")],
+            other: [],
+        };
+        // A refused measure may read the key, wherever it's hosted: run_dax refuses it by name.
+        expect(denylistProblems(clean, ["Injected Faults"])).toEqual([]);
+        const broken: Array<[string, Partial<ModelFiles>, RegExp]> = [
+            ["both ways", { relationships: [relationship("'Scenario Runs'.'Target Key'", "Target.'Target Key'", "crossFilteringBehavior: bothDirections")] }, /filters bothDirections: it must filter one way/],
+            ["automatic", { relationships: [relationship("'Incident Windows'.'Report Date UTC'", "Date.Date", "crossFilteringBehavior: automatic")] }, /filters automatic/],
+            ["the key on the one side", { relationships: [relationship("'Telemetry Snapshots'.'Run ID'", "'Scenario Runs'.'Run ID'")] }, /puts 'Scenario Runs' on its one side/],
+            ["many-to-many", { relationships: [relationship("'RCA Answer Key'.'Target Key'", "Target.'Target Key'", "toCardinality: many")] }, /isn't many-to-one/],
+            ["one-to-one", { relationships: [relationship("'Analysis Findings'.'Target Key'", "Target.'Target Key'", "fromCardinality: one")] }, /isn't many-to-one/],
+            ["a calculated column", { tables: [table("Facts", "    column Scenario = RELATED ( 'Scenario Runs'[Scenario] )", "        dataType: string")] }, /'Facts' column Scenario = RELATED .* reads Scenario Runs/],
+            ["a calculated table", { tables: [table("Copy", "    partition Copy = calculated", "        source =", "                FILTER ( 'Incident  Windows', TRUE () )")] }, /'Copy' partition Copy = calculated reads Incident Windows/],
+            ["a calculation item", { tables: [table("Lens", "    calculationGroup", "        calculationItem Key = CALCULATE ( SELECTEDMEASURE (), [ Injected Faults ] > 0 )")] }, /'Lens' calculationGroup reads \[Injected Faults\]/],
+            ["a measure the refused list missed", { tables: [table("Facts", "    measure Leak = COUNTROWS ( 'Analysis Findings' )")] }, /'Facts' measure Leak = .* reads Analysis Findings/],
+            ["a model function", { other: [{ file: "functions.tmdl", text: "function Faults = () => 'RCA Answer Key'" }] }, /functions\.tmdl reads RCA Answer Key/],
+        ];
+        for (const [what, change, problem] of broken) expect(denylistProblems({ ...clean, ...change }, ["Injected Faults"]).join("\n"), what).toMatch(problem);
+        expect(denylistProblems(clean, ["Injected Faults"], ["Scenario Runs", "Runs"])).toEqual(["'Runs' has no space in its name, so DAX could name it without quotes."]);
+    });
+
+    it("writes no guide for a model that breaks that shape", () => {
+        const dir = mkdtempSync(join(tmpdir(), "dbhub-model-"));
+        try {
+            cpSync(MODEL_DIR, dir, { recursive: true });
+            const file = join(dir, "relationships.tmdl");
+            const text = readFileSync(file, "utf8").replace(/(toColumn: Target\.'Target Key')(\r?\n\r?\nrelationship 'Scenario Runs to Status')/, "$1\n    crossFilteringBehavior: bothDirections$2");
+            expect(text).toContain("crossFilteringBehavior: bothDirections");
+            writeFileSync(file, text, "utf8");
+            expect(() => buildGuideSource(dir)).toThrow(/reach the demo's answer key without naming it[\s\S]*'Scenario Runs'\.'Target Key' to Target\.'Target Key' filters bothDirections/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it("parses a table's description, columns, measures, and calculated rows", () => {

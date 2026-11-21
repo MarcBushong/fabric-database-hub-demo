@@ -10,9 +10,9 @@ export const ANSWER_KEY_TABLES = ["Scenario Runs", "Incident Windows", "RCA Answ
 export const ANSWER_KEY_ANALYSES = ["correlation", "database_agent", "blocking"] as const;
 
 /** The answer-key table or measure a DAX query names, as the query wrote it, or null when it names none. */
-export function answerKeyIn(dax: string, measures: readonly string[]): string | null {
+export function answerKeyIn(dax: string, measures: readonly string[], tables: readonly string[] = ANSWER_KEY_TABLES): string | null {
     const flat = dax.replace(/\s+/g, " ").toLowerCase();
-    const table = ANSWER_KEY_TABLES.find((t) => flat.includes(t.toLowerCase()));
+    const table = tables.find((t) => flat.includes(t.toLowerCase()));
     if (table) return table;
     // [ Injected Faults ] too: the check doesn't rely on DAX reading a bracketed name as written.
     const names = flat.replace(/\[ /g, "[").replace(/ \]/g, "]");

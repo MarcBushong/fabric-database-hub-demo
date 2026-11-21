@@ -99,23 +99,75 @@ export function parseTable(text: string): TmdlTable {
 export interface Relationship {
     from: string;
     to: string;
+    /** Its other properties as TMDL writes them (crossFilteringBehavior, fromCardinality, toCardinality, ...); a flag is "true". */
+    properties?: Record<string, string>;
 }
 
 export function parseRelationships(text: string): Relationship[] {
     const out: Relationship[] = [];
-    let from = "";
+    let current: Required<Relationship> | null = null;
+    const done = (r: Required<Relationship> | null) => {
+        if (r?.from && r.to) out.push(r);
+    };
     for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
         const line = raw.trim();
-        const f = /^fromColumn:\s*(.+)$/.exec(line);
-        const t = /^toColumn:\s*(.+)$/.exec(line);
-        if (f) from = f[1];
-        if (t && from) {
-            out.push({ from, to: t[1] });
-            from = "";
+        if (!line || line.startsWith("///")) continue;
+        if (indentOf(raw) === 0) {
+            done(current);
+            current = /^relationship\s/.test(line) ? { from: "", to: "", properties: {} } : null;
+            continue;
+        }
+        if (!current) continue;
+        const prop = /^(\w+)\s*:\s*(.*)$/.exec(line);
+        if (prop?.[1] === "fromColumn") current.from = prop[2];
+        else if (prop?.[1] === "toColumn") current.to = prop[2];
+        else if (prop) current.properties[prop[1]] = prop[2];
+        else if (/^\w+$/.test(line)) current.properties[line] = "true";
+    }
+    done(current);
+    return out;
+}
+
+/** The table of a TMDL column reference, 'Table'.'Column' or Table.Column. */
+export function tableOfRef(tmdlRef: string): string {
+    const m = /^('(?:[^']|'')+'|[^.]+)\./.exec(tmdlRef.trim());
+    return m ? unquote(m[1]) : "";
+}
+
+export interface TmdlMember {
+    /** column, measure, partition, calculationGroup, and so on, or the name of a property of the table itself. */
+    kind: string;
+    /** Its name, unquoted, when it has one. */
+    name: string;
+    /** Its line and every line under it, without the /// descriptions. */
+    text: string;
+}
+
+/** A TMDL table file's members and the table's own properties, each with every line under it: all the DAX it holds. */
+export function tableMembers(text: string): TmdlMember[] {
+    const lines = text
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .filter((l) => l.trim() && !l.trim().startsWith("///"));
+    const levels = lines.map(indentOf).filter((n) => n > 0);
+    const level = levels.length > 0 ? Math.min(...levels) : 0;
+    const out: TmdlMember[] = [];
+    for (const raw of lines) {
+        const indent = indentOf(raw);
+        const line = raw.trim();
+        if (indent === 0) continue;
+        if (indent <= level || out.length === 0) {
+            const m = /^(\w+)(?:\s+('(?:[^']|'')+'|[^\s=:]+))?/.exec(line);
+            out.push({ kind: m?.[1] ?? "", name: m?.[2] ? unquote(m[2]) : "", text: line });
+        } else {
+            out[out.length - 1].text += `\n${line}`;
         }
     }
     return out;
 }
+
+/** DAX as the answer-key checks compare it: whitespace flattened, lowercase, and [ name ] read as [name] (answer-key.ts). */
+const comparable = (dax: string) => dax.replace(/\s+/g, " ").toLowerCase().replace(/\[ /g, "[").replace(/ \]/g, "]");
 
 /** A column or measure reference in DAX form: 'Table'[Name]. */
 const ref = (table: string, name: string) => `'${table.replace(/'/g, "''")}'[${name}]`;
@@ -125,7 +177,7 @@ const ref = (table: string, name: string) => `'${table.replace(/'/g, "''")}'[${n
  * hold: the guide leaves them out and run_dax refuses them, because DAX names a measure without its table.
  */
 export function reachesAnswerKey(tables: TmdlTable[], keyTables: readonly string[]): string[] {
-    const measures = tables.flatMap((t) => t.measures.map((m) => ({ table: t.name, name: m.name, body: m.body.toLowerCase() })));
+    const measures = tables.flatMap((t) => t.measures.map((m) => ({ table: t.name, name: m.name, body: comparable(m.body) })));
     const reached = new Set(measures.filter((m) => keyTables.includes(m.table) || keyTables.some((k) => m.body.includes(k.toLowerCase()))).map((m) => m.name));
     for (let grew = true; grew; ) {
         grew = false;

@@ -2,12 +2,13 @@
 // SM_DatabaseHub_History's tables, columns, measures, and relationships. It leaves out the demo's answer key
 // (src/copilot/answer-key.ts, ADR 0031): its tables and relationships, every measure that reads them, the grading
 // analyses' rows, and any description clause that names a scenario. The chat investigates without them, the way a
-// DBA's tools would, and run_dax refuses the measures this file lists (ANSWER_KEY_MEASURES).
+// DBA's tools would, and run_dax refuses the measures this file lists (ANSWER_KEY_MEASURES). It writes nothing for a
+// model that would let a query reach the answer key without naming it (denylistProblems).
 // Usage: npm run guide:build   (src/copilot/guide.test.ts fails while the file is out of step with the TMDL)
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES } from "../src/copilot/answer-key";
-import { formatGuide, parseRelationships, parseTable, reachesAnswerKey, type TmdlTable } from "../src/copilot/tmdl";
+import { ANSWER_KEY_ANALYSES, ANSWER_KEY_TABLES, answerKeyIn } from "../src/copilot/answer-key";
+import { formatGuide, parseRelationships, parseTable, reachesAnswerKey, tableMembers, tableOfRef, type Relationship, type TmdlTable } from "../src/copilot/tmdl";
 
 export const MODEL_DIR = resolve(import.meta.dirname, "../../powerbi/SM_DatabaseHub_History.SemanticModel/definition");
 export const OUTPUT = resolve(import.meta.dirname, "../src/copilot/model-guide.generated.ts");
@@ -52,14 +53,78 @@ export function blindTables(all: TmdlTable[]): { tables: TmdlTable[]; answerKeyM
     return { tables, answerKeyMeasures };
 }
 
+/** The model as the denylist's checks read it: each table's TMDL, the relationships, and the model's other DAX. */
+export interface ModelFiles {
+    tables: { name: string; text: string }[];
+    relationships: Relationship[];
+    /** Its functions (functions.tmdl) and its roles' filters (roles/), when it has them. */
+    other: { file: string; text: string }[];
+}
+
+export function readModel(modelDir: string = MODEL_DIR): ModelFiles {
+    const read = (...path: string[]) => readFileSync(join(modelDir, ...path), "utf8");
+    const tmdlIn = (dir: string) => (existsSync(join(modelDir, dir)) ? readdirSync(join(modelDir, dir)).filter((f) => f.endsWith(".tmdl")).sort() : []);
+    return {
+        tables: tmdlIn("tables").map((f) => {
+            const text = read("tables", f);
+            return { name: parseTable(text).name, text };
+        }),
+        relationships: parseRelationships(read("relationships.tmdl")),
+        other: [
+            ...(existsSync(join(modelDir, "functions.tmdl")) ? [{ file: "functions.tmdl", text: read("functions.tmdl") }] : []),
+            ...tmdlIn("roles").map((f) => ({ file: `roles/${f}`, text: read("roles", f) })),
+        ],
+    };
+}
+
+/**
+ * What in the model would let a DAX query reach the answer key without naming it, which run_dax's denylist rules out
+ * (ADR 0031, section 8; the final review of 9b1896c). buildGuideSource writes no guide while there's any:
+ * - a key table's name without a space, which DAX could write without quotes;
+ * - a relationship that puts a key table on its one side, filters both ways (or automatically), or isn't many-to-one,
+ *   so a filter on the key would reach another table, or another table's expanded table would hold the key's columns
+ *   (learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.crossfilteringbehavior);
+ * - DAX outside the key's own tables and the refused measures that names a key table or a refused measure: a calculated
+ *   column or table, a calculation item, detail rows, a model function, or a role's filter would read the key under a
+ *   name run_dax doesn't refuse.
+ */
+export function denylistProblems(model: ModelFiles, refused: readonly string[], keyTables: readonly string[] = ANSWER_KEY_TABLES): string[] {
+    const problems: string[] = [];
+    const isKey = (name: string) => keyTables.some((k) => k.toLowerCase() === name.toLowerCase());
+    const isRefused = (name: string) => refused.some((m) => m.toLowerCase() === name.toLowerCase());
+    for (const table of keyTables) if (!/\s/.test(table)) problems.push(`'${table}' has no space in its name, so DAX could name it without quotes.`);
+    for (const r of model.relationships) {
+        const from = tableOfRef(r.from);
+        const to = tableOfRef(r.to);
+        if (!isKey(from) && !isKey(to)) continue;
+        const what = `The relationship from ${r.from} to ${r.to}`;
+        const p = r.properties ?? {};
+        if (isKey(to)) problems.push(`${what} puts '${to}' on its one side: the key must be on the many side.`);
+        if ((p.crossFilteringBehavior ?? "oneDirection") !== "oneDirection") problems.push(`${what} filters ${p.crossFilteringBehavior}: it must filter one way.`);
+        if ((p.fromCardinality ?? "many") !== "many" || (p.toCardinality ?? "one") !== "one") problems.push(`${what} isn't many-to-one.`);
+    }
+    for (const table of model.tables.filter((t) => !isKey(t.name))) {
+        for (const member of tableMembers(table.text)) {
+            if (member.kind === "measure" && isRefused(member.name)) continue;
+            const named = answerKeyIn(member.text, refused, keyTables);
+            if (named) problems.push(`'${table.name}' ${member.text.split("\n")[0]} reads ${named}.`);
+        }
+    }
+    for (const { file, text } of model.other) {
+        const named = answerKeyIn(text, refused, keyTables);
+        if (named) problems.push(`${file} reads ${named}.`);
+    }
+    return problems;
+}
+
 export function buildGuideSource(modelDir: string = MODEL_DIR): string {
-    const tableDir = join(modelDir, "tables");
-    const all = readdirSync(tableDir)
-        .filter((f) => f.endsWith(".tmdl"))
-        .sort()
-        .map((f) => parseTable(readFileSync(join(tableDir, f), "utf8")));
-    const { tables, answerKeyMeasures } = blindTables(all);
-    const relationships = parseRelationships(readFileSync(join(modelDir, "relationships.tmdl"), "utf8")).filter((r) => !touchesAnswerKey(r.from) && !touchesAnswerKey(r.to));
+    const model = readModel(modelDir);
+    const { tables, answerKeyMeasures } = blindTables(model.tables.map((t) => parseTable(t.text)));
+    const problems = denylistProblems(model, answerKeyMeasures);
+    if (problems.length > 0) {
+        throw new Error(`The history model would let run_dax reach the demo's answer key without naming it (ADR 0031, section 8). Change the model:\n- ${problems.join("\n- ")}`);
+    }
+    const relationships = model.relationships.filter((r) => !touchesAnswerKey(r.from) && !touchesAnswerKey(r.to));
     const guide = formatGuide(tables, relationships);
     return [
         "// Generated by scripts/build-model-guide.ts from fabric/powerbi/SM_DatabaseHub_History.SemanticModel. Don't edit:",
