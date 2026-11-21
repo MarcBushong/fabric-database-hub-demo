@@ -3227,6 +3227,35 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $other.status | Should -Be 'Pass'
     }
 
+    It 'status.ps1 leaves out a time-stamped Run Command Azure began deleting minutes ago, such as its own health read on the T2 host, and older ones still warn (the review of F31)' {
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        # status.ps1's own health read runs under a fresh name whose delete isn't waited for (F31): seconds later, Azure
+        # lists it in Deleting. The control's names end in a time too.
+        $read = 'DbHubDemo-HealthRead-{0}' -f (& $at 0.5)
+        $control = 'DbHubControl-archost01-{0}' -f (& $at 14)
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $read 'Succeeded' 'Deleting'
+            New-RunCommand $control 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Pass'
+        @($result.evidence.deletingRecently) | Should -Be @(('archost01/{0}' -f $read), ('archost01/{0}' -f $control))
+        @($result.evidence.markedForDeletion) | Should -BeNullOrEmpty
+
+        # A delete that has gone on longer still goes with a VM agent that isn't working (R871), and so does a name with no time.
+        $old = 'DbHubDemo-HealthRead-{0}' -f (& $at 20)
+        $script:listed['archost01'] += @(
+            New-RunCommand $old 'Succeeded' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match ('^2 Run Command\(s\) on archost01, T2''s host, are marked for deletion, and Azure hasn''t finished deleting them: archost01/{0}, archost01/DbHubDemo-Chunk-a8a10d93133c-001\. ' -f [regex]::Escape($old))
+        @($result.evidence.deletingRecently).Count | Should -Be 2
+    }
+
     It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
         @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Succeeded'; Finished = $true }
         @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Canceled'; Finished = $true }

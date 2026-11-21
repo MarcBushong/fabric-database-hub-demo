@@ -1197,6 +1197,24 @@ function Test-DemoRunCommandFinished {
     return $false
 }
 
+function Get-DemoRunCommandNameTime {
+    # The UTC time at the end of a Run Command's name, -yyyyMMddHHmmss (Get-DemoRunCommandFreshName's names, F31's fresh
+    # reads, and the session control's DbHubControl-*), or $null when its name has none. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([datetime])]
+    param(
+        [AllowEmptyString()]
+        [string] $Name = ''
+    )
+
+    $stamp = [DateTime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ($Name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$stamp)) {
+        return $stamp
+    }
+    return $null
+}
+
 function Get-DemoVmRunCommandLeftover {
     <#
     .SYNOPSIS
@@ -1211,11 +1229,13 @@ function Get-DemoVmRunCommandLeftover {
     one that Azure is deleting (provisioningState Deleting), and on a running VM one whose script is still Pending or
     Running (a deployment, a check, or an on-demand run in progress). Nothing runs on a VM that isn't running, so there
     every one of them counts. Names of anything else aren't the demo's and are left out. Azure allows 25 managed Run
-    Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, and
-    Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by
-    Test-DemoRunCommandFinished, and Deleting). With -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure
-    is deleting are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go
-    with a VM agent that isn't working (R871).
+    Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, Items
+    (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by Test-DemoRunCommandFinished, and
+    Deleting), and RecentDeletes. With -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure is deleting
+    are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go with a VM agent
+    that isn't working (R871). Except a delete in flight (the review of F31): one whose name ends in a time
+    (-yyyyMMddHHmmss: a fresh-named read, whose delete nobody waits for, or the control's) less than -RecentDeleteMinutes
+    old is a name in RecentDeletes instead, as status.ps1's own health read is seconds after it. Older ones are items.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1231,6 +1251,9 @@ function Get-DemoVmRunCommandLeftover {
 
         [switch] $IncludeDeleting,
 
+        [ValidateRange(1, 1440)]
+        [int] $RecentDeleteMinutes = 15,
+
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
@@ -1238,12 +1261,14 @@ function Get-DemoVmRunCommandLeftover {
     $base = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName (Get-DemoResourceGroupName -Config $Config) -VmName $VmName
     $list = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}&$expand=instanceView' -f $base, (Get-DemoRunCommandApiVersion))) -AllowFailure
     if ($list.ExitCode -ne 0) {
-        return [pscustomobject]@{ Ok = $false; Error = (Protect-DemoText -Text ([string]$list.StdErr).Trim()); Items = @() }
+        return [pscustomobject]@{ Ok = $false; Error = (Protect-DemoText -Text ([string]$list.StdErr).Trim()); Items = @(); RecentDeletes = @() }
     }
     $parsed = if ([string]::IsNullOrWhiteSpace([string]$list.StdOut)) { $null } else { [string]$list.StdOut | ConvertFrom-Json -Depth 32 }
     # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
     $values = Get-DemoMemberValue -InputObject $parsed -Name 'value'
     $items = [System.Collections.Generic.List[object]]::new()
+    $recent = [System.Collections.Generic.List[string]]::new()
+    $recentSince = $NowUtc.ToUniversalTime().AddMinutes(-$RecentDeleteMinutes)
     foreach ($item in @($values)) {
         $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
         $kind = if ($name.StartsWith('DbHubControl-', [System.StringComparison]::Ordinal)) { 'Control' } elseif ($name.StartsWith('DbHubDemo-', [System.StringComparison]::Ordinal)) { 'Demo' } else { '' }
@@ -1258,13 +1283,20 @@ function Get-DemoVmRunCommandLeftover {
             if (-not $IncludeDeleting) {
                 continue
             }
+            # A time-stamped name that Azure began deleting minutes ago is a delete in flight, not a stuck one (the review of
+            # F31: status.ps1's own fresh-named health read, whose delete isn't waited for, listed seconds later).
+            $stamp = Get-DemoRunCommandNameTime -Name $name
+            if ($null -ne $stamp -and $stamp -gt $recentSince) {
+                $recent.Add($name)
+                continue
+            }
         }
         elseif ($name -in 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile' -or ($Running -and $execution -in 'Pending', 'Running')) {
             continue
         }
         $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting })
     }
-    return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray() }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray(); RecentDeletes = $recent.ToArray() }
 }
 
 function Get-DemoRunCommandDeleteCommand {
@@ -1364,8 +1396,9 @@ function Get-DemoRunCommandStatus {
     (Test-DemoRunCommandFinished) belongs to a run in progress and isn't counted, so no delete command stops it.
     On the T2 host, archost01 (2026-11-17), the demo's Run Commands that Azure is still deleting come first, as a Warning
     whose fix is deploy.ps1: ones that stay there go with a VM agent that isn't working (R871), which deploy.ps1 recovers,
-    or rebuilds the host for (R872). -RunInProgress names a run the busy marker says is going on, whose own deletes show
-    for a few minutes. Internal.
+    or rebuilds the host for (R872). A time-stamped one Azure began deleting less than 15 minutes ago is a delete in
+    flight, such as status.ps1's own health read (the review of F31): it's only in the evidence (deletingRecently).
+    -RunInProgress names a run the busy marker says is going on, whose own deletes show for a few minutes. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -1384,6 +1417,7 @@ function Get-DemoRunCommandStatus {
     $doc = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
     $left = [System.Collections.Generic.List[object]]::new()
     $marked = [System.Collections.Generic.List[object]]::new()
+    $recent = [System.Collections.Generic.List[string]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
     $hostVm = Get-DemoHostVmName -Config $Config
     foreach ($vm in @($VmName | Where-Object { $_ })) {
@@ -1391,6 +1425,11 @@ function Get-DemoRunCommandStatus {
         if (-not $found.Ok) {
             $errors.Add(('{0}: {1}' -f $vm, $found.Error))
             continue
+        }
+        # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+        $recentNames = Get-DemoMemberValue -InputObject $found -Name 'RecentDeletes'
+        foreach ($name in @($recentNames | Where-Object { $_ })) {
+            $recent.Add(('{0}/{1}' -f $vm, $name))
         }
         foreach ($item in @($found.Items)) {
             if ([bool](Get-DemoMemberValue -InputObject $item -Name 'Deleting')) {
@@ -1406,7 +1445,7 @@ function Get-DemoRunCommandStatus {
     $names = @($left | ForEach-Object { '{0}/{1}' -f $_.VmName, $_.Name })
     $markedNames = @($marked | ForEach-Object { '{0}/{1}' -f $_.VmName, $_.Name })
     $commands = @($left | Select-Object -First 10 | ForEach-Object { Get-DemoRunCommandDeleteCommand -Config $Config -VmName $_.VmName -Name $_.Name })
-    $evidence = [ordered]@{ leftover = $names; markedForDeletion = $markedNames; deleteCommands = $commands; readErrors = $errors.ToArray(); vms = @($VmName); runInProgress = $RunInProgress }
+    $evidence = [ordered]@{ leftover = $names; markedForDeletion = $markedNames; deletingRecently = $recent.ToArray(); deleteCommands = $commands; readErrors = $errors.ToArray(); vms = @($VmName); runInProgress = $RunInProgress }
     $vmText = if (@($VmName).Count) { @($VmName) -join ' and ' } else { 'the demo VMs' }
     $more = if ($errors.Count) { ' The Run Commands of {0} couldn''t be listed.' -f (($errors | ForEach-Object { $_.Split(':')[0] }) -join ' and ') } else { '' }
     if ($marked.Count -gt 0) {

@@ -4814,3 +4814,22 @@ Until then, deployments keep the pinned image, which works as before.
 
 - **Not run live.**
 - **Another environment's account deleted minutes ago still counts,** because Resource Graph can still list it; the fix says so, as before.
+
+### The review of F31: status.ps1's own health read isn't a stuck Run Command (2026-11-22)
+
+**Why.** The review of F31 (c603bb03) found a Medium regression. `Invoke-DemoVmRunCommand -FreshName` doesn't wait for a fresh name's delete, and `status.ps1` reads each running VM's health before `STATUS.RUNCOMMANDS` lists the VMs' Run Commands. On the T2 host, where that list includes the ones Azure is deleting (R871), its own health read was still in Deleting seconds later. So `status.ps1` warned that the host's Run Commands "go with a VM agent that isn't working", with a host rebuild as the fix. The reviewer reproduced it with a fake `Invoke-DemoAz`.
+
+**Work summary.**
+
+- **`Get-DemoVmRunCommandLeftover -IncludeDeleting`:** a Run Command in Deleting whose name ends in a time (`-yyyyMMddHHmmss`: F31's fresh reads, `Get-DemoRunCommandFreshName`'s names, and the session control's `DbHubControl-*`) less than 15 minutes old (`-RecentDeleteMinutes`) is a delete in flight. It's returned in `RecentDeletes`, not as an item. Older ones, and names with no time such as the chunks', are items as before (R871). `Get-DemoRunCommandNameTime` reads the time, a pure helper.
+- **`STATUS.RUNCOMMANDS`** names those deletes in flight only in its evidence (`deletingRecently`).
+- **Docs:** ADR 0012's F31 amendment, troubleshooting (a row for the host's Deleting **Warning**), the CHANGELOG's F31 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/RunCommandHelpers.ps1`; tests in `tests/unit/DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: the leftover Run Command tests, 20 passed, 0 failed, 0 az calls. With HEAD's `RunCommandHelpers.ps1` and the tests kept, the new test fails. It covers a health read 30 seconds into its delete and a control Run Command 14 minutes old, both left out with a **Pass**; then a read 20 minutes old and a chunk, both in the host's **Warning**.
+
+**Risks.**
+
+- **Not run live.**
+- **A delete that's really stuck** shows 15 minutes after its Run Command's time, not at once. `deploy.ps1`'s own watchdog doesn't use this list.
