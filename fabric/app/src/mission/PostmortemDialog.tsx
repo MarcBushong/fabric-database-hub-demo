@@ -25,14 +25,17 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
     const { notify, rca, rcaError } = useApp();
     const copilot = useCopilot();
     const queryClient = useContext(QueryClientContext);
-    // With the RCA tables, the Cause is the blind investigation of the plan's minutes, once each time it's asked for.
-    const investigates = input !== null && rca === true && queryClient !== null;
+    // With the RCA tables, the Cause is the blind investigation of a session's minutes, once each time it's asked for; a
+    // lone incident request's minutes are its fault's own, so they're never investigated (causeWindow, the review of
+    // 63fb530c).
+    const minutes = useMemo(() => (input ? causeWindow(input.plan, input.nextSessionStart ?? null) : null), [input]);
+    const investigates = minutes !== null && rca === true && queryClient !== null;
     const key = input ? `${input.plan.key}|${input.generatedAt.toISOString()}` : "";
     const [investigated, setInvestigated] = useState<{ key: string; value: BlindCauses } | null>(null);
     useEffect(() => {
-        if (!input || rca !== true || !queryClient) return;
+        if (!input || !minutes || rca !== true || !queryClient) return;
         const asked = `${input.plan.key}|${input.generatedAt.toISOString()}`;
-        const { from, to } = causeWindow(input.plan);
+        const { from, to } = minutes;
         let alive = true;
         // Closed or asked again: the investigation explains no further incident.
         const stop = new AbortController();
@@ -44,20 +47,21 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
             alive = false;
             stop.abort();
         };
-    }, [input, queryClient, rca]);
-    // The blind Cause; undefined while it's investigated; null for the Cause as it was, without the RCA tables. A failed
-    // check of the tables is said in the Cause, never taken for their absence.
-    const cause = useMemo((): BlindCauses | null | undefined => {
+    }, [input, minutes, queryClient, rca]);
+    // The blind Cause; "request" for a lone request's pointer to the Root cause page; undefined while it's investigated;
+    // null for the Cause as it was, without the RCA tables. A failed check of the tables is said in the Cause, never taken
+    // for their absence.
+    const cause = useMemo((): BlindCauses | "request" | null | undefined => {
         if (!input) return null;
+        const checkFailed = rca !== true && rca !== false && !!rcaError;
+        if (!minutes) return rca === true || checkFailed ? "request" : null;
         if (investigates) return investigated && investigated.key === key ? investigated.value : undefined;
-        if (rca !== true && rca !== false && rcaError) {
-            const { from, to } = causeWindow(input.plan);
-            return { from, to, causes: [], notCaptured: [], queries: [], error: `the check of the Incident RCA's tables failed: ${rcaError}` };
-        }
+        if (checkFailed) return { from: minutes.from, to: minutes.to, causes: [], notCaptured: [], queries: [], error: `the check of the Incident RCA's tables failed: ${rcaError}` };
         return null;
-    }, [input, investigates, investigated, key, rca, rcaError]);
+    }, [input, minutes, investigates, investigated, key, rca, rcaError]);
     const investigating = cause === undefined;
     const postmortem = useMemo(() => (input && cause !== undefined ? buildPostmortem({ ...input, rca: cause }) : null), [input, cause]);
+    const causeText = cause === null ? "what was injected" : cause === "request" ? "what was injected, labeled as the answer key, with the Root cause page for the cause" : "a blind investigation of the session's minutes for the Cause, as on the Root cause page, then what was injected, labeled as the answer key";
     // A lone incident request's minutes are its fault's own, so only a session's postmortem has a draft. Its line points to
     // the Root cause page when the navigation lists it: with the RCA tables, or when their check failed (AppShell).
     const drafts = input !== null && draftsWithCopilot(input.plan);
@@ -69,7 +73,7 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
                     <DialogTitle action={<Button appearance="subtle" aria-label="Close" icon={<Dismiss20Regular />} onClick={onClose} />}>{input ? postmortemTitle(input.plan) : "Postmortem"}</DialogTitle>
                     <DialogContent>
                         <p className="pm-lead">
-                            Written from the history alone, so it works without a GitHub sign-in: {cause === null ? "what was injected" : "a blind investigation of the session's minutes for the Cause, as on the Root cause page, then what was injected, labeled as the answer key"}, when each signal showed in the telemetry, the response, and the recovery, with every query behind it.{" "}
+                            Written from the history alone, so it works without a GitHub sign-in: {causeText}, when each signal showed in the telemetry, the response, and the recovery, with every query behind it.{" "}
                             {drafts ? (
                                 <>
                                     <strong>Draft with Copilot</strong> hands the measured rows and queries to your own GitHub Copilot.

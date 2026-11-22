@@ -16,7 +16,7 @@ import type { ColumnSpec } from "@/data/queries";
 import { copyText } from "@/lib/clipboard";
 import { formatTimeUtc } from "@/lib/format";
 import { isEmbedded, toHash } from "@/lib/view-state";
-import type { PostmortemInput } from "@/lib/postmortem";
+import { nextSessionStart, type PostmortemInput } from "@/lib/postmortem";
 import { EVENT_LABEL, planEvents } from "@/lib/scoreboard";
 import { triageAsk } from "@/rca/entry";
 import { CinematicReplay } from "@/mission/CinematicReplay";
@@ -112,7 +112,7 @@ export default function ReplayPage() {
                         <PostmortemButton
                             ready={Boolean(plan) && !data.loading}
                             scoreError={data.scoreError}
-                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, generatedAt: new Date() })}
+                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), generatedAt: new Date() })}
                         />
                     </div>
                 </header>

@@ -8,7 +8,7 @@ import type { Row } from "@/data/query-client";
 import { seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
 import { postgresHealth } from "@/lib/health";
-import { buildPostmortem, causeWindow, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
+import { buildPostmortem, causeWindow, nextSessionStart, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
 import type { BlindCauses } from "@/rca/postmortem";
 import {
     aggregate,
@@ -559,7 +559,8 @@ describe("the postmortem", () => {
     describe("with the Incident RCA's tables, its Cause is the blind investigation (ADR 0031, section 9)", () => {
         const chain = "[demo].[usp_scenario_chain_acquire] (session 63; ContosoCare.Demo, login runner, host SQLVM01) sat idle with its transaction open for up to 79 s, holding X KEY lock on [care].[work_queues] (pk_work_queues).";
         const rca: BlindCauses = {
-            ...causeWindow(plan),
+            from: plan.start,
+            to: new Date(plan.end.getTime() + 15 * 60000),
             causes: [
                 { key: "T1-blocking-20261117T133030Z", target: "T1", signal: "blocked processes", start: new Date(T0 + 30_000), end: new Date(T0 + 10 * 60000 + 10_000), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)", "session 64 waits on 63: LCK_M_U for 58 s (RCA Sessions, 13:31:00 UTC)"], also: ["T1, deadlocks, from 13:32:00 UTC"], notes: [] },
                 { key: "T1-deadlock-20261117T133200Z", target: "T1", signal: "deadlocks", start: at(2), end: at(3), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)"], also: [], notes: [] },
@@ -581,7 +582,7 @@ describe("the postmortem", () => {
             const cause = sectionOf(markdown, "Cause");
             expect(cause).toContain(
                 [
-                    "A blind investigation of the minutes from 13:30 to 15:15 UTC (the window, and the 15 minutes after it, where a signal can still show), the way a DBA would make it: from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, with nothing about what the demo planned.",
+                    "A blind investigation, the way a DBA would make it, of the session's minutes as the session control recorded them, and the 15 minutes after them, where a signal can still show (13:30 to 15:15 UTC). It reads what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and nothing about the faults the demo planned.",
                     "",
                     "What it found, with the incidents the richest evidence explains first; the Root cause page has each one in full:",
                     "",
@@ -606,9 +607,9 @@ describe("the postmortem", () => {
             // The Cause is blind: no word of the plan, which follows in its own section, labeled.
             expect(cause).not.toMatch(/inject|Scenario Runs|Deep blocking chain|blocking-chain/i);
             const key = sectionOf(markdown, "What the demo injected (answer key)");
-            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key, which the investigation above never read, for checking what it found.");
+            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key, for checking what the investigation above found. It took only the session's minutes from the session control's record, never the faults in them.");
             expect(key).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
-            expect(markdown).toContain("- **Cause:** the Incident RCA's blind investigation of the window and the 15 minutes after it: find_incidents, then explain_incident for each incident, at most 6 in the Root cause page's order.");
+            expect(markdown).toContain("- **Cause:** the Incident RCA's blind investigation of the session's minutes, as the session control recorded them, and the 15 minutes after them, up to the next session's start: find_incidents, then explain_incident for each incident, at most 6 in the Root cause page's order.");
             // Every query behind it: the page's, then the investigation's.
             expect(markdown).toContain("```dax\n// Sessions and activity requests\nEVALUATE");
             expect(markdown).toContain("And the investigation's, behind the Cause, each once:\n\n```dax\n// Incident RCA: RCA Sessions\nEVALUATE 'RCA Sessions'\n```");
@@ -629,6 +630,37 @@ describe("the postmortem", () => {
             const release = buildPostmortem(input).markdown;
             expect(sectionOf(release, "Cause")).toMatch(/^## Cause\n\nEvery fault was injected on purpose by the demo's session control/);
             expect(release).not.toMatch(/answer key|the Incident RCA's blind investigation/);
+        });
+
+        it("never aims the investigation at a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)", () => {
+            const request = toPlans(RUNS).find((p) => p.kind === "request")!;
+            expect(request.key).toBe("r9");
+            expect(causeWindow(request)).toBeNull();
+            const { markdown } = buildPostmortem({ ...input, plan: request, scores: [], episodes: [], beat: null, rca: "request" });
+            const cause = sectionOf(markdown, "Cause");
+            expect(cause).toBe(
+                "## Cause\n\nThis is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds and explains the incidents in any minutes you pick, from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded.\n",
+            );
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key.\n");
+            expect(key).toMatch(/^- \*\*.+\*\* on T1 \(Billing\), \d\d:\d\d to \d\d:\d\d UTC\.$/m);
+            expect(markdown).toContain("- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page explains the incidents in the minutes you pick instead (ADR 0031).");
+            expect(markdown).not.toContain("And the investigation's");
+        });
+
+        it("ends a session's minutes at the next session's start, from the session control's record, when it comes within 15 minutes (the review of 63fb530c)", () => {
+            const next = "session:abcdef12-1111-2222-3333-444444444444";
+            // A lone request right after the session is a fault's own minutes, so it never ends them.
+            const runs = [...RUNS, run("r12", "T2", "incident:io-pressure", 92, 100), run(next, "all", "session", 95, 125)];
+            const plans = toPlans(runs);
+            const first = plans.find((p) => p.key === SESSION)!;
+            expect(nextSessionStart(plans, first)).toEqual(at(95));
+            expect(nextSessionStart(plans, plans.find((p) => p.key === next)!)).toBeNull();
+            expect(causeWindow(first, at(95))).toEqual({ from: at(0), to: at(95) });
+            expect(causeWindow(first, at(110))).toEqual({ from: at(0), to: at(105) });
+            expect(causeWindow(first, at(80))).toEqual({ from: at(0), to: at(90) });
+            const { markdown } = buildPostmortem({ ...input, rca: { ...rca, to: at(95) } });
+            expect(sectionOf(markdown, "Cause")).toContain("of the session's minutes as the session control recorded them, and the 5 minutes after them, up to the next session's start (13:30 to 15:05 UTC).");
         });
     });
 

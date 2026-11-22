@@ -17,7 +17,7 @@ import { hubUrlOf } from "@/lib/agent-prompts";
 import { withoutColumns } from "@/lib/ask";
 import { serviceOf } from "@/lib/business";
 import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc, percent } from "@/lib/format";
-import type { PostmortemInput } from "@/lib/postmortem";
+import { nextSessionStart, type PostmortemInput } from "@/lib/postmortem";
 import { minutesText, summarize } from "@/lib/scoreboard";
 import { statusMeta } from "@/lib/status";
 import type { EstateTarget } from "@/lib/view-state";
@@ -68,7 +68,7 @@ export default function MissionControlPage() {
     }));
     const openPostmortem = () => {
         if (!plan) return;
-        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, generatedAt: new Date() });
+        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), generatedAt: new Date() });
     };
     const running = manage.mode === "run" ? manage.running : null;
     const windowText = plan ? `${formatDayUtc(plan.start)} ${formatTimeUtc(plan.start)}–${formatTimeUtc(plan.end)} UTC` : "";

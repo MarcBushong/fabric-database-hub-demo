@@ -218,7 +218,7 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 
 ### 9. The postmortem's Cause
 
-With the RCA tables, the Cause is the blind investigation of the session's minutes and the 15 after them (`TELEMETRY_LAG_MINUTES`), where the postmortem's other sections still read a signal ([`rca/postmortem.ts`](../../fabric/app/src/rca/postmortem.ts)):
+With the RCA tables, the Cause of a session's postmortem is the blind investigation of the session's minutes, as the session control recorded them, and the 15 after them (`TELEMETRY_LAG_MINUTES`), where the postmortem's other sections still read a signal, but never into the next session's ([`rca/postmortem.ts`](../../fabric/app/src/rca/postmortem.ts)). A lone incident request's minutes are its fault's own, from Scenario Runs, so its postmortem never investigates them: an investigation aimed there would be told where the fault was. Its Cause points to the Root cause view instead, which explains the incidents in any minutes a viewer picks (the review of 63fb530c). For a session:
 
 - **What it reads:** `find_incidents`, then `explain_incident` for up to six incidents, in the RCA view's order: the capture's own first, then the others the investigations explain, then the telemetry-only ones.
 - **What it says of each:** its root cause, confidence, and up to three of the rows it cites; or, with no root cause, why, from what wasn't captured (RCA Coverage). A root cause behind two incidents, such as a chain's deadlock and its blocking, is said once. The incidents past six are counted by target, for the RCA view.

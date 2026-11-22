@@ -16,7 +16,7 @@ import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { serviceOf } from "@/lib/business";
 import { formatLevel, formatTimeUtc } from "@/lib/format";
-import { POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/postmortem";
+import { nextSessionStart, POSTMORTEM_COLUMNS, postmortemRows, type PostmortemInput } from "@/lib/postmortem";
 import { aggregate, howMeasured, minutesText, RECOVERED_BINS, SCOREBOARD_SUBTITLE, summarize, TELEMETRY_LAG_MINUTES, type Aggregate, type FaultScore } from "@/lib/scoreboard";
 import { GlobalFilter } from "@/shell/GlobalFilter";
 import { ChartView } from "@/visuals/ChartView";
@@ -158,7 +158,7 @@ export default function ScoreboardPage() {
                         <PostmortemButton
                             ready={Boolean(plan) && !data.loading}
                             scoreError={data.scoreError}
-                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, generatedAt: new Date() })}
+                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), generatedAt: new Date() })}
                         />
                         <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: view.session })}>
                             Mission Control

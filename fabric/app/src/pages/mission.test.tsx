@@ -6,7 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { QuerySpec } from "@/data/queries";
 import { createSourceClient, type QueryResult, type Row } from "@/data/query-client";
+import type { PostmortemInput } from "@/lib/postmortem";
 import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/mission/kiosk";
+import { PostmortemDialog } from "@/mission/PostmortemDialog";
 import { SCOREBOARD_SUBTITLE } from "@/lib/scoreboard";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
 import { sampleRows } from "@/preview/sample-data";
@@ -36,8 +38,8 @@ function sampleClient(failing: Record<string, string> = {}, rows: Record<string,
     };
 }
 
-/** The sample with its RCA tables, as the preview has them; each read of the Incident RCA waits for `gate`. */
-function sampleRcaClient(gate: Promise<void>): FakeQueryClient {
+/** The sample with its RCA tables, as the preview has them; each read of the Incident RCA waits for `gate`, and `runs` join Scenario Runs. */
+function sampleRcaClient(gate: Promise<void>, runs: Row[] = []): FakeQueryClient {
     const ran: string[] = [];
     return {
         ran,
@@ -46,7 +48,8 @@ function sampleRcaClient(gate: Promise<void>): FakeQueryClient {
         run: vi.fn(async (spec: QuerySpec): Promise<QueryResult> => {
             ran.push(spec.id);
             if (spec.id.startsWith("rca-")) await gate;
-            return { spec, columns: spec.columns, rows: sampleRcaRows(spec) ?? sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
+            const rows = sampleRcaRows(spec) ?? sampleRows(spec);
+            return { spec, columns: spec.columns, rows: spec.id === "scenario-runs" ? [...runs, ...rows] : rows, requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
         }),
     };
 }
@@ -223,6 +226,37 @@ describe("Mission Control", () => {
             const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
             expect(headingsOf(dialog)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "What the demo injected (answer key)", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
             expect(within(dialog).getByText("It couldn't run, so it gives no cause: the check of the Incident RCA's tables failed: Execute Queries answered 429 Too Many Requests.")).toBeInTheDocument();
+            expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
+            expect(client.ran.some((id) => id.startsWith("rca-"))).toBe(false);
+        },
+        SLOW,
+    );
+
+    it(
+        "ends the investigated minutes at the next session's start, from the session control's record, when it comes within 15 minutes (the review of 63fb530c)",
+        async () => {
+            const next = { RequestedAt: "2026-11-17T15:05:00.000Z", Intensity: null, Concurrency: null, Dispatch: "session", Status: "Pass", RequestId: "session:abcdef12-1111-2222-3333-444444444444", TargetKey: "all", Profile: "session", DurationMin: 30, Message: "Session abcdef12: NB_DatabaseHub_Control's Run all (ADR 0026).", WindowStart: "2026-11-17T15:05:00.000Z", WindowEnd: "2026-11-17T15:35:00.000Z" };
+            renderWithApp(<MissionControlPage />, { client: sampleRcaClient(Promise.resolve(), [next]), rca: true, view: { session: SESSION_KEY } });
+            const write = await screen.findByRole("button", { name: "Write the postmortem" });
+            await waitFor(() => expect(write).toBeEnabled());
+            fireEvent.click(write);
+            const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+            expect(await within(dialog).findByText(/of the session's minutes as the session control recorded them, and the 5 minutes after them, up to the next session's start \(13:30 to 15:05 UTC\)\./, {}, { timeout: 20000 })).toBeInTheDocument();
+        },
+        SLOW,
+    );
+
+    it(
+        "never investigates a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)",
+        async () => {
+            const client = sampleRcaClient(Promise.resolve());
+            const request: PostmortemInput["plan"] = { key: "r9", kind: "request", label: "CPU pressure on T1", start: new Date("2026-11-17T12:00:00Z"), end: new Date("2026-11-17T12:10:00Z"), requestedAt: null, status: "Pass", message: "", faults: [] };
+            const input: PostmortemInput = { plan: request, scores: [], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: new Date("2026-11-17T21:00:00Z") };
+            renderWithApp(<PostmortemDialog input={input} onClose={vi.fn()} />, { client, rca: true });
+            const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare incident request: CPU pressure on T1" });
+            expect(headingsOf(dialog)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "What the demo injected (answer key)", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
+            expect(within(dialog).getByText(/^This is one incident request's postmortem, and its minutes are its fault's own, .+ The Root cause page finds and explains the incidents in any minutes you pick/)).toBeInTheDocument();
+            expect(within(dialog).queryByText(/Investigating the session's minutes/)).toBeNull();
             expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
             expect(client.ran.some((id) => id.startsWith("rca-"))).toBe(false);
         },

@@ -45,10 +45,14 @@ export interface PostmortemInput {
     /** The measured ones only, with no answer-key table or measure: what a Copilot draft gets (ADR 0031). */
     askSpecs?: ReadonlyArray<QuerySpec | null | undefined>;
     /**
-     * With the RCA tables: the blind investigation of the plan's minutes, which becomes the Cause; what the demo injected
-     * then follows in a section of its own, labeled (ADR 0031, section 9). Without it, the Cause is what was injected.
+     * With the RCA tables (ADR 0031, section 9): for a session, the blind investigation of its minutes, which becomes the
+     * Cause; for a lone incident request, "request": its minutes are its fault's own, so the Cause points to the Root
+     * cause page instead of investigating them. What the demo injected then follows in a section of its own, labeled.
+     * Without it, the Cause is what was injected.
      */
-    rca?: BlindCauses | null;
+    rca?: BlindCauses | "request" | null;
+    /** The next session's start, from the session control's record: the Cause's minutes end there at the latest. */
+    nextSessionStart?: Date | null;
     generatedAt: Date;
 }
 
@@ -126,11 +130,23 @@ export function postmortemTitle(plan: Plan): string {
 }
 
 /**
- * The minutes the Cause investigates: the plan's, and the TELEMETRY_LAG_MINUTES after them, where the rest of the
- * postmortem still reads a signal (episodesIn).
+ * The minutes the Cause investigates (ADR 0031, section 9): a session's, as the session control recorded them, and the
+ * TELEMETRY_LAG_MINUTES after them, where the rest of the postmortem still reads a signal (episodesIn), but never into the
+ * next session's (the review of 63fb530c). None for a lone incident request: its minutes are its fault's own, from
+ * Scenario Runs, so aiming the investigation at them would tell it where the fault was.
  */
-export function causeWindow(plan: Pick<Plan, "start" | "end">): { from: Date; to: Date } {
-    return { from: plan.start, to: new Date(plan.end.getTime() + TELEMETRY_LAG_MINUTES * 60_000) };
+export function causeWindow(plan: Pick<Plan, "kind" | "start" | "end">, nextSessionStart: Date | null = null): { from: Date; to: Date } | null {
+    if (plan.kind !== "session") return null;
+    const end = plan.end.getTime();
+    const after = end + TELEMETRY_LAG_MINUTES * 60_000;
+    const next = nextSessionStart?.getTime();
+    return { from: plan.start, to: new Date(next !== undefined && next < after ? Math.max(next, end) : after) };
+}
+
+/** The start of the first session after a plan's start, from the session control's record, or null when there's none. */
+export function nextSessionStart(plans: readonly Plan[], plan: Pick<Plan, "key" | "start">): Date | null {
+    const later = plans.filter((p) => p.kind === "session" && p.key !== plan.key && p.start.getTime() > plan.start.getTime());
+    return later.reduce<Date | null>((first, p) => (first === null || p.start < first ? p.start : first), null);
 }
 
 /**
@@ -140,8 +156,11 @@ export function causeWindow(plan: Pick<Plan, "start" | "end">): { from: Date; to
 function blindCauseLines(rca: BlindCauses, plan: Plan): string[] {
     const clock = (d: Date) => d.toISOString().slice(11, 19);
     const after = Math.round((rca.to.getTime() - plan.end.getTime()) / 60_000);
-    const minutes = `from ${time(rca.from)} to ${time(rca.to)} UTC${after > 0 ? ` (the window, and the ${after} minutes after it, where a signal can still show)` : ""}`;
-    const out = [`A blind investigation of the minutes ${minutes}, the way a DBA would make it: from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, with nothing about what the demo planned.`, ""];
+    const tail = after <= 0 ? "" : after < TELEMETRY_LAG_MINUTES ? `, and the ${after} minutes after them, up to the next session's start` : `, and the ${after} minutes after them, where a signal can still show`;
+    const out = [
+        `A blind investigation, the way a DBA would make it, of the session's minutes as the session control recorded them${tail} (${time(rca.from)} to ${time(rca.to)} UTC). It reads what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and nothing about the faults the demo planned.`,
+        "",
+    ];
     if (rca.error) return [...out, `It couldn't run, so it gives no cause: ${rca.error}`];
     if (rca.causes.length === 0) out.push(rca.none ?? "Nothing abnormal in these minutes: the detector found no episode.");
     else {
@@ -232,9 +251,22 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     if (episodes.length > 0) injectedLines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
     if (injected === 0 && episodes.length === 0) injectedLines.push("Nothing was injected in this window.");
     lines.push("## Cause", "");
-    if (input.rca) {
+    if (input.rca === "request") {
+        // A lone request's minutes are its fault's own (Scenario Runs), so a blind investigation isn't aimed at them (the
+        // review of 63fb530c): the Root cause page explains the incidents in any minutes a viewer picks.
+        lines.push(
+            "This is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds and explains the incidents in any minutes you pick, from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded.",
+            "",
+        );
+        lines.push("## What the demo injected (answer key)", "", "What the demo planned, from Scenario Runs: the answer key.", "");
+    } else if (input.rca) {
         lines.push(...blindCauseLines(input.rca, plan), "");
-        lines.push("## What the demo injected (answer key)", "", "What the demo planned, from Scenario Runs: the answer key, which the investigation above never read, for checking what it found.", "");
+        lines.push(
+            "## What the demo injected (answer key)",
+            "",
+            "What the demo planned, from Scenario Runs: the answer key, for checking what the investigation above found. It took only the session's minutes from the session control's record, never the faults in them.",
+            "",
+        );
     }
     lines.push(...injectedLines);
     lines.push("");
@@ -286,9 +318,11 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to signal is 0, written as at most one bin, and the timeline tells the injection first.`,
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
-        ...(input.rca
-            ? [`- **Cause:** the Incident RCA's blind investigation of the window and the ${TELEMETRY_LAG_MINUTES} minutes after it: find_incidents, then explain_incident for each incident, at most ${MAX_CAUSES} in the Root cause page's order. It reads the RCA capture, Database Hub's telemetry, and Azure Monitor, never Scenario Runs (ADR 0031).`]
-            : []),
+        ...(input.rca === "request"
+            ? ["- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page explains the incidents in the minutes you pick instead (ADR 0031)."]
+            : input.rca
+              ? [`- **Cause:** the Incident RCA's blind investigation of the session's minutes, as the session control recorded them, and the ${TELEMETRY_LAG_MINUTES} minutes after them, up to the next session's start: find_incidents, then explain_incident for each incident, at most ${MAX_CAUSES} in the Root cause page's order. It reads the RCA capture, Database Hub's telemetry, and Azure Monitor, and never the faults in Scenario Runs (ADR 0031).`]
+              : []),
         "",
     );
     const bounds = scores.filter((s) => s.bound);
@@ -299,7 +333,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## Queries", "", "Every query ran read-only through the app's `history` connector, as the viewer:", "");
     const dax = joinDax(input.specs);
     lines.push("```dax", dax ?? "// No query.", "```", "");
-    const investigated = input.rca?.queries ?? [];
+    const investigated = input.rca && input.rca !== "request" ? input.rca.queries : [];
     if (investigated.length > 0) lines.push("And the investigation's, behind the Cause, each once:", "", "```dax", investigated.map((q) => `// ${q.title}\n${q.dax}`).join("\n\n"), "```", "");
 
     return { title, fileName: postmortemFileName(plan, input.generatedAt), markdown: lines.join("\n") };

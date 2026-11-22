@@ -5023,7 +5023,8 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - **A read that failed** is said as such, for one incident or for the list. An empty list says what the view says, in UTC (`emptyListText`).
   - **Its queries:** each listed once. Once the dialog closes, it explains no further incident.
 - **The Markdown** (`fabric/app/src/lib/postmortem.ts`):
-  - **The Cause** says which minutes it read: the window and the 15 after it (`causeWindow`), as the postmortem reads T4's and T5's episodes (`episodesIn`). Then each incident, with the rows it cites nested under it. A root cause behind two incidents, such as T4's deadlock and its blocking in the sample session, is said once. Then the rest's count, and what wasn't captured.
+  - **The Cause** says which minutes it read: the session's, as the session control recorded them, and the 15 after them (`causeWindow`), as the postmortem reads T4's and T5's episodes (`episodesIn`), but never past the next session's start. Then each incident, with the rows it cites nested under it. A root cause behind two incidents, such as T4's deadlock and its blocking in the sample session, is said once. Then the rest's count, and what wasn't captured.
+  - **A lone incident request** gets no investigation: its minutes are its fault's own, so its Cause points to the Root cause view.
   - **"What the demo injected (answer key)"** follows, with the injected list.
   - **"How this was measured"** says how the Cause was found, and the investigation's queries follow the page's.
   - **Without the investigation,** the postmortem is the release's. The Copilot draft is the same blind draft either way.
@@ -5045,7 +5046,16 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract` (whose scan finds no answer-key name or scenario ID in `rca/postmortem.ts`), `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. No unit test reached the Azure CLI.
 - **Static checks:** PSScriptAnalyzer found nothing in 393 files; markdownlint found no issue in 152 files.
 
-**What its live check needs.** On dbhubrb, after `./scripts/deploy.ps1` from this branch: **Write the postmortem** on Mission Control for session 2233e0ae. Then check its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 a minute, and **Download Markdown**.
+**What its live check needs.** On dbhubrb, after `./scripts/deploy.ps1` from this branch: **Write the postmortem** on Mission Control for session 2233e0ae. Then check its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 a minute, and **Download Markdown**. On a lone incident request's postmortem, if the history has one, the Cause points to the Root cause view, with no investigation.
+
+**The review of 63fb530c: 1 Medium, 1 Low.** The rest was clean: the Cause's content is blind, it matches the view, its failure wording is right, the 429 retries are bounded, and closing aborts.
+
+- **Medium: for a lone incident request, the "blind" Cause looked exactly where the demo injected the fault.** For a request plan, `toPlans` sets the plan's start and end to the request's own `windowStart` and `windowEnd` from Scenario Runs, so `causeWindow` aimed `find_incidents` at the injection's first minute through 15 minutes after its end. The Cause's opening line ("nothing about what the demo planned") and the answer-key section ("never read") were untrue for it. **Write the postmortem** offers such a plan on the scoreboard, the replay, and Mission Control.
+  - `causeWindow` gives a request plan no minutes. Its Cause says its minutes are its fault's own and points to the Root cause view, the answer key follows, and its "How this was measured" says so. The dialog runs no investigation for it.
+  - A session's opening line says "the session's minutes as the session control recorded them", and its answer-key section says the investigation took only those minutes from that record, never the faults in them.
+- **Low: the 15 minutes after a session could reach into the next session's,** whose first incidents were then explained as this one's, while the answer key lists only this session's faults. The minutes end at the next session's start when that comes sooner (`nextSessionStart`, from the same record; never a lone request's start, which is a fault's), and never before the session's own end.
+- **Tests:** 4 new ones fail with 5f0b4386's code: in `lib/mission.test.ts`, a request plan's pointer and the cut at the next session's start; in `pages/mission.test.tsx`, Mission Control ending the minutes at a second session's start, and the dialog running no investigation for a lone request. The first postmortem test, whose wording changed, fails there too. Each of 9 parts, taken out alone, fails its own test.
+- **Validation:** `npm run verify` passed: typecheck, lint, Vitest's 607 tests in 35 files, the license check (136 production packages), and the build. Under strict mode, with the Azure CLI guard, the doc and app suites passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. PSScriptAnalyzer found nothing in 393 files; markdownlint found no issue in 152 files.
 
 **Risks.**
 
