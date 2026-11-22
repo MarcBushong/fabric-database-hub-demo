@@ -106,7 +106,8 @@ function lanesOf(bins: readonly Bin[], scores: readonly FaultScore[], episodes: 
         title: `T5 · ${TARGETS.T5.name}`,
         series: [
             { name: "Normalized RU", kind: "percent", shape: "area", max: 100, points: ru },
-            { name: "429s", kind: "int", shape: "line", points: throttled },
+            // Per minute where the window holds saves at different intervals (cosmosLanePoints), and named so.
+            { name: (cosmos?.saves ?? 1) > 1 ? "429s a minute" : "429s", kind: "int", shape: "line", points: throttled },
         ],
         bands: bandsFor("T5"),
         note: ru.length === 0 ? "Its latest capture isn't from this session" : undefined,

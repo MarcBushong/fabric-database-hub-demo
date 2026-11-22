@@ -338,7 +338,7 @@ describe("Session replay", () => {
             const { container } = renderWithApp(<ReplayPage />, { client: sampleClient({}, { "cosmos-series": rows }), view: { page: "replay", replay: 28 } });
             expect(await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 })).toBeInTheDocument();
             const t5 = () => [...container.querySelectorAll(".cr-readout")].map((e) => e.textContent ?? "").find((t) => t.includes("429s"));
-            await waitFor(() => expect(t5()).toMatch(/· 429s 100$/));
+            await waitFor(() => expect(t5()).toMatch(/· 429s a minute 100$/));
         },
         SLOW,
     );
