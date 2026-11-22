@@ -77,10 +77,12 @@ describe("the model guide", () => {
         expect(off).not.toContain("the estate_overview tool reads");
     });
 
-    it("teaches T5 (Azure Cosmos DB) from its latest capture, with columns and measures the model has", () => {
+    it("teaches T5 (Azure Cosmos DB) over a period, which its measures count once where two captures overlap (F35), with columns and measures the model has", () => {
         const message = buildSystemMessage({ estate: false });
         const rules = message.slice(0, message.indexOf("# The history model"));
-        expect(rules).toContain(`TREATAS ( { "T5" }, 'Target'[Target Key] ), TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )`);
+        expect(rules).toContain(`TREATAS ( { "T5" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "PeakNormRuPct", [Peak Norm RU (%)]`);
+        // Before F35's model, a period's sums counted two captures of it, so the guide filtered T5 to its latest run alone.
+        expect(rules).not.toMatch(/LatestRun|both count in sums|pick each bin's latest capture/);
         const columns = new Set(rules.match(/'[^']+'\[[^\]]+\]/g));
         expect(columns.size).toBeGreaterThan(8);
         for (const column of columns) expect(MODEL_GUIDE).toContain(column);

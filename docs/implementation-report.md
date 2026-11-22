@@ -5099,4 +5099,41 @@ The read-only answer, first:
 - **Not run live:** the two queries run first at the next `./scripts/deploy.ps1`'s app check (`FABRIC.APP.QUERIES`); their rules are tested against the live rows.
 - **A save with one point per series in what's read has no step,** as before: it's an instant, kept unless a kept point covers it. The day before the window makes that rare here; the RCA's narrower windows can hit it.
 - **The row limit:** 20,000 rows hold 20 to 30 saves whose windows overlap the latest one, each at most about 1,000 points (its document's 24 KB bound) and usually 200 to 900. Over it, the query fails as overflow rather than looking complete: T4's or T5's page says the query failed, and the deploy's app check names it (`FABRIC.APP.QUERIES`).
-- **Part 2,** the model's `Snapshot Value`, follows as its own commit.
+- **Part 2,** the model's `Snapshot Value`, is its own commit, below.
+
+### F35 part 2: the history model's `Snapshot Value` (2026-11-22)
+
+**Why.** The read-only answer above: the model's `Snapshot Value` took each bin from its newest save, under every T1 to T3 telemetry measure (the history report, and the Insights app's Estate, Replay, scoreboard bins, and Trends) and T5's model measures (Ask). After a session and an update within a day, the day save's 15-minute totals counted beside the session's own minutes.
+
+**The coordinator's decision.** Part 2 is its own commit, held back until it's proven live on that history's model (dbhubrb) with no redeploy. The adds-versus-peaks list by analysis key and metric is approved, with unlisted metrics as peaks and off-grid analyses keeping the newest capture. The grain comes from the SQL save's window, and from the step for Azure Monitor. A partly covered coarse bin's remainder stays at that bin's start: counts add, and peaks take the higher where a finer point shares it. Window totals and peaks must match exactly. That placement, with the replica's 16:45 case as the example, goes in the ADR amendment and the limitations.
+
+**Work summary.**
+
+- **The measure** (`Telemetry Snapshots.tmdl`). Per target, analysis, metric, and bin, it takes each save's point there:
+  - Each save's interval. A SQL save's comes from its window's length, the notebook's own rule (1 minute up to 2 hours, 5 up to 12, else 15). An Azure Monitor save's is the coarsest of the history helpers' intervals that every bin starts on (from midnight UTC, as the helpers bucket them) and that its window can hold its bins in; T5's hourly metrics get at least 60. Their count alone would read a day-long save of a T4 that ran 2 of its hours (8 bins) as every 180 minutes.
+  - Each point covers its interval, cut to its save's window. With no finer save over it, the point stays. Where one finer save's window covers it, it's left out. Otherwise, from the finer rows in its interval (the finest and newest of each bin, and the outermost of nested ones), a total keeps what's left of it, never below 0, and a peak stays only when it's higher. Then totals add and peaks take the highest. Inside a save it sums across instances and files, and off the bin grid the newest capture stays, as before.
+  - **Each save is read whole, whatever the period:** `report_date_utc` is each row's bin date, so the Estate query's `DATESBETWEEN ( 'Date'[Date], ... )` would have cut a day-long save at midnight and changed the step its bins give. The saves, the step, and the partial reads remove the filters on `'Date'` and `Report Date UTC`.
+  - **A finer save's window stands for its rows,** which are read only in a partly covered interval: the model can't read every finer row in every visual's cell at a cost near today's. It agrees with `finestPerInterval` wherever a finer save's rows add up to the coarser totals, as on the live rows (T5's 1-minute rows from 15:30 to 15:44 sum to the day's 27,630 exactly).
+- **The TypeScript reference** (`fabric/app/src/data/snapshot-value.ts`): the same rule, for the tests and the live check. `f35Check` gives the rule's per-bin values and each target's window measures, by the rule and by `finestPerInterval`. `fabric/app/scripts/f35-reference.ts` runs it on `rows.dax`'s result, from objects or arrays beside their column names, as Execute Queries or a harness returns them.
+- **The live check** (`fabric/powerbi/checks/f35`, with a README):
+  - `rows.dax` exports every SQL row near the session, one row with no bin and no value for each SQL series and save whose window overlaps it (the measure sees every save of a series), and every row of the Azure Monitor saves whose window overlaps it.
+  - `snapshot-value-bins.dax` gives today's and the new value per series and bin, and `window-today.dax` and `window-f35.dax` give 13 window measures per target.
+  - `estate-today.dax` and `estate-f35.dax` are the Estate query, for timing.
+- **Ask's guide** (`fabric/app/src/copilot/guide.ts`): the measures count a time that two captures hold once, and T5's example filters the target and the period, where it filtered T5's latest run alone to avoid that double count.
+- **Docs:** ADR 0014's amendment, ADR 0028's note, the limitations (a section, and **Not proven live yet**), troubleshooting (a row), the report spec (the rule, its outline, the data caveat, and the DAX checks), the app's README, the model guide (regenerated), and the CHANGELOG.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`; `fabric/powerbi/checks/f35/` (seven files); `fabric/powerbi/_brief/report-spec.md`; `fabric/app/src/data/snapshot-value.ts` and its test; `fabric/app/scripts/f35-reference.ts`; `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`; `fabric/app/README.md`; `tests/unit/Fabric.PowerBI.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/adr/0028-ask-copilot-in-the-insights-app.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **The app** (`npm run typecheck`, `npm run lint`, `vitest run`): 380 passed, 0 failed. The reference's 8 tests run on the live rows under placeholder names (T5's session and day-long saves, and the replica's lag at 16:45), plus SQL saves whose windows start and end inside a minute. They cover the steps (the 8-bin T4 day at 15), the window totals against `finestPerInterval` (T5's 51,591 requests and 27,808 429s), the partly covered bins, and a save read from a row with no bin. They're new with the module, so they fail at the parent. The guide's T5 test fails at f9b19f04, which still filters T5's latest run.
+- **Pester** (`Fabric.PowerBI`, `DbHubDemo.PowerBI`, StrictMode): 39 passed, 0 failed, 1 skipped (the report generator's npm packages aren't installed). The 3 new tests fail at the parent: the measure's lists, intervals, and bin rule against `finest-per-interval.ts`, the history helpers, and the notebook; each save read whole; and the check files' measure identical to the TMDL's.
+- **The reference's command** ran on the incident RCA's fixture of the live rows, in both input shapes, with the same result.
+- **Pester** Repo.* with StrictMode: 207 passed, 0 failed, 3 skipped. markdownlint: clean. No live resource name is in the tree.
+
+**Risks.**
+
+- **Not run live:** no local engine runs DAX. The check files on the live model are the first run of the measure's syntax and its time, then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`, which evaluates every measure. Part 2 is held back until the check passes.
+- **Query time:** per visual cell, the measure reads the series' saves (and, for Azure Monitor, their bins), and the finer rows only in a partly covered interval. The check measures it against today's (at most about twice).
+- **Where it can differ from `finestPerInterval`** ([limitations](limitations.md#the-history-models-overlapping-saves-f35)): rows missing inside a finer save's window, three or more intervals at once, a save with a single bin, and a SQL save with a hand-set `BIN_MINUTES`. Live, the check compares both.
+- **Rounding:** a remainder of floating-point totals can be a tiny number rather than 0, in DAX and in TypeScript alike, so the check compares to within rounding.

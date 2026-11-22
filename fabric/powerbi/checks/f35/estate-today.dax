@@ -1,0 +1,19 @@
+// F35's live check, timing: the Insights app's Estate series query (queries.ts seriesQuery, signals-per-bin) for B's day,
+// with today's Snapshot Value. Run it, then estate-f35.dax; F35 passes at no more than about twice this one's time.
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Telemetry Snapshots'[Bucket UTC],
+    'Target'[Target Key],
+    TREATAS ( { "T1", "T2", "T3" }, 'Target'[Target Key] ),
+    DATESBETWEEN ( 'Date'[Date], DATE ( 2026, 11, 21 ), DATE ( 2026, 11, 21 ) ),
+        "Cpu", [CPU (%)],
+        "Blocked", [Blocked Processes (peak)],
+        "LockWaitS", [Lock Wait (s)],
+        "BufferIoS", [Buffer IO Wait (s)],
+        "LogRateS", [Log Rate Governor Wait (s)],
+        "WaitS", [Wait Time (s)],
+        "IoMb", [Data and Log IO (MB)],
+        "Batch", [Batch Requests],
+        "Sessions", [Active Sessions (peak)]
+)
+ORDER BY 'Telemetry Snapshots'[Bucket UTC], 'Target'[Target Key]

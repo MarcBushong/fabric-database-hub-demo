@@ -1,0 +1,27 @@
+// F35's live check, window totals and peaks for B's session minutes with today's Snapshot Value: the doubled totals the
+// newest-per-bin rule gives. Compare with window-f35.dax and fabric/app/scripts/f35-reference.ts.
+// B's session (2026-11-21): its own save's window was 15:14 to 16:57 UTC, inside a day-long save four hours later.
+// Bins from 15:00 to 17:15 hold the partly covered 15-minute ones at both ends.
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Target'[Target Key],
+    FILTER (
+        ALL ( 'Telemetry Snapshots'[Bucket UTC] ),
+        'Telemetry Snapshots'[Bucket UTC] >= DATE ( 2026, 11, 21 ) + TIME ( 15, 0, 0 )
+            && 'Telemetry Snapshots'[Bucket UTC] < DATE ( 2026, 11, 21 ) + TIME ( 17, 15, 0 )
+    ),
+        "LockWaitS", [Lock Wait (s)],
+        "WaitS", [Wait Time (s)],
+        "BufferIoS", [Buffer IO Wait (s)],
+        "IoMb", [Data and Log IO (MB)],
+        "Batch", [Batch Requests],
+        "Deadlocks", [Deadlocks],
+        "CpuPeak", [CPU Peak (%)],
+        "BlockedPeak", [Blocked Processes (peak)],
+        "SessionsPeak", [Active Sessions (peak)],
+        "Requests", [Cosmos DB Requests],
+        "Throttled", [Throttled Requests (429s)],
+        "RuConsumed", [RU Consumed],
+        "NormRuPeak", [Peak Norm RU (%)]
+)
+ORDER BY 'Target'[Target Key]

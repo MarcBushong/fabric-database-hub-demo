@@ -1,0 +1,90 @@
+// F35's live check, the rows for fabric/app/scripts/f35-reference.ts. Read-only; no resource names.
+// - Every SQL row of B's session minutes and the 15 minutes either side, for the bins from 15:00 to 17:15 UTC.
+// - One row with no bin and no value for each SQL series and save whose window overlaps them, wherever its rows are:
+//   the measure sees each save of a series, whatever the period (the reference reads these rows as saves only).
+// - Every row of the Azure Monitor saves whose window overlaps them, whose bins give their step.
+// B's session (2026-11-21): its own save's window was 15:14 to 16:57 UTC, inside a day-long save four hours later.
+// Bins from 15:00 to 17:15 hold the partly covered 15-minute ones at both ends.
+EVALUATE
+VAR NearFrom = DATE ( 2026, 11, 21 ) + TIME ( 14, 45, 0 )
+VAR NearTo = DATE ( 2026, 11, 21 ) + TIME ( 17, 30, 0 )
+VAR OffSql = { "postgresql", "cosmosdb", "wait_profile", "estate_pulse", "memory_clerks", "database_growth", "telemetry_coverage" }
+VAR SqlRows =
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            'Telemetry Snapshots'[Bucket UTC] >= NearFrom,
+            'Telemetry Snapshots'[Bucket UTC] < NearTo,
+            NOT ( 'Telemetry Snapshots'[Analysis Key] IN OffSql )
+        ),
+        "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
+        "AnalysisKey", 'Telemetry Snapshots'[Analysis Key],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", 'Telemetry Snapshots'[Value],
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+VAR SqlSaves =
+    SELECTCOLUMNS (
+        FILTER (
+            CALCULATETABLE (
+                SUMMARIZE (
+                    'Telemetry Snapshots',
+                    'Telemetry Snapshots'[Target Key],
+                    'Telemetry Snapshots'[Analysis Key],
+                    'Telemetry Snapshots'[Metric],
+                    'Telemetry Snapshots'[Captured At UTC],
+                    'Telemetry Snapshots'[Window Start UTC],
+                    'Telemetry Snapshots'[Window End UTC]
+                ),
+                NOT ( 'Telemetry Snapshots'[Analysis Key] IN OffSql )
+            ),
+            'Telemetry Snapshots'[Window Start UTC] < NearTo
+                && 'Telemetry Snapshots'[Window End UTC] > NearFrom
+        ),
+        "Bucket", BLANK (),
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
+        "AnalysisKey", 'Telemetry Snapshots'[Analysis Key],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", BLANK (),
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+VAR MonitorSaves =
+    SELECTCOLUMNS (
+        FILTER (
+            CALCULATETABLE (
+                SUMMARIZE (
+                    'Telemetry Snapshots',
+                    'Telemetry Snapshots'[Captured At UTC],
+                    'Telemetry Snapshots'[Window Start UTC],
+                    'Telemetry Snapshots'[Window End UTC]
+                ),
+                'Telemetry Snapshots'[Analysis Key] IN { "postgresql", "cosmosdb" }
+            ),
+            'Telemetry Snapshots'[Window Start UTC] < NearTo
+                && 'Telemetry Snapshots'[Window End UTC] > NearFrom
+        ),
+        "Captured", 'Telemetry Snapshots'[Captured At UTC]
+    )
+VAR MonitorRows =
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            TREATAS ( MonitorSaves, 'Telemetry Snapshots'[Captured At UTC] ),
+            'Telemetry Snapshots'[Analysis Key] IN { "postgresql", "cosmosdb" }
+        ),
+        "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
+        "AnalysisKey", 'Telemetry Snapshots'[Analysis Key],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", 'Telemetry Snapshots'[Value],
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+RETURN
+    UNION ( SqlRows, SqlSaves, MonitorRows )

@@ -176,6 +176,83 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
     }
 }
 
+Describe 'Snapshot Value: each interval from its finest save (F35)' {
+    BeforeAll {
+        $snapshotsText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
+        $script:measure = [regex]::Match($snapshotsText, "(?ms)^ {4}measure 'Snapshot Value' =\n(.*?)(?=^ {8}\S)").Groups[1].Value
+        $script:checks = Join-Path -Path $powerbi -ChildPath 'checks/f35'
+        $script:squash = { param([string] $Text) ($Text -replace '\s+', ' ').Trim() }
+        $script:items = { param([string] $List) @([regex]::Matches($List, '"([^"]+)"|(\d+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { [int] $_.Groups[2].Value } }) }
+        $script:tsList = {
+            param([string] $Text, [string] $Name)
+            $match = [regex]::Match($Text, ('{0}(?::[^=]+)? = (?:new Set\()?\[([^\]]*)\]' -f [regex]::Escape($Name)))
+            $match.Success | Should -BeTrue -Because $Name
+            & $script:items $match.Groups[1].Value
+        }
+        $script:daxList = {
+            param([string] $Pattern)
+            $match = [regex]::Match($script:measure, $Pattern)
+            $match.Success | Should -BeTrue -Because $Pattern
+            & $script:items $match.Groups['list'].Value
+        }
+    }
+
+    It 'tells totals from peaks, Azure Monitor from SQL, hourly metrics, and analyses off the bin grid by the shared rule''s lists' {
+        # finest-per-interval.test.ts ties these lists to the notebooks and the history helpers that write the rows.
+        $shared = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/finest-per-interval.ts'))
+        $reference = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/snapshot-value.ts'))
+        $adds = [regex]::Match($script:measure, 'VAR Adds = AnalysisName IN \{ (?<a>[^}]*) \} \|\| MetricName IN \{ (?<m>[^}]*) \}')
+        $adds.Success | Should -BeTrue
+        & $script:items $adds.Groups['a'].Value | Should -Be (& $script:tsList $shared 'ADDITIVE_ANALYSES')
+        & $script:items $adds.Groups['m'].Value | Should -Be (& $script:tsList $shared 'ADDITIVE_METRICS')
+        & $script:daxList 'VAR OffGrid = ISBLANK \( Bin \) \|\| AnalysisName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $shared 'OFF_GRID_ANALYSES')
+        & $script:daxList 'VAR IsHourly = MetricName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $shared 'HOURLY_METRICS')
+        & $script:daxList "NOT \( 'Telemetry Snapshots'\[Metric\] IN \{ (?<list>[^}]*) \} \)" | Should -Be (& $script:tsList $shared 'HOURLY_METRICS')
+        & $script:daxList 'VAR IsMonitor = AnalysisName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $reference 'MONITOR_ANALYSES')
+        # Azure Monitor's step: the intervals the history helpers step up through. SQL's: the notebook's own bin rule.
+        $ladder = & $script:daxList 'SELECTCOLUMNS \( \{ (?<list>[^}]*) \}, "@Step"'
+        $ladder | Should -Be (& $script:tsList $reference 'LADDER')
+        foreach ($helper in 'PostgresHistoryHelpers.ps1', 'CosmosHistoryHelpers.ps1') {
+            $text = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath "scripts/modules/DbHubDemo/Private/$helper"))
+            & $script:items ([regex]::Match($text, '(?m)^\$script:\w+HistoryIntervals = @\(([^)]*)\)').Groups[1].Value) | Should -Be $ladder -Because $helper
+        }
+        $script:measure | Should -Match ([regex]::Escape('IF ( SpanMinutes <= 120.000001, 1, IF ( SpanMinutes <= 720.000001, 5, 15 ) )'))
+        $reference | Should -Match ([regex]::Escape('span <= 120 + 1e-6 ? 1 : span <= 720 + 1e-6 ? 5 : 15'))
+        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"
+        $code | Should -Match ([regex]::Escape('bin_minutes = int(BIN_MINUTES) or (1 if span_minutes <= 120 else 5 if span_minutes <= 720 else 15)'))
+    }
+
+    It 'reads each save whole, whatever the period selected: its saves, its step, and the rows of a partly covered interval' {
+        # report_date_utc is each row's bin date, so a period through 'Date' would cut a day-long save at midnight and
+        # change the step its bins give.
+        ([regex]::Matches($script:measure, [regex]::Escape("REMOVEFILTERS ( 'Date' )"))).Count | Should -Be 3
+        $removes = @([regex]::Matches($script:measure, "REMOVEFILTERS \( 'Telemetry Snapshots'\[Bucket UTC\][^)]*\)") | ForEach-Object { $_.Value })
+        $removes.Count | Should -Be 3
+        $removes | ForEach-Object { $_ | Should -Match ([regex]::Escape("'Telemetry Snapshots'[Report Date UTC]")) }
+    }
+
+    It 'checks a live model with the measure''s own expression, in read-only query files' {
+        $expected = & $script:squash $script:measure
+        $expected.Length | Should -BeGreaterThan 5000
+        foreach ($name in 'snapshot-value-bins.dax', 'window-f35.dax', 'estate-f35.dax') {
+            $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:checks -ChildPath $name))
+            $body = [regex]::Match($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[[^\]]+\] =\n(.*?)(?=^EVALUATE)").Groups[1].Value
+            & $script:squash $body | Should -BeExactly $expected -Because $name
+        }
+        $files = @(Get-ChildItem -LiteralPath $script:checks -File | Sort-Object -Property Name | ForEach-Object { $_.Name })
+        $files | Should -Be @('estate-f35.dax', 'estate-today.dax', 'README.md', 'rows.dax', 'snapshot-value-bins.dax', 'window-f35.dax', 'window-today.dax')
+        foreach ($file in Get-ChildItem -LiteralPath $script:checks -File) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            $bytes -contains 13 | Should -BeFalse -Because $file.Name
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse -Because $file.Name
+            if ($file.Extension -eq '.dax') {
+                @($bytes | Where-Object { $_ -eq 9 -or $_ -gt 127 }) | Should -BeNullOrEmpty -Because $file.Name
+            }
+        }
+    }
+}
+
 Describe 'Report RPT_DatabaseHub_History (Phase 19)' {
     It 'has the PBIR folder shape: byPath binding, report.json, version.json, four pages with 10, 8, 11, and 10 visuals' {
         $pbir = Get-Content -LiteralPath (Join-Path -Path $reportRoot -ChildPath 'definition.pbir') -Raw | ConvertFrom-Json -AsHashtable
