@@ -431,9 +431,12 @@ Describe 'T4 sizes (Phase 24)' {
         # Obviously fake prices (ADR 0016), in the shapes the Retail Prices API listed on 2026-11-22: Indonesia Central's Dadsv5,
         # one meter listed as a "vCore" row at about a tenth of its "1 vCore" row; and UAE Central's Dadsv5, a "vCore" meter
         # and a newer, dearer "1 vCore" one. The cheapest row read both "vCore" rows; the coordinator's decision, 2026-11-22.
+        # A "vCore" row beside a size row listed lower pins the middle step: "1 vCore", then the cheapest, would read the size
+        # row (a0e1fd6a's review).
         @{ Case = 'one meter at two prices, as Indonesia Central''s'; Rows = @(@('vCore', 0.03, 'meter-a'), @('1 vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
         @{ Case = 'two meters, the "1 vCore" one dearer, as UAE Central''s'; Rows = @(@('vCore', 0.3, 'meter-a'), @('1 vCore', 0.35, 'meter-c'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.35 }
         @{ Case = 'the "vCore" row only'; Rows = @(@('vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
+        @{ Case = 'a "vCore" row and a cheaper size row'; Rows = @(@('vCore', 0.3, 'meter-a'), @('2 vCore', 0.2, 'meter-d')); Expected = 0.3 }
         @{ Case = 'neither row, as before'; Rows = @(@('2 vCore', 0.6, 'meter-d'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.6 }
     ) {
         $items = @(foreach ($row in $Rows) { [pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = $row[0]; meterName = 'vCore'; meterId = $row[2]; retailPrice = $row[1]; unitOfMeasure = '1 Hour' } })
