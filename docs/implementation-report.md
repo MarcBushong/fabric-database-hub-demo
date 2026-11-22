@@ -4978,4 +4978,41 @@ Until then, deployments keep the pinned image, which works as before.
 **Risks.**
 
 - **Not run live;** the notebook reaches a Fabric workspace with the next `./scripts/deploy.ps1`.
-- **A duration that isn't a whole number** (45.5, say) still plans its whole part and fails at the request, with `build_request`'s message, as before. The Insights app sends whole numbers from 30 to 120.
+- **A duration that isn't a whole number** (45.5, say) still plans its whole part and fails at the request, with `build_request`'s message, as before. The Insights app sends whole numbers from 30 to 120. (Fixed by its review, below.)
+
+### The review of F33: one rule for `DURATION_MINUTES`, a whole number however it arrives (2026-11-22)
+
+**Why.** The review found one Low finding. `session_plan` truncated `DURATION_MINUTES` with `int()` before it checked the bounds, so values that `build_request` refuses passed the plan:
+
+- **45.5** printed "This session runs 45 minutes, until ...", and cell 8 then raised "ValueError: DURATION_MINUTES must be a whole number from 30 to 120."
+- **90.0 and "90"** did the same, although the parameters cell says a parameter may arrive "as a string, a number, or a bool".
+- **20.5** read "you asked for 20", and **True** read "you asked for 1".
+- **None and "abc"** raised a raw TypeError or ValueError in cell 7.
+
+The coordinator's decision: one shared rule, which accepts a whole number however it arrives (an int, a whole float, or text such as "90" or " 90 ") and refuses a bool, None, a fraction, and anything that isn't a number, with the refusal up front and the input quoted as it was given.
+
+**Work summary.**
+
+- **`_whole_number`** (cell 4) returns the int for an int, a whole float, or text of a whole number (optional sign, ASCII digits, an optional `.0`, surrounding spaces). It returns None for a bool (True is an int in Python), None, a fraction, NaN or infinity, and anything else: "abc", "1e2", and "9_0" or non-ASCII digits too, which `int()` alone would read as 90.
+- **`session_minutes`** is the one reading of a session's duration, for both `session_plan` and `build_request`: the minutes, the runbook's bounds (`minMinutes` and the showcase's `maxMinutes`), and `out`: "", "notWhole", "short", or "long". So the plan and the request can't disagree.
+- **`_whole`** coerces with `_whole_number` and returns the int, so the request carries 90 for "90" or 90.0. It also reads an `"activities"` run's `DURATION_MINUTES`, `intensity`, and `concurrency`, each still checked against its own bounds, so "8" goes as 8 and 8.5 or True is refused as before.
+- **`session_plan`** adds `given`, the input as it was given (`_as_given`: text in double quotes, anything else as Python writes it, redacted and capped at 40 characters). **`plan_lines`** has a third `durationOut`: "Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45.5." with "Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again." A coerced value outside the bounds keeps the short or long line and quotes the input as given ("you asked for "20"", "150.0"). The auto-shutdown's tail and fix are as in F33.
+- **Callers checked:** the Insights app sends `DURATION_MINUTES` as a whole number from 30 to 120, typed `int` (`fabric/app/src/lib/control.ts` checks it with `Number.isInteger` against `SESSION_MINUTES` in `src/lib/scenarios.ts`), and its copied notebook parameters are an int literal (`DURATION_MINUTES = 90`). No script passes it, and the runbook checks the int it's sent (`Test-DbHubControlRequest`). No caller relies on text being refused: only more inputs are accepted. `REFRESH_SECONDS`, `WATCH_MINUTES`, and `LOOKBACK_MINUTES` don't use `_whole`, and are unchanged.
+- **Docs:** the troubleshooting row (the third line, the accepted forms, and what "None" means), the control notebook's guide, the CHANGELOG's F33 entry, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 4: `_WHOLE_TEXT`, `_whole_number`, `_as_given`, `_whole`, `session_minutes`, `build_request`'s session branch, `session_plan`, and `plan_lines`); tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1`; `docs/troubleshooting.md`, `fabric/control/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode and the bundled Python:
+
+- Fabric.ControlNotebook: 69 passed, 0 failed, 0 az calls.
+- With b481889b's notebook and the tests kept, 6 tests fail:
+  - the plan test (45.5, None, "abc", True, and 20.5 now refused as not whole; "20" and 150.0 quoted as given; 45.5 at 18:40 with the auto-shutdown's tail; "90", " 90 ", and 90.0 planned as 90);
+  - the `build_request` test (14 more requests, and the plan going ahead exactly when the request is built, for the same minutes, for 520 values at 09:00);
+  - Run all with 45.5, None, and "abc", which now send nothing and quote the value, and with "90", which now runs a 90-minute session and sends the int 90.
+- **The reviewer's check, repeated:** old and new `session_plan` and `plan_lines`, for whole numbers from 30 to 120 at every minute of 2026-11-14, with and without an auto-shutdown, in UTC and US Eastern: 524,160 comparisons against b481889b and 524,160 against 17be6286 (before F33), 0 differences. Every key of the old plan has the same value in the new one, and the lines are the same.
+- The 14 other suites that read the control notebook or its guide (ActivityControl, Destroy, FabricApp, FabricItem, FabricTrack, FirstRun, Golden, HistorySnapshot, Lifecycle, OneCommand, SafetyStop, Tracks, Fabric.Notebooks, and Docs.Walkthrough): 1,520 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped. PSScriptAnalyzer on the test file: 0 findings; it's ASCII-only. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live;** the notebook reaches a Fabric workspace with the next `./scripts/deploy.ps1`.
+- **A showcase without `maxMinutes`** now has no upper bound for a session, where `build_request` raised a KeyError. The catalog always has it (setup bakes the showcase's 120 into it).

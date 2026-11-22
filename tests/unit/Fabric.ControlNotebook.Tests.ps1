@@ -472,7 +472,9 @@ with contextlib.redirect_stdout(buffer):
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False},
-                          "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150}}.get(scenario, {}))
+                          "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150},
+                          "askedfraction": {"DURATION_MINUTES": 45.5}, "askednone": {"DURATION_MINUTES": None}, "askedtext": {"DURATION_MINUTES": "abc"},
+                          "askedstring": {"DURATION_MINUTES": "90"}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
             if index == 2:
@@ -698,13 +700,66 @@ try:
     out.append({"ok": True, "body": json.dumps(build_request("stop", catalog=catalog))})
 except ValueError as error:
     out.append({"ok": False, "error": str(error)})
+# A whole number however it arrives (the review of F33): DURATION_MINUTES, intensity, and concurrency as text or as a whole
+# float go as the int; anything else is refused, as before.
+REQUESTED_BY = "notebook"
+for action, kwargs in [
+    ("session", dict(session_id=sid, duration_minutes="90")),
+    ("session", dict(session_id=sid, duration_minutes=" 90 ")),
+    ("session", dict(session_id=sid, duration_minutes=90.0)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "deadlock-storm", "intensity": "8", "concurrency": 3.0}], duration_minutes="20")),
+    ("session", dict(session_id=sid, duration_minutes=45.5)),
+    ("session", dict(session_id=sid, duration_minutes=None)),
+    ("session", dict(session_id=sid, duration_minutes="abc")),
+    ("session", dict(session_id=sid, duration_minutes=True)),
+    ("session", dict(session_id=sid, duration_minutes="20")),
+    ("session", dict(session_id=sid, duration_minutes=150.0)),
+    ("session", dict(session_id=sid, duration_minutes="9_0")),
+    ("session", dict(session_id=sid, duration_minutes="\u0669\u0660")),
+    ("run", dict(activities=[{"target": "T1", "scenario": "cpu-pressure", "intensity": 8.5}], duration_minutes=20)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "cpu-pressure", "intensity": True}], duration_minutes=20)),
+]:
+    try:
+        out.append({"ok": True, "body": json.dumps(build_request(action, catalog=catalog, **kwargs), separators=(",", ":"))})
+    except ValueError as error:
+        out.append({"ok": False, "error": str(error)})
+# The plan and the request read a session's DURATION_MINUTES the same way (session_minutes): at 09:00, with the day ahead,
+# the plan goes ahead exactly when the request is built, and for the same minutes.
+nine = dt.datetime(2026, 11, 14, 9, 0, tzinfo=dt.timezone.utc)
+values = (list(range(-5, 201)) + [minutes + 0.5 for minutes in range(25, 125)] + [float(minutes) for minutes in range(25, 125)] +
+          [str(minutes) for minutes in range(25, 125)] +
+          [" 30 ", "+90", "90.0", "120.", "", "abc", "1e2", "9_0", None, True, False, [90], float("nan"), float("inf")])
+disagree = []
+for value in values:
+    plan = session_plan(nine, value, catalog)
+    try:
+        built = build_request("session", duration_minutes=value, catalog=catalog, session_id=sid)["durationMinutes"]
+    except ValueError:
+        built = None
+    if plan["ok"] != (built is not None) or (built is not None and (type(built) is not int or built != plan["asked"])):
+        disagree.append(repr(value))
+print(json.dumps({"values": len(values), "disagree": disagree}))
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false, $true, $true, $false)
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false, $true, $true, $false, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $false, $false, $false)
+        # A whole number however it arrives (the review of F33): it goes as the int, and the runbook accepts it (below).
+        foreach ($index in 34, 35, 36) {
+            $results[$index].body | Should -BeExactly '{"action":"session","requestedBy":"notebook","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":90}'
+        }
+        $results[37].body | Should -BeExactly '{"action":"run","requestedBy":"notebook","durationMinutes":20,"activities":[{"target":"T1","scenario":"deadlock-storm","intensity":8,"concurrency":3}]}'
+        # A fraction, None, text that isn't a whole number, a bool, or a whole number outside the bounds, as before.
+        foreach ($index in 38..45) {
+            $results[$index].error | Should -Match 'DURATION_MINUTES must be a whole number from 30 to 120'
+        }
+        $results[46].error | Should -Match 'intensity must be a whole number from 1 to 10'
+        $results[47].error | Should -Match 'intensity must be a whole number from 1 to 10'
+        $agreement = ($output | Select-Object -Last 2 | Select-Object -First 1) | ConvertFrom-Json
+        $agreement.values | Should -BeGreaterThan 500
+        @($agreement.disagree) | Should -BeNullOrEmpty -Because 'the plan and the request read DURATION_MINUTES the same way (session_minutes)'
         # Run from the Insights app's Manage (ADR 0029): REQUESTED_BY names the verified caller, within the runbook's name rule.
         $results[31].body | Should -BeExactly '{"action":"session","requestedBy":"app/ops@contoso.example","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":90}'
         $results[32].body | Should -BeExactly '{"action":"reset","requestedBy":"app/ops@contoso.example","targets":["T1"]}'
@@ -777,6 +832,15 @@ for label, hour, minute, asked, rules in (("asked20", 14, 20, 20, {}), ("asked20
     shown = dict(catalog, session=dict(catalog.get("session") or {}, **rules))
     plan = ns["session_plan"](dt.datetime(2026, 11, 14, hour, minute, tzinfo=dt.timezone.utc), asked, shown)
     out[label] = {"ok": plan["ok"], "out": plan["durationOut"], "lines": ns["plan_lines"](plan, shown)}
+# DURATION_MINUTES however it arrives (the review of F33): a whole number as an int, a whole float, or text of one; anything
+# else is refused before the request, and quoted as it was given.
+for label, value in (("fraction", 45.5), ("none", None), ("text", "abc"), ("bool", True), ("fraction20", 20.5), ("text20", "20"),
+                     ("float150", 150.0)):
+    plan = ns["session_plan"](dt.datetime(2026, 11, 14, 14, 20, tzinfo=dt.timezone.utc), value, catalog)
+    out[label] = {"ok": plan["ok"], "out": plan["durationOut"], "lines": ns["plan_lines"](plan, catalog)}
+out["fractionLate"] = ns["plan_lines"](ns["session_plan"](dt.datetime(2026, 11, 14, 18, 40, tzinfo=dt.timezone.utc), 45.5, catalog), catalog)
+nine = dt.datetime(2026, 11, 14, 9, 0, tzinfo=dt.timezone.utc)
+out["as90"] = [ns["plan_lines"](ns["session_plan"](nine, value, catalog), catalog) == out["morning"]["lines"] for value in ("90", " 90 ", 90.0)]
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
@@ -808,6 +872,25 @@ print(json.dumps(out))
         @($plan.asked150.lines) | Should -Be @('Nothing is started: a session runs at most 120 minutes, and you asked for 150.', 'Fix: set DURATION_MINUTES to 120 or less, then Run all again.')
         # Without an auto-shutdown, it read "This session runs 20 minutes" while it sent nothing.
         @($plan.asked20none.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20.', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        # The review of F33: the plan read DURATION_MINUTES with int(), so 45.5 was "This session runs 45 minutes" and the
+        # request then raised a ValueError; None and "abc" raised in the plan; True was "you asked for 1". Now a value that
+        # isn't a whole number is refused before anything is sent, quoted as it was given.
+        $notWhole = 'Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again.'
+        foreach ($case in @(@('fraction', '45.5'), @('none', 'None'), @('text', '"abc"'), @('bool', 'True'), @('fraction20', '20.5'))) {
+            $result = $plan.($case[0])
+            $result.ok | Should -BeFalse -Because $case[0]
+            $result.out | Should -Be 'notWhole' -Because $case[0]
+            @($result.lines) | Should -Be @(('Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for {0}.' -f $case[1]), $notWhole) -Because $case[0]
+        }
+        # A whole number given as text or as a float, outside the bounds: the bound it's past, quoted as it was given.
+        $plan.text20.out | Should -Be 'short'
+        @($plan.text20.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for "20".', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        $plan.float150.out | Should -Be 'long'
+        @($plan.float150.lines) | Should -Be @('Nothing is started: a session runs at most 120 minutes, and you asked for 150.0.', 'Fix: set DURATION_MINUTES to 120 or less, then Run all again.')
+        # The auto-shutdown is named too when it also leaves too little time.
+        @($plan.fractionLate) | Should -Be @('Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45.5. The VMs'' nightly auto-shutdown at 19:00 (UTC) is too soon for one now, too.', 'Fix: set DURATION_MINUTES to a whole number from 30 to 120, and Run all again earlier in the day, or set autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        # "90", " 90 ", and 90.0 plan as 90 does.
+        @($plan.as90) | Should -Be @($true, $true, $true)
     }
 
     It 'lists the showcase''s beats as the runner plans them: cycles from each target''s start, T4''s tier, and its replica' {
@@ -1346,6 +1429,10 @@ print(json.dumps(out))
         @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
         @{ Case = 'a duration under a session''s 30 minutes: nothing starts, and it names the duration, not the auto-shutdown (F33, live 2026-11-21)'; Scenario = 'askedshort'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at least 30 minutes, and you asked for 20\.\s+Fix: set DURATION_MINUTES to 30 or more, then Run all again\.' }
         @{ Case = 'a duration over a session''s 120 minutes: nothing starts, and it names the duration, rather than a plan cut short by the auto-shutdown and a request that fails (F33)'; Scenario = 'askedlong'; Start = '2026-11-14T09:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at most 120 minutes, and you asked for 150\.\s+Fix: set DURATION_MINUTES to 120 or less, then Run all again\.' }
+        @{ Case = 'a duration that isn''t a whole number: nothing starts, and it quotes the duration, rather than plan 45 minutes and then fail the request (F33''s review)'; Scenario = 'askedfraction'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45\.5\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'no duration: nothing starts, and it says so, rather than a TypeError (F33''s review)'; Scenario = 'askednone'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for None\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'a duration that isn''t a number: nothing starts, and it quotes it, rather than a ValueError (F33''s review)'; Scenario = 'askedtext'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for "abc"\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'a duration given as text, as a pipeline or the Fabric job API can pass it: the session runs it (F33''s review)'; Scenario = 'askedstring'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 90 minutes, until 15:30 \(UTC\)\.' }
         @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
@@ -1434,9 +1521,15 @@ print(json.dumps(out))
         if ($Scenario -in 'active', 'stopnow') {
             $report.sent[0].sessionId | Should -Be ('a' * 32)
         }
-        if ($Scenario -in 'askedshort', 'askedlong') {
-            # The duration asked is the cause (F33): neither the auto-shutdown nor a plan cut short by it is named.
-            $report.printed | Should -Not -Match 'too soon|minutes asked'
+        if ($Scenario -in 'askedshort', 'askedlong', 'askedfraction', 'askednone', 'askedtext') {
+            # The duration asked is the cause (F33): neither the auto-shutdown nor a plan cut short by it is named, and no
+            # plan says a session runs (the review of F33: 45.5 read "This session runs 45 minutes", then the request failed).
+            $report.printed | Should -Not -Match 'too soon|minutes asked|This session runs'
+        }
+        if ($Scenario -eq 'askedstring') {
+            # "90" goes as the int 90, which the runbook accepts (Test-DbHubControlRequest), not as text.
+            $report.sent[0].durationMinutes | Should -BeOfType ([long])
+            $report.sent[0].durationMinutes | Should -Be 90
         }
         if ($Scenario -eq 'stoppedend') {
             # A plain stop for whatever runs, then that session's history, with its metrics and window, after its telemetry.
