@@ -120,25 +120,27 @@ function bucketAt(original: unknown, ms: number): unknown {
 /**
  * The history's binned points, one per interval: Azure Monitor's metrics of T4, its read replica, and T5, or the notebook's
  * SQL telemetry, with no off-grid analysis. The history keeps every save, each at its own grain (1 to 1,440 minutes), so
- * one minute can be in several. By pointKey, `intervals` holds each kept point's span (what it covers, for coverage and
- * sums) and `grains` its save's step (Azure Monitor's or the notebook's interval, to step runs by and name).
+ * one minute can be in several. By pointKey, so a consumer that decodes the kept rows still finds them: `intervals` holds
+ * each kept point's span (what it covers, for coverage and sums), `grains` its save's step (Azure Monitor's or the
+ * notebook's interval, to step runs by and name), `sources` the point that each piece of a coarser point came from, and
+ * `upperBounds` the pieces that are an upper bound.
  *
  * - A point's grain is its save's step: the smallest gap in any of the save's series (T5's hourly metrics, at least an
  *   hour). Its data is its interval's inside its save's window, so a save that starts or ends inside an interval cuts it.
  * - The finest grain is kept first, and of equal grains the newest save.
  * - A coarser point is left out only where the kept points cover all of it. Otherwise it stays for the minutes they
  *   don't cover: a count or a total (addsUp) as its total less theirs, and a maximum or an average only when it's higher
- *   than every point it overlaps. Each uncovered stretch is a point of its own, at its start, with its own span and the
- *   coarser point's `SourceKey`; a total is split across stretches by their length. A peak over two or more stretches is
- *   given to each, marked `UpperBound`: it's one reading, from somewhere in them. A lower peak keeps no point, but still
- *   covers its stretches, so a yet coarser save's peak can't land where it says the value was lower.
+ *   than every point it overlaps. Each uncovered stretch is a point of its own, at its start, with its own span and its
+ *   source; a total is split across stretches by their length. A peak over two or more stretches is given to each, as
+ *   upper bounds: it's one reading, from somewhere in them. A lower peak keeps no point, but still covers its stretches,
+ *   so a yet coarser save's peak can't land where it says the value was lower.
  *
  * So no minute counts twice, and none is lost. In a live test's history (2026-11-21), the newest-per-bin rule kept a
  * day-long save's 15-minute totals beside the session's own 1-minute points, so T5's requests counted twice. Dropping
  * every coarser point that overlaps would have lost the replica's 34 s of lag from 16:57 to 17:00, after the session's
  * window ended. Assumes nested, aligned grids: each grain divides the next, counted from midnight UTC.
  */
-export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; intervals: Map<string, number>; grains: Map<string, number> } {
+export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; intervals: Map<string, number>; grains: Map<string, number>; sources: Map<string, string>; upperBounds: Set<string> } {
     const familyOf = (row: Row) => (row.TargetKey === "T5" ? "cosmos" : row.TargetKey === "T4" || row.TargetKey === "T4-replica" ? "postgres" : "sql");
     const captureOf = (row: Row) => `${String(row.CapturedAt)}|${familyOf(row)}`;
     const seriesOf = (row: Row) => `${String(row.TargetKey)}|${String(row.AnalysisKey ?? "")}|${String(row.Metric)}`;
@@ -186,14 +188,18 @@ export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; interval
     const kept: Array<{ row: Row; at: number }> = [];
     const intervals = new Map<string, number>();
     const grains = new Map<string, number>();
-    const keep = (p: Point, start: number, end: number, value: number | null, marks?: Row) => {
-        const row = start === p.at && value === p.value && !marks ? p.row : { ...p.row, Bucket: bucketAt(p.row.Bucket, start), Value: value, ...marks };
+    const sources = new Map<string, string>();
+    const upperBounds = new Set<string>();
+    const keyOf = (p: Point, at: number) => pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(at));
+    const keep = (p: Point, start: number, end: number, value: number | null, piece?: { upper: boolean }) => {
+        const row = start === p.at && value === p.value && !piece ? p.row : { ...p.row, Bucket: bucketAt(p.row.Bucket, start), Value: value };
         kept.push({ row, at: start });
-        if (p.grain > 0) {
-            const key = pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(start));
-            intervals.set(key, end - start);
-            grains.set(key, p.grain);
-        }
+        if (p.grain <= 0) return;
+        const key = keyOf(p, start);
+        intervals.set(key, end - start);
+        grains.set(key, p.grain);
+        if (piece) sources.set(key, keyOf(p, p.at));
+        if (piece?.upper) upperBounds.add(key);
     };
     for (const group of groups.values()) {
         // The finest grain first, a point of unknown grain last; of equal grains, the newest capture.
@@ -209,22 +215,21 @@ export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; interval
             const gaps = gapsIn(under, p.start, p.end);
             if (gaps.length === 0 || p.value === null || p.grain === 0) continue;
             const values = under.map((s) => s.value).filter((v): v is number => v !== null);
-            const source = { SourceKey: pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(p.at)) };
             if (addsUp(p.row)) {
                 const pieces = shares(Math.max(0, p.value - values.reduce((a, b) => a + b, 0)), gaps.map(([from, to]) => to - from));
                 gaps.forEach(([from, to], i) => {
-                    keep(p, from, to, pieces[i], source);
+                    keep(p, from, to, pieces[i], { upper: false });
                     insert(taken, { start: from, end: to, value: pieces[i] });
                 });
                 continue;
             }
             const higher = values.length === 0 || p.value > Math.max(...values);
             for (const [from, to] of gaps) {
-                if (higher) keep(p, from, to, p.value, gaps.length > 1 ? { ...source, UpperBound: true } : source);
+                if (higher) keep(p, from, to, p.value, { upper: gaps.length > 1 });
                 insert(taken, { start: from, end: to, value: p.value });
             }
         }
     }
     kept.sort((a, b) => a.at - b.at);
-    return { kept: kept.map((k) => k.row), intervals, grains };
+    return { kept: kept.map((k) => k.row), intervals, grains, sources, upperBounds };
 }
