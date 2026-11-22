@@ -444,7 +444,9 @@ BeforeAll {
                         })
                 }
                 if ($script:runCommands.ContainsKey($listed)) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@($script:runCommands[$listed]) + $open) } -Depth 8))
+                    # An entry can be a scriptblock, run at each list: a Run Command Azure lists only for a while.
+                    $raw = @($script:runCommands[$listed] | ForEach-Object { if ($_ -is [scriptblock]) { & $_ } else { $_ } })
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($raw + $open) } -Depth 8))
                 }
                 if ($open.Count -gt 0) {
                     return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@(@{ name = ('DbHubControl-{0}-20261026000000' -f $listed) }, @{ name = 'DbHubDemo-Other' }) + $open) } -Depth 8))
@@ -3383,14 +3385,36 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         # own list keeps it, as Azure did, whatever is asked of it.
         Set-FixtureRunner
         $script:rcaListOpen = $true
+        $began = $script:clock
         $stuck = 'DbHubControl-rca-archost01-0102-{0}' -f $script:clock.AddHours(-3).ToString('yyyyMMddHHmmss')
         $script:runCommands['archost01'] = @(@{ name = $stuck; properties = @{ provisioningState = 'Deleting' } })
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
         $result.status | Should -Be 'Stopped'
-        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' }).Count | Should -Be 1 -Because 'a name more than an hour old holds nothing up'
+        $hostExport = @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' })
+        $hostExport.Count | Should -Be 1 -Because 'a name more than an hour old holds nothing up for long'
+        # The re-review of e55e000b: its delete first, for 90 s from the export's start; then beside it, as stuck.
+        $hostExport[0].At | Should -BeGreaterOrEqual $began.AddSeconds(90)
         $result.rca.status | Should -Be 'Pass'
         $status = Get-SessionStatus
         @($status.rca.leftVms) | Should -BeNullOrEmpty
+    }
+
+    It 'waits for the delete of an hour-old Rca Run Command before the T2 host''s export, and sends once Azure no longer lists it (re-review of e55e000b)' {
+        # A crashed job's leftover, finished: Get-DbHubRcaRoom deletes it, and Azure lists it for 20 s more.
+        Set-FixtureRunner
+        $script:rcaListOpen = $true
+        $began = $script:clock
+        $script:leftover = 'DbHubControl-rca-archost01-0102-{0}' -f $script:clock.AddHours(-3).ToString('yyyyMMddHHmmss')
+        $script:goneAt = $script:clock.AddSeconds(20)
+        $script:runCommands['archost01'] = @({ if ($script:clock -lt $script:goneAt) { @{ name = $script:leftover; properties = @{ provisioningState = 'Deleting' } } } })
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $script:rcaDeleted | Should -Contain $script:leftover -Because 'Get-DbHubRcaRoom asks for its delete'
+        $hostExport = @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' })
+        $hostExport.Count | Should -Be 1
+        $hostExport[0].At | Should -BeGreaterOrEqual $script:goneAt -Because 'R871: never beside its delete'
+        $hostExport[0].At | Should -BeLessThan $began.AddSeconds(90) -Because 'it goes once the delete is done, not at the bound'
+        $result.rca.status | Should -Be 'Pass'
     }
 
     It 'says the T2 host''s Run Commands couldn''t be listed, not that another job''s were there, when its list fails to the stop''s deadline (review of 242a3ef7)' {

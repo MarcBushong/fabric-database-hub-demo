@@ -4652,6 +4652,10 @@ With them, at the coordinator's request: high contrast's selected and hovered na
     - **The fix:** the key's own point is the coarsest the history holds at its time, read before one point per interval is kept (`coarsestIntervals` in `sources.ts`). `finestPerInterval` is unchanged, since the shared one will replace it. A key with nothing in its point's interval still answers "No episode".
   - **Low, errors and deadlocks:** the capture's own episodes of them have no samples of their own, so neither a fall nor "still on" can be told. Such an episode says whether it was still on isn't known, and the review of 803f2b1a's entry above says which families read a fall.
   - **Tests:** 15 new or changed tests fail with 97fdf5ba's modules, and the one that keeps the cut-off case passes with both. Each of nine parts, taken out alone, fails its own: the rise's first point, the next point at the floor, the rise's own conflicts, the evidence without states, the 429s' span, the end where the minutes read end, the episode with no samples, the key's coarsest point, and the explanation's end.
+- **The re-review of e55e000b: 1 Low.** Both of e55e000b's fixes held, checked under Windows PowerShell 5.1.
+  - **The Low:** an old leftover's delete ran beside the export's first T2 Run Command. `Get-DbHubRcaRoom` asks Azure to delete every export Run Command more than an hour old without waiting, and since e55e000b the list that follows leaves them out, so the export went in the same pass as their deletes (R871's overlap). For one stuck in Deleting (F31), that's the accepted trade-off. But a crashed job's finished leftover, which Azure deletes in seconds, ran beside the new export instead of being waited for: the reviewer's run sent the T2 export at +0 s, beside the cleanup's delete.
+  - **The fix:** while Azure still lists such old ones, the T2 host waits for their deletes, up to 90 s from the export's start, and then sends beside those still listed, as stuck. At a stop, most of the 90 s is within its 60 s after the mark.
+  - **Tests:** 2 in `Automation.Runbooks` fail with e55e000b's runbook. A leftover Azure lists for 20 s gets the export once it's gone, before the 90 s; and one stuck in Deleting gets the export at 90 s, still in the stop.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4837,6 +4841,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
 
   PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
+- **The re-review of e55e000b:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` (312), the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, and `Rca.Contract` passed: 1,087 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI. With e55e000b's runbook, the 2 tests of the wait fail. PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks). Step 1.8 retired the three that only it could:
 

@@ -6093,6 +6093,10 @@ $script:DbHubRcaMaxJsonBytes = 16MB
 # A stop lists the T2 host this long after its mark (review of 242a3ef7): a re-check that read the mark open just before it
 # can still send there, after its three PUTs and Send-DbHubRunCommand's two 10-s conflict waits.
 $script:DbHubRcaStopHostDelaySeconds = 60
+# How long from an export's start the T2 host waits for the deletes of export Run Commands more than an hour old, which
+# Get-DbHubRcaRoom has just asked for (re-review of e55e000b): a finished leftover goes in seconds, so the export doesn't run
+# beside its delete (R871); one Azure still lists after this is stuck in Deleting (F31), and the export goes beside it.
+$script:DbHubRcaStaleWaitSeconds = 90
 
 function Get-DbHubRcaSetting {
     # The export's bounds from the settings (Get-DemoActivityControlRunbookSetting), with their defaults, and whether these
@@ -6528,7 +6532,8 @@ function Invoke-DbHubRcaExport {
 
     $settings = $Context.Settings
     $bounds = Get-DbHubRcaSetting -Settings $settings
-    $stamp = (Get-DbHubUtcNow).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+    $startedUtc = Get-DbHubUtcNow
+    $stamp = $startedUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $prefix = [string]$settings.runCommandPrefix
     # Read in the script blocks below.
     $finalExport = [bool]$Final
@@ -6574,7 +6579,8 @@ function Invoke-DbHubRcaExport {
     }
     # A VM's first Run Command of this export, with its export when it has one to send (WantExport): none once the
     # session's stop has begun (above), and on the T2 host none while Azure lists another job's export Run Commands there
-    # (R871): it's Waiting, tried again at each poll, and Busy at the deadline.
+    # (R871), or, up to DbHubRcaStaleWaitSeconds from this export's start, hour-old ones being deleted: it's Waiting, tried
+    # again at each poll, and Busy at the deadline.
     $start = {
         param([object] $State)
         $State.Waiting = $false
@@ -6598,6 +6604,12 @@ function Invoke-DbHubRcaExport {
             $listed = Get-DbHubRcaListed -Context $Context -VmName $State.Vm
             $State.ListFailed = -not $listed.Ok
             if (-not $listed.Ok -or @($listed.Names).Count -gt 0) {
+                $State.Waiting = $true
+                return
+            }
+            # The hour-old ones Get-DbHubRcaRoom has just asked Azure to delete: their deletes first, for a bounded time from
+            # this export's start, then beside one that's stuck (re-review of e55e000b).
+            if (@($listed.Stale).Count -gt 0 -and (Get-DbHubUtcNow) -lt $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)) {
                 $State.Waiting = $true
                 return
             }
