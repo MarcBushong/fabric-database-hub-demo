@@ -5472,3 +5472,27 @@ The read-only answer, first:
 - Where Azure puts the refusal is documented only as a message: if it ever came at the template's validation instead of from the server's operation, the template would fail as before, with Azure's message, rather than move the fallback on.
 - The quota's name in Azure's message isn't documented (Learn's `{0}`); the reason quotes what Azure gives.
 - Not proven live: no quota refusal has occurred. The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### `destroy.ps1 -WhatIf` in a non-interactive shell (2026-11-22)
+
+**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read's `Remove-Item` of its temporary file inherited `$ConfirmPreference` 'Low' and asked, which a non-interactive shell refuses. In a terminal, the same run asked before that question too: to record the guard's context, and to delete each Azure CLI call's temporary file.
+
+**Work summary.**
+
+- **`Remove-DemoEnvironment`** follows the golden snapshot's pattern: everything before the one question only reads (the guard, the group's existence and tags, `Get-DemoDestroyExtraPlan`, whose parts only read, and the golden group's existence), so it runs with `$WhatIfPreference` off and `$ConfirmPreference` 'None'. The caller's values come back for the question, so `-WhatIf` still ends at it (**Not selected**) and `-Confirm` still asks it, whether they were passed or inherited; after a yes, nothing asks again.
+- **`Invoke-DemoAzCli`** deletes its own temporary file without asking (`-Confirm:$false`), as it already did under `-WhatIf`, for any caller with `-Confirm`.
+- **The test** (`DbHubDemo.Destroy.Tests.ps1`) runs `destroy.ps1` in a `pwsh -NonInteractive` child with this module and a stand-in Azure CLI first on PATH: it answers only the subscription guard, as a service principal (no Microsoft Graph read), with one token per audience, and fails every other call, as a read that can't be made; a proxy on a closed port stops any HTTP call. With `-WhatIf`, the run ends at **Not selected**, exit 0, with the plan's own token requests made and only reads sent. Without `-Force`, it stops at its one question, after the plan, and the prompt is `Remove-DemoEnvironment`'s, not an Azure CLI call's.
+- **Docs:** the cleanup guide's commands (one question, and `-WhatIf` asks nothing), the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Remove-DemoEnvironment.ps1`, `scripts/modules/DbHubDemo/Private/Invoke-DemoAzCli.ps1`, `tests/unit/DbHubDemo.Destroy.Tests.ps1`, `docs/cleanup.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 799 passed in DbHubDemo.Destroy, DbHubDemo.Teardown, DbHubDemo.Guard, DbHubDemo.Golden, DbHubDemo.Lifecycle, DbHubDemo.KeyVault, DbHubDemo.Validation, Repo.LifecycleScripts, and Repo.TestAzGuard. One failed, on this PC only: Teardown's "skips every live teardown test" check imports Pester by name in a child process, which here finds a broken OneDrive copy of Pester 5.9.1, so the live tests fail instead of skipping. It fails on b97bdcdb the same way, and with the machine-wide Pester 5.9.1 all 11 skip, as the check expects.
+- Both new tests fail on b97bdcdb's code (the test file copied into a worktree of it): the preview with "PowerShell is in NonInteractive mode" at `Invoke-DemoAzCli.ps1`'s `Remove-Item`, as live.
+- PSScriptAnalyzer: no new findings (9 before and after, all in the test file's helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- The reads before the question now run under `-WhatIf` too; they're the ones a confirmed run makes, and none writes (the writes are `Invoke-DemoDestroyExtra`'s and later, after the question).
+- Not run live: Final tests' next destroy can preview with `-WhatIf` first.

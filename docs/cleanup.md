@@ -40,10 +40,10 @@ With `fabric.manageCapacity` true, destroy also pauses a Fabric capacity that `s
 
 | Command | What it does |
 |---|---|
-| `./scripts/destroy.ps1` | Asks, then runs the steps above for the configured environment (`-ConfigPath`, default `config/demo.config.json`) |
+| `./scripts/destroy.ps1` | Asks once, with the list of what it deletes and keeps, then runs the steps above for the configured environment (`-ConfigPath`, default `config/demo.config.json`) |
 | `./scripts/destroy.ps1 -Force` | The same without asking (the **destroy** workflow passes it after you type the environment's name again) |
 | `./scripts/destroy.ps1 -KeepFabric` | Keeps the demo's and the control's Fabric workspaces, with their items and the history in the lakehouse |
-| `./scripts/destroy.ps1 -WhatIf` | Reads only: nothing is deleted, and no manifest is written (`DESTROY.RESOURCEGROUP` is **Not selected**) |
+| `./scripts/destroy.ps1 -WhatIf` | Reads only and asks nothing, so it runs in a non-interactive shell too, such as an assistant's (since 2026-11-22): it lists what it would delete and keep; nothing is deleted, and no manifest is written (`DESTROY.RESOURCEGROUP` is **Not selected**) |
 | `./scripts/destroy.ps1 -IfExpired` | Deletes only after the day of the group's `expiresOn` tag (the **expiry** workflow) |
 | `./scripts/destroy.ps1 -IncludeGolden` | Also deletes `rg-<prefix>-golden` and its T2 golden snapshots; the next deploy makes T2 again, with no person |
 | `./scripts/destroy.ps1 -WithoutGolden` | Changes nothing now: it overrides `DESTROY.GOLDEN.GUARD`, which no longer refuses anything, because a configuration's `PaygWizard` runs as `JumpstartImage` |

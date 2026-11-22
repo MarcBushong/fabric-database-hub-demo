@@ -10,7 +10,9 @@ function Invoke-DemoAzCli {
     PowerShell's own quoting is pinned to Legacy so it passes those quotes through unchanged.
     Callers decide with ShouldProcess whether a command runs. Under a caller's -WhatIf, the inherited
     $WhatIfPreference would skip the stderr redirection and the temporary file's deletion (Phase 14
-    finding), so it's pinned to $false here, for both paths.
+    finding), so it's pinned to $false here, for both paths; and under a caller's -Confirm, the inherited
+    $ConfirmPreference would ask before that file goes, which a non-interactive shell refuses (2026-11-22), so it
+    goes without asking.
 
     With -TimeoutSeconds, the CLI runs as a child process with no console input, and the whole process
     tree is stopped when it doesn't finish in time: ExitCode is then -1 and StdErr says so. A token request
@@ -52,7 +54,7 @@ function Invoke-DemoAzCli {
         $stderr = Get-Content -LiteralPath $errorFile -Raw -ErrorAction SilentlyContinue
     }
     finally {
-        Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $errorFile -Force -Confirm:$false -ErrorAction SilentlyContinue
     }
 
     [pscustomobject]@{
