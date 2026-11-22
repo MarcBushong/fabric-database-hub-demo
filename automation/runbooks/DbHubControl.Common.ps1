@@ -5071,6 +5071,39 @@ function Get-DbHubReplicaSizeOrder {
     return $order.ToArray()
 }
 
+function Get-DbHubReplicaSizeNote {
+    <#
+    .SYNOPSIS
+    The status's note when a session's read replica runs on another size (Used) than T4's (Asked), from their vCores
+    (Get-DbHubT4VCore): only a size with more vCores costs more. The next size tried has T4's vCores when the documented
+    sizes have one (Get-DbHubReplicaSizeOrder), and those, Standard_D4ds_v5 and Standard_D4ads_v5, have the same price per
+    vCore (the Azure Retail Prices API, 2026-11-22). OverQuota: Azure refused a size over the subscription's vCore quota
+    (F37). Pure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Asked,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Used,
+
+        [switch] $OverQuota
+    )
+
+    $why = if ($OverQuota) { ' over the subscription''s vCore quota' } else { '' }
+    $askedVCores = Get-DbHubT4VCore -SkuName $Asked
+    $usedVCores = Get-DbHubT4VCore -SkuName $Used
+    # A size whose vCores its name doesn't give, or fewer than T4's (which the order never asks for): no claim on its cost.
+    $what = '; ./scripts/estimate-cost.ps1 shows what it costs'
+    if ($askedVCores -gt 0 -and $usedVCores -gt $askedVCores) {
+        $what = ', which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference'
+    }
+    elseif ($askedVCores -gt 0 -and $usedVCores -eq $askedVCores) {
+        $what = ', which has T4''s vCores at the same price per vCore'
+    }
+    return ('Azure refused T4''s size ({0}) for the replica{1}, so it runs on {2}{3}.' -f $Asked, $why, $Used, $what)
+}
+
 function Send-DbHubT4ReplicaCreate {
     <#
     .SYNOPSIS
@@ -5643,8 +5676,8 @@ function Complete-DbHubSessionReplica {
     $part['sizeUsed'] = $used
     if ($used -and $part['sizeAsked'] -and $used -cne [string]$part['sizeAsked']) {
         # A refusal over the subscription's vCore quota says so (F37, 2026-11-22).
-        $why = if (@($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0) { ' over the subscription''s vCore quota' } else { '' }
-        $part['note'] = 'Azure refused T4''s size ({0}) for the replica{2}, so it runs on {1}, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' -f $part['sizeAsked'], $used, $why
+        $overQuota = @($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0
+        $part['note'] = Get-DbHubReplicaSizeNote -Asked ([string]$part['sizeAsked']) -Used $used -OverQuota:$overQuota
     }
     $parameter = Set-DbHubT4ReplicaParameter -Context $Context -Name $Work.Name -Milliseconds $setting.StreamingDelayMs
     if (-not $parameter.Ok) {

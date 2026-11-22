@@ -5496,3 +5496,26 @@ The read-only answer, first:
 
 - The reads before the question now run under `-WhatIf` too; they're the ones a confirmed run makes, and none writes (the writes are `Invoke-DemoDestroyExtra`'s and later, after the question).
 - Not run live: Final tests' next destroy can preview with `-WhatIf` first.
+
+### Run all's replica note: costs more only with more vCores (2026-11-22)
+
+**Why.** 201a6666's review of b97bdcdb (F37) found a Low that predates F37: when a session's read replica ran on another size than T4's, Run all's note said it "has more vCores and costs more" whenever the sizes differed. The next size tried has T4's vCores when the documented sizes have one (`Get-DbHubReplicaSizeOrder`): with T4 on `Standard_D4ds_v5`, the replica falls back to `Standard_D4ads_v5`, with the same 4 vCores at the same price per vCore, and F37 makes that the likely fallback for a quota refusal, since it's another size family. The note is the Replica step's message, which the notebook prints. F37's test matched only the sentence's start, so it passed.
+
+**Work summary.**
+
+- **`Get-DbHubReplicaSizeNote`** (new, pure, in the control runbook) writes the note from both sizes' vCores (`Get-DbHubT4VCore`): more vCores than T4's cost more, as before; T4's vCores are "at the same price per vCore"; and a size whose name gives no vCores, or one with fewer (which the order never asks for), gets no claim on its cost, only `./scripts/estimate-cost.ps1`. `Complete-DbHubSessionReplica` uses it, with the quota's words from F37.
+- **The price claim:** the documented replica sizes are General Purpose `Standard_D2ds_v5`, `Standard_D4ds_v5`, and `Standard_D4ads_v5`, so the sizes with the same vCores are `Standard_D4ds_v5` and `Standard_D4ads_v5`. Their meters have the same per-vCore prices in each region checked (West US 3, East US 2, Central US, North Europe, UK South, West Europe, Japan East, and Australia East) in the Azure Retail Prices API on 2026-11-22. The note gives no price, as the module's T4 fallback says the same ([ADR 0016](adr/0016-cost-profiles.md)).
+- **Docs:** the CHANGELOG and this report.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 346 passed, none failed, in Automation.Runbooks and DbHubDemo.T4Replica.
+- 8 of the new and extended tests fail on 4a6a7b36's runbook: the helper's 6 cases, since it's missing, and both sessions' full sentences (the fallback for `SkuNotAvailable`, with the Replica step's message, and for the quota). The new session with more vCores (T4 on `Standard_D2ds_v5`, the replica on `Standard_D4ds_v5`) passes on both, since it pins the wording that stays.
+- PSScriptAnalyzer: none in the runbook; no new findings in the test file. markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- A documented size with T4's vCores at another price per vCore (another tier or series, such as ADR 0019's proposed v6 rungs) would need the middle case to compare prices; the helper's comment states the assumption.
+- The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.

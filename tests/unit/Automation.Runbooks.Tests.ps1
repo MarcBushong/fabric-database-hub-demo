@@ -1414,8 +1414,23 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status = Get-SessionStatus
         $status.replica.sizeUsed | Should -Be 'Standard_D4ads_v5'
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('SkuNotAvailable', 'Accepted')
-        $status.replica.note | Should -Match 'Azure refused T4''s size \(Standard_D4ds_v5\) for the replica, so it runs on Standard_D4ads_v5'
+        # Standard_D4ads_v5 has T4's 4 vCores at the same price per vCore, so it costs no more (201a6666's Low, 2026-11-22).
+        $note = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.'
+        $status.replica.note | Should -BeExactly $note
+        $replicaStep = @($status.steps | Where-Object step -EQ 'Replica')
+        $replicaStep.Count | Should -Be 1
+        $replicaStep[0].message | Should -BeExactly ('T4''s read replica (pgreplica01-abc123) is Ready. {0}' -f $note) -Because 'the notebook prints the Replica step''s message'
         $script:groupTags['DbHubT4ReplicaSize'] | Should -Be 'Standard_D4ads_v5@any'
+    }
+
+    It 'says the replica costs more only when the size it runs on has more vCores than T4''s' {
+        $script:t4Sku = 'Standard_D2ds_v5'
+        $script:replicaRefuse = @('Standard_D2ds_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D2ds_v5', 'Standard_D4ds_v5')
+        $status = Get-SessionStatus
+        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D2ds_v5) for the replica, so it runs on Standard_D4ds_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.'
     }
 
     It 'moves to the next size when Azure refuses one over the subscription''s vCore quota, and says so (F37, 2026-11-22)' {
@@ -1425,7 +1440,7 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
         $status = Get-SessionStatus
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('QuotaExceeded', 'Accepted')
-        $status.replica.note | Should -Match '^Azure refused T4''s size \(Standard_D4ds_v5\) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5'
+        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D4ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.'
     }
 
     It 'names the quota and its ways out when Azure refuses every size, some over the quota' {
@@ -1799,6 +1814,17 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @(Get-DbHubReplicaSizeOrder -T4SkuName $T4 -Record $Record -Sizes $sizes) | Should -Be $Expected
         $module = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ T4 = $T4; Record = $Record } { Get-DemoT4ReplicaSizeOrder -T4SkuName $T4 -Record $Record | ForEach-Object SkuName })
         $module | Should -Be $Expected -Because 'the runbook and the module follow the same order'
+    }
+
+    It 'says what the replica''s size costs from its vCores against T4''s: <Case>' -ForEach @(
+        @{ Case = 'the same vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.' }
+        @{ Case = 'more vCores'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
+        @{ Case = 'over the quota'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ds_v5'; OverQuota = $true; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ds_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
+        @{ Case = 'fewer vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D2ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D2ds_v5; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'a size whose name gives no vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_Custom'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_Custom; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'T4''s size gives no vCores'; Asked = 'Standard_Custom'; Used = 'Standard_D4ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_Custom) for the replica, so it runs on Standard_D4ds_v5; ./scripts/estimate-cost.ps1 shows what it costs.' }
+    ) {
+        Get-DbHubReplicaSizeNote -Asked $Asked -Used $Used -OverQuota:$OverQuota | Should -BeExactly $Expected
     }
 
     It 'combines metric points into intervals as the module does (shared cases)' {
