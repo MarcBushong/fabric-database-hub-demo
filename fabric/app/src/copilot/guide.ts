@@ -53,6 +53,7 @@ ${live}
 - Incidents: EVALUATE TOPN ( 20, 'Incident Windows', 'Incident Windows'[Window Start UTC], DESC )
 - T5 (Azure Cosmos DB): its measures pick its metrics themselves, so filter only the target and the period. Its latest capture is CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ), and that capture's window is its period:
   EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], TREATAS ( { "T5" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "PeakNormRuPct", [Peak Norm RU (%)], "Throttled429", [Throttled Requests (429s)], "RuConsumed", [RU Consumed] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
+- A per-bin T5 series can show bins of different lengths side by side: a session's own capture is every minute, and a later day-long one every 15 minutes covers the rest of the day, each period from its finest capture. So a 15-minute bin's requests or 429s read higher than a 1-minute bin's at the same rate: compare totals over a period, not one bin with the next.
 - Findings that need attention: filter 'Analysis Findings' with RELATED ( 'Status'[Needs Attention] ) = "Yes".
 - A string column's values: EVALUATE TOPN ( 50, VALUES ( 'Telemetry Snapshots'[Metric] ) ).
 - Return names that are easy to chart: "CpuPct" rather than "[CPU (%)]".

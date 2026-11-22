@@ -5137,3 +5137,66 @@ The read-only answer, first:
 - **Query time:** per visual cell, the measure reads the series' saves (and, for Azure Monitor, their bins), and the finer rows only in a partly covered interval. The check measures it against today's (at most about twice).
 - **Where it can differ from `finestPerInterval`** ([limitations](limitations.md#the-history-models-overlapping-saves-f35)): rows missing inside a finer save's window, three or more intervals at once, a save with a single bin, and a SQL save with a hand-set `BIN_MINUTES`. Live, the check compares both.
 - **Rounding:** a remainder of floating-point totals can be a tiny number rather than 0, in DAX and in TypeScript alike, so the check compares to within rounding.
+
+### F35 part 2's reviews: coverage by rows (2026-11-22)
+
+**Why.** Two reviews of 602e18a1.
+
+- **The static review** found 1 Medium and 1 Low:
+  - With three saves at 1, 5, and 15 minutes, totals counted twice even when every save agreed. A bin's finest row stood for its 5-minute row too, so the 15-minute remainder subtracted only the 1-minute rows, and the minutes only the 5-minute row held counted in both: 1,080 ms for 16:45 to 17:00, and 10,980 for 15:00 to 18:00, where 900 and 10,800 are.
+  - `./scripts/stop-demo.ps1 -SaveHistory` saved a window whose last minutes' SQL telemetry hadn't arrived, and the model took that window for its rows.
+- **Final tests ran it on the live test's model (dbhubrb).**
+  - The per-bin values matched the TypeScript reference in all 6,856 bins.
+  - 7 of 31 window measures fell short of `finestPerInterval`'s: a finer save's window stood for its rows. The session's SQL rows of T1 and T2 start at 15:31, a minute after its window holds 15:30, so the day's 15:30 point, with 1,204 s of T1's waits and 377 MB of its IO more than they, was left out. T2's sparse lock waits lost 0.1 s at 15:45 the same way.
+  - The window and Estate checks never reached the new measure: a model measure reads the deployed `Snapshot Value` whatever a query defines.
+  - `rows.dax` timed out (HTTP 500 after 242 s, twice).
+  - Final tests' own variant, with the dependent measures defined, ran the Estate query in 2,251 ms against 1,467 (1.53× end to end).
+
+**The coordinator's decisions.**
+
+- Coverage by rows, not windows, to match `finestPerInterval`, with the three-grain case handled by the shared function's finest-first order.
+- The check queries define every dependent measure they evaluate; `rows.dax` becomes three queries; a replica-lag measure joins the window check.
+- The Estate and T5 queries at most about 2× today's, end to end, measured again after the change.
+- The producer fix: `stop-demo.ps1 -SaveHistory` passes `WINDOW_END_UTC` as now less `TELEMETRY_LAG_MINUTES`.
+- Ask's guide says a per-bin T5 series can show bins of different lengths, and the latent filter on Captured At gets a note.
+
+**Work summary.**
+
+- **The measure** (`Telemetry Snapshots.tmdl`). Per save of a series, its rows' extent (first and last bin, cut to its window) and whether it has a row in every interval between them:
+  - No finer save's rows reach a point's interval: the point stays, with no read.
+  - One finer save has a row in every one of its intervals across it: the point is covered and left out, with no read.
+  - Otherwise the measure reads the finer saves' rows of the series whole, the same read for every bin of the series, and filters them to the interval in the formula engine. It ranks them by save, the finest first and then the newest, and each later save's rows keep what the shared function keeps of them against the earlier ones: all of a row with nothing earlier under it, nothing where earlier rows cover it, or else a total less theirs, never below 0. Four levels, the fourth holding the fourth and later saves.
+  - The point is left out where those rows cover it; otherwise a total keeps what's left after what they keep, and a peak stays only when it's higher than each of them not covered itself.
+  - The read takes its saves from `SeriesSaves`, so an outside filter on Captured At UTC hides a save there too: the latent case the static review asked a note for is gone, and the comment says why.
+- **The TypeScript reference** (`fabric/app/src/data/snapshot-value.ts`) in step, with the same levels, extents, and shortcuts, and a save's extent from `rows-saves.dax`'s markers (First, Last, Count). On the RCA fixture of the live rows, its T5 totals now equal `finestPerInterval`'s (51,591 requests and 27,808 429s; the window rule gave 51,382).
+- **The checks** (`fabric/powerbi/checks/f35`, written by a generator from the TMDL):
+  - Each `-f35` query defines the new `Snapshot Value` and every measure it evaluates or reads, with the TMDL's expressions.
+  - `rows-sql.dax`, `rows-saves.dax` (each SQL save's extent per series), and `rows-monitor.dax` replace `rows.dax`, and `scripts/f35-reference.ts` reads all three.
+  - The window checks add the read replica's lag peak, a measure both define in the query, since the model has none.
+  - `t5-today.dax` and `t5-f35.dax` time the Azure Monitor path.
+  - The README gives the session's SQL window as 15:19:04 to 16:59:04; its Azure Monitor captures' was 15:14 to 16:57.
+- **`stop-demo.ps1 -SaveHistory`** (`Save-DemoFabricHistory`) passes `WINDOW_END_UTC`, now less the notebook's `TELEMETRY_LAG_MINUTES` (15), with `WINDOW_MINUTES` 720 as before, so its window holds only minutes whose SQL telemetry has arrived, as Run all's save waits it out. T4's and T5's documents keep their own windows (the notebook's Azure Monitor parser doesn't read the SQL window). Its message says the window's end, and its evidence `windowEndUtc`.
+- **Ask's guide:** a per-bin T5 series can show bins of different lengths side by side, so compare totals over a period.
+- **Docs:** ADR 0014's amendment (coverage by rows, its cost, the producer fix, what still differs), the limitations (the list of differences cut to what's still true, and stop-demo's window), troubleshooting, the report spec, the measure's description and the model guide, `docs/deployment.md`, stop-demo's help, and the CHANGELOG.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`; `fabric/powerbi/checks/f35/` (`rows.dax` replaced by three; `t5-today.dax` and `t5-f35.dax` new; the README); `fabric/powerbi/_brief/report-spec.md`; `fabric/app/src/data/snapshot-value.ts` and its test; `fabric/app/scripts/f35-reference.ts`; `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`; `scripts/modules/DbHubDemo/Private/FabricCapacityHelpers.ps1`, `scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1`, and `scripts/stop-demo.ps1`; `tests/unit/Fabric.PowerBI.Tests.ps1` and `DbHubDemo.FirstRun.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `docs/deployment.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **The app** (`npm run typecheck`, `npm run lint`, `vitest run`): 384 passed, 0 failed. The reference has 12 tests, 4 of them new. At 602e18a1, 5 fail:
+  - the two live cases: the session's rows starting after its window does (the day's 15:30 left out, 1,204 ms in the test), and a sparse finer series (100 ms left out);
+  - the two three-save cases: 16:45 reads 540 and 420, where 360 and 240 are;
+  - a save known from its marker alone.
+- **The reviewer's numbers,** by the old and the new rule on the same rows: 1,080 and 10,980 ms before, and 900 and 10,800 after, the shared function's.
+- **The guide's T5 test** pins the new sentence.
+- **Pester** with StrictMode:
+  - Fabric.PowerBI, DbHubDemo.PowerBI, and DbHubDemo.FirstRun: 140 passed, 0 failed, 1 skipped (the report generator's npm packages aren't installed).
+  - Repo.*: 207 passed, 0 failed, 3 skipped.
+  - At 602e18a1, the two changed Power BI checks fail (3 whole-save reads, not 6; check files without the dependent measures), and so does the new FirstRun test (no `WINDOW_END_UTC`).
+- **PSScriptAnalyzer:** no finding in the changed scripts; the test files' findings are the same as at HEAD. markdownlint: clean. The PowerShell is ASCII-only, and no live resource name is in the tree.
+
+**Risks.**
+
+- **Query time, not measured yet:** the row path now runs wherever a finer save's rows reach a coarse point and no single finer save is dense across it, so more points than before reach it (every coarse point a sparse finer series overlaps, not only those at a window's edge). Each such point reads the finer saves' rows of its series whole (one storage-engine query per series and set of finer saves, served from the cache after the first) and filters in the formula engine. Final tests measures the Estate and T5 queries against today's; over about 2×, the next step is to batch that read per visual cell.
+- **The DAX hasn't run on an engine in this form:** brackets and `VAR`/`RETURN` blocks are checked mechanically, and the check files are the first run, then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`.
+- **B's history has two saves per period:** the three-save rule is proven by the TypeScript reference alone, until a history with a session, a stop-demo save, and an update is checked.

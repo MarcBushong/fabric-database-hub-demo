@@ -83,6 +83,8 @@ describe("the model guide", () => {
         expect(rules).toContain(`TREATAS ( { "T5" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "PeakNormRuPct", [Peak Norm RU (%)]`);
         // Before F35's model, a period's sums counted two captures of it, so the guide filtered T5 to its latest run alone.
         expect(rules).not.toMatch(/LatestRun|both count in sums|pick each bin's latest capture/);
+        // Its bins can differ in length, a session's every minute beside a day-long capture's every 15 (F35's review).
+        expect(rules).toContain("A per-bin T5 series can show bins of different lengths side by side");
         const columns = new Set(rules.match(/'[^']+'\[[^\]]+\]/g));
         expect(columns.size).toBeGreaterThan(8);
         for (const column of columns) expect(MODEL_GUIDE).toContain(column);

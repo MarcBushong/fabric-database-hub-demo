@@ -325,7 +325,7 @@ All many-to-one, single direction, active, with matching data types. No bidirect
 Every numeric and date measure has a format string, every measure has a description in TMDL (`///`), and each lives on the table it summarizes, in a display folder; text measures return text that is already formatted. Helper measures that return colors, flags, or keys are hidden. Two patterns carry most of the logic:
 
 - **Each interval from its finest save (F35).** Overlapping notebook runs store the same time more than once, each at its own interval: a session's own save every minute, a 12-hour one every 5 minutes, and an update's day-long one every 15. Azure Monitor's saves of T4 and T5 step from 1 to 1,440 minutes. `Snapshot Value` takes, per target, analysis, metric, and bin, each save's point there, by the rule of `fabric/app/src/data/finest-per-interval.ts`: the finest interval first, then the newest save.
-  - A coarser point is left out where a finer save's window covers all of it. Otherwise it stays for the minutes the finer saves don't cover: a total (waits, counters, IO, T5's requests, 429s, and RU, T4's failed connections) as what's left of it after their points in its interval, and a maximum or an average only when it's higher than all of them.
+  - A coarser point is left out where the finer saves' rows, cut to their windows, cover all of it. Otherwise it stays for the minutes they don't cover: a total (waits, counters, IO, T5's requests, 429s, and RU, T4's failed connections) as what's left of it after what those rows keep, and a maximum or an average only when it's higher than all of them. With three or more saves at an interval, their rows are taken in the shared rule's order, so an intermediate save's remainder counts once.
   - Its remainder shows at its own bin's start, so window totals and peaks are exact, and a per-bin chart can show a remainder up to one coarse bin early at a save window's edges.
   - Inside a save it sums across instances and files. Analyses off the bin grid keep the newest capture. Every telemetry measure builds on it.
 - **Bins first, then aggregate.** Per-bin signals are evaluated per target and bin, then averaged (CPU), maximized (peaks), or summed (waits, requests, IO) over the selection.
@@ -364,10 +364,11 @@ SUMX (
     //   from midnight UTC, and that its window can hold them in), T5's hourly metrics at least 60. A save is read
     //   whole, whatever the period selected.
     // Each save's point at this bin, over its interval cut to its window:
-    //   no finer save overlaps it: the point;
-    //   one finer save's window covers it: BLANK;
-    //   else, from the finer rows in its interval (the finest and newest of each bin, and of nested ones the
-    //   coarser): a total as what's left of it, a maximum or an average only when it's higher.
+    //   no finer save's rows reach it: the point;
+    //   one finer save has a row in every one of its intervals across it: BLANK;
+    //   else, from the finer saves' rows in its interval, the finest save first, then the newest, each keeping what the
+    //   shared rule keeps of it: BLANK where they cover it, else a total less what they keep, or a maximum or an average
+    //   only when it's higher than each of them not covered itself.
     // Then totals add, maxima and averages take the highest.
 )
 

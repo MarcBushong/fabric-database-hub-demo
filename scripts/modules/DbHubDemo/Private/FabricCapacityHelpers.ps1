@@ -16,6 +16,12 @@ $script:FabricCapacityDoc = [ordered]@{
     NotebookParams = 'https://learn.microsoft.com/fabric/data-engineering/notebook-public-api'
 }
 
+# The live-activity notebook's TELEMETRY_LAG_MINUTES: SQL telemetry reaches Database Hub up to 15 minutes after the activity.
+# stop-demo.ps1's history save ends its window that long before it runs (F35's review), as Run all's save waits it out, so
+# it claims only minutes whose telemetry has arrived: the history model and finestPerInterval take a finer save's rows for
+# the minutes it claims, and a later day-long save then holds what it couldn't.
+$script:HistoryTelemetryLagMinutes = 15
+
 function Get-DemoFabricCapacitySetting {
     <#
     .SYNOPSIS
@@ -465,7 +471,10 @@ function Save-DemoFabricHistory {
     of it (evidence capacityInactive; live finding, 2026-11-10), which doesn't mean the lakehouse is missing. The run
     (Invoke-DemoFabricNotebookRun) saves only: SAVE_RESULTS true, and, for a notebook imported before 2026-11-14 whose Run
     all sent an activity request through GitHub, CONFIRM and STOP_ACTIVITY false and no Key Vault, which today's notebook
-    doesn't have (ADR 0026). It writes only the lakehouse's history tables. T4's metrics go with the run only when the
+    doesn't have (ADR 0026). It writes only the lakehouse's history tables. Its SQL window is the -WindowMinutes that end
+    TELEMETRY_LAG_MINUTES (15) before it runs (WINDOW_END_UTC, F35's review): the minutes after them, whose telemetry hasn't
+    arrived yet, go with the next save that holds them, such as deploy.ps1's day-long snapshot. T4's metrics go with the run
+    only when the
     workspace's notebook knows POSTGRES_METRICS (Test-DemoFabricNotebookParameter, 2026-11-16); otherwise it's a Warning
     that says so, with PostgresDropped. T5's (2026-11-18, ADR 0027) go only when it knows COSMOS_METRICS; otherwise the
     message says so, and they stay in Azure Monitor for a later run (CosmosDropped). Returns Result, StillRunning (the run
@@ -537,11 +546,16 @@ function Save-DemoFabricHistory {
     if ($capacity -and $capacity.status -eq 'Manual action required' -and $capacityState -and $capacityState -ine 'Active') {
         return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the workspace''s capacity is {0}, so notebooks can''t run.' -f $capacityState) @{ capacityState = $capacityState } $capacityFix)
     }
+    # The SQL window ends TELEMETRY_LAG_MINUTES ago, so it claims only minutes whose telemetry has arrived; T4's and T5's
+    # documents keep their own windows (the notebook reads them as they are).
+    $windowEnd = [datetime]::UtcNow.AddMinutes(-$script:HistoryTelemetryLagMinutes)
+    $over = 'over the {0} minutes until {1} UTC, whose SQL telemetry has arrived' -f $WindowMinutes, $windowEnd.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
     $parameters = [ordered]@{
         CONFIRM        = $false
         STOP_ACTIVITY  = $false
         SAVE_RESULTS   = $true
         WINDOW_MINUTES = $WindowMinutes
+        WINDOW_END_UTC = $windowEnd.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
         KEY_VAULT_URL  = ''
         RESOURCE_GROUP = (Get-DemoResourceGroupName -Config $Config)
     }
@@ -571,7 +585,7 @@ function Save-DemoFabricHistory {
     $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name 'NB_DatabaseHub_LiveActivity' -Parameter $parameters -Token $token -TimeoutMinutes $TimeoutMinutes
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')
     $stillRunning = $run.status -eq 'Warning' -and $jobStatus -notin 'Completed', 'Failed', 'Cancelled', 'Deduped', ''
-    $evidence = [ordered]@{ windowMinutes = $WindowMinutes; jobStatus = $jobStatus; seconds = (Get-DemoMemberValue -InputObject $run.evidence -Name 'seconds') }
+    $evidence = [ordered]@{ windowMinutes = $WindowMinutes; windowEndUtc = $parameters['WINDOW_END_UTC']; jobStatus = $jobStatus; seconds = (Get-DemoMemberValue -InputObject $run.evidence -Name 'seconds') }
     if ($postgresWithheld) {
         $evidence['postgresMetrics'] = 'withheld'
     }
@@ -583,14 +597,14 @@ function Save-DemoFabricHistory {
         # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
         # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
         $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
-        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}' -f $WindowMinutes, $postgresWithheld, $cosmosNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
+        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand {0}. T4''s metrics weren''t sent: {1}.{2}' -f $over, $postgresWithheld, $cosmosNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
     }
     if ($run.status -eq 'Pass' -and $cosmosWithheld) {
         $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' }
-        return (& $answer 'Warning' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}{2}' -f $WindowMinutes, $run.message, $cosmosNote) $evidence ('{0}; then ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor.' -f $updateFix))
+        return (& $answer 'Warning' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand {0}. {1}{2}' -f $over, $run.message, $cosmosNote) $evidence ('{0}; then ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor.' -f $updateFix))
     }
     if ($run.status -eq 'Pass') {
-        return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}' -f $WindowMinutes, $run.message) $evidence)
+        return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand {0}. {1}' -f $over, $run.message) $evidence)
     }
     if ($stillRunning) {
         return (& $answer 'Warning' ('The history run was still {0} after {1} minutes; it keeps running in Fabric, so the capacity wasn''t paused under it.' -f $jobStatus, $TimeoutMinutes) $evidence 'Check the run in the workspace (Monitor hub); once it''s done, run stop-demo.ps1 again to pause the capacity the demo resumed.' $true)

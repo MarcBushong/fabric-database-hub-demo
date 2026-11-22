@@ -123,12 +123,13 @@ The session control (formerly the on-demand activity control) is part of every d
 The history keeps every save at its own interval. The history model's `Snapshot Value`, under every telemetry measure of the history report and of the Insights app's T1 to T3 views, takes each interval from its finest save ([ADR 0014](adr/0014-notebook-role-and-capacity.md#amendment-2026-11-22-overlapping-saves-each-interval-from-its-finest-save-f35)). The app's T4 and T5 pages and the incident RCA use the same rule on the rows.
 
 - **A remainder shows at its own bin's start:** where a coarser save holds minutes that a finer one doesn't, the model keeps what's left of it at the coarser bin's start. So a per-bin chart can show it up to one coarse bin early, at a save window's edges, and window totals and peaks don't change. For example, a day-long save's 34 s of replica lag for 16:57 to 17:00, after a session's 5-minute window ended at 16:57, shows in the model's 16:45 bin; the app's T4 page puts it at 16:57.
-- **Where the model can differ from the shared rule:** the model takes a finer save's window for its rows, and reads them only where that save covers part of an interval. So it can differ only where a finer save's rows don't hold what a coarser save holds for the same minutes:
-  - rows missing inside a finer save's window, where the coarser save has them: the model leaves those minutes of the coarser save out, and the shared rule keeps them;
-  - three or more intervals at the same minutes: the model takes what's left after the outermost finer rows;
-  - a save with a single bin, which the model reads as its window's coarsest interval, and a SQL save whose bin was set by hand (`BIN_MINUTES`), which it reads by its window's default.
+- **Where the model can differ from the shared rule:** it follows the rule by the rows each save holds, as `finestPerInterval` does, and can differ only in:
+  - a save's interval, which it reads from a SQL save's window and an Azure Monitor save's bins: a SQL save whose bin was set by hand (`BIN_MINUTES`) reads as its window's default, and an Azure Monitor save with a single bin as its window's coarsest interval;
+  - five or more saves at one interval, where the fifth and later are each compared with the first three alone;
+  - seconds at an edge, where a coarser save's own window ends inside an interval that two finer saves share.
 
-  In the live test's history (2026-11-21), the session's rows add up to the day-long save's totals, so none of these arise there, and `fabric/powerbi/checks/f35` compares both on a deployed model.
+  `fabric/powerbi/checks/f35` compares both on a deployed model's overlapping saves.
+- **`./scripts/stop-demo.ps1 -SaveHistory` saves the SQL telemetry up to 15 minutes before it runs** (since 2026-11-22): the last minutes' telemetry hasn't arrived yet, so they go with the next save that holds them, such as `./scripts/deploy.ps1`'s snapshot at its end. Run all's own save waits for them instead.
 
 ## Not proven live yet
 

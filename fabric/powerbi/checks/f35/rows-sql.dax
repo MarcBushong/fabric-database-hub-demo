@@ -1,0 +1,24 @@
+// F35's live check, rows 1 of 3 for fabric/app/scripts/f35-reference.ts: every SQL row of the bins from 14:45 to 17:30.
+// Read-only; no resource names.
+// B's session (2026-11-21): its SQL save's window was 15:19:04 to 16:59:04 UTC, and its Azure Monitor captures' 15:14 to
+// 16:57, inside a day-long save four hours later. Bins from 15:00 to 17:15 hold the partly covered 15-minute ones at both ends.
+EVALUATE
+VAR NearFrom = DATE ( 2026, 11, 21 ) + TIME ( 14, 45, 0 )
+VAR NearTo = DATE ( 2026, 11, 21 ) + TIME ( 17, 30, 0 )
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            'Telemetry Snapshots'[Bucket UTC] >= NearFrom,
+            'Telemetry Snapshots'[Bucket UTC] < NearTo,
+            NOT ( 'Telemetry Snapshots'[Analysis Key] IN { "postgresql", "cosmosdb", "wait_profile", "estate_pulse", "memory_clerks", "database_growth", "telemetry_coverage" } )
+        ),
+            "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+            "TargetKey", 'Telemetry Snapshots'[Target Key],
+            "AnalysisKey", 'Telemetry Snapshots'[Analysis Key],
+            "Metric", 'Telemetry Snapshots'[Metric],
+            "Value", 'Telemetry Snapshots'[Value],
+            "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+            "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+            "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )

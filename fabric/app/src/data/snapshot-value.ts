@@ -17,6 +17,29 @@ interface Save {
     from: number;
     to: number;
     grain: number;
+    /** What its rows of the series cover: from its first row's start to its last row's end, cut to its window. */
+    rowFrom: number;
+    rowTo: number;
+    /** A row in every interval from its first to its last, so its rows cover all of [rowFrom, rowTo). */
+    dense: boolean;
+}
+
+/** A finer save's row in a coarser point's interval: its span, its save's rank there, and what it keeps and leaves taken. */
+interface Piece {
+    save: Save;
+    value: number;
+    from: number;
+    to: number;
+    rank: number;
+    kept: number;
+    taken: number | null;
+}
+
+/** The spans cover [from, to): no gap point, the start or a span's end inside it, lies outside every span. */
+function covers(spans: ReadonlyArray<{ from: number; to: number }>, from: number, to: number): boolean {
+    if (spans.length === 0) return false;
+    const points = [from, ...spans.filter((s) => s.to < to - EPSILON).map((s) => s.to)];
+    return points.every((x) => spans.some((s) => s.from <= x + EPSILON && s.to > x + EPSILON));
 }
 
 const text = (value: unknown) => (value === null || value === undefined ? "" : String(value));
@@ -48,15 +71,16 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
 
 /**
  * The measure's value for each target, analysis, metric, and bin (its SUMMARIZE groups), by key `target|analysis|metric|bin`
- * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there:
- * - No finer save of the series overlaps its interval: it stays whole. A finer save is a finer grain, or the same grain and
- *   newer.
- * - One finer save's window covers all of its interval: it's left out.
- * - Otherwise, from the series' rows in its interval (the finest and newest row of each bin, and of nested ones the coarser):
- *   a total stays as what's left of it, and a maximum or an average only when it's higher than all of them.
+ * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there, as finestPerInterval keeps it:
+ * - No finer save's rows reach its interval: it stays whole. A finer save is a finer grain, or the same grain and newer.
+ * - One finer save has a row in every one of its intervals across it: it's covered, and left out.
+ * - Otherwise, from the finer saves' rows in its interval, ranked by save (the finest first, then the newest), each row
+ *   keeps what the shared function keeps (all of it with nothing earlier under it, nothing when earlier rows cover it, or
+ *   else what's left of it), the fourth and later saves against the first three. Then a point that those rows cover is
+ *   left out; a total stays as what's left of it, and a maximum or an average only when it's higher than every one of
+ *   them that wasn't covered itself.
  * Totals add, and maxima and averages take the highest; a remainder shows at its own bin's start. Off the bin grid, the
- * newest capture. A finer save's window stands for its rows (the model can't read every finer row in every visual's cell),
- * so this agrees with finestPerInterval wherever a finer save's rows add up to the coarser total.
+ * newest capture. A row with no bin is a save only (rows.dax's markers), with its rows' extent in First, Last, and Count.
  */
 export function snapshotValues(rows: readonly Row[]): Map<string, number> {
     const bySeries = new Map<string, Row[]>();
@@ -83,9 +107,8 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
         const adds = ADDITIVE_ANALYSES.has(analysis) || ADDITIVE_METRICS.has(metric);
         const monitor = MONITOR_ANALYSES.has(analysis);
         const hourly = HOURLY_METRICS.has(metric);
-
-        // Off the grid, and rows without a bin: the newest capture, summed.
         const offGrid = OFF_GRID_ANALYSES.has(analysis);
+
         const byBin = new Map<string, Row[]>();
         for (const r of list) {
             const at = time(r.Bucket);
@@ -95,14 +118,44 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
             byBin.set(binKey, group);
         }
 
+        // Each save's rows of the series: their first and last bin and how many bins, from the rows, or from a marker.
+        const extents = new Map<number, { first: number; last: number; count: number }>();
+        const seen = new Map<number, Set<number>>();
+        for (const r of list) {
+            const at = time(r.Bucket);
+            const captured = time(r.CapturedAt);
+            if (at === null || captured === null) continue;
+            const bins = seen.get(captured) ?? new Set<number>();
+            bins.add(at);
+            seen.set(captured, bins);
+        }
+        for (const [captured, bins] of seen) extents.set(captured, { first: Math.min(...bins), last: Math.max(...bins), count: bins.size });
+        for (const r of list) {
+            const captured = time(r.CapturedAt);
+            const first = time(r.First);
+            const last = time(r.Last);
+            if (captured === null || first === null || last === null || r.Count === null || r.Count === undefined) continue;
+            extents.set(captured, { first, last, count: Number(r.Count) });
+        }
+
         const saves = new Map<number, Save>();
         for (const r of list) {
             const captured = time(r.CapturedAt);
             const from = time(r.WindowStart);
             const to = time(r.WindowEnd);
-            if (captured === null || from === null || to === null || saves.has(captured)) continue;
-            const grain = monitor ? monitorGrain(from, to, monitorBins.get(`${target}|${analysis}|${captured}`) ?? []) : sqlGrain(from, to);
-            saves.set(captured, { captured, from, to, grain: hourly ? Math.max(60, grain) : grain });
+            const extent = captured === null ? undefined : extents.get(captured);
+            if (captured === null || from === null || to === null || !extent || saves.has(captured)) continue;
+            const step = monitor ? monitorGrain(from, to, monitorBins.get(`${target}|${analysis}|${captured}`) ?? []) : sqlGrain(from, to);
+            const grain = hourly ? Math.max(60, step) : step;
+            saves.set(captured, {
+                captured,
+                from,
+                to,
+                grain,
+                rowFrom: Math.max(extent.first, from),
+                rowTo: Math.min(extent.last + grain * MINUTE, to),
+                dense: extent.count === Math.round((extent.last - extent.first) / (grain * MINUTE)) + 1,
+            });
         }
         // Each bin's value per save.
         const point = new Map<string, number>();
@@ -114,35 +167,50 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
             point.set(key, (point.get(key) ?? 0) + Number(r.Value));
         }
 
+        const finerThan = (s: Save, than: Save) => s.grain < than.grain || (s.grain === than.grain && s.captured > than.captured);
         const ownOf = (bin: number, save: Save, value: number): number | null => {
             const length = save.grain * MINUTE;
             let start = Math.max(bin, save.from);
             let end = Math.min(bin + length, save.to);
             if (start >= end) [start, end] = [bin, bin + length];
-            const finer = [...saves.values()].filter((s) => (s.grain < save.grain || (s.grain === save.grain && s.captured > save.captured)) && s.from < end && s.to > start);
+            const finer = [...saves.values()].filter((s) => finerThan(s, save) && s.rowFrom < end && s.rowTo > start);
             if (finer.length === 0) return value;
-            if (finer.some((s) => s.from <= start + EPSILON && s.to >= end - EPSILON)) return null;
-            // Partly covered: the series' rows in its interval, from finer saves, that overlap what it covers.
-            const inside: Array<{ at: number; captured: number; grain: number; value: number }> = [];
+            if (finer.some((s) => s.dense && s.rowFrom <= start + EPSILON && s.rowTo >= end - EPSILON)) return null;
+            // The finer saves' rows in its interval, each ranked by its save: the finest first, then the newest.
+            const pieces: Piece[] = [];
             for (const [key, v] of point) {
                 const [atText, capturedText] = key.split("|");
                 const at = Number(atText);
                 const s = saves.get(Number(capturedText));
-                if (!s || at < bin || at >= bin + length) continue;
-                if (!(s.grain < save.grain || (s.grain === save.grain && s.captured > save.captured))) continue;
+                if (!s || !finer.includes(s) || at < bin || at >= bin + length) continue;
                 let from = Math.max(at, s.from);
                 let to = Math.min(at + s.grain * MINUTE, s.to);
                 if (from >= to) [from, to] = [at, at + s.grain * MINUTE];
-                if (from < end && to > start) inside.push({ at, captured: s.captured, grain: s.grain, value: v });
+                pieces.push({ save: s, value: v, from, to, rank: 1 + finer.filter((q) => finerThan(q, s)).length, kept: v, taken: v });
             }
-            const first = inside.filter((p) => !inside.some((q) => q.at === p.at && (q.grain < p.grain || (q.grain === p.grain && q.captured > p.captured))));
-            const outer = first.filter((p) => !first.some((q) => q.grain > p.grain && q.at <= p.at && p.at < q.at + q.grain * MINUTE));
-            if (adds) return Math.max(0, value - outer.reduce((a, p) => a + p.value, 0));
-            return outer.length === 0 || value > Math.max(...outer.map((p) => p.value)) ? value : null;
+            // The first save's rows keep all they hold; each later level's, what finestPerInterval keeps of them.
+            let earlier = pieces.filter((p) => p.rank === 1);
+            for (const level of [2, 3, 4]) {
+                const rows = pieces.filter((p) => (level < 4 ? p.rank === level : p.rank >= 4));
+                for (const r of rows) {
+                    const under = earlier.filter((u) => u.from < r.to && u.to > r.from);
+                    const covered = covers(under, r.from, r.to);
+                    r.kept = under.length === 0 ? r.value : covered ? 0 : Math.max(0, r.value - under.reduce((a, u) => a + u.kept, 0));
+                    r.taken = covered ? null : r.value;
+                }
+                earlier = [...earlier, ...rows];
+            }
+            const under = earlier.filter((u) => u.from < end && u.to > start);
+            if (under.length === 0) return value;
+            if (covers(under, start, end)) return null;
+            if (adds) return Math.max(0, value - under.reduce((a, u) => a + u.kept, 0));
+            const taken = under.map((u) => u.taken).filter((t): t is number => t !== null);
+            return taken.length === 0 || value > Math.max(...taken) ? value : null;
         };
 
         for (const [binKey, group] of byBin) {
             if (binKey === "" || offGrid) {
+                if (binKey === "" && !offGrid && group.every((r) => r.Value === null || r.Value === undefined)) continue;
                 const newest = Math.max(...group.map((r) => time(r.CapturedAt) ?? -Infinity));
                 out.set(`${seriesKey}|${binKey}`, group.filter((r) => time(r.CapturedAt) === newest).reduce((a, r) => a + Number(r.Value), 0));
                 continue;
@@ -177,6 +245,7 @@ export const WINDOW_MEASURES: Record<string, { analysis: string; metric: (name: 
     Throttled: { analysis: "cosmosdb", metric: (m) => m === "ThrottledRequests", adds: true },
     RuConsumed: { analysis: "cosmosdb", metric: (m) => m === "TotalRequestUnits", adds: true },
     NormRuPeak: { analysis: "cosmosdb", metric: (m) => m === "NormalizedRUConsumption", adds: false },
+    ReplicaLagPeak: { analysis: "postgresql", metric: (m) => m === "physical_replication_delay_in_seconds", adds: false },
 };
 
 export interface F35Check {

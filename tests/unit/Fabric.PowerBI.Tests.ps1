@@ -223,25 +223,56 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
         $code | Should -Match ([regex]::Escape('bin_minutes = int(BIN_MINUTES) or (1 if span_minutes <= 120 else 5 if span_minutes <= 720 else 15)'))
     }
 
-    It 'reads each save whole, whatever the period selected: its saves, its step, and the rows of a partly covered interval' {
+    It 'reads each save whole, whatever the period selected: its saves, its step, its rows'' extent, and the rows of a partly covered interval' {
         # report_date_utc is each row's bin date, so a period through 'Date' would cut a day-long save at midnight and
         # change the step its bins give.
-        ([regex]::Matches($script:measure, [regex]::Escape("REMOVEFILTERS ( 'Date' )"))).Count | Should -Be 3
         $removes = @([regex]::Matches($script:measure, "REMOVEFILTERS \( 'Telemetry Snapshots'\[Bucket UTC\][^)]*\)") | ForEach-Object { $_.Value })
-        $removes.Count | Should -Be 3
+        $removes.Count | Should -Be 6
         $removes | ForEach-Object { $_ | Should -Match ([regex]::Escape("'Telemetry Snapshots'[Report Date UTC]")) }
+        ([regex]::Matches($script:measure, [regex]::Escape("REMOVEFILTERS ( 'Date' )"))).Count | Should -Be $removes.Count
     }
 
-    It 'checks a live model with the measure''s own expression, in read-only query files' {
-        $expected = & $script:squash $script:measure
-        $expected.Length | Should -BeGreaterThan 5000
-        foreach ($name in 'snapshot-value-bins.dax', 'window-f35.dax', 'estate-f35.dax') {
-            $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:checks -ChildPath $name))
-            $body = [regex]::Match($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[[^\]]+\] =\n(.*?)(?=^EVALUATE)").Groups[1].Value
-            & $script:squash $body | Should -BeExactly $expected -Because $name
+    It 'checks a live model with the measures'' own expressions, in read-only query files' {
+        $tmdlText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
+        $tmdlMeasure = {
+            param([string] $Name)
+            $quoted = "'" + $Name.Replace("'", "''") + "'"
+            $match = [regex]::Match($tmdlText, ("(?ms)^ {{4}}measure (?:{0}|{1}) =\n(.*?)(?=^ {{0,8}}\S)" -f [regex]::Escape($quoted), [regex]::Escape($Name)))
+            $match.Success | Should -BeTrue -Because $Name
+            & $script:squash $match.Groups[1].Value
         }
+        (& $tmdlMeasure 'Snapshot Value').Length | Should -BeGreaterThan 10000
+        $defined = @{}
+        foreach ($file in Get-ChildItem -LiteralPath $script:checks -Filter '*.dax' -File) {
+            $text = [System.IO.File]::ReadAllText($file.FullName)
+            $blocks = @([regex]::Matches($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[([^\]]+)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)"))
+            $names = @($blocks | ForEach-Object { $_.Groups[1].Value })
+            $defined[$file.Name] = $names
+            foreach ($block in $blocks | Where-Object { $_.Groups[1].Value -ne 'Replica Lag Peak (s)' }) {
+                $name = $block.Groups[1].Value
+                & $script:squash $block.Groups[2].Value | Should -BeExactly (& $tmdlMeasure ($name -replace ' F35$', '')) -Because ('{0} [{1}]' -f $file.Name, $name)
+            }
+            if ($file.Name -like '*-f35.dax') {
+                # A model measure reads the deployed Snapshot Value whatever a query defines (live, 602e18a1's first run): each
+                # measure a check evaluates, or that one of its measures reads, is defined in it.
+                $code = $text -replace '//[^\n]*', ''
+                $referenced = @([regex]::Matches($code, "(?<!['\w\]])\[([^\]@][^\]]*)\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'Value' } | Sort-Object -Unique)
+                $referenced.Count | Should -BeGreaterThan 3 -Because $file.Name
+                @($referenced | Where-Object { $names -notcontains $_ }) | Should -BeNullOrEmpty -Because $file.Name
+                $names[0] | Should -Be 'Snapshot Value' -Because $file.Name
+            }
+        }
+        $defined['snapshot-value-bins.dax'] | Should -Be @('Snapshot Value F35')
+        @($defined['window-f35.dax']).Count | Should -Be 15
+        # The read replica's lag has no model measure: both window checks define the same one.
+        $replica = foreach ($name in 'window-today.dax', 'window-f35.dax') {
+            $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:checks -ChildPath $name))
+            & $script:squash ([regex]::Match($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[Replica Lag Peak \(s\)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)").Groups[1].Value)
+        }
+        $replica[0] | Should -Match ([regex]::Escape('''Telemetry Snapshots''[Metric] = "physical_replication_delay_in_seconds"'))
+        $replica[1] | Should -BeExactly $replica[0]
         $files = @(Get-ChildItem -LiteralPath $script:checks -File | Sort-Object -Property Name | ForEach-Object { $_.Name })
-        $files | Should -Be @('estate-f35.dax', 'estate-today.dax', 'README.md', 'rows.dax', 'snapshot-value-bins.dax', 'window-f35.dax', 'window-today.dax')
+        $files | Should -Be @('estate-f35.dax', 'estate-today.dax', 'README.md', 'rows-monitor.dax', 'rows-saves.dax', 'rows-sql.dax', 'snapshot-value-bins.dax', 't5-f35.dax', 't5-today.dax', 'window-f35.dax', 'window-today.dax')
         foreach ($file in Get-ChildItem -LiteralPath $script:checks -File) {
             $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
             $bytes -contains 13 | Should -BeFalse -Because $file.Name

@@ -124,14 +124,97 @@ describe("Snapshot Value's rule in TypeScript, the model's reference (F35)", () 
         expect(snapshotValues([profile(a, 5), profile(b, 7), profile(b, 1)]).get("T3|wait_profile|Lock|")).toBe(8);
     });
 
-    it("reads a row with no bin and no value as a save only, as rows.dax exports one for each save near the session", () => {
+    it("reads a row with no bin and no value as a save only, with its rows' extent, as rows-saves.dax exports one for each save near the session", () => {
         const older = save("2026-11-21T16:00:00", "2026-11-20T16:00:00", "2026-11-21T16:00:00");
         const newer = save("2026-11-21T21:33:00", "2026-11-20T21:33:00", "2026-11-21T21:33:00");
         const rows: Row[] = [row(older, "T1", "wait_deltas", "Lock")(["15:15", 60])];
-        // The newer save's lock waits are all outside the rows exported; its window still holds 15:15.
-        const marker: Row = { Bucket: null, TargetKey: "T1", AnalysisKey: "wait_deltas", Metric: "Lock", Value: null, ...newer };
+        // The newer save's lock waits are all outside the rows exported; its marker says it has one in every 15 minutes from
+        // 12:00 to 18:00, so they cover 15:15.
+        const marker: Row = { Bucket: null, TargetKey: "T1", AnalysisKey: "wait_deltas", Metric: "Lock", Value: null, First: "2026-11-21T12:00:00", Last: "2026-11-21T18:00:00", Count: 25, ...newer };
         expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(60);
         expect(snapshotValues([...rows, marker]).has(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(false);
         expect(f35Check([...rows, marker], at("15:00"), at("17:15")).bins).toEqual({});
+        // With an interval missing, its rows decide, and none of those exported is at 15:15.
+        expect(snapshotValues([...rows, { ...marker, Count: 24 }]).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(60);
+    });
+
+    // 602e18a1 on the live test's model: a finer save's window stood for its rows, so a coarser point inside it was left out
+    // even where the finer rows didn't hold what it did. Now the rows decide, as in finestPerInterval.
+    describe("coverage by rows, not by windows", () => {
+        const session = save("2026-11-21T17:15:00", "2026-11-21T15:19:04", "2026-11-21T16:59:04");
+        const day = save("2026-11-21T21:33:00", "2026-11-20T21:33:00", "2026-11-21T21:33:00");
+        const expectWindow = (rows: Row[], target: string, seconds: number) => {
+            const { model, finest } = f35Check(rows, at("15:00"), at("17:15")).measures[target].LockWaitS;
+            expect(model).toBeCloseTo(seconds, 9);
+            expect(finest).toBeCloseTo(seconds, 9);
+        };
+
+        it("keeps a coarser total where the session's rows start after its window does", () => {
+            // The session's window starts at 15:19:04, its rows of T1 at 15:31: the day's 15:30 holds 1,204 ms more than they.
+            const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
+            const rows = [...minutes("15:31", Array.from({ length: 88 }, () => 60)).map(lock(session)), ...every("15:00", 15, [900, 900, 2044, 900, 900, 900, 900, 900, 900]).map(lock(day))];
+            const values = snapshotValues(rows);
+            const lockAt = (hhmm: string) => values.get(key("T1", "wait_deltas", "Lock", hhmm));
+            // Before its rows, the day's points stay whole; inside them, they're left out; at 16:45, 16:59 to 17:00 stays.
+            expect(["15:15", "15:30", "15:45", "16:45", "17:00"].map(lockAt)).toEqual([900, 1204, 60, 120, 900]);
+            expectWindow(rows, "T1", 9.244);
+        });
+
+        it("keeps a coarser total's remainder where a sparse finer series has minutes without a row", () => {
+            // T2's lock waits in the session are sparse: the day's 15:45 holds 100 ms in minutes the session has no row for.
+            const lock = (s: Record<string, string>) => row(s, "T2", "wait_deltas", "Lock");
+            const rows = [
+                ...(
+                    [
+                        ["15:47", 300],
+                        ["15:52", 200],
+                        ["16:10", 50],
+                    ] as const
+                ).map(lock(session)),
+                ...(
+                    [
+                        ["15:45", 600],
+                        ["16:00", 50],
+                    ] as const
+                ).map(lock(day)),
+            ];
+            const values = snapshotValues(rows);
+            const lockAt = (hhmm: string) => values.get(key("T2", "wait_deltas", "Lock", hhmm));
+            expect(["15:45", "15:47", "15:52", "16:00", "16:10"].map(lockAt)).toEqual([100, 300, 200, 0, 50]);
+            expectWindow(rows, "T2", 0.65);
+        });
+    });
+
+    // The review of 602e18a1: three saves at 1, 5, and 15 minutes, with T1's lock waits of 60 ms a minute in each. A bin's
+    // finest row stood for its 5-minute row too, so the day's remainder at 16:45 left out the minutes that only the 5-minute
+    // row held, and they counted twice: 1,080 ms for 16:45 to 17:00, and 10,980 for 15:00 to 18:00, where 900 and 10,800 are.
+    describe("three saves at 1, 5, and 15 minutes", () => {
+        const lock = (s: Record<string, string>, from: string, step: number, count: number, cut: Record<string, number> = {}) =>
+            every(from, step, Array.from({ length: count }, () => 60 * step)).map(([bucket, value]) => row(s, "T1", "wait_deltas", "Lock")([bucket, cut[bucket] ?? value]));
+        const day = lock(save("2026-11-21T21:33:00", "2026-11-20T21:33:00", "2026-11-21T21:33:00"), "14:00", 15, 20);
+        const lockAt = (rows: Row[], hhmm: string) => snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", hhmm));
+        const expectWindow = (rows: Row[]) => {
+            const { model, finest } = f35Check(rows, at("15:00"), at("18:00")).measures.T1.LockWaitS;
+            expect(model).toBeCloseTo(10.8, 9);
+            expect(finest).toBeCloseTo(10.8, 9);
+        };
+
+        it("counts each minute once after a Run all session, stop-demo.ps1 -SaveHistory, and an update", () => {
+            const session = lock(save("2026-11-21T17:02:00", "2026-11-21T15:14:00", "2026-11-21T16:47:00"), "15:14", 1, 93);
+            const stop = lock(save("2026-11-21T17:13:00", "2026-11-21T04:58:00", "2026-11-21T16:58:00"), "14:00", 5, 36, { "16:55": 180 });
+            const rows = [...session, ...stop, ...day];
+            // At 16:45: the session's 60, the 5-minute save's 180 for 16:47 to 16:50, and the day's 120 for 16:58 to 17:00.
+            expect(lockAt(rows, "16:45")).toBe(360);
+            expectWindow(rows);
+        });
+
+        it("counts each minute once after back-to-back sessions saved at 1 and 5 minutes, and an update", () => {
+            const first = lock(save("2026-11-21T17:02:00", "2026-11-21T15:14:00", "2026-11-21T16:47:00"), "15:14", 1, 93);
+            const second = lock(save("2026-11-21T20:13:00", "2026-11-21T16:47:00", "2026-11-21T19:58:00"), "16:45", 5, 39, { "16:45": 180, "19:55": 180 });
+            const rows = [...first, ...second, ...day];
+            // The sessions hold all of 16:45 to 17:00 between them, so the day adds nothing there: 60 and 180.
+            expect(lockAt(rows, "16:45")).toBe(240);
+            expectWindow(rows);
+        });
     });
 });

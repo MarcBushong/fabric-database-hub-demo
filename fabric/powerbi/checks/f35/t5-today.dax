@@ -1,0 +1,14 @@
+// F35's live check, timing on the Azure Monitor path: T5's measures per bin for B's day, in the shape Ask's guide teaches
+// (fabric/app/src/copilot/guide.ts), with today's Snapshot Value. Run it, then t5-f35.dax; F35 passes at no more than about
+// twice this one's time. The new measure reads each Azure Monitor save's bins for its interval in every bin's evaluation.
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Telemetry Snapshots'[Bucket UTC],
+    TREATAS ( { "T5" }, 'Target'[Target Key] ),
+    DATESBETWEEN ( 'Date'[Date], DATE ( 2026, 11, 21 ), DATE ( 2026, 11, 21 ) ),
+        "PeakNormRuPct", [Peak Norm RU (%)],
+        "Throttled429", [Throttled Requests (429s)],
+        "RuConsumed", [RU Consumed],
+        "Requests", [Cosmos DB Requests]
+)
+ORDER BY 'Telemetry Snapshots'[Bucket UTC]

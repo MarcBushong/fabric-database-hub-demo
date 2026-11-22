@@ -51,7 +51,8 @@ Save the session's history with NB_DatabaseHub_LiveActivity first (at most 15 mi
 paused. Not with -ParkT2 or -RemoveBastionOnly.
 
 .PARAMETER SaveHistoryWindowMinutes
-How far back the saved history goes (default 720).
+How far back the saved history goes (default 720), ending 15 minutes before the save runs, so it holds only minutes whose
+SQL telemetry has arrived.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
