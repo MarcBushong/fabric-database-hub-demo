@@ -16,7 +16,7 @@
 
 import { COSMOS_METRICS } from "@/data/model";
 import { recommend } from "./catalog";
-import { hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type Recommendation } from "./types";
+import { asWholeReadings, hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type Recommendation } from "./types";
 
 export interface ThroughputAnalysis {
     findings: Finding[];
@@ -36,7 +36,8 @@ const hhmm = (d: Date) => hhmmss(d).slice(0, 5);
 
 export function analyzeThroughput(input: { from: Date; to: Date; metrics: readonly MetricPoint[] }): ThroughputAnalysis {
     const { from, to } = input;
-    const series = (metric: string) => input.metrics.filter((m) => m.target === "T5" && m.metric === metric && m.value !== null && metricIn(m, from, to)).sort((a, b) => a.at.getTime() - b.at.getTime());
+    // A split point's pieces in these minutes as its one whole reading, over its save's whole interval (the review of c4c63abe).
+    const series = (metric: string) => asWholeReadings(input.metrics.filter((m) => m.target === "T5" && m.metric === metric && metricIn(m, from, to))).filter((m) => m.value !== null);
     const normalized = series(COSMOS_METRICS.normalizedRu);
     const requests = series(COSMOS_METRICS.requests);
     const throttled = series(COSMOS_METRICS.throttled);
@@ -44,11 +45,15 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
         return { findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: [`T5: Azure Monitor's normalized RU consumption isn't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC.`], details: {} };
     }
     const end = (m: MetricPoint) => new Date(m.at.getTime() + (m.intervalMs ?? 0));
+    // An interval whose length the read can't tell is said from its start only, and its counts as at its time (the review
+    // of c4c63abe: a 60-minute save's one point read "each 1-minute interval … from 15:00 to 15:00 UTC").
+    const until = (m: MetricPoint) => (m.intervalUnknown ? "" : ` to ${hhmm(end(m))}`);
     const full = normalized.filter((m) => (m.value ?? 0) >= 100);
     const peak = normalized.reduce((best, m) => ((m.value ?? 0) > (best.value ?? 0) ? m : best));
     const at100 = full.length ? full : [peak];
     // Azure Monitor's interval, its save's: a remainder of a coarser point spans only part of it (the shared finestPerInterval's grains).
     const minutes = Math.round((at100[0].grainMs ?? at100[0].intervalMs ?? 60_000) / 60_000);
+    const each = at100[0].intervalUnknown ? "each interval of its save, whose length isn't known in these minutes" : `each ${minutes}-minute interval`;
     // Only the intervals the sentence names (the review of 4e2c65ed: a window a minute past the episode added the next one).
     const named = (m: MetricPoint) => at100.some((n) => m.at.getTime() >= n.at.getTime() && m.at.getTime() < Math.max(end(n).getTime(), n.at.getTime() + 1));
     const sum = (rows: readonly MetricPoint[]) => rows.reduce((n, m) => n + (m.value ?? 0), 0);
@@ -62,10 +67,10 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
     const provisioned = provisionedPoint?.value ?? null;
 
     const those = at100.length > 1 ? "those intervals" : "that interval";
-    const where = full.length > 1 ? `each of the ${full.length} intervals from ${hhmm(at100[0].at)} to ${hhmm(end(at100[at100.length - 1]))} UTC` : `the interval from ${hhmm(peak.at)} to ${hhmm(end(peak))} UTC`;
+    const where = full.length > 1 ? `each of the ${full.length} intervals from ${hhmm(at100[0].at)}${until(at100[at100.length - 1])} UTC` : `the interval from ${hhmm(peak.at)}${until(peak)} UTC`;
     const reached = full.length
-        ? `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each ${minutes}-minute interval) reached 100 % in at least one second of ${where}: in such a second, at least one partition key range used all of its share of the RU/s.`
-        : `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each ${minutes}-minute interval) peaked at ${Math.round(peak.value ?? 0)} % in ${where}.`;
+        ? `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in ${each}) reached 100 % in at least one second of ${where}: in such a second, at least one partition key range used all of its share of the RU/s.`
+        : `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in ${each}) peaked at ${Math.round(peak.value ?? 0)} % in ${where}.`;
     let counted = "";
     if (refused !== null && refused > 0) {
         const of = total !== null ? `${plural(total, "request")} in ${those}, ${refused} of them throttled (429${share !== null ? `, ${share} %` : ""})` : `${plural(refused, "throttled request")} (429) in ${those}`;
@@ -78,6 +83,14 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
         counted = ` Azure Monitor counted ${of}: a request to a range that had used its share in that second was refused, with the time to wait before retrying it.${guide}`;
     } else if (refused !== null) {
         counted = ` Azure Monitor counted ${total !== null ? `${plural(total, "request")} in ${those}, none of them throttled` : `no throttled request (429) in ${those}`}.`;
+    }
+    // A whole reading's interval that finer saves hold part of says what they hold (the review of c4c63abe).
+    const wholeOf = (rows: readonly MetricPoint[]) => rows.find((m) => m.whole && m.whole.covered.length > 0)?.whole;
+    const reading = wholeOf(at100) ?? wholeOf(requestsIn) ?? wholeOf(throttledIn);
+    if (reading) {
+        const held = [wholeOf(requestsIn)?.finer, wholeOf(throttledIn)?.finer];
+        const what = held[0] !== null && held[0] !== undefined ? `: ${plural(held[0], "request")}${held[1] !== null && held[1] !== undefined ? `, ${held[1] === 0 ? "none" : held[1]} of them throttled` : ""}` : "";
+        counted += ` A finer save holds ${reading.covered.map((c) => `${hhmm(c.from)} to ${hhmm(c.to)}`).join(" and ")} UTC of ${those}${what}.`;
     }
     const ru = provisioned === null ? "" : `${Math.round(provisioned)} RU/s`;
     const partitions =
@@ -93,8 +106,8 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
         ...(refused === null ? [`T5: Azure Monitor's throttled requests aren't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC, so whether any request was refused isn't known.`] : []),
     ];
     const evidence: EvidenceRef[] = [
-        { table: "Telemetry Snapshots", at: iso(peak.at), target: "T5", text: `Normalized RU consumption ${Math.round(peak.value ?? 0)} %, the highest from ${hhmm(peak.at)} to ${hhmm(end(peak))} UTC` },
-        ...throttledIn.filter((m) => (m.value ?? 0) > 0).slice(0, 2).map((m) => ({ table: "Telemetry Snapshots", at: iso(m.at), target: "T5" as const, text: `${plural(m.value ?? 0, "throttled request")} (429) from ${hhmm(m.at)} to ${hhmm(end(m))} UTC` })),
+        { table: "Telemetry Snapshots", at: iso(peak.at), target: "T5", text: `Normalized RU consumption ${Math.round(peak.value ?? 0)} %, the highest ${peak.intervalUnknown ? "in the interval " : ""}from ${hhmm(peak.at)}${until(peak)} UTC` },
+        ...throttledIn.filter((m) => (m.value ?? 0) > 0).slice(0, 2).map((m) => ({ table: "Telemetry Snapshots", at: iso(m.at), target: "T5" as const, text: `${plural(m.value ?? 0, "throttled request")} (429) ${m.intervalUnknown ? "in the interval " : ""}from ${hhmm(m.at)}${until(m)} UTC` })),
         ...(provisionedPoint ? [{ table: "Telemetry Snapshots", at: iso(provisionedPoint.at), target: "T5" as const, text: `Provisioned throughput ${ru}` }] : []),
     ];
     // RU-AT-LIMIT: no change. RU-THROTTLED: the clients' retries; more throughput above Learn's 5 %; and a new partition key

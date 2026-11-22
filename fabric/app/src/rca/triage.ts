@@ -4,7 +4,7 @@
 
 import { describeEpisode } from "./detector";
 import { AZURE_MONITOR } from "./errors";
-import { hhmmss, metricIn, plural, type Episode, type Evidence, type RcaTarget } from "./types";
+import { asWholeReadings, hhmmss, metricIn, plural, type Episode, type Evidence, type RcaTarget } from "./types";
 
 export interface Hypothesis {
     target: RcaTarget;
@@ -80,7 +80,8 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         if (hypotheses.some((h) => h.target === target && h.family === "errors")) continue;
         const events = input.evidence.events.filter((e) => e.target === target && (e.kind === "error" || e.kind === "attention") && inWindow(e.at, from, to));
         const throttled = hypotheses.some((h) => h.target === target && h.family === "throttling");
-        const counted = input.evidence.metrics.filter((m) => m.target === target && m.value !== null && m.value > 0 && (m.metric === "connections_failed" || (m.metric === "ThrottledRequests" && !throttled)) && metricIn(m, from, to));
+        // A split point's pieces count as its one whole count (the review of c4c63abe).
+        const counted = asWholeReadings(input.evidence.metrics.filter((m) => m.target === target && (m.metric === "connections_failed" || (m.metric === "ThrottledRequests" && !throttled)) && metricIn(m, from, to))).filter((m) => m.value !== null && m.value > 0);
         const n = events.reduce((sum, e) => sum + e.count, 0) + counted.reduce((sum, m) => sum + (m.value ?? 0), 0);
         if (n === 0) continue;
         // An Azure Monitor count stands for its whole interval, as in errors.ts (the review of 858c50c2: one 5-minute count of
@@ -89,7 +90,7 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         const last = new Date(Math.max(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime() + (m.intervalMs ?? 0))));
         const where = counted.length > 0 ? ` (${AZURE_MONITOR} counts included)` : "";
         // A read that stopped short counted them only up to there (the review of d431edb4).
-        const span = stoppedAt ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} to ${hhmmss(last)} UTC`;
+        const span = stoppedAt ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${plural(n, "error or cancel", "errors and cancels")} ${first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `from ${hhmmss(first)} to ${hhmmss(last)}`} UTC`;
         hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);

@@ -8,13 +8,14 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bi
 import { analyzeConnections } from "./connections";
 import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
-import { MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError } from "./loader";
+import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
+import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
+import { asWholeReadings, emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -93,6 +94,10 @@ export interface Telemetry {
     /** The coarser point each piece came from, and the pieces that are upper bounds of one reading, by pointKey (its sources and upperBounds). */
     sources?: ReadonlyMap<string, string>;
     upperBounds?: ReadonlySet<string>;
+    /** Each piece of a point split into two or more, by pointKey: the one whole reading it's part of (sources.ts's wholeReadings). */
+    wholes?: ReadonlyMap<string, WholeReading>;
+    /** The points whose interval isn't known in these minutes, by pointKey (sources.ts's unknownIntervals). */
+    unknownIntervals?: ReadonlySet<string>;
     /** The coarsest interval of the history's points at each time, before one point per interval is kept (sources.ts's coarsestIntervals): a key's own point. */
     keyIntervals?: ReadonlyMap<string, number>;
     /** The reads that had more rows than they take, by table: what they hold from `until` on wasn't read (sources.ts's paged Azure Monitor read). */
@@ -147,11 +152,14 @@ function targetsOf(args: Record<string, unknown>): RcaTarget[] {
 export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const out: MetricPoint[] = [];
     // Each point's own span and its save's step where the history says them (the shared finestPerInterval's intervals and
-    // grains), its capture's smallest interval otherwise (the review of 803f2b1a).
+    // grains), its capture's smallest interval otherwise (the review of 803f2b1a). A point whose interval the read can't
+    // tell gets none (the review of c4c63abe), and a piece of a split point carries its whole reading.
     const own = (target: RcaTarget, metric: string, at: Date, fallback: number | undefined) => {
         const key = pointKey(target, metric, at);
+        const whole = telemetry.wholes?.get(key);
+        if (telemetry.unknownIntervals?.has(key)) return { intervalMs: undefined, grainMs: undefined, intervalUnknown: true, ...(whole ? { whole } : {}) };
         const intervalMs = telemetry.intervals?.get(key) ?? fallback;
-        return { intervalMs, grainMs: telemetry.grains?.get(key) ?? intervalMs };
+        return { intervalMs, grainMs: telemetry.grains?.get(key) ?? intervalMs, ...(whole ? { whole } : {}) };
     };
     const pg = telemetry.postgres ?? null;
     const pgInterval = pg?.intervalMinutes ? pg.intervalMinutes * MIN : undefined;
@@ -167,14 +175,24 @@ export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     return out.sort((a, b) => a.at.getTime() - b.at.getTime());
 }
 
-/** Error counts the telemetry and the capture's counters hold, as events: T4's failed connections and deadlocks, T5's 429s. An Azure Monitor count stands for its whole interval. */
+/** Error counts the telemetry and the capture's counters hold, as events: T4's failed connections and deadlocks, T5's 429s. An Azure Monitor count stands for its whole interval, and a split point's pieces for its one whole count. */
 function countedErrors(evidence: Evidence, from: Date, to: Date, targets: readonly RcaTarget[]): EventRow[] {
     const inside = (at: Date) => at >= from && at <= to;
     const out: EventRow[] = [];
-    for (const m of evidence.metrics) {
-        if (!targets.includes(m.target) || !metricIn(m, from, to) || m.value === null || m.value <= 0) continue;
-        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, intervalMs: m.intervalMs, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} in the interval (Azure Monitor)` });
-        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, intervalMs: m.intervalMs, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) in the interval (Azure Monitor)` });
+    // A count that's part of a whole reading, in words: the save's whole interval, and what the finer saves hold of it.
+    const of = (m: MetricPoint) => {
+        const w = m.whole;
+        if (w) {
+            const covered = w.covered.map((c) => `${hhmmss(c.from).slice(0, 5)} to ${hhmmss(c.to).slice(0, 5)}`).join(" and ");
+            return `in the ${Math.round(w.intervalMs / MIN)} minutes from ${hhmmss(w.at).slice(0, 5)} UTC (Azure Monitor${w.finer !== null && covered ? `; a finer save holds ${w.finer === 0 ? "none" : w.finer} of them, in ${covered}` : ""})`;
+        }
+        return m.intervalUnknown ? `in the interval from ${hhmmss(m.at).slice(0, 5)} UTC, whose length isn't known in these minutes (Azure Monitor)` : "in the interval (Azure Monitor)";
+    };
+    // The window's points first: a window inside a finer save's stretch reads that save, not the coarser point around it.
+    for (const m of asWholeReadings(evidence.metrics.filter((m) => targets.includes(m.target) && metricIn(m, from, to)))) {
+        if (m.value === null || m.value <= 0) continue;
+        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, intervalMs: m.intervalMs, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} ${of(m)}` });
+        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, intervalMs: m.intervalMs, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) ${of(m)}` });
     }
     // PostgreSQL logs a deadlock's graph only to its server log; the capture counts them (pg_stat_database.deadlocks).
     for (const r of evidence.resource) {
@@ -216,7 +234,7 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     const notCaptured = [
         ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence for ${hhmmss(c.from)}-${hhmmss(c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
         ...unknown,
-        ...(g.evidence.cut ?? []).map((c) => `${c.table}: the window holds more rows than ${c.table === MONITOR_TABLE ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`),
+        ...(g.evidence.cut ?? []).map((c) => `${c.table}: the window holds more rows than ${isPagedTable(c.table) ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`),
     ];
     return {
         tool,
@@ -312,7 +330,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // A read at its limit, the RCA tables' or Azure Monitor's, is said in what wasn't captured, never used silently.
         const cut = [...(loaded.cut ?? []), ...(telemetry.cut ?? [])];
         const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)], ...(cut.length ? { cut } : {}) };
-        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals, grains: telemetry.grains, sources: telemetry.sources, upperBounds: telemetry.upperBounds }, from, to).filter((e) => targets.includes(e.target));
+        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals, grains: telemetry.grains, sources: telemetry.sources, upperBounds: telemetry.upperBounds, wholes: telemetry.wholes }, from, to).filter((e) => targets.includes(e.target));
         return { evidence, episodes, keyIntervals: telemetry.keyIntervals };
     }
 
@@ -332,12 +350,18 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // (the re-review of bb70161f).
         const pg = (t: RcaTarget) => t === "T4" || t === "T4-replica";
         const covered = (t: RcaTarget, from: Date, to: Date) => g.evidence.coverage.some((c) => c.target === t && c.captured && c.from <= to && c.to >= from);
+        // The chains read only up to where the RCA Sessions read stopped: no chain is claimed for the minutes after it (the
+        // review of eb89acbb).
+        const sessionsStop = readStoppedAt(g.evidence, (table) => table === RCA_SPEC.sessions.model);
+        const chainsTo = sessionsStop && sessionsStop < w.to ? sessionsStop : w.to;
+        const stoppedNote = chainsTo < w.to ? ", where the RCA Sessions read stopped," : "";
         const noChain = targets.flatMap((t) => {
             const seen = g.episodes.filter((e) => e.target === t && e.family === "blocking" && e.start <= w.to && (e.end ?? e.last) >= w.from);
             if (seen.length === 0 || a.episodes.some((e) => e.target === t) || !covered(t, w.from, w.to)) return [];
             if (seen.some((e) => e.source === SOURCES.capture || covered(t, e.start, e.end ?? e.last))) {
+                if (chainsTo <= w.from || !seen.some((e) => e.start <= chainsTo)) return [];
                 return [
-                    `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
+                    `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(chainsTo)} UTC${stoppedNote} left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
                 ];
             }
             const from = new Date(Math.min(...seen.map((e) => e.start.getTime())));
@@ -361,7 +385,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         };
     }
 
-    async function errors(args: Record<string, unknown>): Promise<InvestigationResult | string> {
+    async function errors(args: Record<string, unknown>, outerStop?: Date): Promise<InvestigationResult | string> {
         const w = windowOf(args, deps);
         if (typeof w === "string") return w;
         const targets = targetsOf(args);
@@ -369,8 +393,10 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const events = [...g.evidence.events.filter((e) => targets.includes(e.target) && e.at >= w.from && e.at <= w.to), ...countedErrors(g.evidence, w.from, w.to, targets)];
         const base = envelope("explain_errors", w.from, w.to, targets, deps, g, w.at);
         // A read that stopped short holds only what came before: what it didn't find, and what it counted, only up to there
-        // (the review of d431edb4: a read cut at 11:16 said no errors were recorded, beside 300,000 429s after it).
-        const stop = readStoppedAt(g.evidence);
+        // (the review of d431edb4: a read cut at 11:16 said no errors were recorded, beside 300,000 429s after it). An
+        // incident's part reads only its episode's minutes, so its incident's read says where it stopped (outerStop).
+        const own = readStoppedAt(g.evidence);
+        const stop = own && outerStop ? (own < outerStop ? own : outerStop) : (own ?? outerStop ?? null);
         const a = analyzeErrorsResult(events, stop ?? undefined);
         const none = stop
             ? `No errors, cancels, failed connections, or 429s were recorded up to ${hhmmss(stop)} UTC, where the read stopped; what came after it wasn't read.`
@@ -438,9 +464,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
     }
 
     /** T4's connections against the limit, explained by what held them (connections.ts). An episode its capture cut off (openEnded) says so, and one still on where the minutes read end (readEnd) says that. */
-    async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false, readEnd?: Date): Promise<InvestigationResult> {
+    async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false, readEnd?: Date, readStopped?: boolean): Promise<InvestigationResult> {
         const g = await gather(from, to, [target]);
-        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded, readEnd });
+        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded, readEnd, readStopped });
         const base = envelope("explain_connections", from, to, [target], deps, g);
         return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
     }
@@ -482,7 +508,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
      * wait classes have only the telemetry in Phase 1. A replica's lag is read from its own minutes, from before replay
      * last advanced (its peak less its lag) to past its end, and explained as explain_replica_lag explains any time in it.
      */
-    async function explainEpisode(e: Episode): Promise<InvestigationResult | string | null> {
+    async function explainEpisode(e: Episode, stop?: Date | null): Promise<InvestigationResult | string | null> {
         const end = e.end ?? e.last;
         // An episode still on where the minutes read end is read to there, so its part tells the same end as its episode
         // (the review of 97fdf5ba: one answer said two).
@@ -491,9 +517,11 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         if (e.family === "blocking" || e.family === "deadlock") return locking(span);
         // Its rise is read whole, past the minutes asked about when it ran on after them, which it says (the review of 2e19adfc).
         if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN), e.readEnd);
-        if (e.family === "connections") return connectionsAt(e.target, e.start, until, !e.end && !e.readEnd, e.readEnd);
+        if (e.family === "connections") return connectionsAt(e.target, e.start, until, !e.end && !e.readEnd, e.readEnd, e.readStopped);
         if (e.family === "ru") return throughputAt(e.start, new Date(end.getTime() + MIN));
-        if (e.family === "errors" || e.family === "throttling") return errors(span);
+        // An episode with no end where its incident's read stopped is counted at least, through there (the review of eb89acbb:
+        // a 429 storm the read cut at 11:16 read "48000, 09:40:00 to 11:16:00", as if it had ended there).
+        if (e.family === "errors" || e.family === "throttling") return errors(span, stop && !e.end && stop > e.start ? stop : undefined);
         return null;
     }
 
@@ -550,7 +578,8 @@ export function createInvestigationTools(deps: InvestigationDeps) {
                 : `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} to ${hhmmss(to)} UTC: the detector found no episode there.`;
             return { ...base, notCaptured: [...base.notCaptured, nothing], details: stop ? { nothingAbnormal: false, nothingAbnormalUpTo: iso(stop), readStoppedAt: iso(stop) } : { nothingAbnormal: true } };
         }
-        const parts = (await Promise.all(chosen.map(explainEpisode))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
+        const stopped = readStoppedAt(g.evidence);
+        const parts = (await Promise.all(chosen.map((e) => explainEpisode(e, stopped)))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
         // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and its cause isn't captured.
         const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
         const causes = [

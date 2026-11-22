@@ -4,7 +4,8 @@ import { ANSWER_KEY_TABLES } from "@/copilot/answer-key";
 import { QueryFailure } from "@/data/query-client";
 import type { QuerySpec } from "@/data/queries";
 import { loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
-import { createRcaSources, finestPerInterval } from "./sources";
+import { createRcaSources, finestPerInterval, monitorTelemetry, type RunQuery } from "./sources";
+import { emptyListNote } from "./view/facts";
 import { createInvestigationTools } from "./tools";
 import { emptyEvidence, pointKey, type InvestigationResult } from "./types";
 
@@ -59,6 +60,19 @@ describe("the investigations' sources", () => {
         expect(intervals.get(pointKey("T5", "TotalRequests", at("15:31")))).toBe(60_000);
         expect(intervals.get(pointKey("T5", "TotalRequests", at("15:45")))).toBe(15 * 60_000);
         expect([intervals.get(pointKey("T5", "TotalRequests", at("15:33"))), grains.get(pointKey("T5", "TotalRequests", at("15:33")))]).toEqual([12 * 60_000, 15 * 60_000]);
+    });
+
+    // The review of c4c63abe: a coarser point split around a finer save is one reading. Its raw value is of the minutes
+    // its own save's window cuts it to, as the shared function cuts its span: here 15:37 to 15:45, not 15:30 to 15:45.
+    it("give a split point's whole reading over the minutes its save's window cuts it to, with what the finer save holds", () => {
+        const throttled = (capturedAt: string, from: string, to: string) => (bucket: string, value: number) => ({ ...lag(bucket, value, `2026-11-20T${capturedAt}:00`), TargetKey: "T5", ResourceName: "cosmos01", Metric: "ThrottledRequests", Unit: "Count", WindowStart: `2026-11-20T${from}:00`, WindowEnd: `2026-11-20T${to}:00` });
+        const day = throttled("21:33", "15:37", "21:30");
+        const session = throttled("17:09", "15:40", "15:42");
+        const t = monitorTelemetry([day("15:30", 80), day("15:45", 0), day("16:00", 0), session("15:40", 10), session("15:41", 10)]);
+        const whole = { key: pointKey("T5", "ThrottledRequests", at("15:30")), at: at("15:37"), intervalMs: 8 * 60_000, grainMs: 15 * 60_000, value: 80, finer: 20, covered: [{ from: at("15:40"), to: at("15:42") }] };
+        expect(t.wholes?.get(pointKey("T5", "ThrottledRequests", at("15:37")))).toEqual(whole);
+        expect(t.wholes?.get(pointKey("T5", "ThrottledRequests", at("15:42")))).toEqual(whole);
+        expect(t.wholes?.size).toBe(2);
     });
 
     it("give T4's replica lag from overlapping captures, and ask for T1's bins only when T1 is in scope", async () => {
@@ -154,6 +168,46 @@ describe("the investigations' sources", () => {
         const counted = (await tools(4900).investigate("explain_errors", window)) as InvestigationResult;
         expect(counted.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(at least 48000, 09:40:00 through 11:16:00 UTC, where the read stopped, mostly the container's clients\)/);
         expect(counted.findings[0].title).toBe("Throttled requests (429): at least 48000");
+        // The review of eb89acbb: an incident's part reads only its episode's own minutes, whole, so it says where its
+        // incident's read stopped; it read "(48000, 09:40:00 to 11:16:00 UTC ...)" beside its own cut note.
+        const storm = (await tools(4900).investigate("explain_incident", { target: "T5", from: window.from, to: window.to })) as InvestigationResult;
+        expect(storm.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(at least 48000, 09:40:00 through 11:16:00 UTC, where the read stopped, mostly the container's clients\)/);
+        // And the view says nothing abnormal only up to there (the review of eb89acbb: "Nothing abnormal in these minutes").
+        expect(emptyListNote(listed, "America/New_York")).toBe("Nothing abnormal up to 06:16 EST (11:16 UTC), where the read stopped: the detector found no episode there, and what came after it wasn't read.");
+    });
+
+    // The review of eb89acbb: T1 to T3's bins and their waits by category, at most 5,000 rows a query and oldest first, lost
+    // their newest minutes with no note. The reviewer's probe: T1 with 10 wait categories a minute over 1,000 minutes, and
+    // a Tran Log IO storm in minutes 700 to 800, which the first 5,000 rows don't hold.
+    it("read Database Hub's bins and waits a page at a time, and say where a read too long for its pages stopped", async () => {
+        const start = Date.parse("2026-11-20T00:00:00Z");
+        const categories = ["Buffer Latch", "Memory", "Parallelism", "Tran Log IO", "Network IO", "Lock", "Buffer IO", "CPU", "Other", "Preemptive"];
+        const bucket = (m: number) => new Date(start + m * 60_000).toISOString().slice(0, 19);
+        const history = (minutes: number, stormFrom: number) => ({
+            series: Array.from({ length: minutes }, (_, m) => ({ "Bucket UTC": bucket(m), Cpu: 5, Blocked: 0, LockWaitS: 0, BufferIoS: 0, LogRateS: 0, WaitS: 10, IoMb: 1, Batch: 50, Sessions: 8 })),
+            waits: Array.from({ length: minutes }, (_, m) => categories.map((Metric) => ({ "Bucket UTC": bucket(m), Metric, WaitS: Metric === "Tran Log IO" && m >= stormFrom && m < stormFrom + 100 ? 40 : 0.5 }))).flat(),
+        });
+        const pager = (all: ReturnType<typeof history>) =>
+            vi.fn(async (spec: QuerySpec) => {
+                const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
+                const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
+                const rows: Array<Record<string, unknown>> = spec.id.startsWith("spotlight-") ? all.waits : spec.id.startsWith("replay-") ? all.series : [];
+                return rows.filter((r) => Date.parse(`${String(r["Bucket UTC"])}Z`) >= from).slice(0, spec.rowLimit);
+            });
+        const tools = (run: RunQuery) => createInvestigationTools({ load: async () => emptyEvidence(), telemetry: createRcaSources(run).telemetry, timeZone: "UTC", latestDay: new Date(start), latest: new Date(start + 3000 * 60_000) });
+        const whole = pager(history(1000, 700));
+        const listed = (await tools(whole).investigate("find_incidents", { from: "2026-11-20T00:00:00Z", to: "2026-11-20T16:40:00Z", targets: ["T1"] })) as InvestigationResult;
+        expect((listed.episodes ?? []).map((e) => e.key)).toContain("T1-tran_log-20261120T114000Z");
+        expect(listed.details).toMatchObject({ nothingAbnormal: false });
+        expect(listed.details?.readStoppedAt).toBeUndefined();
+        expect(listed.notCaptured.join(" ")).not.toMatch(/wasn't read/);
+        // The waits read three pages, each from the last minute the one before had, whole: 10,000 rows, none twice.
+        expect(whole.mock.calls.filter(([spec]) => spec.id.startsWith("spotlight-"))).toHaveLength(3);
+        // Longer than its pages hold: what they didn't read is said, and nothing is called quiet past where they stopped.
+        const long = (await tools(pager(history(3000, 2700))).investigate("find_incidents", { from: "2026-11-20T00:00:00Z", to: "2026-11-22T02:00:00Z", targets: ["T1"] })) as InvestigationResult;
+        expect((long.episodes ?? []).map((e) => e.key)).not.toContain("T1-tran_log-20261121T210000Z");
+        expect(long.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-21T09:16:00Z", quiet: ["T1"], quietUpTo: "2026-11-21T09:16:00Z" });
+        expect(long.notCaptured).toContain(`Telemetry Snapshots (T1's waits): the window holds more rows than its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return, so what it holds from 09:16:00 UTC on wasn't read; ask about a narrower window`);
     });
 
     // Live, 2026-11-21: Power BI answered 429 to the app's reads. A telemetry read that failed left its part empty, so the

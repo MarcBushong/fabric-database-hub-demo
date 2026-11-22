@@ -13,7 +13,7 @@
 // https://www.postgresql.org/docs/18/hot-standby.html#HOT-STANDBY-CONFLICT, https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
 
 import { recommend } from "./catalog";
-import { hhmmss, iso, plural, type Confidence, type EventRow, type EvidenceRef, type Finding, type MetricPoint, type Recommendation, type ReplicaSample } from "./types";
+import { asWholeReadings, hhmmss, iso, plural, type Confidence, type EventRow, type EvidenceRef, type Finding, type MetricPoint, type Recommendation, type ReplicaSample } from "./types";
 
 export const LAG_METRIC = "physical_replication_delay_in_seconds";
 export const RESTART_GAP_MINUTES = 10;
@@ -31,6 +31,8 @@ export interface LagPoint {
     intervalMs?: number;
     /** Its save's interval, which a remainder's span is only part of: what the value is the highest of (the shared finestPerInterval's grains). */
     grainMs?: number;
+    /** An Azure Monitor point whose interval the read can't tell (MetricPoint.intervalUnknown): the highest of an interval from `at`, of a length not known here. */
+    intervalUnknown?: boolean;
 }
 
 export interface LagSeries {
@@ -62,10 +64,12 @@ const endOf = (p: LagPoint) => p.at.getTime() + (p.intervalMs ?? 0);
 const sinceOf = (p: LagPoint) => p.at.getTime() - p.value * 1000;
 /** Azure Monitor's interval in minutes, for the words "its highest value in each 15-minute interval": its save's (the grain). */
 const minutesOf = (p: LagPoint) => Math.round((p.grainMs ?? p.intervalMs ?? 0) / 60_000);
+/** "in the 3 minutes from 16:57:00 UTC", or "in the interval from 15:00:00 UTC" when its length isn't known in these minutes (the review of c4c63abe). */
+const minutesFrom = (p: LagPoint) => (p.intervalUnknown ? `in the interval from ${hhmmss(p.at)} UTC` : `in the ${spanOf(p)} minutes from ${hhmmss(p.at)} UTC`);
 /** The minutes a point spans, for "in the 3 minutes from 16:57:00": a remainder of a coarser point spans only part of its interval. */
 const spanOf = (p: LagPoint) => Math.round((p.intervalMs ?? 0) / 60_000);
 /** Coarser than a minute: Azure Monitor's value is its interval's highest, not the lag at its start. */
-const coarse = (p: LagPoint) => (p.grainMs ?? p.intervalMs ?? 0) > 60_000;
+const coarse = (p: LagPoint) => p.intervalUnknown === true || (p.grainMs ?? p.intervalMs ?? 0) > 60_000;
 
 /**
  * The lag series for the window: the capture's own samples on the replica (since_last_replayed_s: every 30 s, every 5 s
@@ -79,9 +83,9 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
         .filter((s): s is ReplicaSample & { sinceLastReplayS: number } => s.side === "replica" && s.sinceLastReplayS !== undefined)
         .map((s) => ({ at: s.at, value: s.sinceLastReplayS, source: "RCA Replica" as const }))
         .sort((a, b) => a.at.getTime() - b.at.getTime());
-    const monitor = metrics
-        .filter((m): m is MetricPoint & { value: number } => m.target === "T4-replica" && m.metric === LAG_METRIC && m.value !== null)
-        .sort((a, b) => a.at.getTime() - b.at.getTime());
+    // A split point's pieces as its one whole reading, the highest over its save's whole interval: each piece's value is
+    // only an upper bound of its own stretch (the review of c4c63abe).
+    const monitor = asWholeReadings(metrics.filter((m) => m.target === "T4-replica" && m.metric === LAG_METRIC)).filter((m): m is MetricPoint & { value: number } => m.value !== null);
     const gaps = monitor.slice(1).map((m, i) => m.at.getTime() - monitor[i].at.getTime()).filter((g) => g > 0);
     const grain = gaps.length ? Math.min(...gaps) : 60_000;
     // The minutes the capture sampled: runs of its samples no more than CAPTURE_GAP_MS apart.
@@ -92,7 +96,8 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
         if (last && t - last.to <= CAPTURE_GAP_MS) last.to = t;
         else spans.push({ from: t, to: t });
     }
-    const all = monitor.map((m): LagPoint => ({ at: m.at, value: m.value, source: "Telemetry Snapshots", intervalMs: m.intervalMs ?? grain, grainMs: m.grainMs ?? m.intervalMs ?? grain }));
+    // A point whose interval the read can't tell stands for no more than its start, never the series' step or a minute.
+    const all = monitor.map((m): LagPoint => (m.intervalUnknown ? { at: m.at, value: m.value, source: "Telemetry Snapshots", intervalMs: 0, intervalUnknown: true } : { at: m.at, value: m.value, source: "Telemetry Snapshots", intervalMs: m.intervalMs ?? grain, grainMs: m.grainMs ?? m.intervalMs ?? grain }));
     const missed: LagPoint[] = [];
     const kept = all.filter((point) => {
         const from = point.at.getTime();
@@ -206,17 +211,19 @@ export interface ReplicaAnalysis {
 /** What a point measures, in words. */
 function nameOf(p: LagPoint): string {
     if (p.source === "RCA Replica") return "The replica's time since its last replay";
+    if (p.intervalUnknown) return "Read Replica Lag (its highest value in each interval of its save, whose length isn't known in these minutes)";
     return coarse(p) ? `Read Replica Lag (its highest value in each ${minutesOf(p)}-minute interval)` : "Read Replica Lag";
 }
 
 /** When a point's value was: at an instant, or somewhere in what an Azure Monitor point coarser than a minute spans. */
 function when(p: LagPoint): string {
-    return coarse(p) ? `in the ${spanOf(p)} minutes from ${hhmmss(p.at)} UTC` : `at ${hhmmss(p.at)} UTC`;
+    return coarse(p) ? minutesFrom(p) : `at ${hhmmss(p.at)} UTC`;
 }
 
 /** A point as evidence: "Read Replica Lag 178 s, its highest from 16:15 to 16:20 UTC" for an interval. */
 function refText(p: LagPoint): string {
     if (p.source === "RCA Replica") return `The replica's time since its last replay ${round1(p.value)} s`;
+    if (p.intervalUnknown) return `Read Replica Lag ${round1(p.value)} s, its highest in the interval from ${hhmmss(p.at).slice(0, 5)} UTC, whose length isn't known in these minutes`;
     return coarse(p) ? `Read Replica Lag ${round1(p.value)} s, its highest from ${hhmmss(p.at).slice(0, 5)} to ${hhmmss(new Date(endOf(p))).slice(0, 5)} UTC` : `Read Replica Lag ${round1(p.value)} s`;
 }
 
@@ -257,14 +264,14 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     // "rose from 16:10:00", an interval's start, counting from a last replay at 16:13:00).
     const startPoint = rise.points.find((p) => p.at.getTime() === rise.start.getTime());
     const firstSample = rise.points.find((p) => p.source === "RCA Replica" && p.at >= rise.start && p.value >= 5);
-    const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose in the ${spanOf(startPoint)} minutes from ${hhmmss(startPoint.at)} UTC`) : `rose from ${hhmmss(rise.start)}`;
+    const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose ${minutesFrom(startPoint)}`) : `rose from ${hhmmss(rise.start)}`;
     // The rise is read whole, past the minutes asked about when it runs on after them, and says so (the review of 2e19adfc:
     // asked about 16:10 to 16:18, its episode read "peak 96.6 s at 16:17:57", and its cause "176.7 s at 16:19:17").
     const past = input.askedTo && rise.end > input.askedTo ? ` (read past the minutes asked about, which end at ${hhmmss(input.askedTo)} UTC, to ${rise.recovered ? "its recovery at " : ""}${hhmmss(rise.end)} UTC)` : "";
     const shape = coarse(rise.peak)
         ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}${past}`
         : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}${past}`;
-    if (coarse(rise.peak)) notCaptured.push(`Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`);
+    if (coarse(rise.peak)) notCaptured.push(rise.peak.intervalUnknown ? "Azure Monitor's Read Replica Lag is the highest value in each interval of its save here, and these minutes hold too few of its points to tell how long that is, so when the lag rose and peaked isn't known within it." : `Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`);
     const from = rise.stalledSince.getTime() - 60_000;
     const to = rise.end.getTime() + 60_000;
     const reads = { from: new Date(from), to: new Date(to) };

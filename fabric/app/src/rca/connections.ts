@@ -19,7 +19,7 @@
 // https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits
 
 import { recommend } from "./catalog";
-import { hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type RcaTarget, type Recommendation, type ResourcePoint, type SessionSample } from "./types";
+import { asWholeReadings, hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type RcaTarget, type Recommendation, type ResourcePoint, type SessionSample } from "./types";
 
 /** The share of the limit at which the capture watches every 10 s, and the detector opens an episode. */
 export const CONNECTION_LEVEL = 0.8;
@@ -128,18 +128,22 @@ function wavesOf(samples: readonly ConnectionSample[], level: number, trough: nu
     return waves;
 }
 
-export function analyzeConnections(input: { target: RcaTarget; from: Date; to: Date; resource: readonly ResourcePoint[]; sessions: readonly SessionSample[]; metrics: readonly MetricPoint[]; openEnded?: boolean; readEnd?: Date }): ConnectionAnalysis {
+export function analyzeConnections(input: { target: RcaTarget; from: Date; to: Date; resource: readonly ResourcePoint[]; sessions: readonly SessionSample[]; metrics: readonly MetricPoint[]; openEnded?: boolean; readEnd?: Date; readStopped?: boolean }): ConnectionAnalysis {
     const { target, from, to } = input;
     const notCaptured: string[] = [];
     const samples = connectionSamples(input.resource, target, from, to);
 
-    // Failed connections: only Azure Monitor counts them. Each point stands for its whole interval.
-    const failed = input.metrics.filter((m) => m.target === target && m.metric === FAILED && m.value !== null && metricIn(m, from, to)).sort((a, b) => a.at.getTime() - b.at.getTime());
+    // Failed connections: only Azure Monitor counts them. Each point stands for its whole interval, and a split point's
+    // pieces for its one whole count (the review of c4c63abe).
+    const failed = asWholeReadings(input.metrics.filter((m) => m.target === target && m.metric === FAILED && metricIn(m, from, to))).filter((m) => m.value !== null);
     const failedCount = failed.reduce((n, m) => n + (m.value ?? 0), 0);
     const intervalEnd = (m: MetricPoint) => new Date(m.at.getTime() + (m.intervalMs ?? 0));
-    const intervals = failed.length === 0 ? "" : `${failed.length === 1 ? "its interval" : `its ${failed.length} intervals`} from ${hhmm(failed[0].at)} to ${hhmm(intervalEnd(failed[failed.length - 1]))} UTC`;
+    // An interval whose length the read can't tell has no end to give (the review of c4c63abe).
+    const until = (m: MetricPoint) => (m.intervalUnknown ? "" : ` to ${hhmm(intervalEnd(m))}`);
+    const lastFailed = failed[failed.length - 1];
+    const intervals = failed.length === 0 ? "" : `${failed.length === 1 ? "its interval" : `its ${failed.length} intervals`} from ${hhmm(failed[0].at)}${until(lastFailed)} UTC${lastFailed.intervalUnknown ? ", whose length isn't known in these minutes" : ""}`;
     if (failed.length === 0) notCaptured.push(`${target}: Azure Monitor's failed connections aren't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC.`);
-    const failedRefs: EvidenceRef[] = failed.filter((m) => (m.value ?? 0) > 0).slice(0, 2).map((m) => ({ table: "Telemetry Snapshots", at: iso(m.at), target, text: `${plural(m.value ?? 0, "failed connection")} from ${hhmm(m.at)} to ${hhmm(intervalEnd(m))} UTC (Azure Monitor)` }));
+    const failedRefs: EvidenceRef[] = failed.filter((m) => (m.value ?? 0) > 0).slice(0, 2).map((m) => ({ table: "Telemetry Snapshots", at: iso(m.at), target, text: `${plural(m.value ?? 0, "failed connection")} ${m.intervalUnknown ? "in the interval " : ""}from ${hhmm(m.at)}${until(m)} UTC (Azure Monitor)` }));
 
     if (samples.length === 0) {
         notCaptured.push(`${target}: the capture's connection counts (RCA-PG-10) aren't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC, so how many connections there were, and in what state, isn't known.`);
@@ -190,8 +194,8 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     const fell = (input.openEnded || input.readEnd) && lastAtLevel && lastSample.at > lastAtLevel.at ? samples.find((s) => s.at > lastAtLevel.at) : undefined;
     const cutOff = input.readEnd
         ? fell
-            ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the minutes read end at ${hhmmss(input.readEnd)} UTC, before the capture confirmed the end.`
-            : ` It was still on at ${hhmmss(input.readEnd)} UTC, where the minutes read end.`
+            ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the ${input.readStopped ? "read stopped" : "minutes read end"} at ${hhmmss(input.readEnd)} UTC, before the capture confirmed the end.`
+            : ` It was still on at ${hhmmss(input.readEnd)} UTC, where the ${input.readStopped ? "read stopped" : "minutes read end"}.`
         : !input.openEnded
           ? ""
           : fell

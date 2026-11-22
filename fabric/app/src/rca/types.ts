@@ -158,6 +158,26 @@ export interface MetricPoint {
     intervalMs?: number;
     /** The interval of the save it comes from, which a remainder of a coarser point spans only part of (the shared finestPerInterval's grains): what its value is the highest or the total of. */
     grainMs?: number;
+    /** A piece of a coarser point split across two or more stretches: the one reading it's part of (sources.ts's wholeReadings). */
+    whole?: WholeReading;
+    /** Its interval isn't known in these minutes: the read held too few of its save's points to tell its step. */
+    intervalUnknown?: boolean;
+}
+
+/**
+ * A coarser point's whole reading, which the shared finestPerInterval split into two or more pieces: its raw value over
+ * its interval (cut to its save's window, as the shared function cuts it), from `at` for `intervalMs`, of its save's step
+ * (grainMs); for a total, how much the finer saves hold of it (finer: null for a peak, or when that isn't known), in the
+ * minutes they cover (covered).
+ */
+export interface WholeReading {
+    key: string;
+    at: Date;
+    intervalMs: number;
+    grainMs: number;
+    value: number;
+    finer: number | null;
+    covered: Array<{ from: Date; to: Date }>;
 }
 
 /**
@@ -168,11 +188,27 @@ export interface MetricPoint {
 export const metricIn = (m: MetricPoint, from: Date, to: Date) => {
     const start = m.at.getTime();
     const span = m.intervalMs ?? 0;
-    return (span > 0 ? start < to.getTime() : start <= to.getTime()) && start + Math.max(0, span - 1) >= from.getTime();
+    // A point whose interval isn't known still stands for minutes from its start, never an instant there (the review of c4c63abe).
+    return (span > 0 || m.intervalUnknown ? start < to.getTime() : start <= to.getTime()) && start + Math.max(0, span - 1) >= from.getTime();
 };
 
 /** One Azure Monitor point's key, by its target, its metric as the history names it, and its interval's start: the shared finestPerInterval's. */
 export { pointKey } from "@/data/finest-per-interval";
+
+/**
+ * A window's points with each split coarser point's pieces as its one whole reading (MetricPoint.whole): its raw value at
+ * its start, over its save's whole interval, and the same metric's points inside that interval left out, since the reading
+ * counts them (the review of c4c63abe: its shares by length read as Azure Monitor's counts, each for its own stretch).
+ */
+export function asWholeReadings(points: readonly MetricPoint[]): MetricPoint[] {
+    const byTime = (a: MetricPoint, b: MetricPoint) => a.at.getTime() - b.at.getTime();
+    const wholes = new Map<string, MetricPoint>();
+    for (const p of points) if (p.whole && !wholes.has(`${p.target}|${p.metric}|${p.whole.key}`)) wholes.set(`${p.target}|${p.metric}|${p.whole.key}`, { ...p, at: p.whole.at, value: p.whole.value, intervalMs: p.whole.intervalMs, grainMs: p.whole.grainMs });
+    if (wholes.size === 0) return [...points].sort(byTime);
+    const inside = (p: MetricPoint) =>
+        [...wholes.values()].some((w) => w.target === p.target && w.metric === p.metric && p.at.getTime() >= w.at.getTime() && p.at.getTime() < w.at.getTime() + (w.intervalMs ?? 0));
+    return [...points.filter((p) => !p.whole && !inside(p)), ...wholes.values()].sort(byTime);
+}
 
 /** Everything the investigations read for one window: the RCA tables and the telemetry. Nothing else. */
 export interface Evidence {
@@ -189,8 +225,14 @@ export interface Evidence {
 
 export const emptyEvidence = (): Evidence => ({ sessions: [], events: [], resource: [], replica: [], waits: [], coverage: [], metrics: [] });
 
-/** Where the evidence's reads stopped, the earliest of its cut reads: nothing from then on was read. Null when every read was whole. */
-export const readStoppedAt = (evidence: Evidence): Date | null => (evidence.cut?.length ? new Date(Math.min(...evidence.cut.map((c) => c.until.getTime()))) : null);
+/** Where the evidence's reads stopped, the earliest of its cut reads (of those `which` names): nothing from then on was read. Null when every read was whole. */
+export const readStoppedAt = (evidence: Evidence, which: (table: string) => boolean = () => true): Date | null => {
+    const cut = (evidence.cut ?? []).filter((c) => which(c.table));
+    return cut.length ? new Date(Math.min(...cut.map((c) => c.until.getTime()))) : null;
+};
+
+/** The capture's own tables (RCA Sessions, RCA Events, RCA Resource...), as the loader names their reads. */
+export const isRcaTable = (table: string) => table.startsWith("RCA ");
 
 /** One fact a conclusion rests on: the table, the time, and what it says. The chat cites these. */
 export interface EvidenceRef {
@@ -223,7 +265,7 @@ export interface Finding {
     evidence: EvidenceRef[];
 }
 
-/** How an episode was found: in two or more valued samples in a row, across unknown samples, or in one far over its level. */
+/** How an episode was found: in two or more valued samples in a row, across unknown samples, or in one sample (a rule of one sample, or one far over its level). */
 export type Support = "sustained" | "sparse" | "single sample";
 
 /** One incident the blind detector found: a signal over its level on a target, for a while. */
@@ -254,6 +296,10 @@ export interface Episode {
     unknown: number;
     atLevel: number;
     support: Support;
+    /** Its readEnd is where a read of the capture's tables stopped short, not where the minutes read end (the review of eb89acbb). */
+    readStopped?: boolean;
+    /** A single sample that opened it by being far over its level (twice the level, and the rule's points over its baseline), where its rule asks for more than one. */
+    severe?: boolean;
     /** Where it was seen: the RCA capture, Database Hub's telemetry, or Azure Monitor. */
     source: string;
     confidence: Confidence;

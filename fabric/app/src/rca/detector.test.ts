@@ -36,6 +36,17 @@ describe("the blind detector's rule", () => {
         expect(cpuOf(cpuBins((i) => (i === 33 ? 12 : 0)))).toEqual([]);
     });
 
+    // The review of c4c63abe: a rule that opens on one sample (the replica's lag, connections, 429s, RU) said "far over its
+    // level" of any one sample, as of B's 34 s against its 30 s level.
+    it("says a single sample was far over its level only when that's what opened its episode", () => {
+        const [spike] = cpuOf(cpuBins((i) => (i === 33 ? 66 : 0)));
+        expect(describeEpisode(spike)).toContain("in one sample, far over its level: low confidence");
+        const lag: Sample[] = Array.from({ length: 40 }, (_, i) => ({ at: m(i), value: i === 35 ? 34 : 0.5 }));
+        const [one] = detect("T4-replica", lag, MIN, RULES.replica_lag, "Azure Monitor");
+        expect(one).toMatchObject({ support: "single sample", level: 30, peak: 34 });
+        expect(describeEpisode(one)).toBe("T4-replica: read replica lag over 30 s from 14:05:00 to 14:06:00 UTC, peak 34 s at 14:05:00 UTC, in one sample: low confidence (Azure Monitor).");
+    });
+
     it("needs two samples at the level for a gauge, across at most two unknown samples, and never counts an unknown sample as under", () => {
         // 15 % is over the 10 % level but not twice it: it needs a second sample in the same run.
         expect(cpuOf(cpuBins((i) => (i === 30 || i === 33 ? 15 : i > 30 && i < 33 ? null : 0)))).toHaveLength(1);
@@ -216,6 +227,19 @@ describe("a capture episode with no relaxed event in the minutes read", () => {
         const [bySamples] = read(null, "15:10:00");
         expect(bySamples.readEnd).toBeUndefined();
         expect(describeEpisode(bySamples)).toContain("under its level by 15:00:30 UTC");
+    });
+
+    // The review of eb89acbb: with RCA Events read only to 15:01:00, a surge read "the minutes read end at 15:20:00".
+    it("ends the minutes read where a read of the capture's tables stopped short, not where the window ends", () => {
+        const stopped = (totals: ((s: number) => number) | undefined, table = "RCA Events") => findEpisodes({ evidence: { ...surge("15:30:00", totals), cut: [{ table, until: at("15:01:00") }] } }, at("14:55:00"), at("15:20:00")).filter((e) => e.family === "connections");
+        const [on] = stopped(() => 30);
+        expect(on).toMatchObject({ readEnd: at("15:01:00"), readStopped: true });
+        expect(describeEpisode(on)).toContain("from 15:00:00 UTC (still on at 15:01:00 UTC, where the read stopped)");
+        const [fell] = stopped(undefined);
+        expect(describeEpisode(fell)).toContain("from 15:00:00 UTC, under its level by 15:00:30 UTC (the read stopped at 15:01:00 UTC, before its capture confirmed the end)");
+        // A read of the telemetry that stopped short isn't one of the capture's tables.
+        const [telemetry] = stopped(() => 30, "Telemetry Snapshots (Azure Monitor)");
+        expect(describeEpisode(telemetry)).toContain("(still on at 15:20:00 UTC, where the minutes read end)");
     });
 
     // The capture's own error and deadlock episodes have no samples of their own: neither a fall nor "still on" can be told.

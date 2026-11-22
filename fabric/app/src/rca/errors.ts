@@ -117,7 +117,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
 export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Date): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
     const { classes, findings } = summarizeErrors(events, stoppedAt);
     const top = classes[0];
-    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${hhmmss(c.first)} to ${hhmmss(c.last)} UTC`);
+    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`);
     return {
         findings,
         rootCause: top

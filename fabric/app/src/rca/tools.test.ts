@@ -6,6 +6,8 @@ import { toolSpecs } from "@/copilot/tools";
 import { COSMOS_METRICS, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { decodeEvidence } from "./evidence";
 import { LAG_METRIC } from "./replica";
+import { monitorTelemetry } from "./sources";
+import { emptyListNote } from "./view/facts";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
@@ -215,6 +217,31 @@ describe("every family the RCA explains", () => {
         expect(r.notCaptured).toContain(
             "T1: the blocked processes from 16:00:00 to 16:02:30 UTC left no blocking chain in the capture: its 30-s sentinel saw a blocked process, and the capture samples the chain (RCA-SQL-01) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.",
         );
+        // The review of eb89acbb: no chain is claimed for the minutes after the RCA Sessions read stopped.
+        const sessionsTo = (until: string) =>
+            createInvestigationTools({ load: async (from, to, targets) => ({ ...window(evidence, from, to, targets), cut: [{ table: "RCA Sessions", until: at(until) }] }), telemetry: async () => ({}), timeZone: "America/New_York", latestDay: at("00:00:00") });
+        const minutesAsked = { from: "2026-11-20T16:00:00Z", to: "2026-11-20T16:02:30Z", targets: ["T1"] };
+        const partly = await ask("explain_locking", minutesAsked, sessionsTo("16:01:00"));
+        expect(partly.notCaptured).toContain(
+            "T1: the blocked processes from 16:00:00 to 16:01:00 UTC, where the RCA Sessions read stopped, left no blocking chain in the capture: its 30-s sentinel saw a blocked process, and the capture samples the chain (RCA-SQL-01) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.",
+        );
+        const before = await ask("explain_locking", minutesAsked, sessionsTo("15:59:00"));
+        expect(before.notCaptured.join(" ")).not.toMatch(/left no blocking chain/);
+    });
+
+    // The review of eb89acbb: a surge whose relaxed event is past where the RCA Events read stopped ends its minutes there,
+    // in its episode and in its part alike.
+    it("explains a connection surge the RCA Events read stopped in as on where the read stopped", async () => {
+        const evidence: Evidence = {
+            ...emptyEvidence(),
+            events: [{ target: "T4", at: at("15:00:00"), kind: "capture", name: "escalated", code: "T4-20261120T150000Z", count: 1, detail: "client connections 30 >= 80 % of 35 (max_connections 50 minus 15 reserved)." }],
+            coverage: [{ target: "T4", from: at("14:30:00"), to: at("15:30:00"), captured: true, sources: ["RCA-PG-10"], gaps: [] }],
+        };
+        for (let s = 0; s <= 110; s += 10) for (const [metric, value] of [["connections_total", 30], ["max_connections", 50], ["reserved_connections", 15]] as const) evidence.resource.push({ target: "T4", at: new Date(at("15:00:00").getTime() + s * 1000), source: "RCA-PG-10", metric, value });
+        const deps = createInvestigationTools({ load: async (from, to, targets) => ({ ...window(evidence, from, to, targets), cut: [{ table: "RCA Events", until: at("15:01:00") }] }), telemetry: async () => ({}), timeZone: "America/New_York", latestDay: at("00:00:00") });
+        const r = await ask("explain_incident", { episodeKey: "T4-connections-20261120T150000Z" }, deps);
+        expect((r.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 15:00:00 UTC (still on at 15:01:00 UTC, where the read stopped)");
+        expect(r.rootCause?.statement).toContain("It was still on at 15:01:00 UTC, where the read stopped.");
     });
 
     it("explains T5's normalized RU at 100 % that throttled nothing, from the intervals it names, with no change to recommend", async () => {
@@ -328,5 +355,100 @@ describe("reading whole what a window cuts", () => {
         // The review of 858c50c2: triage dated the count by its interval's start, "from 16:05:00 to 16:05:00".
         const triaged = await ask("triage_window", { at: "2026-11-20T16:10:00Z", targets: ["T4"] }, deps);
         expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels from 16:05:00 to 16:10:00 UTC (Azure Monitor counts included).");
+        // The view's list has no episode for them, and says what the detector found instead (the review of eb89acbb).
+        const listed = await ask("find_incidents", { at: "2026-11-20T16:10:00Z", targets: ["T4"] }, deps);
+        expect(listed.episodes).toEqual([]);
+        expect(emptyListNote(listed, "America/New_York")).toBe("No episode in these minutes; besides episodes, the detector found: T4: 7 errors and cancels from 16:05:00 to 16:10:00 UTC (Azure Monitor counts included).");
+    });
+});
+
+describe("a coarser point a finer save holds part of", () => {
+    const save = (capturedAt: string, from: string, to: string) => (bucket: string, metric: string, value: number) => ({
+        Bucket: `2026-11-20T${bucket}:00`,
+        TargetKey: "T5",
+        ResourceName: "cosmos01",
+        Metric: metric,
+        Value: value,
+        Unit: "Count",
+        CapturedAt: `2026-11-20T${capturedAt}:00`,
+        WindowStart: `2026-11-20T${from}:00`,
+        WindowEnd: `2026-11-20T${to}:00`,
+    });
+    type MonitorRow = ReturnType<ReturnType<typeof save>>;
+    /** The tools over Azure Monitor's rows through one call of the shared function: the rows of the minutes read, as the app reads them, or all of them in every read, as the review's probe did. */
+    const reading = (rows: readonly MonitorRow[], all = false) =>
+        createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => monitorTelemetry(all ? rows : rows.filter((r) => Date.parse(`${r.Bucket}Z`) >= from.getTime() && Date.parse(`${r.Bucket}Z`) <= to.getTime()), { from, to }),
+            timeZone: "UTC",
+            latestDay: at("00:00:00"),
+            latest: at("18:00:00"),
+        });
+    const { normalizedRu: RU, requests: REQUESTS, throttled: THROTTLED } = COSMOS_METRICS;
+    const texts = (r: InvestigationResult) => JSON.stringify(r);
+    /** The throughput investigation's statement among an incident's findings. */
+    const throughput = (r: InvestigationResult) => r.findings.find((f) => f.ruleId === "RU-THROTTLED" || f.ruleId === "RU-AT-LIMIT")?.detail;
+
+    // The review of c4c63abe: a day save's 15:30 point (100 % RU, 9,000 requests, 800 429s) with a session's save from
+    // 15:33 to 15:38 inside it. The shared function keeps what the session doesn't hold as two pieces, 15:30 to 15:33 and
+    // 15:38 to 15:45, a total split by their length: its 800 429s read as two incidents, peaks 240 and 560, and its shares
+    // as Azure Monitor's counts, "2550 requests in that interval, 240 of them throttled (9.4 %)". Each part reads only its
+    // episode's own minutes, so, as in the review's probe, every read here holds all the rows: the session's too.
+    it("is one reading: one candidate, said as Azure Monitor counted it over its whole interval, with what the finer save holds", async () => {
+        const day = save("21:33", "00:00", "21:30");
+        const session = save("17:09", "15:33", "15:38");
+        const tools = reading([
+            ...["15:00", "15:15", "15:30", "15:45", "16:00"].flatMap((b) => [day(b, RU, b === "15:30" ? 100 : 11), day(b, REQUESTS, b === "15:30" ? 9000 : 3000), day(b, THROTTLED, b === "15:30" ? 800 : 0)]),
+            ...[3, 4, 5, 6, 7].flatMap((m) => [session(`15:3${m}`, RU, 40), session(`15:3${m}`, REQUESTS, 100), session(`15:3${m}`, THROTTLED, 0)]),
+        ], true);
+        const listed = await ask("find_incidents", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T5"] }, tools);
+        const throttling = (listed.episodes ?? []).filter((e) => e.family === "throttling");
+        expect(throttling.map((e) => [e.key, e.peak])).toEqual([["T5-throttling-20261120T153000Z", "800 requests"]]);
+        const ru = await ask("explain_incident", { episodeKey: "T5-ru-20261120T153000Z" }, tools);
+        expect(ru.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval) reached 100 % in at least one second of the interval from 15:30 to 15:45 UTC");
+        expect(ru.rootCause?.statement).toContain("Azure Monitor counted 9000 requests in that interval, 800 of them throttled (429, 8.9 %)");
+        expect(ru.rootCause?.statement).toContain("A finer save holds 15:33 to 15:38 UTC of that interval: 500 requests, none of them throttled.");
+        expect(ru.rootCause?.statement).toBe(throughput(ru));
+        const incident = await ask("explain_incident", { episodeKey: "T5-throttling-20261120T153000Z" }, tools);
+        expect(incident.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(800, 15:30:00 to 15:45:00 UTC, mostly the container's clients\)/);
+        expect(incident.findings[0].evidence.map((e) => e.text)).toEqual(["429: 800 throttled requests (429) in the 15 minutes from 15:30 UTC (Azure Monitor; a finer save holds none of them, in 15:33 to 15:38)"]);
+        const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T5"] }, tools);
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(800, 15:30:00 to 15:45:00 UTC, mostly the container's clients\)/);
+        expect(errors.findings[0].evidence.map((e) => e.text)).toEqual(["429: 800 throttled requests (429) in the 15 minutes from 15:30 UTC (Azure Monitor; a finer save holds none of them, in 15:33 to 15:38)"]);
+        // Never a share by length as Azure Monitor's count, or as its own interval.
+        for (const r of [listed, incident, ru, errors]) expect(texts(r)).not.toMatch(/\b(2550|5950|240|560)\b/);
+        // Minutes inside the finer save read that save, never the coarser reading around them.
+        const inside = await ask("explain_errors", { from: "2026-11-20T15:34:00Z", to: "2026-11-20T15:37:00Z", targets: ["T5"] }, tools);
+        expect(inside.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded in the window.");
+    });
+
+    // The review of c4c63abe: minutes holding only one of a 60-minute save's points can't tell its step, and the fallback
+    // read it as an instant or a minute: "each 1-minute interval ... from 15:00 to 15:00 UTC ... counted 60000 requests in
+    // that interval, 3000 of them throttled".
+    it("says an interval the minutes read can't tell the length of as unknown, never an instant or a minute", async () => {
+        const hourly = save("18:05", "14:00", "18:00");
+        const tools = reading(["14:00", "15:00", "16:00", "17:00"].flatMap((b) => [hourly(b, RU, b === "15:00" ? 100 : 20), hourly(b, REQUESTS, b === "15:00" ? 60000 : 10000), hourly(b, THROTTLED, b === "15:00" ? 3000 : 0)]));
+        const incident = await ask("explain_incident", { target: "T5", from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z" }, tools);
+        expect(throughput(incident)).toContain("Azure Monitor keeps the highest in each interval of its save, whose length isn't known in these minutes) reached 100 % in at least one second of the interval from 15:00 UTC:");
+        expect(throughput(incident)).toContain("Azure Monitor counted 60000 requests in that interval, 3000 of them throttled (429, 5 %)");
+        const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z", targets: ["T5"] }, tools);
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000, at 15:00:00 UTC, mostly the container's clients\)/);
+        expect(errors.findings[0].evidence.map((e) => e.text)).toEqual(["429: 3000 throttled requests (429) in the interval from 15:00 UTC, whose length isn't known in these minutes (Azure Monitor)"]);
+        for (const r of [incident, errors]) expect(texts(r)).not.toMatch(/1-minute|15:00(:00)? to 15:00/);
+        // It stands for minutes from its start, so it isn't in the minutes that end there.
+        const before = await ask("explain_errors", { from: "2026-11-20T14:40:00Z", to: "2026-11-20T15:00:00Z", targets: ["T5"] }, tools);
+        expect(before.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded in the window.");
+    });
+
+    // A peak kept around a finer save is only an upper bound of each stretch it's kept for: the replica's rise is said as
+    // Azure Monitor's highest over the whole interval, never as the highest in either stretch.
+    it("says the replica's lag kept around a finer save as Azure Monitor's highest over its whole interval", async () => {
+        const replica = (capturedAt: string, from: string, to: string) => (bucket: string, value: number) => ({ ...save(capturedAt, from, to)(bucket, LAG_METRIC, value), TargetKey: "T4-replica", ResourceName: "pgreplica01", Unit: "Seconds" });
+        const day = replica("21:33", "00:00", "21:30");
+        const session = replica("17:09", "15:33", "15:38");
+        const tools = reading([...["15:00", "15:15", "15:30", "15:45", "16:00"].map((b) => day(b, b === "15:30" ? 120 : 0.5)), ...[3, 4, 5, 6, 7].map((m) => session(`15:3${m}`, 2))], true);
+        const lag = await ask("explain_replica_lag", { at: "2026-11-20T15:31:00Z" }, tools);
+        expect(lag.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 15-minute interval\) reached 120 s in the 15 minutes from 15:30:00 UTC /);
+        expect(texts(lag)).not.toMatch(/in the (3|7) minutes from 15:(30|38)/);
     });
 });

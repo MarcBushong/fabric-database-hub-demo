@@ -21,7 +21,7 @@ import type { DaxLog } from "@/rca/loader";
 import { bothTimes } from "@/rca/time";
 import { EXPLAINED_FAMILIES } from "@/rca/tools";
 import type { InvestigationResult } from "@/rca/types";
-import { episodeOf } from "@/rca/view/facts";
+import { emptyListNote, episodeOf } from "@/rca/view/facts";
 import { RcaReport } from "@/rca/view/RcaReport";
 import { parseSelection } from "@/rca/view/selection";
 
@@ -198,7 +198,7 @@ export default function RcaPage() {
                             ))}
                         </ul>
                     ) : (
-                        <p>Nothing abnormal in these minutes: the detector found no episode.</p>
+                        <p>{emptyListNote(found, timeZone)}</p>
                     )}
                     {selection?.kind === "window" ? (
                         <p style={{ marginBottom: 0 }}>

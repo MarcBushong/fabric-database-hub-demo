@@ -267,6 +267,8 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         expect(late.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T164500Z", as: ["T4-replica-replica_lag-20261121T165700Z"] });
         expect(late.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 15-minute interval\) reached 34 s in the 3 minutes from 16:57:00 UTC /);
         expect(late.rootCause?.statement).not.toMatch(/3-minute/);
+        // The review of c4c63abe: it opened on its one sample because its rule opens on one, not by being far over its level.
+        expect((late.details?.episodes as Array<{ text: string }>)[0].text).toContain("peak 34 s at 16:57:00 UTC, in one sample: low confidence (Azure Monitor).");
         const cpu = await ask("explain_incident", { episodeKey: "T4-cpu-20261121T163500Z" });
         expect((cpu.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 16:35:00 to 16:50:00 UTC");
     });

@@ -92,6 +92,13 @@ export const MONITOR_PAGES = 4;
 /** The Azure Monitor read's name in the logs and in what wasn't captured. */
 export const MONITOR_TABLE = "Telemetry Snapshots (Azure Monitor)";
 
+/** Database Hub's bins of one target, and their waits by category, as their paged reads (sources.ts) are named in the logs and in what wasn't captured. */
+export const binsTable = (target: RcaTarget) => `Telemetry Snapshots (${target}'s bins)`;
+export const waitsTable = (target: RcaTarget) => `Telemetry Snapshots (${target}'s waits)`;
+
+/** Whether a read is paged, MONITOR_PAGES queries of at most MONITOR_ROW_LIMIT rows (sources.ts): Azure Monitor's, and Database Hub's bins and waits. */
+export const isPagedTable = (table: string) => table === MONITOR_TABLE || /^Telemetry Snapshots \(T[1-3]'s (bins|waits)\)$/.test(table);
+
 /**
  * Every capture's Azure Monitor metrics for the window's T4, replica, and T5 (Telemetry Snapshots only), oldest first, or
  * null when the window has none of them. Captures can overlap: sources.ts keeps one point per interval, the finest.

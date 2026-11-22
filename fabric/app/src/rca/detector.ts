@@ -13,7 +13,7 @@
 // episodes; the densest source of a signal comes first (T3's 15-second resource rows before Database Hub's bins).
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
-import { pointKey, type Confidence, type Episode, type Evidence, type EventRow, type RcaTarget, type Support } from "./types";
+import { isRcaTable, pointKey, readStoppedAt, type Confidence, type Episode, type Evidence, type EventRow, type RcaTarget, type Support, type WholeReading } from "./types";
 
 export interface Sample {
     at: Date;
@@ -210,6 +210,9 @@ export function detect(target: RcaTarget, series: readonly Sample[], stepMs: num
             continue;
         }
         const support = supportOf(atLevel, unknown);
+        // One sample opens an episode by itself only for a rule of one sample, or one far over its level (isSevere): only
+        // then does its one sample say "far over its level" (the review of c4c63abe: a 34 s lag against a 30 s level did).
+        const severe = atLevel === 1 && rule.minRun > 1;
         found.push({
             key: `${target}-${rule.family}-${stamp(first.at)}`,
             target,
@@ -227,6 +230,7 @@ export function detect(target: RcaTarget, series: readonly Sample[], stepMs: num
             unknown,
             atLevel,
             support,
+            ...(severe ? { severe } : {}),
             source,
             confidence: CONFIDENCE[support],
         });
@@ -367,8 +371,12 @@ function captureEnding(evidence: Evidence, target: RcaTarget, last: Date, gapped
     return running ? { readEnd: readTo } : {};
 }
 
-/** The capture's own episodes, measured from its samples. `readTo` is where the minutes read end. */
-export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[] {
+/**
+ * The capture's own episodes, measured from its samples. `readTo` is where the minutes read end, and `stop` where a read
+ * of the capture's tables stopped short: an episode on before it ends its minutes there (the review of eb89acbb: with RCA
+ * Events read only to 15:00:30, a surge read "the minutes read end at 15:20:00").
+ */
+export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Date | null): Episode[] {
     const out: Episode[] = [];
     for (const c of captureEpisodes(evidence)) {
         const family = captureFamily(c.detail, c.target);
@@ -382,7 +390,8 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[
         // A one-sample episode (a deadlock count that rose) can fall between the counter's samples: its escalation states the value.
         const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
-        const ending = c.end ? {} : captureEnding(evidence, c.target, samples.length ? samples[samples.length - 1].at : c.start, samples.length < read.length, readTo);
+        const stopped = !!stop && !!readTo && stop < readTo && stop > c.start;
+        const ending = c.end ? {} : captureEnding(evidence, c.target, samples.length ? samples[samples.length - 1].at : c.start, samples.length < read.length, stopped ? (stop as Date) : readTo);
         // An episode with no end whose last samples are back under its level fell under by the first of them, whether its
         // capture cut it off (the review of 803f2b1a: a surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still
         // on") or the minutes read end first (the review of 858c50c2: the replica's stall read "still on at 16:20:00" after
@@ -399,6 +408,7 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[
             end: c.end,
             last: hits.length ? hits[hits.length - 1].at : c.start,
             ...ending,
+            ...(stopped && ending.readEnd ? { readStopped: true } : {}),
             ...(after.length ? { fellBy: after[0].at, ...(ending.readEnd ? {} : { captureEnd: after[after.length - 1].at }) } : {}),
             peak: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? stated : (peak?.value ?? 0),
             peakAt: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? c.start : (peak?.at ?? c.start),
@@ -479,31 +489,46 @@ export interface MonitorShape {
     grains?: ReadonlyMap<string, number>;
     sources?: ReadonlyMap<string, string>;
     upperBounds?: ReadonlySet<string>;
+    /** Each piece of a point split into two or more: its whole reading (sources.ts's wholeReadings). */
+    wholes?: ReadonlyMap<string, WholeReading>;
 }
 
 /**
- * The pieces of a coarser peak over two or more uncovered stretches (upper bounds of one reading) after the first of each:
- * the reading is one candidate, never two episodes, so only its first piece is read, and the others are unknown.
+ * The pieces of a coarser point split across two or more stretches, a total by their length or a peak as an upper bound
+ * in each, are one reading: one candidate, never two episodes (the review of c4c63abe: one 15-minute count of 800 429s read
+ * as two incidents, peaks 240 and 560). Its first piece reads as the whole reading's raw value, and the others as unknown.
+ * Without whole readings, the peaks' pieces by their upper bounds.
  */
-function laterPieces(shape: MonitorShape): Set<string> {
-    const later = new Set<string>();
-    if (!shape.upperBounds || !shape.sources) return later;
+function oneReading(shape: MonitorShape): Map<string, number | null> {
+    const out = new Map<string, number | null>();
     const timeOf = (key: string) => Number(key.slice(key.lastIndexOf("|") + 1));
+    if (shape.wholes) {
+        const seen = new Set<WholeReading>();
+        for (const [key, whole] of [...shape.wholes].sort((x, y) => timeOf(x[0]) - timeOf(y[0]))) {
+            out.set(key, seen.has(whole) ? null : whole.value);
+            seen.add(whole);
+        }
+        return out;
+    }
+    if (!shape.upperBounds || !shape.sources) return out;
     const first = new Set<string>();
     for (const key of [...shape.upperBounds].sort((x, y) => timeOf(x) - timeOf(y))) {
         const source = shape.sources.get(key) ?? key;
-        if (first.has(source)) later.add(key);
+        if (first.has(source)) out.set(key, null);
         else first.add(source);
     }
-    return later;
+    return out;
 }
 
 /** T4's, its replica's, and T5's Azure Monitor metrics; the replica's catch-up after a restart isn't lag. */
 export function episodesFromMonitor(postgres: PostgresCapture | null, cosmos: CosmosCapture | null, shape: MonitorShape = {}): Episode[] {
     const out: Episode[] = [];
-    const later = laterPieces(shape);
+    const reading = oneReading(shape);
     const grainOf = (target: RcaTarget, metric: string) => (p: { at: Date }) => shape.grains?.get(pointKey(target, metric, p.at));
-    const valueOf = (target: RcaTarget, metric: string) => (p: { at: Date; value: number }) => (later.has(pointKey(target, metric, p.at)) ? null : p.value);
+    const valueOf = (target: RcaTarget, metric: string) => (p: { at: Date; value: number }) => {
+        const key = pointKey(target, metric, p.at);
+        return reading.has(key) ? (reading.get(key) ?? null) : p.value;
+    };
     if (postgres) {
         const step = (postgres.intervalMinutes ?? 1) * MIN;
         const lag = postgresSeries(postgres, "T4-replica", POSTGRES_METRICS.lag);
@@ -559,12 +584,12 @@ function rowsCover(evidence: Evidence, target: RcaTarget, from: Date, to: Date):
  */
 export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episode[] {
     const { evidence } = input;
-    const byCapture = episodesFromCapture(evidence, to);
+    const byCapture = episodesFromCapture(evidence, to, readStoppedAt(evidence, isRcaTable));
     const byRows = cpuFromResourceRows(evidence);
     const byEvents = episodesFromEvents(evidence);
     const byBins = episodesFromBins(input.bins ?? []);
     // Runs step by each point's save's step; without the grains (a reader before the shared finestPerInterval), by its span.
-    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null, { grains: input.grains ?? input.intervals, sources: input.sources, upperBounds: input.upperBounds });
+    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null, { grains: input.grains ?? input.intervals, sources: input.sources, upperBounds: input.upperBounds, wholes: input.wholes });
     const overlaps = (a: Episode, b: Episode) => a.target === b.target && a.family === b.family && a.start <= (b.end ?? b.last) && b.start <= (a.end ?? a.last);
     // The events count deadlocks and errors themselves: the capture's own episode for the same minutes would only repeat them.
     const chosen: Episode[] = [...byCapture.filter((c) => !byEvents.some((e) => overlaps(c, e))), ...byRows, ...byEvents];
@@ -594,15 +619,16 @@ export function describeEpisode(e: Episode): string {
     // An episode the capture had no samples of its own for (its errors, PostgreSQL's deadlock counts) can't say whether it
     // was still on (the review of 97fdf5ba).
     const own = e.valued > 0;
+    const readEnds = e.readStopped ? "read stopped" : "minutes read end";
     const span = e.end
         ? `from ${t(e.start)} to ${t(e.end)} UTC`
         : capture
           ? e.readEnd
               ? e.fellBy
-                  ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the minutes read end at ${t(e.readEnd)} UTC, before its capture confirmed the end)`
+                  ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the ${readEnds} at ${t(e.readEnd)} UTC, before its capture confirmed the end)`
                   : own
-                    ? `from ${t(e.start)} UTC (still on at ${t(e.readEnd)} UTC, where the minutes read end)`
-                    : `from ${t(e.start)} UTC (the capture hadn't recorded its end by ${t(e.readEnd)} UTC, where the minutes read end)`
+                    ? `from ${t(e.start)} UTC (still on at ${t(e.readEnd)} UTC, where the ${readEnds})`
+                    : `from ${t(e.start)} UTC (the capture hadn't recorded its end by ${t(e.readEnd)} UTC, where the ${readEnds})`
               : e.fellBy
                 ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the capture ended at ${t(e.captureEnd ?? e.fellBy)} UTC, before it could confirm the end)`
                 : own
@@ -614,7 +640,9 @@ export function describeEpisode(e: Episode): string {
     // with a dip (the review of 803f2b1a: T3's CPU at 95, 96, 60, and 97 % read as "3 samples in a row").
     const how =
         e.support === "single sample"
-            ? "in one sample, far over its level: low confidence"
+            ? e.severe
+                ? "in one sample, far over its level: low confidence"
+                : "in one sample: low confidence"
             : e.support === "sparse"
               ? `in ${e.atLevel} samples, ${e.unknown} of the samples between them without a value`
               : e.valued > e.atLevel

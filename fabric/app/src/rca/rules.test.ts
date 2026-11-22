@@ -6,7 +6,7 @@ import { analyzeLocking, blockingEpisodes, chainsOf } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { analyzeThroughput } from "./throughput";
-import type { MetricPoint, RcaTarget, ReplicaSample, ResourcePoint, SessionSample } from "./types";
+import { pointKey, type MetricPoint, type RcaTarget, type ReplicaSample, type ResourcePoint, type SessionSample, type WholeReading } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 
@@ -316,6 +316,21 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(below.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit.");
     });
 
+    // The review of c4c63abe: a coarser point's count, split by length around a finer save, read its share as Azure
+    // Monitor's count for the share's own minutes, "2 failed connections in its interval from 15:30 to 15:33 UTC".
+    it("says a count split around a finer save as Azure Monitor counted it, over its whole interval", () => {
+        const whole: WholeReading = { key: pointKey("T4", "connections_failed", at("15:30:00")), at: at("15:30:00"), intervalMs: 900_000, grainMs: 900_000, value: 6, finer: 0, covered: [{ from: at("15:33:00"), to: at("15:38:00") }] };
+        const split: MetricPoint[] = [
+            { target: "T4", at: at("15:30:00"), metric: "connections_failed", value: 2, intervalMs: 180_000, grainMs: 900_000, whole },
+            { target: "T4", at: at("15:33:00"), metric: "connections_failed", value: 0, intervalMs: 300_000, grainMs: 300_000 },
+            { target: "T4", at: at("15:38:00"), metric: "connections_failed", value: 4, intervalMs: 420_000, grainMs: 900_000, whole },
+        ];
+        const a = ask(surge(2, 32, 0, 0), split);
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 6 failed connections in its interval from 15:30 to 15:45 UTC;");
+        expect(a.rootCause?.evidence.map((e) => e.text)).toContain("6 failed connections from 15:30 to 15:45 UTC (Azure Monitor)");
+        expect(JSON.stringify(a)).not.toMatch(/\b2 failed connections|15:30 to 15:33/);
+    });
+
     // 3732317d's review: the states leave out the capture's own connection, and the total doesn't, so they add up to one
     // less; and "36 of the 35 slots" read as nonsense where connections that may use the reserved slots took one.
     it("says the total has the capture's own connection, and a total past the limit as such", () => {
@@ -376,6 +391,11 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(read.details).toMatchObject({ captureEnded: null, fellUnder: "2026-11-20T15:31:20Z", readEnd: "2026-11-20T15:31:30Z" });
         const still = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), readEnd: at("15:31:30") });
         expect(still.rootCause?.statement).toContain("It was still on at 15:31:30 UTC, where the minutes read end.");
+        // The review of eb89acbb: where a read of the capture's tables stopped short, that's where it says the read ended.
+        const stopped = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), readEnd: at("15:31:30"), readStopped: true });
+        expect(stopped.rootCause?.statement).toContain("It was still on at 15:31:30 UTC, where the read stopped.");
+        const fellStopped = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: waves, sessions: [], metrics: failed(0), readEnd: at("15:31:30"), readStopped: true });
+        expect(fellStopped.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the read stopped at 15:31:30 UTC, before the capture confirmed the end.");
     });
 });
 

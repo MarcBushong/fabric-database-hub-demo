@@ -78,6 +78,29 @@ describe("the Root cause view (ADR 0031)", () => {
         expect(screen.getByRole("button", { name: "Explain this incident" })).toBeDisabled();
     });
 
+    // The review of eb89acbb: the list said "Nothing abnormal in these minutes" whenever it had no episode, also when its
+    // read had stopped short. Here Azure Monitor's pages always come back full, with nothing abnormal in them.
+    it("says nothing abnormal only up to where a read stopped short", async () => {
+        const client = createSourceClient([
+            {
+                provenance: "sample",
+                answers: () => true,
+                fetch: async (spec) => {
+                    if (spec.id === "rca-newest-bin") return { rows: [{ Newest: "2026-11-20T18:00:00" }], requestId: "test" };
+                    if (spec.title !== "Azure Monitor metrics") return { rows: [], requestId: "test" };
+                    const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
+                    const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
+                    // 50 overlapping saves of one metric a minute: a page holds 100 minutes, so the read stops short.
+                    const rows = Array.from({ length: spec.rowLimit }, (_, i) => ({ Bucket: new Date(from + Math.floor(i / 50) * 60_000).toISOString().slice(0, 19), TargetKey: "T5", ResourceName: "cosmos01", Metric: "NormalizedRUConsumption", Value: 10, Unit: "Percent", CapturedAt: `2026-11-20T18:${String(i % 50).padStart(2, "0")}:00`, WindowStart: "2026-11-20T00:00:00", WindowEnd: "2026-11-20T23:00:00" }));
+                    return { rows, requestId: "test" };
+                },
+            },
+        ]);
+        renderWithApp(<RcaPage />, { rca: true, client: Object.assign(client, { ran: [] as string[] }), view: { page: "rca" } });
+        expect(await screen.findByText(/^Nothing abnormal up to .+, where the read stopped: the detector found no episode there, and what came after it wasn't read\.$/, {}, { timeout: 10000 })).toBeInTheDocument();
+        expect(screen.queryByText(/Nothing abnormal in these minutes/)).toBeNull();
+    });
+
     it("colors with the stage's tokens only, each defined in every theme, and marks the current incident with the system's colors under forced colors (F22)", () => {
         const css = readFileSync(join(process.cwd(), "src", "rca", "view", "rca.css"), "utf8");
         const block = /@media \(forced-colors: active\) \{([\s\S]*?)\n\}/;
