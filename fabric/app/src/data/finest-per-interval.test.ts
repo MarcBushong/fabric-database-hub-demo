@@ -72,6 +72,7 @@ describe("finestPerInterval, the history's overlapping saves (F35)", () => {
         const uncovered = REQUESTS.filter(([bucket]) => bucket === "15:30" || bucket >= "15:41");
         expect(total(rest)).toBe(uncovered.reduce((sum, [, value]) => sum + value, 0));
         expect(rest.map((r) => r.Value)).toEqual([468, 1871]);
+        expect(rest.every((r) => r.SourceKey === pointKey("T5", "TotalRequests", at("15:30")) && r.UpperBound === undefined)).toBe(true);
         expect(total(kept.filter(quarter))).toBe(27630);
 
         // Where only three of its minutes were saved, the same total isn't cut to those 303 requests.
@@ -84,11 +85,19 @@ describe("finestPerInterval, the history's overlapping saves (F35)", () => {
         const session = point(T4_SESSION, "T4-replica", "pgreplica01", "physical_replication_delay_in_seconds", "Seconds");
         const day = point(T4_DAY, "T4-replica", "pgreplica01", "physical_replication_delay_in_seconds", "Seconds");
         const rows = [day("15:45", 2), day("16:00", 2), day("16:15", 178), day("16:30", 2), day("16:45", 34), ...LAG.map(([bucket, value]) => session(bucket, value))];
-        const { kept, intervals } = finestPerInterval(rows);
+        const { kept, intervals, grains } = finestPerInterval(rows);
         // The session's points 1, 1, and 8 s cover 16:45 to 16:57: the day's 34 s were in 16:57 to 17:00.
         const fromDay = kept.filter((r) => r.CapturedAt === T4_DAY.CapturedAt);
         expect(fromDay.map((r) => [hhmm(r), r.Value])).toEqual([["16:57", 34]]);
-        expect(intervals.get(pointKey("T4-replica", "physical_replication_delay_in_seconds", at("16:57")))).toBe(3 * MIN);
+        expect(fromDay[0].SourceKey).toBe(pointKey("T4-replica", "physical_replication_delay_in_seconds", at("16:45")));
+        expect(fromDay[0].UpperBound).toBeUndefined();
+        // Each point's span, and its save's own interval: the session's last point covers 2 of its 5 minutes, and the day's 3 of its 15.
+        const key = (hm: string) => pointKey("T4-replica", "physical_replication_delay_in_seconds", at(hm));
+        expect(["16:50", "16:55", "16:57"].map((hm) => [intervals.get(key(hm)), grains.get(key(hm))])).toEqual([
+            [5 * MIN, 5 * MIN],
+            [2 * MIN, 5 * MIN],
+            [3 * MIN, 15 * MIN],
+        ]);
         // The peak comes from the finest grain: 178 s at 16:20, not the day's 15 minutes from 16:15.
         const peak = kept.reduce((best, r) => (Number(r.Value) > Number(best.Value) ? r : best));
         expect([hhmm(peak), peak.Value, intervals.get(pointKey("T4-replica", "physical_replication_delay_in_seconds", at(hhmm(peak))))]).toEqual(["16:20", 178, 5 * MIN]);
@@ -97,6 +106,32 @@ describe("finestPerInterval, the history's overlapping saves (F35)", () => {
         // A coarser point that isn't higher than what it overlaps adds nothing.
         const { kept: lower } = finestPerInterval([day("16:30", 2), day("16:45", 8), ...LAG.map(([bucket, value]) => session(bucket, value))]);
         expect(lower.filter((r) => r.CapturedAt === T4_DAY.CapturedAt)).toEqual([]);
+    });
+
+    // The review of 576c356e: three saves, at 1, 5, and 15 minutes.
+    it("lets a lower peak cover its uncovered minutes, so a coarser peak can't land where a finer save says it was lower", () => {
+        const save = (capturedAt: string, from: string, to: string) => point({ CapturedAt: `2026-11-21T${capturedAt}:00`, WindowStart: `2026-11-21T${from}:00`, WindowEnd: `2026-11-21T${to}:00` }, "T4", "pgflex01", "cpu_percent", "Percent");
+        const minute = save("10:04", "10:00", "10:03");
+        const five = save("10:11", "10:00", "10:10");
+        const fifteen = save("10:20", "09:30", "10:15");
+        const { kept, intervals } = finestPerInterval([minute("10:00", 50), minute("10:01", 60), minute("10:02", 70), five("10:00", 60), five("10:05", 40), fifteen("09:45", 10), fifteen("10:00", 90)]);
+        // The 5-minute save's 60 covers 10:03 to 10:05, so the 90 can only have been from 10:10 to 10:15.
+        expect(kept.map((r) => [hhmm(r), r.Value])).toEqual([["09:45", 10], ["10:00", 50], ["10:01", 60], ["10:02", 70], ["10:05", 40], ["10:10", 90]]);
+        expect(intervals.get(pointKey("T4", "cpu_percent", at("10:10")))).toBe(5 * MIN);
+    });
+
+    it("gives a peak over two uncovered stretches of one interval to each, marked as one upper bound", () => {
+        const session = point({ ...T5_SESSION, WindowStart: "2026-11-21T15:33:00", WindowEnd: "2026-11-21T15:38:00" }, "T5", "cosmos01", "NormalizedRUConsumption", "Percent");
+        const day = point(T5_DAY, "T5", "cosmos01", "NormalizedRUConsumption", "Percent");
+        const { kept, intervals, grains } = finestPerInterval([day("15:15", 11), day("15:30", 100), day("15:45", 100), ...minutes("15:33", [3, 5, 4, 4, 4]).map(([bucket, value]) => session(bucket, value))]);
+        const pieces = kept.filter((r) => r.SourceKey !== undefined);
+        expect(pieces.map((r) => [hhmm(r), r.Value, r.UpperBound])).toEqual([
+            ["15:30", 100, true],
+            ["15:38", 100, true],
+        ]);
+        expect(new Set(pieces.map((r) => r.SourceKey))).toEqual(new Set([pointKey("T5", "NormalizedRUConsumption", at("15:30"))]));
+        const key = (hm: string) => pointKey("T5", "NormalizedRUConsumption", at(hm));
+        expect([intervals.get(key("15:30")), intervals.get(key("15:38")), grains.get(key("15:38"))]).toEqual([3 * MIN, 7 * MIN, 15 * MIN]);
     });
 
     it("starts a point cut by its window's start there, so a coarser stretch before it has an interval of its own", () => {
