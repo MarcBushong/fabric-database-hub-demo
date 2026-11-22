@@ -4842,7 +4842,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 **Left in Phase 1.**
 
 - **The postmortem's Cause from the RCA** ([§9](adr/0031-incident-rca.md#9-the-postmortems-cause)): built and unit-tested on a local branch stacked on this one, `marcbushong-microsoft-rca-postmortem-cause` ([its entry](#the-postmortems-cause-from-the-blind-investigation-2026-11-22)); its review and its live check are still to come.
-- **The evaluation set's Phase 1 cases,** ported with blind questions.
+- **The evaluation set's Phase 1 cases:** built on the same stacked branch ([its entry](#the-evaluation-sets-phase-1-cases-2026-11-22)), 12 questions graded offline against the answer keys; the rest wait for step 1.8's recorded fixtures and Phase 2.
 - **Decision 6, names:** open for the owner.
 - **The live test's SHA:** 73149836 at first; T2's export failed there (Final tests), so the environments updated to cb224b28, then to 94a17ff7, the app's fix for throttled reads. Both end at 94a17ff7, stopped. The fixes for step 1.8's findings 1 and 2 came after it (4e2c65ed); Final tests checked them against B's model with its headless harness, with no redeploy: finding 1 passed at 4e2c65ed, and what it found for finding 2 was fixed in ca6c9121, 3732317d (the capture), and ebd1c6c3.
 - **Step 1.8, what's left:** the live check of the fixes since that check (findings 1's and 2's in every app commit since 4e2c65ed (bb70161f to 8b43102e, and the fix from its re-reviews, the entry above), and finding 2's in 3732317d, the capture's, whose live check needs a deploy and a new session; finding 3's in 242a3ef7, e55e000b, and 456b9130, and in the `stop-demo.ps1` handoff that closes its limit (f5972d2d, and the fixes from its reviews and 0d0776e4's), whose live check needs `./scripts/deploy.ps1` first, which republishes `DbHub-Stop` (`CONTROL.RUNBOOKS`); finding 4's in f99451f7, 087e096a, and 8b43102e, and in the fixes from f5972d2d's and 0d0776e4's reviews, in which a second stop of a session no longer rewrites its lines); the fixes from the re-reviews of feb64ad3, ff5753e2, and ab1d2d41 and from Final tests' check of ddebd4c3 (the entries above: the draft and the Asks' waits for a session only, a key that reads as its list did, and an incident's own not-captured lines, each target's once beside the errors'); then the phase's final SHA live on an update and on a net-new deployment with a full Run all (the live test's net-new A had no Run all because of the subscription's Automation-account quota). 94a17ff7 is the live test's final SHA, not the phase's.
@@ -5061,3 +5061,35 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 
 - **The time it takes:** a session with many incidents takes up to a minute or two, while Power BI's throttled reads are waited out. The dialog says so, and **Draft with Copilot** doesn't wait.
 - **Rebases:** the branch is rebased on the Incident RCA branch whenever its head moves, so its SHA changes then.
+
+### The evaluation set's Phase 1 cases (2026-11-22)
+
+**Why.** ADR 0031's Phase 1 ends with [the evaluation set's Phase 1 cases](adr/0031-incident-rca.md#phase-1): questions a viewer might ask, graded offline against what was injected. The spike's 30 cases ran on its own fixtures and tools, needed Phase 2's `explain_waits` for most of them, and wrote "injected" into their expected answers. So they're rewritten for Phase 1's tools, on the product's own data. The coordinator asked for them on the stacked branch, after the postmortem's Cause.
+
+**Work summary.**
+
+- **The cases** (`fabric/app/src/rca/testdata/eval-set.ts`, test-only): 12 questions on the contract's two fixtures and B's and A's live rows. Each has the tool calls the playbook leads to, with blind arguments (times, targets, and the keys the tools themselves listed), the facts the answer must rest on, the wrong causes it must not name, its root cause's rule, and the answer key's run it's graded against, or why there's none.
+  - **T1's fixture:** who blocked whom (`BLK-IDLE-HEAD`), the errors (`ERR-LOCK-TIMEOUT`), and the quiet minutes before.
+  - **T4's fixture:** who blocked whom (`BLK-PG-IDLE-IN-TRANSACTION`), why the replica fell behind (`REPL-REPLAY-CONFLICT`), and the quiet minutes after.
+  - **B's rows:** a connection surge (`CONN-IDLE`), the replica's stall, the errors (`ERR-THROTTLED`), T5's throughput (`RU-THROTTLED`), and quiet minutes. **A's rows:** its connection surge.
+- **The grading** (`fabric/app/src/rca/eval.test.ts`):
+  - **Each case:** its facts must be in the tools' outputs, and neither its question, its tool calls, nor the outputs may name a scenario or anything injected. Every finding cites its rows.
+  - **Each dataset:** its blind incident list is graded against its answer key by ADR 0031's scoreboard rule: a run is caught when an incident of its family starts on its target between its start and 15 minutes after its end. A blind incident that no run of a graded family explains is a false alarm.
+  - **The fixtures:** T1's chain is caught after 30 s, T4's locking after 30 s, and the replica's stall after 60 s, with no false alarm. T1's log-flush run is Phase 2's, since its signal is waits.
+  - **The live rows:** B's three connection surges are caught after 2, 22, and 22 s, and A's two after 29 and 30 s, with no false surge alarm. B's key file has no row for T5's storms, T4's CPU after each surge, or the replica's stalls, so those aren't graded.
+  - **The grader itself:** a test shows that it reports an unexplained incident as a false alarm and an uncaught run as missed, and another names the 16 scenarios that no data grades yet.
+
+**Decisions.**
+
+- **12 cases, not the spike's 30.** The rest need data the product doesn't have yet: T3's chain, T1's locking and deadlocks, idle in transaction, and every wait's scenario. Step 1.8's recorded fixtures and Phase 2's `explain_waits` add them.
+- **Test-only:** the set names scenarios, so it lives in `testdata/`, which the contract's blind scan leaves out, and its grading in a test file.
+
+**Changed files.** `fabric/app/src/rca/testdata/eval-set.ts` and `fabric/app/src/rca/eval.test.ts` (new); ADR 0031's evaluation set; and this report.
+
+**Validation.** On feb64ad3 with this change:
+
+- **The app:** `npm run verify` passed: typecheck, lint, Vitest's 623 tests in 36 files (the evaluation set's 16 among them), the license check (136 production packages), and the build.
+- **It bites:** a question that names a scenario, one that says "injected", the replica's run graded on T4 rather than its replica, and B's later session's run graded in these minutes each make it fail.
+- **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. PSScriptAnalyzer found nothing in 393 files; markdownlint found no issue in 152 files.
+
+**What its live check needs.** Nothing to deploy: it reads recorded rows. Step 1.8's net-new run records new fixtures, and the set then adds the cases they make possible.
