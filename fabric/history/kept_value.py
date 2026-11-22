@@ -24,6 +24,7 @@ milliseconds. Not used by the notebook or the model yet: the owner decides on de
 
 from __future__ import annotations
 
+import bisect
 import math
 import re
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,9 @@ OFF_GRID_ANALYSES = frozenset({"wait_profile", "estate_pulse", "memory_clerks", 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _LOCAL_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?")
+# A fraction of a second of any length, as the app's Date reads it: datetime.fromisoformat reads only 3 or 6 digits before
+# Python 3.11 (Fabric Runtime 1.2 runs 3.10), so it's padded or cut to 6, which keeps Date's whole milliseconds (it cuts).
+_FRACTION = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
 
 
 def _js_round(value: float) -> int:
@@ -69,6 +73,7 @@ def to_ms(value) -> int | None:
             return None
         if _LOCAL_ISO.fullmatch(text):
             text += "Z"
+        text = _FRACTION.sub(lambda match: match.group(1) + "." + (match.group(2) + "000000")[:6], text)
         try:
             moment = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
         except ValueError:
@@ -166,34 +171,91 @@ def _sum(values) -> float:
     return total
 
 
-def _own(bin_at, save, value, saves, point, adds):
+class _Points:
+    """
+    A series' points, each save's value at a bin, in the rows' order, indexed by bin: each point then reads only the bins
+    in its interval, where the TypeScript rule reads every point of the series, which made a long history's work grow
+    with its square (201a6666's review of 88ece0f9). The points keep their order, so every sum adds as the rule's does.
+    """
+
+    __slots__ = ("values", "order", "keys_at", "times")
+
+    def __init__(self):
+        self.values = {}
+        self.order = {}
+        self.keys_at = {}
+        self.times = []
+
+    def add(self, at, captured, value) -> None:
+        key = (at, captured)
+        if key not in self.values:
+            self.values[key] = 0
+            self.order[key] = len(self.order)
+            self.keys_at.setdefault(at, []).append(key)
+        self.values[key] = self.values[key] + value
+
+    def seal(self) -> None:
+        self.times = sorted(self.keys_at)
+
+    def within(self, start, end) -> list:
+        """The points whose bin is in [start, end), in the rows' order."""
+        first = bisect.bisect_left(self.times, start)
+        last = bisect.bisect_left(self.times, end)
+        keys = [key for at in self.times[first:last] for key in self.keys_at[at]]
+        keys.sort(key=self.order.__getitem__)
+        return keys
+
+
+class _Saves:
+    """
+    A series' saves by capture, and in the order their rows start, so a point finds the saves whose rows can reach its
+    interval by bisection, within the longest save's reach, instead of reading every save of the series (the review's
+    finding, for a long history). Which saves reach it doesn't depend on their order.
+    """
+
+    __slots__ = ("by_capture", "ordered", "starts", "reach")
+
+    def __init__(self, by_capture):
+        self.by_capture = by_capture
+        self.ordered = sorted(by_capture.values(), key=lambda save: save.row_from)
+        self.starts = [save.row_from for save in self.ordered]
+        self.reach = max((save.row_to - save.row_from for save in self.ordered), default=0)
+
+    def reaching(self, start, end) -> list:
+        """The saves whose rows start before end, and late enough to end after start."""
+        return self.ordered[bisect.bisect_left(self.starts, start - self.reach):bisect.bisect_left(self.starts, end)]
+
+
+def _own(bin_at, save, value, saves, points, adds):
     """What a save's point at a bin keeps of its value under the shared rule, or None when it's left out."""
     length = save.grain * MINUTE
     start = max(bin_at, save.start)
     end = min(bin_at + length, save.end)
     if start >= end:
         start, end = bin_at, bin_at + length
-    finer = [s for s in saves.values() if _finer_than(s, save) and s.row_from < end and s.row_to > start]
+    finer = [s for s in saves.reaching(start, end) if _finer_than(s, save) and s.row_from < end and s.row_to > start]
     if not finer:
         return value
     if any(s.dense and s.row_from <= start + EPSILON and s.row_to >= end - EPSILON for s in finer):
         return None
     # The finer saves' rows in its interval, each ranked by its save: the finest first, then the newest.
     pieces = []
-    for (at, captured), piece_value in point.items():
-        other = saves.get(captured)
-        if other is None or other not in finer or at < bin_at or at >= bin_at + length:
+    for at, captured in points.within(bin_at, bin_at + length):
+        other = saves.by_capture.get(captured)
+        if other is None or other not in finer:
             continue
+        piece_value = points.values[(at, captured)]
         piece_start = max(at, other.start)
         piece_end = min(at + other.grain * MINUTE, other.end)
         if piece_start >= piece_end:
             piece_start, piece_end = at, at + other.grain * MINUTE
         rank = 1 + sum(1 for q in finer if _finer_than(q, other))
         pieces.append(_Piece(other, piece_value, piece_start, piece_end, rank))
-    # The first save's rows keep all they hold; each later level's, what finestPerInterval keeps of them.
+    # The first save's rows keep all they hold; each later save's, what finestPerInterval keeps of them against every
+    # earlier save's rows.
     earlier = [p for p in pieces if p.rank == 1]
-    for level in (2, 3, 4):
-        rows = [p for p in pieces if (p.rank == level if level < 4 else p.rank >= 4)]
+    for level in sorted({p.rank for p in pieces if p.rank > 1}):
+        rows = [p for p in pieces if p.rank == level]
         for row in rows:
             under = [u for u in earlier if u.start < row.end and u.end > row.start]
             covered = _covers(under, row.start, row.end)
@@ -270,13 +332,15 @@ def kept_values(rows) -> list:
                 min(last + grain * MINUTE, end),
                 count == _js_round((last - first) / (grain * MINUTE)) + 1,
             )
+        reaching = _Saves(saves)
 
-        # Each bin's value per save, its rows summed.
-        point = {}
+        # Each bin's value per save, its rows summed, indexed by bin.
+        points = _Points()
         for i in indexes:
             at, captured = times[i]
             if at is not None and captured is not None:
-                point[(at, captured)] = point.get((at, captured), 0) + _number(rows[i].get("Value"))
+                points.add(at, captured, _number(rows[i].get("Value")))
+        points.seal()
 
         for bin_at, group in by_bin.items():
             if bin_at is None or off_grid:
@@ -295,8 +359,8 @@ def kept_values(rows) -> list:
                 save = saves.get(captured) if captured is not None else None
                 if save is None:
                     continue
-                value = point.get((bin_at, captured), 0)
-                own = _own(bin_at, save, value, saves, point, adds)
+                value = points.values.get((bin_at, captured), 0)
+                own = _own(bin_at, save, value, reaching, points, adds)
                 if own is None:
                     continue
                 members = [i for i in group if times[i][1] == captured]

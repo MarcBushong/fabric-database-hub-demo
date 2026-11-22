@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, HOURLY_METRICS, OFF_GRID_ANALYSES } from "./finest-per-interval";
+import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, addsUp, finestPerInterval, HOURLY_METRICS, OFF_GRID_ANALYSES } from "./finest-per-interval";
 import { snapshotValues } from "./snapshot-value";
 
 // F35 design (i)'s shared cases (fabric/history/kept-value-cases.json): rows of the history, and each bin's value by
@@ -152,6 +152,20 @@ const NAMED: Case[] = [
             ["T2", "counter_deltas", "Number of Deadlocks/sec", null, s("21:30"), s("21:26", -1), s("21:26"), 5],
         ],
     },
+    {
+        // 201a6666's review of 88ece0f9: no case reached a fourth finer save. Four 1-minute saves and a 5-minute one in the
+        // day save's 15:15 interval, each taken against every earlier one, as finestPerInterval takes them (the review of
+        // 79a35e57): the minutes hold all of the 5-minute save's two points, so it keeps nothing there.
+        name: "five finer saves in one coarse interval: each against every earlier one",
+        rows: [
+            ...series(save("16:05", "15:15", "15:18"), "T1", "wait_deltas", "Lock", "15:15", 1, repeat(10, 3)),
+            ...series(save("16:04", "15:16", "15:20"), "T1", "wait_deltas", "Lock", "15:16", 1, repeat(12, 4)),
+            ...series(save("16:03", "15:18", "15:22"), "T1", "wait_deltas", "Lock", "15:18", 1, repeat(14, 4)),
+            ...series(save("16:02", "15:20", "15:25"), "T1", "wait_deltas", "Lock", "15:20", 1, repeat(16, 5)),
+            ...series(save("16:20", "14:00", "16:10"), "T1", "wait_deltas", "Lock", "15:15", 5, [70, 80]),
+            ...series(daySave("21:30"), "T1", "wait_deltas", "Lock", "15:00", 15, repeat(900, 4)),
+        ],
+    },
 ];
 
 /** A seeded generator (mulberry32), so the random cases are the same on every run. */
@@ -166,8 +180,11 @@ function generator(seed: number): () => number {
     };
 }
 
-/** Random SQL saves of one series around 16:00, at the notebook's grains, with gaps, windows that cut bins, and two files. */
-function randomCases(count: number, seed: number): Case[] {
+/**
+ * Random SQL saves of one series around 16:00, at the notebook's grains, with gaps, windows that cut bins, and two files:
+ * 2 to 4 saves a case by default, or `saveCount`'s range, so a coarse point can have a fourth finer save (rank 4 and later).
+ */
+function randomCases(count: number, seed: number, saveCount: readonly [number, number] = [2, 4], label = "random"): Case[] {
     const random = generator(seed);
     const int = (lo: number, hi: number) => lo + Math.floor(random() * (hi - lo + 1));
     const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
@@ -182,7 +199,7 @@ function randomCases(count: number, seed: number): Case[] {
     for (let n = 0; n < count; n++) {
         const [target, analysis, metric, top] = pick(kinds);
         const rows: CaseRow[] = [];
-        const saves = int(2, 4);
+        const saves = int(saveCount[0], saveCount[1]);
         for (let k = 0; k < saves; k++) {
             const span = pick([20, 30, 45, 180, 400, 900, 1440]);
             const start = s("16:00") - int(1, span) * 60 + int(-20, 20) * 60 + (random() < 0.2 ? int(1, 59) : 0);
@@ -198,12 +215,13 @@ function randomCases(count: number, seed: number): Case[] {
                 for (let f = 0; f < files; f++) rows.push([target, analysis, metric, at, captured, start, end, int(0, top)]);
             }
         }
-        cases.push({ name: `random ${n + 1}`, rows });
+        cases.push({ name: `${label} ${n + 1}`, rows });
     }
     return cases;
 }
 
-const CASES: Case[] = [...NAMED, ...randomCases(20, 20_261_122)];
+// The first 20 as before; 10 more with 5 saves each, so random shapes reach rank 4 and later (201a6666's review of 88ece0f9).
+const CASES: Case[] = [...NAMED, ...randomCases(20, 20_261_122), ...randomCases(10, 20_261_123, [5, 5], "random with 5 saves")];
 
 const toRow = ([target, analysis, metric, bucket, captured, start, end, value]: CaseRow): Row => ({
     TargetKey: target,
@@ -224,6 +242,41 @@ function binsOf(rows: readonly CaseRow[]): CaseBin[] {
         bins.push([target, analysis, metric, binText === "" ? null : (Number(binText) - BASE) / 1000, value]);
     }
     return bins;
+}
+
+const HOUR = 3_600_000;
+
+/**
+ * Each series' total (a count, a total, or a delta) or peak in each hour, by `target|analysis|metric|hour`: from
+ * snapshotValues' bins (model), and from finestPerInterval's kept points (finest), given the rows as f35Check gives them,
+ * one per save, series, and bin. Off the bin grid, neither: finestPerInterval never sees those rows. An hour holds every
+ * grain in the cases, so a remainder that the two rules place at different starts stays in its hour.
+ */
+function hourlyWindows(rows: readonly CaseRow[]): { model: Map<string, number>; finest: Map<string, number> } {
+    const fold = (map: Map<string, number>, key: string, adds: boolean, value: number) => {
+        const before = map.get(key);
+        map.set(key, before === undefined ? value : adds ? before + value : Math.max(before, value));
+    };
+    const model = new Map<string, number>();
+    for (const [key, value] of snapshotValues(rows.map(toRow))) {
+        const [target, analysis, metric, binText] = key.split("|");
+        if (binText === "" || OFF_GRID_ANALYSES.has(analysis)) continue;
+        const hour = new Date(Math.floor(Number(binText) / HOUR) * HOUR).toISOString();
+        fold(model, `${target}|${analysis}|${metric}|${hour}`, ADDITIVE_ANALYSES.has(analysis) || ADDITIVE_METRICS.has(metric), value);
+    }
+    const grouped = new Map<string, Row>();
+    for (const row of rows.map(toRow)) {
+        if (row.Bucket === null || OFF_GRID_ANALYSES.has(String(row.AnalysisKey))) continue;
+        const key = `${String(row.TargetKey)}|${String(row.AnalysisKey)}|${String(row.Metric)}|${String(row.Bucket)}|${String(row.CapturedAt)}`;
+        const before = grouped.get(key);
+        grouped.set(key, before ? { ...before, Value: Number(before.Value) + Number(row.Value) } : { ...row, Value: Number(row.Value) });
+    }
+    const finest = new Map<string, number>();
+    for (const row of finestPerInterval([...grouped.values()]).kept) {
+        const hour = new Date(Math.floor(Number(row.Bucket) / HOUR) * HOUR).toISOString();
+        fold(finest, `${String(row.TargetKey)}|${String(row.AnalysisKey)}|${String(row.Metric)}|${hour}`, addsUp(row), Number(row.Value));
+    }
+    return { model, finest };
 }
 
 /**
@@ -313,5 +366,35 @@ describe("F35 design (i)'s shared cases", () => {
     it("drops a lower peak and keeps a higher one where the finer points leave a gap", () => {
         expect(valueAt("a peak lower", "15:30")).toBe(30);
         expect(valueAt("a peak higher", "15:30")).toBe(70);
+    });
+
+    it("takes each finer save against every earlier one, as finestPerInterval does: 900 from 15:15 to 15:30, the day's", () => {
+        // The minutes hold 130 from 15:15 to 15:25 and all of the 5-minute save's two points, so the day's 15:15 keeps
+        // 900 - 130 = 770 beside the newest minute's 10: 780. Against the first three only, the 5-minute save's 15:20 kept
+        // 52 there, though the fourth save's minutes hold that time, and the bin was 728, 848 in all.
+        expect(valueAt("five finer saves", "15:15")).toBe(780);
+        expect(totalOf("five finer saves", "15:15", "15:30")).toBe(900);
+    });
+
+    it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, on every case", () => {
+        const differ: string[] = [];
+        let compared = 0;
+        for (const c of CASES) {
+            const { model, finest } = hourlyWindows(c.rows);
+            for (const key of new Set([...model.keys(), ...finest.keys()])) {
+                const a = model.get(key);
+                const b = finest.get(key);
+                compared += 1;
+                if (a === undefined || b === undefined || Math.abs(a - b) > 1e-9 * Math.max(1, Math.abs(a), Math.abs(b))) differ.push(`${c.name}, ${key}: ${a} and ${b}`);
+            }
+        }
+        // One difference, which isn't about ranks: random 11's newer 900-minute save holds 3 rows of T2's sessions, 30 minutes
+        // apart at their closest, and no other series. finestPerInterval reads a save's step from its bins, 30 minutes here,
+        // so the save is coarser than the older one and left out at 15:30, where the older save's 7 is kept; snapshotValues
+        // reads the notebook's 15 from its window, so the newer save is the finer and its 43 is kept. A save of the
+        // notebook's holds every series of its targets, MaxCPU in each bin they ran, which shows its step. With the fourth
+        // and later saves against the first three, the named case differed too: 3,548 and 3,600 from 15:00 to 16:00.
+        expect(differ).toEqual(["random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29"]);
+        expect(compared).toBeGreaterThan(CASES.length);
     });
 });

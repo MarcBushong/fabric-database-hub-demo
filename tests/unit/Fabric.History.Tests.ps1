@@ -82,7 +82,7 @@ for case in data["cases"]:
 print(json.dumps({"cases": len(data["cases"]), "bins": bins, "rows": rows_checked, "problems": problems[:10], "count": len(problems)}))
 '@
         $result['count'] | Should -Be 0 -Because (@($result['problems']) -join "`n")
-        $result['cases'] | Should -BeGreaterOrEqual 34
+        $result['cases'] | Should -BeGreaterOrEqual 45
         $result['bins'] | Should -BeGreaterThan 500
     }
 
@@ -113,6 +113,9 @@ print(json.dumps([
     kept_value.to_ms("2026-11-21T15:30:00Z"),
     kept_value.to_ms("2026-11-21T15:30:00"),
     kept_value.to_ms("2026-11-21T17:09:30.107"),
+    kept_value.to_ms("2026-11-21T17:09:30.1"),
+    kept_value.to_ms("2026-11-21T17:09:30.1070000Z"),
+    kept_value.to_ms("2026-11-21T17:09:30.9999999+00:00"),
     kept_value.to_ms(datetime(2026, 11, 21, 15, 30)),
     kept_value.to_ms(datetime(2026, 11, 21, 15, 30, tzinfo=timezone.utc)),
     kept_value.to_ms(1763739000000),
@@ -124,6 +127,8 @@ print(json.dumps([
 ]))
 '@
         $at = [System.DateTimeOffset]::new(2026, 11, 21, 15, 30, 0, [System.TimeSpan]::Zero).ToUnixTimeMilliseconds()
-        @($result) | Should -Be @($at, $at, ($at + 99 * 60000 + 30107), $at, $at, 1763739000000, $null, $null, 3, 5, 1, 5, 15)
+        # A fraction of 1 or 7 digits reads as the app's Date reads it, cut to whole milliseconds; on Python 3.10, Fabric
+        # Runtime 1.2's, fromisoformat alone refused both (201a6666's review of 88ece0f9).
+        @($result) | Should -Be @($at, $at, ($at + 99 * 60000 + 30107), ($at + 99 * 60000 + 30100), ($at + 99 * 60000 + 30107), ($at + 99 * 60000 + 30999), $at, $at, 1763739000000, $null, $null, 3, 5, 1, 5, 15)
     }
 }

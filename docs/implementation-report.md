@@ -5887,3 +5887,78 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 - None for existing deployments: nothing runs this code yet.
 - Python's float sums follow TypeScript's order (rows and inserts as written), so the bins match to 1e-9 of the larger; a notebook that reorders rows before the rule could differ in the last digits.
+
+### F35 design (i) groundwork: the review's fixes (2026-11-22)
+
+**Why.** 201a6666's review of 88ece0f9 found the rule a faithful port, with two Lows and a design note.
+
+- **Times on Python 3.10 and older:** `to_ms` read a fraction of other than 3 or 6 digits as no time, because `datetime.fromisoformat` before Python 3.11 reads only those. Fabric Runtime 1.2 runs Python 3.10. There, "…T17:09:30.1" and .NET's 7-digit "…T17:09:30.1070000Z" read as no time, while the app's `toDate` reads both. It fails silently: a `CapturedAt` read as no time drops that save's rows, and a `Bucket` makes a binned row off the grid.
+- **No case reached a fourth finer save:** the random cases drew 2 to 4 saves, so rank 4 and later (`kept_value.py`'s level 4) never ran.
+- **The cost:** each point read every point and every save of its series, as `snapshotValues` does, so the work grew with the square of a series' history. That's fine for one save's day either side of its window, but not for a backfill over months.
+
+**Work summary.**
+
+- **`to_ms`** pads or cuts a fraction to 6 digits before `fromisoformat`. It cuts as the app's Date does: V8 reads ".9999999" as 999 milliseconds, not the next second (checked with Node 24).
+- **Rank 4 and later:** a named case has four 1-minute saves and a 5-minute one in one day point's 15-minute interval, and 10 random cases (a new seed) have 5 saves each. The first 20 random cases are unchanged, byte for byte: 45 cases and 1,712 bins, where there were 34 and 1,207.
+  - **What the named case shows:** both rules now take each finer save against every earlier one, as `finestPerInterval`, the shared function of part 1, takes each point against every one it kept before: 15:15 to 15:30 totals 900, the minutes' 130 and the day save's 770. As first written here, `snapshotValues` and this rule took the fourth and later saves against the first three only, so where those overlapped each other, a coarse total lost that time twice, and the case totaled 848. `finestPerInterval` never did; [a later section](#f35-design-i-groundwork-every-finer-save-against-every-earlier-one-2026-11-22) changes both rules.
+- **The index:** a series' points are kept by bin (`_Points`), and its saves in the order their rows start (`_Saves`). Each point bisects to the bins in its interval and to the saves that can reach it, instead of reading them all. The pieces keep the rows' order, so every sum adds as before.
+- **Docs:** this report, and the design note's write-time and backfill rows (in the coordinator's material for decision 3).
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, `tests/unit/Fabric.History.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The same answers:** the indexed rule gives exactly 88ece0f9's kept values, every float and every None, on the 45 shared cases and on 2,000 random histories of every kind (387,283 rows: totals, peaks, Azure Monitor with hourly metrics, off the grid, missing values, and two files).
+- **The cost,** one series of a demo's daily mix with 5 % of its finer bins missing (two 90-minute sessions at 1 minute, a 6-hour stop save at 5 minutes, and a day save at 15 minutes), on this PC with Python 3.11:
+
+  | Days | Rows | 88ece0f9 | Indexed |
+  | --- | --- | --- | --- |
+  | 7 | 2,341 | 0.26 s | 0.07 s |
+  | 30 | 10,073 | 5.13 s | 0.26 s |
+  | 90 | 30,172 | 43.85 s | 0.82 s |
+
+  Without the gaps, dense saves take the cover shortcut and the old rule's scan hardly runs (0.03 s for 7 days).
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 675; a remainder not clamped at 0, 98; a peak never kept in part, 7; level 4 and later dropped, 1; and each rank taken against all earlier ones, 1, the named case's 15:15 bin (828 and 780, where this commit's rule gave 728; the later section makes the latter the rule). An even split changes no bin, and the per-row test catches it; the dense-cover shortcut still changes none.
+- **Times:** `Fabric.History` passes on Python 3.11.9 and 3.10.11 (the embeddable package, signed by the Python Software Foundation, outside the repo). On 3.10 with 88ece0f9's rule, the times test fails: ".1", ".1070000Z", and ".9999999+00:00" read as no time.
+- **And:** vitest (7 tests in the cases file), typecheck, and eslint clean; PSScriptAnalyzer, no findings in the test file; the new and changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- The saves' index bounds each point's search by its series' longest save, so one very long save widens every point's search there; the answers stay the same.
+
+### F35 design (i) groundwork: every finer save against every earlier one (2026-11-22)
+
+**Why.** A fresh reviewer of 79a35e57 found the index and `to_ms` clean, with one Low: the section above said the fourth-and-later limit was part 1's too, but `finestPerInterval` takes each point against every one it kept before. Only `snapshotValues` and this rule took the fourth and later finer saves against the first three. The coordinator's decision: remove the divergence, in `snapshotValues` (4944e22d, on the follow-ups branch) and here, so design (i) matches the app's views exactly.
+
+**Work summary.**
+
+- **`kept_value.py`** takes each finer save's rows against every earlier save's rows, as `snapshotValues` now does.
+- **The shared cases,** written again from the TypeScript rule: only the named case changes, its name and its 15:15 bin, from 728 to 780, so 15:15 to 15:30 totals 900. The other 44 are unchanged, the 10 random cases with 5 saves included: none of them has the double loss.
+- **Parity with `finestPerInterval`,** a new test: each series' total or peak, hour by hour, from `snapshotValues`' bins and from `finestPerInterval`'s kept points, given the rows as `f35Check` gives them. That's 105 hours (76 of totals, 29 of peaks) in 44 cases; the 45th is off the bin grid, which `finestPerInterval` never sees.
+  - The two agree on all but one hour, and that difference isn't about ranks. In `random 11`, the newer of two 900-minute saves holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. `finestPerInterval` reads a save's step from its bins, 30 minutes here, where `snapshotValues` reads the notebook's 15 from its window, so 15:00 to 16:00 peaks at 29 by one and 43 by the other. The test pins that one difference, so any other fails it.
+  - A save of the notebook's holds every series of its targets, MaxCPU in each bin they ran, which shows its step; each random case holds one series.
+  - With the fourth and later saves against the first three, the named case differed too: 3,548 and 3,600 from 15:00 to 16:00.
+- **Docs:** this report, where the section above's named-case bullet now says what each rule does; and the design note's rank paragraph, in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, and this report.
+
+**Validation.**
+
+- **It fails without the change:** with the previous rule, `Fabric.History` fails on the named case's 15:15 bin, 728 where the cases have 780. With this one, it passes on Python 3.11.9 and 3.10.11.
+- **The same answers, indexed or not:** with the same change in 88ece0f9's unindexed port, the two give exactly the same kept values on the 45 cases and on 2,000 random histories of every kind (387,283 rows, 2 to 8 saves a series). Against the previous indexed rule, only the named case differs; no random history does.
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 675; a remainder not clamped at 0, 98; a peak never kept in part, 7; ranks 4 and later dropped, 1, and the fourth and later against the first three, 1, both at the named case's 15:15 bin (828 and 728, where the rule's is 780). An even split changes no bin, and the per-row test catches it; the dense-cover shortcut changes none.
+- **The cost:** the section above's daily mix, and a busy variant with six 20-minute sessions 5 minutes apart each morning, so up to six 1-minute saves reach one 15-minute interval. Best of 3 runs, in each of two rounds, with Python 3.11 on this PC:
+
+  | Mix, 90 days | Rows | The first three only | Every rank |
+  | --- | --- | --- | --- |
+  | The daily mix | 30,172 | 0.98 s, 1.11 s | 0.79 s, 0.96 s |
+  | Busy | 40,445 | 1.50 s, 1.64 s | 1.53 s, 1.39 s |
+
+  The difference is within the rounds' own spread. The kept values are the same in both mixes: the busy mornings' sessions hold all of each 15-minute interval they reach, so that mix measures the work only.
+- **And:** vitest, the cases file's 8 tests and the app's whole suite, 395 of 395 in 22 files; typecheck and eslint clean; markdownlint clean; the changed code files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- Where a save's bins don't show its step, as in `random 11`, this rule and `finestPerInterval` read the save differently. The notebook's saves show it through their other series.
