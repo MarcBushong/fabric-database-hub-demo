@@ -14,6 +14,8 @@ Read-only DAX queries that check the history model's new `Snapshot Value` (F35) 
 | `estate-today.dax`, `estate-f35.dax` | The Insights app's Estate series query (`fabric/app/src/data/queries.ts`, per bin and target, T1 to T3, for B's date), with each measure: for timing. |
 | `t5-today.dax`, `t5-f35.dax` | T5's measures per bin for B's date, in the shape Ask's guide teaches (`fabric/app/src/copilot/guide.ts`), with each measure: for timing on the Azure Monitor path, where the new measure reads each save's bins for its interval. |
 
+Two faster forms of the measure, which give the same answers, wait in [candidates](candidates/README.md) for the live timing that picks one.
+
 ## Run it
 
 1. Run the ten queries against the model, for example through the Execute Queries REST API or an XMLA endpoint, and save each result as JSON. Run the three `rows-*` queries one at a time: together, as one query, they took longer than Execute Queries allows.

@@ -1,0 +1,570 @@
+// F35's speed candidate C2 (C1, and one save's points with no finer save reaching them take their point): window totals and peaks for B's session minutes, with every
+// measure the query evaluates defined in it. Its answer must be byte-identical to window-f35.dax's at 30392d79.
+DEFINE
+    MEASURE 'Telemetry Snapshots'[Snapshot Value] =
+        SUMX (
+            SUMMARIZE (
+                'Telemetry Snapshots',
+                'Telemetry Snapshots'[Target Key],
+                'Telemetry Snapshots'[Analysis Key],
+                'Telemetry Snapshots'[Metric],
+                'Telemetry Snapshots'[Bucket UTC]
+            ),
+            VAR Bin = 'Telemetry Snapshots'[Bucket UTC]
+            VAR AnalysisName = 'Telemetry Snapshots'[Analysis Key]
+            VAR MetricName = 'Telemetry Snapshots'[Metric]
+            VAR OffGrid = ISBLANK ( Bin ) || AnalysisName IN { "wait_profile", "estate_pulse", "memory_clerks", "database_growth", "telemetry_coverage" }
+            RETURN
+                IF (
+                    OffGrid,
+                    VAR NewestCapture = CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ) )
+                    RETURN
+                        CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ), 'Telemetry Snapshots'[Captured At UTC] = NewestCapture ),
+                    VAR Adds = AnalysisName IN { "wait_deltas", "counter_deltas", "storage_io" } || MetricName IN { "TotalRequests", "ThrottledRequests", "TotalRequestUnits", "connections_failed" }
+                    VAR IsMonitor = AnalysisName IN { "postgresql", "cosmosdb" }
+                    VAR IsHourly = MetricName IN { "ProvisionedThroughput", "ServiceAvailability" }
+                    VAR SaveList =
+                        CALCULATETABLE (
+                            SUMMARIZE (
+                                'Telemetry Snapshots',
+                                'Telemetry Snapshots'[Captured At UTC],
+                                'Telemetry Snapshots'[Window Start UTC],
+                                'Telemetry Snapshots'[Window End UTC]
+                            ),
+                            REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Report Date UTC] ),
+                            REMOVEFILTERS ( 'Date' )
+                        )
+                    RETURN
+                        IF (
+                            COUNTROWS ( SaveList ) <= 1,
+                            // One save holds the series, so its point is the value.
+                            CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ) ),
+                            VAR AtBinSaves = CALCULATETABLE ( VALUES ( 'Telemetry Snapshots'[Captured At UTC] ) )
+                            VAR OwnGrains =
+                                ADDCOLUMNS (
+                                    FILTER ( SaveList, 'Telemetry Snapshots'[Captured At UTC] IN AtBinSaves ),
+                                    "@Grain",
+                                        VAR SpanMinutes = ( 'Telemetry Snapshots'[Window End UTC] - 'Telemetry Snapshots'[Window Start UTC] ) * 1440
+                                        VAR FromMinute = ROUND ( ( 'Telemetry Snapshots'[Window Start UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                        VAR ToMinute = ROUND ( ( 'Telemetry Snapshots'[Window End UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                        VAR SaveStep =
+                                            IF (
+                                                IsMonitor,
+                                                VAR SaveBins =
+                                                    CALCULATETABLE (
+                                                        VALUES ( 'Telemetry Snapshots'[Bucket UTC] ),
+                                                        REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Metric], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                        REMOVEFILTERS ( 'Date' ),
+                                                        NOT ( 'Telemetry Snapshots'[Metric] IN { "ProvisionedThroughput", "ServiceAvailability" } )
+                                                    )
+                                                VAR Bins = COUNTROWS ( SaveBins )
+                                                VAR AlignedStep =
+                                                    MINX (
+                                                        SaveBins,
+                                                        VAR BinMinute = ROUND ( ( 'Telemetry Snapshots'[Bucket UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                                        RETURN
+                                                            SWITCH (
+                                                                TRUE (),
+                                                                MOD ( BinMinute, 5 ) <> 0, 1,
+                                                                MOD ( BinMinute, 15 ) <> 0, 5,
+                                                                MOD ( BinMinute, 30 ) <> 0, 15,
+                                                                MOD ( BinMinute, 60 ) <> 0, 30,
+                                                                MOD ( BinMinute, 180 ) <> 0, 60,
+                                                                MOD ( BinMinute, 360 ) <> 0, 180,
+                                                                MOD ( BinMinute, 720 ) <> 0, 360,
+                                                                MOD ( BinMinute, 1440 ) <> 0, 720,
+                                                                1440
+                                                            )
+                                                    )
+                                                RETURN
+                                                    IF (
+                                                        Bins > 0,
+                                                        MAXX (
+                                                            FILTER (
+                                                                SELECTCOLUMNS ( { 1, 5, 15, 30, 60, 180, 360, 720, 1440 }, "@Step", [Value] ),
+                                                                VAR StepNow = [@Step]
+                                                                RETURN
+                                                                    StepNow <= AlignedStep
+                                                                        && ( CEILING ( ToMinute, StepNow ) - FLOOR ( FromMinute, StepNow ) ) / StepNow >= Bins
+                                                            ),
+                                                            [@Step]
+                                                        ),
+                                                        60
+                                                    ),
+                                                IF ( SpanMinutes <= 120.000001, 1, IF ( SpanMinutes <= 720.000001, 5, 15 ) )
+                                            )
+                                        RETURN
+                                            IF ( IsHourly, MAX ( 60, SaveStep ), SaveStep )
+                                )
+                            // A save whose rows weigh on a point here has a window that starts before the point's interval ends, at the
+                            // longest of the points' own intervals from the bin, and ends after the bin; where only the points' own save
+                            // does, its point is the value.
+                            VAR ReachDays = MAXX ( OwnGrains, [@Grain] ) / 1440
+                            VAR NearList =
+                                FILTER (
+                                    SaveList,
+                                    ( 'Telemetry Snapshots'[Window Start UTC] < Bin + ReachDays && 'Telemetry Snapshots'[Window End UTC] > Bin )
+                                        || 'Telemetry Snapshots'[Captured At UTC] IN AtBinSaves
+                                )
+                            RETURN
+                                IF (
+                                    COUNTROWS ( NearList ) <= 1,
+                                    CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ) ),
+                                    VAR NearSaves =
+                                        UNION (
+                                            OwnGrains,
+                                            ADDCOLUMNS (
+                                                FILTER ( NearList, NOT ( 'Telemetry Snapshots'[Captured At UTC] IN AtBinSaves ) ),
+                                                "@Grain",
+                                                    VAR SpanMinutes = ( 'Telemetry Snapshots'[Window End UTC] - 'Telemetry Snapshots'[Window Start UTC] ) * 1440
+                                                    VAR FromMinute = ROUND ( ( 'Telemetry Snapshots'[Window Start UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                                    VAR ToMinute = ROUND ( ( 'Telemetry Snapshots'[Window End UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                                    VAR SaveStep =
+                                                        IF (
+                                                            IsMonitor,
+                                                            VAR SaveBins =
+                                                                CALCULATETABLE (
+                                                                    VALUES ( 'Telemetry Snapshots'[Bucket UTC] ),
+                                                                    REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Metric], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                                    REMOVEFILTERS ( 'Date' ),
+                                                                    NOT ( 'Telemetry Snapshots'[Metric] IN { "ProvisionedThroughput", "ServiceAvailability" } )
+                                                                )
+                                                            VAR Bins = COUNTROWS ( SaveBins )
+                                                            VAR AlignedStep =
+                                                                MINX (
+                                                                    SaveBins,
+                                                                    VAR BinMinute = ROUND ( ( 'Telemetry Snapshots'[Bucket UTC] - DATE ( 1970, 1, 1 ) ) * 1440, 0 )
+                                                                    RETURN
+                                                                        SWITCH (
+                                                                            TRUE (),
+                                                                            MOD ( BinMinute, 5 ) <> 0, 1,
+                                                                            MOD ( BinMinute, 15 ) <> 0, 5,
+                                                                            MOD ( BinMinute, 30 ) <> 0, 15,
+                                                                            MOD ( BinMinute, 60 ) <> 0, 30,
+                                                                            MOD ( BinMinute, 180 ) <> 0, 60,
+                                                                            MOD ( BinMinute, 360 ) <> 0, 180,
+                                                                            MOD ( BinMinute, 720 ) <> 0, 360,
+                                                                            MOD ( BinMinute, 1440 ) <> 0, 720,
+                                                                            1440
+                                                                        )
+                                                                )
+                                                            RETURN
+                                                                IF (
+                                                                    Bins > 0,
+                                                                    MAXX (
+                                                                        FILTER (
+                                                                            SELECTCOLUMNS ( { 1, 5, 15, 30, 60, 180, 360, 720, 1440 }, "@Step", [Value] ),
+                                                                            VAR StepNow = [@Step]
+                                                                            RETURN
+                                                                                StepNow <= AlignedStep
+                                                                                    && ( CEILING ( ToMinute, StepNow ) - FLOOR ( FromMinute, StepNow ) ) / StepNow >= Bins
+                                                                        ),
+                                                                        [@Step]
+                                                                    ),
+                                                                    60
+                                                                ),
+                                                            IF ( SpanMinutes <= 120.000001, 1, IF ( SpanMinutes <= 720.000001, 5, 15 ) )
+                                                        )
+                                                    RETURN
+                                                        IF ( IsHourly, MAX ( 60, SaveStep ), SaveStep )
+                                            )
+                                        )
+                                    VAR OwnGrain = MAXX ( OwnGrains, [@Grain] )
+                                    VAR OwnCaptured = MAXX ( OwnGrains, 'Telemetry Snapshots'[Captured At UTC] )
+                                    VAR OwnCutStart = MAX ( Bin, MAXX ( OwnGrains, 'Telemetry Snapshots'[Window Start UTC] ) )
+                                    VAR OwnCutEnd = MIN ( Bin + OwnGrain / 1440, MAXX ( OwnGrains, 'Telemetry Snapshots'[Window End UTC] ) )
+                                    VAR OwnSpanStart = IF ( OwnCutStart < OwnCutEnd, OwnCutStart, Bin )
+                                    VAR OwnSpanEnd = IF ( OwnCutStart < OwnCutEnd, OwnCutEnd, Bin + OwnGrain / 1440 )
+                                    RETURN
+                                        IF (
+                                            // One save has points here, and no finer save's window reaches their interval: its point is the value.
+                                            COUNTROWS ( OwnGrains ) = 1
+                                                && ISEMPTY (
+                                                    FILTER (
+                                                        NearSaves,
+                                                        ( [@Grain] < OwnGrain || ( [@Grain] = OwnGrain && 'Telemetry Snapshots'[Captured At UTC] > OwnCaptured ) )
+                                                            && 'Telemetry Snapshots'[Window Start UTC] < OwnSpanEnd
+                                                            && 'Telemetry Snapshots'[Window End UTC] > OwnSpanStart
+                                                    )
+                                                ),
+                                            CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ) ),
+                                            VAR AtBin =
+                                                ADDCOLUMNS (
+                                                    CALCULATETABLE ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Captured At UTC] ) ),
+                                                    "@Point", CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ) )
+                                                )
+                                            VAR Owns =
+                                                ADDCOLUMNS (
+                                                    AtBin,
+                                                    "@Own",
+                                                        VAR Captured = 'Telemetry Snapshots'[Captured At UTC]
+                                                        VAR PointValue = [@Point]
+                                                        VAR ThisSave = FILTER ( NearSaves, 'Telemetry Snapshots'[Captured At UTC] = Captured )
+                                                        VAR Grain = MAXX ( ThisSave, [@Grain] )
+                                                        VAR CutStart = MAX ( Bin, MAXX ( ThisSave, 'Telemetry Snapshots'[Window Start UTC] ) )
+                                                        VAR CutEnd = MIN ( Bin + Grain / 1440, MAXX ( ThisSave, 'Telemetry Snapshots'[Window End UTC] ) )
+                                                        VAR SpanStart = IF ( CutStart < CutEnd, CutStart, Bin )
+                                                        VAR SpanEnd = IF ( CutStart < CutEnd, CutEnd, Bin + Grain / 1440 )
+                                                        VAR FinerWindows =
+                                                            FILTER (
+                                                                NearSaves,
+                                                                ( [@Grain] < Grain || ( [@Grain] = Grain && 'Telemetry Snapshots'[Captured At UTC] > Captured ) )
+                                                                    && 'Telemetry Snapshots'[Window Start UTC] < SpanEnd
+                                                                    && 'Telemetry Snapshots'[Window End UTC] > SpanStart
+                                                            )
+                                                        RETURN
+                                                            IF (
+                                                                ISEMPTY ( FinerWindows ),
+                                                                PointValue,
+                                                                // A save's rows lie inside its window, so only a finer save whose window reaches the span can have rows
+                                                                // there: its rows' extent is read then, and only then. The context transition's filter on this point's
+                                                                // save is removed first.
+                                                                VAR Finer =
+                                                                    FILTER (
+                                                                        ADDCOLUMNS (
+                                                                            ADDCOLUMNS (
+                                                                                FinerWindows,
+                                                                                "@First",
+                                                                                    VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                    RETURN
+                                                                                        CALCULATE (
+                                                                                            MIN ( 'Telemetry Snapshots'[Bucket UTC] ),
+                                                                                            REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Captured At UTC], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                                                            REMOVEFILTERS ( 'Date' ),
+                                                                                            'Telemetry Snapshots'[Captured At UTC] = RowSave
+                                                                                        ),
+                                                                                "@Last",
+                                                                                    VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                    RETURN
+                                                                                        CALCULATE (
+                                                                                            MAX ( 'Telemetry Snapshots'[Bucket UTC] ),
+                                                                                            REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Captured At UTC], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                                                            REMOVEFILTERS ( 'Date' ),
+                                                                                            'Telemetry Snapshots'[Captured At UTC] = RowSave
+                                                                                        ),
+                                                                                "@Count",
+                                                                                    VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                    RETURN
+                                                                                        CALCULATE (
+                                                                                            DISTINCTCOUNT ( 'Telemetry Snapshots'[Bucket UTC] ),
+                                                                                            REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Captured At UTC], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                                                            REMOVEFILTERS ( 'Date' ),
+                                                                                            'Telemetry Snapshots'[Captured At UTC] = RowSave
+                                                                                        )
+                                                                            ),
+                                                                            "@RowFrom", MAX ( [@First], 'Telemetry Snapshots'[Window Start UTC] ),
+                                                                            "@RowTo", MIN ( [@Last] + [@Grain] / 1440, 'Telemetry Snapshots'[Window End UTC] ),
+                                                                            "@Dense", [@Count] = ROUND ( ( [@Last] - [@First] ) * 1440 / [@Grain], 0 ) + 1
+                                                                        ),
+                                                                        [@RowFrom] < SpanEnd && [@RowTo] > SpanStart
+                                                                    )
+                                                                VAR DenseCover =
+                                                                    NOT ISEMPTY (
+                                                                        FILTER (
+                                                                            Finer,
+                                                                            [@Dense]
+                                                                                && [@RowFrom] <= SpanStart + 0.00000001
+                                                                                && [@RowTo] >= SpanEnd - 0.00000001
+                                                                        )
+                                                                    )
+                                                                RETURN
+                                                                    IF (
+                                                                        ISEMPTY ( Finer ),
+                                                                        PointValue,
+                                                                        IF (
+                                                                            DenseCover,
+                                                                            BLANK (),
+                                                                            VAR Inside =
+                                                                                ADDCOLUMNS (
+                                                                                    ADDCOLUMNS (
+                                                                                        FILTER (
+                                                                                            GROUPBY (
+                                                                                                CALCULATETABLE (
+                                                                                                    'Telemetry Snapshots',
+                                                                                                    // Every row of the finer saves for this series, whatever its bin, so all of the series' bins share one
+                                                                                                    // read: the context transition's filters on the bin and the save are removed first. The finer saves
+                                                                                                    // come from SaveList, so an outside filter on Captured At UTC hides a save here too.
+                                                                                                    REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC], 'Telemetry Snapshots'[Captured At UTC], 'Telemetry Snapshots'[Report Date UTC] ),
+                                                                                                    REMOVEFILTERS ( 'Date' ),
+                                                                                                    TREATAS ( SELECTCOLUMNS ( Finer, "@Save", 'Telemetry Snapshots'[Captured At UTC] ), 'Telemetry Snapshots'[Captured At UTC] )
+                                                                                                ),
+                                                                                                'Telemetry Snapshots'[Bucket UTC],
+                                                                                                'Telemetry Snapshots'[Captured At UTC],
+                                                                                                "@Value", SUMX ( CURRENTGROUP (), 'Telemetry Snapshots'[Value] )
+                                                                                            ),
+                                                                                            'Telemetry Snapshots'[Bucket UTC] >= Bin
+                                                                                                && 'Telemetry Snapshots'[Bucket UTC] < Bin + Grain / 1440
+                                                                                        ),
+                                                                                        "@G",
+                                                                                            VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                            RETURN MAXX ( FILTER ( Finer, 'Telemetry Snapshots'[Captured At UTC] = RowSave ), [@Grain] ),
+                                                                                        "@From",
+                                                                                            VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                            RETURN MAXX ( FILTER ( Finer, 'Telemetry Snapshots'[Captured At UTC] = RowSave ), 'Telemetry Snapshots'[Window Start UTC] ),
+                                                                                        "@To",
+                                                                                            VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                            RETURN MAXX ( FILTER ( Finer, 'Telemetry Snapshots'[Captured At UTC] = RowSave ), 'Telemetry Snapshots'[Window End UTC] )
+                                                                                    ),
+                                                                                    "@CoverStart",
+                                                                                        VAR RowBin = 'Telemetry Snapshots'[Bucket UTC]
+                                                                                        VAR RowStart = MAX ( RowBin, [@From] )
+                                                                                        VAR RowEnd = MIN ( RowBin + [@G] / 1440, [@To] )
+                                                                                        RETURN IF ( RowStart < RowEnd, RowStart, RowBin ),
+                                                                                    "@CoverEnd",
+                                                                                        VAR RowBin = 'Telemetry Snapshots'[Bucket UTC]
+                                                                                        VAR RowStart = MAX ( RowBin, [@From] )
+                                                                                        VAR RowEnd = MIN ( RowBin + [@G] / 1440, [@To] )
+                                                                                        RETURN IF ( RowStart < RowEnd, RowEnd, RowBin + [@G] / 1440 )
+                                                                                )
+                                                                            VAR Ranked =
+                                                                                ADDCOLUMNS (
+                                                                                    Inside,
+                                                                                    "@Rank",
+                                                                                        VAR RowGrain = [@G]
+                                                                                        VAR RowSave = 'Telemetry Snapshots'[Captured At UTC]
+                                                                                        RETURN 1 + COUNTROWS ( FILTER ( Finer, [@Grain] < RowGrain || ( [@Grain] = RowGrain && 'Telemetry Snapshots'[Captured At UTC] > RowSave ) ) )
+                                                                                )
+                                                                            VAR Level1 =
+                                                                                ADDCOLUMNS (
+                                                                                    ADDCOLUMNS ( FILTER ( Ranked, [@Rank] = 1 ), "@Any", FALSE (), "@Sum", 0.0, "@Covered", FALSE () ),
+                                                                                    "@Kept", [@Value],
+                                                                                    "@Taken", [@Value]
+                                                                                )
+                                                                            VAR Level2 =
+                                                                                ADDCOLUMNS (
+                                                                                    ADDCOLUMNS (
+                                                                                        FILTER ( Ranked, [@Rank] = 2 ),
+                                                                                        "@Any",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN NOT ISEMPTY ( FILTER ( Level1, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ) ),
+                                                                                        "@Sum",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN 0.0 + SUMX ( FILTER ( Level1, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ), [@Kept] ),
+                                                                                        "@Covered",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            VAR UnderRows = FILTER ( Level1, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom )
+                                                                                            RETURN
+                                                                                                NOT ISEMPTY ( UnderRows )
+                                                                                                    && ISEMPTY (
+                                                                                                        FILTER (
+                                                                                                            UNION ( ROW ( "@X", RowFrom ), SELECTCOLUMNS ( FILTER ( UnderRows, [@CoverEnd] < RowTo - 0.00000001 ), "@X", [@CoverEnd] ) ),
+                                                                                                            VAR X = [@X]
+                                                                                                            RETURN ISEMPTY ( FILTER ( UnderRows, [@CoverStart] <= X + 0.00000001 && [@CoverEnd] > X + 0.00000001 ) )
+                                                                                                        )
+                                                                                                    )
+                                                                                    ),
+                                                                                    "@Kept", IF ( NOT [@Any], [@Value], IF ( [@Covered], 0.0, MAX ( 0.0, [@Value] - [@Sum] ) ) ),
+                                                                                    "@Taken", IF ( [@Covered], BLANK (), [@Value] )
+                                                                                )
+                                                                            VAR Upto2 = UNION ( Level1, Level2 )
+                                                                            VAR Level3 =
+                                                                                ADDCOLUMNS (
+                                                                                    ADDCOLUMNS (
+                                                                                        FILTER ( Ranked, [@Rank] = 3 ),
+                                                                                        "@Any",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN NOT ISEMPTY ( FILTER ( Upto2, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ) ),
+                                                                                        "@Sum",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN 0.0 + SUMX ( FILTER ( Upto2, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ), [@Kept] ),
+                                                                                        "@Covered",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            VAR UnderRows = FILTER ( Upto2, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom )
+                                                                                            RETURN
+                                                                                                NOT ISEMPTY ( UnderRows )
+                                                                                                    && ISEMPTY (
+                                                                                                        FILTER (
+                                                                                                            UNION ( ROW ( "@X", RowFrom ), SELECTCOLUMNS ( FILTER ( UnderRows, [@CoverEnd] < RowTo - 0.00000001 ), "@X", [@CoverEnd] ) ),
+                                                                                                            VAR X = [@X]
+                                                                                                            RETURN ISEMPTY ( FILTER ( UnderRows, [@CoverStart] <= X + 0.00000001 && [@CoverEnd] > X + 0.00000001 ) )
+                                                                                                        )
+                                                                                                    )
+                                                                                    ),
+                                                                                    "@Kept", IF ( NOT [@Any], [@Value], IF ( [@Covered], 0.0, MAX ( 0.0, [@Value] - [@Sum] ) ) ),
+                                                                                    "@Taken", IF ( [@Covered], BLANK (), [@Value] )
+                                                                                )
+                                                                            VAR Upto3 = UNION ( Upto2, Level3 )
+                                                                            VAR Level4 =
+                                                                                ADDCOLUMNS (
+                                                                                    ADDCOLUMNS (
+                                                                                        FILTER ( Ranked, [@Rank] >= 4 ),
+                                                                                        "@Any",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN NOT ISEMPTY ( FILTER ( Upto3, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ) ),
+                                                                                        "@Sum",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            RETURN 0.0 + SUMX ( FILTER ( Upto3, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom ), [@Kept] ),
+                                                                                        "@Covered",
+                                                                                            VAR RowFrom = [@CoverStart]
+                                                                                            VAR RowTo = [@CoverEnd]
+                                                                                            VAR UnderRows = FILTER ( Upto3, [@CoverStart] < RowTo && [@CoverEnd] > RowFrom )
+                                                                                            RETURN
+                                                                                                NOT ISEMPTY ( UnderRows )
+                                                                                                    && ISEMPTY (
+                                                                                                        FILTER (
+                                                                                                            UNION ( ROW ( "@X", RowFrom ), SELECTCOLUMNS ( FILTER ( UnderRows, [@CoverEnd] < RowTo - 0.00000001 ), "@X", [@CoverEnd] ) ),
+                                                                                                            VAR X = [@X]
+                                                                                                            RETURN ISEMPTY ( FILTER ( UnderRows, [@CoverStart] <= X + 0.00000001 && [@CoverEnd] > X + 0.00000001 ) )
+                                                                                                        )
+                                                                                                    )
+                                                                                    ),
+                                                                                    "@Kept", IF ( NOT [@Any], [@Value], IF ( [@Covered], 0.0, MAX ( 0.0, [@Value] - [@Sum] ) ) ),
+                                                                                    "@Taken", IF ( [@Covered], BLANK (), [@Value] )
+                                                                                )
+                                                                            VAR Kept = UNION ( Upto3, Level4 )
+                                                                            VAR UnderPoint = FILTER ( Kept, [@CoverStart] < SpanEnd && [@CoverEnd] > SpanStart )
+                                                                            VAR CoveredPoint =
+                                                                                NOT ISEMPTY ( UnderPoint )
+                                                                                    && ISEMPTY (
+                                                                                        FILTER (
+                                                                                            UNION ( ROW ( "@X", SpanStart ), SELECTCOLUMNS ( FILTER ( UnderPoint, [@CoverEnd] < SpanEnd - 0.00000001 ), "@X", [@CoverEnd] ) ),
+                                                                                            VAR X = [@X]
+                                                                                            RETURN ISEMPTY ( FILTER ( UnderPoint, [@CoverStart] <= X + 0.00000001 && [@CoverEnd] > X + 0.00000001 ) )
+                                                                                        )
+                                                                                    )
+                                                                            VAR Highest = MAXX ( UnderPoint, [@Taken] )
+                                                                            RETURN
+                                                                                IF (
+                                                                                    ISEMPTY ( UnderPoint ),
+                                                                                    PointValue,
+                                                                                    IF (
+                                                                                        CoveredPoint,
+                                                                                        BLANK (),
+                                                                                        IF (
+                                                                                            Adds,
+                                                                                            MAX ( 0, PointValue - SUMX ( UnderPoint, [@Kept] ) ),
+                                                                                            IF ( ISBLANK ( Highest ) || PointValue > Highest, PointValue )
+                                                                                        )
+                                                                                    )
+                                                                                )
+                                                                        )
+                                                                    )
+                                                            )
+                                                )
+                                            RETURN
+                                                IF ( Adds, SUMX ( Owns, [@Own] ), MAXX ( Owns, [@Own] ) )
+                                        )
+                                )
+                        )
+                )
+        )
+    MEASURE 'Telemetry Snapshots'[Cosmos DB Requests] =
+        CALCULATE (
+            [Snapshot Value],
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "TotalRequests" )
+        )
+    MEASURE 'Telemetry Snapshots'[Lock Wait (s)] =
+        DIVIDE (
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Lock" )
+            ),
+            1000
+        )
+    MEASURE 'Telemetry Snapshots'[Wait Time (s)] =
+        DIVIDE ( CALCULATE ( [Snapshot Value], KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ) ), 1000 )
+    MEASURE 'Telemetry Snapshots'[Buffer IO Wait (s)] =
+        DIVIDE (
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ),
+                KEEPFILTERS ( FILTER ( ALL ( 'Telemetry Snapshots'[Metric] ), CONTAINSSTRING ( 'Telemetry Snapshots'[Metric], "(PAGEIOLATCH)" ) ) )
+            ),
+            1000
+        )
+    MEASURE 'Telemetry Snapshots'[Data and Log IO (MB)] =
+        CALCULATE (
+            [Snapshot Value],
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "storage_io" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] IN { "ReadMB", "WriteMB" } )
+        )
+    MEASURE 'Telemetry Snapshots'[Batch Requests] =
+        CALCULATE (
+            [Snapshot Value],
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "counter_deltas" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Batch Requests/sec" )
+        )
+    MEASURE 'Telemetry Snapshots'[Deadlocks] =
+        CALCULATE (
+            [Snapshot Value],
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "counter_deltas" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Number of Deadlocks/sec" )
+        )
+    MEASURE 'Telemetry Snapshots'[CPU Peak (%)] =
+        CALCULATE (
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cpu" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "MaxCPU" )
+        )
+    MEASURE 'Telemetry Snapshots'[Blocked Processes (peak)] =
+        CALCULATE (
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "gauges" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Processes blocked" )
+        )
+    MEASURE 'Telemetry Snapshots'[Active Sessions (peak)] =
+        CALCULATE (
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "sessions" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "MaxSessions" )
+        )
+    MEASURE 'Telemetry Snapshots'[Throttled Requests (429s)] =
+        VAR Throttled =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "ThrottledRequests" )
+            )
+        RETURN IF ( ISBLANK ( Throttled ) && NOT ISBLANK ( [Cosmos DB Requests] ), 0, Throttled )
+    MEASURE 'Telemetry Snapshots'[RU Consumed] =
+        CALCULATE (
+            [Snapshot Value],
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "TotalRequestUnits" )
+        )
+    MEASURE 'Telemetry Snapshots'[Peak Norm RU (%)] =
+        CALCULATE (
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "NormalizedRUConsumption" )
+        )
+    MEASURE 'Telemetry Snapshots'[Replica Lag Peak (s)] =
+        CALCULATE (
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "postgresql" ),
+            KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "physical_replication_delay_in_seconds" )
+        )
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Target'[Target Key],
+    FILTER (
+        ALL ( 'Telemetry Snapshots'[Bucket UTC] ),
+        'Telemetry Snapshots'[Bucket UTC] >= DATE ( 2026, 11, 21 ) + TIME ( 15, 0, 0 )
+            && 'Telemetry Snapshots'[Bucket UTC] < DATE ( 2026, 11, 21 ) + TIME ( 17, 15, 0 )
+    ),
+        "LockWaitS", [Lock Wait (s)],
+        "WaitS", [Wait Time (s)],
+        "BufferIoS", [Buffer IO Wait (s)],
+        "IoMb", [Data and Log IO (MB)],
+        "Batch", [Batch Requests],
+        "Deadlocks", [Deadlocks],
+        "CpuPeak", [CPU Peak (%)],
+        "BlockedPeak", [Blocked Processes (peak)],
+        "SessionsPeak", [Active Sessions (peak)],
+        "Requests", [Cosmos DB Requests],
+        "Throttled", [Throttled Requests (429s)],
+        "RuConsumed", [RU Consumed],
+        "NormRuPeak", [Peak Norm RU (%)],
+        "ReplicaLagPeak", [Replica Lag Peak (s)]
+)
+ORDER BY 'Target'[Target Key]

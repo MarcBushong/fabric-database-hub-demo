@@ -5318,3 +5318,22 @@ The read-only answer, first:
 
 - **The bound is a trade-off,** not a fix: a stop save whose last rows partly arrived reads short in one interval while a later day-long save holds that interval whole.
 - **The prompts' sentence is an observation,** from T3's telemetry on 2026-11-21, not a documented behavior: the telemetry page doesn't say that a file key can hold two rows in a sample.
+
+### F35 part 2's speed candidates for the live timing (2026-11-22)
+
+**Why.** Final tests ran 30392d79 on the live test's model: every answer was right, but the Estate query took 2.38 times today's time end to end, against a bar of about 2, and T5's 2.03. In the same lease, it was 1.20 times slower on Estate than da68aed5 with `Under` renamed, and 1.14 times on T5: on that short history, the prune cost more than it saved. The coordinator's decision: F35 isn't needed for Monday, so get the speed right, time-boxed to about 2 hours, with the prune's bound kept for long histories, and give Final tests a timing set. If 2 times isn't reachable, write up the producer-side alternative for the owner's decision.
+
+**Work summary.** Two candidates in `fabric/powerbi/checks/f35/candidates`, written from the TMDL by a generator, each with a values query, a window query, and the Estate and T5 timing queries, and a README with the order of the timing runs and the pass:
+
+- **C1:** a bin reads its points' own saves first, with their intervals. Another save can weigh on those points only if its window starts before the longest of those intervals ends, from the bin, and ends after the bin, so where only the points' own save does, the points are the value, with no other save's interval, rows, or table of points worked out. An Azure Monitor save's interval takes one pass over its bins: the ladder's steps divide each other in turn, so the steps that divide every bin's minute are those up to the smallest of each bin's coarsest step. Before, it took a pass for each of the 9 steps.
+- **C2:** C1, and where one save has points at a bin and no finer save's window reaches their interval, its point is the value, without the table of points per save.
+- Neither changes an answer. The README says why, and a test keeps every other measure the candidates define equal to the TMDL's. The TMDL's measure stays 30392d79's until the timing picks one.
+
+**Changed files.** `fabric/powerbi/checks/f35/candidates/` (8 queries and a README), `fabric/powerbi/checks/f35/README.md`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.** Pester with StrictMode: Fabric.PowerBI 22 passed, 1 skipped. The names test reads the candidates' variables too. The generator checks that each candidate's brackets balance.
+
+**Risks.**
+
+- **Not run on an engine:** the timing run is also their first parse.
+- **Whether either meets the bar** is for the timing to say. C1 leaves most of a bin's work where another save's window reaches its interval, as a session's own minutes have the day-long save's window over them, and C2 takes those too. If neither does, the next step is the producer-side alternative.

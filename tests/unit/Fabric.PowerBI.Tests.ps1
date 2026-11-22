@@ -292,6 +292,33 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
         }
     }
 
+    It 'times faster forms of Snapshot Value beside the model''s own other measures (checks/f35/candidates, temporary)' {
+        # Each candidate query defines its own Snapshot Value first, then every measure it evaluates or reads, with the TMDL's
+        # expressions, so a timing compares the base measure alone.
+        $tmdlText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
+        $tmdlMeasure = {
+            param([string] $Name)
+            $quoted = "'" + $Name.Replace("'", "''") + "'"
+            & $script:squash ([regex]::Match($tmdlText, ("(?ms)^ {{4}}measure (?:{0}|{1}) =\n(.*?)(?=^ {{0,8}}\S)" -f [regex]::Escape($quoted), [regex]::Escape($Name))).Groups[1].Value)
+        }
+        $files = @(Get-ChildItem -LiteralPath (Join-Path -Path $script:checks -ChildPath 'candidates') -Filter '*.dax' -File)
+        @($files | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('c1-bins.dax', 'c1-estate.dax', 'c1-t5.dax', 'c1-window.dax', 'c2-bins.dax', 'c2-estate.dax', 'c2-t5.dax', 'c2-window.dax')
+        foreach ($file in $files) {
+            $text = [System.IO.File]::ReadAllText($file.FullName)
+            $blocks = @([regex]::Matches($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[([^\]]+)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)"))
+            $names = @($blocks | ForEach-Object { $_.Groups[1].Value })
+            $names[0] | Should -BeIn @('Snapshot Value', 'Snapshot Value F35') -Because $file.Name
+            & $script:squash $blocks[0].Groups[2].Value | Should -Not -BeExactly (& $tmdlMeasure 'Snapshot Value') -Because $file.Name
+            foreach ($block in @($blocks | Select-Object -Skip 1 | Where-Object { $_.Groups[1].Value -ne 'Replica Lag Peak (s)' })) {
+                & $script:squash $block.Groups[2].Value | Should -BeExactly (& $tmdlMeasure $block.Groups[1].Value) -Because ('{0} [{1}]' -f $file.Name, $block.Groups[1].Value)
+            }
+            if ($names[0] -eq 'Snapshot Value') {
+                $code = & $script:stripComments $text $false
+                $referenced = @([regex]::Matches($code, "(?<!['\w\]])\[([^\]@][^\]]*)\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'Value' } | Sort-Object -Unique)
+                @($referenced | Where-Object { $names -notcontains $_ }) | Should -BeNullOrEmpty -Because $file.Name
+            }
+        }
+    }
 }
 
 Describe 'DAX variable names' {
