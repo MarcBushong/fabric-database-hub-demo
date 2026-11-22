@@ -318,6 +318,32 @@ describe("Session replay", () => {
     );
 
     it(
+        "reads T5's 429s per minute where a day-long save's 15-minute total meets the session's own minutes (F35)",
+        async () => {
+            // The review of 3fe52edb: the lane read the day's 1,500 from 13:45 beside the session's 10 a minute before it.
+            const save = (CapturedAt: string, WindowStart: string, WindowEnd: string) => ({ CapturedAt, WindowStart, WindowEnd });
+            const session = save("2026-11-17T13:50:00", "2026-11-17T13:30:00", "2026-11-17T13:45:00");
+            const day = save("2026-11-17T14:05:00", "2026-11-16T14:00:00", "2026-11-17T14:00:00");
+            const point = (from: Record<string, string>, minute: string, metric: string, value: number): Row => ({ Bucket: `2026-11-17T${minute}:00`, TargetKey: "T5", ResourceName: "cosmos01-test", Metric: metric, Value: value, Unit: "", ...from });
+            const rows = [
+                ...Array.from({ length: 15 }, (_, m) => `13:${30 + m}`).flatMap((m) => [point(session, m, "ThrottledRequests", 10), point(session, m, "NormalizedRUConsumption", 100)]),
+                ...(
+                    [
+                        ["13:15", 0, 5],
+                        ["13:30", 150, 100],
+                        ["13:45", 1500, 100],
+                    ] as const
+                ).flatMap(([m, throttled, ru]) => [point(day, m, "ThrottledRequests", throttled), point(day, m, "NormalizedRUConsumption", ru)]),
+            ];
+            const { container } = renderWithApp(<ReplayPage />, { client: sampleClient({}, { "cosmos-series": rows }), view: { page: "replay", replay: 28 } });
+            expect(await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 })).toBeInTheDocument();
+            const t5 = () => [...container.querySelectorAll(".cr-readout")].map((e) => e.textContent ?? "").find((t) => t.includes("429s"));
+            await waitFor(() => expect(t5()).toMatch(/· 429s 100$/));
+        },
+        SLOW,
+    );
+
+    it(
         "plays back without writing the address at each step, writes the moment once paused, and says play and pause to a screen reader",
         async () => {
             const { setView, container } = renderWithApp(<ReplayPage />, { client: sampleClient(), view: { page: "replay", replay: 28 } });

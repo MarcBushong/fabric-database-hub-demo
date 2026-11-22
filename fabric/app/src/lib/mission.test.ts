@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
+import { latestPostgresCapture } from "@/data/model";
 import type { Row } from "@/data/query-client";
 import { sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
@@ -514,6 +515,42 @@ describe("T4's connection surge (F34)", () => {
         expect(elsewhere).toMatchObject({ status: "Not supported", family: "connections", signal: "active connections" });
         expect(elsewhere.note).toMatch(/^No capture of T4's Azure Monitor metrics in view covers it/);
         expect(score(null)[0]).toMatchObject({ status: "Not supported", signal: "active connections" });
+    });
+
+    // The review of 3fe52edb: the session's 5-minute save and a later day-long one (15 minutes), with T4 stopped from 13:57
+    // to 15:00. The newest save's interval put the break-off 15 minutes before the run's end, at 13:42.
+    it("says its metrics break off after its last interval at the slots, whatever the newest save's interval (F35)", () => {
+        const session = { CapturedAt: "2026-11-17T14:10:00", WindowStart: "2026-11-17T13:30:00", WindowEnd: "2026-11-17T13:57:00" };
+        const day = { CapturedAt: "2026-11-17T18:30:00", WindowStart: "2026-11-16T18:30:00", WindowEnd: "2026-11-17T18:30:00" };
+        const row = (save: Record<string, string>) => ([minute, value]: readonly [number, number]): Row => ({ Bucket: at(minute).toISOString(), TargetKey: "T4", ResourceName: "pgflex01-test", Metric: "active_connections", Value: value, ...save });
+        const pg = latestPostgresCapture([
+            ...(
+                [
+                    [-30, 13],
+                    [-15, 13],
+                    [0, 39],
+                    [15, 39],
+                    [90, 13],
+                    [105, 13],
+                ] as const
+            ).map(row(day)),
+            ...(
+                [
+                    [0, 13],
+                    [5, 39],
+                    [10, 37],
+                    [15, 38],
+                    [20, 36],
+                    [25, 39],
+                ] as const
+            ).map(row(session)),
+        ]);
+        expect(pg).toMatchObject({ saves: 2, intervalMinutes: 15 });
+        const [surge] = score(pg);
+        expect(surge).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: false, visibleMin: 22 });
+        expect(surge.recoveryNote).toBe("Its metrics break off after 13:55 UTC, its last interval at its bound, so its recovery isn't measured.");
+        // T4's measured episode says the same.
+        expect(postgresEpisodes(pg).find((e) => e.family === "connections")?.note).toBe("Its metrics break off after 13:55 UTC, so its recovery isn't in the capture.");
     });
 
     it("expects connection-surge's connections, and matches a keyword only at a word's start: never IO inside 'connection' or 'transaction'", () => {

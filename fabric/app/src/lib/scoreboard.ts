@@ -761,7 +761,7 @@ function scoreConnectionSurge(base: Omit<FaultScore, "family" | "signal" | "kind
     }
     const visibleMin = minutesBetween(run.from, run.to ?? run.end);
     const why: "ongoing" | "brokeOff" | null = run.to ? null : run.ongoing ? "ongoing" : "brokeOff";
-    const recoveryNote = !why ? "" : why === "ongoing" ? NO_RECOVERY.ongoing.note : `Its metrics break off after ${formatTimeUtc(new Date(run.end.getTime() - stepMs))} UTC, its last interval at its bound, so its recovery isn't measured.`;
+    const recoveryNote = !why ? "" : why === "ongoing" ? NO_RECOVERY.ongoing.note : `Its metrics break off after ${formatTimeUtc(run.last)} UTC, its last interval at its bound, so its recovery isn't measured.`;
     return {
         ...measured,
         visibleAt: run.from,
