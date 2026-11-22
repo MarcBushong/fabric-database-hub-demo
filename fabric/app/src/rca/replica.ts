@@ -5,11 +5,13 @@
 // Monitor's, the highest value in each interval, the minutes it didn't. The rules separate the reasons:
 //   REPL-CATCHUP          the replica's first points after a stop: catch-up, not lag (the app's replicaCatchUp)
 //   REPL-REPLAY-CONFLICT  WAL arrives but replay waits on a lock a replica query holds (hot standby conflict)
-//   REPL-REPLAY-SLOW      replay advances, slower than WAL arrives
+//   REPL-REPLAY-SLOW      replay advances, slower than WAL arrives: WAL received but not replayed, in the stall's samples
 //   REPL-SHIPPING         the WAL isn't reaching the replica (send gap, write or flush lag)
 //   REPL-IDLE-PRIMARY     nothing to replay: the primary committed nothing, so "time since the last replay" grows
 //   REPL-REPLAY-STALLED   replay stood still, and nothing captured says why
 //   REPL-NO-LAG           the lag stayed under 5 s in the window: nothing to explain
+// The capture's replay state backs SLOW, SHIPPING, and IDLE-PRIMARY only from its own samples of the stall; a rise they're
+// only beside reads from its shape (REPL-REPLAY-STALLED or REPL-UNEXPLAINED).
 // https://www.postgresql.org/docs/18/hot-standby.html#HOT-STANDBY-CONFLICT, https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
 
 import { recommend } from "./catalog";
@@ -227,6 +229,21 @@ function refText(p: LagPoint): string {
     return coarse(p) ? `Read Replica Lag ${round1(p.value)} s, its highest from ${hhmmss(p.at).slice(0, 5)} to ${hhmmss(new Date(endOf(p))).slice(0, 5)} UTC` : `Read Replica Lag ${round1(p.value)} s`;
 }
 
+/** Where the capture's samples on the replica are, beside a rise that none of them is from (F4). */
+function sampledBeside(replica: readonly ReplicaSample[], rise: LagRise): string {
+    const before = replica.filter((s) => s.at < rise.start).reduce<ReplicaSample | null>((a, s) => (a && a.at >= s.at ? a : s), null);
+    const after = replica.filter((s) => s.at >= rise.end).reduce<ReplicaSample | null>((a, s) => (a && a.at <= s.at ? a : s), null);
+    const where =
+        before && after
+            ? `stop at ${hhmmss(before.at)} UTC, before this rise, and start again at ${hhmmss(after.at)} UTC, after it`
+            : before
+              ? `end at ${hhmmss(before.at)} UTC, before this rise`
+              : after
+                ? `start at ${hhmmss(after.at)} UTC, after this rise`
+                : "in these minutes aren't from the stall itself";
+    return `The capture's own samples on the replica (RCA Replica) ${where}, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.`;
+}
+
 export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoint[]; samples: readonly ReplicaSample[]; events: readonly EventRow[]; askedTo?: Date }): ReplicaAnalysis {
     const notCaptured: string[] = [];
     const series = lagSeries(input.metrics, input.samples);
@@ -303,6 +320,10 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const watchedRefs = watched.slice(0, 2).map((e) => ({ table: "RCA Events", at: iso(e.at), target: e.target, text: `capture ${e.name}: ${e.detail}` }));
 
     if (replica.length === 0) notCaptured.push("The replica's replay state (RCA Replica) wasn't captured for these minutes: the explanation rests on the metric's shape alone.");
+    // The capture's samples say what replay did only when they're from the stall itself (the rise's own samples, from its
+    // last replay on). Final tests' check of ddebd4c3 (F4): Azure Monitor's 68 s from 18:54, after the capture's last sample
+    // at 18:53:23 (0.1 s since a replay), read as replay slower than WAL, "0 bytes behind", from that sample's minutes.
+    const sawStall = rise.lastReplay !== undefined;
 
     let ruleId: string;
     let statement: string;
@@ -325,16 +346,17 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
         ruleId = "REPL-UNEXPLAINED";
         statement = `${shape}. The capture's own samples on the replica in that interval stayed under 5 s, so the stall fell between them, and nothing captured says why.`;
         confidence = "low";
-    } else if (replica.length > 0 && (maxSendGap > 1_000_000 || maxWriteLag > 5)) {
+    } else if (sawStall && (maxSendGap > 1_000_000 || maxWriteLag > 5)) {
         ruleId = "REPL-SHIPPING";
         statement = `${shape}: the WAL didn't reach the replica in time (send gap up to ${maxSendGap} bytes, write or flush lag up to ${maxWriteLag} s).`;
         confidence = "medium";
         ids = ["RPL-SHORT-REPORTS"];
-    } else if (replica.length > 0 && backlog === 0 && (avgWal ?? 0) < 50) {
+    } else if (sawStall && backlog === 0 && (avgWal ?? 0) < 50) {
         ruleId = "REPL-IDLE-PRIMARY";
         statement = `${shape}, but the replica had nothing to replay: the primary committed nothing, and the metric counts the time since the last replayed transaction.`;
         confidence = "high";
-    } else if (replica.length > 0) {
+    } else if (sawStall && backlog > 0) {
+        // Replay fell behind only with WAL received but not replayed: with none, it had replayed all it received.
         ruleId = "REPL-REPLAY-SLOW";
         statement = `${shape}: replay advanced slower than WAL arrived (${backlog} bytes behind, WAL about ${avgWal ?? "?"} bytes/s).`;
         confidence = "medium";
@@ -345,6 +367,7 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
         const unknown = coarse(rise.peak) ? `Azure Monitor's ${minutesOf(rise.peak)}-minute highest values can't say whether replay stood still or slowed` : "One point can't say whether replay stood still or slowed";
         statement = `${shape}. ${rise.slope === null ? unknown : stood ? "Replay stood still" : "Replay slowed"}, and nothing captured says why.`;
         confidence = "low";
+        if (!sawStall && replica.length > 0) notCaptured.push(sampledBeside(replica, rise));
     }
     return {
         rise,

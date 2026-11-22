@@ -275,6 +275,71 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         expect(a.rootCause?.statement).not.toMatch(/per second/);
         expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
     });
+
+    // Final tests' check of ddebd4c3 (F4): B's 68 s from 18:54, the rest of a 15-minute interval after the capture's last
+    // sample at 18:53:23 (0.1 s since a replay, 0 bytes behind, the primary's WAL about 2797 bytes/s before Stop now), read as
+    // REPL-REPLAY-SLOW: "replay advanced slower than WAL arrived (0 bytes behind …)", from samples before the stall began.
+    describe("names a replay-state cause only from the capture's own samples of the stall, and slow replay only with WAL not replayed", () => {
+        const replica = (t: number, since: number, behind: number): ReplicaSample => ({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: since, receivedNotReplayedBytes: behind });
+        const primary = (t: number): ReplicaSample => ({ target: "T4", at: new Date(t), side: "primary", walBytesPerS: 2797, writeLagS: 0.002, flushLagS: 0.002, sendGapBytes: 0 });
+
+        it("reads a rise the samples are only beside from its shape, and says where they are", () => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("18:45:23").getTime(); t <= at("18:53:23").getTime(); t += 30_000) samples.push(replica(t, 0.1, 0), primary(t));
+            const metrics: MetricPoint[] = [
+                ...Array.from({ length: 9 }, (_, i): MetricPoint => ({ target: "T4-replica", at: new Date(at("18:45:00").getTime() + i * 60_000), metric: LAG_METRIC, value: 0.4, intervalMs: 60_000, grainMs: 60_000 })),
+                { target: "T4-replica", at: at("18:54:00"), metric: LAG_METRIC, value: 68, intervalMs: 6 * 60_000, grainMs: 15 * 60_000 },
+            ];
+            const a = analyzeReplicaLag({ at: at("18:54:00"), metrics, samples, events: [] });
+            expect(a.rise).toMatchObject({ source: "Telemetry Snapshots", peak: { value: 68 } });
+            expect(a.rise?.lastReplay).toBeUndefined();
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+            expect(a.rootCause?.statement).toBe(
+                "Read Replica Lag (its highest value in each 15-minute interval) reached 68 s in the 6 minutes from 18:54:00 UTC (0.1 s, 68 s). Azure Monitor's 15-minute highest values can't say whether replay stood still or slowed, and nothing captured says why.",
+            );
+            expect(a.notCaptured).toContain("The capture's own samples on the replica (RCA Replica) end at 18:53:23 UTC, before this rise, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.");
+            expect(a.recommendations).toEqual([]);
+        });
+
+        // Samples beside the rise that once named a cause (an idle primary, or WAL that didn't reach the replica) name none
+        // either, and the note says where they are: before the rise, after it, or both.
+        it.each([
+            ["an idle primary's, before the rise", { walBytesPerS: 10 }, ["18:51:30", "18:53:30"], "end at 18:53:30 UTC, before this rise"],
+            ["a late primary's, before the rise", { writeLagS: 7.1 }, ["18:51:30", "18:53:30"], "end at 18:53:30 UTC, before this rise"],
+            ["the capture's, after the rise", {}, ["19:00:00", "19:00:45"], "start at 19:00:00 UTC, after this rise"],
+            ["the capture's, before and after the rise", {}, ["18:51:00", "18:52:00", "19:00:15"], "stop at 18:52:00 UTC, before this rise, and start again at 19:00:15 UTC, after it"],
+        ] as const)("names no cause from %s", (_, side, times, where) => {
+            const samples = times.flatMap((t) => [replica(at(t).getTime(), 0.2, 0), { ...primary(at(t).getTime()), ...side }]);
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("18:54:00"), metric: LAG_METRIC, value: 68, intervalMs: 6 * 60_000, grainMs: 15 * 60_000 }];
+            const a = analyzeReplicaLag({ at: at("18:54:00"), metrics, samples, events: [] });
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+            expect(a.notCaptured).toContain(`The capture's own samples on the replica (RCA Replica) ${where}, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.`);
+        });
+
+        /** A stall the capture sampled every 5 s from a last replay at 16:00:00, with `behind` bytes received but not replayed. */
+        const stall = (behind: number) => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("15:59:00").getTime(); t < at("16:00:00").getTime(); t += 30_000) samples.push(replica(t, 0.3, 0), primary(t));
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, behind), primary(t));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 0), primary(at("16:01:35").getTime()));
+            return analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+        };
+
+        it("reads a stall the capture sampled with nothing behind as replay that stood still, not slow replay", () => {
+            const a = stall(0);
+            expect(a.rise?.lastReplay).toEqual(at("16:00:00"));
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(a.rootCause?.statement).toMatch(/; it grew 1 s per second\. Replay stood still, and nothing captured says why\.$/);
+            expect(a.notCaptured.join(" ")).not.toMatch(/RCA Replica/);
+        });
+
+        it("reads replay as slower than WAL when the stall's samples hold WAL received but not replayed", () => {
+            const a = stall(65_536);
+            expect(a.rootCause).toMatchObject({ confidence: "medium", ruleIds: ["REPL-REPLAY-SLOW"] });
+            expect(a.rootCause?.statement).toMatch(/: replay advanced slower than WAL arrived \(65536 bytes behind, WAL about 2797 bytes\/s\)\.$/);
+            expect(a.recommendations.map((r) => r.id)).toEqual(["RPL-SHORT-REPORTS"]);
+        });
+    });
 });
 
 // Live, 2026-11-21: a surge to T4's limit had no explanation at all, since only the errors were read for it, and none was
