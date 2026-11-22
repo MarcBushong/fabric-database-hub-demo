@@ -102,10 +102,10 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
     const classes = (errors?.details?.classes as ErrorClassRow[] | undefined) ?? [];
     const also = (incident.details?.alsoInTheseMinutes as string[] | undefined) ?? [];
     // The errors' minutes say a target has no capture for their own span, in either form (no capture recorded, or a coverage
-    // row marked not captured): for a target the incident notes already, theirs go. The incident's own lines all stay: one
-    // per coverage row not captured, so a storm across two rows has two (the re-review of ab1d2d41), as tools.ts keeps an
-    // incident's own lines and drops its parts' for a target it notes.
-    const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA (?:capture recorded|evidence) for /.exec(s)?.[1];
+    // row marked not captured), for a span or "at" one instant (F5): for a target the incident notes already, theirs go. The
+    // incident's own lines all stay: one per coverage row not captured, so a storm across two rows has two (the re-review of
+    // ab1d2d41), as tools.ts keeps an incident's own lines and drops its parts' for a target it notes.
+    const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA (?:capture recorded|evidence) (?:for|at) /.exec(s)?.[1];
     const noted = new Set(incident.notCaptured.map(noCapture).filter((t): t is string => t !== undefined));
     const notCaptured = [...new Set([...incident.notCaptured, ...(errors?.notCaptured ?? []).filter((s) => !noted.has(noCapture(s) ?? ""))])];
     const recommendations = [...new Map([...incident.recommendations, ...(errors?.recommendations ?? [])].map((r) => [r.id, r])).values()];

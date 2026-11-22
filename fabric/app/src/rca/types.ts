@@ -331,6 +331,8 @@ export const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 export const hhmmss = (d: Date) => d.toISOString().slice(11, 19);
 /** "between 16:52:10 and 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). */
 export const during = (first: Date, last: Date) => (first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `between ${hhmmss(first)} and ${hhmmss(last)}`);
+/** "from 16:52:10 to 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). Final tests' check of ddebd4c3 (F5): "from 19:30:00 to 19:30:00 UTC". */
+export const fromTo = (first: Date, last: Date) => (hhmmss(first) === hhmmss(last) ? `at ${hhmmss(first)}` : `from ${hhmmss(first)} to ${hhmmss(last)}`);
 
 /** Whether the known counts all end by the time the interval whose length isn't known begins, so it can't hold them. */
 function knownBefore(open: { from: Date }, known: { count: number; last: Date } | null): boolean {

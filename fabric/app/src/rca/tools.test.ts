@@ -345,6 +345,34 @@ describe("every family the RCA explains", () => {
         expect(r.notCaptured).toContain("T1: the blocked processes from 15:12:00 to 15:19:00 UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.");
         expect(r.notCaptured.join(" ")).not.toMatch(/its 30-s sentinel saw/);
     });
+
+    // Final tests' check of ddebd4c3 (F5): ten notes wrote one instant as a range, "from 19:30:00 to 19:30:00 UTC" and "no
+    // RCA capture recorded for 19:30:00-19:30:00 UTC". Each says "at 19:30:00 UTC" now, and the incident still says its
+    // target's note once, though its parts read wider minutes.
+    it("says one instant 'at' it, in the telemetry-only note and the no-capture note, and the incident's note once", async () => {
+        // Blocked processes in the telemetry's last bin only: an incident of one instant, with no recovery in the data.
+        const bins = Array.from({ length: 11 }, (_, i) => ({ at: minute("15:05:00", i), target: "T1" as const, cpu: 20, blocked: i === 10 ? 3 : 0, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null }));
+        const evidence: Evidence = { ...emptyEvidence(), coverage: [{ target: "T1", from: at("15:20:00"), to: at("16:00:00"), captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }] };
+        const deps = tools({ evidence, telemetry: { bins } });
+        const locking = await ask("explain_locking", { at: "2026-11-20T15:19:00Z", targets: ["T1"] }, deps);
+        expect(locking.notCaptured).toContain("T1: the blocked processes at 15:15:00 UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.");
+        const [episode] = (await deps.episodes(at("15:00:00"), at("15:30:00"), ["T1"])).filter((e) => e.family === "blocking");
+        expect([episode.start, episode.last, episode.end]).toEqual([at("15:15:00"), at("15:15:00"), null]);
+        const incident = await ask("explain_incident", { episodeKey: episode.key }, deps);
+        expect(incident.notCaptured.filter((line) => line.startsWith("T1: no RCA"))).toEqual(["T1: no RCA capture recorded at 15:15:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
+        expect(JSON.stringify([locking, incident])).not.toMatch(/(\d\d:\d\d:\d\d)(-| to )\1 UTC/);
+        // A coverage row of one instant, marked not captured, says it so too, and the incident's note of it stands for its
+        // target: the part's line for the row after it, which only the part's wider minutes read, goes.
+        const rows: Evidence = {
+            ...emptyEvidence(),
+            coverage: [
+                { target: "T1", from: at("15:15:00"), to: at("15:15:00"), captured: false, sources: [], gaps: [] },
+                { target: "T1", from: at("15:15:30"), to: at("15:40:00"), captured: false, sources: [], gaps: [] },
+            ],
+        };
+        const marked = await ask("explain_incident", { episodeKey: episode.key }, tools({ evidence: rows, telemetry: { bins } }));
+        expect(marked.notCaptured.filter((line) => line.startsWith("T1: no RCA"))).toEqual(["T1: no RCA evidence at 15:15:00 UTC"]);
+    });
 });
 
 // The review of 4e2c65ed: one more read left a stall that hadn't recovered by the end of the minutes read as it stood, so

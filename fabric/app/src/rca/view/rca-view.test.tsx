@@ -174,6 +174,21 @@ describe("the report's root cause, never blank", () => {
         expect(within(gaps).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
     });
 
+    // Final tests' check of ddebd4c3 (F5): one instant reads "at" it, so the view counts that form as a target's note too.
+    it("counts a note of one instant, 'at' it, as its target's, the incident's or the errors'", () => {
+        const at = (lines: string[], extra: string[]) => {
+            const incident: InvestigationResult = { tool: "explain_incident", version: 1, window: { fromUtc: "2026-11-21T16:57:00Z", toUtc: "2026-11-21T16:57:00Z" }, targets: ["T4-replica"], episodes: [], findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: lines };
+            renderWithApp(<RcaReport incident={incident} errors={{ ...incident, tool: "explain_errors", notCaptured: extra }} timeZone="UTC" logs={[]} />);
+            const shown = within(screen.getByRole("region", { name: "Not captured" })).getAllByRole("listitem").map((li) => li.textContent);
+            cleanup();
+            return shown;
+        };
+        const instant = "T4-replica: no RCA capture recorded at 16:57:00 UTC; only the telemetry (Telemetry Snapshots) is known";
+        const span = "T4-replica: no RCA capture recorded for 16:55:00-16:59:00 UTC; only the telemetry (Telemetry Snapshots) is known";
+        expect(at([instant], [span])).toEqual([instant]);
+        expect(at([span], [instant, "T4-replica: no RCA evidence at 16:59:00 UTC"])).toEqual([span]);
+    });
+
     // The re-review of ab1d2d41: an incident across two coverage rows not captured has a line for each, and the view kept
     // only the first, so T5's storm from 12:15 read as not captured only up to 12:25:52.
     it("keeps each of an incident's own lines, and leaves out the errors' for a target it notes", async () => {

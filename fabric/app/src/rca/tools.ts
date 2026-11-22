@@ -15,7 +15,7 @@ import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { asWholeReadings, emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
+import { asWholeReadings, emptyEvidence, fromTo, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -233,11 +233,16 @@ const episodeView = (e: Episode) => ({
 /**
  * The note for a target with no capture in a window, and whether a line is one: an incident says it once. A line is one in
  * either form: none recorded, or a coverage row marked not captured, as T5's are in B's model ("no RCA evidence for"), which
- * a part reading wider minutes said again for a span after the storm had ended (Final tests' check of ddebd4c3, F2).
+ * a part reading wider minutes said again for a span after the storm had ended (Final tests' check of ddebd4c3, F2). Each
+ * says one instant "at" it, never as a range of it (F5: "no RCA capture recorded for 16:57:00-16:57:00 UTC").
  */
-const noCaptureNote = (t: RcaTarget, from: Date, to: Date) => `${t}: no RCA capture recorded for ${hhmmss(from)}-${hhmmss(to)} UTC; only the telemetry (Telemetry Snapshots) is known`;
-const isNoCaptureNote = (t: RcaTarget, line: string) =>
-    (line.startsWith(`${t}: no RCA capture recorded for `) && line.endsWith("; only the telemetry (Telemetry Snapshots) is known")) || line.startsWith(`${t}: no RCA evidence for `);
+const forSpan = (from: Date, to: Date) => (hhmmss(from) === hhmmss(to) ? `at ${hhmmss(from)}` : `for ${hhmmss(from)}-${hhmmss(to)}`);
+const noCaptureNote = (t: RcaTarget, from: Date, to: Date) => `${t}: no RCA capture recorded ${forSpan(from, to)} UTC; only the telemetry (Telemetry Snapshots) is known`;
+const isNoCaptureNote = (t: RcaTarget, line: string) => {
+    if (!line.startsWith(`${t}: `)) return false;
+    const rest = line.slice(t.length + 2);
+    return /^no RCA capture recorded (?:for|at) .*; only the telemetry \(Telemetry Snapshots\) is known$/.test(rest) || /^no RCA evidence (?:for|at) /.test(rest);
+};
 
 function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarget[], deps: InvestigationDeps, g: Gathered, at?: Date): InvestigationResult {
     const coverage = g.evidence.coverage.filter((c) => targets.includes(c.target) && c.to >= from && c.from <= to);
@@ -246,7 +251,7 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
         .filter((t) => !coverage.some((c) => c.target === t))
         .map((t) => noCaptureNote(t, from, to));
     const notCaptured = [
-        ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence for ${hhmmss(c.from)}-${hhmmss(c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
+        ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence ${forSpan(c.from, c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
         ...unknown,
         ...(g.evidence.cut ?? []).map((c) => `${c.table}: the window holds more rows than ${isPagedTable(c.table) ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`),
     ];
@@ -380,7 +385,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             }
             const from = new Date(Math.min(...seen.map((e) => e.start.getTime())));
             const to = new Date(Math.max(...seen.map((e) => (e.end ?? e.last).getTime())));
-            return [`${t}: the blocked processes from ${hhmmss(from)} to ${hhmmss(to)} UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.`];
+            return [`${t}: the blocked processes ${fromTo(from, to)} UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.`];
         });
         return {
             ...base,
@@ -614,7 +619,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
         const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
-        if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded from ${hhmmss(e.start)} to ${hhmmss(e.end ?? e.last)} UTC explains the ${e.signal}.`));
+        if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
             ...base,
             findings: parts.flatMap((p) => p.findings),

@@ -284,6 +284,8 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         );
         expect(late.notCaptured).toContain("Azure Monitor's Read Replica Lag here is its highest value in the 3 minutes from 16:57:00 UTC, so when the lag rose and peaked is known to those 3 minutes only.");
         expect([late.rootCause?.statement, ...late.notCaptured].join(" ")).not.toMatch(/15-minute|3-minute/);
+        // Its own minutes are one instant, its point's start: "at" it (F5), once, though its part read wider minutes.
+        expect(late.notCaptured.filter((line) => line.startsWith("T4-replica: no RCA"))).toEqual(["T4-replica: no RCA capture recorded at 16:57:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
         // The review of c4c63abe: it opened on its one sample because its rule opens on one, not by being far over its level.
         expect((late.details?.episodes as Array<{ text: string }>)[0].text).toContain("peak 34 s at 16:57:00 UTC, in one sample: low confidence (Azure Monitor).");
         const cpu = await ask("explain_incident", { episodeKey: "T4-cpu-20261121T163500Z" });
