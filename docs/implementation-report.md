@@ -4877,6 +4877,7 @@ Until then, deployments keep the pinned image, which works as before.
   - `./scripts/start-demo.ps1` and `./scripts/stop-demo.ps1`, twice in a row: `START.HOSTPASSWORD` and `STOP.HOSTPASSWORD` pass, with no 600-second wait;
   - `./scripts/deploy.ps1`: `INFRA.BOOTSTRAP.LOADER_*` pass, with `DbHubDemo-Bootstrap-<time>` in the log;
   - then `./scripts/validate.ps1` and `./scripts/status.ps1`: the loader checks pass, and no copy is left once its delete finishes.
+- **Live evidence of the cause, on the release's code (2026-11-22):** two updates of the final tests' environment, on the RCA branch, started `sqlvm01` from deallocated, and the loader's first run under `DbHubDemo-Bootstrap` stayed Pending for 923 and 928 seconds. After the watchdog's restart, the same name ran in 63 seconds in the first update, and stayed Pending another 929 seconds in the second, which ended **NOT DONE** (`DEPLOY.EXTENSIONS_SQLVM01`, `INFRA.BOOTSTRAP.LOADER_SQLVM01`, and `DEPLOY.TRACK.T1` **Fail**). This fix runs both under names the handler has never seen ([the check](#a-loader-not-done-on-the-release-code-checked-against-the-fresh-names-2026-11-22)). It's evidence of the cause, not the proof above, which still has to run.
 - **An action at 24 Run Commands on its VM** runs under its fixed name, as before, and can still meet the skip.
 - **Chunk names** repeat when the same content goes to the same VM again; unchanged here.
 
@@ -5647,3 +5648,46 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 - None for deployments: neither the app nor the model runs the reference.
 - A coarser point's later saves are each taken against more rows than before, at most every earlier save's rows in its interval, as `finestPerInterval` takes them already.
+
+### A loader NOT DONE on the release code, checked against the fresh names (2026-11-22)
+
+**Why.** The final tests found a **NOT DONE** on 2026-11-22, in an update of their environment on the RCA branch, whose bootstrap code is the release's. The coordinator asked whether [the review of F31's](#the-review-of-f31-fresh-names-for-actions-too-2026-11-22) fresh names would have prevented it, for the loader's first run and for its run again after the watchdog's restart, and to add the run to that section as live evidence.
+
+- **The run** (times UTC): it started `sqlvm01` and `archost01` from deallocated at 21:09. T1's loader, `DbHubDemo-Bootstrap`, started on `sqlvm01` at 21:26 and stayed Pending for 928 seconds. The watchdog restarted the VM, and the loader ran again under the same name at 21:42, Pending for 929 seconds. The run ended **NOT DONE** after 53.5 minutes, with `DEPLOY.EXTENSIONS_SQLVM01`, `INFRA.BOOTSTRAP.LOADER_SQLVM01`, and `DEPLOY.TRACK.T1` **Fail**. A plain rerun ran the loader in 57 seconds and ended **DONE**, with no **Fail**.
+- **The update before it, that day:** the same first run, Pending for 923 seconds; after the watchdog's restart, the same name ran in 63 seconds (`DEPLOY.WATCHDOG_SQLVM01`, a **Warning**).
+
+**What the check found: the fresh names cover both runs, so there's no code change.**
+
+- **The first run:** the T1 track's loader, `Invoke-DemoBootstrapLoaderRun`, runs `Invoke-DemoVmRunCommand -RunCommandName 'DbHubDemo-Bootstrap' -FreshAction` (`TrackHelpers.ps1:125`); the release's call has no `-FreshAction`.
+  - `Get-DemoRunCommandRunName` gives it `DbHubDemo-Bootstrap-yyyyMMddHHmmss` (`RunCommandHelpers.ps1:370`, `:408`).
+  - The fixed name is deleted first, and that delete waited for (`Invoke-DemoVmRunCommand.ps1:264` to `:277`).
+  - So the PUT (`:314`) goes only to a name the handler has never run, which its sequence-number check can't skip.
+- **The run again after the restart:** the track calls the same loader again (`TrackHelpers.ps1:1139`, `:1140`, `:1149`), and that call takes a name of its own, with its own time, after the restart. The first run's copy is deleted, and its delete waited for (`Invoke-DemoVmRunCommand.ps1:359`), before the call returns that it didn't start (`:412`).
+- **A test pins it:** `DbHubDemo.Arc.Tests.ps1` marks `DbHubDemo-Bootstrap` as a name the handler skips (`:465`) and expects the loader to pass under `DbHubDemo-Bootstrap-<time>` (`:567`, `:573`). It passes on this tree. With `-FreshAction` taken out of the loader's call, as the release has it, it fails: the fixed name stays Pending, and the loader's result is a **Fail**.
+
+**What the evidence says about the cause:** it fits the handler's skip of a name created again ([F31](#a-health-read-under-a-fresh-name-and-a-loader-check-that-knows-when-it-didnt-answer-f31-2026-11-22)), for both runs, but doesn't prove it.
+
+- **It fits:**
+  - The release creates `DbHubDemo-Bootstrap` again on every update, on a VM whose handler ran that name on each earlier update. With no bundle passed, the template doesn't touch it (`demo.bicep:350`).
+  - At both watchdog moments, the VM's saved instance view has the agent Ready and every extension handler and extension succeeded. So the stuck result named only "the VM agent's Run Command handling", which it says when nothing else is busy (`VmExtensionHelpers.ps1:768`).
+  - A skipped Run Command stays Pending for the whole start wait, as these did: 923 to 929 seconds, where this VM's loader otherwise ran in 38 to 78.
+  - A cold start alone doesn't do it: the three updates of 2026-11-21 also started `sqlvm01` from deallocated, and its loader ran in 38 to 51 seconds.
+  - The skip is per VM: in both updates, `archost01`'s loader ran under the same name, in 50 and 54 seconds.
+  - The rerun ran the same name in 57 seconds, after the stuck one's delete, as the next delete's `disable` cleared the name on `archost01`.
+- **Not proven:** the handler's own log on `sqlvm01` (`RunCommandHandler.log`, under `C:\WindowsAzure\Logs`) wasn't read, so its skip line isn't in the evidence, and the delete that missed its `disable` can't be named.
+  - After each loader, the release ran its health read at once, a managed Run Command, and the first action Run Command on `sqlvm01` 67 to 74 seconds later. On `archost01`, the trigger was an action Run Command within seconds of a delete.
+  - A read of that log would settle it.
+
+**Changed files.** This report: an evidence bullet in the review of F31's section, and this section.
+
+**Validation.**
+
+- `DbHubDemo.Arc.Tests.ps1`'s loader test, as above: it passes on this tree, and fails without `-FreshAction`.
+- markdownlint: clean. `Repo.NeutralWording`: 3 passed.
+
+**Risks.** None changes with this check:
+
+- **At 24 or more Run Commands on the VM,** the loader runs under its fixed name, as before, and can meet the skip; the log says why (`RunCommandHelpers.ps1:404` to `:406`). These runs had far fewer: the most the logs show is 8 chunk Run Commands Azure was still deleting.
+- **`deploy.ps1 -Sequential`** still runs the template's loader under its fixed name (`bootstrap.bicep:69`), as the review of F31 chose, so an update with it creates the name again. The default path doesn't use it.
+- **A loader held back by something else** still waits 15 minutes, gets the watchdog's restart, and runs once more, as here.
+- **The review of F31's live proof** still has to run: this is evidence of the cause, not of the fix.
