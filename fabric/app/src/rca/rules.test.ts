@@ -295,8 +295,11 @@ describe("read replica lag (INV-15) on T4's replica", () => {
             expect(a.rise?.lastReplay).toBeUndefined();
             expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
             expect(a.rootCause?.statement).toBe(
-                "Read Replica Lag (its highest value in each 15-minute interval) reached 68 s in the 6 minutes from 18:54:00 UTC (0.1 s, 68 s). Azure Monitor's 15-minute highest values can't say whether replay stood still or slowed, and nothing captured says why.",
+                "Read Replica Lag (its highest value in each interval) reached 68 s in the 6 minutes from 18:54:00 UTC (0.1 s, 68 s). Azure Monitor's highest value in those 6 minutes can't say whether replay stood still or slowed, and nothing captured says why.",
             );
+            // Its words give the 6 minutes, never its save's 15 (F4, the grain).
+            expect(a.notCaptured).toContain("Azure Monitor's Read Replica Lag here is its highest value in the 6 minutes from 18:54:00 UTC, so when the lag rose and peaked is known to those 6 minutes only.");
+            expect([a.rootCause?.statement, ...a.notCaptured].join(" ")).not.toMatch(/15-minute/);
             expect(a.notCaptured).toContain("The capture's own samples on the replica (RCA Replica) end at 18:53:23 UTC, before this rise, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.");
             expect(a.recommendations).toEqual([]);
         });

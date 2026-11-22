@@ -271,15 +271,19 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
 
     // The review of ebd1c6c3, with the shared finestPerInterval (a390db00): the day save's 34 s at 16:45 fell in 16:57 to
     // 17:00, after the session's window, and dropping that point lost it; `…164500Z`, listed at 3732317d, answered "No
-    // episode". A remainder spans only part of its save's interval: it's worded by its save's 15 minutes, and a run of its
-    // grain steps by them (stepped by its 3-minute span, T4's CPU from 16:35 lost its end).
-    it("lists the day save's 34 s from 16:57 as its own incident, worded by its save's interval, and reads the old key as it", async () => {
+    // episode". A remainder spans only part of its save's interval, and a run of its grain steps by that interval (stepped by
+    // its 3-minute span, T4's CPU from 16:35 lost its end). Its words give its own 3 minutes, never the save's 15 (Final
+    // tests' check of ddebd4c3, F4: "its highest value in each 15-minute interval … in the 3 minutes from 16:57:00").
+    it("lists the day save's 34 s from 16:57 as its own incident, worded by its own minutes, and reads the old key as it", async () => {
         const listed = await ask("find_incidents", { from: "2026-11-21T11:00:00Z", to: "2026-11-21T20:00:00Z" });
         expect((listed.episodes ?? []).map((e) => e.key)).toContain("T4-replica-replica_lag-20261121T165700Z");
         const late = await ask("explain_incident", { episodeKey: "T4-replica-replica_lag-20261121T164500Z" });
         expect(late.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T164500Z", as: ["T4-replica-replica_lag-20261121T165700Z"] });
-        expect(late.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 15-minute interval\) reached 34 s in the 3 minutes from 16:57:00 UTC /);
-        expect(late.rootCause?.statement).not.toMatch(/3-minute/);
+        expect(late.rootCause?.statement).toMatch(
+            /^Read Replica Lag \(its highest value in each interval\) reached 34 s in the 3 minutes from 16:57:00 UTC \(1 s, 8 s, 34 s\)\. Azure Monitor's highest value in those 3 minutes can't say whether replay stood still or slowed, and nothing captured says why\.$/,
+        );
+        expect(late.notCaptured).toContain("Azure Monitor's Read Replica Lag here is its highest value in the 3 minutes from 16:57:00 UTC, so when the lag rose and peaked is known to those 3 minutes only.");
+        expect([late.rootCause?.statement, ...late.notCaptured].join(" ")).not.toMatch(/15-minute|3-minute/);
         // The review of c4c63abe: it opened on its one sample because its rule opens on one, not by being far over its level.
         expect((late.details?.episodes as Array<{ text: string }>)[0].text).toContain("peak 34 s at 16:57:00 UTC, in one sample: low confidence (Azure Monitor).");
         const cpu = await ask("explain_incident", { episodeKey: "T4-cpu-20261121T163500Z" });

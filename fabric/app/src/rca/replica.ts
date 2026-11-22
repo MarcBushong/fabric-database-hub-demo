@@ -72,6 +72,12 @@ const minutesFrom = (p: LagPoint) => (p.intervalUnknown ? `in the interval from 
 const spanOf = (p: LagPoint) => Math.round((p.intervalMs ?? 0) / 60_000);
 /** Coarser than a minute: Azure Monitor's value is its interval's highest, not the lag at its start. */
 const coarse = (p: LagPoint) => p.intervalUnknown === true || (p.grainMs ?? p.intervalMs ?? 0) > 60_000;
+/**
+ * Part of its save's interval: a remainder that finer points leave of it, or one its save's window cuts. Its value is the
+ * highest in its own minutes, which its words give, never its save's interval (Final tests' check of ddebd4c3, F4: "its
+ * highest value in each 15-minute interval … in the 3 minutes from 16:57:00").
+ */
+const partial = (p: LagPoint) => coarse(p) && !p.intervalUnknown && spanOf(p) < minutesOf(p);
 
 /**
  * The lag series for the window: the capture's own samples on the replica (since_last_replayed_s: every 30 s, every 5 s
@@ -214,6 +220,7 @@ export interface ReplicaAnalysis {
 function nameOf(p: LagPoint): string {
     if (p.source === "RCA Replica") return "The replica's time since its last replay";
     if (p.intervalUnknown) return "Read Replica Lag (its highest value in each interval of its save, whose length isn't known in these minutes)";
+    if (partial(p)) return "Read Replica Lag (its highest value in each interval)";
     return coarse(p) ? `Read Replica Lag (its highest value in each ${minutesOf(p)}-minute interval)` : "Read Replica Lag";
 }
 
@@ -288,7 +295,15 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const shape = coarse(rise.peak)
         ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}${past}`
         : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}${past}`;
-    if (coarse(rise.peak)) notCaptured.push(rise.peak.intervalUnknown ? "Azure Monitor's Read Replica Lag is the highest value in each interval of its save here, and these minutes hold too few of its points to tell how long that is, so when the lag rose and peaked isn't known within it." : `Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`);
+    if (coarse(rise.peak)) {
+        notCaptured.push(
+            rise.peak.intervalUnknown
+                ? "Azure Monitor's Read Replica Lag is the highest value in each interval of its save here, and these minutes hold too few of its points to tell how long that is, so when the lag rose and peaked isn't known within it."
+                : partial(rise.peak)
+                  ? `Azure Monitor's Read Replica Lag here is its highest value ${minutesFrom(rise.peak)}, so when the lag rose and peaked is known to those ${spanOf(rise.peak)} minutes only.`
+                  : `Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`,
+        );
+    }
     const from = rise.stalledSince.getTime() - 60_000;
     const to = rise.end.getTime() + 60_000;
     const reads = { from: new Date(from), to: new Date(to) };
@@ -364,7 +379,11 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     } else {
         const stood = rise.slope !== null && rise.slope >= 0.8;
         ruleId = stood ? "REPL-REPLAY-STALLED" : "REPL-UNEXPLAINED";
-        const unknown = coarse(rise.peak) ? `Azure Monitor's ${minutesOf(rise.peak)}-minute highest values can't say whether replay stood still or slowed` : "One point can't say whether replay stood still or slowed";
+        const unknown = !coarse(rise.peak)
+            ? "One point can't say whether replay stood still or slowed"
+            : partial(rise.peak)
+              ? `Azure Monitor's highest value in those ${spanOf(rise.peak)} minutes can't say whether replay stood still or slowed`
+              : `Azure Monitor's ${minutesOf(rise.peak)}-minute highest values can't say whether replay stood still or slowed`;
         statement = `${shape}. ${rise.slope === null ? unknown : stood ? "Replay stood still" : "Replay slowed"}, and nothing captured says why.`;
         confidence = "low";
         if (!sawStall && replica.length > 0) notCaptured.push(sampledBeside(replica, rise));
