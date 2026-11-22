@@ -14,7 +14,8 @@ function Test-DemoT4 {
     with no query-level diagnostics), so METRICS.T4 passing is what the Hub's PostgreSQL dashboard needs;
     seeing T4 on the Estate page stays a manual check (HUB.ESTATE.T4 checks Resource Graph).
     T4.MAXCONNECTIONS (2026-11-03): the template sets max_connections to config/versions.json's postgresql.maxConnections
-    on every size, so connection-surge reaches the limit and Database Hub's Failed connections fill; a static parameter,
+    on every size, so connection-surge reaches the limit, which Database Hub's Connections chart shows (its refused attempts
+    aren't in Failed connections: Azure Monitor counted none of them live, 2026-11-21); a static parameter,
     so a new value waits for a restart (isConfigPendingRestart), which deploy.ps1 does before T1 sets T4 up.
     A stopped T4 (2026-11-18): T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS, and T4.MAXCONNECTIONS read through the running
     server, and a stopped one answers ServerStoppedError ("Server '<name>' is in 'Stopped' state", live 2026-11-18;
@@ -223,13 +224,13 @@ function Test-DemoT4 {
         & $add 'T4.MAXCONNECTIONS' 'Warning' ('T4''s max_connections couldn''t be read: {0}' -f $connections.Error) $connectionEvidence 'Run the check again.' $docs['serverParameters']
     }
     elseif ($connections.Value -ne $wantedConnections) {
-        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections is {0}, not {1}, so connection-surge may not reach the limit on this size, and Database Hub''s Failed connections may stay empty.' -f $connections.Value, $wantedConnections) $connectionEvidence 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets it, and the T4 setup restarts T4 to apply it.' $docs['serverParameters']
+        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections is {0}, not {1}, so connection-surge may not reach the limit on this size, and Database Hub''s Connections chart won''t show it there.' -f $connections.Value, $wantedConnections) $connectionEvidence 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets it, and the T4 setup restarts T4 to apply it.' $docs['serverParameters']
     }
     elseif ($connections.PendingRestart) {
         & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections {0} is set but waits for a restart (a static parameter), so the old limit still applies.' -f $connections.Value) $connectionEvidence 'deploy.ps1 restarts T4 before T1 sets it up (DEPLOY.T4.RESTART), or restart it yourself (az postgres flexible-server restart).' $docs['restartServer']
     }
     else {
-        & $add 'T4.MAXCONNECTIONS' 'Pass' ('max_connections is {0} and in effect, so connection-surge reaches the limit and Database Hub''s Failed connections fill on this size.' -f $connections.Value) $connectionEvidence
+        & $add 'T4.MAXCONNECTIONS' 'Pass' ('max_connections is {0} and in effect, so connection-surge reaches the limit on this size: Database Hub''s Connections chart shows it there.' -f $connections.Value) $connectionEvidence
     }
 
     if ($IncludeMetrics) {

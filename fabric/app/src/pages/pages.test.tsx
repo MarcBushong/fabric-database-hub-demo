@@ -314,7 +314,23 @@ describe("Estate", () => {
         expect(within(glance).getByText("pgreplica01-test01")).toBeInTheDocument();
         expect(within(glance).getAllByText("Standard_D4ds_v5")).toHaveLength(2);
         const found = screen.getByRole("region", { name: "What the notebook found" });
-        expect(within(found).getAllByRole("listitem")).toHaveLength(3);
+        expect(within(found).getAllByRole("listitem")).toHaveLength(4);
+    });
+
+    it("grades T4's connections against the slots clients can use, and says what its failed connections leave out (F34)", async () => {
+        // As live (2026-11-21): the surge's connections at 37, at the limit, and Azure Monitor's failed connections at 0.
+        const pg = FIXTURES["postgres-series"].map((r) => (r.Metric === "active_connections" && r.TargetKey === "T4" && r.Value === 34 ? { ...r, Value: 37 } : r.Metric === "connections_failed" ? { ...r, Value: 0 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T4" }, client: fakeQueryClient({ "postgres-series": pg }) });
+        const glance = await screen.findByRole("region", { name: "T4 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("37")).toBeInTheDocument());
+        expect(within(glance).getByText("37").closest(".kpi")).toHaveClass("kpi-warning");
+        expect(within(glance).getByText("Connections, peak")).toBeInTheDocument();
+        // No tile grades failed connections: at 0, it read as a Pass while every attempt past the limit was refused.
+        expect(within(glance).queryByText("Failed connections")).not.toBeInTheDocument();
+        const chart = screen.getByRole("region", { name: "Connections" });
+        expect(within(chart).getByText(/^T4's active connections peaked at 37 at .+, at or above the 35 slots clients can use\. Azure Monitor counted 0 failed connections on T4, which leave out a client refused at the connection limit\.$/)).toBeInTheDocument();
+        expect(within(chart).getByText(/35 or more on T4 is a warning: the 35 slots clients can use \(max_connections 50, less 15 reserved\)\. At the limit, PostgreSQL refuses a new client \(too many connections\), and Azure Monitor's failed connections don't count that refusal\.$/)).toBeInTheDocument();
+        await waitFor(() => expect(within(chart).getByText("35: the slots clients can use")).toBeInTheDocument());
     });
 
     it("shows T5's normalized RU with its throttling episode, its 429s, and its recovery, and asks why it hit 100 %", async () => {

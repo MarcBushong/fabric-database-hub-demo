@@ -236,9 +236,9 @@ Describe 'Test-DemoT4' {
     }
 
     It 'checks max_connections against config/versions.json: <Name> (2026-11-03)' -ForEach @(
-        @{ Name = 'in effect'; Value = '50'; Pending = $false; Status = 'Pass'; Pattern = '^max_connections is 50 and in effect' }
+        @{ Name = 'in effect'; Value = '50'; Pending = $false; Status = 'Pass'; Pattern = '^max_connections is 50 and in effect, so connection-surge reaches the limit on this size: Database Hub''s Connections chart shows it there\.$' }
         @{ Name = 'waiting for a restart'; Value = '50'; Pending = $true; Status = 'Warning'; Pattern = 'waits for a restart' }
-        @{ Name = 'a size''s own default'; Value = '859'; Pending = $false; Status = 'Warning'; Pattern = '^max_connections is 859, not 50' }
+        @{ Name = 'a size''s own default'; Value = '859'; Pending = $false; Status = 'Warning'; Pattern = '^max_connections is 859, not 50, so connection-surge may not reach the limit on this size, and Database Hub''s Connections chart won''t show it there\.$' }
         @{ Name = 'a read that failed'; Value = ''; Pending = $false; Status = 'Warning'; Pattern = 'couldn''t be read: A fake read error' }
     ) {
         $script:t4.MaxConnections = $Value
@@ -246,6 +246,9 @@ Describe 'Test-DemoT4' {
         $check = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.MAXCONNECTIONS'
         $check.status | Should -Be $Status
         $check.message | Should -Match $Pattern
+        # F34 (live, 2026-11-21): Azure Monitor's failed connections didn't count the surge's refused attempts, so no message
+        # promises them.
+        $check.message | Should -Not -Match 'Failed connections'
         $check.evidence.wanted | Should -Be '50'
         @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads; deploy.ps1 restarts'
     }

@@ -350,6 +350,22 @@ export function freshnessInsight(meta: Meta | null, now: Date = new Date()): Ins
 export const REPLICA_LAG_WARNING_SECONDS = 60;
 export const POSTGRES_CPU_WARNING_PERCENT = 80;
 
+/** T4's max_connections, which the template sets on every size (config/versions.json, postgresql.maxConnections). */
+export const POSTGRES_MAX_CONNECTIONS = 50;
+/** The slots Azure keeps for physical replication and monitoring: reserved_connections plus superuser_reserved_connections (Learn: limits). */
+export const POSTGRES_RESERVED_CONNECTIONS = 15;
+/**
+ * The connection slots clients can use on T4, as the notebook counts them: connection-surge's measured signal is T4's
+ * Connections (active_connections) at this many or more (F34). Azure Monitor counts the reserved slots' sessions too, so
+ * a surge that fills the slots reads 35 or more (36 to 39 live, 2026-11-21). Its refused attempts aren't in Failed
+ * connections (connections_failed), which stayed 0 in every interval then.
+ */
+export const POSTGRES_USABLE_CONNECTIONS = POSTGRES_MAX_CONNECTIONS - POSTGRES_RESERVED_CONNECTIONS;
+/** The rule above, in words, for a sentence or a chart's line. */
+export const USABLE_SLOTS_TEXT = `the ${POSTGRES_USABLE_CONNECTIONS} slots clients can use (max_connections ${POSTGRES_MAX_CONNECTIONS}, less ${POSTGRES_RESERVED_CONNECTIONS} reserved)`;
+/** What Azure Monitor's failed connections leave out, wherever they're shown (F34). */
+export const FAILED_CONNECTIONS_CAVEAT = "At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal.";
+
 /** The read replica's peak lag in the latest capture, or why there's none: the replica exists only during a session. Its catch-up after a restart isn't lag (replicaCatchUp). */
 export function replicaLagInsight(capture: PostgresCapture | null): Insight | null {
     if (!capture) return null;
@@ -410,7 +426,7 @@ export function postgresCpuInsight(capture: PostgresCapture | null): Insight | n
     };
 }
 
-/** T4's failed connections in the latest capture: their total, and the interval with the most. */
+/** T4's failed connections in the latest capture: their total, and the interval with the most. A client refused at the connection limit isn't among them (F34). */
 export function failedConnectionsInsight(capture: PostgresCapture | null): Insight | null {
     const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
     const peak = postgresPeak(failed);
@@ -421,8 +437,8 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
             id: "postgres-failed",
             status: "Pass",
             metric: "0",
-            title: "No failed connections on T4 in the latest capture.",
-            detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}.`,
+            title: "Azure Monitor counted no failed connections on T4 in the latest capture.",
+            detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}. ${FAILED_CONNECTIONS_CAVEAT}`,
             page: "estate",
             target: "T4",
         };
@@ -433,7 +449,7 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
         status: "Warning",
         metric: formatNumber(total, "int"),
         title: `${formatNumber(total, "int")} failed connection${total === 1 ? "" : "s"} on T4 in the latest capture.`,
-        detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}. ${FAILED_CONNECTIONS_CAVEAT}`,
         page: "estate",
         target: "T4",
     };

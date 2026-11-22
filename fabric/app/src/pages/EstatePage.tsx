@@ -46,7 +46,7 @@ import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
 import { formatAgo, formatBeside, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
-import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
+import { FAILED_CONNECTIONS_CAVEAT, POSTGRES_CPU_WARNING_PERCENT, POSTGRES_USABLE_CONNECTIONS, REPLICA_LAG_WARNING_SECONDS, USABLE_SLOTS_TEXT } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
@@ -482,6 +482,10 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
     const caught = replicaCatchUp(capture, lagSeries);
     const lagPeak = postgresPeak(lagSeries.filter((p) => !caught.includes(p)));
     const cpuPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.cpu));
+    // connection-surge's measured signal (F34): T4's connections against the slots clients can use. Its refused attempts
+    // aren't in failed connections, so those only show, dashed, with what they leave out.
+    const connPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    const atLimit = connPeak !== null && connPeak.value >= POSTGRES_USABLE_CONNECTIONS;
     const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
     const failedTotal = failed.reduce((a, p) => a + p.value, 0);
     const skus = postgresSkus(d.pgFindingRows);
@@ -542,7 +546,12 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                             }
                         />
                         <KpiTile label="T4 CPU, peak" value={formatBeside(cpuPeak?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT)} status={cpuPeak ? (cpuPeak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass") : null} sub={cpuPeak ? `at ${formatDateTimeUtc(cpuPeak.at)}` : ""} />
-                        <KpiTile label="Failed connections" value={formatNumber(failedTotal, "int")} status={failedTotal > 0 ? "Warning" : "Pass"} sub="On T4 in the capture" />
+                        <KpiTile
+                            label="Connections, peak"
+                            value={connPeak ? formatBeside(connPeak.value, "int", POSTGRES_USABLE_CONNECTIONS) : "–"}
+                            status={connPeak ? (atLimit ? "Warning" : "Pass") : null}
+                            sub={connPeak ? `at ${formatDateTimeUtc(connPeak.at)} · ${POSTGRES_USABLE_CONNECTIONS} slots for clients` : "No connections in this capture"}
+                        />
                     </section>
 
                     <VisualCard
@@ -585,15 +594,26 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         id="estate.t4.connections"
                         className="span-6"
                         title="Connections"
-                        subtitle="Active connections on T4 and its read replica, and T4's failed connections (dashed)."
+                        subtitle={`Active connections on T4 and its read replica, as Database Hub's Connections chart shows them, and T4's failed connections (dashed). ${POSTGRES_USABLE_CONNECTIONS} or more on T4 is a warning: ${USABLE_SLOTS_TEXT}. ${FAILED_CONNECTIONS_CAVEAT}`}
                         specs={[d.pgSeriesSpec]}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && connRows.length === 0}
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "series", label: "Series", kind: "text" }, { key: "value", label: "Connections", kind: "int" }], rows: connRows, caption: "Connections per interval" }}
-                        summary={`${failedTotal} failed connections on T4.`}
+                        summary={`${
+                            connPeak
+                                ? `T4's active connections peaked at ${formatBeside(connPeak.value, "int", POSTGRES_USABLE_CONNECTIONS)} at ${formatDateTimeUtc(connPeak.at)}, ${atLimit ? "at or above" : "under"} the ${POSTGRES_USABLE_CONNECTIONS} slots clients can use.`
+                                : "No active connections on T4 in this capture."
+                        } Azure Monitor counted ${formatNumber(failedTotal, "int")} failed connection${failedTotal === 1 ? "" : "s"} on T4, which leave out a client refused at the connection limit.`}
                     >
-                        <ChartView hideHeader height={200} spec={{ kind: "line", title: "Connections", rows: connRows, x: "at", y: "value", series: "series", unit: "count" }} colors={{ "T4, failed": "var(--status-fail)" }} dashed={["T4, failed"]} />
+                        <ChartView
+                            hideHeader
+                            height={200}
+                            spec={{ kind: "line", title: "Connections", rows: connRows, x: "at", y: "value", series: "series", unit: "count" }}
+                            colors={{ "T4, failed": "var(--status-fail)" }}
+                            dashed={["T4, failed"]}
+                            annotations={{ thresholds: [{ value: POSTGRES_USABLE_CONNECTIONS, label: `${POSTGRES_USABLE_CONNECTIONS}: the slots clients can use`, tone: "warning" }] }}
+                        />
                     </VisualCard>
 
                     <VisualCard

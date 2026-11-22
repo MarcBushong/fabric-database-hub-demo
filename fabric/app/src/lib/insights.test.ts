@@ -322,15 +322,18 @@ describe("T4's insights (ADR 0025)", () => {
         expect(lag?.metric).toBe("59.96 s");
     });
 
-    it("counts T4's failed connections: a warning above 0, a pass at 0", () => {
+    it("counts T4's failed connections: a warning above 0, a pass at 0, and says a client refused at the connection limit isn't among them (F34)", () => {
+        const caveat = "At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal.";
         const failed = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0), point("T4", "connections_failed", 5, 3), point("T4", "connections_failed", 10, 1)]));
         expect(failed?.status).toBe("Warning");
         expect(failed?.metric).toBe("4");
         expect(failed?.title).toBe("4 failed connections on T4 in the latest capture.");
-        expect(failed?.detail).toBe("At most 3 in one 5-minute interval, at 17:05 UTC on 13 Nov.");
+        expect(failed?.detail).toBe(`At most 3 in one 5-minute interval, at 17:05 UTC on 13 Nov. ${caveat}`);
+        // Live (2026-11-21): 0 in every interval while connection-surge's attempts were refused, so 0 never reads as "none refused".
         const none = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0)]));
         expect(none?.status).toBe("Pass");
-        expect(none?.title).toBe("No failed connections on T4 in the latest capture.");
+        expect(none?.title).toBe("Azure Monitor counted no failed connections on T4 in the latest capture.");
+        expect(none?.detail).toMatch(new RegExp(`\\. ${caveat.replace(/[().]/g, "\\$&")}$`));
         expect(failedConnectionsInsight(null)).toBeNull();
     });
 });

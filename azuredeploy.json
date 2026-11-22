@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "5437124903875747299"
+      "templateHash": "4896340129382787578"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -690,7 +690,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "7166381970085252130"
+              "templateHash": "8397703145303925778"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -1214,7 +1214,7 @@
               "tokenResource": "https://ossrdbms-aad.database.windows.net",
               "enhancedMetricsParameter": "metrics.collector_database_activity",
               "maxConnections": 50,
-              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
+              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Connections chart shows the surge at the limit on every size (its refused attempts aren't in Failed connections: Azure Monitor counted none of them live, 2026-11-21). Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
               "autoStartAfterStoppedDays": 7,
               "capabilitiesApiVersion": "2025-08-01",
               "autonomousTuning": {
@@ -9935,7 +9935,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "17417311977485402231"
+                      "templateHash": "3136060761374150035"
                     },
                     "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size."
                   },
@@ -10043,7 +10043,7 @@
                       "minValue": 25,
                       "maxValue": 5000,
                       "metadata": {
-                        "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, and Database Hub's Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
+                        "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, which Database Hub's Connections chart shows, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
                       }
                     },
                     "autonomousTuning": {

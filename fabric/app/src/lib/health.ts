@@ -16,7 +16,7 @@ import {
     type TargetSummary,
 } from "@/data/model";
 import { formatAgo, formatBeside, formatNumber } from "./format";
-import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "./insights";
+import { POSTGRES_CPU_WARNING_PERCENT, POSTGRES_USABLE_CONNECTIONS, REPLICA_LAG_WARNING_SECONDS } from "./insights";
 import { statusBySort, worstStatus, type StatusName } from "./status";
 import type { EstateTarget } from "./view-state";
 
@@ -89,7 +89,10 @@ export function postgresHealth(capture: PostgresCapture | null, findings: readon
     const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
     const caught = replicaCatchUp(capture, lag);
     const lagPeak = postgresPeak(lag.filter((p) => !caught.includes(p)));
-    const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed).reduce((a, p) => a + p.value, 0);
+    // T4's connections at their peak, against the slots clients can use: connection-surge's measured signal. Failed
+    // connections aren't shown here: Azure Monitor didn't count the surge's refused attempts in them (F34).
+    const connectionPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    const atLimit = connectionPeak !== null && connectionPeak.value >= POSTGRES_USABLE_CONNECTIONS;
     return {
         key: "T4",
         status: worst?.name ?? "Pass",
@@ -97,9 +100,9 @@ export function postgresHealth(capture: PostgresCapture | null, findings: readon
         metrics: [
             { label: "CPU peak", value: formatBeside(postgresPeak(cpu)?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT) },
             { label: "Replica lag", value: lagPeak ? formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS) : "–" },
-            { label: "Failed conn.", value: formatNumber(failed, "int") },
+            { label: "Conn. peak", value: connectionPeak ? `${formatBeside(connectionPeak.value, "int", POSTGRES_USABLE_CONNECTIONS)} / ${POSTGRES_USABLE_CONNECTIONS}` : "–" },
         ],
-        note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}`,
+        note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}${atLimit ? "; connections reached the server's limit" : ""}`,
         spark: cpu.map((p) => p.value),
         incidents: 0,
         attention: attention.length,

@@ -209,7 +209,7 @@
     "tokenResource": "https://ossrdbms-aad.database.windows.net",
     "enhancedMetricsParameter": "metrics.collector_database_activity",
     "maxConnections": 50,
-    "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
+    "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Connections chart shows the surge at the limit on every size (its refused attempts aren't in Failed connections: Azure Monitor counted none of them live, 2026-11-21). Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
     "autoStartAfterStoppedDays": 7,
     "capabilitiesApiVersion": "2025-08-01",
     "autonomousTuning": {

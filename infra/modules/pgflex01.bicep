@@ -55,7 +55,7 @@ param adminGroupDisplayName string
 @maxValue(3600000)
 param idleInTransactionTimeoutMs int = 900000
 
-@description('max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms\'s own default of 50, so connection-surge reaches the limit, and Database Hub\'s Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending.')
+@description('max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms\'s own default of 50, so connection-surge reaches the limit, which Database Hub\'s Connections chart shows, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending.')
 @minValue(25)
 @maxValue(5000)
 param maxConnections int = 50

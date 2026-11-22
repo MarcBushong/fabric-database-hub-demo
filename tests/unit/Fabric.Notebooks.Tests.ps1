@@ -1247,7 +1247,7 @@ print(json.dumps({"nov13": lag_finding(nov13), "late": lag_finding(late), "only"
         }
         # Five-minute values from 17:00 UTC; the 18:00 interval has no value yet.
         $script:pgPoints = @{
-            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 34); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
+            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 37); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
             'pgreplica01-abc123' = @{ physical_replication_delay_in_seconds = @(6, 241.37, 2); cpu_percent = @(10.26); active_connections = @(1) }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
@@ -1321,10 +1321,22 @@ again = t4(full)
 partial = json.loads(document)
 partial["servers"] = [server for server in partial["servers"] if server["role"] == "primary"]
 partial["series"] = [series for series in partial["series"] if series["role"] == "primary"]
+# As live (F34, 2026-11-21): connection-surge at the limit, and Azure Monitor's failed connections at 0 in every interval.
+live = json.loads(document)
+for series in live["series"]:
+    if series["metric"] == "connections_failed":
+        series["points"] = [[point[0], 0] for point in series["points"]]
+# A capture whose connections stay under the slots clients can use.
+under = json.loads(document)
+for series in under["series"]:
+    if series["metric"] == "active_connections" and series["role"] == "primary":
+        series["points"] = [[point[0], min(point[1], 34)] for point in series["points"]]
 print(json.dumps({
     "full": summary(full, printed),
     "again": summary(full, again),
     "primaryOnly": summary(*run(json.dumps(partial))),
+    "live": summary(*run(json.dumps(live))),
+    "under": summary(*run(json.dumps(under))),
     "invalid": summary(*run('{"version": 2, "servers": [], "series": []}')),
     "empty": summary(*run("")),
 }))
@@ -1347,8 +1359,8 @@ print(json.dumps({
         $lag[0]['reportDate'] | Should -Be '2026-11-13'
         @($full['rows'] | Where-Object { $_['metric'] -eq 'connections_failed' } | ForEach-Object { '{0}:{1}:{2}' -f $_['target'], $_['unit'], [string]$_['value'] }) | Should -Be @('T4:connections:0', 'T4:connections:3', 'T4:connections:1')
         @($full['rows'] | Where-Object { $_['metric'] -eq 'cpu_percent' -and $_['target'] -eq 'T4' } | ForEach-Object { $_['value'] }) | Should -Be @(43.3, 91.3, 50)
-        $full['findings'].Count | Should -Be 4
-        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections_failed') {
+        $full['findings'].Count | Should -Be 5
+        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections', 'postgresql.T4.connections_failed') {
             $full['findings'].ContainsKey($id) | Should -BeTrue -Because $id
         }
         $full['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
@@ -1359,12 +1371,23 @@ print(json.dumps({
         $full['findings']['postgresql.T4.cpu']['finding'] | Should -Be 'T4''s CPU on pgflex01-abc123 peaked at 91.3% at 2026-11-13 17:05 UTC (a Warning at 80% or more).'
         $full['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Warning'
         $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -Match '^Failed connections on T4 \(pgflex01-abc123\): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval'
+        # F34 (live, 2026-11-21): connection-surge's signal is T4's connections at the slots clients can use, never its failed
+        # connections, which leave out a client refused at the connection limit; they say so whatever their count.
+        $leaveOut = 'They leave out a client refused at the connection limit (too many connections), so T4''s active connections show a connection surge.'
+        $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -BeLike ('* ' + $leaveOut)
+        $full['findings']['postgresql.T4.connections']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.connections']['finding'] | Should -Be 'T4''s active connections on pgflex01-abc123 peaked at 37 at 2026-11-13 17:05 UTC, at or above the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more). At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor''s failed connections don''t count that refusal.'
+        $result['live']['findings']['postgresql.T4.connections']['status'] | Should -Be 'Warning'
+        $result['live']['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Pass'
+        $result['live']['findings']['postgresql.T4.connections_failed']['finding'] | Should -Be ('Azure Monitor counted no failed connections on T4 (pgflex01-abc123) from 2026-11-13 17:00 to 2026-11-13 17:15 UTC. ' + $leaveOut)
+        $result['under']['findings']['postgresql.T4.connections']['status'] | Should -Be 'Pass'
+        $result['under']['findings']['postgresql.T4.connections']['finding'] | Should -Be 'T4''s active connections on pgflex01-abc123 peaked at 34 at 2026-11-13 17:05 UTC, under the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more).'
         $full['findings']['postgresql.T4.cpu']['reportDate'] | Should -Be '2026-11-13'
         $full['printed'] | Should -Contain 'T4''s metrics from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes:'
 
         # Running the cell again replaces its rows and findings instead of adding to them.
         $result['again']['rows'].Count | Should -Be 15
-        $result['again']['findings'].Count | Should -Be 4
+        $result['again']['findings'].Count | Should -Be 5
 
         $primaryOnly = $result['primaryOnly']
         @($primaryOnly['rows'] | Where-Object { $_['target'] -eq 'T4-replica' }).Count | Should -Be 0
@@ -1767,5 +1790,50 @@ print("ok")
 '@
         $output = & $python $script $live.Path 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+    }
+
+    It 'expects connection-surge''s connections, never IO by a keyword inside a word, and counts T4''s slots from the template''s max_connections (F34)' {
+        # Live (2026-11-21): the surge's refused attempts weren't in Azure Monitor's failed connections; its connections reached
+        # the slots clients can use. The notebook and the app count those slots the same way, from config/versions.json.
+        $postgres = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable)['postgresql']
+        $liveCode | Should -Match ('(?m)^POSTGRES_MAX_CONNECTIONS = {0}$' -f $postgres['maxConnections'])
+        $liveCode | Should -Match '(?m)^POSTGRES_RESERVED_CONNECTIONS = 15$'
+        $insights = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/lib/insights.ts') -Raw
+        $insights | Should -Match ('export const POSTGRES_MAX_CONNECTIONS = {0};' -f $postgres['maxConnections'])
+        $insights | Should -Match 'export const POSTGRES_RESERVED_CONNECTIONS = 15;'
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/lib/scoreboard.ts') -Raw) | Should -Match '"connection-surge": \["connections"\]'
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for this Python'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'expected.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"]]
+ns = {}
+for index, cell in enumerate(cells):
+    if cell.startswith(("# Parameters cell", "# Helpers, part")):
+        exec(compile(cell, "cell-%d" % index, "exec"), ns)
+signals = ns["expected_signals"]
+print(json.dumps({profile: list(signals("incident:" + profile)) for profile in ("connection-surge", "idle-in-transaction", "io-pressure", "session-locking", "index-io-mix", "ru-storm")}))
+'@
+        $output = & $python $script $live.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $expected = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        @($expected['connection-surge']) | Should -Be @('connections')
+        # Before, "io" inside "connection", "transaction", and "session" read as IO pressure.
+        @($expected['idle-in-transaction']) | Should -Be @('activity')
+        @($expected['session-locking']) | Should -Be @('blocking')
+        @($expected['io-pressure']) | Should -Be @('io')
+        @($expected['index-io-mix']) | Should -Be @('cpu', 'io')
+        @($expected['ru-storm']) | Should -Be @('activity')
     }
 }
