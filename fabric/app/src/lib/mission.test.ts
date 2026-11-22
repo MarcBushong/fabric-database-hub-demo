@@ -8,7 +8,8 @@ import type { Row } from "@/data/query-client";
 import { seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
 import { postgresHealth } from "@/lib/health";
-import { buildPostmortem, postmortemAsk, postmortemFileName } from "@/lib/postmortem";
+import { buildPostmortem, causeWindow, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
+import type { BlindCauses } from "@/rca/postmortem";
 import {
     aggregate,
     cosmosEpisodes,
@@ -553,6 +554,82 @@ describe("the postmortem", () => {
         expect(ctx.rows?.[0]).toMatchObject({ target: "T4", service: "Reporting", signal: "CPU" });
         expect(ctx.dax).toMatch(/^\/\/ .+\nEVALUATE/);
         expect(JSON.stringify(ctx)).not.toMatch(/inject|Scenario Runs|Incident Windows|Analysis Findings|blocking chain/i);
+    });
+
+    describe("with the Incident RCA's tables, its Cause is the blind investigation (ADR 0031, section 9)", () => {
+        const chain = "[demo].[usp_scenario_chain_acquire] (session 63; ContosoCare.Demo, login runner, host SQLVM01) sat idle with its transaction open for up to 79 s, holding X KEY lock on [care].[work_queues] (pk_work_queues).";
+        const rca: BlindCauses = {
+            ...causeWindow(plan),
+            causes: [
+                { key: "T1-blocking-20261117T133030Z", target: "T1", signal: "blocked processes", start: new Date(T0 + 30_000), end: new Date(T0 + 10 * 60000 + 10_000), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)", "session 64 waits on 63: LCK_M_U for 58 s (RCA Sessions, 13:31:00 UTC)"], also: ["T1, deadlocks, from 13:32:00 UTC"], notes: [] },
+                { key: "T1-deadlock-20261117T133200Z", target: "T1", signal: "deadlocks", start: at(2), end: at(3), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)"], also: [], notes: [] },
+                { key: "T2-memory-20261117T134100Z", target: "T2", signal: "Memory waits", start: at(11), end: null, statement: null, confidence: null, evidence: [], also: [], notes: ["T2: no RCA capture recorded for 13:41:00-13:48:00 UTC; only the telemetry (Telemetry Snapshots) is known"] },
+                { key: "T3-cpu-20261117T140400Z", target: "T3", signal: "CPU", start: at(34), end: at(57), statement: null, confidence: null, evidence: [], also: [], notes: [], failed: "RCA Resource: The model didn't answer." },
+            ],
+            more: "3 more incidents in these minutes (T3 3), with less evidence: the Root cause page explains each.",
+            notCaptured: ["T5: no RCA capture recorded for 13:30:00-15:15:00 UTC; only the telemetry (Telemetry Snapshots) is known"],
+            queries: [{ title: "Incident RCA: RCA Sessions", dax: "EVALUATE 'RCA Sessions'" }],
+        };
+        const sectionOf = (markdown: string, heading: string) => markdown.slice(markdown.indexOf(`## ${heading}\n`), markdown.indexOf("\n## ", markdown.indexOf(`## ${heading}\n`) + 3));
+
+        it("explains each incident head blocker first, with its confidence and the rows it cites, then gives what was injected, labeled as the answer key", () => {
+            expect(causeWindow(plan)).toEqual({ from: plan.start, to: new Date(plan.end.getTime() + 15 * 60000) });
+            const { title, markdown } = buildPostmortem({ ...input, rca });
+            expect(title).toBe(postmortemTitle(plan));
+            const sections = markdown.split("\n").filter((l) => l.startsWith("## "));
+            expect(sections).toEqual(["## Summary", "## Timeline (UTC)", "## Impact on ContosoCare", "## Cause", "## What the demo injected (answer key)", "## Response", "## Times to signal and recover", "## Follow-ups", "## How this was measured", "## Queries"]);
+            const cause = sectionOf(markdown, "Cause");
+            expect(cause).toContain(
+                [
+                    "A blind investigation of the minutes from 13:30 to 15:15 UTC (the window, and the 15 minutes after it, where a signal can still show), the way a DBA would make it: from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, with nothing about what the demo planned.",
+                    "",
+                    "What it found, with the incidents the richest evidence explains first; the Root cause page has each one in full:",
+                    "",
+                    `- **T1, blocked processes, 13:30:30 to 13:40:10 UTC** (confidence high): ${chain}`,
+                    "  - head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)",
+                    "  - session 64 waits on 63: LCK_M_U for 58 s (RCA Sessions, 13:31:00 UTC)",
+                    "  - Also in these minutes: T1, deadlocks, from 13:32:00 UTC",
+                    // One root cause behind two incidents is said once.
+                    "- **T1, deadlocks, 13:32:00 to 13:33:00 UTC** (confidence high): the same root cause as **T1, blocked processes, 13:30:30 to 13:40:10 UTC** above.",
+                    "- **T2, Memory waits, from 13:41:00 UTC**: no root cause:",
+                    "  - T2: no RCA capture recorded for 13:41:00-13:48:00 UTC; only the telemetry (Telemetry Snapshots) is known",
+                    "- **T3, CPU, 14:04:00 to 14:27:00 UTC**: it couldn't be explained: RCA Resource: The model didn't answer.",
+                    "",
+                    "3 more incidents in these minutes (T3 3), with less evidence: the Root cause page explains each.",
+                    "",
+                    "**Not captured:**",
+                    "",
+                    "- T5: no RCA capture recorded for 13:30:00-15:15:00 UTC; only the telemetry (Telemetry Snapshots) is known",
+                ].join("\n"),
+            );
+            expect(cause.match(/head 63/g)).toHaveLength(1);
+            // The Cause is blind: no word of the plan, which follows in its own section, labeled.
+            expect(cause).not.toMatch(/inject|Scenario Runs|Deep blocking chain|blocking-chain/i);
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key, which the investigation above never read, for checking what it found.");
+            expect(key).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
+            expect(markdown).toContain("- **Cause:** the Incident RCA's blind investigation of the window and the 15 minutes after it: find_incidents, then explain_incident for each incident, at most 6 in the Root cause page's order.");
+            // Every query behind it: the page's, then the investigation's.
+            expect(markdown).toContain("```dax\n// Sessions and activity requests\nEVALUATE");
+            expect(markdown).toContain("And the investigation's, behind the Cause, each once:\n\n```dax\n// Incident RCA: RCA Sessions\nEVALUATE 'RCA Sessions'\n```");
+            // Copilot's draft is the same blind draft, with or without the investigation.
+            expect(postmortemAsk({ ...input, rca })).toEqual(postmortemAsk(input));
+        });
+
+        it("says an investigation that couldn't run, and one that found nothing, never taking either for the plan's faults", () => {
+            const failed = buildPostmortem({ ...input, rca: { ...rca, causes: [], more: undefined, notCaptured: [], queries: [], error: "the check of the Incident RCA's tables failed: The model didn't answer." } }).markdown;
+            const cause = sectionOf(failed, "Cause");
+            expect(cause).toContain("\n\nIt couldn't run, so it gives no cause: the check of the Incident RCA's tables failed: The model didn't answer.");
+            expect(cause).not.toMatch(/inject|Nothing abnormal/i);
+            expect(sectionOf(failed, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
+            expect(failed).not.toContain("And the investigation's");
+            const quiet = buildPostmortem({ ...input, rca: { ...rca, causes: [], more: undefined, notCaptured: [], none: "Nothing abnormal in these minutes: the detector found no episode." } }).markdown;
+            expect(sectionOf(quiet, "Cause")).toMatch(/\n\nNothing abnormal in these minutes: the detector found no episode\.\n/);
+            // Without the RCA tables, the Cause is what was injected, as the release wrote it.
+            const release = buildPostmortem(input).markdown;
+            expect(sectionOf(release, "Cause")).toMatch(/^## Cause\n\nEvery fault was injected on purpose by the demo's session control/);
+            expect(release).not.toMatch(/answer key|the Incident RCA's blind investigation/);
+        });
     });
 
     it("says no fault's signal was visible by its rule, never that no signal showed, when each rose short of its rule (F23)", () => {

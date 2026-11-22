@@ -1,11 +1,14 @@
 // One-click postmortem (ADR 0030): a session's write-up from what the app alone knows (what was injected, when its
 // signal showed, the response, the recovery), in two ways. Without Copilot: deterministic Markdown from the data alone,
 // with every query behind it, so it works with no GitHub sign-in. With Copilot: the same rows and queries handed to the
-// viewer's own Copilot through the app's existing ask contract (useCopilot().ask), with a structured template.
+// viewer's own Copilot through the app's existing ask contract (useCopilot().ask), with a structured template. With the
+// Incident RCA's tables, the Markdown's Cause is the blind investigation of the session's minutes (rca/postmortem.ts),
+// and what was injected follows in a section of its own, labeled as the answer key (ADR 0031, section 9).
 
 import type { AskContext, DataProvenance } from "@/copilot/contract";
 import type { AgentBeat, SessionRun } from "@/data/model";
 import type { ColumnSpec, QuerySpec } from "@/data/queries";
+import { MAX_CAUSES, type BlindCauses } from "@/rca/postmortem";
 import { buildAskContext, joinDax } from "./ask";
 import { serviceOf } from "./business";
 import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc } from "./format";
@@ -41,6 +44,11 @@ export interface PostmortemInput {
     specs: ReadonlyArray<QuerySpec | null | undefined>;
     /** The measured ones only, with no answer-key table or measure: what a Copilot draft gets (ADR 0031). */
     askSpecs?: ReadonlyArray<QuerySpec | null | undefined>;
+    /**
+     * With the RCA tables: the blind investigation of the plan's minutes, which becomes the Cause; what the demo injected
+     * then follows in a section of its own, labeled (ADR 0031, section 9). Without it, the Cause is what was injected.
+     */
+    rca?: BlindCauses | null;
     generatedAt: Date;
 }
 
@@ -112,10 +120,55 @@ export function postmortemFileName(plan: Plan, generatedAt: Date): string {
     return `contosocare-postmortem-${id}-${stamp}Z.md`;
 }
 
+/** The postmortem's title: the dialog shows it while the Cause is still being investigated. */
+export function postmortemTitle(plan: Plan): string {
+    return `Postmortem: ${planTitle(plan)}`;
+}
+
+/**
+ * The minutes the Cause investigates: the plan's, and the TELEMETRY_LAG_MINUTES after them, where the rest of the
+ * postmortem still reads a signal (episodesIn).
+ */
+export function causeWindow(plan: Pick<Plan, "start" | "end">): { from: Date; to: Date } {
+    return { from: plan.start, to: new Date(plan.end.getTime() + TELEMETRY_LAG_MINUTES * 60_000) };
+}
+
+/**
+ * The Cause from the blind investigation (ADR 0031, section 9): each incident in the Root cause view's order, with its
+ * root cause, confidence, and the rows it cites, or why it has none; what wasn't captured; and a read that failed as such.
+ */
+function blindCauseLines(rca: BlindCauses, plan: Plan): string[] {
+    const clock = (d: Date) => d.toISOString().slice(11, 19);
+    const after = Math.round((rca.to.getTime() - plan.end.getTime()) / 60_000);
+    const minutes = `from ${time(rca.from)} to ${time(rca.to)} UTC${after > 0 ? ` (the window, and the ${after} minutes after it, where a signal can still show)` : ""}`;
+    const out = [`A blind investigation of the minutes ${minutes}, the way a DBA would make it: from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, with nothing about what the demo planned.`, ""];
+    if (rca.error) return [...out, `It couldn't run, so it gives no cause: ${rca.error}`];
+    if (rca.causes.length === 0) out.push(rca.none ?? "Nothing abnormal in these minutes: the detector found no episode.");
+    else {
+        out.push("What it found, with the incidents the richest evidence explains first; the Root cause page has each one in full:", "");
+        // One root cause behind two incidents (a chain's deadlock and its blocking) is said once, with its evidence.
+        const said = new Map<string, string>();
+        for (const c of rca.causes) {
+            const name = `${c.target}, ${c.signal}, ${c.end ? `${clock(c.start)} to ${clock(c.end)}` : `from ${clock(c.start)}`} UTC`;
+            const earlier = c.statement ? said.get(`${c.target}|${c.statement}`) : undefined;
+            const sub = [...(earlier ? [] : c.evidence), ...c.notes, ...c.also.map((a) => `Also in these minutes: ${a}`)];
+            if (c.failed) out.push(`- **${name}**: it couldn't be explained: ${c.failed}`);
+            else if (earlier) out.push(`- **${name}** (confidence ${c.confidence}): the same root cause as **${earlier}** above.`);
+            else if (c.statement) out.push(`- **${name}** (confidence ${c.confidence}): ${c.statement}`);
+            else out.push(`- **${name}**: no root cause${c.notes.length > 0 ? ":" : " in what was recorded."}`);
+            if (c.statement && !earlier) said.set(`${c.target}|${c.statement}`, name);
+            for (const line of sub) out.push(`  - ${line}`);
+        }
+        if (rca.more) out.push("", rca.more);
+    }
+    if (rca.notCaptured.length > 0) out.push("", "**Not captured:**", "", ...rca.notCaptured.map((n) => `- ${n}`));
+    return out;
+}
+
 /** The postmortem in Markdown, from the data alone: every figure is measured, and every query is listed. */
 export function buildPostmortem(input: PostmortemInput): Postmortem {
     const { plan, scores, episodes, beat } = input;
-    const title = `Postmortem: ${planTitle(plan)}`;
+    const title = postmortemTitle(plan);
     const summary = summarize(scores);
     const lines: string[] = [];
     lines.push(`# ${title}`, "");
@@ -168,14 +221,22 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     else lines.push(...table(["Service", "Target", "What it felt", "Measured signal"], impacts.map((i) => [i.impact.service, i.target, i.impact.headline.replace(/^[^:]+:\s*/, ""), i.impact.evidence])));
     lines.push("");
 
-    lines.push("## Cause", "");
+    // The Cause (ADR 0031, section 9): with the RCA tables, what the blind investigation found, the way a DBA would find it,
+    // and then what the demo injected, in a section of its own, labeled as the answer key. Without them, what was injected.
+    const injectedLines: string[] = [];
     if (injected > 0) {
-        lines.push("Every fault was injected on purpose by the demo's session control (NB_DatabaseHub_Control), bounded in time, inside the ContosoCare database only, on sessions tagged `ContosoCare.Demo/`:", "");
-        for (const s of scores) lines.push(`- **${s.title}** on ${s.target} (${serviceName(s.target)}), ${time(s.injectedAt)} to ${time(s.injectedEnd)} UTC.`);
-        for (const r of unscored) lines.push(`- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`);
+        injectedLines.push("Every fault was injected on purpose by the demo's session control (NB_DatabaseHub_Control), bounded in time, inside the ContosoCare database only, on sessions tagged `ContosoCare.Demo/`:", "");
+        for (const s of scores) injectedLines.push(`- **${s.title}** on ${s.target} (${serviceName(s.target)}), ${time(s.injectedAt)} to ${time(s.injectedEnd)} UTC.`);
+        for (const r of unscored) injectedLines.push(`- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`);
     }
-    if (episodes.length > 0) lines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
-    if (injected === 0 && episodes.length === 0) lines.push("Nothing was injected in this window.");
+    if (episodes.length > 0) injectedLines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
+    if (injected === 0 && episodes.length === 0) injectedLines.push("Nothing was injected in this window.");
+    lines.push("## Cause", "");
+    if (input.rca) {
+        lines.push(...blindCauseLines(input.rca, plan), "");
+        lines.push("## What the demo injected (answer key)", "", "What the demo planned, from Scenario Runs: the answer key, which the investigation above never read, for checking what it found.", "");
+    }
+    lines.push(...injectedLines);
     lines.push("");
 
     lines.push("## Response", "");
@@ -225,6 +286,9 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         `- **Signal visible in telemetry:** the first bin, from the injection to ${TELEMETRY_LAG_MINUTES} minutes after its window, where the scenario's signal reaches the analysis notebook's level (CPU 80 %, or 1.5 times and 10 points above its baseline; blocked processes or Log Rate Governor waits above 0; Buffer IO waits 1 s; other wait categories 5 s per bin), for 2 bins in a row where the notebook's rule asks for them. Its time is the bin's start: in the bin that holds the injection, that can be before the injection, so the time to signal is 0, written as at most one bin, and the timeline tells the injection first.`,
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
+        ...(input.rca
+            ? [`- **Cause:** the Incident RCA's blind investigation of the window and the ${TELEMETRY_LAG_MINUTES} minutes after it: find_incidents, then explain_incident for each incident, at most ${MAX_CAUSES} in the Root cause page's order. It reads the RCA capture, Database Hub's telemetry, and Azure Monitor, never Scenario Runs (ADR 0031).`]
+            : []),
         "",
     );
     const bounds = scores.filter((s) => s.bound);
@@ -235,6 +299,8 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## Queries", "", "Every query ran read-only through the app's `history` connector, as the viewer:", "");
     const dax = joinDax(input.specs);
     lines.push("```dax", dax ?? "// No query.", "```", "");
+    const investigated = input.rca?.queries ?? [];
+    if (investigated.length > 0) lines.push("And the investigation's, behind the Cause, each once:", "", "```dax", investigated.map((q) => `// ${q.title}\n${q.dax}`).join("\n\n"), "```", "");
 
     return { title, fileName: postmortemFileName(plan, input.generatedAt), markdown: lines.join("\n") };
 }

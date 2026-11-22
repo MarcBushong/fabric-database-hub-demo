@@ -19,9 +19,8 @@ import { Stage } from "@/mission/Stage";
 import { createRcaClient } from "@/rca/client";
 import type { DaxLog } from "@/rca/loader";
 import { bothTimes } from "@/rca/time";
-import { EXPLAINED_FAMILIES } from "@/rca/tools";
 import type { InvestigationResult } from "@/rca/types";
-import { emptyListNote, episodeOf } from "@/rca/view/facts";
+import { emptyListNote, episodeOf, incidentsByEvidence } from "@/rca/view/facts";
 import { RcaReport } from "@/rca/view/RcaReport";
 import { parseSelection } from "@/rca/view/selection";
 
@@ -70,12 +69,8 @@ export default function RcaPage() {
     }, [client, listArgs, listKey, rca]);
 
     const listed = list && list.key === listKey ? list : null;
-    // The incidents with the richest evidence first: the capture's own (a blocking chain, the replica's stall), then the
-    // others the investigations explain (errors, throttling), then the telemetry-only ones, each group in time order.
-    const episodes = useMemo(() => {
-        const rank = (e: { family: string; source: string }) => (e.source === "the RCA capture" ? 2 : EXPLAINED_FAMILIES.includes(e.family) ? 1 : 0);
-        return [...(listed?.value?.episodes ?? [])].sort((a, b) => rank(b) - rank(a) || a.start.localeCompare(b.start));
-    }, [listed]);
+    // The incidents with the richest evidence first, as the postmortem explains them (incidentsByEvidence).
+    const episodes = useMemo(() => incidentsByEvidence(listed?.value?.episodes ?? []), [listed]);
     const selectedKey = selection?.kind === "episode" ? selection.key : (episodes[0]?.key ?? null);
     const selected = episodes.find((e) => e.key === selectedKey) ?? null;
     const fallbackTarget = selection?.target ?? "T1";

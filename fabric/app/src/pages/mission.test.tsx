@@ -10,7 +10,9 @@ import { KIOSK_START, kioskReducer, RETRY_SECONDS, SCENE_SECONDS } from "@/missi
 import { SCOREBOARD_SUBTITLE } from "@/lib/scoreboard";
 import { ServiceMap, type MapNode } from "@/mission/ServiceMap";
 import { sampleRows } from "@/preview/sample-data";
+import { sampleRcaRows } from "@/preview/sample-rca";
 import { SESSION_KEY } from "@/preview/sample-session";
+import { answerKeyInContext } from "@/test/blind";
 import { renderWithApp, type FakeQueryClient } from "@/test/render";
 import KioskPage from "./KioskPage";
 import MissionControlPage from "./MissionControlPage";
@@ -32,6 +34,30 @@ function sampleClient(failing: Record<string, string> = {}, rows: Record<string,
             return { spec, columns: spec.columns, rows: rows[spec.id] ?? sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
         }),
     };
+}
+
+/** The sample with its RCA tables, as the preview has them; each read of the Incident RCA waits for `gate`. */
+function sampleRcaClient(gate: Promise<void>): FakeQueryClient {
+    const ran: string[] = [];
+    return {
+        ran,
+        peek: () => undefined,
+        clear: () => undefined,
+        run: vi.fn(async (spec: QuerySpec): Promise<QueryResult> => {
+            ran.push(spec.id);
+            if (spec.id.startsWith("rca-")) await gate;
+            return { spec, columns: spec.columns, rows: sampleRcaRows(spec) ?? sampleRows(spec), requestId: "sample", fetchedAt: new Date(Date.UTC(2026, 10, 17, 21)), provenance: "sample" };
+        }),
+    };
+}
+
+const headingsOf = (dialog: HTMLElement) => [...dialog.querySelectorAll(".pm-view h4")].map((h) => h.textContent);
+
+/** The list right under a heading of the postmortem's view. */
+function listUnder(dialog: HTMLElement, heading: string): HTMLUListElement {
+    let el = [...dialog.querySelectorAll(".pm-view h4")].find((h) => h.textContent === heading)?.nextElementSibling ?? null;
+    while (el && el.tagName !== "UL") el = el.nextElementSibling;
+    return el as HTMLUListElement;
 }
 
 describe("Mission Control", () => {
@@ -141,11 +167,67 @@ describe("Mission Control", () => {
                 expect(lead).toContain("There's no Draft with Copilot for a lone incident request, only for a session: a request's minutes are its fault's own, so they'd tell the chat where to look.");
                 expect(lead.includes("The Root cause page finds the incidents from the signals alone and explains each one.")).toBe(points);
                 // The app's own Markdown stays, with no sign-in. What the page's Asks hand the chat is ask-blind's to check.
-                expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
+                await waitFor(() => expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled());
             },
             SLOW,
         );
     }
+
+    it(
+        "with the Incident RCA's tables, writes the Cause from a blind investigation of the session's minutes, then what was injected, labeled as the answer key (ADR 0031, section 9)",
+        async () => {
+            URL.createObjectURL = vi.fn(() => "blob:postmortem");
+            URL.revokeObjectURL = vi.fn();
+            let release = () => undefined as void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const client = sampleRcaClient(gate);
+            const { copilot, notify } = renderWithApp(<MissionControlPage />, { client, rca: true });
+            const write = await screen.findByRole("button", { name: "Write the postmortem" });
+            await waitFor(() => expect(write).toBeEnabled());
+            fireEvent.click(write);
+            // Titled at once, while the investigation runs; Download and Copy wait for its Markdown, and the draft doesn't.
+            const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+            expect(within(dialog).getByText("Investigating the session's minutes for the Cause, which can take a minute or two…")).toBeInTheDocument();
+            expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeDisabled();
+            expect(within(dialog).getByRole("button", { name: "Copy", hidden: true })).toBeDisabled();
+            expect(within(dialog).getByRole("button", { name: "Draft with Copilot", hidden: true })).toBeEnabled();
+            release();
+            await waitFor(() => expect(headingsOf(dialog)).toContain("What the demo injected (answer key)"), { timeout: 20000 });
+            expect(headingsOf(dialog)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "What the demo injected (answer key)", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
+            expect(within(dialog).queryByText("Investigating the session's minutes for the Cause, which can take a minute or two…")).toBeNull();
+            // The capture's chain first, its head blocker named, with the rows it cites nested under it.
+            const first = listUnder(dialog, "Cause").children[0];
+            expect(first.textContent).toMatch(/^T1, blocked processes, 14:02:30 to 14:11:40 UTC \(confidence high\): \[demo\]\.\[usp_scenario_chain_acquire\] \(session 63;/);
+            const cited = [...first.querySelectorAll("ul > li")].map((li) => li.textContent);
+            expect(cited).toHaveLength(3);
+            expect(cited[0]).toMatch(/^head 63: sleeping, open transactions 1, idle \d+ s, \[demo\]\.\[usp_scenario_chain_acquire\] \(RCA Sessions, 14:03:00 UTC\)$/);
+            // What the plan injected, only in its own section.
+            expect(listUnder(dialog, "What the demo injected (answer key)").textContent).toMatch(/on T1 \(Billing\)/);
+            expect(client.ran.filter((id) => id.startsWith("rca-")).length).toBeGreaterThan(0);
+            fireEvent.click(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true }));
+            expect(notify).toHaveBeenCalledWith(expect.stringMatching(/^Downloaded contosocare-postmortem-7f3a9c21-\d{8}T\d{4}Z\.md$/), "success");
+            fireEvent.click(within(dialog).getByRole("button", { name: "Draft with Copilot", hidden: true }));
+            expect(answerKeyInContext(vi.mocked(copilot.ask).mock.calls[0][0])).toBeNull();
+        },
+        SLOW,
+    );
+
+    it(
+        "says in the Cause that the check of the RCA tables failed, never taking it for their absence, and runs no investigation",
+        async () => {
+            const client = sampleClient();
+            renderWithApp(<MissionControlPage />, { client, rca: null, rcaError: "Execute Queries answered 429 Too Many Requests." });
+            const write = await screen.findByRole("button", { name: "Write the postmortem" });
+            await waitFor(() => expect(write).toBeEnabled());
+            fireEvent.click(write);
+            const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+            expect(headingsOf(dialog)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "What the demo injected (answer key)", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
+            expect(within(dialog).getByText("It couldn't run, so it gives no cause: the check of the Incident RCA's tables failed: Execute Queries answered 429 Too Many Requests.")).toBeInTheDocument();
+            expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
+            expect(client.ran.some((id) => id.startsWith("rca-"))).toBe(false);
+        },
+        SLOW,
+    );
 
     it(
         "names the history that didn't load, and measures nothing rather than reading every fault as not visible",

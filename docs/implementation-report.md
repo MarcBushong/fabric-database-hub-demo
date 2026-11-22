@@ -4841,7 +4841,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 
 **Left in Phase 1.**
 
-- **The postmortem's Cause from the RCA** ([§9](adr/0031-incident-rca.md#9-the-postmortems-cause)): drafted, and merged with its tests after the live test's SHA.
+- **The postmortem's Cause from the RCA** ([§9](adr/0031-incident-rca.md#9-the-postmortems-cause)): built and unit-tested on a local branch stacked on this one, `marcbushong-microsoft-rca-postmortem-cause` ([its entry](#the-postmortems-cause-from-the-blind-investigation-2026-11-22)); its review and its live check are still to come.
 - **The evaluation set's Phase 1 cases,** ported with blind questions.
 - **Decision 6, names:** open for the owner.
 - **The live test's SHA:** 73149836 at first; T2's export failed there (Final tests), so the environments updated to cb224b28, then to 94a17ff7, the app's fix for throttled reads. Both end at 94a17ff7, stopped. The fixes for step 1.8's findings 1 and 2 came after it (4e2c65ed); Final tests checked them against B's model with its headless harness, with no redeploy: finding 1 passed at 4e2c65ed, and what it found for finding 2 was fixed in ca6c9121, 3732317d (the capture), and ebd1c6c3.
@@ -5010,3 +5010,44 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **SQL Server's capture** ran live on T1, T2, and T3. It recorded the chains with their head blockers, the event session's errors, deadlocks, and escalations, and T3's optimized-locking `LCK_M_S_XACT_MODIFY` waits. Its statements stayed within the observer's cadence except twice, both on T2, the nested guest: 2.5 s on A and 2.2 s on B. On PostgreSQL, one statement took 2.1 s on T4. Another took 10.0 s on A's replica while it was being deleted (`RCA-PG-06`, then "No such host is known").
 - **The estimate's job minutes, measured:** a 90-minute session's jobs took 23.8 minutes. That's 9.09 for the start, 3.25 and 3.95 for the re-checks, and 7.53 for the stop, against "at most about 60". A start that fetches an earlier session's evidence added about 1.4 minutes.
 - **The history's size, measured:** 371,740 bytes of Delta for a 90-minute session's save, against the estimate's 1 to 2 MB. A's three scripts' saves came to 598,582 bytes together.
+
+### The postmortem's Cause from the blind investigation (2026-11-22)
+
+**Why.** [ADR 0031, section 9](adr/0031-incident-rca.md#9-the-postmortems-cause): in Phase 1, the postmortem's Cause comes from the blind RCA, and what was injected moves to a section of its own, labeled as the answer key. The coordinator asked for it on a local branch stacked on the Incident RCA's, `marcbushong-microsoft-rca-postmortem-cause`, so that the Incident RCA branch's head stays the live round's final SHA. The owner gets it reviewed and unit-tested, with its live check still to come.
+
+**Work summary.**
+
+- **The blind module** (`fabric/app/src/rca/postmortem.ts`, new): `blindCauses` runs `find_incidents` over the minutes, then `explain_incident` for up to six incidents, one at a time, in the Root cause view's order, which both now share (`incidentsByEvidence` in `rca/view/facts.ts`).
+  - **Each cause:** its root cause, its confidence, up to three of the rows it cites, and up to two of the view's "Also in these minutes". With no root cause, what wasn't captured says why; with one, the key's own note says when it read as another incident.
+  - **The rest:** the incidents past six are counted by target, for the Root cause view.
+  - **A read that failed** is said as such, for one incident or for the list. An empty list says what the view says, in UTC (`emptyListText`).
+  - **Its queries:** each listed once. Once the dialog closes, it explains no further incident.
+- **The Markdown** (`fabric/app/src/lib/postmortem.ts`):
+  - **The Cause** says which minutes it read: the window and the 15 after it (`causeWindow`), as the postmortem reads T4's and T5's episodes (`episodesIn`). Then each incident, with the rows it cites nested under it. A root cause behind two incidents, such as T4's deadlock and its blocking in the sample session, is said once. Then the rest's count, and what wasn't captured.
+  - **"What the demo injected (answer key)"** follows, with the injected list.
+  - **"How this was measured"** says how the Cause was found, and the investigation's queries follow the page's.
+  - **Without the investigation,** the postmortem is the release's. The Copilot draft is the same blind draft either way.
+- **The dialog** (`fabric/app/src/mission/PostmortemDialog.tsx`): with the RCA tables, it investigates when it opens, titled at once. It says it's investigating, which can take a minute or two, and **Download Markdown** and **Copy** wait for it; **Draft with Copilot** doesn't. A failed check of the RCA tables is said in the Cause, never taken for their absence, and runs no investigation. Without the tables, or before their check answers, it's the release's.
+- **Nested lists** in the postmortem's view (`MarkdownView` in `fabric/app/src/mission/parts.tsx`), one level, for the cited rows.
+
+**Decisions.**
+
+- **Six incidents at most, one at a time.** The sample session's 49 incidents took 88 queries for six. Execute Queries allows each viewer 120 a minute, and a throttled read is tried again, so a real session's Cause can take a minute or two, which the dialog says. The Root cause view lists them all.
+- **The 15 minutes after the window** (`TELEMETRY_LAG_MINUTES`), as for the postmortem's T4 and T5 episodes, so a signal that shows after the window's last fault is in both.
+- **The answer key stays in the postmortem,** in its own section, as ADR 0031's section 9 says. The rest of the postmortem (summary, timeline, impact, and times) is the scoreboard's measurement against the plan, as before.
+
+**Changed files.** `fabric/app/src/`: `rca/postmortem.ts` and `rca/postmortem.test.ts` (new); `lib/postmortem.ts`, `mission/PostmortemDialog.tsx`, `mission/parts.tsx`, `rca/view/facts.ts`, `pages/RcaPage.tsx`, `lib/mission.test.ts`, and `pages/mission.test.tsx`. ADR 0031 (section 9 and the Wave 1 audit's row), the app's README, the CHANGELOG, and this report.
+
+**Validation.** On 0d0776e4 with this change:
+
+- **The app:** `npm run verify` passed: typecheck, lint, Vitest's 603 tests in 35 files, the license check (136 production packages), and the build. The build's warning that the main chunk is over 700 kB is the release's: 0d0776e4's main chunk is 940.64 kB and this one's 940.72 kB, and the dialog's new code loads with its pages.
+- **The new tests fail without their change:** with 0d0776e4's modules, the dialog's 2 on Mission Control fail (no investigation, and no answer-key section), and `rca/postmortem.test.ts` and `lib/mission.test.ts` don't load, since what they import isn't there. Each of 19 parts, taken out alone, fails its own test.
+- **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract` (whose scan finds no answer-key name or scenario ID in `rca/postmortem.ts`), `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. No unit test reached the Azure CLI.
+- **Static checks:** PSScriptAnalyzer found nothing in 393 files; markdownlint found no issue in 152 files.
+
+**What its live check needs.** On dbhubrb, after `./scripts/deploy.ps1` from this branch: **Write the postmortem** on Mission Control for session 2233e0ae. Then check its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 a minute, and **Download Markdown**.
+
+**Risks.**
+
+- **The time it takes:** a session with many incidents takes up to a minute or two, while Power BI's throttled reads are waited out. The dialog says so, and **Draft with Copilot** doesn't wait.
+- **Rebases:** the branch is rebased on the Incident RCA branch whenever its head moves, so its SHA changes then.

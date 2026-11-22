@@ -218,7 +218,16 @@ One TypeScript implementation in the app (`fabric/app/src/rca/`), used by the RC
 
 ### 9. The postmortem's Cause
 
-Today the Cause section lists what was injected ([`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163). In Phase 1 it comes from the blind RCA: for each episode, `explain_incident`'s root cause, confidence, and cited rows, or "not captured" and why (RCA Coverage). The injected list moves to a section of its own, "What the demo injected (answer key)", with the scoreboard's measurements, which the app writes itself. The Copilot draft is blind already ([decision 7](#decisions-and-open-items)): a session's postmortem hands it the session's minutes, T4's and T5's measured episodes, and the measured queries, and it investigates the rest with the tools. A lone incident request's postmortem has no draft, because its minutes are its fault's own: its dialog says so, and points to the Root cause view whenever the navigation lists it (the re-review of feb64ad3).
+With the RCA tables, the Cause is the blind investigation of the session's minutes and the 15 after them (`TELEMETRY_LAG_MINUTES`), where the postmortem's other sections still read a signal ([`rca/postmortem.ts`](../../fabric/app/src/rca/postmortem.ts)):
+
+- **What it reads:** `find_incidents`, then `explain_incident` for up to six incidents, in the RCA view's order: the capture's own first, then the others the investigations explain, then the telemetry-only ones.
+- **What it says of each:** its root cause, confidence, and up to three of the rows it cites; or, with no root cause, why, from what wasn't captured (RCA Coverage). A root cause behind two incidents, such as a chain's deadlock and its blocking, is said once. The incidents past six are counted by target, for the RCA view.
+- **A read that failed** is said as such, for one incident or for the list, never as no cause or nothing abnormal. So is a failed check of the RCA tables, which is never taken for their absence.
+- **The answer key:** what the demo injected follows in a section of its own, "What the demo injected (answer key)", which the app writes itself. The postmortem's other sections are the scoreboard's measurements, as before.
+- **Its queries** end the postmortem, after the page's.
+- **The dialog** says it's investigating, and its Download and Copy wait for the investigation.
+
+Without the RCA tables, the Cause lists what was injected, as the release did ([`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts)). The Copilot draft is the same blind draft either way ([decision 7](#decisions-and-open-items)): a session's postmortem hands it the session's minutes, T4's and T5's measured episodes, and the measured queries, and it investigates the rest with the tools. A lone incident request's postmortem has no draft, because its minutes are its fault's own: its dialog says so, and points to the Root cause view whenever the navigation lists it (the re-review of feb64ad3).
 
 ### 10. Permissions, cost, and volume
 
@@ -324,7 +333,7 @@ Wave 1 is built as verification against the plan, by design ([ADR 0030](0030-ins
 | `lib/scoreboard.ts`, lines 343 to 350 (`baselineOf`) | Every injected window that raises the signal | Leaves those windows out of the baseline: it knows where not to look |
 | `lib/scoreboard.ts`, lines 361 to 384 (`firstRun`); the notebook's `signal_episodes` (`NB_DatabaseHub_LiveActivity.ipynb`, JSON lines 686 to 709) | Telemetry bins | Blind in itself, but a bin without a value breaks a run: the 65.95 % miss on session 81446b84 |
 | The notebook's `incident_window_rows` (JSON lines 1670 to 1700) and `expected_signals` (677 to 684) | Scenario Runs | Turns an episode that overlaps a planned window and matches its expected signal into that window's evidence; an incident outside every window is a **Warning** |
-| [`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163 | Scenario Runs | The Cause is what was injected |
+| [`lib/postmortem.ts`](../../fabric/app/src/lib/postmortem.ts), lines 156 to 163 | Scenario Runs | The Cause is what was injected. Since Phase 1, only without the RCA tables: with them, the Cause is blind, and what was injected follows it, labeled as the answer key ([§9](#9-the-postmortems-cause)) |
 | [`pages/IncidentsPage.tsx`](../../fabric/app/src/pages/IncidentsPage.tsx), lines 50 and 290; the agent loop, lines 112 to 168 | Incident Windows' scenario; the beat's run events | Shows the scenario; Respond and Verify read the workload's own events |
 
 **Release wording that read as blind detection,** with the one-line fixes the release then made (R927; lines at a8d51ac):

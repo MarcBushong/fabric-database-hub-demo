@@ -1,6 +1,7 @@
 // What the Root cause view reads off an investigation's result (ADR 0031), apart from its components.
 
 import { bothTimes } from "../time";
+import { EXPLAINED_FAMILIES } from "../tools";
 import type { InvestigationResult } from "../types";
 
 export interface EpisodeFacts {
@@ -22,14 +23,29 @@ export function episodeOf(result: InvestigationResult): EpisodeFacts | null {
 }
 
 /**
+ * The incidents with the richest evidence first, as the Root cause view lists them and the postmortem explains them: the
+ * capture's own (a blocking chain, the replica's stall), then the others the investigations explain (errors, throttling),
+ * then the telemetry-only ones, each group in time order.
+ */
+export function incidentsByEvidence<E extends { family: string; source: string; start: string }>(episodes: readonly E[]): E[] {
+    const rank = (e: E) => (e.source === "the RCA capture" ? 2 : EXPLAINED_FAMILIES.includes(e.family) ? 1 : 0);
+    return [...episodes].sort((a, b) => rank(b) - rank(a) || a.start.localeCompare(b.start));
+}
+
+/**
  * What an incident list with no episode says, from find_incidents' own words: nothing abnormal only when every read was
  * whole, up to where a read stopped short otherwise, and what the detector found besides episodes (errors it counted).
  * The review of eb89acbb: the view said "Nothing abnormal in these minutes" of a list whose read had stopped short.
  */
 export function emptyListNote(found: InvestigationResult, timeZone: string): string {
+    return emptyListText(found, (at) => bothTimes(at, timeZone));
+}
+
+/** emptyListNote's words, with each time as `when` writes it: the postmortem writes UTC alone. */
+export function emptyListText(found: InvestigationResult, when: (at: Date) => string): string {
     const details = found.details ?? {};
     if (details.nothingAbnormal === true) return "Nothing abnormal in these minutes: the detector found no episode.";
-    const stop = typeof details.readStoppedAt === "string" ? bothTimes(new Date(details.readStoppedAt), timeZone) : null;
+    const stop = typeof details.readStoppedAt === "string" ? when(new Date(details.readStoppedAt)) : null;
     const besides = found.findings.map((f) => f.title);
     if (besides.length === 0 && stop) return `Nothing abnormal up to ${stop}, where the read stopped: the detector found no episode there, and what came after it wasn't read.`;
     return `No episode ${stop ? `up to ${stop}, where the read stopped` : "in these minutes"}${besides.length ? `; besides episodes, the detector found: ${besides.join(" ")}` : "."}`;
