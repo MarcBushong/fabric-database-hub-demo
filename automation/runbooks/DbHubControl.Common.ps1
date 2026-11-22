@@ -9699,7 +9699,10 @@ function Invoke-DbHubStop {
     anything, and T5's container goes only when its lifecycle is Session (Remove-DbHubT5Container).
     Nightly and T3Check say when the safety stop's identity can't read the demo resource group (NotGranted: its role isn't
     assigned). Nightly, T3Check, and T4 are Deferred while the group's busy marker is active (Get-DbHubBusyMarker,
-    2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off.
+    2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off. -RequestedBy stop-demo.ps1
+    (2026-11-22): Scope All for ./scripts/stop-demo.ps1, which hands a Run all session's stop to the control: it never waits
+    for a deploy.ps1 run, the session's status says stop-demo.ps1 stopped it, and the result has the lines that status got
+    (rcaLines), read back from its copy when this job wrote it.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -9709,7 +9712,10 @@ function Invoke-DbHubStop {
         [Parameter(Mandatory = $true)]
         [object] $Context,
 
-        [int] $PollSeconds = 30
+        [int] $PollSeconds = 30,
+
+        [ValidateSet('Auto-stop', 'stop-demo.ps1')]
+        [string] $RequestedBy = 'Auto-stop'
     )
 
     $label = 'stop-' + $Scope.ToLowerInvariant()
@@ -9813,10 +9819,13 @@ function Invoke-DbHubStop {
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
     }
-    # start-demo.ps1's auto-stop (2026-11-19) waits for a deploy.ps1 run that's still going; a session's never does.
-    $waiting = Get-DbHubStartDemoDeferral -Context $Context -Tags $group.Tags
-    if ($null -ne $waiting) {
-        return $waiting
+    # start-demo.ps1's auto-stop (2026-11-19) waits for a deploy.ps1 run that's still going; a session's never does, and
+    # neither does stop-demo.ps1's stop (2026-11-22), which a person asked for now.
+    if ($RequestedBy -ne 'stop-demo.ps1') {
+        $waiting = Get-DbHubStartDemoDeferral -Context $Context -Tags $group.Tags
+        if ($null -ne $waiting) {
+            return $waiting
+        }
     }
     $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds
     $status = 'Stopped'
@@ -9825,8 +9834,20 @@ function Invoke-DbHubStop {
         $status = 'Partial'
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
-    Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By 'Auto-stop'
-    return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
+    Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By $RequestedBy
+    $result = [pscustomobject]@{ action = $label; status = $status; message = ('{0}: {1}{2}.' -f $RequestedBy, (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
+    if ($RequestedBy -eq 'stop-demo.ps1') {
+        # The lines the session's status got (RCA.EXPORT, RCA.CAPTURE.<target>, RCA.PENDING), for stop-demo.ps1 to print:
+        # from the status's copy, when this job wrote it.
+        $lines = @()
+        $copy = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -ne $copy -and [string]$copy['phase'] -eq 'stopped' -and [string]$copy['jobId'] -eq [string]$Context.JobId -and [string]$copy['stoppedBy'] -eq $RequestedBy) {
+            $lines = @(@($copy['rcaLines']) | Where-Object { $null -ne $_ })
+        }
+        $result | Add-Member -NotePropertyName 'requestedBy' -NotePropertyValue $RequestedBy
+        $result | Add-Member -NotePropertyName 'rcaLines' -NotePropertyValue $lines
+    }
+    return $result
 }
 
 function Invoke-DbHubMonitor {

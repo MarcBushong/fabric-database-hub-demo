@@ -1597,6 +1597,29 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.stoppedBy | Should -Be 'Auto-stop'
         $status.sessionId | Should -Be $script:sessionId
         $status.metrics.status | Should -Be 'Pass'
+        $result.PSObject.Properties.Name | Should -Not -Contain 'rcaLines'
+    }
+
+    It 'stops a Run all session for stop-demo.ps1 as the auto-stop does, says stop-demo.ps1 stopped it, and returns the lines its status got (2026-11-22)' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        $result = Invoke-DbHubStop -Scope All -Context (New-TestContext) -RequestedBy 'stop-demo.ps1'
+        $result.status | Should -Be 'Stopped'
+        $result.requestedBy | Should -Be 'stop-demo.ps1'
+        $result.message | Should -Match '^stop-demo\.ps1: auto-stop removed, '
+        $script:replica | Should -BeNullOrEmpty
+        $status = Get-SessionStatus
+        $status.stoppedBy | Should -Be 'stop-demo.ps1'
+        $status.metrics.status | Should -Be 'Pass'
+        @($status.rcaLines).Count | Should -BeGreaterThan 0
+        @($result.rcaLines | ForEach-Object { $_['step'] }) | Should -Be @($status.rcaLines | ForEach-Object { $_.step })
+        @($result.rcaLines | ForEach-Object { $_['message'] }) | Should -Be @($status.rcaLines | ForEach-Object { $_.message })
+        # Another job's copy of the status gives this result none of its lines.
+        $script:automationVariables['DbHubSessionStatus'] = ($script:automationVariables['DbHubSessionStatus'] -replace '"jobId":"[^"]*"', '"jobId":"bbbbbbbb-0000-0000-0000-00000000000b"')
+        Mock -CommandName Write-DbHubStopStatus -MockWith { }
+        $again = Invoke-DbHubStop -Scope All -Context (New-TestContext) -RequestedBy 'stop-demo.ps1'
+        @($again.rcaLines) | Should -BeNullOrEmpty
     }
 
     It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {
@@ -2430,6 +2453,17 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
             $script:backupDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
             @($script:links | Where-Object { $_.Schedule -eq 'dbhub-autostop' -and $_.Runbook -eq 'DbHub-Stop' }).Count | Should -Be 1
             @($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty
+        }
+
+        It 'never moves the stop that stop-demo.ps1 hands the control: a person asked for it now (2026-11-22)' {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'deploy' }
+            $script:autostop = '2026-10-27T15:00:00Z'
+            $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T11:00:00Z.'
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext) -RequestedBy 'stop-demo.ps1'
+            $result.status | Should -Be 'Stopped'
+            @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+            @($script:calls | Where-Object { $_.Path -match '/archost01/deallocate$' }).Count | Should -Be 1
         }
 
         It 'stops at once for <Case>' -ForEach @(
