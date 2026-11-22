@@ -1635,8 +1635,8 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
     }
 
     It 'ends its SQL window when it runs: it sends no WINDOW_END_UTC, so the notebook takes now (the review of da68aed5)' {
-        # Coverage by rows keeps a later day-long save's remainder for minutes this save holds no rows for, so its window
-        # needn't end early; ending it 15 minutes early left the stop's last 15 minutes unsaved when no day-long save followed.
+        # Ending it 15 minutes early, so that it held only minutes whose SQL telemetry had arrived, left the stop's last 15
+        # minutes out of the history whenever no later save followed within a day, and the coordinator undid it.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith {
             $script:sent = $Parameter
             New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ran' -Evidence @{ status = 'Completed'; seconds = 95 }

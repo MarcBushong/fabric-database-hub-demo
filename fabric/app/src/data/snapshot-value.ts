@@ -1,5 +1,7 @@
-// The history model's 'Snapshot Value' (F35) in TypeScript: the same rule as the measure in Telemetry Snapshots.tmdl, for
-// its tests and for the live checks against a deployed model (fabric/powerbi/checks/f35). Not used by the app's views.
+// F35's rule for the history model's overlapping saves, as one value per series and bin: each interval from its finest
+// save, by the rows each save holds, as finestPerInterval keeps it. It's the reference for a fix of the model, with its
+// tests: the model's 'Snapshot Value' still takes each bin from its newest save, because taking this rule in its DAX, at
+// query time, was too slow (ADR 0014's amendment of 2026-11-22). Not used by the app's views.
 
 import { toDate } from "@/lib/format";
 import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, finestPerInterval, HOURLY_METRICS, OFF_GRID_ANALYSES } from "./finest-per-interval";
@@ -70,7 +72,7 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
 }
 
 /**
- * The measure's value for each target, analysis, metric, and bin (its SUMMARIZE groups), by key `target|analysis|metric|bin`
+ * The value for each target, analysis, metric, and bin (the model's 'Snapshot Value' groups), by key `target|analysis|metric|bin`
  * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there, as finestPerInterval keeps it:
  * - No finer save's rows reach its interval: it stays whole. A finer save is a finer grain, or the same grain and newer.
  * - One finer save has a row in every one of its intervals across it: it's covered, and left out.
@@ -80,7 +82,7 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
  *   left out; a total stays as what's left of it, and a maximum or an average only when it's higher than every one of
  *   them that wasn't covered itself.
  * Totals add, and maxima and averages take the highest; a remainder shows at its own bin's start. Off the bin grid, the
- * newest capture. A row with no bin is a save only (rows.dax's markers), with its rows' extent in First, Last, and Count.
+ * newest capture. A row with no bin is a save only, a marker with its rows' extent in First, Last, and Count.
  */
 export function snapshotValues(rows: readonly Row[]): Map<string, number> {
     const bySeries = new Map<string, Row[]>();
@@ -230,7 +232,7 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
     return out;
 }
 
-/** The window measures window-f35.dax evaluates per target: an analysis, which metrics, and whether they add up or peak. */
+/** Each target's window totals and peaks, after the model's telemetry measures: an analysis, which metrics, and whether they add up or peak. */
 export const WINDOW_MEASURES: Record<string, { analysis: string; metric: (name: string) => boolean; adds: boolean; scale?: number }> = {
     LockWaitS: { analysis: "wait_deltas", metric: (m) => m === "Lock", adds: true, scale: 1 / 1000 },
     WaitS: { analysis: "wait_deltas", metric: () => true, adds: true, scale: 1 / 1000 },
@@ -251,14 +253,14 @@ export const WINDOW_MEASURES: Record<string, { analysis: string; metric: (name: 
 export interface F35Check {
     /** The model rule's value per series and bin in the window, by `target|analysis|metric|bin`, bin in ISO UTC. */
     bins: Record<string, number>;
-    /** Each target's window measures: by the model rule (what window-f35.dax must return) and by finestPerInterval. */
+    /** Each target's window measures: by this rule per bin (model) and by finestPerInterval (finest), which must agree. */
     measures: Record<string, Record<string, { model: number | null; finest: number | null }>>;
 }
 
 /**
- * F35's live check from rows.dax's rows: the model rule's per-bin values (snapshot-value-bins.dax's F35 column must equal
- * them), and each target's window totals and peaks by the model rule and by finestPerInterval, which must agree. Bins in
- * [from, to), by their own start, as the DAX filters them.
+ * F35's check from a history's rows, as the model holds them (one per save, series, and bin, and a marker per save and
+ * series): the rule's per-bin values, and each target's window totals and peaks by the rule and by finestPerInterval,
+ * which must agree. Bins in [from, to), by their own start, as a DAX filter takes them.
  */
 export function f35Check(rows: readonly Row[], from: Date, to: Date): F35Check {
     const inWindow = (at: number) => at >= from.getTime() && at < to.getTime();

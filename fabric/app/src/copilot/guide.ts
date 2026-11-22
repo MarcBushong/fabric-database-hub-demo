@@ -45,15 +45,14 @@ ${live}
 - When the viewer asks about a visual, the question includes that visual's title, its DAX, and a sample of its rows: use them, and query further when needed.
 
 # DAX that works on this model
-- Measures take each interval from its finest capture, so a time that two captures hold (a session's own and a later day-long one) counts once; use them instead of summing 'Telemetry Snapshots'[Value] yourself.
+- Measures already pick each bin's latest capture; use them instead of summing 'Telemetry Snapshots'[Value] yourself.
 - Filter targets with TREATAS ( { "T1", "T3" }, 'Target'[Target Key] ), and days with DATESBETWEEN ( 'Date'[Date], DATE(2026,11,1), DATE(2026,11,7) ).
 - A time series per target:
   EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], 'Target'[Target Key], TREATAS ( { "T1", "T2", "T3" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "CpuPct", [CPU (%)], "WaitS", [Wait Time (s)] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - Where the wait time went: EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], 'Target'[Target Key], <filters>, "WaitS", [Wait Time (s)] ) ORDER BY [WaitS] DESC
 - Incidents: EVALUATE TOPN ( 20, 'Incident Windows', 'Incident Windows'[Window Start UTC], DESC )
-- T5 (Azure Cosmos DB): its measures pick its metrics themselves, so filter only the target and the period. Its latest capture is CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ), and that capture's window is its period:
-  EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], TREATAS ( { "T5" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "PeakNormRuPct", [Peak Norm RU (%)], "Throttled429", [Throttled Requests (429s)], "RuConsumed", [RU Consumed] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
-- A per-bin T5 series can show bins of different lengths side by side: a session's own capture is every minute, and a later day-long one every 15 minutes covers the rest of the day, each period from its finest capture. So a 15-minute bin's requests or 429s read higher than a 1-minute bin's at the same rate: compare totals over a period, not one bin with the next.
+- T5 (Azure Cosmos DB): its measures pick its metrics themselves; filter only the target and its latest capture, because two captures of one period both count in sums:
+  EVALUATE VAR LatestCapture = CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb" ) VAR LatestRun = CALCULATETABLE ( VALUES ( 'Analysis Findings'[Run ID] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb", 'Analysis Findings'[Captured At UTC] = LatestCapture ) RETURN SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], TREATAS ( { "T5" }, 'Target'[Target Key] ), TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ), "PeakNormRuPct", [Peak Norm RU (%)], "Throttled429", [Throttled Requests (429s)], "RuConsumed", [RU Consumed] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - Findings that need attention: filter 'Analysis Findings' with RELATED ( 'Status'[Needs Attention] ) = "Yes".
 - A string column's values: EVALUATE TOPN ( 50, VALUES ( 'Telemetry Snapshots'[Metric] ) ).
 - Return names that are easy to chart: "CpuPct" rather than "[CPU (%)]".

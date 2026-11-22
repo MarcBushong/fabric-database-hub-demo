@@ -33,7 +33,7 @@ const T5_ROWS = [
     ...session("NormalizedRUConsumption", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 7, 4, 4, 100, 100, 100, 3, 100, 100, 100, 5, 100, 100, 100, 4, 4, 4]),
 ];
 
-describe("Snapshot Value's rule in TypeScript, the model's reference (F35)", () => {
+describe("F35's per-bin rule in TypeScript, the reference for a fix of the history model", () => {
     it("takes a SQL save's bin from its window, as the notebook does, and an Azure Monitor save's from its bins", () => {
         const t = (iso: string) => new Date(iso).getTime();
         const bins = (from: string, step: number, count: number) => Array.from({ length: count }, (_, i) => t(from) + i * step * MIN);
@@ -124,7 +124,7 @@ describe("Snapshot Value's rule in TypeScript, the model's reference (F35)", () 
         expect(snapshotValues([profile(a, 5), profile(b, 7), profile(b, 1)]).get("T3|wait_profile|Lock|")).toBe(8);
     });
 
-    it("reads a row with no bin and no value as a save only, with its rows' extent, as rows-saves.dax exports one for each save near the session", () => {
+    it("reads a row with no bin and no value as a save only, with its rows' extent, a marker for each save of a series", () => {
         const older = save("2026-11-21T16:00:00", "2026-11-20T16:00:00", "2026-11-21T16:00:00");
         const newer = save("2026-11-21T21:33:00", "2026-11-20T21:33:00", "2026-11-21T21:33:00");
         const rows: Row[] = [row(older, "T1", "wait_deltas", "Lock")(["15:15", 60])];

@@ -5344,12 +5344,15 @@ The read-only answer, first:
 
 - **The candidates:** Final tests timed 4361ad4e's two candidates on B's model in one lease. Both gave 30392d79's answers: the bins 6,933 of 6,933, the window 32 of 32 (C2's within 8.2e-16), and the Estate and T5 answers byte-identical. Both were slower:
 
-  | End to end, against today's query (medians of 5 warm, interleaved runs) | Estate | T5 |
-  |---|---|---|
-  | da68aed5's measure, with `Under` renamed | 2.12× | 1.68× |
-  | 30392d79's measure | 2.51× | 1.87× |
-  | C1 | 2.75× | 3.30× |
-  | C2 | 2.79× | 3.42× |
+  | Medians of 5 warm, interleaved runs, in one lease | Estate | Against today's | Net | T5 | Against today's | Net |
+  |---|---|---|---|---|---|---|
+  | Today's measure | 1,450 ms | 1.00× | 1.00× | 1,269 ms | 1.00× | 1.00× |
+  | da68aed5's measure, with `Under` renamed | 3,080 ms | 2.12× | 4.30× | 2,128 ms | 1.68× | 3.74× |
+  | 30392d79's measure | 3,640 ms | 2.51× | 5.43× | 2,376 ms | 1.87× | 4.54× |
+  | C1 | 3,988 ms | 2.75× | 6.14× | 4,190 ms | 3.30× | 10.33× |
+  | C2 | 4,051 ms | 2.79× | 6.27× | 4,346 ms | 3.42× | 10.83× |
+
+  "Against today's" is end to end. "Net" takes off the round trip first, a trivial `EVALUATE ROW ( "x", 1 )` that took 956 ms (the median of 5 runs at the lease's end), so it compares the queries' own time: today's took 494 ms on Estate and 313 on T5.
 
   C1 lost most on T5. Final tests points at its Azure Monitor interval: a `MINX` with up to 8 `MOD`s over every bin of each save near a bin, at each bin, where the ladder's `ISEMPTY ( FILTER ( … ) )` tests can stop early. The coordinator's decision: the speed work stops, neither candidate is adopted, and the TMDL keeps 30392d79's measure. Final tests now times da68aed5's and 30392d79's forms on a synthetic month of history, which decides between them, and whether the write-time version is needed.
 - **The stripper:** the review of 5eac6f95 and 4361ad4e found that the names test could still miss a name. A `//` inside a `/* */` comment, or inside a DAX string across lines, cut the rest of its line, so `/* https://x */ VAR Under = 1` passed. No file had it.
@@ -5366,11 +5369,64 @@ The read-only answer, first:
 
 **Validation.**
 
-- A new test reads 14 VAR names in DAX and 5 in TypeScript, each after one of those forms. With 4361ad4e's stripper, it misses 6 of the DAX names and reads one inside a comment. It also fails with any one of the new stripper's seven parts taken out.
+- A new test reads 14 VAR names in DAX and 5 in TypeScript, each after one of those forms. With 4361ad4e's stripper, it misses 6 of the DAX names and reads one inside a comment. It also fails with any one of seven of the new stripper's parts taken out.
 - On the 21 files the names test reads (the model's tables, the DAX checks, and the app's `queries.ts`), the new stripper finds the same 505 VAR names and the same measure references as the old one. Its only change to their text is in `queries.ts`: it strips the 35 doc comments, whose 30 backticks the old one read as template literals. They happened to pair up.
 - Pester with StrictMode: Fabric.PowerBI 22 passed, 1 skipped, and with Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks, 155 passed, 4 skipped. PSScriptAnalyzer: no new findings. markdownlint: clean.
 
 **Risks.**
 
 - A VAR in a `--` comment is checked like code: at worst, a false alarm.
-- F35 part 2's speed is unchanged: 30392d79's measure, at 2.51 times today's Estate time and 1.87 times T5's in that lease, until the long-history timing decides.
+- F35 part 2's speed is unchanged: 30392d79's measure, at 2.51 times today's Estate time and 1.87 times T5's in that lease, or 5.43 and 4.54 times net of the round trip, until the long-history timing decides.
+
+### F35 part 2's query-time version withdrawn, and 55de8cc3's review (2026-11-22)
+
+**Why.**
+
+- **The long-history timing:** Final tests timed both correct forms of part 2's measure, da68aed5's (with `Under` renamed) and 30392d79's, on the live test's model with a month and then two months more history: that day's rows, copied for each earlier day through Fabric's Livy API, and deleted afterward. Medians of 5 warm runs, end to end, against the release's measure in the same history:
+
+  | Query, history | The release's | da68aed5's | 30392d79's |
+  |---|---|---|---|
+  | The app's 7-day Performance query, + 1 month | 2,780 ms | 19,018 ms (6.84×) | fails, 2 of 2 |
+  | The same, + 2 months | 2,648 ms | 20,347 ms (7.68×) | fails, 1 of 1 |
+  | Estate: the live test's day only; + 1 month; + 2 months | 1,451; 1,611; 1,714 ms | 2.24×; 3.32×; 2.96× | 2.68×; 4.16×; 3.88× |
+  | T5: the same | 1,201; 1,380; 1,340 ms | 1.98×; 2.41×; 2.51× | 2.15×; 2.45×; 2.33× |
+
+  - 30392d79's form ran out of the F4 capacity's 1,024 MB of memory per query, after 27 to 30 s.
+  - The window drives the cost, not the history: the second month changed each form by −13 to +11 %, while each day of window added about 2 to 2.6 s with da68aed5's form and 5.7 s with 30392d79's. So 30392d79's prune didn't pay.
+  - A few 7-day runs within minutes put the F4 capacity into Fabric's 20-second interactive delay, twice.
+  - The answers didn't change at any history length, and the two forms agreed exactly on 1- and 3-day windows.
+- **The decision (the coordinator):** the query-time version is withdrawn, and this branch must not ship it. Part 1, the shared function, stays. The model goes back to the release's, the docs keep the release's double count as a known issue with its workaround, and a fix that resolves the overlaps when a save is written is the owner's decision 3.
+- **55de8cc3's review:** the scanner and the removal were clean, with two Lows: the timing section gave ratios only, and the sample test didn't pin the stripper's template part.
+
+**Work summary.**
+
+- **The model is the release's again:** `fabric/powerbi` equals b059c91's, the TMDL and the report spec included. So do the app's parts that taught part 2's measure: Ask's guide and its test (T5's measures from its latest capture again), the generated model guide, the app's README, and ADR 0028.
+- **Removed:** `fabric/powerbi/checks/f35`, the live checks, whose `-f35` queries defined part 2's measure, and `fabric/app/scripts/f35-reference.ts`, their driver. A later fix's live proof can take them from 55de8cc3.
+- **Kept, for a later fix:**
+  - the rule's TypeScript reference with its tests (`fabric/app/src/data/snapshot-value.ts`), whose comments now call it that;
+  - the DAX variable-name test, with its stripper and reserved words. It now reads the model's tables and the app's queries: 81 names, against a floor of 60;
+  - `./scripts/stop-demo.ps1 -SaveHistory`'s window, which still ends when it runs, and its test, whose comment no longer leans on part 2's measure.
+- **Tests:** the Power BI tests' F35 block, which pinned part 2's measure and its checks, is gone.
+- **Docs:**
+  - CHANGELOG: part 2's entry is gone, and part 1's says the model's fix is pending;
+  - limitations: the known issue, where it shows and where it doesn't, its workaround, and the pending fix;
+  - troubleshooting: the known issue's row, in place of part 2's;
+  - ADR 0014: an amendment that records the query-time version as rejected, with this evidence.
+- **55de8cc3's Lows:**
+  - The withdrawal's section above gives each median in milliseconds, end to end and net of the 956 ms round trip.
+  - The sample test has a template that holds a URL, with a name after it on the same line: without the template's part, the URL's `//` reads as a comment and hides the name.
+  - The stripper's comment says that a template's text is kept whole, a DAX comment in it included, so a name there is checked too: at worst, a false alarm. It also names its limits, which none of the files it reads has: a string or a `/*` that's never closed, or a template inside another's `${…}`, can shift what it reads as a string or a comment from there on.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`, `fabric/powerbi/_brief/report-spec.md`, `fabric/powerbi/checks/f35/` (removed), `fabric/app/scripts/f35-reference.ts` (removed), `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`, `fabric/app/README.md`, `fabric/app/src/data/snapshot-value.ts` and its test (comments), `tests/unit/Fabric.PowerBI.Tests.ps1`, `tests/unit/DbHubDemo.FirstRun.Tests.ps1` (a comment), `CHANGELOG.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `docs/adr/0014-notebook-role-and-capacity.md`, `docs/adr/0028-ask-copilot-in-the-insights-app.md`, and this report.
+
+**Validation.**
+
+- Each part of the stripper, taken out or narrowed in turn, fails the sample test: 12 mutants, each run through Pester. In DAX: strings, strings across lines, `'table'` names, `[column]` names, and `--` lines. In TypeScript: `'…'` and `"…"` strings, templates, and a backslash before a line's end. In both: `/* */` comments, a comment read as a space, and `//` comments. At 55de8cc3, the template's mutant passes.
+- Pester with StrictMode: 606 passed, 4 skipped, in Fabric.PowerBI, DbHubDemo.PowerBI, DbHubDemo.FabricItem, DbHubDemo.FirstRun, DbHubDemo.ActivityProfile, DbHubDemo.OneCommand, Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks. The report generator's check is skipped as before, because its npm dependencies aren't installed; `fabric/powerbi` equals b059c91's.
+- The Insights app: the generated model guide equals a fresh `npm run guide:build`, and typecheck, lint, and 386 tests in 21 files pass.
+- PSScriptAnalyzer: no new findings. markdownlint: clean.
+
+**Risks.**
+
+- Until a write-time fix, the history report's telemetry, the app's T1 to T3 charts, and Ask's T1 to T3 sums count overlapping saves twice, as in the release. Limitations says where, and the workaround.
+- A later fix's live proof needs checks again: 55de8cc3 has the queries and their driver.

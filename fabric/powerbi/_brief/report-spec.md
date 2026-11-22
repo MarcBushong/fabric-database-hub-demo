@@ -30,7 +30,7 @@ The report is **history**: it reads the lakehouse snapshots that the notebooks w
   - The live-activity notebook hasn't run yet, and no incident scenario has run live; only the healthy baseline has. Today only the deployment notebook's rows exist: 12 `validation_results` rows and 54 `telemetry_coverage` rows in `telemetry_snapshots`. Pages 1 to 3 therefore open on explicit empty states until the live-activity notebook runs.
   - `scenario_runs` holds only notebook-dispatched requests. Runs started from PowerShell (`demo-control.ps1`), GitHub Actions, or the `business-day` profile are recorded in SQL (`demo.scenario_runs` in `ContosoCare`), which Fabric can't reach. The model gets incident windows from a new table that the live-activity notebook derives; see "Incident windows".
   - The telemetry endpoint keeps 7 days; the lakehouse keeps history beyond that.
-  - Overlapping notebook runs store the same times more than once, each at its own interval; the measures take each interval from its finest capture, so no time counts twice (F35, under "Measures").
+  - Overlapping notebook runs store the same bins more than once; the measures keep only the most recent capture of each bin.
   - `scenario_runs` and `analysis_findings` don't exist yet, and `incident_windows` is new. Direct Lake can't frame a model whose source tables are missing, so the notebook changes create them first.
   - The Phase 19 branch base (`52890c8`) predates the Phase 12 tip (`0d8b4a6`); the build merges it before changing the notebooks.
   - Statuses follow ADR 0012: Pass, Fail, Warning, Manual action required, Not supported, and Not selected.
@@ -324,10 +324,7 @@ All many-to-one, single direction, active, with matching data types. No bidirect
 
 Every numeric and date measure has a format string, every measure has a description in TMDL (`///`), and each lives on the table it summarizes, in a display folder; text measures return text that is already formatted. Helper measures that return colors, flags, or keys are hidden. Two patterns carry most of the logic:
 
-- **Each interval from its finest save (F35).** Overlapping notebook runs store the same time more than once, each at its own interval: a session's own save every minute, a 12-hour one every 5 minutes, and an update's day-long one every 15. Azure Monitor's saves of T4 and T5 step from 1 to 1,440 minutes. `Snapshot Value` takes, per target, analysis, metric, and bin, each save's point there, by the rule of `fabric/app/src/data/finest-per-interval.ts`: the finest interval first, then the newest save.
-  - A coarser point is left out where the finer saves' rows, cut to their windows, cover all of it. Otherwise it stays for the minutes they don't cover: a total (waits, counters, IO, T5's requests, 429s, and RU, T4's failed connections) as what's left of it after what those rows keep, and a maximum or an average only when it's higher than all of them. With three or more saves at an interval, their rows are taken in the shared rule's order, so an intermediate save's remainder counts once.
-  - Its remainder shows at its own bin's start, so window totals and peaks are exact, and a per-bin chart can show a remainder up to one coarse bin early at a save window's edges.
-  - Inside a save it sums across instances and files. Analyses off the bin grid keep the newest capture. Every telemetry measure builds on it.
+- **Latest capture wins.** Overlapping notebook runs store the same bin more than once. `Snapshot Value` keeps, per target, analysis, metric, and bin, only the most recent capture, then sums across instances and files inside that capture. Every telemetry measure builds on it.
 - **Bins first, then aggregate.** Per-bin signals are evaluated per target and bin, then averaged (CPU), maximized (peaks), or summed (waits, requests, IO) over the selection.
 
 Summary (format strings in backticks; "dynamic" means a dynamic format string):
@@ -352,24 +349,19 @@ Hidden helpers: Snapshot Value `#,0.##`, Signal Peak, Wait Bar Color, the four h
 Telemetry Snapshots:
 
 ```dax
-// Base (hidden). Format #,0.##. Each interval from its finest save (F35). The full expression is in
-// Telemetry Snapshots.tmdl (fabric/powerbi/checks/f35 runs the same one live); in outline:
+// Base (hidden). Format #,0.##. Latest capture wins per target, analysis, metric, and bin.
 Snapshot Value =
 SUMX (
-    SUMMARIZE ( 'Telemetry Snapshots', [Target Key], [Analysis Key], [Metric], [Bucket UTC] ),
-    // Off the bin grid: the newest capture's SUM, as before.
-    // Otherwise, the series' saves (Captured At, Window Start, Window End), each with its interval:
-    //   SQL by its window's length, the notebook's own rule (1 minute up to 2 hours, 5 up to 12 hours, else 15);
-    //   Azure Monitor by its bins (the coarsest of 1, 5, 15, 30, 60, 180, 360, 720, 1440 that every bin starts on,
-    //   from midnight UTC, and that its window can hold them in), T5's hourly metrics at least 60. A save is read
-    //   whole, whatever the period selected.
-    // Each save's point at this bin, over its interval cut to its window:
-    //   no finer save's rows reach it: the point;
-    //   one finer save has a row in every one of its intervals across it: BLANK;
-    //   else, from the finer saves' rows in its interval, the finest save first, then the newest, each keeping what the
-    //   shared rule keeps of it: BLANK where they cover it, else a total less what they keep, or a maximum or an average
-    //   only when it's higher than each of them not covered itself.
-    // Then totals add, maxima and averages take the highest.
+    SUMMARIZE (
+        'Telemetry Snapshots',
+        'Telemetry Snapshots'[Target Key],
+        'Telemetry Snapshots'[Analysis Key],
+        'Telemetry Snapshots'[Metric],
+        'Telemetry Snapshots'[Bucket UTC]
+    ),
+    VAR LatestCapture = CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ) )
+    RETURN
+        CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ), 'Telemetry Snapshots'[Captured At UTC] = LatestCapture )
 )
 
 // CPU. Format #,0.0" %". On T3 the value is a percentage of the service tier's limit.
@@ -1788,7 +1780,7 @@ Design Brief:
 - Validation:
   - `powerbi-report-author validate fabric/powerbi/RPT_DatabaseHub_History.Report` after every generator run; JSON parses; page and visual counts match this contract (4 pages with 10, 8, 11, and 10 placements).
   - Pester: TMDL conventions (every measure has a format string and a description; no real GUID; every Direct Lake `entityName` is one of the five tables), the notebook changes, and the PBIR folder shape. `./tests/Invoke-StaticValidation.ps1` before the pull request.
-  - DAX checks against the deployed model: `Snapshot Value` returns one value per bin even after two overlapping runs, and counts no interval twice when they're at different intervals (F35: `fabric/powerbi/checks/f35`); `Selected Validation Run` returns the newest run; the empty-state measures return their messages on today's data.
+  - DAX checks against the deployed model: `Snapshot Value` returns one value per bin even after two overlapping runs; `Selected Validation Run` returns the newest run; the empty-state measures return their messages on today's data.
 - Desktop screenshot verification:
   - Power BI Desktop 2.159 (Microsoft Store) with the report-authoring preview feature on. For local preview, `definition.pbir` uses the full `byConnection` form against the deployed model, because Desktop can't host a local Direct Lake on OneLake model offline.
   - `powerbi-desktop open`, `status`, `reload --pid`, and `screenshot-all`, serially per process; review each page against the pre-flight checklist (squint test, sibling test, no clipped slicers or scrollbars, glyphs render, color map honored), and loop until clean. Screenshots stay in `out/`.

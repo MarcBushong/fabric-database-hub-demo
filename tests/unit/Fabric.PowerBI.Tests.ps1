@@ -19,8 +19,11 @@ BeforeAll {
     #   (https://learn.microsoft.com/dax/dax-syntax-reference); and // and /* */ comments. The DAX query view's page
     #   lists those two, not -- (https://learn.microsoft.com/power-bi/transform-model/dax-query-view), so a -- line is
     #   kept whole: a name in it is still checked, and a double quote in it opens no string.
-    # - TypeScript: '...', "...", and `...` strings, where a backslash escapes, and // and /* */ comments.
-    # A /* */ comment becomes a space, so the words on either side stay apart.
+    # - TypeScript: '...', "...", and `...` strings, where a backslash escapes, and // and /* */ comments. A template's
+    #   text is kept whole, a DAX comment in it included, so a name there is checked too: at worst, a false alarm.
+    # A /* */ comment becomes a space, so the words on either side stay apart. Its limits, which none of the files it
+    # reads has: a string or a /* that's never closed, or a template inside another's ${...}, can shift what it reads
+    # as a string or a comment from there on.
     $script:stripComments = {
         param([string] $Text, [bool] $TypeScript)
         $kept = if ($TypeScript) { '''(?:[^''\\\n]|\\[\s\S])*''|"(?:[^"\\\n]|\\[\s\S])*"|`(?:[^`\\]|\\[\s\S])*`' } else { '"(?:[^"]|"")*"|''[^''\n]*''|\[[^\]\n]*\]|--[^\n]*' }
@@ -191,115 +194,6 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
     }
 }
 
-Describe 'Snapshot Value: each interval from its finest save (F35)' {
-    BeforeAll {
-        $snapshotsText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
-        $script:measure = [regex]::Match($snapshotsText, "(?ms)^ {4}measure 'Snapshot Value' =\n(.*?)(?=^ {8}\S)").Groups[1].Value
-        $script:checks = Join-Path -Path $powerbi -ChildPath 'checks/f35'
-        $script:squash = { param([string] $Text) ($Text -replace '\s+', ' ').Trim() }
-        $script:items = { param([string] $List) @([regex]::Matches($List, '"([^"]+)"|(\d+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { [int] $_.Groups[2].Value } }) }
-        $script:tsList = {
-            param([string] $Text, [string] $Name)
-            $match = [regex]::Match($Text, ('{0}(?::[^=]+)? = (?:new Set\()?\[([^\]]*)\]' -f [regex]::Escape($Name)))
-            $match.Success | Should -BeTrue -Because $Name
-            & $script:items $match.Groups[1].Value
-        }
-        $script:daxList = {
-            param([string] $Pattern)
-            $match = [regex]::Match($script:measure, $Pattern)
-            $match.Success | Should -BeTrue -Because $Pattern
-            & $script:items $match.Groups['list'].Value
-        }
-    }
-
-    It 'tells totals from peaks, Azure Monitor from SQL, hourly metrics, and analyses off the bin grid by the shared rule''s lists' {
-        # finest-per-interval.test.ts ties these lists to the notebooks and the history helpers that write the rows.
-        $shared = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/finest-per-interval.ts'))
-        $reference = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/snapshot-value.ts'))
-        $adds = [regex]::Match($script:measure, 'VAR Adds = AnalysisName IN \{ (?<a>[^}]*) \} \|\| MetricName IN \{ (?<m>[^}]*) \}')
-        $adds.Success | Should -BeTrue
-        & $script:items $adds.Groups['a'].Value | Should -Be (& $script:tsList $shared 'ADDITIVE_ANALYSES')
-        & $script:items $adds.Groups['m'].Value | Should -Be (& $script:tsList $shared 'ADDITIVE_METRICS')
-        & $script:daxList 'VAR OffGrid = ISBLANK \( Bin \) \|\| AnalysisName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $shared 'OFF_GRID_ANALYSES')
-        & $script:daxList 'VAR IsHourly = MetricName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $shared 'HOURLY_METRICS')
-        & $script:daxList "NOT \( 'Telemetry Snapshots'\[Metric\] IN \{ (?<list>[^}]*) \} \)" | Should -Be (& $script:tsList $shared 'HOURLY_METRICS')
-        & $script:daxList 'VAR IsMonitor = AnalysisName IN \{ (?<list>[^}]*) \}' | Should -Be (& $script:tsList $reference 'MONITOR_ANALYSES')
-        # Azure Monitor's step: the intervals the history helpers step up through. SQL's: the notebook's own bin rule.
-        $ladder = & $script:daxList 'SELECTCOLUMNS \( \{ (?<list>[^}]*) \}, "@Step"'
-        $ladder | Should -Be (& $script:tsList $reference 'LADDER')
-        foreach ($helper in 'PostgresHistoryHelpers.ps1', 'CosmosHistoryHelpers.ps1') {
-            $text = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath "scripts/modules/DbHubDemo/Private/$helper"))
-            & $script:items ([regex]::Match($text, '(?m)^\$script:\w+HistoryIntervals = @\(([^)]*)\)').Groups[1].Value) | Should -Be $ladder -Because $helper
-        }
-        $script:measure | Should -Match ([regex]::Escape('IF ( SpanMinutes <= 120.000001, 1, IF ( SpanMinutes <= 720.000001, 5, 15 ) )'))
-        $reference | Should -Match ([regex]::Escape('span <= 120 + 1e-6 ? 1 : span <= 720 + 1e-6 ? 5 : 15'))
-        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
-        $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"
-        $code | Should -Match ([regex]::Escape('bin_minutes = int(BIN_MINUTES) or (1 if span_minutes <= 120 else 5 if span_minutes <= 720 else 15)'))
-    }
-
-    It 'reads each save whole, whatever the period selected: its saves, its step, its rows'' extent, and the rows of a partly covered interval' {
-        # report_date_utc is each row's bin date, so a period through 'Date' would cut a day-long save at midnight and
-        # change the step its bins give.
-        $removes = @([regex]::Matches($script:measure, "REMOVEFILTERS \( 'Telemetry Snapshots'\[Bucket UTC\][^)]*\)") | ForEach-Object { $_.Value })
-        $removes.Count | Should -Be 6
-        $removes | ForEach-Object { $_ | Should -Match ([regex]::Escape("'Telemetry Snapshots'[Report Date UTC]")) }
-        ([regex]::Matches($script:measure, [regex]::Escape("REMOVEFILTERS ( 'Date' )"))).Count | Should -Be $removes.Count
-    }
-
-    It 'checks a live model with the measures'' own expressions, in read-only query files' {
-        $tmdlText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
-        $tmdlMeasure = {
-            param([string] $Name)
-            $quoted = "'" + $Name.Replace("'", "''") + "'"
-            $match = [regex]::Match($tmdlText, ("(?ms)^ {{4}}measure (?:{0}|{1}) =\n(.*?)(?=^ {{0,8}}\S)" -f [regex]::Escape($quoted), [regex]::Escape($Name)))
-            $match.Success | Should -BeTrue -Because $Name
-            & $script:squash $match.Groups[1].Value
-        }
-        (& $tmdlMeasure 'Snapshot Value').Length | Should -BeGreaterThan 10000
-        $defined = @{}
-        foreach ($file in Get-ChildItem -LiteralPath $script:checks -Filter '*.dax' -File) {
-            $text = [System.IO.File]::ReadAllText($file.FullName)
-            $blocks = @([regex]::Matches($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[([^\]]+)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)"))
-            $names = @($blocks | ForEach-Object { $_.Groups[1].Value })
-            $defined[$file.Name] = $names
-            foreach ($block in $blocks | Where-Object { $_.Groups[1].Value -ne 'Replica Lag Peak (s)' }) {
-                $name = $block.Groups[1].Value
-                & $script:squash $block.Groups[2].Value | Should -BeExactly (& $tmdlMeasure ($name -replace ' F35$', '')) -Because ('{0} [{1}]' -f $file.Name, $name)
-            }
-            if ($file.Name -like '*-f35.dax') {
-                # A model measure reads the deployed Snapshot Value whatever a query defines (live, 602e18a1's first run): each
-                # measure a check evaluates, or that one of its measures reads, is defined in it.
-                $code = & $script:stripComments $text $false
-                $referenced = @([regex]::Matches($code, "(?<!['\w\]])\[([^\]@][^\]]*)\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'Value' } | Sort-Object -Unique)
-                $referenced.Count | Should -BeGreaterThan 3 -Because $file.Name
-                @($referenced | Where-Object { $names -notcontains $_ }) | Should -BeNullOrEmpty -Because $file.Name
-                $names[0] | Should -Be 'Snapshot Value' -Because $file.Name
-            }
-        }
-        $defined['snapshot-value-bins.dax'] | Should -Be @('Snapshot Value F35')
-        @($defined['window-f35.dax']).Count | Should -Be 15
-        # The read replica's lag has no model measure: both window checks define the same one.
-        $replica = foreach ($name in 'window-today.dax', 'window-f35.dax') {
-            $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:checks -ChildPath $name))
-            & $script:squash ([regex]::Match($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[Replica Lag Peak \(s\)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)").Groups[1].Value)
-        }
-        $replica[0] | Should -Match ([regex]::Escape('''Telemetry Snapshots''[Metric] = "physical_replication_delay_in_seconds"'))
-        $replica[1] | Should -BeExactly $replica[0]
-        $files = @(Get-ChildItem -LiteralPath $script:checks -File | Sort-Object -Property Name | ForEach-Object { $_.Name })
-        $files | Should -Be @('estate-f35.dax', 'estate-today.dax', 'README.md', 'rows-monitor.dax', 'rows-saves.dax', 'rows-sql.dax', 'snapshot-value-bins.dax', 't5-f35.dax', 't5-today.dax', 'window-f35.dax', 'window-today.dax')
-        foreach ($file in Get-ChildItem -LiteralPath $script:checks -File) {
-            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
-            $bytes -contains 13 | Should -BeFalse -Because $file.Name
-            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse -Because $file.Name
-            if ($file.Extension -eq '.dax') {
-                @($bytes | Where-Object { $_ -eq 9 -or $_ -gt 127 }) | Should -BeNullOrEmpty -Because $file.Name
-            }
-        }
-    }
-
-}
-
 Describe 'DAX variable names' {
     BeforeAll {
         # Learn's VAR page: a name has only a-z, A-Z, and 0-9, never a digit first, with __ allowed as a prefix, and isn't a
@@ -314,7 +208,7 @@ Describe 'DAX variable names' {
         $script:tableNames = @($tableFiles | ForEach-Object {
                 [regex]::Match([System.IO.File]::ReadAllText($_.FullName), "(?m)^table\s+('(?:[^']|'')+'|\S+)").Groups[1].Value.Trim("'").Replace("''", "'")
             })
-        # The model's measures, every DAX file in fabric/powerbi (the F35 checks among them), and the Insights app's queries.
+        # The model's measures, every DAX file in fabric/powerbi, and the Insights app's queries.
         $script:daxSources = @($tableFiles) + @(Get-ChildItem -LiteralPath $powerbi -Filter '*.dax' -File -Recurse) +
             @(Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/queries.ts'))
     }
@@ -348,7 +242,8 @@ Describe 'DAX variable names' {
                 }
             }
         }
-        $declared | Should -BeGreaterThan 400
+        # 81 on 2026-11-22: a floor, so a stripper or a path that reads nothing can't pass.
+        $declared | Should -BeGreaterThan 60
         @($problems | Sort-Object -Unique) | Should -BeNullOrEmpty
     }
 
@@ -363,7 +258,7 @@ Describe 'DAX variable names' {
         $tsStripped | Should -BeLikeExactly "*'https://x' + ""a//b""*"
     }
 
-    It 'finds every name after a /* */ comment, a string across lines, and a name or -- line with a double quote in it' {
+    It 'finds every name after a /* */ comment, a string across lines, a URL in a template, and a name or -- line with a double quote in it' {
         $dax = @(
             '/* https://x */ VAR A1 = 1'
             'VAR A2 = "a string'
@@ -385,9 +280,10 @@ Describe 'DAX variable names' {
             'const s = ''it\''s // text'' + "a\"b // text" // var Hidden = 0'
             'const u = ''a line \'
             'continued // text''; var T5 = 5'
+            'const v = `https://x/${id}`; var T6 = 6'
         ) -join "`n"
         $tsStripped = & $script:stripComments $ts $true
-        & $names $tsStripped | Should -BeExactly 'T1,T2,T3,T4,T5'
+        & $names $tsStripped | Should -BeExactly 'T1,T2,T3,T4,T5,T6'
         $tsStripped.Contains('''it\''s // text'' + "a\"b // text"') | Should -BeTrue
     }
 }
