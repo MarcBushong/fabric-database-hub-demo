@@ -1125,7 +1125,8 @@ function Get-DemoVmRunCommandLeftover {
     every one of them counts. Names of anything else aren't the demo's and are left out. Azure allows 25 managed Run
     Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, and
     Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by
-    Test-DemoRunCommandFinished, and Deleting). With -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure
+    Test-DemoRunCommandFinished, Deleting, and StartUtc, its instance view's startTime, $null when it has none). With
+    -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure
     is deleting are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go
     with a VM agent that isn't working (R871).
     #>
@@ -1164,7 +1165,8 @@ function Get-DemoVmRunCommandLeftover {
         }
         $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
         $provisioning = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
-        $execution = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'instanceView') -Name 'executionState')
+        $view = Get-DemoMemberValue -InputObject $properties -Name 'instanceView'
+        $execution = [string](Get-DemoMemberValue -InputObject $view -Name 'executionState')
         $deleting = $provisioning -eq 'Deleting'
         if ($deleting) {
             if (-not $IncludeDeleting) {
@@ -1174,7 +1176,7 @@ function Get-DemoVmRunCommandLeftover {
         elseif ($name -in 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile' -or ($Running -and $execution -in 'Pending', 'Running')) {
             continue
         }
-        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting })
+        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting; StartUtc = (ConvertTo-DemoRunCommandUtc -Value (Get-DemoMemberValue -InputObject $view -Name 'startTime')) })
     }
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray() }
 }

@@ -1615,11 +1615,144 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($status.rcaLines).Count | Should -BeGreaterThan 0
         @($result.rcaLines | ForEach-Object { $_['step'] }) | Should -Be @($status.rcaLines | ForEach-Object { $_.step })
         @($result.rcaLines | ForEach-Object { $_['message'] }) | Should -Be @($status.rcaLines | ForEach-Object { $_.message })
-        # Another job's copy of the status gives this result none of its lines.
-        $script:automationVariables['DbHubSessionStatus'] = ($script:automationVariables['DbHubSessionStatus'] -replace '"jobId":"[^"]*"', '"jobId":"bbbbbbbb-0000-0000-0000-00000000000b"')
-        Mock -CommandName Write-DbHubStopStatus -MockWith { }
+        $result.PSObject.Properties.Name | Should -Not -Contain 'yieldedTo'
+        # A copy that another job's status replaced after this job wrote its own gives this result none of its lines.
+        $script:otherCopy = ($script:automationVariables['DbHubSessionStatus'] -replace '"jobId":"[^"]*"', '"jobId":"bbbbbbbb-0000-0000-0000-00000000000b"')
+        $script:automationVariables.Remove('DbHubSessionStatus')
+        Mock -CommandName Write-DbHubStopStatus -MockWith { $script:automationVariables['DbHubSessionStatus'] = $script:otherCopy }
         $again = Invoke-DbHubStop -Scope All -Context (New-TestContext) -RequestedBy 'stop-demo.ps1'
         @($again.rcaLines) | Should -BeNullOrEmpty
+    }
+
+    Context 'a second stop of a session (review of f5972d2d): one stop does the session''s own part' {
+        BeforeEach {
+            # The stop that ran first: stop-demo.ps1's handoff, whose status has the metrics' final version and the stop's lines.
+            $script:firstJob = 'bbbbbbbb-0000-0000-0000-00000000000b'
+            $script:firstStatus = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'stopped'; updatedUtc = '2026-10-27T14:58:00Z'; stoppedUtc = '2026-10-27T14:58:00Z'; stoppedBy = 'stop-demo.ps1'; jobId = $script:firstJob; done = @('auto-stop removed'); failed = @(); metrics = [ordered]@{ status = 'Pass'; message = 'saved'; version = ('c' * 32) }; planKept = $true; rcaLines = @([ordered]@{ step = 'RCA.EXPORT'; status = 'Pass'; message = 'The session''s evidence was exported.'; fix = '' }) }
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:t4 = 'Ready'
+            $script:replica = 'Ready'
+            $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+            $script:sleeps = 0
+            $script:sleepHook = $null
+            Mock Start-Sleep {
+                $script:clock = $script:clock.AddSeconds($Seconds)
+                $script:sleeps++
+                if ($null -ne $script:sleepHook) {
+                    & $script:sleepHook
+                }
+            }
+            # What the session's part writes: the export's Run Commands, the metrics, and the status.
+            function Get-SessionPart {
+                [pscustomobject]@{
+                    Exports = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-rca-' }).Count
+                    Metrics = $script:secrets.ContainsKey('dbhub-session-metrics')
+                    Status  = $script:secrets.ContainsKey('dbhub-session-status')
+                }
+            }
+        }
+
+        It 'stops what''s left after the session''s stop ran, and keeps that stop''s status: Stop now, the auto-stop, and stop-demo.ps1''s' {
+            $before = ConvertTo-Json -InputObject $script:firstStatus -Depth 8 -Compress
+            $script:automationVariables['DbHubSessionStatus'] = $before
+            # The notebook's own end after a handoff (its last status read said running): Stop now, with the session.
+            $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext)
+            $result.status | Should -Be 'Stopped'
+            @($result.done) | Should -Contain 'session 01234567''s stop ran already (job bbbbbbbb, stop-demo.ps1): its evidence, metrics, and status are that stop''s'
+            @($result.done) | Should -Contain 'sqlvm01 deallocating'
+            $script:replica | Should -BeNullOrEmpty -Because 'the resources still stop'
+            $part = Get-SessionPart
+            $part.Exports | Should -Be 0
+            $part.Metrics | Should -BeFalse
+            $part.Status | Should -BeFalse
+            $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $before
+            # The session's auto-stop, and a later run's auto-stop that reads the session's ID from the group's tag: the same.
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $auto = Invoke-DbHubStop -Scope All -Context (New-TestContext -JobId 'dddddddd-0000-0000-0000-00000000000d')
+            @($auto.done) | Should -Contain 'session 01234567''s stop ran already (job bbbbbbbb, stop-demo.ps1): its evidence, metrics, and status are that stop''s'
+            (Get-SessionPart).Status | Should -BeFalse
+            # stop-demo.ps1's: its result has that stop's lines, and says whose they are.
+            $handed = Invoke-DbHubStop -Scope All -Context (New-TestContext -JobId 'eeeeeeee-0000-0000-0000-00000000000e') -RequestedBy 'stop-demo.ps1'
+            $handed.yieldedTo['state'] | Should -Be 'Stopped'
+            $handed.yieldedTo['jobId'] | Should -Be $script:firstJob
+            @($handed.rcaLines | ForEach-Object { $_['message'] }) | Should -Be @('The session''s evidence was exported.')
+            $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $before
+        }
+
+        It 'waits for another job''s stop of the session that still runs, and leaves the session''s part to it' {
+            $running = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'running'; updatedUtc = '2026-10-27T14:59:00Z'; runEndUtc = '2026-10-27T15:30:00Z'; stopBegunUtc = '2026-10-27T14:59:00Z'; stopBegunJobId = $script:firstJob }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $script:jobs = @(@{ properties = @{ jobId = $script:firstJob; status = 'Running'; runbook = @{ name = 'DbHub-Stop' }; creationTime = '2026-10-27T14:58:30Z' } })
+            # That stop ends two polls later, with its status.
+            $script:sleepHook = {
+                if ($script:sleeps -eq 2) {
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $script:firstStatus -Depth 8 -Compress
+                    $script:jobs = @(@{ properties = @{ jobId = $script:firstJob; status = 'Completed'; runbook = @{ name = 'DbHub-Stop' }; creationTime = '2026-10-27T14:58:30Z' } })
+                }
+            }
+            $context = New-TestContext
+            $result = Invoke-DbHubStop -Scope All -Context $context
+            $result.status | Should -Be 'Stopped'
+            @($result.done) | Should -Contain 'session 01234567''s stop ran already (job bbbbbbbb, stop-demo.ps1): its evidence, metrics, and status are that stop''s'
+            @($context.Log | Where-Object { $_ -match 'Session 01234567''s stop began in job bbbbbbbb-0000-0000-0000-00000000000b, which still runs: this stop waits for it' }) | Should -Not -BeNullOrEmpty
+            $part = Get-SessionPart
+            $part.Exports | Should -Be 0
+            $part.Metrics | Should -BeFalse
+            $part.Status | Should -BeFalse
+            # Still running once that mark's life ends: the rest is stopped, and the session's part is left to it.
+            Reset-TestAzure
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $script:jobs = @(@{ properties = @{ jobId = $script:firstJob; status = 'Running'; runbook = @{ name = 'DbHub-Stop' }; creationTime = '2026-10-27T14:58:30Z' } })
+            $script:sleepHook = $null
+            $late = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            @($late.done) | Should -Contain 'session 01234567''s stop still runs (job bbbbbbbb): its evidence, metrics, and status are left to it'
+            $script:clock | Should -Be ([datetime]::new(2026, 10, 27, 15, 14, 0, [System.DateTimeKind]::Utc)) -Because 'it waits until the mark''s life ends, 15 minutes after it began'
+            (Get-SessionPart).Status | Should -BeFalse
+            @($late.done) | Should -Contain 'sqlvm01 deallocating'
+        }
+
+        It 'does the whole work when that other job ended without stopping the session, and its own mark names its job' {
+            $running = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'running'; updatedUtc = '2026-10-27T14:59:00Z'; runEndUtc = '2026-10-27T15:30:00Z'; stopBegunUtc = '2026-10-27T14:59:00Z'; stopBegunJobId = $script:firstJob }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $script:jobs = @(@{ properties = @{ jobId = $script:firstJob; status = 'Failed'; runbook = @{ name = 'DbHub-Control' }; creationTime = '2026-10-27T14:58:30Z' } })
+            $script:marks = [System.Collections.Generic.List[string]]::new()
+            $script:sleepHook = { $script:marks.Add([string](($script:automationVariables['DbHubSessionStatus'] | ConvertFrom-Json).stopBegunJobId)) }
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Stopped'
+            @($result.done) | Should -Not -Contain 'session 01234567''s stop still runs (job bbbbbbbb): its evidence, metrics, and status are left to it'
+            $script:marks[0] | Should -Be 'aaaaaaaa-0000-0000-0000-00000000000a' -Because 'the mark names this job, read back 5 seconds later'
+            $part = Get-SessionPart
+            $part.Metrics | Should -BeTrue
+            $part.Status | Should -BeTrue
+            (Get-SessionStatus).stoppedBy | Should -Be 'Auto-stop'
+        }
+
+        It 'of two stops that mark at once, leaves the session''s part to the one whose mark stands' {
+            $running = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'running'; updatedUtc = '2026-10-27T14:59:00Z'; runEndUtc = '2026-10-27T15:30:00Z' }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $other = 'cccccccc-0000-0000-0000-00000000000c'
+            $script:sleepHook = {
+                if ($script:sleeps -eq 1) {
+                    # Another stop marked right after this one, which reads its mark back now.
+                    $copy = $script:automationVariables['DbHubSessionStatus'] | ConvertFrom-Json
+                    $copy.stopBegunJobId = 'cccccccc-0000-0000-0000-00000000000c'
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $copy -Depth 8 -Compress
+                    $script:jobs = @(@{ properties = @{ jobId = 'cccccccc-0000-0000-0000-00000000000c'; status = 'Running'; runbook = @{ name = 'DbHub-Control' }; creationTime = '2026-10-27T15:00:00Z' } })
+                }
+                if ($script:sleeps -eq 3) {
+                    $done = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'stopped'; stoppedUtc = '2026-10-27T15:01:00Z'; stoppedBy = 'Stop now'; jobId = 'cccccccc-0000-0000-0000-00000000000c'; metrics = [ordered]@{ status = 'Pass' } }
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $done -Depth 8 -Compress
+                }
+            }
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            @($result.done) | Should -Contain ('session 01234567''s stop ran already (job {0}, Stop now): its evidence, metrics, and status are that stop''s' -f $other.Substring(0, 8))
+            $part = Get-SessionPart
+            $part.Exports | Should -Be 0
+            $part.Metrics | Should -BeFalse
+            $part.Status | Should -BeFalse
+        }
     }
 
     It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {

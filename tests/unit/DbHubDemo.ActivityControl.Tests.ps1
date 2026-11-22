@@ -1948,9 +1948,11 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         Get-Deleted | Should -Contain 'dbhub-autostop-backup'
     }
 
-    It 'is called by Stop-DemoEnvironment for a full stop with the control on, and not for -ParkT2' {
+    It 'is called by Stop-DemoEnvironment for a full stop with the control on, unless the handoff removed it already, and not for -ParkT2' {
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1') -Raw
-        $text | Should -Match 'if \(-not \$ParkT2 -and \(Get-DemoActivityControlSetting -Config \$Config\)\.Enabled\) \{\s+#[^\n]*\n\s+\$results\.Add\(\(Clear-DemoActivityControlAutoStop -Config \$Config -Confirm:\$false\)\)'
+        # The handoff of a Run all session's stop removes it right before the control's job (review of f5972d2d), and its
+        # result is reported instead.
+        $text | Should -Match 'if \(-not \$ParkT2 -and \(Get-DemoActivityControlSetting -Config \$Config\)\.Enabled\) \{(\s+#[^\n]*\n)+\s+if \(\$null -ne \$handoff -and \$null -ne \(Get-DemoMemberValue -InputObject \$handoff -Name ''AutoStop''\)\) \{\s+\$results\.Add\(\$handoff\.AutoStop\)\s+\}\s+else \{\s+\$results\.Add\(\(Clear-DemoActivityControlAutoStop -Config \$Config -Confirm:\$false\)\)'
     }
 }
 

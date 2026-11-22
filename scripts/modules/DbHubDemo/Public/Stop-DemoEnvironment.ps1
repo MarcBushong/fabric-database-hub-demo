@@ -49,8 +49,12 @@ function Stop-DemoEnvironment {
       stop's own, runs that export, and saves the session's metrics and stopped status; this stop waits for it, prints its lines
       (STOP.RCA.EXPORT, STOP.RCA.CAPTURE.<target>, STOP.RCA.PENDING), and then does the rest, as before, apart from what
       that job did: the activity profiles aren't set to off, T2's guest isn't shut down first (the VMs' deallocation ends
-      both, as with Stop now), and the scripts' own export doesn't run. The Database Agent beat's hold, and with
-      -SaveHistory T4's and the replica's metrics, are taken before it. When the control can't take it, the stop goes on as
+      both, as with Stop now), and the scripts' own export doesn't run, so -SaveHistory saves the history without the
+      session's Incident RCA evidence, which the control's stop keeps in the control vault for the session's own save (the
+      next Run all, or Run all's at the session's planned end; review of f5972d2d). The Database Agent beat's hold, and with
+      -SaveHistory T4's and the replica's metrics, are taken before it; right before its job, the T2 host's password Run
+      Command is waited for (STOP.CONTROL.HOSTPASSWORD), and the session's auto-stop goes (STOP.CONTROL.AUTOSTOP), so no
+      second stop of the session starts beside it. When the control can't take it, the stop goes on as
       before, with a Warning that names the risk; while a stop job of the control's still runs, nothing is stopped under it.
       Not with -ParkT2, -RemoveBastionOnly, or -UpdateEnd.
     - Phase 26b (ADR 0023), both opt-in and skipped with -ParkT2: -SaveHistory (or fabric.saveHistoryOnStop) runs
@@ -227,8 +231,14 @@ function Stop-DemoEnvironment {
         $state = $handoff.State
     }
     if (-not $ParkT2 -and (Get-DemoActivityControlSetting -Config $Config).Enabled) {
-        # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
-        $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
+        # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs. The handoff
+        # removed it already when it went to the control (review of f5972d2d): its result is reported instead.
+        if ($null -ne $handoff -and $null -ne (Get-DemoMemberValue -InputObject $handoff -Name 'AutoStop')) {
+            $results.Add($handoff.AutoStop)
+        }
+        else {
+            $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
+        }
     }
     if (-not $ParkT2 -and -not $updateEnd) {
         # The busy marker (2026-11-14): everything stops now, so nothing waits for the nightly stop any more; a deferred
@@ -453,6 +463,11 @@ function Stop-DemoEnvironment {
             }
             try {
                 $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' })
+                if ($handedOff -and $null -ne $saved.Result -and ([string]$saved.Result.status -in 'Pass', 'Warning' -or [bool]$saved.StillRunning)) {
+                    # The control's stop exported the session's evidence into the control vault, which this save can't read
+                    # (review of f5972d2d): the session's own save takes it.
+                    $saved.Result.message = '{0} It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on. To save it at once, stop a session with Stop now in {1} instead.' -f ([string]$saved.Result.message).TrimEnd(), (Get-DemoActivityControlName -Config $Config).Notebook
+                }
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
                 # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.

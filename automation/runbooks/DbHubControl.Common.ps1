@@ -1991,10 +1991,12 @@ function Stop-DbHubDemo {
     starts again. A session's stop first exports its evidence for the Incident RCA (2026-11-20, ADR 0031,
     Invoke-DbHubRcaStop) through managed Run Commands that only read, bounded by rca.stopMinutes, while the VMs still run.
     Before anything else it marks the session's stop as begun in its status's copy (Set-DbHubStopBegun), so a re-check
-    that's still exporting writes no bundle after the metrics' final version.
+    that's still exporting writes no bundle after the metrics' final version. One stop does the session's own part
+    (Resolve-DbHubStopClaim, review of f5972d2d): when another stop of the session began and still runs, or ran, this one
+    leaves the export, the metrics, and the session's status to it (Yielded), and stops the rest.
     Returns Done, Failed, MetricsStatus, MetricsMessage, MetricsVersion (the final version's ID, which the stop's status
     keeps), T5Status (Remove-DbHubT5Container's outcome, '' when it wasn't asked; apart from Failed, review of ab91ee5),
-    and Rca (the export's State, Index, and Lines, or $null).
+    Rca (the export's State, Index, and Lines, or $null), and Yielded (the stop it left the session's part to, or $null).
 
     .DESCRIPTION
     With the control's session settings (2026-11-14, ADR 0026), and T4's read replica there or a session's busy marker set:
@@ -2037,7 +2039,7 @@ function Stop-DbHubDemo {
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Deallocate the VMs, stop T4, and delete T5''s container')) {
-        return [pscustomobject]@{ Done = @(); Failed = @(); MetricsStatus = ''; MetricsMessage = ''; MetricsVersion = ''; Rca = $null }
+        return [pscustomobject]@{ Done = @(); Failed = @(); MetricsStatus = ''; MetricsMessage = ''; MetricsVersion = ''; Rca = $null; Yielded = $null }
     }
     $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
@@ -2045,14 +2047,19 @@ function Stop-DbHubDemo {
     $metricsMessage = ''
     $metricsVersion = ''
     $t5Status = ''
+    $yielded = $null
     $session = Test-DbHubSessionCapable -Settings $settings
     if ($session -and $null -eq $OnlyVm) {
-        # First (review of 15ad76d): a re-check still exporting this session's evidence writes no bundle from now on.
+        # First (review of 15ad76d): a re-check still exporting this session's evidence writes no bundle from now on. And
+        # another stop of the session that began, or ran, keeps the session's own part (review of f5972d2d).
         $stopping = $SessionId
         if (-not $stopping) {
             $stopping = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
         }
-        $null = Set-DbHubStopBegun -Context $Context -SessionId $stopping
+        $yielded = Resolve-DbHubStopClaim -Context $Context -SessionId $stopping -PollSeconds $PollSeconds
+        if ($null -ne $yielded) {
+            $done.Add((Get-DbHubStopYieldText -Yielded $yielded))
+        }
     }
     if (Clear-DbHubAutoStop -Context $Context) {
         $done.Add('auto-stop removed')
@@ -2067,7 +2074,7 @@ function Stop-DbHubDemo {
     $replicaGoes = -not $KeepT4 -or $RemoveReplica
     if ($session) {
         $replicaThere = (Get-DbHubT4Replica -Context $Context -Tags $Tags).State -notin 'NotConfigured', 'Missing', 'Unknown'
-        if (($replicaThere -and $replicaGoes) -or $busy.By -eq 'session') {
+        if ($null -eq $yielded -and (($replicaThere -and $replicaGoes) -or $busy.By -eq 'session')) {
             # The session's evidence for the Incident RCA first (ADR 0031), while the VMs still run: its bundles go into the
             # vault before the metrics' final version, which lists them. Bounded (rca.stopMinutes); what isn't exported by
             # then stays on the VMs, and the next session's start exports it.
@@ -2193,7 +2200,7 @@ function Stop-DbHubDemo {
             Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
         }
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; MetricsVersion = $metricsVersion; T5Status = $t5Status; Rca = $rca }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; MetricsVersion = $metricsVersion; T5Status = $t5Status; Rca = $rca; Yielded = $yielded }
 }
 
 function Get-DbHubLastShutdownUtc {
@@ -8721,7 +8728,8 @@ function Set-DbHubStopBegun {
     before each evidence bundle it writes (Test-DbHubRcaRecheckOpen), so none goes after the stop's final version of the
     metrics. Only the copy, and only while it's that session's and it hasn't stopped: the vault's status is the notebook's,
     and the stop's own status replaces both at its end (Write-DbHubStopStatus). Its updatedUtc changes too, so a re-check
-    that read the copy before doesn't write over it. Returns whether it was marked. Never throws.
+    that read the copy before doesn't write over it. The mark names its job (stopBegunJobId, review of f5972d2d), so a
+    second stop of the session tells whose it is (Resolve-DbHubStopClaim). Returns whether it was marked. Never throws.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Marks only the session''s own status copy; Stop-DbHubDemo, its caller, asks ShouldProcess.')]
     param(
@@ -8742,6 +8750,7 @@ function Set-DbHubStopBegun {
         }
         $now = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
         $copy['stopBegunUtc'] = $now
+        $copy['stopBegunJobId'] = [string]$Context.JobId
         $copy['updatedUtc'] = $now
         return (Save-DbHubSessionStatusCopy -Context $Context -Json (ConvertTo-Json -InputObject $copy -Depth 8 -Compress))
     }
@@ -8777,6 +8786,176 @@ function Test-DbHubRcaRecheckOpen {
     $begun = ConvertTo-DbHubUtc -Value $Status['stopBegunUtc']
     $lasts = [System.Math]::Max($script:DbHubStopBegunMinutes, $StopMinutes + 9)
     return ($null -eq $begun -or (Get-DbHubUtcNow) -ge $begun.AddMinutes($lasts))
+}
+
+function Get-DbHubStopJobList {
+    # The control account's DbHub-Stop and DbHub-Control jobs (review of f5972d2d): each one's Id (its jobId), Status,
+    # Runbook, and Created (its creationTime, in UTC), from the first page of Job - List By Automation Account for each
+    # runbook, as Get-DbHubActiveRun reads them (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account).
+    # Returns Ok, Error, and Jobs. Never throws.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    $settings = $Context.Settings
+    $found = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    try {
+        $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
+        $account = Get-DbHubAccountPath -Settings $settings
+        foreach ($runbook in @([string]$settings.stopRunbook, [string]$settings.controlRunbook)) {
+            if (-not $runbook) {
+                continue
+            }
+            $filter = [uri]::EscapeDataString(("properties/runbook/name eq '{0}'" -f $runbook))
+            $jobs = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/jobs?$filter={1}' -f $account, $filter) -ApiVersion $version
+            if ($jobs.StatusCode -ne 200) {
+                return [pscustomobject]@{ Ok = $false; Error = [string]$jobs.Error; Jobs = @() }
+            }
+            foreach ($item in @(Get-DbHubMember -InputObject $jobs.Body -Name 'value')) {
+                $properties = Get-DbHubMember -InputObject $item -Name 'properties'
+                $id = [string](Get-DbHubMember -InputObject $properties -Name 'jobId')
+                if (-not $id -or -not $seen.Add($id)) {
+                    continue
+                }
+                $found.Add([pscustomobject]@{
+                        Id      = $id
+                        Status  = [string](Get-DbHubMember -InputObject $properties -Name 'status')
+                        Runbook = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $properties -Name 'runbook') -Name 'name')
+                        Created = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $properties -Name 'creationTime')
+                    })
+            }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Jobs = @() }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Jobs = $found.ToArray() }
+}
+
+function Resolve-DbHubStopClaim {
+    <#
+    .SYNOPSIS
+    Which stop does a session's own part (review of f5972d2d): the export of its evidence, the history's metrics, and its
+    stopped status. A second whole stop of the session (its auto-stop, Stop now, or stop-demo.ps1's handoff) rebuilt that
+    status from scratch after the first, or exported beside it, so one of the two documents' sets was in no index. This
+    stop leaves that part to another stop of the session when the session's status copy:
+    - says it stopped: State Stopped. That's also a later stop that reads the last session's ID from the group's tag (an
+      on-demand run's or a start-demo.ps1 session's auto-stop), which exported and wrote under that session's ID before;
+    - says that another job's stop of it began (Set-DbHubStopBegun's stopBegunJobId) while that job is still queued or
+      running: this stop waits for it, polling every -PollSeconds, until that mark's life ends (Test-DbHubRcaRecheckOpen's
+      bound, 15 minutes or more, when that stop's export is past its own bound), and then leaves the part to it: Stopped
+      once it has stopped the session, or Running when it still runs then.
+    A job that the list doesn't show, or a list that can't be read, is told by the mark's age, as the re-checks tell it.
+    When that other job ended without the stopped status, the copy is another session's, or there's none, this stop does
+    the whole work: it marks its stop begun, waits 5 seconds, and reads the mark back, so of two stops that mark at once,
+    the one whose mark stands goes on and the other waits for it. Returns $null when this stop does the session's part,
+    or what it leaves it to: State, SessionId, JobId, and By (who stopped it, when the copy says). Never throws.
+    https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [int] $PollSeconds = 20
+    )
+
+    if ($SessionId -notmatch '^[0-9a-f]{32}$') {
+        return $null
+    }
+    $me = [string]$Context.JobId
+    $lasts = [System.Math]::Max($script:DbHubStopBegunMinutes, (Get-DbHubRcaSetting -Settings $Context.Settings).StopMinutes + 9)
+    $poll = [System.Math]::Max(5, $PollSeconds)
+    $marks = 0
+    $deadline = $null
+    try {
+        while ($true) {
+            $copy = Read-DbHubSessionStatusCopy -Context $Context
+            if ($null -eq $copy -or [string]$copy['sessionId'] -ne $SessionId) {
+                # None, or a later session's: nothing of this session's to keep apart, and nothing to mark.
+                return $null
+            }
+            if ([string]$copy['phase'] -eq 'stopped') {
+                return [pscustomobject]@{ State = 'Stopped'; SessionId = $SessionId; JobId = [string]$copy['jobId']; By = [string]$copy['stoppedBy'] }
+            }
+            $other = [string]$copy['stopBegunJobId']
+            # This stop's own mark, read back; with no job ID (a run outside Azure Automation), only once it marked.
+            $ours = $other -eq $me -and ($me -or $marks -gt 0)
+            if ($copy.Contains('stopBegunUtc') -and -not $ours) {
+                $begun = ConvertTo-DbHubUtc -Value $copy['stopBegunUtc']
+                $markEnd = $null
+                if ($null -ne $begun) {
+                    $markEnd = $begun.AddMinutes($lasts)
+                }
+                $job = $null
+                if ($other) {
+                    $list = Get-DbHubStopJobList -Context $Context
+                    $job = @(@($list.Jobs) | Where-Object { $_.Id -eq $other }) | Select-Object -First 1
+                }
+                $now = Get-DbHubUtcNow
+                $active = $null -ne $markEnd -and $now -lt $markEnd
+                if ($null -ne $job) {
+                    $active = $job.Status -in $script:DbHubActiveJobStatuses
+                }
+                if ($active) {
+                    if ($null -eq $deadline) {
+                        # Until the mark's life ends: by then that stop's export is past its bound.
+                        $deadline = $now.AddMinutes($lasts)
+                        if ($null -ne $markEnd) {
+                            $deadline = $markEnd
+                        }
+                        Write-DbHubLog -Context $Context -Message ('Session {0}''s stop began in job {1}, which still runs: this stop waits for it, until {2:HH:mm} UTC at the latest, and leaves the session''s evidence, metrics, and status to it.' -f $SessionId.Substring(0, 8), $(if ($other) { $other } else { 'an earlier one' }), $deadline)
+                    }
+                    if ($now -ge $deadline) {
+                        return [pscustomobject]@{ State = 'Running'; SessionId = $SessionId; JobId = $other; By = '' }
+                    }
+                    Start-Sleep -Seconds $poll
+                    continue
+                }
+                # That job ended without the stopped status, or its mark's life ended: this stop does the whole work.
+            }
+            elseif ($marks -gt 0) {
+                # No other stop marked after this one.
+                return $null
+            }
+            if ($marks -ge 3) {
+                return $null
+            }
+            if (-not (Set-DbHubStopBegun -Context $Context -SessionId $SessionId)) {
+                return $null
+            }
+            $marks++
+            Start-Sleep -Seconds 5
+        }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('Whether another stop of the session runs couldn''t be read: {0}' -f $_.Exception.Message)
+    }
+    return $null
+}
+
+function Get-DbHubStopYieldText {
+    # What a stop that left the session's own part to another stop did instead (Resolve-DbHubStopClaim), for its done list.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Yielded
+    )
+
+    $job = [string]$Yielded.JobId
+    $short = if ($job.Length -gt 8) { $job.Substring(0, 8) } elseif ($job) { $job } else { 'an earlier one' }
+    $session = [string]$Yielded.SessionId
+    if ($session.Length -gt 8) {
+        $session = $session.Substring(0, 8)
+    }
+    if ([string]$Yielded.State -eq 'Stopped') {
+        $by = if ([string]$Yielded.By) { ', {0}' -f $Yielded.By } else { '' }
+        return ('session {0}''s stop ran already (job {1}{2}): its evidence, metrics, and status are that stop''s' -f $session, $short, $by)
+    }
+    return ('session {0}''s stop still runs (job {1}): its evidence, metrics, and status are left to it' -f $session, $short)
 }
 
 function Add-DbHubRcaHandoff {
@@ -9673,7 +9852,10 @@ function Invoke-DbHubControl {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
-        Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
+        # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
+        if ($null -eq (Get-DbHubMember -InputObject $stopped -Name 'Yielded')) {
+            Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
+        }
         return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     }
     if ($request.Action -eq 'reset') {
@@ -9702,7 +9884,9 @@ function Invoke-DbHubStop {
     2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off. -RequestedBy stop-demo.ps1
     (2026-11-22): Scope All for ./scripts/stop-demo.ps1, which hands a Run all session's stop to the control: it never waits
     for a deploy.ps1 run, the session's status says stop-demo.ps1 stopped it, and the result has the lines that status got
-    (rcaLines), read back from its copy when this job wrote it.
+    (rcaLines), read back from its copy when this job wrote it. A stop that leaves the session's own part to another stop
+    of the session (Resolve-DbHubStopClaim, review of f5972d2d) writes no status: its result says whose it is (yieldedTo),
+    with that stop's lines once it has stopped the session.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -9834,18 +10018,29 @@ function Invoke-DbHubStop {
         $status = 'Partial'
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
-    Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By $RequestedBy
+    # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
+    $yielded = Get-DbHubMember -InputObject $stopped -Name 'Yielded'
+    if ($null -eq $yielded) {
+        Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By $RequestedBy
+    }
     $result = [pscustomobject]@{ action = $label; status = $status; message = ('{0}: {1}{2}.' -f $RequestedBy, (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     if ($RequestedBy -eq 'stop-demo.ps1') {
         # The lines the session's status got (RCA.EXPORT, RCA.CAPTURE.<target>, RCA.PENDING), for stop-demo.ps1 to print:
-        # from the status's copy, when this job wrote it.
+        # from the status's copy, when this job wrote it, or the stop it left the session's part to, once that one has.
         $lines = @()
+        $wrote = [string]$Context.JobId
+        if ($null -ne $yielded) {
+            $wrote = [string]$yielded.JobId
+        }
         $copy = Read-DbHubSessionStatusCopy -Context $Context
-        if ($null -ne $copy -and [string]$copy['phase'] -eq 'stopped' -and [string]$copy['jobId'] -eq [string]$Context.JobId -and [string]$copy['stoppedBy'] -eq $RequestedBy) {
+        if ($null -ne $copy -and [string]$copy['phase'] -eq 'stopped' -and $wrote -and [string]$copy['jobId'] -eq $wrote -and ($null -ne $yielded -or [string]$copy['stoppedBy'] -eq $RequestedBy)) {
             $lines = @(@($copy['rcaLines']) | Where-Object { $null -ne $_ })
         }
         $result | Add-Member -NotePropertyName 'requestedBy' -NotePropertyValue $RequestedBy
         $result | Add-Member -NotePropertyName 'rcaLines' -NotePropertyValue $lines
+        if ($null -ne $yielded) {
+            $result | Add-Member -NotePropertyName 'yieldedTo' -NotePropertyValue ([ordered]@{ state = [string]$yielded.State; jobId = [string]$yielded.JobId; by = [string]$yielded.By })
+        }
     }
     return $result
 }
