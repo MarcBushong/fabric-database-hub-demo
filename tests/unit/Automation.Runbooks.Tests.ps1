@@ -3378,6 +3378,59 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $t2.message | Should -Match '^T2: not exported\. archost01 takes one Run Command at a time'
     }
 
+    It 'sends the T2 host its stop''s export beside an Rca Run Command more than an hour old that Azure keeps listing while it deletes it (review of 242a3ef7)' {
+        # F31: Azure listed a Run Command in Deleting for hours. Get-DbHubRcaRoom asks for its delete each time; the mock's
+        # own list keeps it, as Azure did, whatever is asked of it.
+        Set-FixtureRunner
+        $script:rcaListOpen = $true
+        $stuck = 'DbHubControl-rca-archost01-0102-{0}' -f $script:clock.AddHours(-3).ToString('yyyyMMddHHmmss')
+        $script:runCommands['archost01'] = @(@{ name = $stuck; properties = @{ provisioningState = 'Deleting' } })
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' }).Count | Should -Be 1 -Because 'a name more than an hour old holds nothing up'
+        $result.rca.status | Should -Be 'Pass'
+        $status = Get-SessionStatus
+        @($status.rca.leftVms) | Should -BeNullOrEmpty
+    }
+
+    It 'says the T2 host''s Run Commands couldn''t be listed, not that another job''s were there, when its list fails to the stop''s deadline (review of 242a3ef7)' {
+        Set-FixtureRunner
+        Mock Get-DbHubRcaListed { [pscustomobject]@{ Ok = $false; Names = @(); Stale = @() } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' }) | Should -BeNullOrEmpty -Because 'a host whose list fails keeps waiting, as it should'
+        $export = (Get-SessionStatus).rcaLines | Where-Object step -EQ 'RCA.EXPORT'
+        $export.status | Should -Be 'Warning'
+        $export.message | Should -Match 'archost01 takes one Run Command at a time \(R871\), and its Run Commands couldn''t be listed when this export''s time was up, so this export sent nothing there'
+        $export.message | Should -Not -Match 'another job'
+    }
+
+    It 'lists the T2 host only from 60 seconds after the stop''s mark, past a re-check''s three PUTs and two conflict waits (review of 242a3ef7)' {
+        # A running session's status copy, which the stop marks (stopBegunUtc) before its export.
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T14:50:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        Set-FixtureRunner
+        $script:rcaListOpen = $true
+        $begun = $script:clock
+        # The export's own check, by when it runs: the stop's other lists of Run Commands (Clear-DbHubOldRunCommand) aren't it.
+        $script:listedAt = [System.Collections.Generic.List[datetime]]::new()
+        $script:realListed = ${function:Get-DbHubRcaListed}
+        Mock Get-DbHubRcaListed {
+            $script:listedAt.Add($script:clock)
+            & $script:realListed -Context $Context -VmName $VmName
+        }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.rca.status | Should -Be 'Pass'
+        $script:listedAt.Count | Should -BeGreaterThan 0
+        @($script:listedAt | Where-Object { $_ -lt $begun.AddSeconds(60) }) | Should -BeNullOrEmpty -Because 'a re-check that read the mark open just before it may still send there'
+        $hostExport = @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' })
+        $hostExport.Count | Should -Be 1
+        $hostExport[0].At | Should -BeGreaterOrEqual $begun.AddSeconds(60)
+        $sqlExport = @($script:rcaCommands | Where-Object { $_.Vm -eq 'sqlvm01' -and $_.Request.command -eq 'export' })
+        $sqlExport[0].At | Should -BeLessThan $begun.AddSeconds(60) -Because 'sqlvm01 doesn''t wait for it'
+    }
+
     It 'takes a document of no session with the session''s evidence, as the notebook writes it, and hands another session''s to that session (review of 93243d6)' {
         # The operator's scripts export with --session none: a span they bound keeps no session for its later documents.
         Set-ServedRunner -Case @(@{ Id = '20261120T180000Z-sqlvm01-0003'; Session = $null }, @{ Id = '20261120T181500Z-sqlvm01-0004'; Session = ('a' * 32) }) -EveryExport
@@ -3597,6 +3650,36 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         # What the re-check listed goes to the stopped status, still to export, for the next session's start.
         $status = Get-SessionStatus
         $status.phase | Should -Be 'stopped'
+        @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@archost01' -f $id))
+    }
+
+    It 'keeps the stop''s export off the T2 host while a running re-check''s Run Command is listed there, never two at once (review of 242a3ef7)' {
+        # The fence test above with Azure's list of the export's Run Commands on: the stop begins while the re-check's first
+        # part runs on archost01, so its own export there waits for that part, which the re-check reads only after the stop
+        # (both run in this one test's flow), and ends Busy, leaving the T2 host's capture to the next start.
+        $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+        $id = '20261027T142000Z-archost01-0001'
+        Set-ServedRunner -Case @(@{ Id = $id; Session = $script:fixtureSession }) -Vm @('archost01')
+        $script:rcaListOpen = $true
+        $script:servedRunner = $script:rcaRunner
+        $script:stopFired = $false
+        $script:rcaRunner = {
+            param($Command)
+            if (-not $script:stopFired -and $Command.Vm -eq 'archost01' -and $Command.Request.command -eq 'part') {
+                $script:stopFired = $true
+                $script:stopped = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext -NowUtc $script:clock)
+            }
+            return (& $script:servedRunner $Command)
+        }
+        $check = Update-DbHubSessionRca -Context (New-TestContext) -Tags @{ DbHubSessionId = $script:fixtureSession }
+        $check.Outcome | Should -Be 'Changed'
+        $script:stopped.status | Should -Be 'Stopped'
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'export' }).Count | Should -Be 1 -Because 'only the re-check''s: the stop sent none beside its part'
+        $script:rcaMostOpen['archost01'] | Should -Be 1 -Because 'the T2 host takes one Run Command at a time, across jobs too'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'stopped'
+        @($status.rca.leftVms) | Should -Contain 'archost01'
         @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@archost01' -f $id))
     }
 

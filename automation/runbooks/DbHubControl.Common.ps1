@@ -6090,6 +6090,9 @@ $script:DbHubRcaStatuses = @('Pass', 'Fail', 'Warning', 'Manual action required'
 $script:DbHubRcaTerminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
 # What a document may decompress to: far above what the export's 64 KiB of gzip holds, so a bad stream stops early.
 $script:DbHubRcaMaxJsonBytes = 16MB
+# A stop lists the T2 host this long after its mark (review of 242a3ef7): a re-check that read the mark open just before it
+# can still send there, after its three PUTs and Send-DbHubRunCommand's two 10-s conflict waits.
+$script:DbHubRcaStopHostDelaySeconds = 60
 
 function Get-DbHubRcaSetting {
     # The export's bounds from the settings (Get-DemoActivityControlRunbookSetting), with their defaults, and whether these
@@ -6266,9 +6269,12 @@ function Get-DbHubRcaListed {
     <#
     .SYNOPSIS
     The export's managed Run Commands that Azure lists on a VM, whatever their state, one it's still deleting included:
-    Ok ($false when they couldn't be listed) and Names. Before an export's first Run Command on the T2 host, which takes
-    one at a time (R871), another job's there must be gone: live (2026-11-21), a stop's export ran there beside its
-    session's re-check's last parts. It deletes nothing.
+    Ok ($false when they couldn't be listed), Names, and Stale. Before an export's first Run Command on the T2 host, which
+    takes one at a time (R871), another job's there must be gone: live (2026-11-21), a stop's export ran there beside its
+    session's re-check's last parts. A name whose time is more than an hour old is in Stale, not Names (review of 242a3ef7):
+    Get-DbHubRcaRoom deletes it, finished or not, and Azure can go on listing one it's deleting (F31), which held the host
+    up for every later export. No export runs that long: its deadline is at most 30 minutes, and a Run Command's time-out
+    at most 1,020 s. It deletes nothing.
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/list-by-virtual-machine
     #>
     param(
@@ -6283,17 +6289,24 @@ function Get-DbHubRcaListed {
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
     $list = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands' -f (Get-DbHubDemoPath -Settings $settings), $VmName) -ApiVersion $version
     $names = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $stale = New-Object -TypeName 'System.Collections.Generic.List[string]'
     if ($list.StatusCode -ne 200) {
-        return [pscustomobject]@{ Ok = $false; Names = $names.ToArray() }
+        return [pscustomobject]@{ Ok = $false; Names = $names.ToArray(); Stale = $stale.ToArray() }
     }
     $prefix = [string]$settings.runCommandPrefix + 'rca-'
     foreach ($item in @(Get-DbHubMember -InputObject $list.Body -Name 'value')) {
         $name = [string](Get-DbHubMember -InputObject $item -Name 'name')
-        if ($name.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
-            $names.Add($name)
+        if (-not $name.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+            continue
         }
+        $stamp = [DateTime]::MinValue
+        if ($name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$stamp) -and $stamp.AddHours(1) -lt $Context.NowUtc) {
+            $stale.Add($name)
+            continue
+        }
+        $names.Add($name)
     }
-    return [pscustomobject]@{ Ok = $true; Names = $names.ToArray() }
+    return [pscustomobject]@{ Ok = $true; Names = $names.ToArray(); Stale = $stale.ToArray() }
 }
 
 function ConvertFrom-DbHubRcaOutput {
@@ -6507,7 +6520,10 @@ function Invoke-DbHubRcaExport {
 
         [switch] $NoNewExport,
 
-        [switch] $WhileRunning
+        [switch] $WhileRunning,
+
+        [AllowNull()]
+        [object] $HostNotBeforeUtc = $null
     )
 
     $settings = $Context.Settings
@@ -6517,6 +6533,7 @@ function Invoke-DbHubRcaExport {
     # Read in the script blocks below.
     $finalExport = [bool]$Final
     $recheck = [bool]$WhileRunning
+    $hostNotBefore = $HostNotBeforeUtc
     $hosts = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $work = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $documents = [ordered]@{}
@@ -6572,7 +6589,14 @@ function Invoke-DbHubRcaExport {
             return
         }
         if ($State.OneAtATime) {
+            # A stop lists the T2 host only from 60 s after its mark (-HostNotBeforeUtc, review of 242a3ef7): a re-check that
+            # read the mark just before it can still send there, after its three PUTs and two conflict waits.
+            if ($hostNotBefore -is [datetime] -and (Get-DbHubUtcNow) -lt $hostNotBefore) {
+                $State.Waiting = $true
+                return
+            }
             $listed = Get-DbHubRcaListed -Context $Context -VmName $State.Vm
+            $State.ListFailed = -not $listed.Ok
             if (-not $listed.Ok -or @($listed.Names).Count -gt 0) {
                 $State.Waiting = $true
                 return
@@ -6723,7 +6747,7 @@ function Invoke-DbHubRcaExport {
             }
         }
         $held = -not $sentName -and $entry.Vm -in @($SkipVm)
-        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Unread = $false; Held = $held; Others = 0; Outside = 0; Consumed = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0; Waiting = $false; WantExport = $false }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Unread = $false; Held = $held; Others = 0; Outside = 0; Consumed = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0; Waiting = $false; ListFailed = $false; WantExport = $false }
         if (($NoNewExport -or $held) -and -not $sentName -and $earlier.Count -eq 0) {
             if ($held) {
                 $state.Outcome = 'Held'
@@ -6821,7 +6845,13 @@ function Invoke-DbHubRcaExport {
                     $state.Waiting = $false
                     $state.WantExport = $false
                     $state.Outcome = 'Busy'
-                    $state.Message = '{0} takes one Run Command at a time (R871), and another job''s export Run Commands were still there when this export''s time was up, so this export sent nothing there; what its observer captured stays on it until the next export.' -f $state.Vm
+                    # A list that kept failing kept the host waiting too, as it should; its message says so (review of 242a3ef7).
+                    $state.Message = if ($state.ListFailed) {
+                        '{0} takes one Run Command at a time (R871), and its Run Commands couldn''t be listed when this export''s time was up, so this export sent nothing there; what its observer captured stays on it until the next export.' -f $state.Vm
+                    }
+                    else {
+                        '{0} takes one Run Command at a time (R871), and another job''s export Run Commands were still there when this export''s time was up, so this export sent nothing there; what its observer captured stays on it until the next export.' -f $state.Vm
+                    }
                     continue
                 }
             }
@@ -7321,7 +7351,10 @@ function Invoke-DbHubRcaSessionExport {
 
         [switch] $WhileRunning,
 
-        [switch] $NoNewExport
+        [switch] $NoNewExport,
+
+        [AllowNull()]
+        [object] $HostNotBeforeUtc = $null
     )
 
     $state = ConvertTo-DbHubRcaState -State $Earlier -SessionId $SessionId
@@ -7332,7 +7365,7 @@ function Invoke-DbHubRcaSessionExport {
         return [pscustomobject]@{ State = $state; Index = $null; Lines = @([pscustomobject]@{ Step = 'RCA.EXPORT'; Status = 'Warning'; Message = $state['message']; Fix = 'Run ./scripts/deploy.ps1.' }); New = 0; Held = $false; Fresh = @(); Others = @(); Hosts = @() }
     }
     $earlierBundles = @($state['bundles']).Count
-    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc ((Get-DbHubUtcNow).AddMinutes($Minutes)) -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -SessionWindow $SessionWindow -OutsideFromUtc $OutsideFromUtc -OutsideToUtc $OutsideToUtc -HeldBy $HeldBy -NoNewExport:$NoNewExport -WhileRunning:$WhileRunning -PollSeconds $PollSeconds
+    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc ((Get-DbHubUtcNow).AddMinutes($Minutes)) -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -SessionWindow $SessionWindow -OutsideFromUtc $OutsideFromUtc -OutsideToUtc $OutsideToUtc -HeldBy $HeldBy -NoNewExport:$NoNewExport -WhileRunning:$WhileRunning -PollSeconds $PollSeconds -HostNotBeforeUtc $HostNotBeforeUtc
     $pending = New-Object -TypeName 'System.Collections.Generic.List[object]'
     foreach ($item in @($run.Pending)) {
         $pending.Add($item)
@@ -8960,6 +8993,7 @@ function Invoke-DbHubRcaStop {
         $skip = @()
         $from = $null
         $to = $null
+        $hostAfter = $null
         $copy = Read-DbHubSessionStatusCopy -Context $Context
         if ($null -ne $copy -and [string]$copy['sessionId'] -eq $session) {
             $earlier = Get-DbHubMember -InputObject $copy -Name 'rca'
@@ -8968,8 +9002,14 @@ function Invoke-DbHubRcaStop {
             # Nothing captured before the session began (review of 02d398a).
             $from = ConvertTo-DbHubUtc -Value $copy['rcaPreviousEndUtc']
             $to = ConvertTo-DbHubUtc -Value $copy['acceptedUtc']
+            # The T2 host from 60 s after the stop's mark (review of 242a3ef7): a re-check that read the mark open just before
+            # it can still send there, after its three PUTs and Send-DbHubRunCommand's two conflict waits.
+            $begun = ConvertTo-DbHubUtc -Value $copy['stopBegunUtc']
+            if ($begun -is [datetime]) {
+                $hostAfter = $begun.AddSeconds($script:DbHubRcaStopHostDelaySeconds)
+            }
         }
-        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds)
+        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds -HostNotBeforeUtc $hostAfter)
     }
     catch {
         Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at its stop: {0}' -f $_.Exception.Message)
