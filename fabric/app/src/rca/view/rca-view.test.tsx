@@ -191,4 +191,16 @@ describe("the report's errors table", () => {
         // Known counts alone, as before.
         expect(rowsOf(before)).toEqual([["100", "T5", "14:40 UTC (14:40 UTC) to 15:00 UTC (15:00 UTC)"]]);
     });
+
+    // The re-review of 8b43102e: two of three known 5-minute counts end before an interval of unknown length from 15:00, but
+    // the table said it "may hold the 3 counted", where the tools say "some of", and the class counted 30, not those 2 more.
+    it("says an interval of unknown length may hold some of the known counts when some end before it, and counts those", () => {
+        const known = ["14:50", "14:55", "15:05"].map((hm) => count("T4", minute(hm, 0), 1, 300_000));
+        const events = [count("T4", hour, 30, "unknown"), ...known];
+        expect(rowsOf(events)).toEqual([["30 in an interval of unknown length, which may hold some of the 3 counted", "T4", "from 15:00 UTC (15:00 UTC), length unknown; counted 14:50 UTC (14:50 UTC) to 15:10 UTC (15:10 UTC)"]]);
+        expect((analyzeErrorsResult(events).details!.classes as Array<{ count: number }>)[0].count).toBe(32);
+        // One known instant reads as one.
+        const instant = [count("T4", hour, 30, "unknown"), count("T4", minute("15:20", 0), 2, 0)];
+        expect(rowsOf(instant)[0][2]).toBe("from 15:00 UTC (15:00 UTC), length unknown; counted at 15:20 UTC (15:20 UTC)");
+    });
 });

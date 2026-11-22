@@ -66,7 +66,7 @@ export interface ErrorSummary {
     last: Date;
     /** Its counts whose interval isn't known in these minutes (the reviews of 4667459c and 11b7c4b9), apart from the known ones in words: their total, the first one's start, and how many intervals; null when it has none. */
     open: { count: number; from: Date; intervals: number } | null;
-    /** Its known counts: their total and span; null when it has none. With `open`, `count` adds them only when they end before its interval begins (the re-review of 087e096a). */
+    /** Its known counts: their total and span; null when it has none. With `open`, `count` adds those that end by its interval's start, and of the rest takes the larger (openKnownCount; the re-reviews of 087e096a and 8b43102e). */
     known: { count: number; first: Date; last: Date } | null;
     intercepted: number;
     top: string;
@@ -97,6 +97,8 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         const knownRows = rows.filter((r) => !r.intervalUnknown);
         const open = openRows.length ? { count: sum(openRows), from: new Date(Math.min(...openRows.map((r) => r.at.getTime()))), intervals: openRows.length } : null;
         const known = knownRows.length ? { count: sum(knownRows), first: new Date(Math.min(...knownRows.map((r) => r.at.getTime()))), last: new Date(Math.max(...knownRows.map((r) => r.at.getTime() + (r.intervalMs ?? 0)))) } : null;
+        // The known counts that end by the open interval's start can't be in it (the re-review of 8b43102e).
+        const before = open ? sum(knownRows.filter((r) => r.at.getTime() + (r.intervalMs ?? 0) <= open.from.getTime())) : 0;
         const tally = new Map<string, number>();
         for (const r of rows) {
             const who = r.module ?? r.program ?? r.detail.slice(0, 60);
@@ -104,7 +106,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         }
         return {
             classId: id, title: c.title,
-            count: open ? openKnownCount(open, known) : sum(rows),
+            count: open ? openKnownCount(open, before, sum(knownRows) - before) : sum(rows),
             targets: [...new Set(rows.map((r) => r.target))],
             first: sorted[0].at, last, open, known,
             intercepted: rows.filter((r) => r.intercepted).reduce((n, r) => n + (r.count ?? 1), 0),

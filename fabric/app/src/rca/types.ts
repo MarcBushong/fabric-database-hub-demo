@@ -347,17 +347,18 @@ function knownBefore(open: { from: Date }, known: { count: number; last: Date } 
 export function openCountWords(open: { count: number; from: Date; intervals: number }, known: { count: number; first: Date; last: Date } | null, what = ""): string {
     const where = `${open.count}${what ? ` ${what}` : ""} ${open.intervals > 1 ? `in ${open.intervals} intervals` : "in the interval"} from ${hhmmss(open.from)} UTC, whose length isn't known in these minutes`;
     if (!known || known.count === 0) return where;
-    const span = `${hhmmss(known.first)} to ${hhmmss(known.last)} UTC`;
-    if (knownBefore(open, known)) return `${where}, after the ${known.count} counted from ${span}`;
-    return `${where}, which may hold ${known.first < open.from ? "some of " : ""}the ${known.count} counted from ${span}`;
+    // One instant reads as one (the re-review of 8b43102e: "the 5 counted from 15:20:00 to 15:20:00 UTC").
+    const span = known.first.getTime() === known.last.getTime() ? `at ${hhmmss(known.first)} UTC` : `from ${hhmmss(known.first)} to ${hhmmss(known.last)} UTC`;
+    if (knownBefore(open, known)) return `${where}, after the ${known.count} counted ${span}`;
+    return `${where}, which may hold ${known.first < open.from ? "some of " : ""}the ${known.count} counted ${span}`;
 }
 
 /**
- * The count of a class with counts of an interval whose length isn't known (the re-review of 087e096a), for its ranking and
- * severity: both when the known ones end before that interval begins, since they can't overlap (100 counted from 14:40 to
- * 15:00 and 3,000 from 15:00 are 3,100), and otherwise the larger, since that interval may hold the known ones.
+ * The count of a class with counts of an interval whose length isn't known (the re-reviews of 087e096a and 8b43102e), for its
+ * ranking and severity. Its known counts that end by that interval's start can't be in it, so they add (`before`: 100
+ * counted from 14:40 to 15:00 beside 3,000 from 15:00 are 3,100); of the rest (`after`), which it may hold, the larger
+ * stands for both.
  */
-export function openKnownCount(open: { count: number; from: Date }, known: { count: number; last: Date } | null): number {
-    if (!known || known.count === 0) return open.count;
-    return knownBefore(open, known) ? open.count + known.count : Math.max(open.count, known.count);
+export function openKnownCount(open: { count: number }, before: number, after: number): number {
+    return before + Math.max(open.count, after);
 }

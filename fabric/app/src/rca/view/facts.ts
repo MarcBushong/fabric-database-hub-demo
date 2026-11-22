@@ -68,9 +68,11 @@ export function errorClassCells(c: ErrorClassRow, timeZone: string): { count: st
     const unknown = `${n(open.count)} in ${open.intervals > 1 ? `${open.intervals} intervals` : "an interval"} of unknown length`;
     const from = `from ${at(open.from)}, length unknown`;
     if (!c.known || !c.knownFirst || !c.knownLast) return { count: unknown, when: from };
-    const counted = `${at(c.knownFirst)} to ${at(c.knownLast)}`;
+    const counted = c.knownFirst === c.knownLast ? `at ${at(c.knownFirst)}` : `${at(c.knownFirst)} to ${at(c.knownLast)}`;
     if (new Date(c.knownLast).getTime() <= new Date(open.from).getTime()) {
         return { count: `${n(c.count)}: ${n(c.known)} counted, then ${unknown}`, when: `${counted}, then ${from}` };
     }
-    return { count: `${unknown}, which may hold the ${n(c.known)} counted`, when: `${from}; counted ${counted}` };
+    // Known counts from before that interval's start can't all be in it (the re-review of 8b43102e), as the tools say.
+    const some = new Date(c.knownFirst).getTime() < new Date(open.from).getTime() ? "some of " : "";
+    return { count: `${unknown}, which may hold ${some}the ${n(c.known)} counted`, when: `${from}; counted ${counted}` };
 }

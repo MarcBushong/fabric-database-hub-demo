@@ -11,7 +11,7 @@ import { emptyListNote } from "./view/facts";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
-import { emptyEvidence, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
+import { emptyEvidence, type EventRow, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 const minute = (from: string, n: number) => new Date(at(from).getTime() + n * 60_000);
@@ -485,6 +485,42 @@ describe("a coarser point a finer save holds part of", () => {
         const errors = (triaged.details!.hypotheses as Array<{ family: string; summary: string; score: number }>).find((h) => h.family === "errors");
         expect(errors?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes, after the 20 counted from 14:40:00 to 15:00:00 UTC (Azure Monitor counts included).");
         expect(errors?.score).toBe(5.4);
+    });
+
+    // The re-review of 8b43102e: triage pooled every kind of error under one interval of unknown length, so an hour's 30 failed
+    // connections from 15:00 "may hold the 7 counted", 5 statement-timeout cancels among them, which a failed-connections
+    // count can't hold: it counted 30 where explain_errors counts 35. And one instant read "from 15:20:00 to 15:20:00".
+    const refusals = (times: readonly string[]) => {
+        const hourly = save("18:05", "14:00", "18:00");
+        const failed = ["14:00", "15:00", "16:00", "17:00"].map((b) => ({ ...hourly(b, "connections_failed", b === "15:00" ? 30 : 0), TargetKey: "T4", ResourceName: "pgflex01" }));
+        const event = (time: string, code: string, detail: string): EventRow => ({ target: "T4", at: at(time), kind: "error", code, count: 1, detail });
+        const events = [...Array.from({ length: 5 }, () => event("15:20:00", "57014", "canceling statement due to statement timeout")), ...times.map((t) => event(t, "53300", "sorry, too many clients already"))];
+        return createInvestigationTools({
+            load: async () => ({ ...emptyEvidence(), events }),
+            telemetry: async (from, to) => monitorTelemetry(failed.filter((r) => Date.parse(`${r.Bucket}Z`) >= from.getTime() && Date.parse(`${r.Bucket}Z`) <= to.getTime()), { from, to }),
+            timeZone: "UTC",
+            latestDay: at("00:00:00"),
+            latest: at("18:00:00"),
+        });
+    };
+    const refusalWindow = { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:30:00Z", targets: ["T4"] };
+
+    it("counts triage's errors by class, as explain_errors does", async () => {
+        const tools = refusals(["15:20:00", "15:25:00"]);
+        const errors = await ask("explain_errors", refusalWindow, tools);
+        expect((errors.details!.classes as Array<{ class: string; count: number }>).map((c) => [c.class, c.count])).toEqual([["connection-refused", 30], ["timeout-or-cancel", 5]]);
+        const triaged = await ask("triage_window", refusalWindow, tools);
+        const hypothesis = (triaged.details!.hypotheses as Array<{ family: string; summary: string; score: number }>).find((h) => h.family === "errors");
+        expect(hypothesis?.summary).toBe("T4: 35 errors and cancels: 30 refused connections and failed logins in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 2 counted from 15:20:00 to 15:25:00 UTC; 5 timeouts and cancels (attentions) at 15:20:00 UTC (Azure Monitor counts included).");
+        expect(hypothesis?.score).toBe(5.6);
+    });
+
+    it("says one instant of known counts beside an interval of unknown length as one", async () => {
+        const tools = refusals(["15:20:00", "15:20:00"]);
+        const errors = await ask("explain_errors", refusalWindow, tools);
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were refused connections and failed logins \(30 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 2 counted at 15:20:00 UTC, mostly /);
+        const triaged = await ask("triage_window", refusalWindow, tools);
+        for (const r of [errors, triaged]) expect(texts(r)).not.toMatch(/15:20:00 to 15:20:00/);
     });
 
     // A peak kept around a finer save is only an upper bound of each stretch it's kept for: the replica's rise is said as
