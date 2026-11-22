@@ -66,8 +66,14 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
     const provisionedPoint = input.metrics.filter((m) => m.target === "T5" && m.metric === COSMOS_METRICS.provisioned && m.value !== null && m.at <= to).sort((a, b) => a.at.getTime() - b.at.getTime()).pop();
     const provisioned = provisionedPoint?.value ?? null;
 
-    const those = at100.length > 1 ? "those intervals" : "that interval";
-    const where = full.length > 1 ? `each of the ${full.length} intervals from ${hhmm(at100[0].at)}${until(at100[at100.length - 1])} UTC` : `the interval from ${hhmm(peak.at)}${until(peak)} UTC`;
+    // The intervals between the first at 100 % and the last: "each of the 9" only when none is under it. Final tests' check
+    // of ddebd4c3 (F6): 9 of the 11 from 15:31 to 15:42 read as all of them, and the 429s of the other 2 were in the page's
+    // errors only (14,593 there, 13,222 here).
+    const [first, last] = [at100[0].at.getTime(), at100[at100.length - 1].at.getTime()];
+    const lower = full.length > 1 ? normalized.filter((m) => m.at.getTime() > first && m.at.getTime() < last && (m.value ?? 0) < 100) : [];
+    const those = at100.length > 1 ? (lower.length > 0 ? `those ${full.length} intervals` : "those intervals") : "that interval";
+    const which = lower.length > 0 ? `${full.length} of the ${full.length + lower.length} intervals` : `each of the ${full.length} intervals`;
+    const where = full.length > 1 ? `${which} from ${hhmm(at100[0].at)}${until(at100[at100.length - 1])} UTC` : `the interval from ${hhmm(peak.at)}${until(peak)} UTC`;
     const reached = full.length
         ? `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in ${each}) reached 100 % in at least one second of ${where}: in such a second, at least one partition key range used all of its share of the RU/s.`
         : `T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in ${each}) peaked at ${Math.round(peak.value ?? 0)} % in ${where}.`;
@@ -83,6 +89,13 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
         counted = ` Azure Monitor counted ${of}: a request to a range that had used its share in that second was refused, with the time to wait before retrying it.${guide}`;
     } else if (refused !== null) {
         counted = ` Azure Monitor counted ${total !== null ? `${plural(total, "request")} in ${those}, none of them throttled` : `no throttled request (429) in ${those}`}.`;
+    }
+    // The 429s of the span's intervals under 100 %, so its count adds up to the minutes' own (F6).
+    const inLower = (m: MetricPoint) => lower.some((n) => m.at.getTime() >= n.at.getTime() && m.at.getTime() < Math.max(end(n).getTime(), n.at.getTime() + 1));
+    const between = sum(throttled.filter(inLower));
+    if (between > 0) {
+        const others = lower.length === 1 ? "the other interval" : `the other ${lower.length} intervals`;
+        counted += ` In ${others}, where normalized RU consumption stayed under 100 %, Azure Monitor counted ${plural(between, `${refused ? "more " : ""}throttled request`)}.`;
     }
     // A whole reading's interval that finer saves hold part of says what they hold (the review of c4c63abe).
     const wholeOf = (rows: readonly MetricPoint[]) => rows.find((m) => m.whole && m.whole.covered.length > 0)?.whole;

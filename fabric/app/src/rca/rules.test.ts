@@ -430,6 +430,27 @@ describe("T5's normalized RU consumption at 100 %", () => {
         expect(a.rootCause?.statement).toContain("the interval from 17:00 to 17:03 UTC");
     });
 
+    // Final tests' check of ddebd4c3 (F6): "each of the 9 intervals from 15:31 to 15:42" read as all 11 at 100 %, and the 429s
+    // of the 2 under it were only in the page's errors table, so it said 14,593 where the statement said 13,222.
+    it("says how many of the intervals from its first at 100 % to its last were, and counts the 429s of the others", () => {
+        const series = (ru: number[], throttled: number[]) => [
+            ...ru.map((v, i) => point(COSMOS_METRICS.normalizedRu, `17:0${i}:00`, v)),
+            ...ru.map((_, i) => point(COSMOS_METRICS.requests, `17:0${i}:00`, 1000)),
+            ...throttled.map((v, i) => point(COSMOS_METRICS.throttled, `17:0${i}:00`, v)),
+        ];
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:05:00"), metrics: series([100, 4, 100, 100, 3], [300, 200, 400, 100, 50]) });
+        expect(a.rootCause?.statement).toContain("reached 100 % in at least one second of 3 of the 4 intervals from 17:00 to 17:04 UTC:");
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 3000 requests in those 3 intervals, 800 of them throttled (429, 26.7 %)");
+        // 17:01's, not 17:04's, which comes after the last interval at 100 %.
+        expect(a.rootCause?.statement).toContain(" In the other interval, where normalized RU consumption stayed under 100 %, Azure Monitor counted 200 more throttled requests.");
+        expect(analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 4, 100], [300, 0, 400]) }).rootCause?.statement).not.toContain("In the other");
+        // None throttled at 100 %: the others' are counted, with no "more".
+        const quiet = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 4, 100], [0, 70, 0]) });
+        expect(quiet.rootCause?.statement).toContain("Azure Monitor counted 2000 requests in those 2 intervals, none of them throttled. In the other interval, where normalized RU consumption stayed under 100 %, Azure Monitor counted 70 throttled requests.");
+        // Every interval at 100 %: "each of", as before.
+        expect(analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 100, 60], [1, 1, 1]) }).rootCause?.statement).toContain("each of the 2 intervals from 17:00 to 17:02 UTC: ");
+    });
+
     it.each([
         ["above 5 %: more throughput", [150, 50, 0], "200 of them throttled (429, 8 %)", "That's more than the 5 % of requests at which Learn recommends more throughput.", ["RU-RETRY", "RU-AUTOSCALE"]],
         ["up to 5 %: the clients' retries only", [60, 40, 0], "100 of them throttled (429, 4 %)", "Learn counts up to 5 % of requests throttled, with acceptable latency, as RU/s fully used, with no action needed.", ["RU-RETRY"]],

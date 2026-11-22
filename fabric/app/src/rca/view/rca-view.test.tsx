@@ -13,6 +13,7 @@ import { analyzeErrorsResult } from "@/rca/errors";
 import { createInvestigationTools } from "@/rca/tools";
 import type { EventRow, InvestigationResult } from "@/rca/types";
 import { RcaReport } from "@/rca/view/RcaReport";
+import { episodeOf, ERRORS_AROUND_MINUTES } from "@/rca/view/facts";
 import { answerKeyInContext } from "@/test/blind";
 import { renderWithApp, type FakeQueryClient } from "@/test/render";
 import { STAGE_TOKENS } from "@/theme/stage";
@@ -202,6 +203,21 @@ describe("the report's errors table", () => {
         return cells;
     };
     const hour = minute("15:00", 0);
+
+    // Final tests' check of ddebd4c3 (F6): T5's storm from 15:31 said 13,222 throttled requests, for its 9 intervals at 100 %,
+    // and its errors table 14,593, read as the page reads them, with nothing on the page to say why.
+    it("says which minutes it counts, the incident's and 2 on either side, beside a root cause that counts only the intervals it names", async () => {
+        const tools = createInvestigationTools({ ...liveSources(), timeZone: "UTC", latestDay: live("00:00:00"), latest: live("21:33:15") });
+        const storm = (await tools.investigate("explain_incident", { episodeKey: LIVE_KEYS.ru })) as InvestigationResult;
+        const facts = episodeOf(storm)!;
+        const around = (at: string, sign: number) => new Date(Date.parse(at) + sign * ERRORS_AROUND_MINUTES * 60_000).toISOString();
+        const errors = (await tools.investigate("explain_errors", { from: around(facts.start, -1), to: around(facts.end!, 1), targets: ["T5"] })) as InvestigationResult;
+        renderWithApp(<RcaReport incident={storm} errors={errors} timeZone="UTC" logs={[]} />);
+        const section = screen.getByRole("heading", { name: "Errors in these minutes" }).closest("section")!;
+        expect(within(section).getByText("Recorded from 15:29 UTC (15:29 UTC) to 15:44 UTC (15:44 UTC), the incident's minutes and 2 on either side. A count in the root cause covers only the intervals it names, so it can be lower.")).toBeInTheDocument();
+        expect(within(within(section).getByRole("table")).getAllByRole("row")[1].textContent).toContain("14,593");
+        expect(storm.rootCause?.statement).toContain("13222 of them throttled");
+    });
 
     it("shows counts of an interval whose length isn't known apart, from that interval's start with its length unknown", () => {
         expect(rowsOf([count("T4", hour, 7, "unknown")])).toEqual([["7 in an interval of unknown length", "T4", "from 15:00 UTC (15:00 UTC), length unknown"]]);

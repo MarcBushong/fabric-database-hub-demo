@@ -20,7 +20,7 @@ import { createRcaClient } from "@/rca/client";
 import type { DaxLog } from "@/rca/loader";
 import { bothTimes } from "@/rca/time";
 import type { InvestigationResult } from "@/rca/types";
-import { emptyListNote, episodeOf, incidentsByEvidence } from "@/rca/view/facts";
+import { emptyListNote, episodeOf, ERRORS_AROUND_MINUTES, incidentsByEvidence } from "@/rca/view/facts";
 import { RcaReport } from "@/rca/view/RcaReport";
 import { parseSelection } from "@/rca/view/selection";
 
@@ -87,8 +87,8 @@ export default function RcaPage() {
             const start = new Date(facts?.start ?? incident.window.fromUtc);
             const end = new Date(facts?.end ?? incident.window.toUtc);
             const errors = await tools.investigate("explain_errors", {
-                from: new Date(start.getTime() - 2 * 60000).toISOString(),
-                to: new Date(end.getTime() + 2 * 60000).toISOString(),
+                from: new Date(start.getTime() - ERRORS_AROUND_MINUTES * 60000).toISOString(),
+                to: new Date(end.getTime() + ERRORS_AROUND_MINUTES * 60000).toISOString(),
                 targets: [facts?.target ?? fallbackTarget],
             });
             return { incident, errors: typeof errors === "string" ? null : errors, logs: client.drainLogs() };

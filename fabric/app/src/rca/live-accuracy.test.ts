@@ -217,8 +217,17 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         const sum = (metric: string) => cosmos.points.filter((p) => p.metric === metric && at100.has(p.at.getTime())).reduce((n, p) => n + p.value, 0);
         expect(at100.size).toBe(9);
         expect([sum(COSMOS_METRICS.requests), sum(COSMOS_METRICS.throttled)]).toEqual([24820, 13222]);
-        expect(r.rootCause?.statement).toContain("reached 100 % in at least one second of each of the 9 intervals from 15:31 to 15:42 UTC");
-        expect(r.rootCause?.statement).toContain("Azure Monitor counted 24820 requests in those intervals, 13222 of them throttled (429, 53.3 %)");
+        expect(r.rootCause?.statement).toContain("reached 100 % in at least one second of 9 of the 11 intervals from 15:31 to 15:42 UTC");
+        expect(r.rootCause?.statement).toContain("Azure Monitor counted 24820 requests in those 9 intervals, 13222 of them throttled (429, 53.3 %)");
+        // Final tests' check of ddebd4c3 (F6): the 429s of 15:34 and 15:38, under 100 %, were only in the page's errors table,
+        // 14,593 from 15:31 to 15:43 with 15:42's. The statement counts them too, so the two add up.
+        const throttledAt = (keep: (t: number) => boolean) => cosmos.points.filter((p) => p.metric === COSMOS_METRICS.throttled && keep(p.at.getTime())).reduce((n, p) => n + p.value, 0);
+        const between = throttledAt((t) => t >= live("15:31:00").getTime() && t < live("15:42:00").getTime() && !at100.has(t));
+        expect(between).toBe(1354);
+        expect(r.rootCause?.statement).toContain(" In the other 2 intervals, where normalized RU consumption stayed under 100 %, Azure Monitor counted 1354 more throttled requests.");
+        const storm = await ask("explain_incident", { episodeKey: "T5-throttling-20261121T153100Z" });
+        expect(storm.rootCause?.statement).toContain("(14593, 15:31:00 to 15:43:00 UTC,");
+        expect(13222 + between + throttledAt((t) => t === live("15:42:00").getTime())).toBe(14593);
         // One note that T5 wasn't captured, the incident's, not its part's too (the coordinator's note on 803f2b1a), in the
         // form B's model gives it: T5's coverage rows are marked not captured (Final tests' check of ddebd4c3, F2).
         expect(r.notCaptured.filter((line) => /^T5: no RCA (capture recorded|evidence)/.test(line))).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);

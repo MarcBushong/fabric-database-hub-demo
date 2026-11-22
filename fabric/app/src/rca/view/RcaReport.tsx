@@ -7,7 +7,7 @@ import { bothTimes } from "../time";
 import type { ChainNodeView } from "../tools";
 import type { InvestigationResult, Recommendation } from "../types";
 import { ChainTree } from "./ChainTree";
-import { episodeOf, errorClassCells, type ErrorClassRow } from "./facts";
+import { episodeOf, errorClassCells, errorsWindowNote, type ErrorClassRow } from "./facts";
 
 interface Tree {
     target: string;
@@ -182,6 +182,11 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
 
             <section className="rca-panel" aria-labelledby="rca-errors-title">
                 <h2 id="rca-errors-title">Errors in these minutes</h2>
+                {errors ? (
+                    <p className="rca-muted" style={{ margin: "0 0 8px" }}>
+                        {errorsWindowNote(errors, timeZone)}
+                    </p>
+                ) : null}
                 {classes.length > 0 ? (
                     <table className="rca-table">
                         <thead>

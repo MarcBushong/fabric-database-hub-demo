@@ -22,6 +22,20 @@ export function episodeOf(result: InvestigationResult): EpisodeFacts | null {
     return list?.[0] ?? null;
 }
 
+/** The minutes either side of an incident that the Root cause page reads its errors over (explain_errors). */
+export const ERRORS_AROUND_MINUTES = 2;
+
+/**
+ * What the errors table counts, beside the root cause: every error and 429 in its own minutes, which take in the
+ * incident's and a little either side, so its counts can be the root cause's and more. Final tests' check of ddebd4c3
+ * (F6): T5's storm from 15:31 said 13,222 throttled requests, for its 9 intervals at 100 %, and its table 14,593.
+ */
+export function errorsWindowNote(errors: InvestigationResult, timeZone: string): string {
+    const from = bothTimes(new Date(errors.window.fromUtc), timeZone);
+    const to = bothTimes(new Date(errors.window.toUtc), timeZone);
+    return `Recorded from ${from} to ${to}, the incident's minutes and ${ERRORS_AROUND_MINUTES} on either side. A count in the root cause covers only the intervals it names, so it can be lower.`;
+}
+
 /**
  * The incidents with the richest evidence first, as the Root cause view lists them and the postmortem explains them: the
  * capture's own (a blocking chain, the replica's stall), then the others the investigations explain (errors, throttling),
