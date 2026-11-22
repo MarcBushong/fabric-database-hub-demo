@@ -3,10 +3,12 @@
 // bounded DAX query on the history model as the signed-in viewer. Blind (ADR 0031): Telemetry Snapshots and the RCA
 // tables only, over any session, not only the latest capture.
 
+import { finestPerInterval, HOURLY_METRICS } from "@/data/finest-per-interval";
 import { toBins, toCosmosCapture, toPostgresCapture, toWaitBins, withCategoryWaits } from "@/data/model";
 import { incidentSeriesQuery, incidentWaitsQuery, type QuerySpec } from "@/data/queries";
 import { isMissingInModel } from "@/data/retry";
 import { SQL_TARGETS } from "@/lib/dax";
+import { toDate as toInstant } from "@/lib/format";
 import { loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError, rcaMonitorDax, type DaxLog } from "./loader";
 import { toDate } from "./rows";
 import type { Telemetry } from "./tools";
@@ -22,110 +24,67 @@ export interface RcaSources {
     telemetry(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<Telemetry>;
 }
 
-/**
- * Azure Monitor's points for the RCA, one per interval, with each point's own interval (by pointKey). The history keeps
- * every save, each at its own grain (1 to 1,440 minutes, the smallest that fits), so one minute can be in several: the
- * finest grain is kept first, and of equal grains the newest capture. A coarser point whose interval overlaps a kept one
- * is left out, so no minute counts twice. The model's measures keep the newest capture of each bin instead, which kept
- * B's day-long save at 15 minutes beside the session's own 1-minute points: T5's requests and 429s for 15:30 to 15:42
- * counted both, and the replica's lag at 16:15 read as 5 minutes at 178 s, the 15 minutes' highest (the review of
- * 803f2b1a). A point's grain is its series' step in its capture, or else its capture's smallest.
- */
-export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; intervals: Map<string, number> } {
-    const captureOf = (row: Row) => `${String(row.CapturedAt)}|${row.TargetKey === "T5" ? "cosmos" : "postgres"}`;
-    const seriesOf = (row: Row) => `${String(row.CapturedAt)}|${String(row.TargetKey)}|${String(row.Metric)}`;
-    const times = new Map<string, { capture: string; at: number[] }>();
-    for (const row of rows) {
-        const at = toDate(row.Bucket);
-        if (!at) continue;
-        const series = times.get(seriesOf(row)) ?? { capture: captureOf(row), at: [] };
-        series.at.push(at.getTime());
-        times.set(seriesOf(row), series);
-    }
-    const seriesStep = new Map<string, number>();
-    const captureStep = new Map<string, number>();
-    for (const [key, series] of times) {
-        const sorted = [...new Set(series.at)].sort((a, b) => a - b);
-        const gaps = sorted.slice(1).map((t, i) => t - sorted[i]);
-        if (gaps.length === 0) continue;
-        const step = Math.min(...gaps);
-        seriesStep.set(key, step);
-        captureStep.set(series.capture, Math.min(captureStep.get(series.capture) ?? step, step));
-    }
-    const groups = new Map<string, Array<{ row: Row; at: number; step: number; captured: number }>>();
-    for (const row of rows) {
-        const at = toDate(row.Bucket);
-        if (!at) continue;
-        const key = `${String(row.TargetKey)}|${String(row.Metric)}`;
-        const group = groups.get(key) ?? [];
-        group.push({ row, at: at.getTime(), step: seriesStep.get(seriesOf(row)) ?? captureStep.get(captureOf(row)) ?? 0, captured: toDate(row.CapturedAt)?.getTime() ?? 0 });
-        groups.set(key, group);
-    }
-    const kept: Row[] = [];
-    const intervals = new Map<string, number>();
-    for (const group of groups.values()) {
-        // The finest grain first, a point of unknown grain last; of equal grains, the newest capture.
-        group.sort((a, b) => (a.step || Infinity) - (b.step || Infinity) || b.captured - a.captured || a.at - b.at);
-        const taken: Array<[number, number]> = [];
-        for (const p of group) {
-            const end = p.at + Math.max(p.step, 1);
-            if (taken.some(([start, stop]) => p.at < stop && start < end)) continue;
-            taken.push([p.at, end]);
-            kept.push(p.row);
-            if (p.step > 0) intervals.set(pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(p.at)), p.step);
-        }
-    }
-    return { kept: kept.sort((a, b) => (toDate(a.Bucket)?.getTime() ?? 0) - (toDate(b.Bucket)?.getTime() ?? 0)), intervals };
-}
+// One point per interval, from the history's overlapping saves: the shared finestPerInterval (F35, from the release's
+// follow-ups, src/data/finest-per-interval.ts), which the app's T4 and T5 views read through too. Its rows go once to
+// the pure decoders (toPostgresCapture, toCosmosCapture): its output isn't valid input again. Re-exported for the tests.
+export { finestPerInterval };
 
 /**
  * The coarsest interval of the history's points at each time, by pointKey, read before finestPerInterval keeps one point
  * per interval: a key an earlier list made from a coarser save's point (B's day-long save, 15 minutes at 15:30) reads as
- * the incident in that point's interval, as it did then (the review of 97fdf5ba). A point's grain is its series' step in
- * its capture, or else its capture's smallest, as finestPerInterval finds it; that function stays as the shared one is.
+ * the incident in that point's interval, as it did then (the review of 97fdf5ba). A point's grain is the shared
+ * function's: its save's step, the smallest gap in any of the save's series, and at least an hour for T5's hourly metrics.
  */
 export function coarsestIntervals(rows: readonly Row[]): Map<string, number> {
-    const captureOf = (row: Row) => `${String(row.CapturedAt)}|${row.TargetKey === "T5" ? "cosmos" : "postgres"}`;
-    const seriesOf = (row: Row) => `${String(row.CapturedAt)}|${String(row.TargetKey)}|${String(row.Metric)}`;
+    const familyOf = (row: Row) => (row.TargetKey === "T5" ? "cosmos" : row.TargetKey === "T4" || row.TargetKey === "T4-replica" ? "postgres" : "sql");
+    const captureOf = (row: Row) => `${String(row.CapturedAt)}|${familyOf(row)}`;
+    const seriesOf = (row: Row) => `${String(row.CapturedAt)}|${String(row.TargetKey)}|${String(row.AnalysisKey ?? "")}|${String(row.Metric)}`;
     const times = new Map<string, { capture: string; at: Set<number> }>();
     for (const row of rows) {
-        const at = toDate(row.Bucket);
-        if (!at) continue;
+        const at = toInstant(row.Bucket);
+        if (!at || HOURLY_METRICS.has(String(row.Metric))) continue;
         const series = times.get(seriesOf(row)) ?? { capture: captureOf(row), at: new Set<number>() };
         series.at.add(at.getTime());
         times.set(seriesOf(row), series);
     }
-    const seriesStep = new Map<string, number>();
     const captureStep = new Map<string, number>();
-    for (const [key, series] of times) {
+    for (const series of times.values()) {
         const sorted = [...series.at].sort((a, b) => a - b);
-        if (sorted.length < 2) continue;
-        const step = Math.min(...sorted.slice(1).map((t, i) => t - sorted[i]));
-        seriesStep.set(key, step);
-        captureStep.set(series.capture, Math.min(captureStep.get(series.capture) ?? step, step));
+        for (let i = 1; i < sorted.length; i++) {
+            const gap = sorted[i] - sorted[i - 1];
+            const step = captureStep.get(series.capture);
+            if (step === undefined || gap < step) captureStep.set(series.capture, gap);
+        }
     }
     const out = new Map<string, number>();
     for (const row of rows) {
-        const at = toDate(row.Bucket);
+        const at = toInstant(row.Bucket);
         if (!at) continue;
-        const step = seriesStep.get(seriesOf(row)) ?? captureStep.get(captureOf(row)) ?? 0;
+        const step = captureStep.get(captureOf(row)) ?? 0;
+        const grain = HOURLY_METRICS.has(String(row.Metric)) ? Math.max(60 * 60_000, step) : step;
         const key = pointKey(String(row.TargetKey), String(row.Metric), at);
-        if (step > (out.get(key) ?? 0)) out.set(key, step);
+        if (grain > (out.get(key) ?? 0)) out.set(key, grain);
     }
     return out;
 }
 
-/** Azure Monitor's rows as the investigations read them: one point per interval with its own interval, and each time's coarsest. */
-export function monitorTelemetry(rows: readonly Row[]): Pick<Telemetry, "postgres" | "cosmos" | "intervals" | "keyIntervals"> {
-    const { kept, intervals } = finestPerInterval(rows);
+/**
+ * Azure Monitor's rows as the investigations read them, from one call of the shared finestPerInterval: one point per
+ * interval with its span (intervals) and its save's step (grains), the source of each piece of a coarser point and which
+ * pieces are upper bounds, and each time's coarsest point (keyIntervals).
+ */
+export function monitorTelemetry(rows: readonly Row[]): Pick<Telemetry, "postgres" | "cosmos" | "intervals" | "grains" | "sources" | "upperBounds" | "keyIntervals"> {
+    const { kept, intervals, grains, sources, upperBounds } = finestPerInterval(rows);
     return {
         postgres: toPostgresCapture(kept.filter((r) => r.TargetKey === "T4" || r.TargetKey === "T4-replica")),
         cosmos: toCosmosCapture(kept.filter((r) => r.TargetKey === "T5")),
         intervals,
+        grains,
+        sources,
+        upperBounds,
         keyIntervals: coarsestIntervals(rows),
     };
 }
-
 function hash(text: string): string {
     let h = 5381;
     for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;

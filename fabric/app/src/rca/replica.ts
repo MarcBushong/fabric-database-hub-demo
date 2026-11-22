@@ -27,8 +27,10 @@ export interface LagPoint {
     value: number;
     /** The capture's own sample on the replica (an instant), or Azure Monitor's Read Replica Lag (Telemetry Snapshots). */
     source: LagSource;
-    /** Azure Monitor's interval: the value is the highest from `at` to `at` plus this. Absent for the capture's samples. */
+    /** Azure Monitor's span: the value is the highest from `at` to `at` plus this. Absent for the capture's samples. */
     intervalMs?: number;
+    /** Its save's interval, which a remainder's span is only part of: what the value is the highest of (the shared finestPerInterval's grains). */
+    grainMs?: number;
 }
 
 export interface LagSeries {
@@ -58,10 +60,12 @@ const round1 = (v: number) => Math.round(v * 10) / 10;
 const endOf = (p: LagPoint) => p.at.getTime() + (p.intervalMs ?? 0);
 /** When replay last advanced, by a point: its time less its lag (for an Azure Monitor interval, the earliest it can be). */
 const sinceOf = (p: LagPoint) => p.at.getTime() - p.value * 1000;
-/** Azure Monitor's interval in minutes, for the words: "5". */
-const minutesOf = (p: LagPoint) => Math.round((p.intervalMs ?? 0) / 60_000);
-/** Coarser than a minute: Azure Monitor's value is the interval's highest, not the lag at its start. */
-const coarse = (p: LagPoint) => (p.intervalMs ?? 0) > 60_000;
+/** Azure Monitor's interval in minutes, for the words "its highest value in each 15-minute interval": its save's (the grain). */
+const minutesOf = (p: LagPoint) => Math.round((p.grainMs ?? p.intervalMs ?? 0) / 60_000);
+/** The minutes a point spans, for "in the 3 minutes from 16:57:00": a remainder of a coarser point spans only part of its interval. */
+const spanOf = (p: LagPoint) => Math.round((p.intervalMs ?? 0) / 60_000);
+/** Coarser than a minute: Azure Monitor's value is its interval's highest, not the lag at its start. */
+const coarse = (p: LagPoint) => (p.grainMs ?? p.intervalMs ?? 0) > 60_000;
 
 /**
  * The lag series for the window: the capture's own samples on the replica (since_last_replayed_s: every 30 s, every 5 s
@@ -88,7 +92,7 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
         if (last && t - last.to <= CAPTURE_GAP_MS) last.to = t;
         else spans.push({ from: t, to: t });
     }
-    const all = monitor.map((m): LagPoint => ({ at: m.at, value: m.value, source: "Telemetry Snapshots", intervalMs: m.intervalMs ?? grain }));
+    const all = monitor.map((m): LagPoint => ({ at: m.at, value: m.value, source: "Telemetry Snapshots", intervalMs: m.intervalMs ?? grain, grainMs: m.grainMs ?? m.intervalMs ?? grain }));
     const missed: LagPoint[] = [];
     const kept = all.filter((point) => {
         const from = point.at.getTime();
@@ -205,9 +209,9 @@ function nameOf(p: LagPoint): string {
     return coarse(p) ? `Read Replica Lag (its highest value in each ${minutesOf(p)}-minute interval)` : "Read Replica Lag";
 }
 
-/** When a point's value was: at an instant, or somewhere in an Azure Monitor interval coarser than a minute. */
+/** When a point's value was: at an instant, or somewhere in what an Azure Monitor point coarser than a minute spans. */
 function when(p: LagPoint): string {
-    return coarse(p) ? `in the ${minutesOf(p)} minutes from ${hhmmss(p.at)} UTC` : `at ${hhmmss(p.at)} UTC`;
+    return coarse(p) ? `in the ${spanOf(p)} minutes from ${hhmmss(p.at)} UTC` : `at ${hhmmss(p.at)} UTC`;
 }
 
 /** A point as evidence: "Read Replica Lag 178 s, its highest from 16:15 to 16:20 UTC" for an interval. */
@@ -253,7 +257,7 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     // "rose from 16:10:00", an interval's start, counting from a last replay at 16:13:00).
     const startPoint = rise.points.find((p) => p.at.getTime() === rise.start.getTime());
     const firstSample = rise.points.find((p) => p.source === "RCA Replica" && p.at >= rise.start && p.value >= 5);
-    const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose in the ${minutesOf(startPoint)} minutes from ${hhmmss(startPoint.at)} UTC`) : `rose from ${hhmmss(rise.start)}`;
+    const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose in the ${spanOf(startPoint)} minutes from ${hhmmss(startPoint.at)} UTC`) : `rose from ${hhmmss(rise.start)}`;
     const shape = coarse(rise.peak)
         ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}`
         : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}`;

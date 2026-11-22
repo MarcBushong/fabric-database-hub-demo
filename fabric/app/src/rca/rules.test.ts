@@ -401,6 +401,15 @@ describe("T5's normalized RU consumption at 100 %", () => {
         expect(a.notCaptured[0]).toMatch(/^T5: which partition key range was busiest.* Nor is its provisioned throughput for these minutes, so whether a new partition key could help isn't known/);
     });
 
+    // The shared finestPerInterval (a390db00): a remainder of a coarser save spans only part of its interval, and its value
+    // is that interval's highest. The words name the save's interval, never the remainder's span.
+    it("names the interval of the save a remainder comes from, not its own span", () => {
+        const piece = { ...point(COSMOS_METRICS.normalizedRu, "17:00:00", 100, 3 * 60_000), grainMs: 15 * 60_000 };
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [piece] });
+        expect(a.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval");
+        expect(a.rootCause?.statement).toContain("the interval from 17:00 to 17:03 UTC");
+    });
+
     it.each([
         ["above 5 %: more throughput", [150, 50, 0], "200 of them throttled (429, 8 %)", "That's more than the 5 % of requests at which Learn recommends more throughput.", ["RU-RETRY", "RU-AUTOSCALE"]],
         ["up to 5 %: the clients' retries only", [60, 40, 0], "100 of them throttled (429, 4 %)", "Learn counts up to 5 % of requests throttled, with acceptable latency, as RU/s fully used, with no action needed.", ["RU-RETRY"]],

@@ -44,10 +44,11 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
         return { findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: [`T5: Azure Monitor's normalized RU consumption isn't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC.`], details: {} };
     }
     const end = (m: MetricPoint) => new Date(m.at.getTime() + (m.intervalMs ?? 0));
-    const minutes = Math.round((normalized[0].intervalMs ?? 60_000) / 60_000);
     const full = normalized.filter((m) => (m.value ?? 0) >= 100);
     const peak = normalized.reduce((best, m) => ((m.value ?? 0) > (best.value ?? 0) ? m : best));
     const at100 = full.length ? full : [peak];
+    // Azure Monitor's interval, its save's: a remainder of a coarser point spans only part of it (the shared finestPerInterval's grains).
+    const minutes = Math.round((at100[0].grainMs ?? at100[0].intervalMs ?? 60_000) / 60_000);
     // Only the intervals the sentence names (the review of 4e2c65ed: a window a minute past the episode added the next one).
     const named = (m: MetricPoint) => at100.some((n) => m.at.getTime() >= n.at.getTime() && m.at.getTime() < Math.max(end(n).getTime(), n.at.getTime() + 1));
     const sum = (rows: readonly MetricPoint[]) => rows.reduce((n, m) => n + (m.value ?? 0), 0);

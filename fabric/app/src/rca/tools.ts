@@ -86,8 +86,13 @@ export interface Telemetry {
     bins?: readonly Bin[];
     postgres?: PostgresCapture | null;
     cosmos?: CosmosCapture | null;
-    /** Each Azure Monitor point's own interval, by pointKey (sources.ts's pointIntervals); the capture's otherwise. */
+    /** Each Azure Monitor point's span, by pointKey (the shared finestPerInterval's intervals): what it covers, for coverage, ends, and sums. */
     intervals?: ReadonlyMap<string, number>;
+    /** Each point's save's step, by pointKey (its grains): what its value is the highest or the total of, to step runs by and name. */
+    grains?: ReadonlyMap<string, number>;
+    /** The coarser point each piece came from, and the pieces that are upper bounds of one reading, by pointKey (its sources and upperBounds). */
+    sources?: ReadonlyMap<string, string>;
+    upperBounds?: ReadonlySet<string>;
     /** The coarsest interval of the history's points at each time, before one point per interval is kept (sources.ts's coarsestIntervals): a key's own point. */
     keyIntervals?: ReadonlyMap<string, number>;
     /** The reads that had more rows than they take: their latest rows weren't read (sources.ts's paged Azure Monitor read). */
@@ -141,19 +146,24 @@ function targetsOf(args: Record<string, unknown>): RcaTarget[] {
 /** The Azure Monitor series the investigations read, as metric points, each with its interval: the replica's lag, T4's failed connections and CPU, T5's 429s, RU, requests, and its hourly provisioned throughput. */
 export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const out: MetricPoint[] = [];
-    // Each point's own interval where the history says it, its capture's smallest otherwise (the review of 803f2b1a).
-    const own = (target: RcaTarget, metric: string, at: Date, fallback: number | undefined) => telemetry.intervals?.get(pointKey(target, metric, at)) ?? fallback;
+    // Each point's own span and its save's step where the history says them (the shared finestPerInterval's intervals and
+    // grains), its capture's smallest interval otherwise (the review of 803f2b1a).
+    const own = (target: RcaTarget, metric: string, at: Date, fallback: number | undefined) => {
+        const key = pointKey(target, metric, at);
+        const intervalMs = telemetry.intervals?.get(key) ?? fallback;
+        return { intervalMs, grainMs: telemetry.grains?.get(key) ?? intervalMs };
+    };
     const pg = telemetry.postgres ?? null;
     const pgInterval = pg?.intervalMinutes ? pg.intervalMinutes * MIN : undefined;
-    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value, intervalMs: own("T4-replica", POSTGRES_METRICS.lag, p.at, pgInterval) });
+    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value, ...own("T4-replica", POSTGRES_METRICS.lag, p.at, pgInterval) });
     for (const target of ["T4", "T4-replica"] as const) {
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value, intervalMs: own(target, POSTGRES_METRICS.failed, p.at, pgInterval) });
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value, intervalMs: own(target, POSTGRES_METRICS.cpu, p.at, pgInterval) });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value, ...own(target, POSTGRES_METRICS.failed, p.at, pgInterval) });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value, ...own(target, POSTGRES_METRICS.cpu, p.at, pgInterval) });
     }
     const cosmos = telemetry.cosmos ?? null;
     const cosmosInterval = cosmos?.intervalMinutes ? cosmos.intervalMinutes * MIN : undefined;
-    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, intervalMs: own("T5", metric, p.at, cosmosInterval) });
-    for (const p of cosmosSeries(cosmos, COSMOS_METRICS.provisioned)) out.push({ target: "T5", at: p.at, metric: COSMOS_METRICS.provisioned, value: p.value, intervalMs: HOUR });
+    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, ...own("T5", metric, p.at, cosmosInterval) });
+    for (const p of cosmosSeries(cosmos, COSMOS_METRICS.provisioned)) out.push({ target: "T5", at: p.at, metric: COSMOS_METRICS.provisioned, value: p.value, intervalMs: HOUR, grainMs: HOUR });
     return out.sort((a, b) => a.at.getTime() - b.at.getTime());
 }
 
@@ -302,7 +312,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // A read at its limit, the RCA tables' or Azure Monitor's, is said in what wasn't captured, never used silently.
         const cut = [...(loaded.cut ?? []), ...(telemetry.cut ?? [])];
         const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)], ...(cut.length ? { cut } : {}) };
-        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals }, from, to).filter((e) => targets.includes(e.target));
+        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals, grains: telemetry.grains, sources: telemetry.sources, upperBounds: telemetry.upperBounds }, from, to).filter((e) => targets.includes(e.target));
         return { evidence, episodes, keyIntervals: telemetry.keyIntervals };
     }
 

@@ -90,8 +90,7 @@ export function liveSources(env: LiveEnv = "rb"): { load: (from: Date, to: Date,
                 const at = toDate(row.Bucket);
                 return !!at && at >= from && at <= to;
             };
-            const { postgres, cosmos, intervals, keyIntervals } = monitorTelemetry(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
-            return { postgres, cosmos, intervals, keyIntervals };
+            return monitorTelemetry(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
         },
     };
 }

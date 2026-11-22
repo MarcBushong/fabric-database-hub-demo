@@ -156,6 +156,8 @@ export interface MetricPoint {
     value: number | null;
     /** Azure Monitor's interval: the value is the interval's highest (or its total) from `at` to `at` plus this. */
     intervalMs?: number;
+    /** The interval of the save it comes from, which a remainder of a coarser point spans only part of (the shared finestPerInterval's grains): what its value is the highest or the total of. */
+    grainMs?: number;
 }
 
 /**
@@ -169,8 +171,8 @@ export const metricIn = (m: MetricPoint, from: Date, to: Date) => {
     return (span > 0 ? start < to.getTime() : start <= to.getTime()) && start + Math.max(0, span - 1) >= from.getTime();
 };
 
-/** One Azure Monitor point's key, by its target, its metric as the history names it, and its interval's start. */
-export const pointKey = (target: string, metric: string, at: Date) => `${target}|${metric}|${at.getTime()}`;
+/** One Azure Monitor point's key, by its target, its metric as the history names it, and its interval's start: the shared finestPerInterval's. */
+export { pointKey } from "@/data/finest-per-interval";
 
 /** Everything the investigations read for one window: the RCA tables and the telemetry. Nothing else. */
 export interface Evidence {

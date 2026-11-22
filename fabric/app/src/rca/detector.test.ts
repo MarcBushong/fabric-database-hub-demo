@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { POSTGRES_METRICS, type Bin, type PostgresCapture } from "@/data/model";
+import { COSMOS_METRICS, POSTGRES_METRICS, type Bin, type PostgresCapture } from "@/data/model";
 import { describeEpisode, detect, episodesFromBins, findEpisodes, levelOf, RULES, type Sample } from "./detector";
+import { monitorTelemetry } from "./sources";
 import { answerKeyOf, fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { emptyEvidence, pointKey } from "./types";
 
@@ -227,5 +228,29 @@ describe("a capture episode with no relaxed event in the minutes read", () => {
         evidence.coverage[0].to = at("17:30:00");
         const [open] = findEpisodes({ evidence }, at("16:50:00"), at("17:10:00")).filter((e) => e.family === "errors");
         expect(describeEpisode(open)).toContain("from 16:55:00 UTC (the capture hadn't recorded its end by 17:10:00 UTC, where the minutes read end)");
+    });
+});
+
+// The shared finestPerInterval (a390db00): a coarser peak over two uncovered stretches of one interval is given to each,
+// as upper bounds of one reading. It's one candidate, never two episodes.
+describe("the pieces of one coarser peak", () => {
+    it("open one episode, from the first piece, never a second from a later piece of the same reading", () => {
+        const save = (capturedAt: string, from: string, to: string) => (bucket: string, value: number) => ({
+            Bucket: `2026-11-20T${bucket}:00`,
+            TargetKey: "T5",
+            ResourceName: "cosmos01",
+            Metric: COSMOS_METRICS.normalizedRu,
+            Value: value,
+            Unit: "Percent",
+            CapturedAt: `2026-11-20T${capturedAt}:00`,
+            WindowStart: `2026-11-20T${from}:00`,
+            WindowEnd: `2026-11-20T${to}:00`,
+        });
+        const day = save("21:33", "00:00", "21:30");
+        const session = save("17:09", "15:33", "15:38");
+        const telemetry = monitorTelemetry([day("15:15", 11), day("15:30", 100), day("15:45", 40), ...[3, 5, 4, 4, 4].map((v, i) => session(`15:3${3 + i}`, v))]);
+        expect([...(telemetry.upperBounds ?? [])].sort()).toEqual([pointKey("T5", COSMOS_METRICS.normalizedRu, at("15:30")), pointKey("T5", COSMOS_METRICS.normalizedRu, at("15:38"))].sort());
+        const ru = findEpisodes({ evidence: emptyEvidence(), cosmos: telemetry.cosmos, intervals: telemetry.intervals, grains: telemetry.grains, sources: telemetry.sources, upperBounds: telemetry.upperBounds }, at("15:00"), at("16:00")).filter((e) => e.family === "ru");
+        expect(ru.map((e) => e.key)).toEqual(["T5-ru-20261120T153000Z"]);
     });
 });

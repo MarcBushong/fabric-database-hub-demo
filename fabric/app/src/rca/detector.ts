@@ -458,14 +458,15 @@ export function episodesFromEvents(evidence: Evidence): Episode[] {
 }
 
 /**
- * A series' runs of one grain, oldest first, each with its step: each point's own interval where the history says it
- * (intervals, by pointKey), the capture's otherwise. A day-long save's 15-minute points read at the 1 minute of a
- * session's own save split one T5 storm in two, 12:15 and 12:30, in the day's list (the review of 803f2b1a).
+ * A series' runs of one grain, oldest first, each with its step: each point's save's step where the history says it (the
+ * shared finestPerInterval's grains, by pointKey), the capture's otherwise. A day-long save's 15-minute points read at the
+ * 1 minute of a session's own save split one T5 storm in two, 12:15 and 12:30, in the day's list (the review of 803f2b1a);
+ * a remainder's own span is shorter than its save's step, so it would split a run of its grain.
  */
-function byGrain<T extends { at: Date }>(points: readonly T[], intervalOf: (p: T) => number | undefined, fallback: number): Array<{ points: T[]; step: number }> {
+function byGrain<T extends { at: Date }>(points: readonly T[], grainOf: (p: T) => number | undefined, fallback: number): Array<{ points: T[]; step: number }> {
     const out: Array<{ points: T[]; step: number }> = [];
     for (const p of points) {
-        const step = intervalOf(p) ?? fallback;
+        const step = grainOf(p) ?? fallback;
         const run = out[out.length - 1];
         if (run && run.step === step) run.points.push(p);
         else out.push({ points: [p], step });
@@ -473,43 +474,72 @@ function byGrain<T extends { at: Date }>(points: readonly T[], intervalOf: (p: T
     return out;
 }
 
+/** What episodesFromMonitor reads beside the captures, by pointKey: each point's save's step, and the pieces of coarser points. */
+export interface MonitorShape {
+    grains?: ReadonlyMap<string, number>;
+    sources?: ReadonlyMap<string, string>;
+    upperBounds?: ReadonlySet<string>;
+}
+
+/**
+ * The pieces of a coarser peak over two or more uncovered stretches (upper bounds of one reading) after the first of each:
+ * the reading is one candidate, never two episodes, so only its first piece is read, and the others are unknown.
+ */
+function laterPieces(shape: MonitorShape): Set<string> {
+    const later = new Set<string>();
+    if (!shape.upperBounds || !shape.sources) return later;
+    const timeOf = (key: string) => Number(key.slice(key.lastIndexOf("|") + 1));
+    const first = new Set<string>();
+    for (const key of [...shape.upperBounds].sort((x, y) => timeOf(x) - timeOf(y))) {
+        const source = shape.sources.get(key) ?? key;
+        if (first.has(source)) later.add(key);
+        else first.add(source);
+    }
+    return later;
+}
+
 /** T4's, its replica's, and T5's Azure Monitor metrics; the replica's catch-up after a restart isn't lag. */
-export function episodesFromMonitor(postgres: PostgresCapture | null, cosmos: CosmosCapture | null, intervals?: ReadonlyMap<string, number>): Episode[] {
+export function episodesFromMonitor(postgres: PostgresCapture | null, cosmos: CosmosCapture | null, shape: MonitorShape = {}): Episode[] {
     const out: Episode[] = [];
+    const later = laterPieces(shape);
+    const grainOf = (target: RcaTarget, metric: string) => (p: { at: Date }) => shape.grains?.get(pointKey(target, metric, p.at));
+    const valueOf = (target: RcaTarget, metric: string) => (p: { at: Date; value: number }) => (later.has(pointKey(target, metric, p.at)) ? null : p.value);
     if (postgres) {
         const step = (postgres.intervalMinutes ?? 1) * MIN;
         const lag = postgresSeries(postgres, "T4-replica", POSTGRES_METRICS.lag);
         const caught = new Set(replicaCatchUp(postgres, lag));
-        for (const run of byGrain(lag, (p) => intervals?.get(pointKey("T4-replica", POSTGRES_METRICS.lag, p.at)), step)) {
-            out.push(...detect("T4-replica", run.points.map((p) => ({ at: p.at, value: caught.has(p) ? null : p.value })), run.step, RULES.replica_lag, SOURCES.monitor));
+        const lagValue = valueOf("T4-replica", POSTGRES_METRICS.lag);
+        for (const run of byGrain(lag, grainOf("T4-replica", POSTGRES_METRICS.lag), step)) {
+            out.push(...detect("T4-replica", run.points.map((p) => ({ at: p.at, value: caught.has(p) ? null : lagValue(p) })), run.step, RULES.replica_lag, SOURCES.monitor));
         }
         for (const target of ["T4", "T4-replica"] as const) {
             const cpu = postgresSeries(postgres, target, POSTGRES_METRICS.cpu);
-            for (const run of byGrain(cpu, (p) => intervals?.get(pointKey(target, POSTGRES_METRICS.cpu, p.at)), step)) {
-                out.push(...detect(target, run.points.map((p) => ({ at: p.at, value: p.value })), run.step, RULES.cpu, SOURCES.monitor));
+            const cpuValue = valueOf(target, POSTGRES_METRICS.cpu);
+            for (const run of byGrain(cpu, grainOf(target, POSTGRES_METRICS.cpu), step)) {
+                out.push(...detect(target, run.points.map((p) => ({ at: p.at, value: cpuValue(p) })), run.step, RULES.cpu, SOURCES.monitor));
             }
         }
     }
     if (cosmos) {
         const step = (cosmos.intervalMinutes ?? 1) * MIN;
         for (const [metric, rule] of [[COSMOS_METRICS.throttled, RULES.throttling], [COSMOS_METRICS.normalizedRu, RULES.ru]] as const) {
-            for (const run of byGrain(cosmosSeries(cosmos, metric), (p) => intervals?.get(pointKey("T5", metric, p.at)), step)) {
-                out.push(...detect("T5", run.points.map((p) => ({ at: p.at, value: p.value })), run.step, rule, SOURCES.monitor));
+            const value = valueOf("T5", metric);
+            for (const run of byGrain(cosmosSeries(cosmos, metric), grainOf("T5", metric), step)) {
+                out.push(...detect("T5", run.points.map((p) => ({ at: p.at, value: value(p) })), run.step, rule, SOURCES.monitor));
             }
         }
     }
     return out;
 }
 
-export interface DetectorInput {
+export interface DetectorInput extends MonitorShape {
     evidence: Evidence;
     bins?: readonly Bin[];
     postgres?: PostgresCapture | null;
     cosmos?: CosmosCapture | null;
-    /** Each Azure Monitor point's own interval, by pointKey (sources.ts's pointIntervals). */
+    /** Each Azure Monitor point's span, by pointKey (the shared finestPerInterval's intervals): an Azure Monitor point stands for what it covers. */
     intervals?: ReadonlyMap<string, number>;
 }
-
 /** Whether the observer captured a target over these minutes (an rca_coverage row says so). */
 function captured(evidence: Evidence, target: RcaTarget, from: Date, to: Date): boolean {
     return evidence.coverage.some((c) => c.target === target && c.captured && c.from <= to && c.to >= from);
@@ -533,7 +563,8 @@ export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episod
     const byRows = cpuFromResourceRows(evidence);
     const byEvents = episodesFromEvents(evidence);
     const byBins = episodesFromBins(input.bins ?? []);
-    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null, input.intervals);
+    // Runs step by each point's save's step; without the grains (a reader before the shared finestPerInterval), by its span.
+    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null, { grains: input.grains ?? input.intervals, sources: input.sources, upperBounds: input.upperBounds });
     const overlaps = (a: Episode, b: Episode) => a.target === b.target && a.family === b.family && a.start <= (b.end ?? b.last) && b.start <= (a.end ?? a.last);
     // The events count deadlocks and errors themselves: the capture's own episode for the same minutes would only repeat them.
     const chosen: Episode[] = [...byCapture.filter((c) => !byEvents.some((e) => overlaps(c, e))), ...byRows, ...byEvents];

@@ -245,6 +245,21 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         expect(await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T150000Z" })).toMatch(/^No episode /);
     });
 
+    // The review of ebd1c6c3, with the shared finestPerInterval (a390db00): the day save's 34 s at 16:45 fell in 16:57 to
+    // 17:00, after the session's window, and dropping that point lost it; `…164500Z`, listed at 3732317d, answered "No
+    // episode". A remainder spans only part of its save's interval: it's worded by its save's 15 minutes, and a run of its
+    // grain steps by them (stepped by its 3-minute span, T4's CPU from 16:35 lost its end).
+    it("lists the day save's 34 s from 16:57 as its own incident, worded by its save's interval, and reads the old key as it", async () => {
+        const listed = await ask("find_incidents", { from: "2026-11-21T11:00:00Z", to: "2026-11-21T20:00:00Z" });
+        expect((listed.episodes ?? []).map((e) => e.key)).toContain("T4-replica-replica_lag-20261121T165700Z");
+        const late = await ask("explain_incident", { episodeKey: "T4-replica-replica_lag-20261121T164500Z" });
+        expect(late.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T164500Z", as: ["T4-replica-replica_lag-20261121T165700Z"] });
+        expect(late.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 15-minute interval\) reached 34 s in the 3 minutes from 16:57:00 UTC /);
+        expect(late.rootCause?.statement).not.toMatch(/3-minute/);
+        const cpu = await ask("explain_incident", { episodeKey: "T4-cpu-20261121T163500Z" });
+        expect((cpu.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 16:35:00 to 16:50:00 UTC");
+    });
+
     // The review of 97fdf5ba: keys the list gave T5's session storms until ebd1c6c3, from the day-long save's 15-minute
     // points, answered "No episode" once a key's interval came from the 1-minute point kept at its time. The RCA page keeps
     // a selected key in its address and its remembered view.

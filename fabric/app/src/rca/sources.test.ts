@@ -45,18 +45,20 @@ describe("the investigations' sources", () => {
 
     // The review of 803f2b1a: B's day-long save at 15 minutes, newer than the session's own at 1 minute, kept its total for
     // 15:30 to 15:45 beside the 1-minute points it holds, and T5's requests counted both; each point read the capture's
-    // smallest interval.
-    it("keep the finest grain of each minute, a coarser point only where no finer one is, each with its own interval", () => {
+    // smallest interval. With the shared finestPerInterval (a390db00), the rest of the 15 minutes stays as what the minutes
+    // saved didn't hold (the review of ebd1c6c3: dropping it lost the replica's 34 s at 16:57).
+    it("keep the finest grain of each minute, and of a coarser total what the finer points don't hold, each with its span and its grain", () => {
         const requests = (bucket: string, value: number, capturedAt: string) => ({ ...lag(bucket, value, capturedAt), TargetKey: "T5", Metric: "TotalRequests" });
-        const { kept, intervals } = finestPerInterval([
+        const { kept, intervals, grains } = finestPerInterval([
             ...["15:30", "15:31", "15:32"].map((bucket, i) => requests(bucket, 100 + i, "2026-11-20T17:09:30")),
             requests("15:15", 50, "2026-11-20T21:33:44"),
             requests("15:30", 27630, "2026-11-20T21:33:44"),
             requests("15:45", 900, "2026-11-20T21:33:44"),
         ]);
-        expect(kept.map((r) => [String(r.Bucket).slice(11, 16), r.Value])).toEqual([["15:15", 50], ["15:30", 100], ["15:31", 101], ["15:32", 102], ["15:45", 900]]);
+        expect(kept.map((r) => [String(r.Bucket).slice(11, 16), r.Value])).toEqual([["15:15", 50], ["15:30", 100], ["15:31", 101], ["15:32", 102], ["15:33", 27327], ["15:45", 900]]);
         expect(intervals.get(pointKey("T5", "TotalRequests", at("15:31")))).toBe(60_000);
         expect(intervals.get(pointKey("T5", "TotalRequests", at("15:45")))).toBe(15 * 60_000);
+        expect([intervals.get(pointKey("T5", "TotalRequests", at("15:33"))), grains.get(pointKey("T5", "TotalRequests", at("15:33")))]).toEqual([12 * 60_000, 15 * 60_000]);
     });
 
     it("give T4's replica lag from overlapping captures, and ask for T1's bins only when T1 is in scope", async () => {
@@ -86,7 +88,7 @@ describe("the investigations' sources", () => {
     // The coordinator's note on the shared finestPerInterval: the read stops at MONITOR_ROW_LIMIT rows, oldest first, so one
     // at the limit silently lost its newest rows, the incident's own minutes.
     it("read Azure Monitor's metrics a page at a time, each from the last bucket before it, and say when a window holds more than its pages", async () => {
-        const metrics = ["NormalizedRUConsumption", "TotalRequests", "ThrottledRequests", "ProvisionedThroughput"];
+        const metrics = ["NormalizedRUConsumption", "TotalRequests", "ThrottledRequests", "TotalRequestUnits"];
         const start = Date.parse("2026-11-20T00:00:00Z");
         // A row a minute for each metric: 1,500 minutes, 6,000 rows in all, as the DAX orders them.
         const all = (minutes: number) =>
