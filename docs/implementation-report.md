@@ -5475,12 +5475,12 @@ The read-only answer, first:
 
 ### `destroy.ps1 -WhatIf` in a non-interactive shell (2026-11-22)
 
-**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read's `Remove-Item` of its temporary file inherited `$ConfirmPreference` 'Low' and asked, which a non-interactive shell refuses. In a terminal, the same run asked before that question too: to record the guard's context, and to delete each Azure CLI call's temporary file.
+**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read inherited `$ConfirmPreference` 'Low': the redirection of the CLI's errors to its temporary file, which writes through `Out-File`, asked first ("Output to File"), and the file's `Remove-Item` asked again, and its error, the last, was the one the run showed; a non-interactive shell refuses both. In a terminal, the same run asked before that question too: to record the guard's context, and twice for each Azure CLI call's temporary file.
 
 **Work summary.**
 
 - **`Remove-DemoEnvironment`** follows the golden snapshot's pattern: everything before the one question only reads (the guard, the group's existence and tags, `Get-DemoDestroyExtraPlan`, whose parts only read, and the golden group's existence), so it runs with `$WhatIfPreference` off and `$ConfirmPreference` 'None'. The caller's values come back for the question, so `-WhatIf` still ends at it (**Not selected**) and `-Confirm` still asks it, whether they were passed or inherited; after a yes, nothing asks again.
-- **`Invoke-DemoAzCli`** deletes its own temporary file without asking (`-Confirm:$false`), as it already did under `-WhatIf`, for any caller with `-Confirm`.
+- **`Invoke-DemoAzCli`** deletes its own temporary file without asking (`-Confirm:$false`), as it already did under `-WhatIf`, for any caller with `-Confirm`. That was only half: the redirection before it still asked, which [a later section](#invoke-demoazcli-for-a-caller-with--confirm-2026-11-22) fixes.
 - **The test** (`DbHubDemo.Destroy.Tests.ps1`) runs `destroy.ps1` in a `pwsh -NonInteractive` child with this module and a stand-in Azure CLI first on PATH: it answers only the subscription guard, as a service principal (no Microsoft Graph read), with one token per audience, and fails every other call, as a read that can't be made; a proxy on a closed port stops any HTTP call. With `-WhatIf`, the run ends at **Not selected**, exit 0, with the plan's own token requests made and only reads sent. Without `-Force`, it stops at its one question, after the plan, and the prompt is `Remove-DemoEnvironment`'s, not an Azure CLI call's.
 - **Docs:** the cleanup guide's commands (one question, and `-WhatIf` asks nothing), the CHANGELOG, and this report.
 
@@ -5489,7 +5489,7 @@ The read-only answer, first:
 **Validation.**
 
 - Pester with StrictMode: 799 passed in DbHubDemo.Destroy, DbHubDemo.Teardown, DbHubDemo.Guard, DbHubDemo.Golden, DbHubDemo.Lifecycle, DbHubDemo.KeyVault, DbHubDemo.Validation, Repo.LifecycleScripts, and Repo.TestAzGuard. One failed, on this PC only: Teardown's "skips every live teardown test" check imports Pester by name in a child process, which here finds a broken OneDrive copy of Pester 5.9.1, so the live tests fail instead of skipping. It fails on b97bdcdb the same way, and with the machine-wide Pester 5.9.1 all 11 skip, as the check expects.
-- Both new tests fail on b97bdcdb's code (the test file copied into a worktree of it): the preview with "PowerShell is in NonInteractive mode" at `Invoke-DemoAzCli.ps1`'s `Remove-Item`, as live.
+- Both new tests fail on b97bdcdb's code (the test file copied into a worktree of it): the preview with "PowerShell is in NonInteractive mode" at `Invoke-DemoAzCli.ps1`'s `Remove-Item`, as live, where the redirection before it had asked first.
 - PSScriptAnalyzer: no new findings (9 before and after, all in the test file's helpers). markdownlint: clean. The changed PowerShell files are ASCII.
 
 **Risks.**
@@ -5519,3 +5519,26 @@ The read-only answer, first:
 
 - A documented size with T4's vCores at another price per vCore (another tier or series, such as ADR 0019's proposed v6 rungs) would need the middle case to compare prices; the helper's comment states the assumption.
 - The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### `Invoke-DemoAzCli` for a caller with `-Confirm` (2026-11-22)
+
+**Why.** 1f7dca70's review of 4a6a7b36 found its `Invoke-DemoAzCli` part only half-worked: under a caller's `-Confirm`, the inherited `$ConfirmPreference` 'Low' made the redirection of the CLI's errors to its temporary file (`2> $errorFile`, which writes through `Out-File`) ask "Output to File" before the `finally` block's `-Confirm:$false` deletion was reached. At b97bdcdb that redirection was the first prompt in the live failure; the error pointed at the deletion because it asked too, and its error replaced the first. A path that still asked: in a terminal, `./scripts/check-sign-in-data.ps1 -Clean` without `-Force` hands `-Confirm` to `Find-DemoSignInData`, and after a Yes for a VM, `Get-DemoVmPowerState`'s `az vm get-instance-view` asked about its temporary file. The reviewer's probes in a `pwsh -NonInteractive` child reproduced both prompts, and so did this one's.
+
+**Work summary.**
+
+- **`Invoke-DemoAzCli`** pins `$ConfirmPreference` to 'None', next to `$WhatIfPreference` off, for both of its paths: callers decide with ShouldProcess whether a command runs, so neither the redirection nor the deletion asks. The deletion's `-Confirm:$false`, now redundant, is gone, and the comment gives the cause.
+- **The test** (`DbHubDemo.Guard.Tests.ps1`) runs an advanced caller with `-Confirm` in a `pwsh -NonInteractive` child, with a stand-in Azure CLI first on PATH that writes to both streams and a temporary folder of its own: the call asks nothing, returns both streams, and leaves no temporary file.
+- **Docs:** the destroy section above and its CHANGELOG entry give the cause (the redirection asked first, then the deletion), and the entry names the `check-sign-in-data.ps1` path; this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/Invoke-DemoAzCli.ps1`, `tests/unit/DbHubDemo.Guard.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 618 passed, none failed, in DbHubDemo.Guard, DbHubDemo.Destroy, DbHubDemo.SignInData, DbHubDemo.Validation, DbHubDemo.Lifecycle, Repo.TestAzGuard, and Repo.LifecycleScripts.
+- The new test fails on 885a8d52's `Invoke-DemoAzCli.ps1`, which is 4a6a7b36's: "PowerShell is in NonInteractive mode" at the redirection, and no result. It passes with the fix; its temporary folder check holds because the child's temporary file goes to that folder (checked).
+- PSScriptAnalyzer: no new findings (none in the wrapper, and 6 before and after in the test file, all its helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- The wrapper asks nothing itself, as under `-WhatIf` since Phase 14: each caller decides with ShouldProcess before a call that writes, and the temporary file is the wrapper's own plumbing.
+- Not changed: `Invoke-DemoDotNet` redirects to a temporary file the same way, but no script hands it `-Confirm` (each caller of `Publish-DemoWorkloadRunner` passes `-Confirm:$false`); only a direct `Publish-DemoWorkloadRunner -Confirm` would ask about it.
