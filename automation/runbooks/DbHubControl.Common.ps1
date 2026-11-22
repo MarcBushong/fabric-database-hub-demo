@@ -8832,7 +8832,7 @@ function Add-DbHubRcaHandoff {
                 $state['pending'] = @(@($state['pending']) + $added.ToArray())
                 $state['final'] = $false
                 $Status['rca'] = $state
-                # The stop's RCA.PENDING line takes them too (finding 4 of the live check of 4e2c65ed).
+                # The stop's RCA.PENDING line takes them too (step 1.8's finding 4).
                 $lines = @(Get-DbHubRcaStopLineList -Settings $Context.Settings -Status $Status -NowUtc (Get-DbHubUtcNow))
                 if ($lines.Count -gt 0) {
                     $Status['rcaLines'] = $lines
@@ -9444,7 +9444,7 @@ $script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4',
 function Get-DbHubRcaStopLeftLine {
     <#
     .SYNOPSIS
-    The RCA.PENDING line of a session's stop (Final tests' live check of 4e2c65ed, finding 4: Stop now's RCA.CAPTURE lines
+    The RCA.PENDING line of a session's stop (step 1.8's finding 4: Stop now's RCA.CAPTURE lines
     said what it captured from 18:49 to 18:53, and nothing said that 18:21 to 18:49 was still on the VMs): what the stop
     leaves there, which start takes it, and until when, as the next start's own backlog of the stop's status gives them
     (Get-DbHubRcaBacklog) and in the words of that start's RCA.EARLIER lines. $null when the stop leaves nothing.
