@@ -5475,7 +5475,7 @@ The read-only answer, first:
 
 ### `destroy.ps1 -WhatIf` in a non-interactive shell (2026-11-22)
 
-**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read inherited `$ConfirmPreference` 'Low': the redirection of the CLI's errors to its temporary file, which writes through `Out-File`, asked first ("Output to File"), and the file's `Remove-Item` asked again, and its error, the last, was the one the run showed; a non-interactive shell refuses both. In a terminal, the same run asked before that question too: to record the guard's context, and twice for each Azure CLI call's temporary file.
+**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read inherited `$ConfirmPreference` 'Low': the redirection of the CLI's errors to its temporary file, which writes through `Out-File`, asked first ("Output to File"), and the file's `Remove-Item` asked again, and its error, the last, was the one the run showed; a non-interactive shell refuses both. In a terminal, the same run asked before that question too, twice for each Azure CLI call's temporary file; without `-WhatIf`, the guard also asked to clear and record its context.
 
 **Work summary.**
 
@@ -5499,12 +5499,12 @@ The read-only answer, first:
 
 ### Run all's replica note: costs more only with more vCores (2026-11-22)
 
-**Why.** 201a6666's review of b97bdcdb (F37) found a Low that predates F37: when a session's read replica ran on another size than T4's, Run all's note said it "has more vCores and costs more" whenever the sizes differed. The next size tried has T4's vCores when the documented sizes have one (`Get-DbHubReplicaSizeOrder`): with T4 on `Standard_D4ds_v5`, the replica falls back to `Standard_D4ads_v5`, with the same 4 vCores at the same price per vCore, and F37 makes that the likely fallback for a quota refusal, since it's another size family. The note is the Replica step's message, which the notebook prints. F37's test matched only the sentence's start, so it passed.
+**Why.** 201a6666's review of b97bdcdb (F37) found a Low that predates F37: when a session's read replica ran on another size than T4's, Run all's note said it "has more vCores and costs more" whenever the sizes differed. The next size tried has T4's vCores when the documented sizes have one (`Get-DbHubReplicaSizeOrder`): with T4 on `Standard_D4ds_v5`, the replica falls back to `Standard_D4ads_v5`, with the same 4 vCores, and F37 makes that the likely fallback for a quota refusal, since it's another size family. The note is the Replica step's message, which the notebook prints. F37's test matched only the sentence's start, so it passed.
 
 **Work summary.**
 
-- **`Get-DbHubReplicaSizeNote`** (new, pure, in the control runbook) writes the note from both sizes' vCores (`Get-DbHubT4VCore`): more vCores than T4's cost more, as before; T4's vCores are "at the same price per vCore"; and a size whose name gives no vCores, or one with fewer (which the order never asks for), gets no claim on its cost, only `./scripts/estimate-cost.ps1`. `Complete-DbHubSessionReplica` uses it, with the quota's words from F37.
-- **The price claim:** the documented replica sizes are General Purpose `Standard_D2ds_v5`, `Standard_D4ds_v5`, and `Standard_D4ads_v5`, so the sizes with the same vCores are `Standard_D4ds_v5` and `Standard_D4ads_v5`. Their meters have the same per-vCore prices in each region checked (West US 3, East US 2, Central US, North Europe, UK South, West Europe, Japan East, and Australia East) in the Azure Retail Prices API on 2026-11-22. The note gives no price, as the module's T4 fallback says the same ([ADR 0016](adr/0016-cost-profiles.md)).
+- **`Get-DbHubReplicaSizeNote`** (new, pure, in the control runbook) writes the note from both sizes' vCores (`Get-DbHubT4VCore`): more vCores than T4's cost more, as before; T4's vCores were "at the same price per vCore", which [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) drops; and a size whose name gives no vCores, or one with fewer (which the order never asks for), gets no claim on its cost, only `./scripts/estimate-cost.ps1`. `Complete-DbHubSessionReplica` uses it, with the quota's words from F37.
+- **The price claim:** the documented replica sizes are General Purpose `Standard_D2ds_v5`, `Standard_D4ds_v5`, and `Standard_D4ads_v5`, so the sizes with the same vCores are `Standard_D4ds_v5` and `Standard_D4ads_v5`. Their meters had the same per-vCore prices in each region checked (West US 3, East US 2, Central US, North Europe, UK South, West Europe, Japan East, and Australia East) in the Azure Retail Prices API on 2026-11-22, but not in every region: 201a6666's review found Norway West, so [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) drops the claim. The note gives no price ([ADR 0016](adr/0016-cost-profiles.md)).
 - **Docs:** the CHANGELOG and this report.
 
 **Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, `CHANGELOG.md`, and this report.
@@ -5517,7 +5517,7 @@ The read-only answer, first:
 
 **Risks.**
 
-- A documented size with T4's vCores at another price per vCore (another tier or series, such as ADR 0019's proposed v6 rungs) would need the middle case to compare prices; the helper's comment states the assumption.
+- A documented size with T4's vCores at another price per vCore would need the middle case to compare prices; one region already has that, so [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) makes no claim there instead.
 - The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
 
 ### `Invoke-DemoAzCli` for a caller with `-Confirm` (2026-11-22)
@@ -5541,4 +5541,28 @@ The read-only answer, first:
 **Risks.**
 
 - The wrapper asks nothing itself, as under `-WhatIf` since Phase 14: each caller decides with ShouldProcess before a call that writes, and the temporary file is the wrapper's own plumbing.
-- Not changed: `Invoke-DemoDotNet` redirects to a temporary file the same way, but no script hands it `-Confirm` (each caller of `Publish-DemoWorkloadRunner` passes `-Confirm:$false`); only a direct `Publish-DemoWorkloadRunner -Confirm` would ask about it.
+
+### T4's sizes with the same vCores: no price claim (2026-11-22)
+
+**Why.** 201a6666's review of 885a8d52 found the new note's middle case wrong in one region. The Azure Retail Prices API gives `Standard_D4ds_v5` and `Standard_D4ads_v5` the same hourly price in 57 of the 58 regions that sell both; in Norway West, `Standard_D4ds_v5` lists at 1.3236 USD an hour and `Standard_D4ads_v5` at 0.6214 (list prices on 2026-11-22, dated examples; [ADR 0016](adr/0016-cost-profiles.md)). So a replica there that fell back from `Standard_D4ads_v5` to `Standard_D4ds_v5` would have been told it costs the same. The claim predates 885a8d52 in T4's own fallback Warning (`DEPLOY.T4.SKU`, when it tries `Standard_D4ads_v5`) and in `t4SkuName`'s description. A check of the same API here agreed: 58 regions sell both at 4 vCores, only Norway West differs, and it differs at 2 vCores too. With it, 1f7dca70's decision on afb30e0e: pin `Invoke-DemoDotNet` as `Invoke-DemoAzCli` is, since it redirects to a temporary file the same way, and its re-review's docs Low on the destroy section.
+
+**Work summary.**
+
+- **Run all's note** (`Get-DbHubReplicaSizeNote`): a size with T4's vCores gets "..., which has T4's vCores; ./scripts/estimate-cost.ps1 shows what it costs." A size with more vCores still costs more: each 4-vCore size lists above `Standard_D2ds_v5` in every region that sells both (116 pairs, the same API and day).
+- **T4's fallback Warning** (`T4Helpers.ps1`) and **`t4SkuName`'s description** (`config/environment.schema.json`) drop "at the same price per vCore": the Warning keeps estimate-cost.ps1's pointer, and the description now reads as the template's does.
+- **`Invoke-DemoDotNet`** pins `$WhatIfPreference` off and `$ConfirmPreference` to 'None', as `Invoke-DemoAzCli` does, so the module's `Publish-DemoWorkloadRunner -Confirm` no longer asks about the SDK call's temporary file. No script hands it `-Confirm`: each caller of `Publish-DemoWorkloadRunner` passes `-Confirm:$false`.
+- **Tests:** the runbook's pinned sentences (both sessions, and the helper's cases, with a new one the other way round, `Standard_D4ads_v5` to `Standard_D4ds_v5`); the fallback Warning's sentence (`DbHubDemo.T4Fallback`); and a `pwsh -NonInteractive` child in which an advanced caller with `-Confirm` runs `Invoke-DemoDotNet`, with this PowerShell as the stand-in dotnet writing to both streams, and a temporary folder of its own (`DbHubDemo.DotNetSdk`).
+- **Docs:** the CHANGELOG (the replica note's entry, and the .NET SDK's calls in the destroy entry), the 885a8d52 and afb30e0e sections above, the destroy section's sentence on what a terminal asked (the guard asked only without `-WhatIf`), and this report.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, `scripts/modules/DbHubDemo/Private/T4Helpers.ps1`, `scripts/modules/DbHubDemo/Private/WorkloadHelpers.ps1`, `config/environment.schema.json`, `tests/unit/Automation.Runbooks.Tests.ps1`, `tests/unit/DbHubDemo.T4Fallback.Tests.ps1`, `tests/unit/DbHubDemo.DotNetSdk.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 1,233 passed, none failed, in Automation.Runbooks, DbHubDemo.T4Fallback, DbHubDemo.DotNetSdk, DbHubDemo.T4, DbHubDemo.T4Replica, DbHubDemo.Lifecycle, DbHubDemo.Preflight, DbHubDemo.Workload, DbHubDemo.Config, DbHubDemo.Cost, and DbHubDemo.OneClick. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+- 6 tests fail on afb30e0e's three source files (swapped in from a backup, then restored): both sessions' notes, the helper's two cases with the same vCores, the fallback Warning's sentence, and the new `Invoke-DemoDotNet` test.
+- PSScriptAnalyzer: no new findings (none in the three source files, and 6, 7, and 4 before and after in the test files, all their helpers). markdownlint: clean. The changed PowerShell files and the schema are ASCII, and the schema parses.
+
+**Risks.**
+
+- The note and the Warning say less and point to the estimate, which prices each size from the Retail Prices API at run time.
+- The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.

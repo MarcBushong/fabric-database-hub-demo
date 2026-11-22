@@ -1193,6 +1193,8 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         @($steps.evidence.next) | Should -Be @('Zone', 'Standard_D4ads_v5')
         $steps[0].message | Should -Match 'tries it once more in zone 2, which the region''s capabilities list for it'
         $steps[1].message | Should -Match 'so autonomous tuning stays on, and later runs keep it'
+        # No claim on its price: a series can cost another price per vCore in a region (201a6666's Low on 885a8d52).
+        $steps[1].message | Should -Match ' This run tries Standard_D4ads_v5, General Purpose with 4 vCores on AMD processors \(estimate-cost\.ps1 prices it at run time\), so autonomous tuning stays on, and later runs keep it\.$'
         @($script:recorded) | Should -Be @('Standard_D4ads_v5')
         $deployment.T4SkuName | Should -Be 'Standard_D4ads_v5'
         # The notice names both zones tried and the size deployed; both sizes are priced for it (2026-11-09).

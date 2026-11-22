@@ -1414,8 +1414,9 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status = Get-SessionStatus
         $status.replica.sizeUsed | Should -Be 'Standard_D4ads_v5'
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('SkuNotAvailable', 'Accepted')
-        # Standard_D4ads_v5 has T4's 4 vCores at the same price per vCore, so it costs no more (201a6666's Low, 2026-11-22).
-        $note = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.'
+        # Standard_D4ads_v5 has T4's 4 vCores, and no claim on its price, which can differ per vCore in a region (201a6666's
+        # Lows on b97bdcdb and 885a8d52, 2026-11-22).
+        $note = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.'
         $status.replica.note | Should -BeExactly $note
         $replicaStep = @($status.steps | Where-Object step -EQ 'Replica')
         $replicaStep.Count | Should -Be 1
@@ -1440,7 +1441,7 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
         $status = Get-SessionStatus
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('QuotaExceeded', 'Accepted')
-        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D4ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.'
+        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D4ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.'
     }
 
     It 'names the quota and its ways out when Azure refuses every size, some over the quota' {
@@ -1817,7 +1818,8 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
     }
 
     It 'says what the replica''s size costs from its vCores against T4''s: <Case>' -ForEach @(
-        @{ Case = 'the same vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores at the same price per vCore.' }
+        @{ Case = 'the same vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'the same vCores, the other way'; Asked = 'Standard_D4ads_v5'; Used = 'Standard_D4ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ads_v5) for the replica, so it runs on Standard_D4ds_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.' }
         @{ Case = 'more vCores'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
         @{ Case = 'over the quota'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ds_v5'; OverQuota = $true; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ds_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
         @{ Case = 'fewer vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D2ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D2ds_v5; ./scripts/estimate-cost.ps1 shows what it costs.' }

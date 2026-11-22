@@ -5075,10 +5075,10 @@ function Get-DbHubReplicaSizeNote {
     <#
     .SYNOPSIS
     The status's note when a session's read replica runs on another size (Used) than T4's (Asked), from their vCores
-    (Get-DbHubT4VCore): only a size with more vCores costs more. The next size tried has T4's vCores when the documented
-    sizes have one (Get-DbHubReplicaSizeOrder), and those, Standard_D4ds_v5 and Standard_D4ads_v5, have the same price per
-    vCore (the Azure Retail Prices API, 2026-11-22). OverQuota: Azure refused a size over the subscription's vCore quota
-    (F37). Pure.
+    (Get-DbHubT4VCore): only a size with more vCores is said to cost more. One with T4's vCores, which the order tries
+    next when the documented sizes have one (Get-DbHubReplicaSizeOrder), makes no claim on its price: a series can cost
+    another price per vCore in a region (the Azure Retail Prices API, 2026-11-22: Standard_D4ds_v5 and Standard_D4ads_v5
+    in Norway West). OverQuota: Azure refused a size over the subscription's vCore quota (F37). Pure.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -5099,7 +5099,7 @@ function Get-DbHubReplicaSizeNote {
         $what = ', which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference'
     }
     elseif ($askedVCores -gt 0 -and $usedVCores -eq $askedVCores) {
-        $what = ', which has T4''s vCores at the same price per vCore'
+        $what = ', which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs'
     }
     return ('Azure refused T4''s size ({0}) for the replica{1}, so it runs on {2}{3}.' -f $Asked, $why, $Used, $what)
 }

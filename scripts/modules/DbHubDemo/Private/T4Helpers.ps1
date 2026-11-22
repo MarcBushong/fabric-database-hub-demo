@@ -1329,7 +1329,7 @@ function New-DemoT4FallbackResult {
         return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $keep -DocUrl $docUrl)
     }
     if ($Next -eq 'Standard_D4ads_v5') {
-        $message = 'Azure refused T4''s default size, Standard_D4ds_v5 ({0}). This run tries Standard_D4ads_v5, General Purpose with 4 vCores on AMD processors at the same price per vCore (estimate-cost.ps1 prices it at run time), so autonomous tuning stays on, and later runs keep it.' -f $refusal
+        $message = 'Azure refused T4''s default size, Standard_D4ds_v5 ({0}). This run tries Standard_D4ads_v5, General Purpose with 4 vCores on AMD processors (estimate-cost.ps1 prices it at run time), so autonomous tuning stays on, and later runs keep it.' -f $refusal
         return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $keep -DocUrl $docUrl)
     }
     if ($Next -eq 'Refused') {
