@@ -604,6 +604,26 @@ public sealed class RcaObserverTests
         Assert.Equal(samples.Count, samples.Distinct().Count());
     }
 
+    /// <summary>
+    /// RCA-PG-10's total counts the observer's own connection, which takes one of max_connections' slots like any other
+    /// (verified on PostgreSQL 18: with the observer and 6 clients in 7 ordinary slots, the next client was refused, 53300).
+    /// Its counts by state leave the observer out, whose session is always running this query (Final tests' live check of
+    /// 4e2c65ed: "1 ran a query" in every sample).
+    /// </summary>
+    [Fact]
+    public void TheConnectionCountsByStateLeaveOutTheObserverAndItsTotalKeepsIt()
+    {
+        var text = CaptureCatalog.Get("RCA-PG-10");
+        string Count(string name) => Assert.Single(text.Split('\n'), line => line.TrimEnd().EndsWith($") AS {name},", StringComparison.Ordinal) || line.TrimEnd().EndsWith($") AS {name}", StringComparison.Ordinal));
+
+        Assert.DoesNotContain("pg_backend_pid()", Count("client_connections"), StringComparison.Ordinal);
+        foreach (var state in new[] { "active", "idle", "idle_in_transaction", "waiting_lock" })
+        {
+            Assert.Contains("a.pid <> pg_backend_pid()", Count(state), StringComparison.Ordinal);
+            Assert.Contains("a.backend_type = 'client backend'", Count(state), StringComparison.Ordinal);
+        }
+    }
+
     /// <summary>A lock timeout (error 1222) of the chain's run, as the observer's event session reports it.</summary>
     private static string LockTimeout(DateTimeOffset at, int session) =>
         Event("error_reported", at, [("error_number", "1222", null), ("severity", "16", null), ("is_intercepted", "true", null), ("message", "Lock request time out period exceeded.", null)], [("client_app_name", ChainApp), ("session_id", session.ToString(CultureInfo.InvariantCulture))]);

@@ -226,16 +226,22 @@ ORDER BY t.seq_tup_read DESC;
 
 -- name: RCA-PG-10
 -- The sentinel's connection picture, every 30 s (every 10 s while connections are at 80 % of max_connections or more):
--- client connections by state against max_connections and the reserved slots, and the clients waiting on a lock (the
--- blocking trigger), in one row. Refused attempts (SQLSTATE 53300) never reach the server's views; Azure Monitor counts
--- them (connections_failed, in the history's Telemetry Snapshots).
+-- client connections against max_connections and the reserved slots, by state, and the clients waiting on a lock (the
+-- blocking trigger), in one row.
+-- client_connections counts every client backend, the observer's own too: each takes one of max_connections' slots, and
+-- once the free slots are down to the reserved ones, PostgreSQL accepts only roles with their privileges
+-- (https://www.postgresql.org/docs/18/runtime-config-connection.html#GUC-SUPERUSER-RESERVED-CONNECTIONS). The counts by
+-- state leave the observer out: its session is always running this query, which read as a client running one in every
+-- sample (Final tests' live check of 4e2c65ed). So they add up to one less than client_connections, or fewer.
+-- Refused attempts (SQLSTATE 53300) never reach the server's views, and Azure Monitor's connections_failed doesn't count
+-- them either (live, 2026-11-21: 48 refused attempts, none counted), so nothing here counts them.
 SELECT clock_timestamp() AS captured_at,
        current_setting('max_connections')::integer AS max_connections,
        current_setting('superuser_reserved_connections')::integer
          + COALESCE(NULLIF(current_setting('reserved_connections', true), '')::integer, 0) AS reserved_connections,
        count(*) FILTER (WHERE a.backend_type = 'client backend') AS client_connections,
-       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.state = 'active') AS active,
-       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.state = 'idle') AS idle,
-       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.state LIKE 'idle in transaction%') AS idle_in_transaction,
-       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.wait_event_type = 'Lock') AS waiting_lock
+       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() AND a.state = 'active') AS active,
+       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() AND a.state = 'idle') AS idle,
+       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() AND a.state LIKE 'idle in transaction%') AS idle_in_transaction,
+       count(*) FILTER (WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() AND a.wait_event_type = 'Lock') AS waiting_lock
 FROM pg_stat_activity AS a;

@@ -4597,6 +4597,14 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 
     They replace the rows rebuilt from the live answers, and the modeled split by state: `CONN-IDLE` at high confidence follows the real counts. Left out: RCA Sessions, T4's lock-wait capture episodes, RCA-PG-03, RCA-PG-10 outside the surges' minutes, and the telemetry the RCA doesn't read. Each environment's answer-key file holds its surges' rows, the grading reference only.
   - **Tests:** 16 new or changed tests fail with bb70161f's four modules. Each part alone fails its own: the gap that ends an episode, the waves, the key's fallback, the hour's look-back (also on B's real storm from 15:45), the note's provenance, and the rise's first sample.
+- **The capture counted its own connection as a client's query** (Final tests' live check of 4e2c65ed). RCA-PG-10's counts by state included the observer's own session, which is always running RCA-PG-10, so every sample read "1 ran a query". The counts by state leave it out now (`a.pid <> pg_backend_pid()`). The total keeps it, since it takes one of `max_connections`' slots like any other ([connection slots](https://www.postgresql.org/docs/18/runtime-config-connection.html#GUC-SUPERUSER-RESERVED-CONNECTIONS)).
+  - **Why not the total too:** the request was to leave the observer out of RCA-PG-10, since "36 of 35" seemed to come from it.
+    - **On PostgreSQL 18,** with 7 slots for roles without the reserved ones, the observer and 6 clients filled them: the next client was refused (53300), and the total read 7. Without the observer it would read 6, a full server as one with a slot free.
+    - **On B,** the first surge's 4 samples at 35 of 35 held 34 idle clients and the observer, and the answer key had 3 attempts refused by 15:26:44.
+    - **"36 of 35" at 19:30:16** is 35 idle clients and the observer. That's past the 35 that roles without the reserved slots can use, so at least one connection was a role that may use them: the count is right. The app's wording for it is the next commit's.
+  - **When:** the runner embeds the capture's SQL, so the change takes effect at the next deploy. Earlier rows count the observer in both.
+  - **Also corrected:** the block's comment said that Azure Monitor counts refusals at the limit.
+  - **Tests:** `RcaObserverTests` pins the block: the total without the filter, and each count by state with it. It fails with ca6c9121's block. The counts above come from a run on the spike's local PostgreSQL 18.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4756,6 +4764,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
 
   PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
+- **The capture's own connection:** .NET, 808 tests: 787 passed, 21 skipped (the opt-in tests against real engines), none failed. The new test fails with ca6c9121's RCA-PG-10. On the spike's local PostgreSQL 18 (`max_connections` 12, 3 slots for superusers, and 2 more reserved), the observer and 6 clients filled the 7 others: the next client was refused (53300). The block read a total of 7 and 1 active, the client running `pg_sleep`, where the block before it read 2. Under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, and `Agent.PromptPack` passed: 775 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI. markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks). Step 1.8 retired the three that only it could:
 
