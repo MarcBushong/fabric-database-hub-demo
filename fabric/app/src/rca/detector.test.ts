@@ -253,6 +253,17 @@ describe("a capture episode with no relaxed event in the minutes read", () => {
         expect(describeEpisode(e)).toContain("from 15:00:00 UTC (still on at 15:00:30 UTC, where the read stopped), peak 85.7 % at 15:00:00 UTC, in 4 samples in a row");
     });
 
+    // The review of 11b7c4b9: an episode its capture ended keeps every sample, whatever another table's read stopped at (a
+    // surge to 35 of 35 at 15:05, ended at 15:10:40, read "peak 85.7 % at 15:00:00 ... in 4 samples in a row").
+    it("keeps every sample of an episode its capture ended, whatever another table's read stopped at", () => {
+        const evidence = surge("15:30:00", (s) => (s === 300 ? 35 : s < 640 ? 30 : 10), 640);
+        evidence.events.push({ target: "T4", at: at("15:10:40"), kind: "capture", name: "relaxed", code: "T4-20261120T150000Z", count: 1, detail: "client connections 10 < 80 % of 35 for 30 s." });
+        const [e] = findEpisodes({ evidence: { ...evidence, cut: [{ table: "RCA Sessions", until: at("15:00:30") }] } }, at("14:55:00"), at("15:20:00")).filter((x) => x.family === "connections");
+        expect(e).toMatchObject({ end: at("15:10:40"), peak: 100, valued: 65, atLevel: 64 });
+        expect(e.readStopped).toBeUndefined();
+        expect(describeEpisode(e)).toContain("peak 100 % at 15:05:00 UTC, in 64 of its 65 samples");
+    });
+
     // The capture's own error and deadlock episodes have no samples of their own: neither a fall nor "still on" can be told.
     it("says whether an episode with no samples of its own was still on isn't known", () => {
         const evidence = emptyEvidence();

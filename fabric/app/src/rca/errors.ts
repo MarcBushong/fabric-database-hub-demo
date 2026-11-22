@@ -4,7 +4,7 @@
 // event session and Azure Monitor's counts (T4's failed connections, T5's 429s), never the workload's own account of them.
 
 import { recommend } from "./catalog";
-import { during, hhmmss, iso, openSpan, unknownFromOf, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
+import { during, hhmmss, iso, openCountWords, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
 
 export interface ErrorClass {
     id: string;
@@ -64,8 +64,10 @@ export interface ErrorSummary {
     first: Date;
     /** When the last one was: an event's time, or the end of the interval of an Azure Monitor count (the review of ebd1c6c3). */
     last: Date;
-    /** The start of the latest count whose interval isn't known in these minutes: the class ends in it, no one knows where (the review of 4667459c). */
-    unknownFrom: Date | null;
+    /** Its counts whose interval isn't known in these minutes (the reviews of 4667459c and 11b7c4b9), apart from the known ones, never added: their total, the first one's start, and how many intervals; null when it has none. */
+    open: { count: number; from: Date; intervals: number } | null;
+    /** Its known counts: their total and span; null when it has none. */
+    known: { count: number; first: Date; last: Date } | null;
     intercepted: number;
     top: string;
     cause: string;
@@ -88,6 +90,12 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         // An Azure Monitor count stands for its whole interval: 10382 429s counted at 12:15 and 12:30 in 15-minute intervals
         // ran to 12:45, not 12:30 (the review of ebd1c6c3).
         const last = new Date(Math.max(...rows.map((r) => r.at.getTime() + (r.intervalMs ?? 0))));
+        // Counts of an interval whose length isn't known in these minutes stand apart: such an interval may hold the known ones.
+        const sum = (list: readonly EventRow[]) => list.reduce((n, r) => n + (r.count ?? 1), 0);
+        const openRows = rows.filter((r) => r.intervalUnknown);
+        const knownRows = rows.filter((r) => !r.intervalUnknown);
+        const open = openRows.length ? { count: sum(openRows), from: new Date(Math.min(...openRows.map((r) => r.at.getTime()))), intervals: openRows.length } : null;
+        const known = knownRows.length ? { count: sum(knownRows), first: new Date(Math.min(...knownRows.map((r) => r.at.getTime()))), last: new Date(Math.max(...knownRows.map((r) => r.at.getTime() + (r.intervalMs ?? 0)))) } : null;
         const tally = new Map<string, number>();
         for (const r of rows) {
             const who = r.module ?? r.program ?? r.detail.slice(0, 60);
@@ -95,9 +103,9 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         }
         return {
             classId: id, title: c.title,
-            count: rows.reduce((n, r) => n + (r.count ?? 1), 0),
+            count: open && known ? Math.max(open.count, known.count) : sum(rows),
             targets: [...new Set(rows.map((r) => r.target))],
-            first: sorted[0].at, last, unknownFrom: unknownFromOf(rows),
+            first: sorted[0].at, last, open, known,
             intercepted: rows.filter((r) => r.intercepted).reduce((n, r) => n + (r.count ?? 1), 0),
             top: [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0],
             cause: c.cause, followUp: c.followUp, recommendationIds: c.recommendationIds,
@@ -108,8 +116,8 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         ruleId: `ERR-${c.classId.toUpperCase()}`,
         target: c.targets[0],
         severity: c.count >= 100 ? "critical" : "warning",
-        title: `${c.title}: ${stoppedAt ? "at least " : ""}${c.count}`,
-        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${c.unknownFrom ? openSpan(c.first, c.unknownFrom) : `${during(c.first, c.last)} UTC`}`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
+        title: `${c.title}: ${stoppedAt ? "at least " : ""}${c.open && c.known ? `${c.open.count} in an interval of unknown length, ${c.known.count} counted` : c.count}`,
+        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.open ? openCountWords(c.open, c.known, `${c.title.toLowerCase()} on ${c.targets.join(", ")}`) : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC`}`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
         evidence: c.evidence,
     }));
     return { classes, findings };
@@ -119,7 +127,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
 export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Date): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
     const { classes, findings } = summarizeErrors(events, stoppedAt);
     const top = classes[0];
-    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${c.unknownFrom ? openSpan(c.first, c.unknownFrom) : `${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`}`);
+    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : c.open ? openCountWords(c.open, c.known) : `${c.count}, ${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`);
     return {
         findings,
         rootCause: top
@@ -132,6 +140,6 @@ export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Dat
             : null,
         recommendations: recommend(...new Set(classes.flatMap((c) => c.recommendationIds))),
         nextSteps: classes.slice(0, 3).map((c) => `${c.followUp} for ${c.targets.join(", ")} (${c.title.toLowerCase()})`),
-        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), ...(c.unknownFrom ? { endsInIntervalFrom: iso(c.unknownFrom), endUnknown: true } : {}), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
+        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), ...(c.open ? { endUnknown: true, inIntervalOfUnknownLength: { count: c.open.count, from: iso(c.open.from), intervals: c.open.intervals }, known: c.known ? c.known.count : 0 } : {}), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
     };
 }

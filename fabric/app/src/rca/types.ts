@@ -333,17 +333,16 @@ export const hhmmss = (d: Date) => d.toISOString().slice(11, 19);
 export const during = (first: Date, last: Date) => (first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `between ${hhmmss(first)} and ${hhmmss(last)}`);
 
 /**
- * A span that ends in an Azure Monitor count's interval whose length isn't known in these minutes (MetricPoint
- * .intervalUnknown): never an instant at its start (the review of 4667459c: a 60-minute save's count read "3000 throttled
- * requests (429) on T5 at 15:00:00 UTC").
+ * Azure Monitor counts of an interval whose length isn't known in these minutes (MetricPoint.intervalUnknown), in words,
+ * beside the counts whose interval is known, and never added to them: such an interval may hold them (the reviews of
+ * 4667459c and 11b7c4b9: an hour's count read "at 15:00:00 UTC", then, with a finer save's, "4600 ... in the interval from
+ * 15:00:00 UTC", the hour's 3,000 and the 1,600 it may hold). `known` is the known counts' total, and `first` and `last`
+ * their span; `what` follows the count ("throttled requests (429) on T5").
  */
-export const openSpan = (first: Date, unknownFrom: Date) =>
-    first.getTime() === unknownFrom.getTime()
-        ? `in the interval from ${hhmmss(unknownFrom)} UTC, whose length isn't known in these minutes`
-        : `from ${hhmmss(first)} UTC into the interval from ${hhmmss(unknownFrom)} UTC, whose length isn't known in these minutes`;
-
-/** The latest start of the rows' counts whose interval isn't known in these minutes, or null. */
-export const unknownFromOf = (rows: ReadonlyArray<{ at: Date; intervalUnknown?: boolean }>): Date | null => {
-    const open = rows.filter((r) => r.intervalUnknown).map((r) => r.at.getTime());
-    return open.length ? new Date(Math.max(...open)) : null;
-};
+export function openCountWords(open: { count: number; from: Date; intervals: number }, known: { count: number; first: Date; last: Date } | null, what = ""): string {
+    const where = `${open.count}${what ? ` ${what}` : ""} ${open.intervals > 1 ? `in ${open.intervals} intervals` : "in the interval"} from ${hhmmss(open.from)} UTC, whose length isn't known in these minutes`;
+    if (!known || known.count === 0) return where;
+    const span = `${hhmmss(known.first)} to ${hhmmss(known.last)} UTC`;
+    if (known.last.getTime() <= open.from.getTime()) return `${where}, after the ${known.count} counted from ${span}`;
+    return `${where}, which may hold ${known.first < open.from ? "some of " : ""}the ${known.count} counted from ${span}`;
+}

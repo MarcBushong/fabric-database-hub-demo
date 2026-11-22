@@ -3381,6 +3381,49 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         ($status.rcaLines | Where-Object step -EQ 'RCA.PENDING').message | Should -Match '^Still on the VMs, for this session''s history: the capture on archost01 that no export took, for the next start that sends activity there, until \d{4}-\d\d-\d\d \d\d:\d\d UTC, when the runner deletes it\.$'
     }
 
+    It 'counts the sessions ahead of a stop''s evidence the same in Windows PowerShell 5.1, whose Sort-Object reverses equal times (the transport review of f99451f7)' {
+        $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $IsWindows -or -not $powershell) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
+            return
+        }
+        # An earlier session's documents that the runner deletes when it deletes this session's: a start fetches the first of
+        # equal times, and this session's entry is the last, so it waits for the start after the next.
+        $probe = {
+            param([string] $Common, [string] $SettingsJson, [string] $Session)
+            . $Common
+            $settings = ConvertFrom-DbHubSetting -Json $SettingsJson
+            $now = New-Object -TypeName DateTime -ArgumentList 2026, 11, 21, 18, 55, 0, ([System.DateTimeKind]::Utc)
+            $earlier = [ordered]@{ sessionId = 'fedcba9876543210fedcba9876543210'; pending = @([ordered]@{ documentId = '20261119T100000Z-sqlvm01-0001'; parts = 1; sha256 = ('a' * 64); vm = 'sqlvm01' }); leftVms = @(); expiresUtc = '2026-11-28T18:55:00Z' }
+            $state = [ordered]@{ sessionId = $Session; bundles = @(); documents = @(); pending = @([ordered]@{ documentId = '20261121T182100Z-sqlvm01-0001'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01' }); leftVms = @(); final = $false; finalRan = $true; status = 'Warning'; message = ''; boundVms = @() }
+            $status = [ordered]@{ schemaVersion = 1; sessionId = $Session; phase = 'stopped'; updatedUtc = ''; acceptedUtc = '2026-11-21T18:00:00Z'; metrics = [ordered]@{ status = 'Pass' }; rca = $state; rcaEarlierPending = @($earlier) }
+            return [string](Get-DbHubRcaStopLeftLine -Settings $settings -Status $status -NowUtc $now)['message']
+        }
+        $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
+        $here = & $probe $common $script:settingsJson $script:fixtureSession
+        $inputFile = Join-Path -Path $TestDrive -ChildPath 'ahead.json'
+        Set-Content -LiteralPath $inputFile -Value (ConvertTo-Json -InputObject @{ common = $common; settings = $script:settingsJson; session = $script:fixtureSession; probe = $probe.ToString() } -Depth 4) -Encoding utf8
+        $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common `$in.settings `$in.session; [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$out))" -f $inputFile
+        $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
+        $LASTEXITCODE | Should -Be 0
+        $there = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]($output | Select-Object -Last 1)).Trim()))
+        $there | Should -Match 'the first from 18:21 UTC, which a later start fetches, behind 1 earlier session\(s\), one per start, until 2026-11-28 18:55 UTC, when the runner deletes them\.$'
+        $there | Should -Be $here
+    }
+
+    It 'writes a stopped session''s RCA.PENDING line again when a re-check routes another session''s documents ahead of its own (the transport review of f99451f7)' {
+        $state = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(New-TestPending -DocumentId $script:fixtureIds[1] -Vm 'sqlvm01'); leftVms = @(); final = $false; finalRan = $true; status = 'Warning'; message = ''; boundVms = @() }
+        $older = 'Still on the VMs, for this session''s history: 1 document(s) on sqlvm01 not fetched whole, the first from 17:00 UTC, which the next session''s start fetches, until 2026-11-03 14:00 UTC, when the runner deletes them.'
+        # The stop wrote its status at 14:00; the re-check hands its documents over at 15:00, and its write sets the time again,
+        # which the next start counts this session's documents from.
+        $status = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T14:00:00Z'; acceptedUtc = '2026-10-27T13:30:00Z'; metrics = [ordered]@{ status = 'Pass' }; rca = $state; rcaLines = @([ordered]@{ step = 'RCA.PENDING'; status = 'Info'; message = $older; fix = '' }) }
+        $other = [ordered]@{ documentId = '20261027T143000Z-sqlvm01-0001'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01'; sessionId = 'fedcba9876543210fedcba9876543210' }
+        $own = Add-DbHubRcaHandoff -Context (New-TestContext) -Status $status -SessionId $script:fixtureSession -Document @() -Elsewhere @($other)
+        $own | Should -Be 0 -Because 'none of the documents is the session''s own'
+        $left = @((Get-SessionStatus).rcaLines | Where-Object step -EQ 'RCA.PENDING')
+        $left.Count | Should -Be 1
+        $left[0].message | Should -Match '^Still on the VMs, for this session''s history: 1 document\(s\) on sqlvm01 not fetched whole, the first from 17:00 UTC, which a later start fetches, behind 1 earlier session\(s\), one per start, until '
+    }
     It 'says what a stop leaves on the VMs, which start takes it, and until when, behind an earlier session''s evidence (step 1.8''s finding 4)' {
         $now = [datetime]::new(2026, 11, 21, 18, 55, 0, [System.DateTimeKind]::Utc)
         $earlier = [ordered]@{ sessionId = 'fedcba9876543210fedcba9876543210'; pending = @([ordered]@{ documentId = '20261119T100000Z-sqlvm01-0001'; parts = 1; sha256 = ('a' * 64); vm = 'sqlvm01' }); leftVms = @(); expiresUtc = '2026-11-25T10:00:00Z' }

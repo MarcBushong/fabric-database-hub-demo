@@ -433,7 +433,7 @@ describe("a coarser point a finer save holds part of", () => {
         expect(throughput(incident)).toContain("Azure Monitor counted 60000 requests in that interval, 3000 of them throttled (429, 5 %)");
         const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z", targets: ["T5"] }, tools);
         // The review of 4667459c: never an hour's count at one second, "(3000, at 15:00:00 UTC ...)".
-        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000, in the interval from 15:00:00 UTC, whose length isn't known in these minutes, mostly the container's clients\)/);
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, mostly the container's clients\)/);
         expect(errors.findings[0].detail).toMatch(/^3000 throttled requests \(429\) on T5 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, mostly /);
         expect(errors.findings[0].evidence.map((e) => e.text)).toEqual(["429: 3000 throttled requests (429) in the interval from 15:00 UTC, whose length isn't known in these minutes (Azure Monitor)"]);
         for (const r of [incident, errors]) expect(texts(r)).not.toMatch(/1-minute|15:00(:00)? to 15:00/);
@@ -444,6 +444,25 @@ describe("a coarser point a finer save holds part of", () => {
         const failed = reading(["14:00", "15:00", "16:00", "17:00"].map((b) => ({ ...hourly(b, "connections_failed", b === "15:00" ? 7 : 0), TargetKey: "T4", ResourceName: "pgflex01" })));
         const triaged = await ask("triage_window", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z", targets: ["T4"] }, failed);
         expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes (Azure Monitor counts included).");
+    });
+
+    // The review of 11b7c4b9: a 60-minute save's 3,000 429s at 15:00, beside 100 a minute from 15:14 that a finer save holds,
+    // read "4600 ... in the interval from 15:00:00 UTC, whose length isn't known": the hour's count may hold the others.
+    it("never adds a count of unknown interval to the known counts it may hold", async () => {
+        const hourly = save("18:05", "14:00", "18:00");
+        const minutes = save("16:00", "15:14", "15:30");
+        const counts = (metric: string, target: string, hour: number, each: number) => [
+            ...["14:00", "15:00", "16:00", "17:00"].map((b) => ({ ...hourly(b, metric, b === "15:00" ? hour : 0), TargetKey: target })),
+            ...Array.from({ length: 16 }, (_, i) => ({ ...minutes(`15:${String(14 + i).padStart(2, "0")}`, metric, each), TargetKey: target })),
+        ];
+        const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:30:00Z", targets: ["T5"] }, reading(counts(THROTTLED, "T5", 3000, 100)));
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 1600 counted from 15:14:00 to 15:30:00 UTC, mostly the container's clients\)/);
+        expect(errors.findings[0].title).toBe("Throttled requests (429): 3000 in an interval of unknown length, 1600 counted");
+        expect(errors.findings[0].detail).toMatch(/^3000 throttled requests \(429\) on T5 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 1600 counted from 15:14:00 to 15:30:00 UTC, mostly /);
+        expect(texts(errors)).not.toMatch(/\b4600\b/);
+        // Triage's count of errors that no episode holds: T4's failed connections the same way.
+        const triaged = await ask("triage_window", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:30:00Z", targets: ["T4"] }, reading(counts("connections_failed", "T4", 7, 1).map((r) => ({ ...r, ResourceName: "pgflex01" }))));
+        expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 16 counted from 15:14:00 to 15:30:00 UTC (Azure Monitor counts included).");
     });
 
     // A peak kept around a finer save is only an upper bound of each stretch it's kept for: the replica's rise is said as

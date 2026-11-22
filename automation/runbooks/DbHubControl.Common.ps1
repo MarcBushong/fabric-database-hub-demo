@@ -8822,7 +8822,8 @@ function Add-DbHubRcaHandoff {
                 $added.Add([ordered]@{ documentId = $id; parts = [int](Get-DbHubMember -InputObject $item -Name 'parts'); sha256 = [string](Get-DbHubMember -InputObject $item -Name 'sha256'); vm = $vm })
             }
         }
-        $routed = Add-DbHubRcaElsewhere -Status $Status -Document @($Elsewhere) -NowUtc (Get-DbHubUtcNow)
+        $now = Get-DbHubUtcNow
+        $routed = Add-DbHubRcaElsewhere -Status $Status -Document @($Elsewhere) -NowUtc $now
         if ($added.Count -eq 0 -and $routed -eq 0) {
             return 0
         }
@@ -8832,11 +8833,13 @@ function Add-DbHubRcaHandoff {
                 $state['pending'] = @(@($state['pending']) + $added.ToArray())
                 $state['final'] = $false
                 $Status['rca'] = $state
-                # The stop's RCA.PENDING line takes them too (step 1.8's finding 4).
-                $lines = @(Get-DbHubRcaStopLineList -Settings $Context.Settings -Status $Status -NowUtc (Get-DbHubUtcNow))
-                if ($lines.Count -gt 0) {
-                    $Status['rcaLines'] = $lines
-                }
+            }
+            # The stop's RCA.PENDING line takes them too (step 1.8's finding 4), and another session's documents ahead of
+            # this one's, from one now with the status's time blank, as at the stop: its write sets the time again.
+            $Status['updatedUtc'] = ''
+            $lines = @(Get-DbHubRcaStopLineList -Settings $Context.Settings -Status $Status -NowUtc $now)
+            if ($lines.Count -gt 0) {
+                $Status['rcaLines'] = $lines
             }
             $null = Write-DbHubSessionStatus -Context $Context -Status $Status
             return $added.Count
@@ -9476,10 +9479,11 @@ function Get-DbHubRcaStopLeftLine {
         $began = [datetime]::ParseExact($first.Substring(0, 16), 'yyyyMMdd\THHmmss\Z', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
         $vms = @($pending | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'vm') } | Where-Object { $_ } | Select-Object -Unique)
         # The queue a start fetches from, as Invoke-DbHubRcaEarlier keeps it: bundles no saved index lists first, then
-        # documents in the order the runner deletes them; one session's per start.
+        # documents in the order the runner deletes them, one session's per start; of equal times the first, and this
+        # session's entry is the last. Counted, not sorted: Windows PowerShell 5.1's Sort-Object reverses equal elements
+        # (the transport review of f99451f7).
         $unsaved = @($entries | Where-Object { $_['mustFetch'] }).Count
-        $order = @($entries | Where-Object { @($_['pending']).Count -gt 0 -and -not $_['mustFetch'] } | Sort-Object -Property { $_['expiresUtc'] })
-        $ahead = [array]::IndexOf($order, $own) + $unsaved
+        $ahead = $unsaved + @($entries | Where-Object { -not [object]::ReferenceEquals($_, $own) -and @($_['pending']).Count -gt 0 -and -not $_['mustFetch'] -and $_['expiresUtc'] -le $own['expiresUtc'] }).Count
         $turn = 'which the next session''s start fetches'
         if ($own['mustFetch']) {
             $turn = 'which a later start fetches with its bundles'

@@ -385,7 +385,9 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Da
         // Where a read of the capture's tables stopped short, the episode's own samples stop too, whichever table they come
         // from (the review of 4667459c: RCA Resource read whole beside RCA Events read to 15:00:30 gave one answer both "under
         // its level by 15:10:00" and "still on at 15:00:30, where the read stopped").
-        const stopped = !!stop && !!readTo && stop < readTo && stop > c.start;
+        // Only an episode with no end: one its capture ended keeps all its samples, whatever another table's read stopped at
+        // (the review of 11b7c4b9: a surge to 35 of 35 at 15:05 that ended at 15:10:40 read "peak 85.7 % at 15:00:00").
+        const stopped = !c.end && !!stop && !!readTo && stop < readTo && stop > c.start;
         const read = episodeSamples(evidence, c.target, family, c.start, c.end ?? new Date(8.64e15)).filter((s) => s.value !== null && (!stopped || s.at <= (stop as Date)));
         const samples = c.end ? read : untilGap(read);
         const level = rule.family === "replica_lag" ? rule.floor : levelOf(rule, null);
