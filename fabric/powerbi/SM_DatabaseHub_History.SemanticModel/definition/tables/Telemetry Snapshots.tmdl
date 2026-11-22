@@ -49,7 +49,8 @@ table 'Telemetry Snapshots'
                                 VAR NearSaves =
                                     ADDCOLUMNS (
                                         // Only a save with a point here, or one whose window reaches the day from this bin, can weigh on
-                                        // the bin's points, since a step is at most a day: the work doesn't grow with the history.
+                                        // the bin's points, since a step is at most a day. Only this pass over the series' saves grows with the history;
+                                        // each save's interval and rows are worked out for these alone.
                                         FILTER (
                                             SaveList,
                                             ( 'Telemetry Snapshots'[Window Start UTC] < Bin + 1 && 'Telemetry Snapshots'[Window End UTC] > Bin )

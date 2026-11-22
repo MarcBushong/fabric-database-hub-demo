@@ -5284,3 +5284,37 @@ The read-only answer, first:
 - **T3's IO now includes the second set's,** whatever it is. If the endpoint drops it or tells it apart later, the sums follow with no change.
 - **Saves from before keep their values** ([troubleshooting](troubleshooting.md#database-hub-and-telemetry)). Under F35's finest-first rule, a later and coarser save doesn't replace a session's 1-minute rows; only a save of the same window does.
 - **The agent prompts,** for Copilot CLI and VS Code, ask the agent to write its own KQL on `SqlServerStorageIO` by the rule for cumulative counters. On T3, that KQL meets the same pair. This commit doesn't change them.
+
+### The reviews of 30392d79 and F36: a stop save's partial rows, the work's wording, the names test, and the agent prompts (2026-11-22)
+
+**Why.** Two reviews, with the coordinator's decisions.
+
+- **30392d79's re-review** found the prune exact, at the day's edges, for hourly Azure Monitor metrics, and for a point's own save; the late reads of the rows' extents give the same answers; the revert of `stop-demo.ps1 -SaveHistory` matches 602e18a1 byte for byte; and the names test is sound. It found one Low and two narrow gaps:
+  - **Partly arrived rows** (the Low, a trade-off): a stop save's last rows can hold only part of their telemetry, and where they fill every slot of a later day-long save's interval, they stand for it. The decision: keep the window ending when the save runs, and document the bound exactly.
+  - **The CHANGELOG's "a long history doesn't slow it"** held only for the costly part: the light pass over a series' list of saves still grows with the history.
+  - **The names test** matched `VAR` in `queries.ts` in upper case only, and cut a line at a `//` inside a DAX string.
+- **F36's review** (1546f89f) found it clean, apart from the agent prompts, which asked an agent to write its own KQL on `SqlServerStorageIO` without saying that a file key can hold two rows in a sample. The decision: add the rule to each of them, with a test.
+
+**Work summary.**
+
+- **The bound,** in the limitations and ADR 0014's amendment: a stop save's partly arrived rows stand for at most one 15-minute interval of a later day-long save, the last one its window holds whole, short by what hadn't arrived, and only where such a save holds it. A new reference test pins the review's probe: the stop save's 17:55 holds 120 of 300 ms and its 18:00 holds 60, so 17:00 to 18:15 reads 4.32 s, where the later save holds 4.5, in the model and in `finestPerInterval` alike. Ending the window 15 minutes early would avoid it, but would leave the stop's last 15 minutes out whenever no later save follows within a day.
+- **The wording:** the CHANGELOG, ADR 0014's cost bullet, and the measure's comment say that a bin works out each save's interval and rows for the saves near it alone, and that only the pass over the series' list of saves grows with the history. The measure changes in its comment only, and so do the four check queries generated from it.
+- **The names test:**
+  - It reads `var` in any case, in the app's TypeScript too, where the language's own `var` is a lint error (`no-var`, in typescript-eslint's recommended rules).
+  - One stripper, `$script:stripComments`, removes `//` comments without cutting a string: a DAX string (`"..."`, with `""` inside), or in TypeScript a `'...'`, `"..."`, or `` `...` `` string. A DAX name can't hold a slash. The F35 checks' test of dependent measures uses it too.
+  - A new test pins both on samples: a `VAR` after a string holding `https://`, and a lowercase `var` in a template string.
+- **The agent prompts:** the Insights app's new `STORAGE_IO_RULE` holds one sentence: "On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID." It follows the storage sentence in the app's IO prompt, and in the five skills prompts that ask for KQL on that table: `capacity-max`, `io-pressure`, `log-flush-waits`, `log-rate-pressure`, and `resource-governance`. T3 is the default target of `log-rate-pressure` and `resource-governance`, and one of `capacity-max`'s three. `Agent.PromptPack.Tests.ps1` reads the sentence from the app and checks that every prompt block naming `SqlServerStorageIO` holds it, five in all; the app's test checks where it sits.
+- **Docs:** the limitations (the bound, and F36's prompts), ADR 0014's amendment, and the CHANGELOG (the wording, and F36's prompts).
+
+**Changed files.** `fabric/app/src/data/snapshot-value.test.ts`; `fabric/app/src/lib/agent-prompts.ts` and its test; `fabric/agent/prompts/capacity-max.skills.md`, `io-pressure.skills.md`, `log-flush-waits.skills.md`, `log-rate-pressure.skills.md`, and `resource-governance.skills.md`; `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl` (a comment) and the four `-f35` check queries; `tests/unit/Fabric.PowerBI.Tests.ps1` and `Agent.PromptPack.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **vitest:** snapshot-value 14 of 14, the probe among them; agent-prompts and the pages, 72 passed.
+- **Pester** with StrictMode: Fabric.PowerBI 21 passed, 1 skipped (the report generator's npm packages aren't installed); Agent.PromptPack 473 passed; Repo.* 207 passed, 0 failed, 3 skipped. At 1546f89f, the prompts' test fails: the app has no such sentence.
+- **The rest:** the app's typecheck and eslint, PSScriptAnalyzer (no finding that HEAD doesn't have), and markdownlint are clean, and the PowerShell is ASCII-only.
+
+**Risks.**
+
+- **The bound is a trade-off,** not a fix: a stop save whose last rows partly arrived reads short in one interval while a later day-long save holds that interval whole.
+- **The prompts' sentence is an observation,** from T3's telemetry on 2026-11-21, not a documented behavior: the telemetry page doesn't say that a file key can hold two rows in a sample.

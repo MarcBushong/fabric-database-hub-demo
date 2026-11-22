@@ -38,7 +38,7 @@ Using the telemetry agent instructions, adapt sample query 5 to {target} for {in
 ### 2. Log flushes and log file writes against the baseline
 
 ```text
-For {target}, write KQL queries that compare {baselineWindow} with {incidentWindow}: the per-second rate of Log Bytes Flushed/sec and Log Flushes/sec from SqlServerPerformanceCountersCommon, and the delta of writes and write stalls on the log file from SqlServerStorageIO, following the rule for cumulative counters. List any gaps longer than two minutes. Don't change anything.
+For {target}, write KQL queries that compare {baselineWindow} with {incidentWindow}: the per-second rate of Log Bytes Flushed/sec and Log Flushes/sec from SqlServerPerformanceCountersCommon, and the delta of writes and write stalls on the log file from SqlServerStorageIO, following the rule for cumulative counters. On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID. List any gaps longer than two minutes. Don't change anything.
 ```
 
 ### 3. The governed log rate, with the SQL diagnostics skill

@@ -199,6 +199,32 @@ describe("Snapshot Value's rule in TypeScript, the model's reference (F35)", () 
             expect(model).toBeCloseTo(4.5, 9);
             expect(finest).toBeCloseTo(4.5, 9);
         });
+
+        it("lets a save's partly arrived rows stand for a later save's interval they fill: short by what hadn't arrived, in one interval", () => {
+            // The review of 30392d79's probe: the same save at 18:07, with its last rows only partly arrived, 17:55 holding 120
+            // of 300 and 18:00 holding 60. They fill every slot of 17:45 to 18:00, so they stand for the later save's 900
+            // there, and 18:00 to 18:15 keeps the later save's 900 less the 60. From 17:00 to 18:15, 4,320 ms where the later
+            // save holds 4,500, in both rules: at most one interval per such save, short by what hadn't arrived.
+            const stop = save("2026-11-21T18:07:30", "2026-11-21T06:07:00", "2026-11-21T18:07:00");
+            const later = save("2026-11-21T18:30:00", "2026-11-20T18:30:00", "2026-11-21T18:30:00");
+            const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
+            const rows = [
+                ...every("16:00", 5, Array.from({ length: 23 }, () => 300)).map(lock(stop)),
+                ...(
+                    [
+                        ["17:55", 120],
+                        ["18:00", 60],
+                    ] as const
+                ).map(lock(stop)),
+                ...every("16:00", 15, Array.from({ length: 9 }, () => 900)).map(lock(later)),
+            ];
+            const values = snapshotValues(rows);
+            const lockAt = (hhmm: string) => values.get(key("T1", "wait_deltas", "Lock", hhmm));
+            expect(["17:45", "17:50", "17:55", "18:00"].map(lockAt)).toEqual([300, 300, 120, 900]);
+            const { model, finest } = f35Check(rows, at("17:00"), at("18:15")).measures.T1.LockWaitS;
+            expect(model).toBeCloseTo(4.32, 9);
+            expect(finest).toBeCloseTo(4.32, 9);
+        });
     });
 
     // The review of 602e18a1: three saves at 1, 5, and 15 minutes, with T1's lock waits of 60 ms a minute in each. A bin's

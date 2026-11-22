@@ -12,6 +12,15 @@ BeforeAll {
     $zero = '00000000-0000-0000-0000-000000000000'
     $tableFiles = @(Get-ChildItem -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/tables') -Filter '*.tmdl' -File)
 
+    # Strips // comments without cutting a string: a DAX string ("...", with "" inside) or, in TypeScript, a '...', "...",
+    # or `...` string, where a backslash escapes. A DAX name can't hold a slash
+    # (https://learn.microsoft.com/dax/dax-syntax-reference), so outside a string, // starts a comment.
+    $script:stripComments = {
+        param([string] $Text, [bool] $TypeScript)
+        $strings = if ($TypeScript) { '''(?:[^''\\\n]|\\.)*''|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`' } else { '"(?:[^"\n]|"")*"' }
+        [regex]::Replace($Text, $strings + '|//[^\n]*', [System.Text.RegularExpressions.MatchEvaluator] { param($Match) if ($Match.Value.StartsWith('//')) { '' } else { $Match.Value } })
+    }
+
     # Every measure: table, name, the /// description above it, and its properties.
     $script:measures = foreach ($file in $tableFiles) {
         $lines = [System.IO.File]::ReadAllLines($file.FullName)
@@ -255,7 +264,7 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
             if ($file.Name -like '*-f35.dax') {
                 # A model measure reads the deployed Snapshot Value whatever a query defines (live, 602e18a1's first run): each
                 # measure a check evaluates, or that one of its measures reads, is defined in it.
-                $code = $text -replace '//[^\n]*', ''
+                $code = & $script:stripComments $text $false
                 $referenced = @([regex]::Matches($code, "(?<!['\w\]])\[([^\]@][^\]]*)\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'Value' } | Sort-Object -Unique)
                 $referenced.Count | Should -BeGreaterThan 3 -Because $file.Name
                 @($referenced | Where-Object { $names -notcontains $_ }) | Should -BeNullOrEmpty -Because $file.Name
@@ -282,6 +291,7 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
             }
         }
     }
+
 }
 
 Describe 'DAX variable names' {
@@ -315,10 +325,10 @@ Describe 'DAX variable names' {
     It 'names every VAR as Learn allows: letters and digits, never a DAX keyword, a function''s name, or a table''s' {
         $declared = 0
         $problems = foreach ($file in $script:daxSources) {
-            $text = [System.IO.File]::ReadAllText($file.FullName) -replace '//[^\n]*', ''
-            # In TypeScript, only the DAX keyword's upper case, never the language's own var.
-            $options = if ($file.Extension -eq '.ts') { [System.Text.RegularExpressions.RegexOptions]::None } else { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
-            foreach ($match in [regex]::Matches($text, '\bVAR\s+([^\s=]+)\s*=', $options)) {
+            $text = & $script:stripComments ([System.IO.File]::ReadAllText($file.FullName)) ($file.Extension -eq '.ts')
+            # DAX keywords are case-insensitive. In TypeScript, the language's own var is a lint error there (no-var), so a
+            # var in any case is DAX's.
+            foreach ($match in [regex]::Matches($text, '\bVAR\s+([^\s=]+)\s*=', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
                 $declared++
                 $name = $match.Groups[1].Value
                 if ($name -cnotmatch '^(__)?[A-Za-z][A-Za-z0-9]*$') {
@@ -334,6 +344,17 @@ Describe 'DAX variable names' {
         }
         $declared | Should -BeGreaterThan 400
         @($problems | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+
+    It 'reads a // inside a string as text, and finds a lowercase var, so neither hides a name' {
+        $dax = "VAR Url = ""https://learn.microsoft.com"" VAR Under = 1 // VAR Hidden = 2`nRETURN Url"
+        $stripped = & $script:stripComments $dax $false
+        $stripped | Should -BeLikeExactly '*VAR Under = 1 *'
+        $stripped | Should -Not -BeLike '*Hidden*'
+        $ts = "const q = ``var Under = 1`` // var Hidden = 2`nconst u = 'https://x' + ""a//b"""
+        $tsStripped = & $script:stripComments $ts $true
+        @([regex]::Matches($tsStripped, '\bVAR\s+([^\s=]+)\s*=', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }) -join ',' | Should -BeExactly 'Under'
+        $tsStripped | Should -BeLikeExactly "*'https://x' + ""a//b""*"
     }
 }
 
