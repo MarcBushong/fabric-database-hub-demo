@@ -15,6 +15,9 @@ import ReplayPage from "@/pages/ReplayPage";
 import ScoreboardPage from "@/pages/ScoreboardPage";
 import TrendsPage from "@/pages/TrendsPage";
 import type { ViewState } from "@/lib/view-state";
+import { windowPhrase } from "@/lib/agent-prompts";
+import { formatDateTimeUtc } from "@/lib/format";
+import { postmortemAsk } from "@/lib/postmortem";
 import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
 import { answerKeyInContext, faultMinutesInContext, type FaultMinutes } from "@/test/blind";
 import { findIncidentsAsk, triageAsk } from "@/rca/entry";
@@ -180,5 +183,25 @@ describe("the chat's entry points come back blind with the RCA tables (ADR 0031)
             prompt: expect.stringMatching(/^Triage ContosoCare's databases from 2026-11-17 13:30 UTC to 2026-11-17 15:00 UTC: call triage_window with from 2026-11-17T13:30:00Z and to 2026-11-17T15:00:00Z, then explain/),
         });
         expect(findIncidentsAsk({ targets: ["T1"] })).toMatchObject({ title: "The history's newest 90 minutes on T1", prompt: expect.stringMatching(/^Find the incidents in ContosoCare's databases in the history's newest 90 minutes on T1 from the signals themselves: call find_incidents/) });
+    });
+});
+
+// The re-review of ab1d2d41: the guard read only ISO times in a prompt or title, so the app's own wordings passed unseen:
+// ff5753e2's leak, a lone request's draft ("from 20 Oct 2026 15:00 to 15:30 UTC"), and agent-prompts' windowPhrase.
+describe("the guard against a lone request's minutes", () => {
+    const [lone] = LONE_MINUTES;
+    const ask = (prompt: string): AskContext => ({ title: "Why?", prompt });
+
+    it("finds them in the app's own wordings, not only in ISO times", () => {
+        const plan = { key: "r7", kind: "request" as const, label: "Deep blocking chain and lock escalation on T1", start: lone.start, end: lone.end, requestedAt: null, status: "Pass", message: "", faults: [] };
+        const draft = postmortemAsk({ plan, scores: [], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: new Date("2026-10-21T21:00:00Z") });
+        expect(draft.title).toBe("Postmortem draft: ContosoCare from 20 Oct 2026 15:00 to 15:30 UTC");
+        expect(faultMinutesInContext(draft, LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext({ title: draft.title }, LONE_MINUTES)).toBe("T1's fault minutes in the title: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext(ask(`What happened ${windowPhrase(lone.start, lone.end)}?`), LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext(ask(`What changed after ${formatDateTimeUtc(lone.end)}?`), LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:30:00.000Z");
+        // A session's minutes, the next morning, aren't the request's.
+        const morning = { start: new Date("2026-10-21T09:00:00Z"), end: new Date("2026-10-21T10:30:00Z") };
+        expect(faultMinutesInContext(ask(`What happened ${windowPhrase(morning.start, morning.end)}, from ${formatDateTimeUtc(morning.start)}?`), LONE_MINUTES)).toBeNull();
     });
 });

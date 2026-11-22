@@ -172,6 +172,17 @@ describe("the report's root cause, never blank", () => {
         const gaps = screen.getByRole("region", { name: "Not captured" });
         expect(within(gaps).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
     });
+
+    // The re-review of ab1d2d41: an incident across two coverage rows not captured has a line for each, and the view kept
+    // only the first, so T5's storm from 12:15 read as not captured only up to 12:25:52.
+    it("keeps each of an incident's own lines, and leaves out the errors' for a target it notes", async () => {
+        const tools = createInvestigationTools({ ...liveSources(), timeZone: "UTC", latestDay: live("00:00:00"), latest: live("21:33:15") });
+        const incident = (await tools.investigate("explain_incident", { episodeKey: "T5-ru-20261121T121500Z" })) as InvestigationResult;
+        const errors = (await tools.investigate("explain_errors", { from: incident.window.fromUtc, to: incident.window.toUtc, targets: ["T5"] })) as InvestigationResult;
+        renderWithApp(<RcaReport incident={incident} errors={errors} timeZone="UTC" logs={[]} />);
+        const gaps = within(screen.getByRole("region", { name: "Not captured" })).getAllByRole("listitem").map((li) => li.textContent ?? "");
+        expect(gaps.filter((s) => s.startsWith("T5: no RCA"))).toEqual(["T5: no RCA evidence for 12:09:10-12:25:52 UTC", "T5: no RCA evidence for 12:25:52-12:47:21 UTC"]);
+    });
 });
 
 // The re-review of 087e096a: the errors table showed each class's count and "first to last" alone, so an hour's 3,000 429s
