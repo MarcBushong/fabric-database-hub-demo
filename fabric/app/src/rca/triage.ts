@@ -83,9 +83,12 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         const counted = input.evidence.metrics.filter((m) => m.target === target && m.value !== null && m.value > 0 && (m.metric === "connections_failed" || (m.metric === "ThrottledRequests" && !throttled)) && metricIn(m, from, to));
         const n = events.reduce((sum, e) => sum + e.count, 0) + counted.reduce((sum, m) => sum + (m.value ?? 0), 0);
         if (n === 0) continue;
-        const times = [...events.map((e) => e.at), ...counted.map((m) => m.at)].sort((a, b) => a.getTime() - b.getTime());
+        // An Azure Monitor count stands for its whole interval, as in errors.ts (the review of 858c50c2: one 5-minute count of
+        // failed connections read "from 15:30:00 to 15:30:00").
+        const first = new Date(Math.min(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime())));
+        const last = new Date(Math.max(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime() + (m.intervalMs ?? 0))));
         const where = counted.length > 0 ? ` (${AZURE_MONITOR} counts included)` : "";
-        hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(times[0])} to ${hhmmss(times[times.length - 1])} UTC${where}.`, nextTool: "explain_errors" });
+        hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} to ${hhmmss(last)} UTC${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);
     const flagged = new Set(hypotheses.map((h) => h.target));

@@ -383,10 +383,12 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[
         const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
         const ending = c.end ? {} : captureEnding(evidence, c.target, samples.length ? samples[samples.length - 1].at : c.start, samples.length < read.length, readTo);
-        // An episode its capture cut off whose last samples are back under its level fell under by the first of them: a
-        // surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still on" (the review of 803f2b1a).
+        // An episode with no end whose last samples are back under its level fell under by the first of them, whether its
+        // capture cut it off (the review of 803f2b1a: a surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still
+        // on") or the minutes read end first (the review of 858c50c2: the replica's stall read "still on at 16:20:00" after
+        // its samples had fallen to 0.4 s at 16:19:27).
         const lastHit = hits[hits.length - 1];
-        const after = !c.end && !ending.readEnd && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
+        const after = !c.end && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
         out.push({
             key: `${c.target}-${family}-${stamp(c.start)}`,
             target: c.target,
@@ -397,7 +399,7 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[
             end: c.end,
             last: hits.length ? hits[hits.length - 1].at : c.start,
             ...ending,
-            ...(after.length ? { fellBy: after[0].at, captureEnd: after[after.length - 1].at } : {}),
+            ...(after.length ? { fellBy: after[0].at, ...(ending.readEnd ? {} : { captureEnd: after[after.length - 1].at }) } : {}),
             peak: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? stated : (peak?.value ?? 0),
             peakAt: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? c.start : (peak?.at ?? c.start),
             level,
@@ -565,9 +567,11 @@ export function describeEpisode(e: Episode): string {
         ? `from ${t(e.start)} to ${t(e.end)} UTC`
         : capture
           ? e.readEnd
-              ? own
-                  ? `from ${t(e.start)} UTC (still on at ${t(e.readEnd)} UTC, where the minutes read end)`
-                  : `from ${t(e.start)} UTC (the capture hadn't recorded its end by ${t(e.readEnd)} UTC, where the minutes read end)`
+              ? e.fellBy
+                  ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the minutes read end at ${t(e.readEnd)} UTC, before its capture confirmed the end)`
+                  : own
+                    ? `from ${t(e.start)} UTC (still on at ${t(e.readEnd)} UTC, where the minutes read end)`
+                    : `from ${t(e.start)} UTC (the capture hadn't recorded its end by ${t(e.readEnd)} UTC, where the minutes read end)`
               : e.fellBy
                 ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the capture ended at ${t(e.captureEnd ?? e.fellBy)} UTC, before it could confirm the end)`
                 : own

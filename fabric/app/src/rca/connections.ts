@@ -183,13 +183,15 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
                 : `, and was at ${pct} % of the limit or more in ${atLevel.length} of the ${between} samples between ${hhmmss(first.at)} and ${hhmmss(last.at)} UTC (${span(last.at.getTime() - first.at.getTime())})`;
     }
     const lastSample = samples[samples.length - 1];
-    // A surge its capture cut off (openEnded): still on only when its last sample was at the level. Its samples back under
-    // the level after its last at it say when it fell (the review of 803f2b1a: 32, 8, and 8 of 35 read as "still on"). One
-    // the capture still watched where the minutes read end (readEnd) was on then, its end after them (the review of 97fdf5ba).
+    // A surge with no end, cut off by its capture (openEnded) or past the minutes read (readEnd): still on only when its
+    // last sample was at the level. Its samples back under the level after its last at it say when it fell (the review of
+    // 803f2b1a: 32, 8, and 8 of 35 read as "still on"; the review of 858c50c2: 8, 10, 10, and 20 of 35 at the minutes' end).
     const lastAtLevel = level !== null ? [...samples].reverse().find((s) => s.total >= level) : undefined;
-    const fell = input.openEnded && lastAtLevel && lastSample.at > lastAtLevel.at ? samples.find((s) => s.at > lastAtLevel.at) : undefined;
+    const fell = (input.openEnded || input.readEnd) && lastAtLevel && lastSample.at > lastAtLevel.at ? samples.find((s) => s.at > lastAtLevel.at) : undefined;
     const cutOff = input.readEnd
-        ? ` It was still on at ${hhmmss(input.readEnd)} UTC, where the minutes read end.`
+        ? fell
+            ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the minutes read end at ${hhmmss(input.readEnd)} UTC, before the capture confirmed the end.`
+            : ` It was still on at ${hhmmss(input.readEnd)} UTC, where the minutes read end.`
         : !input.openEnded
           ? ""
           : fell

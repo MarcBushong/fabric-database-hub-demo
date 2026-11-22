@@ -370,6 +370,12 @@ describe("T4's connections against the limit, by what held them", () => {
         const on = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), openEnded: true });
         expect(on.rootCause?.statement).toContain("The capture ended at 15:31:10 UTC while it was still on (it recorded no end), so what came after isn't known.");
         expect(on.details).toMatchObject({ fellUnder: null });
+        // The review of 858c50c2: where the minutes read end first, the same fall, and the same "still on" only at the level.
+        const read = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: waves, sessions: [], metrics: failed(0), readEnd: at("15:31:30") });
+        expect(read.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the minutes read end at 15:31:30 UTC, before the capture confirmed the end.");
+        expect(read.details).toMatchObject({ captureEnded: null, fellUnder: "2026-11-20T15:31:20Z", readEnd: "2026-11-20T15:31:30Z" });
+        const still = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), readEnd: at("15:31:30") });
+        expect(still.rootCause?.statement).toContain("It was still on at 15:31:30 UTC, where the minutes read end.");
     });
 });
 

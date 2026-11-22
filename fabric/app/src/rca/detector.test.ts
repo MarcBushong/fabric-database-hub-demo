@@ -181,24 +181,28 @@ describe("the blind detector on the contract's fixtures", () => {
 // The review of 97fdf5ba: RCA Events are read up to a window's end, so an episode that relaxed after it read as one its
 // capture had cut off, with a fall and the capture's end.
 describe("a capture episode with no relaxed event in the minutes read", () => {
-    const surge = (coverageTo: string | null) => {
+    const surge = (coverageTo: string | null, totals: (s: number) => number = (s) => (s < 30 ? 30 : 10)) => {
         const evidence = emptyEvidence();
         evidence.events.push({ target: "T4", at: at("15:00:00"), kind: "capture", name: "escalated", code: "T4-20261120T150000Z", count: 1, detail: "client connections 30 >= 80 % of 35 (max_connections 50 minus 15 reserved)." });
-        // 30 of 35 three times, then 10, every 10 s to 15:01:50.
+        // 30 of 35 three times, then 10, every 10 s to 15:01:50 (or the totals given).
         for (let s = 0; s <= 110; s += 10) {
             const time = new Date(at("15:00:00").getTime() + s * 1000);
-            for (const [metric, value] of [["connections_total", s < 30 ? 30 : 10], ["max_connections", 50], ["reserved_connections", 15]] as const) evidence.resource.push({ target: "T4", at: time, source: "RCA-PG-10", metric, value });
+            for (const [metric, value] of [["connections_total", totals(s)], ["max_connections", 50], ["reserved_connections", 15]] as const) evidence.resource.push({ target: "T4", at: time, source: "RCA-PG-10", metric, value });
         }
         if (coverageTo) evidence.coverage.push({ target: "T4", from: at("14:30:00"), to: at(coverageTo), captured: true, sources: ["RCA-PG-10"], gaps: [] });
         return evidence;
     };
-    const read = (coverageTo: string | null, to: string) => findEpisodes({ evidence: surge(coverageTo) }, at("14:55:00"), at(to)).filter((e) => e.family === "connections");
+    const read = (coverageTo: string | null, to: string, totals?: (s: number) => number) => findEpisodes({ evidence: surge(coverageTo, totals) }, at("14:55:00"), at(to)).filter((e) => e.family === "connections");
 
-    it("says it was still on where the minutes read end while its capture ran on, with no fall and no end of the capture", () => {
+    it("says where it fell, and that the minutes read end before its capture confirmed the end, while its capture ran on", () => {
         const [e] = read("15:30:00", "15:02:00");
         expect(e.readEnd).toEqual(at("15:02:00"));
-        expect(e.fellBy).toBeUndefined();
-        expect(describeEpisode(e)).toContain("from 15:00:00 UTC (still on at 15:02:00 UTC, where the minutes read end)");
+        expect(e.captureEnd).toBeUndefined();
+        // The review of 858c50c2: its samples had fallen to 10 of 35, so it wasn't "still on".
+        expect(describeEpisode(e)).toContain("from 15:00:00 UTC, under its level by 15:00:30 UTC (the minutes read end at 15:02:00 UTC, before its capture confirmed the end)");
+        // Still on only when its last sample read was at its level.
+        const [on] = read("15:30:00", "15:02:00", () => 30);
+        expect(describeEpisode(on)).toContain("from 15:00:00 UTC (still on at 15:02:00 UTC, where the minutes read end)");
         // Without coverage, while its samples run to where the minutes read end.
         const [open] = read(null, "15:02:00");
         expect(open.readEnd).toEqual(at("15:02:00"));

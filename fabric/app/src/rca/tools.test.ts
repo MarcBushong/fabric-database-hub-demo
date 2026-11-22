@@ -325,5 +325,8 @@ describe("reading whole what a window cuts", () => {
         expect(before.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded in the window.");
         const after = await ask("explain_errors", { at: "2026-11-20T16:10:00Z", targets: ["T4"] }, deps);
         expect((after.details!.classes as Array<{ count: number }>).reduce((n, c) => n + c.count, 0)).toBe(7);
+        // The review of 858c50c2: triage dated the count by its interval's start, "from 16:05:00 to 16:05:00".
+        const triaged = await ask("triage_window", { at: "2026-11-20T16:10:00Z", targets: ["T4"] }, deps);
+        expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels from 16:05:00 to 16:10:00 UTC (Azure Monitor counts included).");
     });
 });

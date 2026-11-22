@@ -170,19 +170,28 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
     });
 
     // The review of 97fdf5ba: RCA Events are read up to a window's end, so a surge that relaxed after it read as one its
-    // capture cut off, with a fall and an end: "under its level by 15:30:21 (the capture ended at 15:30:51 …)", though the
-    // next wave read 33 at 15:31:01, the capture relaxed it at 15:35:11, and T4's coverage in the same read ran to 15:55.
-    it("says a surge or a stall the minutes read end in was still on then, never that its capture ended it", async () => {
+    // capture cut off: "(the capture ended at 15:30:51 …)", though the next wave read 33 at 15:31:01, the capture relaxed it
+    // at 15:35:11, and T4's coverage in the same read ran to 15:55. The review of 858c50c2: it read "still on" then, though
+    // its samples in the minutes read had fallen under the level: 8, 10, 10, and 20 of 35, and the replica's to 0.4 s.
+    it("says where a surge or a stall the minutes read end in fell, never that its capture ended it, nor that it was still on", async () => {
         const summary = (r: InvestigationResult, family: string) => (r.details?.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === family)?.summary;
-        expect(summary(await ask("triage_window", { at: "2026-11-21T15:26:00Z", targets: ["T4"] }), "connections")).toContain("from 15:26:41 UTC (still on at 15:31:00 UTC, where the minutes read end)");
-        expect(summary(await ask("find_incidents", { at: "2026-11-21T15:28:00Z", targets: ["T4"] }), "connections")).toContain("from 15:26:41 UTC (still on at 15:33:00 UTC, where the minutes read end)");
-        // It relaxed at 16:20:03, after the minutes read: not "ended at 16:19:58".
-        expect(summary(await ask("triage_window", { at: "2026-11-21T16:15:00Z", targets: ["T4-replica"] }), "replica_lag")).toContain("from 16:17:12 UTC (still on at 16:20:00 UTC, where the minutes read end)");
+        expect(summary(await ask("triage_window", { at: "2026-11-21T15:26:00Z", targets: ["T4"] }), "connections")).toContain(
+            "from 15:26:41 UTC, under its level by 15:30:21 UTC (the minutes read end at 15:31:00 UTC, before its capture confirmed the end)",
+        );
+        expect(summary(await ask("find_incidents", { at: "2026-11-21T15:28:00Z", targets: ["T4"] }), "connections")).toContain(
+            "from 15:26:41 UTC, under its level by 15:32:31 UTC (the minutes read end at 15:33:00 UTC, before its capture confirmed the end)",
+        );
+        // It relaxed at 16:20:03, after the minutes read: not "ended at 16:19:58", nor "still on at 16:20:00".
+        const stall = await ask("explain_incident", { target: "T4-replica", from: "2026-11-21T16:10:00Z", to: "2026-11-21T16:20:00Z" });
+        expect((stall.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 16:17:12 UTC, under its level by 16:19:27 UTC (the minutes read end at 16:20:00 UTC, before its capture confirmed the end)");
+        expect(stall.rootCause?.statement).toContain("and was back to 0.4 s at 16:19:27 UTC");
         // One end in one answer: its episode's, and its explanation's.
         const r = await ask("explain_incident", { target: "T4", from: "2026-11-21T15:21:00Z", to: "2026-11-21T15:31:00Z" });
+        expect(r.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:30:21 UTC; the minutes read end at 15:31:00 UTC, before the capture confirmed the end.");
         for (const text of [...(r.details?.episodes as Array<{ text: string }>).map((e) => e.text), r.rootCause!.statement]) {
-            expect(text).toContain("still on at 15:31:00 UTC, where the minutes read end");
-            expect(text).not.toMatch(/the capture ended|under its level by|fell under/);
+            expect(text).toContain("15:30:21 UTC");
+            expect(text).toMatch(/the minutes read end at 15:31:00 UTC, before (its|the) capture confirmed the end/);
+            expect(text).not.toMatch(/the capture ended|still on/);
         }
     });
 });
