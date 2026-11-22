@@ -246,6 +246,30 @@ describe("Mission Control", () => {
         SLOW,
     );
 
+    // Each page that writes the postmortem hands it the period's plans (the re-review of feb64ad3).
+    for (const [name, Page] of [
+        ["Mission Control", MissionControlPage],
+        ["the scoreboard", ScoreboardPage],
+        ["the replay", ReplayPage],
+    ] as const) {
+        it(
+            `lists another plan's fault in the investigated minutes in the answer key, labeled as outside this session, from ${name} (the re-review of feb64ad3)`,
+            async () => {
+                const next = { RequestedAt: "2026-11-17T15:05:00.000Z", Intensity: null, Concurrency: null, Dispatch: "session", Status: "Pass", RequestId: "session:abcdef12-1111-2222-3333-444444444444", TargetKey: "all", Profile: "session", DurationMin: 30, Message: "Session abcdef12: NB_DatabaseHub_Control's Run all (ADR 0026).", WindowStart: "2026-11-17T15:05:00.000Z", WindowEnd: "2026-11-17T15:35:00.000Z" };
+                const r12 = { RequestedAt: "2026-11-17T15:02:00.000Z", Intensity: 5, Concurrency: 2, Dispatch: "webhook", Status: "Pass", RequestId: "r12", TargetKey: "T2", Profile: "incident:io-pressure", DurationMin: 8, Message: "Ran io-pressure on T2 for 8 minutes", WindowStart: "2026-11-17T15:02:00.000Z", WindowEnd: "2026-11-17T15:10:00.000Z" };
+                renderWithApp(<Page />, { client: sampleRcaClient(Promise.resolve(), [next, r12]), rca: true, view: { session: SESSION_KEY } });
+                const write = await screen.findByRole("button", { name: "Write the postmortem" });
+                await waitFor(() => expect(write).toBeEnabled());
+                fireEvent.click(write);
+                const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+                await waitFor(() => expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled(), { timeout: 20000 });
+                expect(dialog.textContent).toContain("Outside this session: other plans injected these faults in the investigated minutes");
+                expect(dialog.textContent).toContain("IO pressure on T2 (Front desk), 15:02 to 15:10 UTC: a lone incident request.");
+            },
+            SLOW,
+        );
+    }
+
     it(
         "never investigates a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)",
         async () => {
@@ -255,7 +279,7 @@ describe("Mission Control", () => {
             renderWithApp(<PostmortemDialog input={input} onClose={vi.fn()} />, { client, rca: true });
             const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare incident request: CPU pressure on T1" });
             expect(headingsOf(dialog)).toEqual(["Summary", "Timeline (UTC)", "Impact on ContosoCare", "Cause", "What the demo injected (answer key)", "Response", "Times to signal and recover", "Follow-ups", "How this was measured", "Queries"]);
-            expect(within(dialog).getByText(/^This is one incident request's postmortem, and its minutes are its fault's own, .+ The Root cause page finds and explains the incidents in any minutes you pick/)).toBeInTheDocument();
+            expect(within(dialog).getByText(/^This is one incident request's postmortem, and its minutes are its fault's own, .+ The Root cause page finds the incidents from the signals alone, .+ and explains each one\.$/)).toBeInTheDocument();
             expect(within(dialog).queryByText(/Investigating the session's minutes/)).toBeNull();
             expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
             expect(client.ran.some((id) => id.startsWith("rca-"))).toBe(false);

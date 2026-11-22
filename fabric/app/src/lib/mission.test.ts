@@ -639,12 +639,12 @@ describe("the postmortem", () => {
             const { markdown } = buildPostmortem({ ...input, plan: request, scores: [], episodes: [], beat: null, rca: "request" });
             const cause = sectionOf(markdown, "Cause");
             expect(cause).toBe(
-                "## Cause\n\nThis is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds and explains the incidents in any minutes you pick, from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded.\n",
+                "## Cause\n\nThis is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds the incidents from the signals alone, in what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and explains each one.\n",
             );
             const key = sectionOf(markdown, "What the demo injected (answer key)");
             expect(key).toContain("What the demo planned, from Scenario Runs: the answer key.\n");
             expect(key).toMatch(/^- \*\*.+\*\* on T1 \(Billing\), \d\d:\d\d to \d\d:\d\d UTC\.$/m);
-            expect(markdown).toContain("- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page explains the incidents in the minutes you pick instead (ADR 0031).");
+            expect(markdown).toContain("- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page finds and explains the incidents instead (ADR 0031).");
             expect(markdown).not.toContain("And the investigation's");
         });
 
@@ -661,6 +661,45 @@ describe("the postmortem", () => {
             expect(causeWindow(first, at(80))).toEqual({ from: at(0), to: at(90) });
             const { markdown } = buildPostmortem({ ...input, rca: { ...rca, to: at(95) } });
             expect(sectionOf(markdown, "Cause")).toContain("of the session's minutes as the session control recorded them, and the 5 minutes after them, up to the next session's start (13:30 to 15:05 UTC).");
+        });
+
+        it("lists other plans' faults that reach into the investigated minutes in the answer key, labeled as outside this session, never in the Cause or the draft (the re-review of feb64ad3)", () => {
+            const next = "session:abcdef12-1111-2222-3333-444444444444";
+            // The review's lone request after the session, before the next one's start; one that began just before the
+            // session; one that ended 14 minutes before it, whose signal can still show; and what's out: one that ended 16
+            // minutes before it, and the next session's own fault.
+            const runs = [
+                ...RUNS,
+                run("r12", "T2", "incident:io-pressure", 92, 100),
+                run(next, "all", "session", 95, 125),
+                run(`${next}:00`, "T3", "incident:cpu-pressure", 96, 106),
+                run("r13", "T1", "incident:cpu-pressure", -5, 5),
+                run("r14", "T3", "incident:cpu-pressure", -30, -14),
+                run("r15", "T3", "incident:cpu-pressure", -40, -16),
+            ];
+            const plans = toPlans(runs);
+            const first = plans.find((p) => p.key === SESSION)!;
+            const investigated = { ...rca, ...causeWindow(first, nextSessionStart(plans, first))! };
+            const { markdown } = buildPostmortem({ ...input, plan: first, plans, rca: investigated });
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
+            expect(key).toContain(
+                [
+                    "**Outside this session:** other plans injected these faults in the investigated minutes, or up to 15 minutes before them, where a signal can still show, so an incident above may be one of theirs:",
+                    "",
+                    "- **CPU pressure** on T3 (Scheduling), 13:00 to 13:16 UTC: a lone incident request.",
+                    "- **CPU pressure** on T1 (Billing), 13:25 to 13:35 UTC: a lone incident request.",
+                    "- **IO pressure** on T2 (Front desk), 15:02 to 15:10 UTC: a lone incident request.",
+                    "",
+                ].join("\n"),
+            );
+            expect(key).not.toMatch(/12:50|15:06/);
+            // The Cause stays blind, and so does Copilot's draft: neither gets them.
+            expect(sectionOf(markdown, "Cause")).not.toMatch(/pressure|lone incident request|Outside this session/);
+            expect(postmortemAsk({ ...input, plan: first, plans, rca: investigated })).toEqual(postmortemAsk({ ...input, plan: first }));
+            // A session that injected nothing says so of its own plan only; without an investigation, nothing is added.
+            expect(sectionOf(buildPostmortem({ ...input, plan: { ...first, faults: [] }, scores: [], beat: null, plans, rca: investigated }).markdown, "What the demo injected (answer key)")).toContain("This session's plan injected nothing.\n\n**Outside this session:**");
+            expect(buildPostmortem({ ...input, plan: first, plans }).markdown).not.toContain("Outside this session");
         });
     });
 

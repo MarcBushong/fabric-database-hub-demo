@@ -53,6 +53,11 @@ export interface PostmortemInput {
     rca?: BlindCauses | "request" | null;
     /** The next session's start, from the session control's record: the Cause's minutes end there at the latest. */
     nextSessionStart?: Date | null;
+    /**
+     * Every plan in the period, from Scenario Runs: after the blind Cause, the answer key also lists other plans' faults
+     * that reach into its minutes, labeled as outside this session. The investigation never reads them.
+     */
+    plans?: readonly Plan[];
     generatedAt: Date;
 }
 
@@ -150,6 +155,22 @@ export function nextSessionStart(plans: readonly Plan[], plan: Pick<Plan, "key" 
 }
 
 /**
+ * Other plans' faults that reach into the investigated minutes, or end up to TELEMETRY_LAG_MINUTES before them, where their
+ * signal can still show: a lone incident request just before or after the session, or another session's (the re-review of
+ * feb64ad3). The answer key lists them, labeled, so an incident the investigation explains in them isn't read as a false
+ * alarm. Only the answer key reads them, after the investigation.
+ */
+function faultsFromOtherPlans(plans: readonly Plan[], plan: Pick<Plan, "key">, minutes: { from: Date; to: Date }): Array<{ plan: Plan; run: SessionRun }> {
+    const from = minutes.from.getTime();
+    const to = minutes.to.getTime();
+    return plans
+        .filter((p) => p.key !== plan.key)
+        .flatMap((p) => p.faults.map((run) => ({ plan: p, run })))
+        .filter(({ run }) => run.windowStart !== null && run.windowEnd !== null && run.windowStart.getTime() < to && run.windowEnd.getTime() + TELEMETRY_LAG_MINUTES * 60_000 > from)
+        .sort((a, b) => (a.run.windowStart?.getTime() ?? 0) - (b.run.windowStart?.getTime() ?? 0) || a.run.target.localeCompare(b.run.target));
+}
+
+/**
  * The Cause from the blind investigation (ADR 0031, section 9): each incident in the Root cause view's order, with its
  * root cause, confidence, and the rows it cites, or why it has none; what wasn't captured; and a read that failed as such.
  */
@@ -242,6 +263,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
 
     // The Cause (ADR 0031, section 9): with the RCA tables, what the blind investigation found, the way a DBA would find it,
     // and then what the demo injected, in a section of its own, labeled as the answer key. Without them, what was injected.
+    const others = input.rca && input.rca !== "request" ? faultsFromOtherPlans(input.plans ?? [], plan, input.rca) : [];
     const injectedLines: string[] = [];
     if (injected > 0) {
         injectedLines.push("Every fault was injected on purpose by the demo's session control (NB_DatabaseHub_Control), bounded in time, inside the ContosoCare database only, on sessions tagged `ContosoCare.Demo/`:", "");
@@ -249,13 +271,21 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         for (const r of unscored) injectedLines.push(`- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`);
     }
     if (episodes.length > 0) injectedLines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
-    if (injected === 0 && episodes.length === 0) injectedLines.push("Nothing was injected in this window.");
+    if (injected === 0 && episodes.length === 0) injectedLines.push(others.length > 0 ? "This session's plan injected nothing." : "Nothing was injected in this window.");
+    if (others.length > 0) {
+        injectedLines.push(
+            "",
+            `**Outside this session:** other plans injected these faults in the investigated minutes, or up to ${TELEMETRY_LAG_MINUTES} minutes before them, where a signal can still show, so an incident above may be one of theirs:`,
+            "",
+            ...others.map(({ plan: p, run: r }) => `- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC: ${p.kind === "session" ? `session ${shortSessionId(p.key)}'s plan` : "a lone incident request"}.`),
+        );
+    }
     lines.push("## Cause", "");
     if (input.rca === "request") {
         // A lone request's minutes are its fault's own (Scenario Runs), so a blind investigation isn't aimed at them (the
-        // review of 63fb530c): the Root cause page explains the incidents in any minutes a viewer picks.
+        // review of 63fb530c): the Root cause page finds and explains the incidents from the signals alone.
         lines.push(
-            "This is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds and explains the incidents in any minutes you pick, from what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded.",
+            "This is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds the incidents from the signals alone, in what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and explains each one.",
             "",
         );
         lines.push("## What the demo injected (answer key)", "", "What the demo planned, from Scenario Runs: the answer key.", "");
@@ -319,7 +349,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         `- **Recovered:** the first bin after its last bin at that level, with ${RECOVERED_BINS} bins under it in a row.`,
         "- **T4 and T5:** their captured Azure Monitor metrics: T5's throttling episodes (429s, normalized RU at 100 %) and their recovery, and T4's read replica lag at 60 s or more.",
         ...(input.rca === "request"
-            ? ["- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page explains the incidents in the minutes you pick instead (ADR 0031)."]
+            ? ["- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page finds and explains the incidents instead (ADR 0031)."]
             : input.rca
               ? [`- **Cause:** the Incident RCA's blind investigation of the session's minutes, as the session control recorded them, and the ${TELEMETRY_LAG_MINUTES} minutes after them, up to the next session's start: find_incidents, then explain_incident for each incident, at most ${MAX_CAUSES} in the Root cause page's order. It reads the RCA capture, Database Hub's telemetry, and Azure Monitor, and never the faults in Scenario Runs (ADR 0031).`]
               : []),
