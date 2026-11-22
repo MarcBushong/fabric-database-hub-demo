@@ -321,7 +321,9 @@ function ConvertTo-DemoT4RefusedRecord {
     # with the zones it was tried in ('any' for no zone preference), and when, as in
     # "Standard_B1ms@1,2;Standard_B2s@1;2026-11-09T21:25:13Z"; within a tag's 256 characters. -Refusal items have Sku and
     # Zones. -Kept (#25, 2026-11-17) adds the part "kept": Azure refused to scale an existing T4 to that size, and it kept
-    # its own, as in "Standard_D4ds_v5@any;kept;2026-11-17T12:00:00Z"; an older reader skips the part. Pure. Internal.
+    # its own, as in "Standard_D4ds_v5@any;kept;2026-11-17T12:00:00Z"; an older reader skips the part. A size Azure refused
+    # over the subscription's vCore quota (F37, 2026-11-22) has "quota" among its zones, as in "Standard_D4ds_v5@any,quota",
+    # which an older reader drops with the zones it doesn't know. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -336,7 +338,7 @@ function ConvertTo-DemoT4RefusedRecord {
     $parts = [System.Collections.Generic.List[string]]::new()
     foreach ($item in @($Refusal | Where-Object { $null -ne $_ })) {
         $zoneValue = Get-DemoMemberValue -InputObject $item -Name 'Zones'
-        $zones = @(@($zoneValue) | Where-Object { [string]$_ -in '1', '2', '3', 'any' } | ForEach-Object { [string]$_ })
+        $zones = @(@($zoneValue) | Where-Object { [string]$_ -in '1', '2', '3', 'any', 'quota' } | ForEach-Object { [string]$_ })
         $parts.Add($(if ($zones.Count -gt 0) { '{0}@{1}' -f [string]$item.Sku, ($zones -join ',') } else { [string]$item.Sku }))
     }
     if ($parts.Count -eq 0) {
@@ -353,9 +355,10 @@ function ConvertTo-DemoT4RefusedRecord {
 }
 
 function ConvertFrom-DemoT4RefusedRecord {
-    # Reads DbHubT4Refused (ConvertTo-DemoT4RefusedRecord): Asked (its first size, or ''), Refusals (Sku and Zones),
-    # TimeUtc, and Kept (#25: the record is a refused scale's, which kept an existing server's size). An empty or unreadable
-    # value gives an empty record. Pure. Internal.
+    # Reads DbHubT4Refused (ConvertTo-DemoT4RefusedRecord): Asked (its first size, or ''), Refusals (Sku and Zones, "quota"
+    # among them for a size Azure refused over the subscription's vCore quota, F37), TimeUtc, and Kept (#25: the record is a
+    # refused scale's, which kept an existing server's size). An empty or unreadable value gives an empty record. Pure.
+    # Internal.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -379,7 +382,7 @@ function ConvertFrom-DemoT4RefusedRecord {
         if ($part -cmatch '^(?<sku>Standard_[A-Za-z0-9_]+)(@(?<zones>[a-z0-9,]+))?$' -and $Matches['sku'] -cin $script:T4Sizes) {
             $sku = [string]$Matches['sku']
             $zoneText = [string]$Matches['zones']
-            $zones = [string[]]@($zoneText -split ',' | Where-Object { $_ -in '1', '2', '3', 'any' })
+            $zones = [string[]]@($zoneText -split ',' | Where-Object { $_ -in '1', '2', '3', 'any', 'quota' })
             $refusals.Add([pscustomobject]@{ Sku = $sku; Zones = $zones })
         }
     }
@@ -696,8 +699,14 @@ function New-DemoT4SizeResult {
             if ($null -ne $Failure) {
                 $evidence['refusedUtc'] = $Failure.TimeUtc
             }
-            $message = 'Azure refused to scale T4 to {0} (SkuNotAvailable{1}), so T4 keeps {2}, and later runs keep it too (the resource group''s DbHubT4Size records it); autonomous tuning stays off on a size under 4 vCores.' -f $SkuName, $(if ($null -ne $Failure) { ', at ' + $Failure.TimeUtc } else { '' }), $from
-            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Nothing to do: T4 works at its size. To have the default, first ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then set t4SkuName to {0} and run ./scripts/deploy.ps1, which moves T4 after checking its cost; the fallback only chooses a size for a new server, so a refusal of that move is a Fail.' -f $SkuName) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
+            # Over the subscription's vCore quota (F37, 2026-11-22), the way to the default is room in the quota.
+            $quota = $null -ne (Get-DemoMemberValue -InputObject $Failure -Name 'Quota')
+            if ($quota) {
+                $evidence['refusedFor'] = 'quota'
+            }
+            $message = 'Azure refused to scale T4 to {0} ({1}{2}), so T4 keeps {3}, and later runs keep it too (the resource group''s DbHubT4Size records it); autonomous tuning stays off on a size under 4 vCores.' -f $SkuName, (Format-DemoT4RefusalReason -Failure $Failure), $(if ($null -ne $Failure) { ', at ' + $Failure.TimeUtc } else { '' }), $from
+            $first = if ($quota) { 'make room in the subscription''s vCore quota for Azure Database for PostgreSQL in this region (./scripts/destroy.ps1 on a demo environment you no longer use frees its T4 and read replica, or request more quota: Learn, Request a quota increase)' } else { 'ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors)' }
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Nothing to do: T4 works at its size. To have the default, first {1}, then set t4SkuName to {0} and run ./scripts/deploy.ps1, which moves T4 after checking its cost; the fallback only chooses a size for a new server, so a refusal of that move is a Fail.' -f $SkuName, $first) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
         }
     }
 }
@@ -1059,7 +1068,8 @@ function Get-DemoT4CreateFailure {
     <#
     .SYNOPSIS
     T4's last refused creation: the resource group's pgflex01 deployment (the template's T4 module) when it
-    failed with SkuNotAvailable. Returns Sku, Zone, and TimeUtc, or $null. A read. Internal.
+    failed with SkuNotAvailable, or over the subscription's vCore quota (F37, 2026-11-22). Returns Sku, Zone, TimeUtc, Code
+    (SkuNotAvailable or QuotaExceeded), and Quota (Get-DemoT4QuotaRefusal's figures, or $null), or $null. A read. Internal.
 
     .DESCRIPTION
     Azure answers SkuNotAvailable ("Specified SKU is not supported in this region") when a size isn't offered
@@ -1067,9 +1077,10 @@ function Get-DemoT4CreateFailure {
     (live, 2026-10-26). Learn's remedy is another size. deploy.ps1's fallback moves on by itself (ADR 0019): without
     t4SkuName, Standard_D4ds_v5 once more in another zone the region lists, then Standard_D4ads_v5, then Standard_D2ds_v5
     (autonomous tuning off) after its cost check; for a size t4SkuName sets (2026-11-09), the size once more in another
-    zone, then the next size Azure accepts, cheapest first (Get-DemoT4FallbackOrder); only this code moves it on,
-    and no other failure (a quota, a policy denial, a transient error) does. Deploy and preflight use this to report it
-    and to move the fallback on.
+    zone, then the next size Azure accepts, cheapest first (Get-DemoT4FallbackOrder); only this code moves it on, and,
+    since 2026-11-22 (F37, the coordinator), Learn's message for the subscription's vCore quota ("exceeding approved {0}
+    Cores quota", Get-DemoT4QuotaRefusal), without the retry in another zone. No other failure (another quota, a policy
+    denial, a transient error) does. Deploy and preflight use this to report it and to move the fallback on.
     Sources: https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors,
     https://learn.microsoft.com/cli/azure/deployment/group#az-deployment-group-show,
     https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list
@@ -1102,7 +1113,9 @@ function Get-DemoT4CreateFailure {
             }
         }
     }
-    if ($errorText -notmatch 'SkuNotAvailable') {
+    $sku = $errorText -match 'SkuNotAvailable'
+    $quota = if ($sku) { $null } else { Get-DemoT4QuotaRefusal -Text $errorText }
+    if (-not $sku -and $null -eq $quota) {
         return $null
     }
     $parameters = Get-DemoMemberValue -InputObject $properties -Name 'parameters'
@@ -1114,6 +1127,8 @@ function Get-DemoT4CreateFailure {
         Sku     = [string](Get-DemoMemberValue -InputObject $sizing -Name 'skuName')
         Zone    = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parameters -Name 'availabilityZone') -Name 'value')
         TimeUtc = $timeUtc
+        Code    = $(if ($sku) { 'SkuNotAvailable' } else { 'QuotaExceeded' })
+        Quota   = $quota
     }
 }
 
@@ -1123,7 +1138,9 @@ function New-DemoT4SkuFailureResult {
     configuration names another zone to try first, or a Fail when nothing moves the fallback on, which leaves the run
     NOT DONE. Since 2026-11-09 (user-directed) a size t4SkuName sets has the fallback too (Get-DemoT4FallbackOrder), so its
     remediation never asks for another size to be set: deploy.ps1 moves on by itself, and only a refusal of every size
-    needs a Region access request. Internal.
+    needs a Region access request. A refusal over the subscription's vCore quota (F37, 2026-11-22) says so, with Azure's
+    figures, and its fix is room in the quota in -Location, more quota, or another region (Get-DemoT4QuotaRemediation).
+    Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
     [CmdletBinding()]
@@ -1138,12 +1155,22 @@ function New-DemoT4SkuFailureResult {
         [ValidateSet('Fail', 'Warning')]
         [string] $Status = 'Fail',
 
-        [string] $NextZone = ''
+        [string] $NextZone = '',
+
+        [AllowEmptyString()]
+        [string] $Location = ''
     )
 
     $where = if ($Failure.Zone) { 'zone {0}' -f $Failure.Zone } else { 'no zone preference' }
     $evidence = [ordered]@{ refusedSku = $Failure.Sku; refusedZone = $Failure.Zone; refusedUtc = $Failure.TimeUtc }
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
+    if ($null -ne (Get-DemoMemberValue -InputObject $Failure -Name 'Quota')) {
+        # Over the quota: no zone to try (a quota is the subscription's in the region), so this is always the Fail.
+        $evidence['refusedFor'] = 'quota'
+        $evidence['overQuota'] = $true
+        $message = 'Azure refused to create T4 at size {0} with {1} at {2}: {3}.' -f $Failure.Sku, $where, $Failure.TimeUtc, (Format-DemoT4RefusalReason -Failure $Failure)
+        return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Fail' -Message $message -Evidence $evidence -Remediation (Get-DemoT4QuotaRemediation -Location $Location) -DocUrl $docUrl)
+    }
     if ($Status -eq 'Warning') {
         $message = 'Azure refused T4''s size {0} with {1} at {2} (SkuNotAvailable: not supported in the region, or temporarily unavailable). This run tries {0} once more in zone {3}, as t4AvailabilityZone says; if Azure refuses it again, deploy.ps1''s fallback moves on to its next size by itself, and says which.' -f $Failure.Sku, $where, $Failure.TimeUtc, $NextZone
         return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do: T4 is part of every deployment, and deploy.ps1''s fallback chooses the size by itself.' -DocUrl $docUrl)
@@ -1204,7 +1231,10 @@ function New-DemoT4FallbackResult {
         [string] $Pinned = '',
 
         [AllowEmptyCollection()]
-        [object[]] $Tried = @()
+        [object[]] $Tried = @(),
+
+        [AllowEmptyString()]
+        [string] $Location = ''
     )
 
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
@@ -1214,14 +1244,41 @@ function New-DemoT4FallbackResult {
     $startSku = switch ($Next) { 'Zone' { '' } 'None' { 'Standard_D2ds_v5' } 'Refused' { '' } default { $Next } }
     $evidence = [ordered]@{ next = $Next; startSku = $startSku }
     $refusal = 'SkuNotAvailable, on record or found by preflight'
+    # A refusal over the subscription's vCore quota (F37, 2026-11-22) says so, with Azure's figures, and its fix is room in
+    # the quota, not a Region access request.
+    $quota = $null -ne (Get-DemoMemberValue -InputObject $Refused -Name 'Quota')
     if ($null -ne $Refused) {
         $where = if ($Refused.Zone) { 'zone {0}' -f $Refused.Zone } else { 'no zone preference' }
-        $refusal = '{0}, at {1}; SkuNotAvailable' -f $where, $Refused.TimeUtc
+        $refusal = '{0}, at {1}; {2}' -f $where, $Refused.TimeUtc, (Format-DemoT4RefusalReason -Failure $Refused)
         $evidence['refusedSku'] = $Refused.Sku
         $evidence['refusedZone'] = $Refused.Zone
         $evidence['refusedUtc'] = $Refused.TimeUtc
+        if ($quota) {
+            $evidence['refusedFor'] = 'quota'
+        }
     }
     $keep = 'Nothing to do. To choose T4''s size yourself, set t4SkuName in your configuration; if Azure refuses it, deploy.ps1 moves on to the next size Azure accepts, cheapest first.'
+    # Every size refused (Refused): the sizes refused over the quota carry "quota" among their zones (-Tried, F37); a run
+    # that had both kinds of refusal says so, and its fix names both. Zones are read into a variable first: wrapping
+    # Get-DemoMemberValue's array in @() directly would make it one item.
+    $triedItems = @($Tried | Where-Object { $null -ne $_ })
+    $triedQuota = $quota
+    $triedUnavailable = $null -ne $Refused -and -not $quota
+    foreach ($item in $triedItems) {
+        $zoneValue = Get-DemoMemberValue -InputObject $item -Name 'Zones'
+        $zones = @(@($zoneValue) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($zones -contains 'quota') {
+            $triedQuota = $true
+        }
+        elseif ($zones.Count -gt 0) {
+            $triedUnavailable = $true
+        }
+    }
+    $mixed = if ($triedQuota -and $triedUnavailable) { ' Azure refused some of them as unavailable (SkuNotAvailable), and some over the subscription''s vCore quota.' } else { '' }
+    if ($Next -eq 'Refused' -and $triedQuota) {
+        # DEPLOY.T4.OFF gives this result's fix when it's the quota's (New-DemoT4OffResult).
+        $evidence['overQuota'] = $true
+    }
     if ($Pinned) {
         # 2026-11-09 (user-directed: "fall back automatically, cheapest first, with a Warning"): a size t4SkuName sets that
         # Azure refuses moves on too.
@@ -1233,10 +1290,10 @@ function New-DemoT4FallbackResult {
             return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $pinnedKeep -DocUrl $docUrl)
         }
         if ($Next -eq 'Refused') {
-            $triedText = @(foreach ($item in @($Tried | Where-Object { $null -ne $_ })) { $zoneValue = Get-DemoMemberValue -InputObject $item -Name 'Zones'; $zoneText = Format-DemoT4ZoneText -Zone ([string[]]@($zoneValue)); if ($zoneText) { '{0} ({1})' -f [string]$item.Sku, $zoneText } else { [string]$item.Sku } }) -join ', '
-            $evidence['tried'] = @(foreach ($item in @($Tried | Where-Object { $null -ne $_ })) { [string]$item.Sku })
-            $message = 'Azure refused every size T4''s fallback tries for {0}, the size t4SkuName sets: {1} ({2}). T4 is part of every deployment, so this run deploys the rest and ends NOT DONE. Azure''s regional capacity changes, and every run tries the sizes again.' -f $Pinned, $triedText, $refusal
-            $remediation = 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then run ./scripts/deploy.ps1, which tries the sizes again.'
+            $triedText = @(foreach ($item in $triedItems) { $zoneValue = Get-DemoMemberValue -InputObject $item -Name 'Zones'; $zoneText = Format-DemoT4ZoneText -Zone ([string[]]@($zoneValue)); $over = @($zoneValue) -contains 'quota'; $about = @(@($zoneText, $(if ($over) { 'over the vCore quota' })) | Where-Object { $_ }) -join ', '; if ($about) { '{0} ({1})' -f [string]$item.Sku, $about } else { [string]$item.Sku } }) -join ', '
+            $evidence['tried'] = @(foreach ($item in $triedItems) { [string]$item.Sku })
+            $message = 'Azure refused every size T4''s fallback tries for {0}, the size t4SkuName sets: {1} ({2}). T4 is part of every deployment, so this run deploys the rest and ends NOT DONE. Azure''s regional capacity changes, and every run tries the sizes again.{3}' -f $Pinned, $triedText, $refusal, $mixed
+            $remediation = if ($triedQuota) { Get-DemoT4QuotaRemediation -Location $Location -AlsoUnavailable:$triedUnavailable } else { 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then run ./scripts/deploy.ps1, which tries the sizes again.' }
             return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Fail' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
         }
         $spec = Get-DemoT4SkuSpec -SkuName $(if ($Next -eq 'None') { 'Standard_D2ds_v5' } else { $Next })
@@ -1282,8 +1339,8 @@ function New-DemoT4FallbackResult {
             # A caller from before 2026-11-09; autonomous tuning no longer stops the fallback.
             $evidence['tuningRequired'] = $true
         }
-        $message = 'Azure refused every size T4''s fallback tries, the last one Standard_D2ds_v5 ({0}), after both 4-vCore sizes, Standard_D4ds_v5 (in another zone too, when the region lists one) and Standard_D4ads_v5. T4 is part of every deployment, so this run deploys the rest and ends NOT DONE. Azure''s regional capacity changes, and every run tries the sizes again.' -f $refusal
-        $remediation = 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you in this region, then run ./scripts/deploy.ps1.'
+        $message = 'Azure refused every size T4''s fallback tries, the last one Standard_D2ds_v5 ({0}), after both 4-vCore sizes, Standard_D4ds_v5 (in another zone too, when the region lists one) and Standard_D4ads_v5. T4 is part of every deployment, so this run deploys the rest and ends NOT DONE. Azure''s regional capacity changes, and every run tries the sizes again.{1}' -f $refusal, $mixed
+        $remediation = if ($triedQuota) { Get-DemoT4QuotaRemediation -Location $Location -AlsoUnavailable:$triedUnavailable } else { 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you in this region, then run ./scripts/deploy.ps1.' }
         return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Fail' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
     }
 
@@ -1631,7 +1688,9 @@ function Format-DemoT4KeptText {
     $spec = Get-DemoT4SkuSpec -SkuName $sku
     $sized = '{0} {1} ({2} vCore{3})' -f $(if ($spec.Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $sku, $spec.VCores, $(if ($spec.VCores -eq 1) { '' } else { 's' })
     $whose = if (Get-DemoT4PinnedSku -Config $Config) { 'the size t4SkuName sets' } else { 'T4''s default size' }
-    $text = 'T4 kept its size, {0}: Azure refused to scale it to {1}, {2} (SkuNotAvailable{3}), so later runs keep it (the resource group''s DbHubT4Size records it); deploy.ps1''s fallback didn''t create it.' -f $sized, $asked, $whose, $(if ($refused.TimeUtc) { ', at ' + $refused.TimeUtc } else { '' })
+    # A refusal over the subscription's vCore quota is recorded with "quota" among its zones (F37, 2026-11-22).
+    $quota = @(@($refused.Refusals) | Where-Object { @($_.Zones) -contains 'quota' }).Count -gt 0
+    $text = 'T4 kept its size, {0}: Azure refused to scale it to {1}, {2} ({3}{4}), so later runs keep it (the resource group''s DbHubT4Size records it); deploy.ps1''s fallback didn''t create it.' -f $sized, $asked, $whose, (Format-DemoT4RefusalReason -Quota:$quota), $(if ($refused.TimeUtc) { ', at ' + $refused.TimeUtc } else { '' })
     if ((Get-DemoT4Tuning -Config $Config -SkuName $asked).Enabled -and -not (Get-DemoT4Tuning -Config $Config -SkuName $sku).Enabled) {
         $text += ' Autonomous tuning stays off at this size: it needs a General Purpose size with at least 4 vCores.'
     }
@@ -1885,14 +1944,16 @@ function Format-DemoT4SizeChangeText {
     $spec = Get-DemoT4SkuSpec -SkuName $Deployed
     $sized = '{0} ({1}, {2} vCore{3})' -f $Deployed, $(if ($spec.Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $spec.VCores, $(if ($spec.VCores -eq 1) { '' } else { 's' })
     # A refusal with zones was tried and refused; one without wasn't tried in that run, because preflight or an earlier
-    # run found the size unavailable.
+    # run found the size unavailable. One with "quota" among its zones was refused over the subscription's vCore quota (F37).
     $tried = [System.Collections.Generic.List[string]]::new()
+    $quotaTried = [System.Collections.Generic.List[bool]]::new()
     $skipped = [System.Collections.Generic.List[string]]::new()
     foreach ($item in @($Refusal | Where-Object { $null -ne $_ })) {
         $zoneValue = Get-DemoMemberValue -InputObject $item -Name 'Zones'
         $zoneText = Format-DemoT4ZoneText -Zone ([string[]]@($zoneValue))
         if ($zoneText) {
             $tried.Add(('{0} ({1})' -f [string]$item.Sku, $zoneText))
+            $quotaTried.Add((@($zoneValue) -contains 'quota'))
         }
         else {
             $skipped.Add([string]$item.Sku)
@@ -1905,8 +1966,15 @@ function Format-DemoT4SizeChangeText {
     if ($skipped.Count -gt 0) {
         $parts.Add(('{0} {1} unavailable here (found by preflight or an earlier run)' -f ($skipped -join ' and '), $(if ($skipped.Count -eq 1) { 'was' } else { 'were' })))
     }
-    if ($tried.Count -gt 0) {
-        $parts.Add(('Azure refused {0} with SkuNotAvailable{1}' -f ($tried -join ', then '), $(if ($Since) { ', at {0}' -f $Since } else { '' })))
+    $at = if ($Since) { ', at {0}' -f $Since } else { '' }
+    if ($tried.Count -gt 0 -and -not $quotaTried.Contains($true)) {
+        $parts.Add(('Azure refused {0} with SkuNotAvailable{1}' -f ($tried -join ', then '), $at))
+    }
+    elseif ($tried.Count -gt 0) {
+        $reasoned = for ($i = 0; $i -lt $tried.Count; $i++) {
+            '{0} {1}' -f $tried[$i], $(if ($quotaTried[$i]) { (Format-DemoT4RefusalReason -Quota) } else { 'with SkuNotAvailable' })
+        }
+        $parts.Add(('Azure refused {0}{1}' -f (@($reasoned) -join ', then '), $at))
     }
     $why = $parts -join ', and '
     $text = if ($Later) {

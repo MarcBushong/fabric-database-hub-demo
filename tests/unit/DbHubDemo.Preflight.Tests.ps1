@@ -265,6 +265,60 @@ Describe 'Invoke-DemoPreflight' {
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU').Count | Should -Be 0
     }
 
+    It 'counts a refusal over the subscription''s vCore quota on record like SkuNotAvailable, with no zone to try, and says why (F37, 2026-11-22)' {
+        Set-HappyAzMock
+        $refused = { param([string] $Sku, [string] $Zone) ConvertTo-Json -Depth 20 -InputObject @{ name = 'pgflex01'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-10-26T14:11:42Z'; parameters = @{ sizing = @{ value = @{ skuName = $Sku; tier = 'GeneralPurpose' } }; availabilityZone = @{ value = $Zone } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure'; details = $null }) } } } }
+        # Learn's message (Resolve capacity errors, "Exceeded quota"), with obviously round figures.
+        $script:pgOperationsJson = ConvertTo-Json -Depth 20 -InputObject @(@{ properties = @{ provisioningState = 'Failed'; targetResource = @{ resourceType = 'Microsoft.DBforPostgreSQL/flexibleServers' }; statusMessage = @{ status = 'Failed'; error = @{ code = 'QuotaExceeded'; message = 'Operation could not be completed as it results in exceeding approved standardDDSv5Family Cores quota. Additional details - Current Limit: 24, Current Usage: 24, Additional Required: 4, (Minimum) New Limit Required: 28.' } } } })
+        $script:pgDeploymentJson = & $refused 'Standard_D4ds_v5' ''
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match '^Azure refused T4''s Standard_D4ds_v5 at 2026-10-26T14:11:42Z \(over the subscription''s vCore quota for Azure Database for PostgreSQL here, its standardDDSv5Family Cores quota: 24 of 24 in use, 4 more needed\), so deploy\.ps1 starts with Standard_D4ads_v5'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+
+        # A zone the configuration names isn't another place to try: a quota is the subscription's in the region.
+        $zoned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $zoned[$key] = $config[$key] }
+        $zoned['t4AvailabilityZone'] = '2'
+        $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Not -Match 'once more in zone'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+
+        # A size t4SkuName sets is tried again, since room in the quota can come back, but never in another zone.
+        $zoned['t4SkuName'] = 'Standard_D4ds_v5'
+        $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'so deploy\.ps1 tries it again, since room in the quota can come back, and then the next size Azure accepts, cheapest first \(Standard_D4ads_v5, Standard_D2ds_v5, Standard_B2s, Standard_B1ms\)\.'
+    }
+
+    It 'logs the region''s PostgreSQL vCore usage for diagnosis only, keeps it in PREFLIGHT.T4.REPLICA''s evidence, and never judges it (F37, 2026-11-22)' {
+        Set-HappyAzMock
+        # Azure created servers past such readings (2026-11-21), so even readings over their limits change no status.
+        $script:pgUsagesJson = ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ name = @{ value = 'cores' }; currentValue = 24; limit = 24 }, @{ name = @{ value = 'standardDDSv5Family' }; currentValue = 24; limit = 4 }, @{ name = @{ value = 'standardBSFamily' }; currentValue = 0; limit = 8 }) }
+        $script:pgUsagesExit = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^rest --method get --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft\.DBforPostgreSQL/locations/westus3/resourceType/flexibleServers/usages\?api-version=\S+ ' } -MockWith {
+            if ($script:pgUsagesExit -ne 0) {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "ERROR: (AuthorizationFailed) The client does not have authorization.`nMore lines." }
+            }
+            [pscustomobject]@{ ExitCode = 0; StdOut = $script:pgUsagesJson; StdErr = '' }
+        }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -ceq 'For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in westus3 reads cores 24 of 24, standardDDSv5Family 24 of 4; T4 at Standard_D4ds_v5 takes 4 vCores, and its read replica 4 vCores more while it exists. Azure has created servers past such readings, so preflight doesn''t judge them: a refusal at creation moves the size fallback on, and says so.' }
+        $replica = $results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA'
+        $replica.status | Should -Be 'Pass'
+        @($replica.evidence.quotaUsage.readings) | Should -Be @('cores 24 of 24', 'standardDDSv5Family 24 of 4')
+        $replica.evidence.quotaUsage.family | Should -Be 'standardDDSv5Family'
+        @($results | Where-Object { [string]$_.status -in 'Fail', 'Warning' -and [string]$_.message -match 'quota' }) | Should -BeNullOrEmpty
+
+        # A read that fails is a line too, and preflight goes on as before.
+        $script:pgUsagesExit = 1
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -ceq 'For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in westus3 couldn''t be read (ERROR: (AuthorizationFailed) The client does not have authorization); T4 at Standard_D4ds_v5 takes 4 vCores, and its read replica 4 vCores more while it exists.' }
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA').evidence.quotaUsage.error | Should -Match '^ERROR: \(AuthorizationFailed\)'
+    }
+
     It 'checks that the region offers T4''s size and PostgreSQL version, from the Location Based Capabilities API (Phase 24)' {
         Set-HappyAzMock
         $capabilities = { param([string[]] $Versions) ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @($Versions | ForEach-Object { @{ name = $_ } }) }) } }

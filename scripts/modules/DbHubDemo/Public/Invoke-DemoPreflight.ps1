@@ -19,6 +19,10 @@ function Invoke-DemoPreflight {
       that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features. And the
       Azure Automation accounts this deployment adds, against the subscription's quota in the region
       (Get-DemoAutomationAccountQuotaResult, PREFLIGHT.P3.AUTOMATION; F30, 2026-11-22): a Fail only for a new deployment.
+      And, for diagnosis only, the subscription's vCore usage for Azure Database for PostgreSQL in the region against T4's
+      size and its read replica's (Read-DemoPostgresQuotaUsage; F37, 2026-11-22): a log line and PREFLIGHT.T4.REPLICA's
+      quotaUsage evidence, never a status, because Azure created servers past those readings; a refusal at creation moves
+      T4's or its replica's size fallback on.
     - C6: Azure Hybrid Benefit only with the entitlement attestation.
     - P4 and P5: the Fabric tenant setting, read through the Fabric admin API when the caller is a Fabric
       administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
@@ -428,20 +432,23 @@ function Invoke-DemoPreflight {
         # Warning, since T4 is part of every deployment (2026-11-09): for a size t4SkuName sets, deploy.ps1 tries it
         # again, then its fallback; otherwise the fallback starts one step on, Standard_D4ds_v5 to Standard_D4ads_v5,
         # Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and after Standard_D2ds_v5, every size again
-        # from the default. The retry in another zone happens only in deploy.ps1, right after a refusal.
+        # from the default. The retry in another zone happens only in deploy.ps1, right after a refusal. A refusal over the
+        # subscription's vCore quota (F37, 2026-11-22) counts the same, with no zone to try: a quota is the region's.
         if (-not $t4Exists) {
             $refused = Get-DemoT4CreateFailure -Config $Config
             if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
                 $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
-                $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
+                $refusedQuota = $null -ne (Get-DemoMemberValue -InputObject $refused -Name 'Quota')
+                $refusedWhy = Format-DemoT4RefusalReason -Failure $refused
+                $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone -and -not $refusedQuota
                 if (-not $otherZone -and $t4Ladder -and $t4Pinned) {
                     # A size t4SkuName sets that Azure refused on record (2026-11-09, user-directed): deploy.ps1 tries it again,
                     # since Azure's regional capacity changes, and then its fallback; a size after it in the order (a record's)
                     # moves the start one step on, as without t4SkuName.
                     $start = if ($t4Sku -ceq $t4Pinned) { '' } else { Get-DemoT4NextSku -Config $Config -Current $t4Sku }
                     $t4Starts.Add($start)
-                    $then = if ($start) { 'starts at {0}, the next size in the fallback''s order' -f $start } else { 'tries it again, since Azure''s regional capacity changes, once more in another zone the region lists, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') }
-                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}. A Warning names the size T4 gets and both monthly estimates.' -f $t4Sku, $refused.TimeUtc, $then) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start; pinnedSku = $t4Pinned }) -Remediation 'Nothing to do: T4 is part of every deployment, and the fallback chooses its size.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                    $then = if ($start) { 'starts at {0}, the next size in the fallback''s order' -f $start } elseif ($refusedQuota) { 'tries it again, since room in the quota can come back, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') } else { 'tries it again, since Azure''s regional capacity changes, once more in another zone the region lists, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') }
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} ({3}), so deploy.ps1 {2}. A Warning names the size T4 gets and both monthly estimates.' -f $t4Sku, $refused.TimeUtc, $then, $refusedWhy) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start; pinnedSku = $t4Pinned }) -Remediation 'Nothing to do: T4 is part of every deployment, and the fallback chooses its size.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
                 }
                 elseif (-not $otherZone -and $t4Ladder) {
                     # The last size refused: every run tries the sizes again from the default (2026-11-09, T4 is required).
@@ -452,7 +459,8 @@ function Invoke-DemoPreflight {
                         'Standard_D2ds_v5' { 'goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off (PREFLIGHT.T4.FALLBACK gives its price)' }
                         default { 'tries every size again from the default, because T4 is part of every deployment and Azure''s regional capacity changes; if Azure refuses them all, the run ends NOT DONE with the fix' }
                     }
-                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if (-not $start) { 'If Azure keeps refusing them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you here.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                    $lastFix = if ($refusedQuota) { 'If Azure keeps refusing them over the quota: {0}' -f (Get-DemoT4QuotaRemediation -Location $location) } else { 'If Azure keeps refusing them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you here.' }
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} ({3}), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what, $refusedWhy) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if (-not $start) { $lastFix } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
                 }
                 else {
                     $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
@@ -475,7 +483,21 @@ function Invoke-DemoPreflight {
         $tuningWhy = if ($t4Start -and $t4Pinned) { 'deploy.ps1''s fallback starts at {0} because {1}, the size t4SkuName sets, is ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' -f $t4Start, $t4Pinned } elseif ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
         $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
         # T4's read replica (2026-11-13, ADR 0025), on the size T4 gets: a Burstable size has none (Not supported, with the fix).
-        $results.Add((New-DemoT4ReplicaPreflightResult -SkuName $tuningSku))
+        $replicaCheck = New-DemoT4ReplicaPreflightResult -SkuName $tuningSku
+        # The subscription's vCore usage for Azure Database for PostgreSQL in the region, for diagnosis only (F37,
+        # 2026-11-22): Azure didn't enforce it as reported, so it's logged and kept in this check's evidence, redacted as
+        # New-DemoResult does, and never judged; a refusal at creation moves the size fallback on, and says so.
+        try {
+            $quotaLine = Format-DemoPostgresQuotaUsageText -Usage (Read-DemoPostgresQuotaUsage -Config $Config) -SkuName $tuningSku -Location $location
+            Write-DemoLog -Message $quotaLine.Text
+            if ($replicaCheck.evidence -is [System.Collections.IDictionary]) {
+                $replicaCheck.evidence['quotaUsage'] = (Protect-DemoText -Text ($quotaLine.Evidence | ConvertTo-Json -Depth 4 -Compress)) | ConvertFrom-Json -AsHashtable
+            }
+        }
+        catch {
+            Write-DemoLog -Message ('For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in {0} couldn''t be read: {1}' -f $location, (Protect-DemoText -Text $_.Exception.Message))
+        }
+        $results.Add($replicaCheck)
     }
     else {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))

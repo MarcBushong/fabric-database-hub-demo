@@ -26,7 +26,9 @@ function Invoke-DemoTemplateDeployment {
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
        server that doesn't exist yet.
     6. T4's fallback (ADR 0019; since T4's 4-vCore default, 2026-11-04), only when T4 doesn't exist yet, and only for
-       Azure's SkuNotAvailable (a quota, a policy denial, or a transient error fails the template as before). For a size
+       Azure's SkuNotAvailable or, since 2026-11-22 (F37), Learn's refusal over the subscription's vCore quota
+       (Get-DemoT4QuotaRefusal), which skips the retry in another zone; another quota, a policy denial, or a transient
+       error fails the template as before. For a size
        t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning"): the size
        once more in another zone the region lists for it, then the next size Azure accepts, cheapest first
        (Get-DemoT4FallbackOrder: the sizes that cost as much or more, then the cheaper ones, nearest first), each after
@@ -535,9 +537,11 @@ function Invoke-DemoTemplateDeployment {
     $groupSeen = $tags.Count -gt 0
     $record = {
         # -KeptFrom (#25, 2026-11-17): a refused scale's record, which says the server kept its size (ConvertTo-DemoT4RefusedRecord
-        # -Kept), with the size Azure refused first, so DONE and status.ps1 never call the server the fallback's creation.
+        # -Kept), with the size Azure refused first, so DONE and status.ps1 never call the server the fallback's creation; a
+        # refusal over the subscription's vCore quota is marked "quota" among its zones (F37, 2026-11-22).
         param([string] $Value, [AllowNull()] [object] $KeptFrom = $null)
-        $refusedValue = if (-not $Value) { '' } elseif ($null -ne $KeptFrom) { ConvertTo-DemoT4RefusedRecord -Refusal @([pscustomobject]@{ Sku = [string]$KeptFrom.Sku; Zones = [string[]]@($(if ([string]$KeptFrom.Zone) { [string]$KeptFrom.Zone } else { 'any' })) }) -TimeUtc ([string]$KeptFrom.TimeUtc) -Kept } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
+        $keptZones = if ($null -ne $KeptFrom) { [string[]]@(@($(if ([string]$KeptFrom.Zone) { [string]$KeptFrom.Zone } else { 'any' })) + @($(if ($null -ne (Get-DemoMemberValue -InputObject $KeptFrom -Name 'Quota')) { 'quota' }))) } else { [string[]]@() }
+        $refusedValue = if (-not $Value) { '' } elseif ($null -ne $KeptFrom) { ConvertTo-DemoT4RefusedRecord -Refusal @([pscustomobject]@{ Sku = [string]$KeptFrom.Sku; Zones = $keptZones }) -TimeUtc ([string]$KeptFrom.TimeUtc) -Kept } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
         if ([string]$tags[$t4TagName] -ceq $Value -and [string]$tags[$t4RefusedTagName] -ceq $refusedValue) {
             return
         }
@@ -1049,32 +1053,39 @@ function Invoke-DemoTemplateDeployment {
             $t4Failure = Get-DemoT4CreateFailure -Config $effective
         }
         $current = Get-DemoT4SkuName -Config $effective
-        # A scale to the default that Azure refused with SkuNotAvailable (2026-11-04): T4 keeps its size, which the group
-        # records, so later runs keep it too, and this run deploys again without the scale.
+        # Azure's refusal over the subscription's vCore quota (F37, 2026-11-22) moves the fallback on as SkuNotAvailable
+        # does, but never to the same size in another zone: a quota is the subscription's in the region, not a zone's.
+        $t4QuotaRefusal = $null -ne (Get-DemoMemberValue -InputObject $t4Failure -Name 'Quota')
+        # A scale to the default that Azure refused with SkuNotAvailable (2026-11-04), or over the quota: T4 keeps its size,
+        # which the group records, so later runs keep it too, and this run deploys again without the scale.
         if ($t4Scaling -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             $t4Scaling = $false
             $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
-            & $record $t4ServerSku -KeptFrom ([pscustomobject]@{ Sku = $current; Zone = [string]$t4Failure.Zone; TimeUtc = [string]$t4Failure.TimeUtc })
+            & $record $t4ServerSku -KeptFrom ([pscustomobject]@{ Sku = $current; Zone = [string]$t4Failure.Zone; TimeUtc = [string]$t4Failure.TimeUtc; Quota = (Get-DemoMemberValue -InputObject $t4Failure -Name 'Quota') })
             $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $current -Outcome Refused -Failure $t4Failure))
             Write-DemoLog -Level Warning -Message ('Azure refused to scale T4 to {0}; deploying again with T4 at {1}.' -f $current, $t4ServerSku)
             continue
         }
         # The fallback (ADR 0019, since T4's 4-vCore default, 2026-11-04): only Azure's SkuNotAvailable for the size this
-        # attempt sent moves it on, and only while T4's server doesn't exist (read above): the asked size once more in
-        # another zone the region lists for it, then, without t4SkuName, Standard_D4ads_v5, then Standard_D2ds_v5 (after its
-        # cost check, at the top of the next attempt), and Standard_D2ds_v5 to no T4; for a size t4SkuName sets (2026-11-09),
-        # the next size Azure accepts, cheapest first (Get-DemoT4NextSku), each after its cost check, and the last one to no
-        # T4. A quota, a policy denial, or a transient error fails the template as before. What it chose is recorded for
-        # later runs, with what Azure refused.
+        # attempt sent, or its refusal over the subscription's vCore quota (F37), moves it on, and only while T4's server
+        # doesn't exist (read above): the asked size once more in another zone the region lists for it (not after a quota
+        # refusal), then, without t4SkuName, Standard_D4ads_v5, then Standard_D2ds_v5 (after its cost check, at the top of
+        # the next attempt), and Standard_D2ds_v5 to no T4; for a size t4SkuName sets (2026-11-09), the next size Azure
+        # accepts, cheapest first (Get-DemoT4NextSku), each after its cost check, and the last one to no T4. Another quota,
+        # a policy denial, or a transient error fails the template as before. What it chose is recorded for later runs, with
+        # what Azure refused ("quota" among a size's zones for a quota refusal).
         if ($ladder -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current -and $current -notin $t4Refused) {
             if (-not $t4Refusals.Contains($current)) {
                 $t4Refusals[$current] = [System.Collections.Generic.List[string]]::new()
             }
             $t4Refusals[$current].Add($(if ([string]$t4Failure.Zone) { [string]$t4Failure.Zone } else { 'any' }))
+            if ($t4QuotaRefusal -and -not $t4Refusals[$current].Contains('quota')) {
+                $t4Refusals[$current].Add('quota')
+            }
             $t4RefusalUtc = [string]$t4Failure.TimeUtc
             $lastRefusal = $t4Failure
             $retryZone = ''
-            if ($current -ceq $t4Asked -and -not $zoneTried) {
+            if ($current -ceq $t4Asked -and -not $zoneTried -and -not $t4QuotaRefusal) {
                 $zoneTried = $true
                 $retryZone = [string](@(Get-DemoT4SkuZone -Config $effective -SkuName $current) | Where-Object { $_ -ne [string]$t4Failure.Zone } | Select-Object -First 1)
             }
@@ -1108,7 +1119,7 @@ function Invoke-DemoTemplateDeployment {
                     # the fix); nothing is recorded, so every run tries the sizes again.
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
                     & $record ''
-                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Pinned $t4Pinned -Tried @(& $refusalList)))
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Pinned $t4Pinned -Tried @(& $refusalList) -Location ([string]$Config['location'])))
                     Write-DemoLog -Level Warning -Message ('Azure refused every size T4''s fallback tries for {0}; deploying the rest again without T4, and the run ends NOT DONE.' -f $t4Pinned)
                 }
                 continue
@@ -1131,7 +1142,7 @@ function Invoke-DemoTemplateDeployment {
                     # tries the sizes again (2026-11-09).
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
                     & $record ''
-                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused'))
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Tried @(& $refusalList) -Location ([string]$Config['location'])))
                     Write-DemoLog -Level Warning -Message 'Azure refused T4''s 2-vCore fallback, Standard_D2ds_v5, too; deploying the rest again without T4, and the run ends NOT DONE.'
                 }
             }
@@ -1193,7 +1204,7 @@ function Invoke-DemoTemplateDeployment {
         $results.Add($failure)
         if ($null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             # A size Azure refused for T4 that the configuration sets gets its own Fail, with the documented fallback (Phase 24, ADR 0019).
-            $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure))
+            $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure -Location ([string]$Config['location'])))
         }
         return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
     }

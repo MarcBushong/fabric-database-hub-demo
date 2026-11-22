@@ -96,6 +96,8 @@ BeforeAll {
         # ready for it, whether the identity may, and the minutes it takes), its deletion, its parameter, the second
         # auto-stop, the control vault's secrets as the runbook writes them, and whether the group's tags can be written.
         $script:replicaRefuse = @()
+        # Sizes Azure refuses over the subscription's vCore quota, with Learn's message (F37, 2026-11-22).
+        $script:replicaQuota = @()
         $script:replicaNotReady = 0
         $script:replicaForbidden = $false
         $script:replicaCreateMinutes = 9
@@ -410,6 +412,7 @@ BeforeAll {
                         return (New-Response 409 '{"error":{"code":"ReadReplicaServerInUnexpectedState","message":"Cannot perform operation on read replica because it''s in ''Restarting'' state."}}')
                     }
                     if ($sku -in $script:replicaRefuse) { return (New-Response 400 ('{{"error":{{"code":"SkuNotAvailable","message":"The requested SKU {0} isn''t available in westus3."}}}}' -f $sku)) }
+                    if ($sku -in $script:replicaQuota) { return (New-Response 400 '{"error":{"code":"QuotaExceeded","message":"Operation could not be completed as it results in exceeding approved standardDDSv5Family Cores quota. Additional details - Current Limit: 24, Current Usage: 24, Additional Required: 4, (Minimum) New Limit Required: 28."}}') }
                     $script:replica = 'Provisioning'
                     $script:replicaSku = $sku
                     $script:replicaReadyAt = $script:clock.AddMinutes($script:replicaCreateMinutes)
@@ -1413,6 +1416,29 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('SkuNotAvailable', 'Accepted')
         $status.replica.note | Should -Match 'Azure refused T4''s size \(Standard_D4ds_v5\) for the replica, so it runs on Standard_D4ads_v5'
         $script:groupTags['DbHubT4ReplicaSize'] | Should -Be 'Standard_D4ads_v5@any'
+    }
+
+    It 'moves to the next size when Azure refuses one over the subscription''s vCore quota, and says so (F37, 2026-11-22)' {
+        $script:replicaQuota = @('Standard_D4ds_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $status = Get-SessionStatus
+        @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('QuotaExceeded', 'Accepted')
+        $status.replica.note | Should -Match '^Azure refused T4''s size \(Standard_D4ds_v5\) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5'
+    }
+
+    It 'names the quota and its ways out when Azure refuses every size, some over the quota' {
+        $script:replicaQuota = @('Standard_D4ds_v5')
+        $script:replicaRefuse = @('Standard_D2ds_v5', 'Standard_D4ads_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $status = Get-SessionStatus
+        $status.replica.state | Should -Be 'Refused'
+        $status.replica.note | Should -Match 'over the subscription''s vCore quota for Azure Database for PostgreSQL in westus3, so this session has none\.$'
+        $status.replica.fix | Should -Match '^Free vCores in westus3: \./scripts/destroy\.ps1 -ConfigPath <its configuration>'
+        $status.replica.fix | Should -Match 'request more quota for Azure Database for PostgreSQL flexible server in westus3 \(Learn: Request a quota increase\)\. For the sizes Azure refused as unavailable \(SkuNotAvailable\), ask for access with a Region access request \(Learn: Resolve capacity errors\)\. Then Run all again\.$'
+        $script:replica | Should -BeNullOrEmpty
     }
 
     It 'asks again while T4 restarts (ReadReplicaServerInUnexpectedState, live 2026-11-13), then creates the replica' {

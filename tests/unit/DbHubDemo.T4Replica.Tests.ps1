@@ -177,9 +177,13 @@ Describe 'Creating the replica: the fallback, its notice, and Azure''s refusals 
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaTemplate -MockWith { $script:outcomes.Dequeue() }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaCreateFailure -MockWith {
             $last = $script:sent[$script:sent.Count - 1].Split('@')
-            [pscustomobject]@{ Code = $script:failureCode; Text = 'A fake error.'; Sku = $last[0]; Zone = $last[1]; TimeUtc = '2026-11-13T12:00:00Z' }
+            # Each failed attempt's code, from the plan when it has one (F37: QuotaExceeded carries Azure's figures).
+            $code = if ($script:failurePlan.Count -gt 0) { $script:failurePlan.Dequeue() } else { $script:failureCode }
+            [pscustomobject]@{ Code = $code; Text = 'A fake error.'; Sku = $last[0]; Zone = $last[1]; TimeUtc = '2026-11-13T12:00:00Z'; Quota = $(if ($code -eq 'QuotaExceeded') { $script:failureQuota } else { $null }) }
         }
         $script:failureCode = 'SkuNotAvailable'
+        $script:failurePlan = [System.Collections.Generic.Queue[string]]::new()
+        $script:failureQuota = [pscustomobject]@{ Quota = 'standardDDSv5Family'; Limit = 24; Usage = 24; Required = 4 }
         # Before the creation it isn't there; after a refusal its shell is Dropping; after a success it's Ready.
         $script:replicaReads = 0
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith {
@@ -247,6 +251,39 @@ Describe 'Creating the replica: the fallback, its notice, and Azure''s refusals 
         $main.remediation | Should -Match '^Ask for access with a Region access request for Azure Database for PostgreSQL flexible server in westus3 .+ then run \./scripts/deploy\.ps1'
         $script:recorded.Count | Should -Be 0
     }
+
+    It 'skips T4''s size in another zone after Azure''s refusal over the subscription''s vCore quota, and the notice names it (F37, 2026-11-22)' {
+        # A quota is the subscription's in the region, not a zone's: the same size elsewhere would only be refused again.
+        $script:failureCode = 'QuotaExceeded'
+        $script:outcomes.Enqueue('Failed')
+        $script:outcomes.Enqueue('Succeeded')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4ReplicaCreate -Config $Config -DeploymentId 'abc123' -CheckPrefix START -Confirm:$false })
+        @($script:sent) | Should -Be @('Standard_D4ds_v5@', 'Standard_D4ads_v5@')
+        $notice = $results | Where-Object checkId -EQ 'START.T4.REPLICA.FALLBACK'
+        $notice.status | Should -Be 'Warning'
+        $notice.message | Should -Match '^T4''s read replica was created as Standard_D4ads_v5 \(no zone preference\), where T4''s size Standard_D4ds_v5 was asked for, because Azure refused Standard_D4ds_v5 \(no zone preference\) \(over the subscription''s vCore quota for Azure Database for PostgreSQL here, its standardDDSv5Family Cores quota: 24 of 24 in use, 4 more needed\)\.'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'for T4''s read replica \(over the subscription''s vCore quota' }
+    }
+
+    It 'gives the quota''s ways out when Azure refuses every size, some over it: <Prefix>' -ForEach @(
+        @{ Prefix = 'DEPLOY'; Status = 'Fail'; Command = 'deploy.ps1' }
+        @{ Prefix = 'START'; Status = 'Warning'; Command = 'start-demo.ps1' }
+    ) {
+        # T4's size unavailable in its first zone, then over the quota in the next one, then the peer unavailable.
+        foreach ($code in 'SkuNotAvailable', 'QuotaExceeded', 'SkuNotAvailable') {
+            $script:failurePlan.Enqueue($code)
+            $script:outcomes.Enqueue('Failed')
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Prefix = $Prefix; Record = { param($Values) $script:recorded.Add($Values) } } { Invoke-DemoT4ReplicaCreate -Config $Config -DeploymentId 'abc123' -CheckPrefix $Prefix -RecordState $Record -Confirm:$false })
+        @($script:sent) | Should -Be @('Standard_D4ds_v5@', 'Standard_D4ds_v5@1', 'Standard_D4ads_v5@')
+        $main = $results | Where-Object checkId -EQ ('{0}.T4.REPLICA' -f $Prefix)
+        $main.status | Should -Be $Status
+        $main.message | Should -Match 'Azure refused every size it can have \(SkuNotAvailable; over the subscription''s vCore quota for Azure Database for PostgreSQL here, its standardDDSv5Family Cores quota: 24 of 24 in use, 4 more needed\): Standard_D4ds_v5 \(no zone preference\), Standard_D4ds_v5 in zone 1, Standard_D4ads_v5 \(no zone preference\)\.'
+        $main.remediation | Should -Match '^Free vCores in westus3: \./scripts/destroy\.ps1 -ConfigPath <its configuration>'
+        $main.remediation | Should -Match ('For the sizes Azure refused as unavailable \(SkuNotAvailable\), ask for access with a Region access request \(Learn: Resolve capacity errors\)\. Then run \./scripts/{0} again\.' -f [regex]::Escape($Command))
+        $script:recorded.Count | Should -Be 0
+    }
+
 
     It 'stops at an error that isn''t a refusal, without trying another size: a Warning for start-demo.ps1' {
         $script:failureCode = 'Other'
@@ -917,5 +954,31 @@ Describe 'The replica''s checks while T4 doesn''t run, or while the replica is c
         $left = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123' }
         $left.status | Should -Be 'Warning'
         $left.remediation | Should -Be 'Run ./scripts/stop-demo.ps1, which deletes it.'
+    }
+}
+
+Describe 'The replica''s failure reader: Azure''s refusal over the vCore quota (F37, 2026-11-22)' {
+    It 'reads Azure''s refusal over the vCore quota from the replica''s deployment, with its figures, and SkuNotAvailable first' {
+        $script:operationMessage = $null
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = @($ArgumentList) -join ' '
+            if ($joined -like 'deployment group show *') {
+                return [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = (ConvertTo-Json -Depth 20 -InputObject @{ name = 'dbhub-t4-replica'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-11-22T10:00:00Z'; parameters = @{ skuName = @{ value = 'Standard_D4ds_v5' }; availabilityZone = @{ value = '' } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure' }) } } }) }
+            }
+            if ($joined -like 'deployment operation group list *') {
+                return [pscustomobject]@{ ExitCode = 0; StdErr = ''; StdOut = (ConvertTo-Json -Depth 20 -InputObject @(@{ properties = @{ provisioningState = 'Failed'; statusMessage = @{ status = 'Failed'; error = @{ code = 'QuotaExceeded'; message = $script:operationMessage } } } })) }
+            }
+            throw ('unexpected Azure CLI call: {0}' -f $joined)
+        }
+        $script:operationMessage = 'Operation could not be completed as it results in exceeding approved Total Regional Cores quota. Additional details - Current Limit: 24, Current Usage: 24, Additional Required: 4, (Minimum) New Limit Required: 28.'
+        $failure = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaCreateFailure -Config $Config }
+        $failure.Code | Should -Be 'QuotaExceeded'
+        $failure.Sku | Should -Be 'Standard_D4ds_v5'
+        $failure.Quota.Quota | Should -BeExactly 'Total Regional'
+        $failure.Quota.Required | Should -Be 4
+        $script:operationMessage = 'SkuNotAvailable: Specified SKU is not supported in this region.'
+        $failure = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaCreateFailure -Config $Config }
+        $failure.Code | Should -Be 'SkuNotAvailable'
+        $failure.Quota | Should -BeNullOrEmpty
     }
 }

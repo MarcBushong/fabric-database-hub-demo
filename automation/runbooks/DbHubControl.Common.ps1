@@ -5077,9 +5077,12 @@ function Send-DbHubT4ReplicaCreate {
     Asks Azure for T4's read replica at SkuName (Servers - Create, createMode Replica), as infra/replica/pgreplica01.bicep
     makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
     and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
-    StatusCode, Code (SkuNotAvailable, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    StatusCode, Code (SkuNotAvailable, QuotaExceeded, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    QuotaExceeded is Learn's refusal over the subscription's vCore quota ("exceeding approved {0} Cores quota"; F37,
+    2026-11-22), which moves the session's size fallback on as SkuNotAvailable does.
     https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
     https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
+    https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -5142,6 +5145,9 @@ function Send-DbHubT4ReplicaCreate {
     }
     elseif ($text -match 'SkuNotAvailable') {
         $code = 'SkuNotAvailable'
+    }
+    elseif ($text -match '(?is)exceeding\s+approved\s+[^"\\\r\n]{0,80}?\s*Cores\s+quota') {
+        $code = 'QuotaExceeded'
     }
     elseif ($text -match 'ReadReplicaServerInUnexpectedState') {
         $code = 'SourceNotReady'
@@ -5449,7 +5455,8 @@ function Start-DbHubSessionReplica {
 function Send-DbHubSessionReplicaAttempt {
     <#
     .SYNOPSIS
-    Asks for the session's read replica at the work's next size: SkuNotAvailable moves to the next size, a T4 that's
+    Asks for the session's read replica at the work's next size: SkuNotAvailable, or Azure's refusal over the
+    subscription's vCore quota (QuotaExceeded, F37), moves to the next size, a T4 that's
     restarting or updating (ReadReplicaServerInUnexpectedState) is asked again every PollSeconds for up to RaceMinutes (live,
     2026-11-13: T4's restart refused the replica), and any other refusal ends it, with the fix in the status. Returns the
     work.
@@ -5513,7 +5520,7 @@ function Send-DbHubSessionReplicaAttempt {
             $Work.AcceptedUtc = Get-DbHubUtcNow
             return $Work
         }
-        if ($sent.Code -eq 'SkuNotAvailable') {
+        if ($sent.Code -in 'SkuNotAvailable', 'QuotaExceeded') {
             $Work.Index++
             continue
         }
@@ -5530,6 +5537,16 @@ function Send-DbHubSessionReplicaAttempt {
         return (& $finish 'Failed' ('T4''s read replica couldn''t be created: {0}' -f $sent.Error) 'Fix the cause (a policy denial names its policy), then Run all again; ./scripts/start-demo.ps1 creates it too, with more detail.')
     }
     $tried = @($Work.Attempts | ForEach-Object { [string]$_['size'] } | Select-Object -Unique) -join ', '
+    # Over the subscription's vCore quota (F37, 2026-11-22): the fix is room in it, more of it, or another region.
+    $overQuota = @($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0
+    if ($overQuota) {
+        $where = [string](Get-DbHubMember -InputObject $Work.Source -Name 'location')
+        if (-not $where) {
+            $where = 'the region'
+        }
+        $unavailable = if (@($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'SkuNotAvailable' }).Count -gt 0) { ' For the sizes Azure refused as unavailable (SkuNotAvailable), ask for access with a Region access request (Learn: Resolve capacity errors).' } else { '' }
+        return (& $finish 'Refused' ('Azure refused every size for T4''s read replica ({0}), some or all over the subscription''s vCore quota for Azure Database for PostgreSQL in {1}, so this session has none.' -f $tried, $where) ('Free vCores in {0}: ./scripts/destroy.ps1 -ConfigPath <its configuration> deletes a demo environment you no longer use, with its T4 and read replica (a stopped server still counts against the quota). Or request more quota for Azure Database for PostgreSQL flexible server in {0} (Learn: Request a quota increase).{1} Then Run all again.' -f $where, $unavailable))
+    }
     return (& $finish 'Refused' ('Azure refused every size for T4''s read replica ({0}), so this session has none.' -f $tried) 'Ask for the size in the region (a Region access request), or set t4SkuName in config/demo.config.json and run ./scripts/deploy.ps1.')
 }
 
@@ -5625,7 +5642,9 @@ function Complete-DbHubSessionReplica {
     }
     $part['sizeUsed'] = $used
     if ($used -and $part['sizeAsked'] -and $used -cne [string]$part['sizeAsked']) {
-        $part['note'] = 'Azure refused T4''s size ({0}) for the replica, so it runs on {1}, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' -f $part['sizeAsked'], $used
+        # A refusal over the subscription's vCore quota says so (F37, 2026-11-22).
+        $why = if (@($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0) { ' over the subscription''s vCore quota' } else { '' }
+        $part['note'] = 'Azure refused T4''s size ({0}) for the replica{2}, so it runs on {1}, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' -f $part['sizeAsked'], $used, $why
     }
     $parameter = Set-DbHubT4ReplicaParameter -Context $Context -Name $Work.Name -Milliseconds $setting.StreamingDelayMs
     if (-not $parameter.Ok) {
