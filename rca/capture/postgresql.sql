@@ -232,7 +232,8 @@ ORDER BY t.seq_tup_read DESC;
 -- once the free slots are down to the reserved ones, PostgreSQL accepts only roles with their privileges
 -- (https://www.postgresql.org/docs/18/runtime-config-connection.html#GUC-SUPERUSER-RESERVED-CONNECTIONS). The counts by
 -- state leave the observer out: its session is always running this query, which read as a client running one in every
--- sample (Final tests' live check of 4e2c65ed). So they add up to one less than client_connections, or fewer.
+-- sample (Final tests' live check of 4e2c65ed). So active, idle, and idle_in_transaction add up to at most one less than
+-- client_connections, and waiting_lock is a part of active.
 -- Refused attempts (SQLSTATE 53300) never reach the server's views, and Azure Monitor's connections_failed doesn't count
 -- them either (live, 2026-11-21: 48 refused attempts, none counted), so nothing here counts them.
 SELECT clock_timestamp() AS captured_at,

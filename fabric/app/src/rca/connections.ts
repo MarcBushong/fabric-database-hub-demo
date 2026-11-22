@@ -44,7 +44,12 @@ export interface ConnectionAnalysis {
     details: Record<string, unknown>;
 }
 
-/** RCA-PG-10's rows for a target, one sample per capture time, oldest first. */
+/**
+ * RCA-PG-10's rows for a target, one sample per capture time, oldest first. The total counts the capture's own connection,
+ * and the states leave it out (3732317d); in rows from before that, the capture's own query was one of the active. Such a
+ * row is one whose active, idle, and idle in a transaction add up to the total, which a later row's can't: its active is
+ * read as one less, so every row's states are the other clients'.
+ */
 export function connectionSamples(resource: readonly ResourcePoint[], target: RcaTarget, from: Date, to: Date): ConnectionSample[] {
     const byTime = new Map<number, Map<string, number>>();
     for (const r of resource) {
@@ -56,16 +61,23 @@ export function connectionSamples(resource: readonly ResourcePoint[], target: Rc
     return [...byTime.entries()]
         .filter(([, row]) => row.has("connections_total"))
         .sort(([a], [b]) => a - b)
-        .map(([t, row]) => ({
-            at: new Date(t),
-            total: row.get("connections_total") as number,
-            active: row.get("connections_active"),
-            idle: row.get("connections_idle"),
-            idleInTransaction: row.get("connections_idle_in_transaction"),
-            waitingLock: row.get("connections_waiting_lock"),
-            maxConnections: row.get("max_connections"),
-            reserved: row.get("reserved_connections"),
-        }));
+        .map(([t, row]) => {
+            const total = row.get("connections_total") as number;
+            const active = row.get("connections_active");
+            const idle = row.get("connections_idle");
+            const idleInTransaction = row.get("connections_idle_in_transaction");
+            const ownCounted = active !== undefined && idle !== undefined && active >= 1 && active + idle + (idleInTransaction ?? 0) === total;
+            return {
+                at: new Date(t),
+                total,
+                active: ownCounted ? active - 1 : active,
+                idle,
+                idleInTransaction,
+                waitingLock: row.get("connections_waiting_lock"),
+                maxConnections: row.get("max_connections"),
+                reserved: row.get("reserved_connections"),
+            };
+        });
 }
 
 /** "5 min 10 s", "40 s". */
@@ -144,9 +156,14 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     const last = watched[watched.length - 1];
     const ref = (s: ConnectionSample, text: string): EvidenceRef => ({ table: "RCA Resource", at: iso(s.at), target, text });
 
+    // The total counts the capture's own connection, which takes a slot like any other (3732317d's review). Past the
+    // limit, the rest are roles that may use the reserved slots, or clients still connecting: "36 of the 35" read as nonsense.
+    const own = "the capture's own connection among them";
     const limitText = limit !== null
-        ? `${peak.total} of the ${limit} slots clients can use (max_connections ${maxConnections} less ${reserved} reserved)`
-        : `${peak.total} client connections (max_connections wasn't captured)`;
+        ? peak.total > limit
+            ? `${peak.total}, over the ${limit} slots clients can use (max_connections ${maxConnections} less ${reserved} reserved, which only privileged roles can take; ${own})`
+            : `${peak.total} of the ${limit} slots clients can use (max_connections ${maxConnections} less ${reserved} reserved; ${own})`
+        : `${peak.total} client connections (max_connections wasn't captured; ${own})`;
     const share = limit ? Math.round((100 * peak.total) / limit) : null;
     const reached = `${target}'s client connections reached ${limitText} at ${hhmmss(peak.at)} UTC`;
     // The surge's shape: its waves, with their peaks and the troughs between them, and how many samples were at the level.
@@ -172,11 +189,12 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     // the samples never saw every slot in use, the slots may still have filled between them: live, a wave filled them for
     // 0.1 s, refusing 2 attempts, between two 10-s samples of 34 of 35.
     const full = limit !== null ? samples.filter((s) => s.total >= limit) : [];
+    const most = full.length ? Math.max(...full.map((s) => s.total)) : 0;
     const fullText =
         limit === null
             ? ""
             : full.length
-              ? ` Every usable slot was in use ${full.length === 1 ? `at ${hhmmss(full[0].at)} UTC` : `in ${full.length} samples between ${hhmmss(full[0].at)} and ${hhmmss(full[full.length - 1].at)} UTC`} (${Math.max(...full.map((s) => s.total))} of ${limit}), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).`
+              ? ` Every usable slot was in use ${full.length === 1 ? `at ${hhmmss(full[0].at)} UTC` : `in ${full.length} samples between ${hhmmss(full[0].at)} and ${hhmmss(full[full.length - 1].at)} UTC`} (${most > limit ? `up to ${most} connections, over the ${limit}` : `${most} of ${limit}`}), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).`
               : ` The capture's samples saw at most ${peak.total} of the ${limit} usable slots in use; between them the slots may have filled, so whether a client was refused isn't known.`;
     const monitorText =
         failed.length === 0
@@ -274,7 +292,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
 
     const statement = `${reached}${held}.${cutOff} ${cause}${who}${fullText}${monitorText}`;
     const evidence: EvidenceRef[] = [
-        ref(peak, `${peak.total} client connections${limit ? ` of ${limit} (${share} %)` : ""}: ${active} active, ${idle} idle, ${idleInTx} idle in a transaction, ${waiting} waiting on a lock`),
+        ref(peak, `${peak.total} client connections${limit ? ` of ${limit} (${share} %)` : ""}: ${active} active, ${idle} idle, ${idleInTx} idle in a transaction, ${waiting} waiting on a lock, and the capture's own`),
         ...(first.at.getTime() !== peak.at.getTime() ? [ref(first, `${first.total} client connections`)] : []),
         ...(last.at.getTime() !== peak.at.getTime() ? [ref(last, `${last.total} client connections`)] : []),
         ...failedRefs,

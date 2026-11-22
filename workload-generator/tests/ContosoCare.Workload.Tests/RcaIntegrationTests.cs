@@ -112,6 +112,14 @@ public sealed class RcaIntegrationTests : IDisposable
 
         Assert.Empty(RcaSchemas.Errors(RcaSchemas.Evidence, view.Json));
 
+        // The observer ran alone for its first 8 s: RCA-PG-10's total counts its own connection, and no state does
+        // (3732317d's review). The setup's connection was closed before it started, and the opener pools none.
+        var counts = view.Table("rca_resource").Where(r => (string?)r["target"] == "T4" && (string?)r["source"] == "RCA-PG-10").ToList();
+        var firstAt = counts.Min(r => (DateTimeOffset)r["at_utc"]!);
+        var first = counts.Where(r => (DateTimeOffset)r["at_utc"]! == firstAt).ToDictionary(r => (string)r["metric"]!, r => (double)r["value"]!);
+        Assert.Equal(0, first["connections_active"]);
+        Assert.True(first["connections_total"] >= 1, $"The first sample's connections_total was {first["connections_total"]}, without the observer's own connection.");
+
         // Blind: the detection tables name no scenario and no run.
         foreach (var text in view.Strings)
         {

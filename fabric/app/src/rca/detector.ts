@@ -13,7 +13,7 @@
 // episodes; the densest source of a signal comes first (T3's 15-second resource rows before Database Hub's bins).
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
-import { type Confidence, type Episode, type Evidence, type EventRow, type RcaTarget, type Support } from "./types";
+import { pointKey, type Confidence, type Episode, type Evidence, type EventRow, type RcaTarget, type Support } from "./types";
 
 export interface Sample {
     at: Date;
@@ -416,25 +416,46 @@ export function episodesFromEvents(evidence: Evidence): Episode[] {
     return out;
 }
 
+/**
+ * A series' runs of one grain, oldest first, each with its step: each point's own interval where the history says it
+ * (intervals, by pointKey), the capture's otherwise. A day-long save's 15-minute points read at the 1 minute of a
+ * session's own save split one T5 storm in two, 12:15 and 12:30, in the day's list (the review of 803f2b1a).
+ */
+function byGrain<T extends { at: Date }>(points: readonly T[], intervalOf: (p: T) => number | undefined, fallback: number): Array<{ points: T[]; step: number }> {
+    const out: Array<{ points: T[]; step: number }> = [];
+    for (const p of points) {
+        const step = intervalOf(p) ?? fallback;
+        const run = out[out.length - 1];
+        if (run && run.step === step) run.points.push(p);
+        else out.push({ points: [p], step });
+    }
+    return out;
+}
+
 /** T4's, its replica's, and T5's Azure Monitor metrics; the replica's catch-up after a restart isn't lag. */
-export function episodesFromMonitor(postgres: PostgresCapture | null, cosmos: CosmosCapture | null): Episode[] {
+export function episodesFromMonitor(postgres: PostgresCapture | null, cosmos: CosmosCapture | null, intervals?: ReadonlyMap<string, number>): Episode[] {
     const out: Episode[] = [];
     if (postgres) {
         const step = (postgres.intervalMinutes ?? 1) * MIN;
         const lag = postgresSeries(postgres, "T4-replica", POSTGRES_METRICS.lag);
         const caught = new Set(replicaCatchUp(postgres, lag));
-        out.push(...detect("T4-replica", lag.map((p) => ({ at: p.at, value: caught.has(p) ? null : p.value })), step, RULES.replica_lag, SOURCES.monitor));
+        for (const run of byGrain(lag, (p) => intervals?.get(pointKey("T4-replica", POSTGRES_METRICS.lag, p.at)), step)) {
+            out.push(...detect("T4-replica", run.points.map((p) => ({ at: p.at, value: caught.has(p) ? null : p.value })), run.step, RULES.replica_lag, SOURCES.monitor));
+        }
         for (const target of ["T4", "T4-replica"] as const) {
             const cpu = postgresSeries(postgres, target, POSTGRES_METRICS.cpu);
-            if (cpu.length) out.push(...detect(target, cpu.map((p) => ({ at: p.at, value: p.value })), step, RULES.cpu, SOURCES.monitor));
+            for (const run of byGrain(cpu, (p) => intervals?.get(pointKey(target, POSTGRES_METRICS.cpu, p.at)), step)) {
+                out.push(...detect(target, run.points.map((p) => ({ at: p.at, value: p.value })), run.step, RULES.cpu, SOURCES.monitor));
+            }
         }
     }
     if (cosmos) {
         const step = (cosmos.intervalMinutes ?? 1) * MIN;
-        const throttled = cosmosSeries(cosmos, COSMOS_METRICS.throttled);
-        if (throttled.length) out.push(...detect("T5", throttled.map((p) => ({ at: p.at, value: p.value })), step, RULES.throttling, SOURCES.monitor));
-        const ru = cosmosSeries(cosmos, COSMOS_METRICS.normalizedRu);
-        if (ru.length) out.push(...detect("T5", ru.map((p) => ({ at: p.at, value: p.value })), step, RULES.ru, SOURCES.monitor));
+        for (const [metric, rule] of [[COSMOS_METRICS.throttled, RULES.throttling], [COSMOS_METRICS.normalizedRu, RULES.ru]] as const) {
+            for (const run of byGrain(cosmosSeries(cosmos, metric), (p) => intervals?.get(pointKey("T5", metric, p.at)), step)) {
+                out.push(...detect("T5", run.points.map((p) => ({ at: p.at, value: p.value })), run.step, rule, SOURCES.monitor));
+            }
+        }
     }
     return out;
 }
@@ -444,6 +465,8 @@ export interface DetectorInput {
     bins?: readonly Bin[];
     postgres?: PostgresCapture | null;
     cosmos?: CosmosCapture | null;
+    /** Each Azure Monitor point's own interval, by pointKey (sources.ts's pointIntervals). */
+    intervals?: ReadonlyMap<string, number>;
 }
 
 /** Whether the observer captured a target over these minutes (an rca_coverage row says so). */
@@ -469,7 +492,7 @@ export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episod
     const byRows = cpuFromResourceRows(evidence);
     const byEvents = episodesFromEvents(evidence);
     const byBins = episodesFromBins(input.bins ?? []);
-    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null);
+    const byMonitor = episodesFromMonitor(input.postgres ?? null, input.cosmos ?? null, input.intervals);
     const overlaps = (a: Episode, b: Episode) => a.target === b.target && a.family === b.family && a.start <= (b.end ?? b.last) && b.start <= (a.end ?? a.last);
     // The events count deadlocks and errors themselves: the capture's own episode for the same minutes would only repeat them.
     const chosen: Episode[] = [...byCapture.filter((c) => !byEvents.some((e) => overlaps(c, e))), ...byRows, ...byEvents];
@@ -480,7 +503,11 @@ export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episod
         chosen.push(e);
     }
     for (const e of byMonitor) {
-        if (e.family === "replica_lag" && byCapture.some((c) => overlaps(c, e))) continue;
+        // An Azure Monitor point stands for its whole interval: the replica's lag at 16:15, Azure Monitor's 5 minutes, holds
+        // the capture's stall from 16:17:12, which is the same stall, listed once as the capture's (the review of 803f2b1a).
+        const step = e.family === "replica_lag" ? input.intervals?.get(pointKey(e.target, POSTGRES_METRICS.lag, e.last)) ?? (input.postgres?.intervalMinutes ?? 0) * MIN : 0;
+        const reach = Math.max((e.end ?? e.last).getTime(), e.last.getTime() + step - 1);
+        if (e.family === "replica_lag" && byCapture.some((c) => c.target === e.target && c.family === e.family && c.start.getTime() <= reach && e.start <= (c.end ?? c.last))) continue;
         chosen.push(e);
     }
     return chosen.filter((e) => e.start <= to && (e.end ?? e.last) >= from).sort((a, b) => a.start.getTime() - b.start.getTime() || a.target.localeCompare(b.target));

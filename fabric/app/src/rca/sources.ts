@@ -10,7 +10,7 @@ import { SQL_TARGETS } from "@/lib/dax";
 import { loadEvidence, MONITOR_ROW_LIMIT, RcaReadError, rcaMonitorDax, type DaxLog } from "./loader";
 import { toDate } from "./rows";
 import type { Telemetry } from "./tools";
-import type { Evidence, RcaTarget } from "./types";
+import { pointKey, type Evidence, type RcaTarget } from "./types";
 
 type Row = Record<string, unknown>;
 
@@ -22,17 +22,60 @@ export interface RcaSources {
     telemetry(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<Telemetry>;
 }
 
-/** The newest capture of each target, metric, and bin, as the model's measures keep it: captures can overlap. */
-export function newestCapturePerBin(rows: readonly Row[]): Row[] {
-    const kept = new Map<string, Row>();
+/**
+ * Azure Monitor's points for the RCA, one per interval, with each point's own interval (by pointKey). The history keeps
+ * every save, each at its own grain (1 to 1,440 minutes, the smallest that fits), so one minute can be in several: the
+ * finest grain is kept first, and of equal grains the newest capture. A coarser point whose interval overlaps a kept one
+ * is left out, so no minute counts twice. The model's measures keep the newest capture of each bin instead, which kept
+ * B's day-long save at 15 minutes beside the session's own 1-minute points: T5's requests and 429s for 15:30 to 15:42
+ * counted both, and the replica's lag at 16:15 read as 5 minutes at 178 s, the 15 minutes' highest (the review of
+ * 803f2b1a). A point's grain is its series' step in its capture, or else its capture's smallest.
+ */
+export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; intervals: Map<string, number> } {
+    const captureOf = (row: Row) => `${String(row.CapturedAt)}|${row.TargetKey === "T5" ? "cosmos" : "postgres"}`;
+    const seriesOf = (row: Row) => `${String(row.CapturedAt)}|${String(row.TargetKey)}|${String(row.Metric)}`;
+    const times = new Map<string, { capture: string; at: number[] }>();
     for (const row of rows) {
         const at = toDate(row.Bucket);
         if (!at) continue;
-        const key = `${String(row.TargetKey)}|${String(row.Metric)}|${at.getTime()}`;
-        const prior = kept.get(key);
-        if (!prior || (toDate(row.CapturedAt)?.getTime() ?? 0) > (toDate(prior.CapturedAt)?.getTime() ?? 0)) kept.set(key, row);
+        const series = times.get(seriesOf(row)) ?? { capture: captureOf(row), at: [] };
+        series.at.push(at.getTime());
+        times.set(seriesOf(row), series);
     }
-    return [...kept.values()];
+    const seriesStep = new Map<string, number>();
+    const captureStep = new Map<string, number>();
+    for (const [key, series] of times) {
+        const sorted = [...new Set(series.at)].sort((a, b) => a - b);
+        const gaps = sorted.slice(1).map((t, i) => t - sorted[i]);
+        if (gaps.length === 0) continue;
+        const step = Math.min(...gaps);
+        seriesStep.set(key, step);
+        captureStep.set(series.capture, Math.min(captureStep.get(series.capture) ?? step, step));
+    }
+    const groups = new Map<string, Array<{ row: Row; at: number; step: number; captured: number }>>();
+    for (const row of rows) {
+        const at = toDate(row.Bucket);
+        if (!at) continue;
+        const key = `${String(row.TargetKey)}|${String(row.Metric)}`;
+        const group = groups.get(key) ?? [];
+        group.push({ row, at: at.getTime(), step: seriesStep.get(seriesOf(row)) ?? captureStep.get(captureOf(row)) ?? 0, captured: toDate(row.CapturedAt)?.getTime() ?? 0 });
+        groups.set(key, group);
+    }
+    const kept: Row[] = [];
+    const intervals = new Map<string, number>();
+    for (const group of groups.values()) {
+        // The finest grain first, a point of unknown grain last; of equal grains, the newest capture.
+        group.sort((a, b) => (a.step || Infinity) - (b.step || Infinity) || b.captured - a.captured || a.at - b.at);
+        const taken: Array<[number, number]> = [];
+        for (const p of group) {
+            const end = p.at + Math.max(p.step, 1);
+            if (taken.some(([start, stop]) => p.at < stop && start < end)) continue;
+            taken.push([p.at, end]);
+            kept.push(p.row);
+            if (p.step > 0) intervals.set(pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(p.at)), p.step);
+        }
+    }
+    return { kept: kept.sort((a, b) => (toDate(a.Bucket)?.getTime() ?? 0) - (toDate(b.Bucket)?.getTime() ?? 0)), intervals };
 }
 
 function hash(text: string): string {
@@ -74,11 +117,12 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
                 ),
                 monitor ? read("Telemetry Snapshots (Azure Monitor)", spec("Azure Monitor metrics", monitor, MONITOR_ROW_LIMIT)) : Promise.resolve([]),
             ]);
-            const rows = newestCapturePerBin(monitorRows);
+            const { kept: rows, intervals } = finestPerInterval(monitorRows);
             return {
                 bins: bins.flat(),
                 postgres: toPostgresCapture(rows.filter((r) => r.TargetKey === "T4" || r.TargetKey === "T4-replica")),
                 cosmos: toCosmosCapture(rows.filter((r) => r.TargetKey === "T5")),
+                intervals,
             };
         },
     };

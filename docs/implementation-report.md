@@ -4584,9 +4584,9 @@ With them, at the coordinator's request: high contrast's selected and hovered na
     - **"Stayed at 80 % … 32 samples (7 min 30 s)" hid 4 waves,** with drops to 8 connections between them. The answer gives the shape now: the waves at 80 % of the limit or more, their peaks (35, 33, 33, and 33), the troughs between them, and the 32 of 53 samples at that level.
     - **`T5-ru-20261121T123000Z` was listed, but answered "No episode"** (at 94a17ff7 too).
       - **Why:** the telemetry query keeps each bin's newest capture with that capture's own interval, so Azure Monitor's 15-minute and 1-minute intervals from different captures read differently over different windows. Over the day, `find_incidents` listed 12:30 apart from 12:15; in 12:30's own minutes, the two are one episode, from 12:15.
-      - **The fix:** `explain_incident` reads the episode of the same target and signal that holds the key's time, or else the first to start within 15 minutes after it, and says which (`readAs`). Every key `find_incidents` lists over B's 11:00 to 20:00 UTC resolves, `T4-replica-replica_lag-20261121T161500Z` among them, an Azure Monitor key that the capture's episode replaces in its own minutes.
-      - **Left for Phase 2:** bins that read the same over every window need a change to the telemetry query, which the Estate page shares.
-    - **T5's counts, checked against the real rows:** from 15:30 to 15:42, the 10 intervals at 100 % hold 52,450 requests, 27,815 of them throttled (53 %), which the answer now says. 4e2c65ed's 55,152 and 29,186 (52.9 %) also counted 15:34, 15:38, 15:42, and 15:43, which weren't at 100 % (the review of 4e2c65ed).
+      - **The fix:** `explain_incident` reads the episode of the same target and signal that holds the key's time, or else the first to start within 15 minutes after it, and says which (`readAs`). Every key `find_incidents` lists over B's 11:00 to 20:00 UTC resolves. Since the RCA reads one Azure Monitor point per interval (below), the list no longer splits 12:15 from 12:30, or lists `T4-replica-replica_lag-20261121T161500Z`, Azure Monitor's 15 minutes of the capture's own stall.
+      - **Left for Phase 2:** the shared telemetry query, which Replay and the Estate page use, keeps each bin's newest capture; the RCA reads its own way since the entry below.
+    - **T5's counts, checked against the real rows:** for 15:30 to 15:42 this commit said 52,450 requests in 10 intervals at 100 %, 27,815 of them throttled (53 %). That still counted the day-long save's 15-minute total for 15:30 beside the 1-minute points it holds; corrected below to 24,820 requests in 9 intervals from 15:31, 13,222 of them throttled (53.3 %). 4e2c65ed's 55,152 and 29,186 (52.9 %) also counted 15:34, 15:38, 15:42, and 15:43, which weren't at 100 % (the review of 4e2c65ed).
   - **The re-review of bb70161f: 3 Low.**
     - **The hour's provisioned throughput:** Azure Monitor keeps it hourly, stamped with the hour's start, and an RU episode read T5's history from 30 minutes before it. One that began 30 minutes or more into its hour, about half of them, missed it: it said the throughput wasn't known, and left out why a new key wouldn't help. T5's history is read from the start of the episode's hour now.
     - **The no-chain note** said the capture's sentinel saw the blocking whenever the window overlapped captured minutes, even for blocking that only Database Hub's telemetry saw, before the capture ran. It says so now only for the capture's own episode, or one whose minutes the capture covered. Otherwise, it says the blocking is in Database Hub's telemetry only, and the capture wasn't running then.
@@ -4605,6 +4605,22 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - **When:** the runner embeds the capture's SQL, so the change takes effect at the next deploy. Earlier rows count the observer in both.
   - **Also corrected:** the block's comment said that Azure Monitor counts refusals at the limit.
   - **Tests:** `RcaObserverTests` pins the block: the total without the filter, and each count by state with it. It fails with ca6c9121's block. The counts above come from a run on the spike's local PostgreSQL 18.
+- **One Azure Monitor point per interval, one coverage note per target, and the capture's own connection in the words** (the coordinator's note on 803f2b1a, and the capture review of 3732317d).
+  - **The two "no RCA capture recorded" lines for one T5 storm** (15:30 to 15:42, and 15:30 to 15:43) came from one incident: its own minutes, and its throughput part's, a minute wider. They weren't two episodes in the list. An incident says each target's note once now, for its own minutes.
+  - **What the list did have twice, and the counts it got wrong:** B's history holds a day-long save at 15 minutes (21:33) beside the session's own (17:09) at 1 minute for T5 and 5 for T4. Taking each bin's newest capture, as the model's measures do, kept 15:30's 15-minute totals beside the 1-minute points they hold:
+    - T5's requests and 429s for its first storm counted both: 52,450 and 27,815 at 803f2b1a, where the 1-minute rows give 24,820 and 13,222 (53.3 %) in 9 intervals at 100 %, from 15:31;
+    - the replica's "Read Replica Lag 178 s, its highest from 16:15 to 16:20" was the 15 minutes' highest, from the second stall; the 5-minute interval's is 148 s;
+    - the day's list split T5's 12:15 to 12:45 storm in two, and listed Azure Monitor's 16:15 beside the capture's own stall from 16:17:12.
+  - **The fix, in the RCA's own reader, not the shared query:**
+    - `finestPerInterval` (`fabric/app/src/rca/sources.ts`) keeps the finest grain first, and of equal grains the newest capture, with each point's own interval (its series' step in its capture). A coarser point whose interval overlaps a kept one is left out, so no minute counts twice.
+    - The detector steps each run of one grain by that grain.
+    - An Azure Monitor replica-lag point stands for its whole interval when the list sets it against the capture's own stall.
+    - Replay and the Estate page read the shared query, which still keeps the newest capture per bin: Phase 2.
+  - **The capture review of 3732317d, 3 Low:**
+    - **The words:** the total has the capture's own connection, so the statement says "the capture's own connection among them", and its evidence ends "and the capture's own". An earlier row, whose active, idle, and idle in a transaction add up to its total, which a later row's can't, is read with one active less, the capture's own query: B's surges read "none ran a query" now. A total past the limit reads "reached 36, over the 35 slots clients can use (max_connections 50 less 15 reserved, which only privileged roles can take; …)", never "36 of the 35".
+    - **The docs' arithmetic:** active, idle, and idle in a transaction add up to at most one less than the total, and waiting on a lock is a part of active (`rca/README.md`, the block's comment).
+    - **The result, not only the text:** the opt-in PostgreSQL test (`RcaIntegrationTests`) checks that the first RCA-PG-10 sample, taken while the observer ran alone, reads `connections_active` 0 and `connections_total` at least 1. It passed on the local PostgreSQL 18, and failed with ca6c9121's block, which read 1 active.
+  - **Tests:** the finest grain over the day-long save, and equal grains' newest (`sources.test.ts`); a stall listed once when a coarse point's interval holds the capture's (`detector.test.ts`); B's T5 sums from the raw 1-minute rows, its one coverage note, and the list without 12:30, 15:30, or 16:15 (`live-accuracy.test.ts`); the words, an earlier row, and a total past the limit (`rules.test.ts`). Each part, taken out alone, fails its own test.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4765,6 +4781,20 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 
   PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
 - **The capture's own connection:** .NET, 808 tests: 787 passed, 21 skipped (the opt-in tests against real engines), none failed. The new test fails with ca6c9121's RCA-PG-10. On the spike's local PostgreSQL 18 (`max_connections` 12, 3 slots for superusers, and 2 more reserved), the observer and 6 clients filled the 7 others: the next client was refused (53300). The block read a total of 7 and 1 active, the client running `pg_sleep`, where the block before it read 2. Under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, and `Agent.PromptPack` passed: 775 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI. markdownlint found no issue in 152 files.
+- **One Azure Monitor point per interval, and the capture review of 3732317d:** `npm run verify` passed: typecheck, lint, Vitest's 543 tests in 33 files, the license check (136 production packages), and the build. Seven mutations, each taking one part out, fail their own tests:
+  - keeping the newest capture per bin;
+  - stepping a run by its capture's smallest interval;
+  - setting an Azure Monitor point against the capture's stall by its time alone;
+  - keeping a part's coverage note;
+  - leaving out the words for the capture's own connection;
+  - reading an earlier row's states as they are;
+  - saying "36 of the 35".
+
+  .NET: 808 tests, 787 passed, 21 skipped, none failed. The opt-in PostgreSQL test passed on the local PostgreSQL 18 (primary and standby, 1 min 44 s), and failed with ca6c9121's RCA-PG-10. Under strict mode, with the Azure CLI guard, 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI:
+  - the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, and `Agent.PromptPack` (775);
+  - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
+
+  markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks). Step 1.8 retired the three that only it could:
 

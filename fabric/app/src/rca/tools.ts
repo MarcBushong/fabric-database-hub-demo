@@ -14,7 +14,7 @@ import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
+import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -86,6 +86,8 @@ export interface Telemetry {
     bins?: readonly Bin[];
     postgres?: PostgresCapture | null;
     cosmos?: CosmosCapture | null;
+    /** Each Azure Monitor point's own interval, by pointKey (sources.ts's pointIntervals); the capture's otherwise. */
+    intervals?: ReadonlyMap<string, number>;
 }
 
 export interface InvestigationDeps {
@@ -135,16 +137,18 @@ function targetsOf(args: Record<string, unknown>): RcaTarget[] {
 /** The Azure Monitor series the investigations read, as metric points, each with its interval: the replica's lag, T4's failed connections and CPU, T5's 429s, RU, requests, and its hourly provisioned throughput. */
 export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const out: MetricPoint[] = [];
+    // Each point's own interval where the history says it, its capture's smallest otherwise (the review of 803f2b1a).
+    const own = (target: RcaTarget, metric: string, at: Date, fallback: number | undefined) => telemetry.intervals?.get(pointKey(target, metric, at)) ?? fallback;
     const pg = telemetry.postgres ?? null;
     const pgInterval = pg?.intervalMinutes ? pg.intervalMinutes * MIN : undefined;
-    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value, intervalMs: pgInterval });
+    for (const p of postgresSeries(pg, "T4-replica", POSTGRES_METRICS.lag)) out.push({ target: "T4-replica", at: p.at, metric: LAG_METRIC, value: p.value, intervalMs: own("T4-replica", POSTGRES_METRICS.lag, p.at, pgInterval) });
     for (const target of ["T4", "T4-replica"] as const) {
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value, intervalMs: pgInterval });
-        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value, intervalMs: pgInterval });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.failed)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.failed, value: p.value, intervalMs: own(target, POSTGRES_METRICS.failed, p.at, pgInterval) });
+        for (const p of postgresSeries(pg, target, POSTGRES_METRICS.cpu)) out.push({ target, at: p.at, metric: POSTGRES_METRICS.cpu, value: p.value, intervalMs: own(target, POSTGRES_METRICS.cpu, p.at, pgInterval) });
     }
     const cosmos = telemetry.cosmos ?? null;
     const cosmosInterval = cosmos?.intervalMinutes ? cosmos.intervalMinutes * MIN : undefined;
-    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, intervalMs: cosmosInterval });
+    for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, intervalMs: own("T5", metric, p.at, cosmosInterval) });
     for (const p of cosmosSeries(cosmos, COSMOS_METRICS.provisioned)) out.push({ target: "T5", at: p.at, metric: COSMOS_METRICS.provisioned, value: p.value, intervalMs: HOUR });
     return out.sort((a, b) => a.at.getTime() - b.at.getTime());
 }
@@ -184,12 +188,16 @@ const episodeView = (e: Episode) => ({
     peak: `${Math.round(e.peak * 10) / 10}${e.unit === "%" ? " %" : ` ${e.unit}`}`,
 });
 
+/** The note for a target with no capture in a window, and whether a line is one: an incident says it once. */
+const noCaptureNote = (t: RcaTarget, from: Date, to: Date) => `${t}: no RCA capture recorded for ${hhmmss(from)}-${hhmmss(to)} UTC; only the telemetry (Telemetry Snapshots) is known`;
+const isNoCaptureNote = (t: RcaTarget, line: string) => line.startsWith(`${t}: no RCA capture recorded for `) && line.endsWith("; only the telemetry (Telemetry Snapshots) is known");
+
 function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarget[], deps: InvestigationDeps, g: Gathered, at?: Date): InvestigationResult {
     const coverage = g.evidence.coverage.filter((c) => targets.includes(c.target) && c.to >= from && c.from <= to);
     // No coverage row at all: the capture didn't run then (history saved before the environment had it, or T5, which has no observer).
     const unknown = targets
         .filter((t) => !coverage.some((c) => c.target === t))
-        .map((t) => `${t}: no RCA capture recorded for ${hhmmss(from)}-${hhmmss(to)} UTC; only the telemetry (Telemetry Snapshots) is known`);
+        .map((t) => noCaptureNote(t, from, to));
     const notCaptured = [
         ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence for ${hhmmss(c.from)}-${hhmmss(c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
         ...unknown,
@@ -287,7 +295,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const lead = new Date(from.getTime() - LEAD_MINUTES * MIN);
         const [loaded, telemetry] = await Promise.all([deps.load(lead, to, targets), deps.telemetry ? deps.telemetry(lead, to, targets) : Promise.resolve<Telemetry>({})]);
         const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)] };
-        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos }, from, to).filter((e) => targets.includes(e.target));
+        const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals }, from, to).filter((e) => targets.includes(e.target));
         return { evidence, episodes };
     }
 
@@ -509,7 +517,11 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             })),
         ].sort((a, b) => RANK[b.confidence] - RANK[a.confidence]);
         const [rootCause, ...others] = causes;
-        const notCaptured = [...new Set([...base.notCaptured, ...parts.flatMap((p) => p.notCaptured), ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
+        // Each part reads its own minutes, a little wider than the incident's, so its envelope said the incident's "no RCA
+        // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
+        // incident's own note says it once.
+        const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
+        const notCaptured = [...new Set([...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded from ${hhmmss(e.start)} to ${hhmmss(e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { Bin } from "@/data/model";
+import { POSTGRES_METRICS, type Bin, type PostgresCapture } from "@/data/model";
 import { describeEpisode, detect, episodesFromBins, findEpisodes, levelOf, RULES, type Sample } from "./detector";
 import { answerKeyOf, fixtureEvidence, namesAScenario } from "./testdata/contract";
-import { emptyEvidence } from "./types";
+import { emptyEvidence, pointKey } from "./types";
 
 const MIN = 60_000;
 const BASE = Date.parse("2026-11-20T13:30:00Z");
@@ -81,6 +81,22 @@ describe("the blind detector on the contract's fixtures", () => {
         ]);
         expect(episodes.every((e) => e.support === "sustained")).toBe(true);
         expect(episodes.find((e) => e.family === "replica_lag")?.peakAt).toEqual(at("17:14:10"));
+    });
+
+    // The review of 803f2b1a: Azure Monitor's one point for 17:10, a day-long save's 15 minutes, holds the capture's own
+    // stall from 17:12, so the stall is listed once, as the capture's. Read at the capture's 1 minute, the point ended at
+    // 17:10, before the stall, and the list had it twice.
+    it("lists a stall once when one Azure Monitor point's interval holds the capture's own episode of it", () => {
+        const point = (time: string, value: number) => ({ at: at(time), target: "T4-replica" as const, server: "", metric: POSTGRES_METRICS.lag, value });
+        const postgres: PostgresCapture = { capturedAt: at("18:00:00"), windowStart: at("16:00:00"), windowEnd: at("18:00:00"), intervalMinutes: 1, servers: {}, points: [point("16:55:00", 1), point("17:10:00", 175)] };
+        const intervals = new Map([["16:55:00", 15], ["17:10:00", 15]].map(([time, minutes]) => [pointKey("T4-replica", POSTGRES_METRICS.lag, at(time as string)), (minutes as number) * 60_000]));
+        const lag = (withIntervals: boolean) =>
+            findEpisodes({ evidence: fixtureEvidence("t4"), postgres, intervals: withIntervals ? intervals : undefined }, at("16:50:00"), at("17:30:00"))
+                .filter((e) => e.family === "replica_lag")
+                .map((e) => e.source)
+                .sort();
+        expect(lag(true)).toEqual(["the RCA capture"]);
+        expect(lag(false)).toEqual(["Azure Monitor", "the RCA capture"]);
     });
 
     it("finds no error burst in T1's 6 lock timeouts a minute: that's under the 10 a minute that makes one", () => {

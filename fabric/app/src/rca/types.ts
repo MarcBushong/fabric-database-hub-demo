@@ -167,6 +167,9 @@ export const metricIn = (m: MetricPoint, from: Date, to: Date) => {
     return (span > 0 ? start < to.getTime() : start <= to.getTime()) && start + Math.max(0, span - 1) >= from.getTime();
 };
 
+/** One Azure Monitor point's key, by its target, its metric as the history names it, and its interval's start. */
+export const pointKey = (target: string, metric: string, at: Date) => `${target}|${metric}|${at.getTime()}`;
+
 /** Everything the investigations read for one window: the RCA tables and the telemetry. Nothing else. */
 export interface Evidence {
     sessions: SessionSample[];

@@ -40,8 +40,9 @@ describe("the replica's lag (finding 1)", () => {
         ]) {
             expect(r.rootCause?.statement).toContain(fact);
         }
-        // Database Hub's chart, cited beside the samples: Azure Monitor's 5-minute interval that holds the stall.
-        expect(r.rootCause?.evidence.map((e) => e.text)).toContain("Read Replica Lag 178 s, its highest from 16:15 to 16:20 UTC");
+        // Database Hub's chart, cited beside the samples: Azure Monitor's 5-minute interval that holds the stall, from the
+        // session's own save; the day-long save's 15 minutes (178 s, the second stall's) is left out (the review of 803f2b1a).
+        expect(r.rootCause?.evidence.map((e) => e.text)).toContain("Read Replica Lag 148 s, its highest from 16:15 to 16:20 UTC");
         // The timeline is the capture's own samples, from before the stall to its recovery, not two 5-minute intervals.
         const lag = part(r, "explain_replica_lag")?.lag as Array<{ at: string; seconds: number; source: string }>;
         expect(lag[lag.length - 1]).toMatchObject({ at: "2026-11-21T16:19:27Z", seconds: 0.4 });
@@ -77,7 +78,7 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
         const r = await ask("explain_incident", { episodeKey: LIVE_KEYS.connections });
         expect(r.rootCause).toMatchObject({ ruleIds: ["CONN-IDLE"], confidence: "high" });
         const s = r.rootCause!.statement;
-        expect(s).toMatch(/^T4's client connections reached 35 of the 35 slots clients can use \(max_connections 50 less 15 reserved\) at 15:26:51 UTC, /);
+        expect(s).toMatch(/^T4's client connections reached 35 of the 35 slots clients can use \(max_connections 50 less 15 reserved; the capture's own connection among them\) at 15:26:51 UTC, /);
         // The live series ran in 4 waves, with drops to 8 to 10 connections between them, never one continuous surge.
         expect(s).toContain("in 4 waves at 80 % of the limit or more between 15:26:41 and 15:34:11 UTC, with peaks of 35, 33, 33, and 33 and the connections falling to 8, 8, and 8 between them; 32 of the 53 samples from 15:26:41 to 15:35:41 UTC were at that level.");
         expect(s).toContain("Every usable slot was in use in 4 samples between 15:26:51 and 15:27:21 UTC (35 of 35), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).");
@@ -157,19 +158,25 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
 });
 
 describe("T5's normalized RU and every listed incident (the live check of 4e2c65ed)", () => {
-    it("counts T5's requests and 429s from the intervals at 100 % that it names, as the raw rows hold them", async () => {
+    // The review of 803f2b1a: B's day-long save kept 15:30's 15-minute total (27630 requests) beside the session's own
+    // 1-minute points, and the sums counted both. One point per interval now, the finest: 9 intervals at 100 % from 15:31.
+    it("counts T5's requests and 429s from the intervals at 100 % that it names, as the raw rows hold them, each once", async () => {
         const r = await ask("explain_incident", { episodeKey: LIVE_KEYS.ru });
         const cosmos = (await liveSources().telemetry(live("15:30:00"), live("15:43:00"), ["T5"])).cosmos!;
         const at100 = new Set(cosmos.points.filter((p) => p.metric === COSMOS_METRICS.normalizedRu && p.value >= 100 && p.at < live("15:43:00")).map((p) => p.at.getTime()));
         const sum = (metric: string) => cosmos.points.filter((p) => p.metric === metric && at100.has(p.at.getTime())).reduce((n, p) => n + p.value, 0);
-        expect(at100.size).toBe(10);
-        expect(r.rootCause?.statement).toContain(`Azure Monitor counted ${sum(COSMOS_METRICS.requests)} requests in those intervals, ${sum(COSMOS_METRICS.throttled)} of them throttled (429, `);
+        expect(at100.size).toBe(9);
+        expect([sum(COSMOS_METRICS.requests), sum(COSMOS_METRICS.throttled)]).toEqual([24820, 13222]);
+        expect(r.rootCause?.statement).toContain("reached 100 % in at least one second of each of the 9 intervals from 15:31 to 15:42 UTC");
+        expect(r.rootCause?.statement).toContain("Azure Monitor counted 24820 requests in those intervals, 13222 of them throttled (429, 53.3 %)");
+        // One "no RCA capture" note for T5, the incident's, not its part's too (the coordinator's note on 803f2b1a).
+        expect(r.notCaptured.filter((line) => line.startsWith("T5: no RCA capture recorded"))).toEqual(["T5: no RCA capture recorded for 15:31:00-15:42:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
     });
 
-    // The re-review of bb70161f: the storm from 15:45 read T5's history from 15:15, so it missed 15:00's hourly provisioned
+    // The re-review of bb70161f: the storm from 15:46 read T5's history from 15:16, so it missed 15:00's hourly provisioned
     // throughput, and said nothing of why a new partition key wouldn't help.
-    it("reads the hour's provisioned throughput for the storm 45 minutes into its hour", async () => {
-        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261121T154500Z" });
+    it("reads the hour's provisioned throughput for the storm 46 minutes into its hour", async () => {
+        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261121T154600Z" });
         expect(r.rootCause?.statement).toContain("At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition");
         expect(r.notCaptured.join(" ")).not.toMatch(/provisioned throughput/);
     });
@@ -177,14 +184,17 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
     it("resolves every incident find_incidents lists over the day, also where its own minutes read it differently", async () => {
         const listed = await ask("find_incidents", { from: "2026-11-21T11:00:00Z", to: "2026-11-21T20:00:00Z" });
         const keys = (listed.episodes ?? []).map((e) => e.key);
-        expect(keys).toEqual(expect.arrayContaining(["T5-ru-20261121T121500Z", "T5-ru-20261121T123000Z", LIVE_KEYS.replicaFirst, LIVE_KEYS.connectionsCutOff]));
+        expect(keys).toEqual(expect.arrayContaining(["T5-ru-20261121T121500Z", LIVE_KEYS.ru, LIVE_KEYS.replicaFirst, LIVE_KEYS.connectionsCutOff]));
+        // One incident per storm and stall (the review of 803f2b1a): the day-long save's 15-minute points no longer split
+        // 12:15 from 12:30, or list Azure Monitor's 16:15 beside the capture's own stall from 16:17:12.
+        for (const twin of ["T5-ru-20261121T123000Z", "T5-ru-20261121T153000Z", "T4-replica-replica_lag-20261121T161500Z"]) expect(keys).not.toContain(twin);
         for (const key of keys) {
             const r = await tools().investigate("explain_incident", { episodeKey: key });
             expect(typeof r, key).not.toBe("string");
             const result = r as InvestigationResult;
             expect(result.rootCause !== null || result.notCaptured.length > 0, key).toBe(true);
         }
-        // Azure Monitor's 15-minute intervals join 12:15 and 12:30 in 12:30's own minutes.
+        // A key from an earlier list still reads as the incident that holds its time.
         const joined = (await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T123000Z" })) as InvestigationResult;
         expect(joined.details?.readAs).toEqual({ key: "T5-ru-20261121T123000Z", as: ["T5-ru-20261121T121500Z"] });
         expect(joined.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);

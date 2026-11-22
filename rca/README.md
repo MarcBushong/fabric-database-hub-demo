@@ -109,7 +109,7 @@ One JSON document per host and export, UTF-8, no byte order mark. The schema say
 
 RCA-AZ-01 isn't an episode's capture: the runner reads it every 30 minutes and at the session's end, and keeps every 15-second row it hasn't kept yet (by `end_time`), with no deadband, so a missing row means a missing sample. That's about 1,800 rows and 4.6 KB of gzip for a 90-minute session. It gives the blind detector T3's CPU at 15 seconds where Database Hub's bins are sparse ([ADR 0031](../docs/adr/0031-incident-rca.md#the-shared-blind-detector)).
 
-RCA-PG-10's `connections_total` counts every client backend, the observer's own too, since each takes one of `max_connections`' slots. Its counts by state leave the observer out, so they add up to one less than the total, or fewer (since 2026-11-21; before, the observer's own query was one of `connections_active` in every sample).
+RCA-PG-10's `connections_total` counts every client backend, the observer's own too, since each takes one of `max_connections`' slots. Its counts by state leave the observer out: `connections_active`, `connections_idle`, and `connections_idle_in_transaction` add up to at most one less than the total, and `connections_waiting_lock` is a part of `connections_active` (since 2026-11-21; before, the observer's own query was one of `connections_active` in every sample).
 
 ### Deadlocks
 

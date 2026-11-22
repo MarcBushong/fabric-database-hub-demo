@@ -4,8 +4,9 @@ import { ANSWER_KEY_TABLES } from "@/copilot/answer-key";
 import { QueryFailure } from "@/data/query-client";
 import type { QuerySpec } from "@/data/queries";
 import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
-import { createRcaSources, newestCapturePerBin } from "./sources";
+import { createRcaSources, finestPerInterval } from "./sources";
 import { createInvestigationTools } from "./tools";
+import { pointKey } from "./types";
 
 const at = (hhmm: string) => new Date(`2026-11-20T${hhmm}:00Z`);
 const lag = (bucket: string, value: number, capturedAt: string) => ({
@@ -37,9 +38,25 @@ describe("the investigations' sources", () => {
         expect(rcaDax("sessions", at("17:00"), at("17:20"), ["T1"])).toContain("'RCA Sessions'[Captured At UTC] >= DATE ( 2026, 11, 20 ) + TIME ( 17, 0, 0 )");
     });
 
-    it("keep the newest capture of each bin, as the model's measures do", () => {
-        const kept = newestCapturePerBin([lag("17:13", 100, "2026-11-20T17:20:00"), lag("17:13", 106, "2026-11-20T17:40:00"), lag("17:14", 166, "2026-11-20T17:20:00")]);
-        expect(kept.map((r) => r.Value)).toEqual([106, 166]);
+    it("keep the newest capture of each interval of one grain", () => {
+        const { kept } = finestPerInterval([lag("17:13", 100, "2026-11-20T17:20:00"), lag("17:14", 166, "2026-11-20T17:20:00"), lag("17:13", 106, "2026-11-20T17:40:00"), lag("17:14", 170, "2026-11-20T17:40:00")]);
+        expect(kept.map((r) => r.Value)).toEqual([106, 170]);
+    });
+
+    // The review of 803f2b1a: B's day-long save at 15 minutes, newer than the session's own at 1 minute, kept its total for
+    // 15:30 to 15:45 beside the 1-minute points it holds, and T5's requests counted both; each point read the capture's
+    // smallest interval.
+    it("keep the finest grain of each minute, a coarser point only where no finer one is, each with its own interval", () => {
+        const requests = (bucket: string, value: number, capturedAt: string) => ({ ...lag(bucket, value, capturedAt), TargetKey: "T5", Metric: "TotalRequests" });
+        const { kept, intervals } = finestPerInterval([
+            ...["15:30", "15:31", "15:32"].map((bucket, i) => requests(bucket, 100 + i, "2026-11-20T17:09:30")),
+            requests("15:15", 50, "2026-11-20T21:33:44"),
+            requests("15:30", 27630, "2026-11-20T21:33:44"),
+            requests("15:45", 900, "2026-11-20T21:33:44"),
+        ]);
+        expect(kept.map((r) => [String(r.Bucket).slice(11, 16), r.Value])).toEqual([["15:15", 50], ["15:30", 100], ["15:31", 101], ["15:32", 102], ["15:45", 900]]);
+        expect(intervals.get(pointKey("T5", "TotalRequests", at("15:31")))).toBe(60_000);
+        expect(intervals.get(pointKey("T5", "TotalRequests", at("15:45")))).toBe(15 * 60_000);
     });
 
     it("give T4's replica lag from overlapping captures, and ask for T1's bins only when T1 is in scope", async () => {

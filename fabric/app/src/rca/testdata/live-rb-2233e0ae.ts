@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { toCosmosCapture, toPostgresCapture } from "@/data/model";
 import { ROW_MAPPERS, toDate } from "../rows";
-import { newestCapturePerBin } from "../sources";
+import { finestPerInterval } from "../sources";
 import { PHASE_1_TABLES, RCA_SPEC, type RcaTableKey } from "../spec";
 import type { Telemetry } from "../tools";
 import { emptyEvidence, type Evidence, type RcaTarget } from "../types";
@@ -32,7 +32,8 @@ export const LIVE_KEYS = {
     connectionsCutOff: "T4-connections-20261121T185152Z",
     /** Session 2718f9a2's surge, 37 minutes later. */
     connectionsNext: "T4-connections-20261121T193006Z",
-    ru: "T5-ru-20261121T153000Z",
+    /** T5's first storm, from 15:31: the session's own 1-minute save (the day-long save's 15:30 is 15 minutes). */
+    ru: "T5-ru-20261121T153100Z",
 } as const;
 
 /** A's surges: the capture's episodes, which 4e2c65ed explained. */
@@ -90,10 +91,11 @@ export function liveSources(env: LiveEnv = "rb"): { load: (from: Date, to: Date,
                 const at = toDate(row.Bucket);
                 return !!at && at >= from && at <= to;
             };
-            const rows = newestCapturePerBin(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
+            const { kept: rows, intervals } = finestPerInterval(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
             return {
                 postgres: toPostgresCapture(rows.filter((r) => r.TargetKey === "T4" || r.TargetKey === "T4-replica")),
                 cosmos: toCosmosCapture(rows.filter((r) => r.TargetKey === "T5")),
+                intervals,
             };
         },
     };
