@@ -17,19 +17,22 @@ import {
     FAMILY_LABEL,
     COSMOS_METRICS,
     cosmosSeries,
+    grainMinutes,
+    perMinute,
     POSTGRES_METRICS,
     postgresPeak,
     postgresSeries,
     postgresSkus,
     replicaCatchUp,
+    spanMinutes,
     toBins,
     toFindings,
     toIncidents,
     throttledRuns,
     throttleEpisodes,
     toCaptureFindings,
-    toCosmosCapture,
-    toPostgresCapture,
+    latestCosmosCapture,
+    latestPostgresCapture,
     toPostgresFindings,
     toTargetNames,
     toTargets,
@@ -38,6 +41,7 @@ import {
     type PostgresCapture,
     type PostgresTarget,
 } from "@/data/model";
+import { ADDITIVE_METRICS } from "@/data/finest-per-interval";
 import { cosmosFindingsQuery, cosmosSeriesQuery, estateQuery, findingsQuery, incidentsQuery, postgresFindingsQuery, postgresSeriesQuery, seriesQuery, targetNamesQuery, waitsQuery, type ColumnSpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
 import { useQuery } from "@/data/use-query";
@@ -111,9 +115,9 @@ function useEstateData() {
     const bins = useMemo(() => toBins(series.data?.rows ?? []), [series.data]);
     const findings = useMemo(() => toFindings(findingsState.data?.rows ?? []), [findingsState.data]);
     const names = useMemo(() => toTargetNames(namesState.data?.rows ?? []), [namesState.data]);
-    const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
+    const capture = useMemo(() => latestPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
-    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmos = useMemo(() => latestCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
     const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
     return {
         estateSpec,
@@ -469,10 +473,15 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
 function lineRows(capture: PostgresCapture | null, series: Array<[PostgresTarget, string, string]>): Row[] {
     const out: Row[] = [];
     for (const [target, metric, label] of series) {
-        for (const p of postgresSeries(capture, target, metric)) out.push({ at: iso(p.at), series: label, value: p.value });
+        const points = postgresSeries(capture, target, metric);
+        for (const p of ADDITIVE_METRICS.has(metric) ? perMinute(points, capture) : points) out.push({ at: iso(p.at), series: label, value: p.value });
     }
     return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
+
+/** The page's words for a capture whose window holds saves at different intervals (F35). */
+const MERGED_NOTE = "with each interval from the finest save that has it";
+const PER_MINUTE_NOTE = "The saves here have different intervals, so totals show per minute.";
 
 function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onClick?: () => void }>; focus: EstateTarget }) {
     const { runtime } = useApp();
@@ -507,7 +516,13 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
         <div className="page">
             <PageHeader
                 title={title}
-                description={capture ? `The latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, captured ${formatAgo(capture.capturedAt)}.` : "T4, the PostgreSQL flexible server, and its read replica, from Azure Monitor metrics the demo captures at a session's end."}
+                description={
+                    capture
+                        ? (capture.saves ?? 1) > 1
+                            ? `Azure Monitor metrics from ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, the latest capture's window, captured ${formatAgo(capture.capturedAt)}, ${MERGED_NOTE}.`
+                            : `The latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, captured ${formatAgo(capture.capturedAt)}.`
+                        : "T4, the PostgreSQL flexible server, and its read replica, from Azure Monitor metrics the demo captures at a session's end."
+                }
                 crumbs={crumbs}
                 filter={false}
                 actions={
@@ -594,7 +609,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         id="estate.t4.connections"
                         className="span-6"
                         title="Connections"
-                        subtitle={`Active connections on T4 and its read replica, as Database Hub's Connections chart shows them, and T4's failed connections (dashed). ${POSTGRES_USABLE_CONNECTIONS} or more on T4 is a warning: ${USABLE_SLOTS_TEXT}. ${FAILED_CONNECTIONS_CAVEAT}`}
+                        subtitle={`Active connections on T4 and its read replica, as Database Hub's Connections chart shows them, and T4's failed connections (dashed). ${POSTGRES_USABLE_CONNECTIONS} or more on T4 is a warning: ${USABLE_SLOTS_TEXT}. ${FAILED_CONNECTIONS_CAVEAT}${(capture?.saves ?? 1) > 1 ? ` ${PER_MINUTE_NOTE}` : ""}`}
                         specs={[d.pgSeriesSpec]}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
@@ -649,7 +664,8 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
 function cosmosRows(capture: CosmosCapture | null, series: Array<[string, string]>): Row[] {
     const out: Row[] = [];
     for (const [metric, label] of series) {
-        for (const p of cosmosSeries(capture, metric)) out.push({ at: iso(p.at), series: label, value: p.value });
+        const points = cosmosSeries(capture, metric);
+        for (const p of ADDITIVE_METRICS.has(metric) ? perMinute(points, capture) : points) out.push({ at: iso(p.at), series: label, value: p.value });
     }
     return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
@@ -668,7 +684,9 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
     const availability = cosmosSeries(capture, COSMOS_METRICS.availability).map((p) => p.value);
     const lowest = availability.length > 0 ? Math.min(...availability) : null;
     const latency = cosmosSeries(capture, COSMOS_METRICS.latency);
-    const latencyAvg = latency.length > 0 ? latency.reduce((a, p) => a + p.value, 0) / latency.length : null;
+    // Weighted by each interval's length (F35: a window can hold saves at different intervals).
+    const latencyWeight = latency.reduce((a, p) => a + spanMinutes(p, capture?.intervalMinutes ?? 1), 0);
+    const latencyAvg = latency.length > 0 ? latency.reduce((a, p) => a + p.value * spanMinutes(p, capture?.intervalMinutes ?? 1), 0) / latencyWeight : null;
     const latencyPeak = postgresPeak(latency);
     const episodes = throttleEpisodes(d.cosmosFindingsState.data?.rows ?? []);
     const recovery = d.cosmosFindingRows.find((f) => f.id === "cosmosdb.T5.recovery") ?? null;
@@ -683,13 +701,26 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
     const latencyRows = latency.map((p) => ({ at: iso(p.at), "Gateway latency": p.value }));
     const loading = d.cosmosSeriesState.loading || d.cosmosFindingsState.loading;
     const none = !loading && !d.cosmosSeriesState.error && !capture && d.cosmosFindingRows.length === 0;
-    const interval = capture?.intervalMinutes ? `${formatNumber(capture.intervalMinutes, "int")}-minute intervals` : "intervals";
+    const merged = (capture?.saves ?? 1) > 1;
+    const lengths = merged ? [...new Set(ru.map((p) => grainMinutes(p, capture?.intervalMinutes ?? 1)))].sort((a, b) => a - b) : [];
+    const interval =
+        lengths.length > 1
+            ? `${formatNumber(lengths[0], "int")}- to ${formatNumber(lengths[lengths.length - 1], "int")}-minute intervals`
+            : capture?.intervalMinutes
+              ? `${formatNumber(capture.intervalMinutes, "int")}-minute intervals`
+              : "intervals";
 
     return (
         <div className="page">
             <PageHeader
                 title="T5 · Azure Cosmos DB"
-                description={capture ? `${capture.account || "The account"}: the latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, captured ${formatAgo(capture.capturedAt)}.` : "T5, an Azure Cosmos DB for NoSQL account, from Azure Monitor metrics the demo captures at a session's end."}
+                description={
+                    capture
+                        ? merged
+                            ? `${capture.account || "The account"}: Azure Monitor metrics from ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, the latest capture's window, captured ${formatAgo(capture.capturedAt)}, ${MERGED_NOTE}.`
+                            : `${capture.account || "The account"}: the latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, captured ${formatAgo(capture.capturedAt)}.`
+                        : "T5, an Azure Cosmos DB for NoSQL account, from Azure Monitor metrics the demo captures at a session's end."
+                }
                 crumbs={crumbs}
                 filter={false}
                 actions={
@@ -767,7 +798,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         id="estate.t5.requests"
                         className="span-6"
                         title="Requests and 429s"
-                        subtitle="Requests in each interval, and the ones Cosmos DB throttled (429)."
+                        subtitle={`Requests in each interval, and the ones Cosmos DB throttled (429).${merged ? ` ${PER_MINUTE_NOTE}` : ""}`}
                         specs={[d.cosmosSeriesSpec]}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}

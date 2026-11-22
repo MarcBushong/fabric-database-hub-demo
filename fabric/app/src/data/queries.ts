@@ -518,24 +518,44 @@ VAR LatestRun =
     )`;
 
 /**
- * T4's and its read replica's Azure Monitor metrics from the latest capture (analysis `postgresql`; targets T4 and
- * T4-replica), one row per metric and interval. The notebook can't read Azure Monitor, so stop-demo.ps1 -SaveHistory and
- * deploy.ps1 pass these metrics to it; there are none until one of them ran. Not filtered by target or period.
+ * The most Azure Monitor rows one of T4's or T5's reads returns (F35), the app's bound for any query: the saves whose
+ * windows overlap the latest capture's, each at most about 1,000 points (its document's 24 KB bound) and usually 200 to
+ * 900, so 20 to 30 of them. Over it, the query fails as overflow, and the deploy's app check says so (FABRIC.APP.QUERIES).
+ */
+export const MONITOR_SERIES_ROW_LIMIT = 20000;
+
+/** The latest run's window (F35), after POSTGRES_LATEST_RUN or COSMOS_LATEST_RUN: the earliest start and latest end of its rows. */
+const latestWindow = (analysis: string) => `VAR WindowStart =
+    CALCULATE ( MIN ( 'Telemetry Snapshots'[Window Start UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "${analysis}", TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ) )
+VAR WindowEnd =
+    CALCULATE ( MAX ( 'Telemetry Snapshots'[Window End UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "${analysis}", TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ) )`;
+
+/**
+ * T4's and its read replica's Azure Monitor metrics (analysis `postgresql`; targets T4 and T4-replica) in the latest
+ * capture's window, from every save whose window overlaps it (F35), one row per save, metric, and interval, the newest
+ * save first: toPostgresCapture keeps each interval's finest point, so a session's own 5-minute points stay beside a later
+ * day-long save's 15-minute ones, and nothing counts twice. The day before the window gives a save that only overlaps its
+ * start its step. The notebook can't read Azure Monitor, so stop-demo.ps1 -SaveHistory and deploy.ps1 pass these metrics
+ * to it; there are none until one of them ran. Not filtered by target or period.
  */
 export function postgresSeriesQuery(): QuerySpec {
     return {
         id: "postgres-series",
-        title: "T4 and its read replica: Azure Monitor metrics, latest capture",
-        rowLimit: 5000,
+        title: "T4 and its read replica: Azure Monitor metrics in the latest capture's window",
+        rowLimit: MONITOR_SERIES_ROW_LIMIT,
         dax: `EVALUATE
 ${POSTGRES_LATEST_RUN}
+${latestWindow("postgresql")}
 RETURN
     SELECTCOLUMNS (
         CALCULATETABLE (
             'Telemetry Snapshots',
             REMOVEFILTERS (),
             'Telemetry Snapshots'[Analysis Key] = "postgresql",
-            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+            'Telemetry Snapshots'[Window End UTC] > WindowStart,
+            'Telemetry Snapshots'[Window Start UTC] < WindowEnd,
+            'Telemetry Snapshots'[Bucket UTC] >= WindowStart - 1,
+            'Telemetry Snapshots'[Bucket UTC] <= WindowEnd
         ),
         "Bucket", 'Telemetry Snapshots'[Bucket UTC],
         "TargetKey", 'Telemetry Snapshots'[Target Key],
@@ -547,7 +567,7 @@ RETURN
         "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
         "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
     )
-ORDER BY [Bucket] ASC, [TargetKey] ASC, [Metric] ASC`,
+ORDER BY [CapturedAt] DESC, [Bucket] ASC, [TargetKey] ASC, [Metric] ASC`,
         columns: [
             { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
             { key: "TargetKey", label: "Target", kind: "text" },
@@ -616,18 +636,21 @@ VAR LatestRun =
 const COSMOS_EMPTY = "until a capture of T5's metrics: a session's end saves one (Run all), and so do stop-demo.ps1 -SaveHistory and deploy.ps1; none while T5 is off";
 
 /**
- * T5's Azure Monitor metrics from the latest capture (analysis `cosmosdb`), one row per metric and interval: normalized
- * RU, request units, requests and 429s, gateway latency, and the hourly provisioned throughput and availability. The
- * notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS). Not filtered by target or period.
+ * T5's Azure Monitor metrics (analysis `cosmosdb`, target T5) in the latest capture's window, from every save whose window
+ * overlaps it (F35), one row per save, metric, and interval, the newest save first: normalized RU, request units, requests and
+ * 429s, gateway latency, and the hourly provisioned throughput and availability. toCosmosCapture keeps each interval's
+ * finest point, as T4's does. The notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS).
+ * Not filtered by target or period.
  */
 export function cosmosSeriesQuery(): QuerySpec {
     return {
         id: "cosmos-series",
-        title: "T5 Azure Cosmos DB: Azure Monitor metrics, latest capture",
-        rowLimit: 5000,
+        title: "T5 Azure Cosmos DB: Azure Monitor metrics in the latest capture's window",
+        rowLimit: MONITOR_SERIES_ROW_LIMIT,
         mayBeEmpty: COSMOS_EMPTY,
         dax: `EVALUATE
 ${COSMOS_LATEST_RUN}
+${latestWindow("cosmosdb")}
 RETURN
     SELECTCOLUMNS (
         CALCULATETABLE (
@@ -635,9 +658,13 @@ RETURN
             REMOVEFILTERS (),
             'Telemetry Snapshots'[Analysis Key] = "cosmosdb",
             'Telemetry Snapshots'[Target Key] = "T5",
-            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+            'Telemetry Snapshots'[Window End UTC] > WindowStart,
+            'Telemetry Snapshots'[Window Start UTC] < WindowEnd,
+            'Telemetry Snapshots'[Bucket UTC] >= WindowStart - 1,
+            'Telemetry Snapshots'[Bucket UTC] <= WindowEnd
         ),
         "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
         "ResourceName", 'Telemetry Snapshots'[Resource Name],
         "Metric", 'Telemetry Snapshots'[Metric],
         "Value", 'Telemetry Snapshots'[Value],
@@ -646,9 +673,10 @@ RETURN
         "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
         "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
     )
-ORDER BY [Bucket] ASC, [Metric] ASC`,
+ORDER BY [CapturedAt] DESC, [Bucket] ASC, [Metric] ASC`,
         columns: [
             { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
+            { key: "TargetKey", label: "Target", kind: "text" },
             { key: "ResourceName", label: "Account", kind: "text" },
             { key: "Metric", label: "Azure Monitor metric", kind: "text" },
             { key: "Value", label: "Value", kind: "decimal" },

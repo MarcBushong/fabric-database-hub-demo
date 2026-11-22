@@ -443,7 +443,8 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
             target: "T4",
         };
     }
-    const interval = capture?.intervalMinutes;
+    const top = failed.find((p) => p.at === peak.at);
+    const interval = (capture?.saves ?? 1) > 1 ? (top?.grain ?? capture?.intervalMinutes) : capture?.intervalMinutes;
     return {
         id: "postgres-failed",
         status: "Warning",

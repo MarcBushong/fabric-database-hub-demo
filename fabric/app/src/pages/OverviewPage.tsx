@@ -13,7 +13,7 @@ import { LiveNow } from "@/components/LiveNow";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { FAMILY_LABEL, toBins, toCaptureFindings, toChecks, toCosmosCapture, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
+import { FAMILY_LABEL, latestCosmosCapture, latestPostgresCapture, toBins, toCaptureFindings, toChecks, toFindings, toIncidents, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
 import {
     cosmosFindingsQuery,
     cosmosSeriesQuery,
@@ -102,9 +102,9 @@ export default function OverviewPage() {
     const summary = useMemo(() => toReadinessSummary(summaryState.data?.rows ?? []), [summaryState.data]);
     const checks = useMemo(() => toChecks(checksState.data?.rows ?? []), [checksState.data]);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
-    const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
+    const capture = useMemo(() => latestPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
-    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmos = useMemo(() => latestCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
     const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
 
     const health = useMemo(() => {

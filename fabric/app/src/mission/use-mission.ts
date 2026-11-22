@@ -8,13 +8,13 @@ import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "@/app-context";
 import {
+    latestCosmosCapture,
+    latestPostgresCapture,
     toAgentBeats,
     toBins,
     toCaptureFindings,
-    toCosmosCapture,
     toFindings,
     toIncidents,
-    toPostgresCapture,
     toPostgresFindings,
     toSessions,
     toTargets,
@@ -232,7 +232,7 @@ export function useMission(others = 0): MissionData {
     const seriesPending = series.loading && !series.data;
     const waitsSettled = waits.results.every((r, i) => r !== undefined || waits.errors[i] !== undefined);
     // T4's capture scores its connection surge (F34), so it's read before the faults are, and they wait for its first load.
-    const postgres = useMemo(() => toPostgresCapture(pgSeriesRows), [pgSeriesRows]);
+    const postgres = useMemo(() => latestPostgresCapture(pgSeriesRows), [pgSeriesRows]);
     const pgPending = pgSeries.loading && !pgSeries.data;
     const scored = useMemo(() => {
         const map = new Map<string, FaultScore[]>();
@@ -241,7 +241,7 @@ export function useMission(others = 0): MissionData {
         return map;
     }, [shown, bins, beats, runs, incidents, postgres, waitsSettled, seriesPending, pgPending, scoreError]);
 
-    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesRows), [cosmosSeriesRows]);
+    const cosmos = useMemo(() => latestCosmosCapture(cosmosSeriesRows), [cosmosSeriesRows]);
     const allEpisodes = useMemo(
         () =>
             [...(view.targets.includes("T5") ? cosmosEpisodes(cosmos, cosmosFindingRows) : []), ...(view.targets.includes("T4") ? postgresEpisodes(postgres) : [])].sort(

@@ -349,6 +349,29 @@ describe("Estate", () => {
         expect(client.ran).toEqual(expect.arrayContaining(["cosmos-series", "cosmos-findings"]));
     });
 
+    it("says when T5's window holds saves at different intervals, and shows its totals per minute (F35)", async () => {
+        const save = (capturedAt: string, windowStart: string, windowEnd: string) => (bucket: string, metric: string, value: number) => ({
+            Bucket: `2026-11-21T${bucket}:00`,
+            TargetKey: "T5",
+            ResourceName: "cosmos01-test01",
+            Metric: metric,
+            Value: value,
+            WindowStart: windowStart,
+            WindowEnd: windowEnd,
+            CapturedAt: capturedAt,
+        });
+        const day = save("2026-11-21T21:33:44", "2026-11-20T21:26:00", "2026-11-21T21:26:00");
+        const session = save("2026-11-21T17:09:30", "2026-11-21T15:15:00", "2026-11-21T15:17:00");
+        const rows = [
+            ...["11:30", "11:45"].flatMap((b) => [day(b, "NormalizedRUConsumption", 11), day(b, "TotalRequests", 300), day(b, "ThrottledRequests", 0)]),
+            ...["15:15", "15:16"].flatMap((b) => [session(b, "NormalizedRUConsumption", 4), session(b, "TotalRequests", 60), session(b, "ThrottledRequests", 0)]),
+        ];
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        await waitFor(() => expect(screen.getByText(/in 1- to 15-minute intervals, the latest capture's window, captured .+, with each interval from the finest save that has it\.$/)).toBeInTheDocument());
+        const chart = screen.getByRole("region", { name: "Requests and 429s" });
+        expect(within(chart).getByText(/The saves here have different intervals, so totals show per minute\.$/)).toBeInTheDocument();
+    });
+
     it("never writes T5's throttled share as 0.0 % when a request was throttled", async () => {
         // 3 of the capture's 7,710 requests answered 429: 0.04 %, which one decimal alone writes as 0.0 %.
         const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "ThrottledRequests" ? { ...r, Value: r.Bucket === "2026-11-13T17:02:00" ? 3 : 0 } : r));
