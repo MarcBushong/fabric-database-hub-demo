@@ -120,6 +120,34 @@ describe("Mission Control", () => {
         SLOW,
     );
 
+    // ADR 0031, decision 7: the chat gets a session's minutes, never a lone incident request's, which are its fault's own.
+    // The line points to the Root cause page whenever the navigation lists it (AppShell).
+    const LONE: Array<{ state: string; rca: boolean | null; rcaError: string | null; points: boolean }> = [
+        { state: "and points to the Root cause page", rca: true, rcaError: null, points: true },
+        { state: "and points to the Root cause page when the RCA tables' check failed, which that page says", rca: null, rcaError: "The model didn't answer.", points: true },
+        { state: "with no Root cause page to point to without the RCA tables", rca: false, rcaError: null, points: false },
+    ];
+    for (const { state, rca, rcaError, points } of LONE) {
+        it(
+            `offers no Copilot draft for a lone incident request, whose minutes are its fault's own, ${state} (the re-review of feb64ad3)`,
+            async () => {
+                const { copilot } = renderWithApp(<MissionControlPage />, { client: sampleClient(), rca, rcaError, view: { session: "s5" } });
+                const write = await screen.findByRole("button", { name: "Write the postmortem" });
+                await waitFor(() => expect(write).toBeEnabled());
+                fireEvent.click(write);
+                const dialog = await screen.findByRole("dialog", { name: /^Postmortem: ContosoCare incident request: .+ on T1$/ });
+                expect(within(dialog).queryByRole("button", { name: "Draft with Copilot", hidden: true })).toBeNull();
+                const lead = dialog.querySelector(".pm-lead")?.textContent ?? "";
+                expect(lead).toContain("There's no Draft with Copilot for a lone incident request, only for a session: a request's minutes are its fault's own, so they'd tell the chat where to look.");
+                expect(lead.includes("The Root cause page finds the incidents from the signals alone and explains each one.")).toBe(points);
+                // The app's own Markdown stays, with no sign-in.
+                expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
+                expect(copilot.ask).not.toHaveBeenCalled();
+            },
+            SLOW,
+        );
+    }
+
     it(
         "names the history that didn't load, and measures nothing rather than reading every fault as not visible",
         async () => {

@@ -321,6 +321,14 @@ const EPISODE_COLUMNS: ColumnSpec[] = [
     { key: "impact", label: "Measured impact", kind: "text" },
 ];
 
+/**
+ * Whether a plan's postmortem offers a Copilot draft: a session's only. A lone incident request's minutes are its fault's
+ * own (toPlans), so a draft would aim the chat at what was injected (ADR 0031, decision 7; the re-review of feb64ad3).
+ */
+export function draftsWithCopilot(plan: Plan): boolean {
+    return plan.kind === "session";
+}
+
 /** What Copilot gets: the template, the measured rows, and the measured queries, through the app's existing ask contract. */
 export function postmortemAsk(input: PostmortemInput): AskContext {
     const rows = input.episodes.map((e) => ({ target: e.target, service: serviceName(e.target), signal: e.signal, visible: e.visibleAt, recovered: e.recoveredAt ?? e.endAt, peak: e.peak, impact: e.impact.sentence }));
