@@ -5,8 +5,9 @@
 # stop-demo.ps1 waits for it, says what it did, and then does what it doesn't cover (Stop-DemoEnvironment). When the control
 # can't take it, the stop goes on as before, with a Warning that names the risk. A Contributor may start the job; no role is
 # assigned for it. Right before the job (review of f5972d2d), the session's auto-stop and its backup go, and the control's
-# jobs are read again, so no second stop of the session starts beside this one, and the T2 host's password Run Command is
-# waited for, which the T2 host may still be deleting.
+# jobs are read again, so the auto-stop can't start a second stop beside this one, and a Stop now that starts anyway waits
+# for it and stops only what's left (review of 0d0776e4); and the T2 host's password Run Command is waited for, which the
+# T2 host may still be deleting.
 # - Job - Create: https://learn.microsoft.com/rest/api/automation/job/create
 # - Job - Get: https://learn.microsoft.com/rest/api/automation/job/get
 # - Job - Get Output: https://learn.microsoft.com/rest/api/automation/job/get-output
@@ -148,6 +149,8 @@ function Wait-DemoStopHandoffHostPassword {
     2026-11-13. The host takes one Run Command at a time, so the stop's export of T2's evidence could run beside that
     delete. This waits, up to -WaitSeconds, polling every -PollSeconds, until the host lists none of them less than an hour
     old: by the time at the end of a fresh name, or else by its instance view's start; one whose age isn't known counts.
+    A fresh name that Get-DemoVmRunCommandLeftover gives only in RecentDeletes, once the release's follow-ups are merged,
+    counts the same way (review of 0d0776e4).
     Returns Waited (seconds), Left (the names still listed), and Result: $null, or a Warning (STOP.CONTROL.HOSTPASSWORD)
     when the wait reached its bound or the host's Run Commands couldn't be read. Read-only. Internal.
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/list-by-virtual-machine
@@ -188,6 +191,18 @@ function Wait-DemoStopHandoffHostPassword {
                 $at = [datetime]$item.StartUtc
             }
             if ($null -eq $at -or $at.AddHours(1) -gt $now) {
+                $recent.Add($name)
+            }
+        }
+        # After the release's follow-ups, -IncludeDeleting gives a time-stamped name that Azure began deleting under 15 minutes
+        # ago by name alone, in RecentDeletes, and the rotation's is fresh (DbHubDemo-HostPassword-<time>, -FreshAction): it
+        # counts too, by the time in its name (review of 0d0776e4). Assigned first: Get-DemoMemberValue returns an array as one
+        # object, which @() wouldn't unroll.
+        $deletes = Get-DemoMemberValue -InputObject $list -Name 'RecentDeletes'
+        foreach ($deleting in @($deletes)) {
+            $name = [string]$deleting
+            $stamp = [DateTime]::MinValue
+            if ($name -match '^DbHubDemo-HostPassword-(\d{14})$' -and -not $recent.Contains($name) -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$stamp) -and $stamp.AddHours(1) -gt $now) {
                 $recent.Add($name)
             }
         }

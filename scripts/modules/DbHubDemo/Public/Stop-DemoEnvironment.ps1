@@ -51,10 +51,12 @@ function Stop-DemoEnvironment {
       that job did: the activity profiles aren't set to off, T2's guest isn't shut down first (the VMs' deallocation ends
       both, as with Stop now), and the scripts' own export doesn't run, so -SaveHistory saves the history without the
       session's Incident RCA evidence, which the control's stop keeps in the control vault for the session's own save (the
-      next Run all, or Run all's at the session's planned end; review of f5972d2d). The Database Agent beat's hold, and with
+      next Run all that starts a session within 7 days, or Run all's at the session's planned end; after 7 days, nothing
+      saves it; reviews of f5972d2d and 0d0776e4). The Database Agent beat's hold, and with
       -SaveHistory T4's and the replica's metrics, are taken before it; right before its job, the T2 host's password Run
-      Command is waited for (STOP.CONTROL.HOSTPASSWORD), and the session's auto-stop goes (STOP.CONTROL.AUTOSTOP), so no
-      second stop of the session starts beside it. When the control can't take it, the stop goes on as
+      Command is waited for (STOP.CONTROL.HOSTPASSWORD), and the session's auto-stop goes (STOP.CONTROL.AUTOSTOP), so the
+      auto-stop can't start a second stop beside it, and a Stop now that starts anyway waits for it and stops only what's
+      left. When the control can't take it, the stop goes on as
       before, with a Warning that names the risk; while a stop job of the control's still runs, nothing is stopped under it.
       Not with -ParkT2, -RemoveBastionOnly, or -UpdateEnd.
     - Phase 26b (ADR 0023), both opt-in and skipped with -ParkT2: -SaveHistory (or fabric.saveHistoryOnStop) runs
@@ -466,7 +468,7 @@ function Stop-DemoEnvironment {
                 if ($handedOff -and $null -ne $saved.Result -and ([string]$saved.Result.status -in 'Pass', 'Warning' -or [bool]$saved.StillRunning)) {
                     # The control's stop exported the session's evidence into the control vault, which this save can't read
                     # (review of f5972d2d): the session's own save takes it.
-                    $saved.Result.message = '{0} It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on. To save it at once, stop a session with Stop now in {1} instead.' -f ([string]$saved.Result.message).TrimEnd(), (Get-DemoActivityControlName -Config $Config).Notebook
+                    $saved.Result.message = '{0} It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all that starts a session within 7 days saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on; after 7 days, nothing saves it. To save it at once, stop a session with Stop now in {1} instead.' -f ([string]$saved.Result.message).TrimEnd(), (Get-DemoActivityControlName -Config $Config).Notebook
                 }
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning

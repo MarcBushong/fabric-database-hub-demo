@@ -8729,7 +8729,11 @@ function Set-DbHubStopBegun {
     metrics. Only the copy, and only while it's that session's and it hasn't stopped: the vault's status is the notebook's,
     and the stop's own status replaces both at its end (Write-DbHubStopStatus). Its updatedUtc changes too, so a re-check
     that read the copy before doesn't write over it. The mark names its job (stopBegunJobId, review of f5972d2d), so a
-    second stop of the session tells whose it is (Resolve-DbHubStopClaim). Returns whether it was marked. Never throws.
+    second stop of the session tells whose it is (Resolve-DbHubStopClaim). Another job's mark that's still within its life
+    (Test-DbHubRcaRecheckOpen's bound) stays as it is, unless -EndedJobId names that job, whose stop ended without the
+    stopped status (review of 0d0776e4: a second stop wrote its mark over the first's, which had landed after the second
+    stop's read of the copy; with the second's write slow, the first had read its own mark back by then, so both did the
+    whole work). Returns whether it was marked. Never throws.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Marks only the session''s own status copy; Stop-DbHubDemo, its caller, asks ShouldProcess.')]
     param(
@@ -8737,7 +8741,10 @@ function Set-DbHubStopBegun {
         [object] $Context,
 
         [AllowEmptyString()]
-        [string] $SessionId = ''
+        [string] $SessionId = '',
+
+        [AllowEmptyString()]
+        [string] $EndedJobId = ''
     )
 
     if ($SessionId -notmatch '^[0-9a-f]{32}$') {
@@ -8747,6 +8754,17 @@ function Set-DbHubStopBegun {
         $copy = Read-DbHubSessionStatusCopy -Context $Context
         if ($null -eq $copy -or [string]$copy['sessionId'] -ne $SessionId -or [string]$copy['phase'] -eq 'stopped') {
             return $false
+        }
+        $other = [string]$copy['stopBegunJobId']
+        $mine = $other -and $other -eq [string]$Context.JobId
+        $ended = $EndedJobId -and $other -eq $EndedJobId
+        if ($copy.Contains('stopBegunUtc') -and -not $mine -and -not $ended) {
+            $begun = ConvertTo-DbHubUtc -Value $copy['stopBegunUtc']
+            $lasts = [System.Math]::Max($script:DbHubStopBegunMinutes, (Get-DbHubRcaSetting -Settings $Context.Settings).StopMinutes + 9)
+            if ($null -ne $begun -and (Get-DbHubUtcNow) -lt $begun.AddMinutes($lasts)) {
+                Write-DbHubLog -Context $Context -Message ('Session {0}''s stop is marked begun by job {1} already, so this stop didn''t mark it.' -f $SessionId.Substring(0, 8), $(if ($other) { $other } else { 'an earlier one' }))
+                return $false
+            }
         }
         $now = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
         $copy['stopBegunUtc'] = $now
@@ -8850,8 +8868,10 @@ function Resolve-DbHubStopClaim {
     A job that the list doesn't show, or a list that can't be read, is told by the mark's age, as the re-checks tell it.
     When that other job ended without the stopped status, the copy is another session's, or there's none, this stop does
     the whole work: it marks its stop begun, waits 5 seconds, and reads the mark back, so of two stops that mark at once,
-    the one whose mark stands goes on and the other waits for it. Returns $null when this stop does the session's part,
-    or what it leaves it to: State, SessionId, JobId, and By (who stopped it, when the copy says). Never throws.
+    the one whose mark stands goes on and the other waits for it. A mark that came first in the meantime isn't written over
+    (Set-DbHubStopBegun, review of 0d0776e4): this stop reads the copy again and waits for that stop. Returns $null when
+    this stop does the session's part, or what it leaves it to: State, SessionId, JobId, and By (who stopped it, when the
+    copy says). Never throws.
     https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
     #>
     param(
@@ -8871,6 +8891,7 @@ function Resolve-DbHubStopClaim {
     $lasts = [System.Math]::Max($script:DbHubStopBegunMinutes, (Get-DbHubRcaSetting -Settings $Context.Settings).StopMinutes + 9)
     $poll = [System.Math]::Max(5, $PollSeconds)
     $marks = 0
+    $tries = 0
     $deadline = $null
     try {
         while ($true) {
@@ -8922,11 +8943,14 @@ function Resolve-DbHubStopClaim {
                 # No other stop marked after this one.
                 return $null
             }
-            if ($marks -ge 3) {
+            if ($tries -ge 3) {
                 return $null
             }
-            if (-not (Set-DbHubStopBegun -Context $Context -SessionId $SessionId)) {
-                return $null
+            $tries++
+            if (-not (Set-DbHubStopBegun -Context $Context -SessionId $SessionId -EndedJobId $other)) {
+                # Not marked: another stop's mark came first, which the next read finds and waits for (review of 0d0776e4),
+                # or the copy changed or couldn't be written, which after 3 tries leaves the whole work to this stop.
+                continue
             }
             $marks++
             Start-Sleep -Seconds 5

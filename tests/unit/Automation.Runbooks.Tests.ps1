@@ -1753,6 +1753,61 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
             $part.Metrics | Should -BeFalse
             $part.Status | Should -BeFalse
         }
+
+        It 'never writes its mark over another job''s that came between its reads, and waits for that stop (review of 0d0776e4)' {
+            $running = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'running'; updatedUtc = '2026-10-27T14:59:00Z'; runEndUtc = '2026-10-27T15:30:00Z' }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            # Another stop's mark lands after this stop read the copy unmarked, right as it reads the copy to mark it. Written
+            # over, both stops read their own marks back once this one's write is slow, and both did the whole work.
+            $script:landed = $false
+            $script:variableReadHook = {
+                if (-not $script:landed -and @(Get-PSCallStack | Where-Object { $_.Command -eq 'Set-DbHubStopBegun' }).Count -gt 0) {
+                    $script:landed = $true
+                    $copy = $script:automationVariables['DbHubSessionStatus'] | ConvertFrom-Json
+                    $copy | Add-Member -NotePropertyName 'stopBegunUtc' -NotePropertyValue $script:clock.ToString('yyyy-MM-ddTHH:mm:ssZ') -Force
+                    $copy | Add-Member -NotePropertyName 'stopBegunJobId' -NotePropertyValue 'cccccccc-0000-0000-0000-00000000000c' -Force
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $copy -Depth 8 -Compress
+                    $script:jobs = @(@{ properties = @{ jobId = 'cccccccc-0000-0000-0000-00000000000c'; status = 'Running'; runbook = @{ name = 'DbHub-Control' }; creationTime = '2026-10-27T15:00:00Z' } })
+                }
+            }
+            # That stop ends two polls later, with its status.
+            $script:sleepHook = {
+                if ($script:sleeps -eq 2) {
+                    $done = [ordered]@{ schemaVersion = 1; sessionId = $script:sessionId; phase = 'stopped'; stoppedUtc = '2026-10-27T15:01:00Z'; stoppedBy = 'Stop now'; jobId = 'cccccccc-0000-0000-0000-00000000000c'; metrics = [ordered]@{ status = 'Pass' } }
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $done -Depth 8 -Compress
+                }
+            }
+            $context = New-TestContext
+            $result = Invoke-DbHubStop -Scope All -Context $context
+            $script:landed | Should -BeTrue
+            @($context.Log | Where-Object { $_ -match 'Session 01234567''s stop is marked begun by job cccccccc-0000-0000-0000-00000000000c already, so this stop didn''t mark it' }) | Should -Not -BeNullOrEmpty
+            @($result.done) | Should -Contain 'session 01234567''s stop ran already (job cccccccc, Stop now): its evidence, metrics, and status are that stop''s'
+            $part = Get-SessionPart
+            $part.Exports | Should -Be 0
+            $part.Metrics | Should -BeFalse
+            $part.Status | Should -BeFalse
+            # Its mark's life over, it's written over as before: a stop whose job the list no longer shows does the whole work.
+            Reset-TestAzure
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $script:landed = $false
+            $script:clock = $script:clock.AddMinutes(16)
+            $script:variableReadHook = {
+                if (-not $script:landed -and @(Get-PSCallStack | Where-Object { $_.Command -eq 'Set-DbHubStopBegun' }).Count -gt 0) {
+                    $script:landed = $true
+                    $copy = $script:automationVariables['DbHubSessionStatus'] | ConvertFrom-Json
+                    $copy | Add-Member -NotePropertyName 'stopBegunUtc' -NotePropertyValue $script:clock.AddMinutes(-16).ToString('yyyy-MM-ddTHH:mm:ssZ') -Force
+                    $copy | Add-Member -NotePropertyName 'stopBegunJobId' -NotePropertyValue 'cccccccc-0000-0000-0000-00000000000c' -Force
+                    $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $copy -Depth 8 -Compress
+                }
+            }
+            $script:sleepHook = $null
+            $whole = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc $script:clock)
+            $script:landed | Should -BeTrue
+            $whole.status | Should -Be 'Stopped'
+            (Get-SessionPart).Status | Should -BeTrue
+        }
     }
 
     It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {

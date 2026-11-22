@@ -2215,7 +2215,7 @@ Describe 'Stop-DemoEnvironment' {
             $script:order | Should -Not -Contain 'ScriptsExport'
             Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -Times 1 -Exactly -ParameterFilter { $RcaEvidence -eq '' }
             # It says so (review of f5972d2d): the session's evidence is the control vault's, for the session's own save.
-            (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Match ' It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on\. To save it at once, stop a session with Stop now in NB_DatabaseHub_Control instead\.$'
+            (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Match ' It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all that starts a session within 7 days saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on; after 7 days, nothing saves it\. To save it at once, stop a session with Stop now in NB_DatabaseHub_Control instead\.$'
             $script:order.Clear()
             $script:state = New-TestState @{ RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01') }
             $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
@@ -2421,6 +2421,23 @@ Describe 'Stop-DemoEnvironment' {
             $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
             $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
             @($script:order | Where-Object { $_ -eq 'HostList' }).Count | Should -Be 1
+            @($results | Where-Object { $_.checkId -eq 'STOP.CONTROL.HOSTPASSWORD' }) | Should -BeNullOrEmpty
+        }
+
+        It 'waits for the host password''s fresh-named Run Command that the list gives only by name, in RecentDeletes (review of 0d0776e4)' {
+            # After the release's follow-ups, the rotation's Run Command is DbHubDemo-HostPassword-<time>, and the list gives a
+            # time-stamped name that Azure began deleting under 15 minutes ago in RecentDeletes, not in Items: two reads here.
+            # Another fresh name there, a health read's, isn't the rotation's.
+            $script:hostReads = 0
+            $now = [DateTime]::UtcNow
+            $script:deletes = @(('DbHubDemo-HostPassword-{0}' -f $now.AddMinutes(-3).ToString('yyyyMMddHHmmss')), ('DbHubDemo-HealthRead-{0}' -f $now.AddMinutes(-1).ToString('yyyyMMddHHmmss')))
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRunCommandLeftover -MockWith {
+                $script:order.Add('HostList')
+                $script:hostReads++
+                [pscustomobject]@{ Ok = $true; Error = ''; Items = @(); RecentDeletes = @(if ($script:hostReads -le 2) { $script:deletes } else { $script:deletes[1] }) }
+            } -ParameterFilter { $VmName -eq 'archost01' -and $IncludeDeleting }
+            $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+            $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Release', 'HostList', 'HostList', 'HostList', 'AutoStopClear', 'Handoff', 'Nightly', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'AutoTuning')
             @($results | Where-Object { $_.checkId -eq 'STOP.CONTROL.HOSTPASSWORD' }) | Should -BeNullOrEmpty
         }
 
