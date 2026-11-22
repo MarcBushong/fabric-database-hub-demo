@@ -106,6 +106,10 @@ function replicaRows(): ReplicaSample[] {
 /** T4's sentinel connection counts (RCA-PG-10): every 30 s, every 10 s while at 80 % of the 35 slots clients can use. */
 function connectionRows(): ResourcePoint[] {
     const rows: ResourcePoint[] = [];
+    // MODELED, NOT LIVE: the totals, their times, and the limit follow the live answers, but the split by state (active,
+    // idle, idle in a transaction, waiting on a lock) is an assumption, since the harness kept no counts by state. Every
+    // assertion about what held the slots (CONN-IDLE and its confidence in live-accuracy.test.ts) rests on this model
+    // until Final tests' rows from B's model replace it (the review of 4e2c65ed).
     const sample = (at: Date, active: number, idle: number, idleInTransaction = 0, waiting = 0) => {
         const counts: Record<string, number> = {
             connections_total: active + idle + idleInTransaction,

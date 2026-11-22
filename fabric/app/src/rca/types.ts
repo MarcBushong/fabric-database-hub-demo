@@ -156,8 +156,16 @@ export interface MetricPoint {
     intervalMs?: number;
 }
 
-/** Whether a metric point falls in a window: an Azure Monitor point stands for its whole interval, so one that started before the window but runs into it does. */
-export const metricIn = (m: MetricPoint, from: Date, to: Date) => m.at.getTime() <= to.getTime() && m.at.getTime() + Math.max(0, (m.intervalMs ?? 0) - 1) >= from.getTime();
+/**
+ * Whether a metric point falls in a window. An Azure Monitor point stands for its whole interval, from `at` up to its end:
+ * one that started before the window but runs into it does, and one that starts at the window's end doesn't (the review of
+ * 4e2c65ed: two adjacent windows both counted it). An instant at the window's end does.
+ */
+export const metricIn = (m: MetricPoint, from: Date, to: Date) => {
+    const start = m.at.getTime();
+    const span = m.intervalMs ?? 0;
+    return (span > 0 ? start < to.getTime() : start <= to.getTime()) && start + Math.max(0, span - 1) >= from.getTime();
+};
 
 /** Everything the investigations read for one window: the RCA tables and the telemetry. Nothing else. */
 export interface Evidence {

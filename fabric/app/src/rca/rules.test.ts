@@ -145,6 +145,29 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         expect(a.rise?.points.map((p) => p.source)).toEqual(["RCA Replica", "Telemetry Snapshots", "RCA Replica"]);
     });
 
+    // The review of 4e2c65ed: a stall that began after an interval's last sentinel sample, or ended before the next
+    // interval's first, made that interval stand for its minutes, so the rise read "from 16:15:00", counting from a last
+    // replay at 16:14:51, and the recovery's own samples were dropped.
+    it("keeps the capture's samples where the one beside an interval saw the stall: begun after its last sample, or over before its first", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: number, s: number) => samples.push({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: Math.round(s * 10) / 10, receivedNotReplayedBytes: 0 });
+        const since = at("16:19:50").getTime();
+        for (let t = at("16:10:12").getTime(); t <= at("16:19:42").getTime(); t += 30_000) add(t, 0.4);
+        add(at("16:20:12").getTime(), 22);
+        for (let t = at("16:20:40").getTime(); t <= at("16:25:00").getTime(); t += 5_000) add(t, (t - since) / 1000);
+        add(at("16:25:05").getTime(), 0.9);
+        for (let t = at("16:25:10").getTime(); t <= at("16:25:15").getTime(); t += 5_000) add(t, 0.4);
+        for (let t = at("16:25:42").getTime(); t <= at("16:34:42").getTime(); t += 30_000) add(t, 0.4);
+        // Azure Monitor's highest in each 5 minutes: 10 s as 16:20 began, 310 s as 16:25 began, 312 s at the recovery.
+        const metrics: MetricPoint[] = ([["16:10:00", 1], ["16:15:00", 10], ["16:20:00", 310], ["16:25:00", 312], ["16:30:00", 1]] as const).map(([t, v]) => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 300_000 }));
+        const a = analyzeReplicaLag({ at: at("16:22:00"), metrics, samples, events: [] });
+        expect(a.rise?.source).toBe("RCA Replica");
+        expect(a.rise?.points.every((p) => p.source === "RCA Replica")).toBe(true);
+        expect(a.rise?.lastReplay).toEqual(at("16:19:50"));
+        expect(a.rootCause?.statement).toMatch(/^The replica's time since its last replay rose from 16:20:12 to 310 s at 16:25:00 UTC \(.*\), counting from its last replay at 16:19:50 UTC, and was back to 0\.9 s at 16:25:05 UTC; it grew 1 s per second/);
+        expect(a.reads).toEqual({ from: at("16:18:50"), to: at("16:26:05") });
+    });
+
     it("says 'nothing captured says why' when only the metric is left, at low confidence, and never guesses", () => {
         const a = analyzeReplicaLag({ at: at("17:14:00"), metrics: LIVE_LAG, samples: [], events: [] });
         expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
@@ -210,7 +233,10 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(a.rootCause).toMatchObject({ ruleIds: [ruleId], confidence: "high" });
         expect(a.rootCause?.statement).toContain("T4's client connections reached 35 of the 35 slots clients can use (max_connections 50 less 15 reserved) at 15:30:00 UTC");
         expect(a.rootCause?.statement).toContain(held);
-        expect(a.rootCause?.statement).toContain("No client was refused: Azure Monitor counted no failed connection in its interval from 15:30 to 15:35 UTC");
+        // Only what's measured (the review of 4e2c65ed): Learn documents connections_failed as the number of failed
+        // connections, not as the refusals at the limit.
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted no failed connection in its interval from 15:30 to 15:35 UTC.");
+        expect(a.rootCause?.statement).not.toMatch(/No client was refused|no client asked/);
         expect(a.recommendations.map((r) => r.id)).toEqual(ids);
     });
 
@@ -232,27 +258,46 @@ describe("T4's connections against the limit, by what held them", () => {
 
 // Found with the live findings (2026-11-21): an RU episode was explained only through its 429s, so one without any had no cause.
 describe("T5's normalized RU consumption at 100 %", () => {
-    const point = (metric: string, time: string, value: number): MetricPoint => ({ target: "T5", at: at(time), metric, value, intervalMs: 60_000 });
+    const point = (metric: string, time: string, value: number, intervalMs = 60_000): MetricPoint => ({ target: "T5", at: at(time), metric, value, intervalMs });
     const minutes = (throttled: number[]) => [
         ...[100, 100, 60].map((v, i) => point(COSMOS_METRICS.normalizedRu, `17:0${i}:00`, v)),
         ...[1200, 1300, 900].map((v, i) => point(COSMOS_METRICS.requests, `17:0${i}:00`, v)),
         ...throttled.map((v, i) => point(COSMOS_METRICS.throttled, `17:0${i}:00`, v)),
     ];
+    const provisioned = (ru: number) => point(COSMOS_METRICS.provisioned, "17:00:00", ru, 3_600_000);
 
-    it("says the container used its throughput to the limit without refusing a request, when none was throttled", () => {
-        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:02:00"), metrics: minutes([0, 0, 0]) });
+    // The review of 4e2c65ed: the counts took in 17:02's interval, which the sentence doesn't name; 100 % read as the
+    // container's whole throughput; and a new partition key and autoscale were recommended with nothing throttled.
+    it("says what 100 % means, counts only the intervals it names, and recommends no change when none was throttled", () => {
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: minutes([0, 0, 0]) });
         expect(a.rootCause).toMatchObject({ ruleIds: ["RU-AT-LIMIT"], confidence: "medium" });
         expect(a.rootCause?.statement).toBe(
-            "T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each 1-minute interval) reached 100 % in 2 intervals from 17:00 to 17:02 UTC. Azure Monitor counted 3400 requests in those minutes, none of them throttled: the container used its throughput to the limit without refusing a request.",
+            "T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each 1-minute interval) reached 100 % in at least one second of each of the 2 intervals from 17:00 to 17:02 UTC: in such a second, at least one partition key range used all of its share of the RU/s. Azure Monitor counted 2500 requests in those intervals, none of them throttled.",
         );
-        expect(a.recommendations.map((r) => r.id)).toEqual(["RU-PARTITION", "RU-AUTOSCALE"]);
-        expect(a.notCaptured[0]).toMatch(/^T5: which partition key range was busiest/);
+        expect(a.recommendations).toEqual([]);
+        expect(a.notCaptured[0]).toMatch(/^T5: which partition key range was busiest.* Nor is its provisioned throughput for these minutes, so whether a new partition key could help isn't known/);
     });
 
-    it("counts the throttled requests and their share when there were some", () => {
-        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:02:00"), metrics: minutes([150, 50, 0]) });
+    it.each([
+        ["above 5 %: more throughput", [150, 50, 0], "200 of them throttled (429, 8 %)", "That's more than the 5 % of requests at which Learn recommends more throughput.", ["RU-RETRY", "RU-AUTOSCALE"]],
+        ["up to 5 %: the clients' retries only", [60, 40, 0], "100 of them throttled (429, 4 %)", "Learn counts up to 5 % of requests throttled, with acceptable latency, as RU/s fully used, with no action needed.", ["RU-RETRY"]],
+    ])("counts the throttled requests in the intervals it names, with their share, and recommends by Learn's 5 %, %s", (_, throttled, counted, guide, ids) => {
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: minutes(throttled as number[]) });
         expect(a.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
-        expect(a.rootCause?.statement).toContain("Azure Monitor counted 3400 requests in those minutes, 200 of them throttled (429, 5.9 %)");
-        expect(a.recommendations.map((r) => r.id)).toEqual(["RU-RETRY", "RU-PARTITION", "RU-AUTOSCALE"]);
+        expect(a.rootCause?.statement).toContain(`Azure Monitor counted 2500 requests in those intervals, ${counted}`);
+        expect(a.rootCause?.statement).toContain(guide as string);
+        expect(a.recommendations.map((r) => r.id)).toEqual(ids);
+    });
+
+    it("says why a new partition key wouldn't help a container of one physical partition, and recommends one only with several", () => {
+        const one = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [...minutes([150, 50, 0]), provisioned(400)] });
+        expect(one.rootCause?.statement).toContain(
+            "At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition unless it holds more than 50 GB, so all its requests share those 400 RU/s whatever their partition key: a new key wouldn't raise the limit.",
+        );
+        expect(one.recommendations.map((r) => r.id)).toEqual(["RU-RETRY", "RU-AUTOSCALE"]);
+        expect(one.notCaptured[0]).not.toMatch(/Nor is its provisioned throughput/);
+        const several = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [...minutes([150, 50, 0]), provisioned(20_000)] });
+        expect(several.rootCause?.statement).toContain("At 20000 RU/s, over the 10,000 RU/s one physical partition serves, the container has several physical partitions");
+        expect(several.recommendations.map((r) => r.id)).toEqual(["RU-RETRY", "RU-AUTOSCALE", "RU-PARTITION"]);
     });
 });

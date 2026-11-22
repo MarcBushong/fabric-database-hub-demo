@@ -211,12 +211,13 @@ describe("every family the RCA explains", () => {
         };
         const r = await ask("explain_incident", { episodeKey: "T1-blocking-20261120T160000Z" }, tools({ evidence, telemetry: {} }));
         expect(r.rootCause).toBeNull();
+        // The sentinel saw it, so it ended before the next chain sample (the review of 4e2c65ed: not "between the sentinel's samples").
         expect(r.notCaptured).toContain(
-            "T1: the blocked processes from 16:00:00 to 16:02:30 UTC left no blocking chain in the capture: it samples chains (RCA-SQL-01) every 10 s once its 30-s sentinel sees a blocked process, so blocking that began and ended between the sentinel's samples has none, and neither the head blocker nor its statement is known.",
+            "T1: the blocked processes from 16:00:00 to 16:02:30 UTC left no blocking chain in the capture: its 30-s sentinel saw a blocked process, and the capture samples the chain (RCA-SQL-01) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.",
         );
     });
 
-    it("explains T5's normalized RU at 100 % that throttled nothing", async () => {
+    it("explains T5's normalized RU at 100 % that throttled nothing, from the intervals it names, with no change to recommend", async () => {
         const points = Array.from({ length: 10 }, (_, i) => [
             { at: minute("17:00:00", i), metric: COSMOS_METRICS.normalizedRu, value: i < 3 ? 100 : 40 },
             { at: minute("17:00:00", i), metric: COSMOS_METRICS.requests, value: 1000 },
@@ -225,6 +226,56 @@ describe("every family the RCA explains", () => {
         const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("17:20:00"), windowStart: at("17:00:00"), windowEnd: at("17:10:00"), intervalMinutes: 1, points };
         const r = await ask("explain_incident", { episodeKey: "T5-ru-20261120T170000Z" }, tools({ evidence: emptyEvidence(), telemetry: { cosmos } }));
         expect(r.rootCause).toMatchObject({ ruleIds: ["RU-AT-LIMIT"], confidence: "medium" });
-        expect(r.rootCause?.statement).toMatch(/reached 100 % in 3 intervals from 17:00 to 17:03 UTC\. Azure Monitor counted 5000 requests in those minutes, none of them throttled/);
+        // 1,000 a minute in 3 intervals (the review of 4e2c65ed: it once counted 5,000, with the minutes past them).
+        expect(r.rootCause?.statement).toMatch(/reached 100 % in at least one second of each of the 3 intervals from 17:00 to 17:03 UTC: .* Azure Monitor counted 3000 requests in those intervals, none of them throttled\./);
+        expect(r.recommendations).toEqual([]);
+    });
+});
+
+// The review of 4e2c65ed: one more read left a stall that hadn't recovered by the end of the minutes read as it stood, so
+// the chat and the RCA view explained one stall two ways, and an Azure Monitor interval counted in two adjacent windows.
+describe("reading whole what a window cuts", () => {
+    /** Read Replica Lag a minute at a time, from Azure Monitor only: replay stood still from 16:01 to 16:31. */
+    function stall(): Telemetry {
+        const lag = (i: number) => (i >= 12 && i <= 40 ? (i - 11) * 60 : i === 41 ? 0.6 : 0.5);
+        const postgres: PostgresCapture = {
+            capturedAt: at("16:55:00"),
+            windowStart: at("15:50:00"),
+            windowEnd: at("16:50:00"),
+            intervalMinutes: 1,
+            servers: {},
+            points: Array.from({ length: 60 }, (_, i) => ({ at: minute("15:50:00", i), target: "T4-replica" as const, server: "pgreplica01", metric: LAG_METRIC, value: lag(i) })),
+        };
+        return { postgres };
+    }
+
+    it("reads a rise that hasn't recovered by the end of the minutes read again, so the chat asked in a 30-minute stall's first minute gives the view's finding", async () => {
+        const deps = tools({ evidence: emptyEvidence(), telemetry: stall() });
+        const [episode] = (await deps.episodes(at("15:55:00"), at("16:45:00"))).filter((e) => e.family === "replica_lag");
+        const view = await ask("explain_incident", { episodeKey: episode.key }, deps);
+        const chat = await ask("explain_replica_lag", { at: "2026-11-20T16:03:00Z" }, deps);
+        expect(view.rootCause?.statement).toMatch(/^Read Replica Lag rose from 16:02:00 to 1740 s at 16:30:00 UTC \(.*\) and was back to 0\.6 s at 16:31:00 UTC/);
+        expect(chat.rootCause).toEqual(view.rootCause);
+        expect(chat.findings).toEqual(view.findings);
+        // Azure Monitor's intervals bound when replay last advanced only from below: it's never given as the time.
+        const details = chat.details as Record<string, unknown>;
+        expect(details.lastReplay).toBeUndefined();
+        expect(details).toMatchObject({ lastReplayNoEarlierThan: "2026-11-20T16:01:00Z", recovered: true });
+    });
+
+    it("counts an Azure Monitor interval in the window it starts in, not also in the one that ends where it starts", async () => {
+        const postgres: PostgresCapture = {
+            capturedAt: at("16:30:00"),
+            windowStart: at("15:45:00"),
+            windowEnd: at("16:20:00"),
+            intervalMinutes: 5,
+            servers: {},
+            points: Array.from({ length: 7 }, (_, i) => ({ at: minute("15:45:00", 5 * i), target: "T4" as const, server: "pgflex01", metric: "connections_failed", value: i === 4 ? 7 : 0 })),
+        };
+        const deps = tools({ evidence: emptyEvidence(), telemetry: { postgres } });
+        const before = await ask("explain_errors", { at: "2026-11-20T16:00:00Z", targets: ["T4"] }, deps);
+        expect(before.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded in the window.");
+        const after = await ask("explain_errors", { at: "2026-11-20T16:10:00Z", targets: ["T4"] }, deps);
+        expect((after.details!.classes as Array<{ count: number }>).reduce((n, c) => n + c.count, 0)).toBe(7);
     });
 });

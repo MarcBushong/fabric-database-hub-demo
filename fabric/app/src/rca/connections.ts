@@ -78,7 +78,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     const notCaptured: string[] = [];
     const samples = connectionSamples(input.resource, target, from, to);
 
-    // Refused attempts: only Azure Monitor counts them. Each point stands for its whole interval.
+    // Failed connections: only Azure Monitor counts them. Each point stands for its whole interval.
     const failed = input.metrics.filter((m) => m.target === target && m.metric === FAILED && m.value !== null && metricIn(m, from, to)).sort((a, b) => a.at.getTime() - b.at.getTime());
     const refused = failed.reduce((n, m) => n + (m.value ?? 0), 0);
     const intervalEnd = (m: MetricPoint) => new Date(m.at.getTime() + (m.intervalMs ?? 0));
@@ -87,7 +87,8 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
         ? null
         : refused > 0
           ? `Azure Monitor counted ${plural(refused, "failed connection")} in ${intervals}: with every slot taken, PostgreSQL refuses a new connection (SQLSTATE 53300, too many clients) rather than queue it.`
-          : `No client was refused: Azure Monitor counted no failed connection in ${failed.length === 1 ? "" : "any of "}${intervals}, and PostgreSQL refuses a connection past the limit (SQLSTATE 53300) rather than queue it, so no client asked for one while every slot was taken. A wait inside an application's own pool, if any, isn't visible to the server.`;
+          : // Only what's measured (the review of 4e2c65ed): Learn documents connections_failed as the number of failed connections, not as the refusals at the limit, and live the capture saw every slot taken while it counted none.
+            `Azure Monitor counted no failed connection in ${failed.length === 1 ? "" : "any of "}${intervals}.`;
     if (failed.length === 0) notCaptured.push(`${target}: Azure Monitor's failed connections aren't in the history for ${hhmmss(from)}-${hhmmss(to)} UTC, so whether a client was refused isn't known.`);
     const failedRefs: EvidenceRef[] = failed.filter((m) => (m.value ?? 0) > 0).slice(0, 2).map((m) => ({ table: "Telemetry Snapshots", at: iso(m.at), target, text: `${plural(m.value ?? 0, "failed connection")} from ${hhmm(m.at)} to ${hhmm(intervalEnd(m))} UTC (Azure Monitor)` }));
 

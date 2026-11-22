@@ -104,6 +104,11 @@ const RESULT_CHARS = 60_000;
 const MIN = 60_000;
 /** The detector's baselines read the minutes before a window. */
 const LEAD_MINUTES = 30;
+/** How many more times the replica's lag is read while its rise runs past the minutes read, and how far past their end an unrecovered rise is read each time: at most 4 reads, 45 minutes past the first. */
+const REPLICA_REREADS = 3;
+const REPLICA_STEP_MINUTES = 15;
+/** Azure Monitor's ProvisionedThroughput is hourly: a point stands for its hour. */
+const HOUR = 60 * MIN;
 
 function windowOf(args: Record<string, unknown>, deps: InvestigationDeps): { from: Date; to: Date; at?: Date } | string {
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
@@ -125,7 +130,7 @@ function targetsOf(args: Record<string, unknown>): RcaTarget[] {
     return list.length ? list : [...RCA_TARGETS];
 }
 
-/** The Azure Monitor series the investigations read, as metric points, each with its interval: the replica's lag, T4's failed connections and CPU, T5's 429s, RU, and requests. */
+/** The Azure Monitor series the investigations read, as metric points, each with its interval: the replica's lag, T4's failed connections and CPU, T5's 429s, RU, requests, and its hourly provisioned throughput. */
 export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const out: MetricPoint[] = [];
     const pg = telemetry.postgres ?? null;
@@ -138,6 +143,7 @@ export function monitorMetrics(telemetry: Telemetry): MetricPoint[] {
     const cosmos = telemetry.cosmos ?? null;
     const cosmosInterval = cosmos?.intervalMinutes ? cosmos.intervalMinutes * MIN : undefined;
     for (const metric of [COSMOS_METRICS.throttled, COSMOS_METRICS.normalizedRu, COSMOS_METRICS.requests]) for (const p of cosmosSeries(cosmos, metric)) out.push({ target: "T5", at: p.at, metric, value: p.value, intervalMs: cosmosInterval });
+    for (const p of cosmosSeries(cosmos, COSMOS_METRICS.provisioned)) out.push({ target: "T5", at: p.at, metric: COSMOS_METRICS.provisioned, value: p.value, intervalMs: HOUR });
     return out.sort((a, b) => a.at.getTime() - b.at.getTime());
 }
 
@@ -304,7 +310,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         );
         const noChain = chainless.map(
             (t) =>
-                `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: it samples chains (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s once its 30-s sentinel sees ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, so blocking that began and ended between the sentinel's samples has none, and neither the head blocker nor its statement is known.`,
+                `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
         );
         return {
             ...base,
@@ -342,9 +348,11 @@ export function createInvestigationTools(deps: InvestigationDeps) {
 
     /**
      * The replica's lag at `at`, for explain_replica_lag and for an incident alike: the rise around it, whole, and its cause
-     * from the rise's own minutes. When the rise or its cause runs past the minutes asked about (a stall that began before
-     * them, or ended after), those minutes are read too, once, so every question about one rise gets the same answer from
-     * the same rows (live, 2026-11-21: the RCA view and the chat explained one stall two ways).
+     * from the rise's own minutes. When the rise or its cause runs past the minutes read (a stall that began before them,
+     * or hadn't recovered by their end), they're read again with those minutes, up to REPLICA_REREADS more times, so every
+     * question about one rise gets the same answer from the same rows (live, 2026-11-21: the RCA view and the chat explained
+     * one stall two ways; the review of 4e2c65ed: one more read left a 14-minute stall unrecovered when asked about its
+     * first minute). A rise that the history still shows unrecovered after them is reported as it stands.
      */
     async function replicaAt(at: Date, from: Date, to: Date): Promise<InvestigationResult> {
         const targets: RcaTarget[] = ["T4", "T4-replica"];
@@ -354,9 +362,19 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             return { w, g, a };
         };
         let r = await analyze({ from, to });
-        const reads = r.a.reads;
-        if (reads && (reads.from < r.w.from || reads.to > r.w.to)) {
-            r = await analyze({ from: new Date(Math.min(r.w.from.getTime(), reads.from.getTime() - 3 * MIN)), to: new Date(Math.max(r.w.to.getTime(), reads.to.getTime() + 3 * MIN)) });
+        for (let again = 0; again < REPLICA_REREADS; again++) {
+            const { a, w: read } = r;
+            if (!a.reads || !a.rise) break;
+            // Unrecovered at the end of the minutes read: its end is their last point's.
+            const open = !a.rise.recovered && a.rise.end.getTime() >= read.to.getTime() - 2 * MIN;
+            if (a.reads.from >= read.from && a.reads.to <= read.to && !open) break;
+            const before = a.rise.end.getTime();
+            r = await analyze({
+                from: new Date(Math.min(read.from.getTime(), a.reads.from.getTime() - 3 * MIN)),
+                to: new Date(Math.max(read.to.getTime(), a.reads.to.getTime() + 3 * MIN, open ? read.to.getTime() + REPLICA_STEP_MINUTES * MIN : 0)),
+            });
+            // The history has nothing past where the rise stood: reading further finds no more.
+            if (open && r.a.rise && !r.a.rise.recovered && r.a.rise.end.getTime() <= before) break;
         }
         const { w, g, a } = r;
         const base = envelope("explain_replica_lag", w.from, w.to, targets, deps, g, at);
@@ -373,7 +391,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
                       lag: a.rise.points.map((p) => ({ at: iso(p.at), seconds: Math.round(p.value * 10) / 10, source: p.source, ...(p.intervalMs ? { intervalMinutes: Math.round(p.intervalMs / MIN) } : {}) })),
                       slopeSPerS: a.rise.slope,
                       peak: { at: iso(a.rise.peak.at), seconds: Math.round(a.rise.peak.value * 10) / 10 },
-                      lastReplay: iso(a.rise.stalledSince),
+                      // From the capture's own samples only; Azure Monitor's intervals bound it from below (the review of 4e2c65ed).
+                      ...(a.rise.lastReplay ? { lastReplay: iso(a.rise.lastReplay) } : { lastReplayNoEarlierThan: iso(a.rise.stalledSince) }),
+                      recovered: !!a.rise.recovered,
                   }
                 : {},
         };

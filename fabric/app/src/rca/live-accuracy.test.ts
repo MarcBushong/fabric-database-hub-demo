@@ -71,13 +71,15 @@ describe("the replica's lag (finding 1)", () => {
 });
 
 describe("T4's connection surge (finding 2)", () => {
-    it("explains it by what held the slots, says no client was refused, and says exactly what isn't captured", async () => {
+    // CONN-IDLE and its high confidence rest on the fixture's modeled split by state (testdata/live-rb-2233e0ae.ts,
+    // connectionRows): the live answers gave totals only. Final tests' rows from B's model replace it.
+    it("explains it by what held the slots, says only what Azure Monitor counted, and says exactly what isn't captured", async () => {
         const r = await ask("explain_incident", { episodeKey: LIVE_KEYS.connections });
         expect(r.rootCause).toMatchObject({ ruleIds: ["CONN-IDLE"], confidence: "high" });
         expect(r.rootCause?.statement).toBe(
             "T4's client connections reached 35 of the 35 slots clients can use (max_connections 50 less 15 reserved) at 15:26:51 UTC, and stayed at 80 % of the limit or more in 32 samples between 15:26:41 and 15:31:51 UTC (5 min 10 s). " +
                 "Most of them sat idle: 32 of the 35 at the peak, and at least 27 in every sample (3 ran a query, none sat idle in a transaction, none waited on a lock). Clients kept connections open without using them, so the slots filled with idle connections, not with work. " +
-                "No client was refused: Azure Monitor counted no failed connection in any of its 3 intervals from 15:25 to 15:40 UTC, and PostgreSQL refuses a connection past the limit (SQLSTATE 53300) rather than queue it, so no client asked for one while every slot was taken. A wait inside an application's own pool, if any, isn't visible to the server.",
+                "Azure Monitor counted no failed connection in any of its 3 intervals from 15:25 to 15:40 UTC.",
         );
         expect(r.findings).toHaveLength(1);
         expect(r.recommendations.map((x) => x.id)).toEqual(["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"]);

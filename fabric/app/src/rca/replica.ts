@@ -46,8 +46,10 @@ export interface LagRise {
     points: LagPoint[];
     /** Where its peak comes from: the observer's own samples on the replica, or Azure Monitor's metric. */
     source: LagSource;
-    /** When replay last advanced before it, at the earliest: a point's time less its lag, since the lag is the time since the last replay. */
+    /** When replay last advanced before it, at the earliest: a point's time less its lag, since the lag is the time since the last replay. An Azure Monitor point gives only a lower bound: its value was the highest at some time in its interval. */
     stalledSince: Date;
+    /** When replay last advanced, from the capture's own samples in the rise; absent when none backs it (the review of 4e2c65ed). */
+    lastReplay?: Date;
     /** When it ended: its recovery, or the end of its last point (an interval's end for Azure Monitor's) when it hadn't recovered in these minutes. */
     end: Date;
 }
@@ -91,9 +93,14 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
         const to = endOf(point);
         if (!spans.some((s) => s.from < to && s.to >= from)) return true;
         // The capture sampled this interval: its samples stand, unless the interval rose to the floor and none of them did,
-        // when the stall fell between them and the interval stands for its minutes.
-        const seen = own.filter((p) => p.at.getTime() >= from && p.at.getTime() < to);
-        const between = point.value >= floor && seen.every((p) => p.value < floor);
+        // nor the capture's nearest samples on either side of it, when the stall fell between them and the interval stands
+        // for its minutes. A stall that began after the interval's last sample, or ended before its first, shows in the
+        // sample beside it (the review of 4e2c65ed: a stall from 16:19:50 read as a rise from 16:15:00 without that).
+        if (point.value < floor) return false;
+        if (own.some((p) => p.at.getTime() >= from && p.at.getTime() < to && p.value >= floor)) return false;
+        const before = own.filter((p) => p.at.getTime() < from && from - p.at.getTime() <= CAPTURE_GAP_MS).pop();
+        const after = own.find((p) => p.at.getTime() >= to && p.at.getTime() - to <= CAPTURE_GAP_MS);
+        const between = (before === undefined || before.value < floor) && (after === undefined || after.value < floor);
         if (between) missed.push(point);
         return between;
     });
@@ -135,6 +142,9 @@ export function lagRise(series: LagSeries, at: Date, floor = 5): LagRise | null 
     const first = rising[0];
     const last = rising[rising.length - 1];
     const slope = rising.length >= 2 && last.value > first.value ? (last.value - first.value) / ((last.at.getTime() - first.at.getTime()) / 1000) : null;
+    const run = lag.slice(s, e + 1);
+    const sinceOf = (q: LagPoint) => q.at.getTime() - q.value * 1000;
+    const sampled = run.filter((q) => q.source === "RCA Replica");
     return {
         start: lag[s].at,
         peak: lag[p],
@@ -142,7 +152,8 @@ export function lagRise(series: LagSeries, at: Date, floor = 5): LagRise | null 
         slope: slope === null ? null : Math.round(slope * 100) / 100,
         points,
         source: lag[p].source,
-        stalledSince: new Date(Math.min(...lag.slice(s, e + 1).map((q) => q.at.getTime() - q.value * 1000))),
+        stalledSince: new Date(Math.min(...run.map(sinceOf))),
+        ...(sampled.length ? { lastReplay: new Date(Math.min(...sampled.map(sinceOf))) } : {}),
         end: recovered ? recovered.at : new Date(endOf(lag[e])),
     };
 }
@@ -229,7 +240,7 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const values = shown.map((p) => `${round1(p.value)} s`).join(", ");
     const back = rise.recovered ? `${rise.source === "RCA Replica" ? "," : ""} and was back to ${round1(rise.recovered.value)} s ${when(rise.recovered)}` : "";
     const grew = rise.slope !== null ? `; it grew ${rise.slope} s per second` : "";
-    const since = rise.source === "RCA Replica" ? `, counting from its last replay at ${hhmmss(rise.stalledSince)} UTC` : "";
+    const since = rise.source === "RCA Replica" && rise.lastReplay ? `, counting from its last replay at ${hhmmss(rise.lastReplay)} UTC` : "";
     const shape = coarse(rise.peak)
         ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}`
         : `${nameOf(rise.peak)} rose from ${hhmmss(rise.start)} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}`;
