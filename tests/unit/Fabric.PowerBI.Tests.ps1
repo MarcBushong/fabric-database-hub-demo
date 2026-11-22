@@ -284,6 +284,59 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
     }
 }
 
+Describe 'DAX variable names' {
+    BeforeAll {
+        # Learn's VAR page: a name has only a-z, A-Z, and 0-9, never a digit first, with __ allowed as a prefix, and isn't a
+        # reserved keyword or an existing table's name (https://learn.microsoft.com/dax/var-dax). Live, the engine refused
+        # 'Under' (2026-11-22) in a measure whose texts every other check passed, so each DAX source is checked here.
+        $script:reservedWords = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($line in [System.IO.File]::ReadAllLines((Join-Path -Path $PSScriptRoot -ChildPath 'data/dax-reserved-words.txt'))) {
+            if ($line -and -not $line.StartsWith('#')) {
+                [void]$script:reservedWords.Add($line.Trim())
+            }
+        }
+        $script:tableNames = @($tableFiles | ForEach-Object {
+                [regex]::Match([System.IO.File]::ReadAllText($_.FullName), "(?m)^table\s+('(?:[^']|'')+'|\S+)").Groups[1].Value.Trim("'").Replace("''", "'")
+            })
+        # The model's measures, every DAX file in fabric/powerbi (the F35 checks among them), and the Insights app's queries.
+        $script:daxSources = @($tableFiles) + @(Get-ChildItem -LiteralPath $powerbi -Filter '*.dax' -File -Recurse) +
+            @(Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/queries.ts'))
+    }
+
+    It 'has the reserved words and the model''s tables to check against' {
+        $script:reservedWords.Count | Should -BeGreaterThan 500
+        foreach ($word in 'UNDER', 'FUNCTION', 'EVALUATE', 'RETURN', 'CALCULATE', 'FIRST', 'ROWS', 'CURRENTMEMBER') {
+            $script:reservedWords.Contains($word) | Should -BeTrue -Because $word
+        }
+        $script:tableNames | Should -Contain 'Telemetry Snapshots'
+        $script:tableNames | Should -Contain 'Date'
+    }
+
+    It 'names every VAR as Learn allows: letters and digits, never a DAX keyword, a function''s name, or a table''s' {
+        $declared = 0
+        $problems = foreach ($file in $script:daxSources) {
+            $text = [System.IO.File]::ReadAllText($file.FullName) -replace '//[^\n]*', ''
+            # In TypeScript, only the DAX keyword's upper case, never the language's own var.
+            $options = if ($file.Extension -eq '.ts') { [System.Text.RegularExpressions.RegexOptions]::None } else { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
+            foreach ($match in [regex]::Matches($text, '\bVAR\s+([^\s=]+)\s*=', $options)) {
+                $declared++
+                $name = $match.Groups[1].Value
+                if ($name -cnotmatch '^(__)?[A-Za-z][A-Za-z0-9]*$') {
+                    '{0}: VAR {1} has a character a variable''s name can''t' -f $file.Name, $name
+                }
+                elseif ($script:reservedWords.Contains($name)) {
+                    '{0}: VAR {1} is a DAX keyword or function name' -f $file.Name, $name
+                }
+                elseif ($script:tableNames -contains $name) {
+                    '{0}: VAR {1} is a table''s name' -f $file.Name, $name
+                }
+            }
+        }
+        $declared | Should -BeGreaterThan 400
+        @($problems | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Report RPT_DatabaseHub_History (Phase 19)' {
     It 'has the PBIR folder shape: byPath binding, report.json, version.json, four pages with 10, 8, 11, and 10 visuals' {
         $pbir = Get-Content -LiteralPath (Join-Path -Path $reportRoot -ChildPath 'definition.pbir') -Raw | ConvertFrom-Json -AsHashtable

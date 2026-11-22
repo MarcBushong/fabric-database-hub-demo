@@ -183,6 +183,22 @@ describe("Snapshot Value's rule in TypeScript, the model's reference (F35)", () 
             expect(["15:45", "15:47", "15:52", "16:00", "16:10"].map(lockAt)).toEqual([100, 300, 200, 0, 50]);
             expectWindow(rows, "T2", 0.65);
         });
+
+        it("keeps a later save's data for a save's last minutes that have no rows yet, as stop-demo.ps1 -SaveHistory's can", () => {
+            // The review of da68aed5's probe: a 5-minute save at 18:07 whose last 12 minutes' telemetry hadn't arrived, so its
+            // rows stop at 17:50, and a later day-long save. From 17:00 to 18:15, 75 minutes of 60 ms: 4,500 ms.
+            const stop = save("2026-11-21T18:07:30", "2026-11-21T06:07:00", "2026-11-21T18:07:00");
+            const later = save("2026-11-21T18:30:00", "2026-11-20T18:30:00", "2026-11-21T18:30:00");
+            const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
+            const rows = [...every("16:00", 5, Array.from({ length: 23 }, () => 300)).map(lock(stop)), ...every("16:00", 15, Array.from({ length: 9 }, () => 900)).map(lock(later))];
+            const values = snapshotValues(rows);
+            const lockAt = (hhmm: string) => values.get(key("T1", "wait_deltas", "Lock", hhmm));
+            // The day's 17:30 is left out; its 17:45 keeps 17:55 to 18:00 beside the 5-minute 300, and its 18:00 is whole.
+            expect(["17:30", "17:45", "17:50", "18:00"].map(lockAt)).toEqual([300, 600, 300, 900]);
+            const { model, finest } = f35Check(rows, at("17:00"), at("18:15")).measures.T1.LockWaitS;
+            expect(model).toBeCloseTo(4.5, 9);
+            expect(finest).toBeCloseTo(4.5, 9);
+        });
     });
 
     // The review of 602e18a1: three saves at 1, 5, and 15 minutes, with T1's lock waits of 60 ms a minute in each. A bin's

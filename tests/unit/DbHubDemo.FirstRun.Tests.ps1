@@ -1634,29 +1634,21 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { -not $Create }
     }
 
-    It 'ends its SQL window TELEMETRY_LAG_MINUTES before it runs, so it claims only minutes whose telemetry has arrived (F35''s review)' {
-        # The history model and finestPerInterval take a finer save's rows for the minutes it claims: a 5-minute save ending
-        # now, before its last minutes' telemetry arrived, would leave out what a later day-long save holds for them.
+    It 'ends its SQL window when it runs: it sends no WINDOW_END_UTC, so the notebook takes now (the review of da68aed5)' {
+        # Coverage by rows keeps a later day-long save's remainder for minutes this save holds no rows for, so its window
+        # needn't end early; ending it 15 minutes early left the stop's last 15 minutes unsaved when no day-long save followed.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith {
             $script:sent = $Parameter
             New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ran' -Evidence @{ status = 'Completed'; seconds = 95 }
         }
-        $before = [datetime]::UtcNow
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
-        $after = [datetime]::UtcNow
         $script:sent['WINDOW_MINUTES'] | Should -Be 720
-        $script:sent['WINDOW_END_UTC'] | Should -Match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$'
-        $end = [datetime]::ParseExact($script:sent['WINDOW_END_UTC'], "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]'AssumeUniversal, AdjustToUniversal')
-        $end | Should -BeGreaterOrEqual $before.AddMinutes(-15).AddSeconds(-1)
-        $end | Should -BeLessOrEqual $after.AddMinutes(-15)
-        ([datetime]$saved.Result.evidence['windowEndUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $script:sent['WINDOW_END_UTC']
-        $saved.Result.message | Should -BeLike ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the 720 minutes until {0} UTC, whose SQL telemetry has arrived. *' -f $end.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture))
-        # The notebook's own lag, which the window end follows, and its parameter for it.
+        $script:sent.Contains('WINDOW_END_UTC') | Should -BeFalse
+        $saved.Result.message | Should -BeLike 'Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last 720 minutes. *'
+        # The notebook's window ends now when WINDOW_END_UTC is empty, its default.
         $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $cell = (@($notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join ''
-        $cell | Should -Match '(?m)^TELEMETRY_LAG_MINUTES = 15\b'
         $cell | Should -Match '(?m)^WINDOW_END_UTC = ""'
-        InModuleScope DbHubDemo { $script:HistoryTelemetryLagMinutes } | Should -Be 15
     }
 
     It 'is Manual action required, and runs nothing, when the capacity isn''t running' {

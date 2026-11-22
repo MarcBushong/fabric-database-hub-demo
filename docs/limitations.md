@@ -129,7 +129,7 @@ The history keeps every save at its own interval. The history model's `Snapshot 
   - seconds at an edge, where a coarser save's own window ends inside an interval that two finer saves share.
 
   `fabric/powerbi/checks/f35` compares both on a deployed model's overlapping saves.
-- **`./scripts/stop-demo.ps1 -SaveHistory` saves the SQL telemetry up to 15 minutes before it runs** (since 2026-11-22): the last minutes' telemetry hasn't arrived yet, so they go with the next save that holds them, such as `./scripts/deploy.ps1`'s snapshot at its end. Run all's own save waits for them instead.
+- **`./scripts/stop-demo.ps1 -SaveHistory` saves up to the moment it runs:** SQL telemetry arrives up to 15 minutes after the activity, so the save's last minutes can have no rows yet. A finer save covers only the minutes its rows hold, so a later save that holds them, such as `./scripts/deploy.ps1`'s snapshot at its end, still counts them; until one does, they aren't in the history. Run all's own save waits for them instead.
 
 ## Not proven live yet
 

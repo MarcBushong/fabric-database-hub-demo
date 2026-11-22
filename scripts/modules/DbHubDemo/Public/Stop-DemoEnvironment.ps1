@@ -77,8 +77,7 @@ function Stop-DemoEnvironment {
     capacity is paused (STOP.FABRIC.SAVEHISTORY; also with fabric.saveHistoryOnStop). Not with -ParkT2.
 
     .PARAMETER SaveHistoryWindowMinutes
-    How far back the saved history goes (default 720 minutes; the notebook uses 5-minute bins up to 12 hours), ending 15
-    minutes before the save runs, so it holds only minutes whose SQL telemetry has arrived.
+    How far back the saved history goes (default 720 minutes; the notebook uses 5-minute bins up to 12 hours).
 
     .PARAMETER ProfileOffWaitSeconds
     How long the profiles' off waits for both VMs together before the stop goes on anyway, and how long the guest's clean
