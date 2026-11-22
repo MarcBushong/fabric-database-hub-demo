@@ -426,6 +426,26 @@ Describe 'T4 sizes (Phase 24)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { throw 'offline' }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4HourlyPrice -Config $Config } | Should -BeNullOrEmpty
     }
+
+    It 'reads a General Purpose series'' per-vCore price from its "1 vCore" row first, then its "vCore" row, then the cheapest: <Case>' -ForEach @(
+        # Obviously fake prices (ADR 0016), in the shapes the Retail Prices API listed on 2026-11-22: Indonesia Central's Dadsv5,
+        # one meter listed as a "vCore" row at about a tenth of its "1 vCore" row; and UAE Central's Dadsv5, a "vCore" meter
+        # and a newer, dearer "1 vCore" one. The cheapest row read both "vCore" rows; the coordinator's decision, 2026-11-22.
+        @{ Case = 'one meter at two prices, as Indonesia Central''s'; Rows = @(@('vCore', 0.03, 'meter-a'), @('1 vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
+        @{ Case = 'two meters, the "1 vCore" one dearer, as UAE Central''s'; Rows = @(@('vCore', 0.3, 'meter-a'), @('1 vCore', 0.35, 'meter-c'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.35 }
+        @{ Case = 'the "vCore" row only'; Rows = @(@('vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
+        @{ Case = 'neither row, as before'; Rows = @(@('2 vCore', 0.6, 'meter-d'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.6 }
+    ) {
+        $items = @(foreach ($row in $Rows) { [pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = $row[0]; meterName = 'vCore'; meterId = $row[2]; retailPrice = $row[1]; unitOfMeasure = '1 Hour' } })
+        $items += [pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = '1 vCore'; meterName = 'vCore'; meterId = 'meter-a'; retailPrice = 0.001; unitOfMeasure = '1 Year' }
+        $picked = InModuleScope DbHubDemo -Parameters @{ Items = $items } { Select-DemoT4ComputePrice -Item $Items -Spec (Get-DemoT4SkuSpec -SkuName 'Standard_D4ads_v5') }
+        $picked.retailPrice | Should -Be $Expected
+        # T4's hour at Standard_D4ads_v5: 4 vCores at the row read.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { $items }
+        $config = New-TestConfig
+        $config['t4SkuName'] = 'Standard_D4ads_v5'
+        [System.Math]::Round((InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4HourlyPrice -Config $Config }), 6) | Should -Be ([System.Math]::Round(4 * $Expected, 6))
+    }
 }
 
 Describe 'Invoke-DemoT4PowerAction' {

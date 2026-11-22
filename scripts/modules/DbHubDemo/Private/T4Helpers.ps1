@@ -717,7 +717,15 @@ function New-DemoT4SizeResult {
 }
 
 function Select-DemoT4ComputePrice {
-    # T4's compute meter among Retail Prices items: the size's own meter for Burstable, the vCore meter for General Purpose. Internal.
+    <#
+    T4's compute meter among Retail Prices items: the size's own meter for Burstable, and for General Purpose its series'
+    per-vCore price: the "1 vCore" row, then the "vCore" row, then, when neither is listed, the cheapest vCore row, as
+    before. It read the cheapest row, which on 2026-11-22 changed two prices: in Indonesia Central the Dadsv5 series'
+    "vCore" row listed about a tenth of its "1 vCore" row, the same meter, and of its size rows; and in UAE Central the
+    Dadsv5 series has a newer "1 vCore" meter (listed since 2026-10-01) dearer than its "vCore" one. The newer meter is
+    the likelier bill, and an estimate too low is the worse error, since it could let a move past the cost ceilings (the
+    coordinator's decision, 2026-11-22). Internal.
+    #>
     [CmdletBinding()]
     [OutputType([object])]
     param(
@@ -730,7 +738,14 @@ function Select-DemoT4ComputePrice {
 
     $hourly = @($Item | Where-Object { $_.unitOfMeasure -eq '1 Hour' })
     if ($Spec.PerVCore) {
-        return ($hourly | Where-Object { [string]$_.meterName -eq 'vCore' } | Sort-Object -Property retailPrice | Select-Object -First 1)
+        $vcore = @($hourly | Where-Object { [string]$_.meterName -eq 'vCore' })
+        foreach ($skuName in '1 vCore', 'vCore') {
+            $row = $vcore | Where-Object { [string]$_.skuName -eq $skuName } | Sort-Object -Property retailPrice | Select-Object -First 1
+            if ($null -ne $row) {
+                return $row
+            }
+        }
+        return ($vcore | Sort-Object -Property retailPrice | Select-Object -First 1)
     }
     return ($hourly | Where-Object { ([string]$_.skuName).ToUpperInvariant() -eq $Spec.Meter } | Select-Object -First 1)
 }
