@@ -972,7 +972,7 @@ Describe 'T4 created by a run that skipped preflight is priced first, as a scale
     }
 
     It 'says so when the size the fallback creates instead is over a ceiling too (the review of this change)' {
-        # The reviewer's case: Azure refuses Standard_D4ds_v5, and Standard_D4ads_v5, at the same vCore price, is over the ceiling.
+        # The reviewer's case: Azure refuses Standard_D4ds_v5, and Standard_D4ads_v5, with the same vCores, is over the ceiling.
         $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
         $script:costBySize = @{
             Standard_D4ds_v5  = (New-TestCost -SkuName 'Standard_D4ds_v5' -SkipReason 'MonthlyCeiling' -HourlyUsd 1.0 -MonthlyWorstCaseUsd 312.4)
@@ -1401,12 +1401,22 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $size.message | Should -Match 'Its cost check passed: about 0\.500 USD an hour while it runs .* counted as about a day per restart because a safety stop is in place'
         $deployment.T4Note | Should -Match '^T4 scaled from Standard_D2ds_v5 to the default'
 
-        # A move that doesn't raise the price isn't priced: the two 4-vCore sizes share the vCore price.
+        # A move to the other 4-vCore size is priced too (201a6666's review, 2026-11-22): the two are separate meters, whose
+        # list prices can differ in a region. Within both ceilings, it scales; over one, T4 keeps its size.
         Initialize-TemplateHarness
         $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ads_v5'; tier = 'GeneralPurpose' } }
-        Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4 | Out-Null
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:pricedSizes) | Should -Be @('Standard_D4ds_v5')
         @($script:sizes) | Should -Be @('Standard_D4ds_v5')
-        @($script:pricedSizes) | Should -BeNullOrEmpty
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE' | ForEach-Object { $_.evidence.outcome }) | Should -Be @('Scale')
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ads_v5'; tier = 'GeneralPurpose' } }
+        $script:cost = New-TestCost -SkipReason 'MonthlyCeiling' -MonthlyWorstCaseUsd 312.21 -SkuName 'Standard_D4ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_D4ads_v5') -Because 'over the ceiling, the server keeps its size'
+        $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+        $size.evidence.outcome | Should -Be 'Ceiling'
+        $size.message | Should -Match '^T4 exists as Standard_D4ads_v5 \(General Purpose\)\. Moving it to the default, General Purpose Standard_D4ds_v5 with autonomous tuning, would put the demo''s month at 312\.21 USD, over monthlyCeilingUsd'
     }
 
     It 'prices a t4SkuName the configuration changed on an existing T4, then scales it or keeps its size (review of PR 20)' {
@@ -1442,6 +1452,16 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
         @($script:pricedSizes) | Should -BeNullOrEmpty
 
+        # The other 4-vCore size is priced (201a6666's review, 2026-11-22): their list prices can differ in a region.
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5'; tier = 'GeneralPurpose' } }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_D4ads_v5') -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:pricedSizes) | Should -Be @('Standard_D4ads_v5')
+        @($script:sizes) | Should -Be @('Standard_D4ads_v5')
+        $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+        $size.evidence.outcome | Should -Be 'Scale'
+        $size.message | Should -Match '^T4 exists as Standard_D4ds_v5 \(General Purpose\), and your configuration sets t4SkuName to Standard_D4ads_v5, so this deployment scales it'
+
         # Without -ScaleT4 (start-demo.ps1's T3 recreation, after its own cost check), a size the configuration sets goes as before.
         Initialize-TemplateHarness
         $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
@@ -1450,17 +1470,20 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         @($script:pricedSizes) | Should -BeNullOrEmpty
     }
 
-    It 'tells a larger T4 size from a smaller one: <From> to <To>' -ForEach @(
-        @{ From = 'Standard_B1ms'; To = 'Standard_B2s'; Larger = $true }
-        @{ From = 'Standard_B2s'; To = 'Standard_D2ds_v5'; Larger = $true }
-        @{ From = 'Standard_D2ds_v5'; To = 'Standard_D4ds_v5'; Larger = $true }
-        @{ From = 'Standard_B1ms'; To = 'Standard_D4ads_v5'; Larger = $true }
-        @{ From = 'Standard_D4ads_v5'; To = 'Standard_D4ds_v5'; Larger = $false }
-        @{ From = 'Standard_D4ds_v5'; To = 'Standard_D2ds_v5'; Larger = $false }
-        @{ From = 'Standard_D2ds_v5'; To = 'Standard_B2s'; Larger = $false }
-        @{ From = 'Standard_D4ds_v5'; To = 'Standard_E4ds_v5'; Larger = $true }
+    It 'prices a move that can raise T4''s price, and only such a move: <From> to <To>' -ForEach @(
+        @{ From = 'Standard_B1ms'; To = 'Standard_B2s'; Priced = $true }
+        @{ From = 'Standard_B2s'; To = 'Standard_D2ds_v5'; Priced = $true }
+        @{ From = 'Standard_D2ds_v5'; To = 'Standard_D4ds_v5'; Priced = $true }
+        @{ From = 'Standard_B1ms'; To = 'Standard_D4ads_v5'; Priced = $true }
+        # The two 4-vCore sizes, either way (201a6666's review, 2026-11-22): their list prices can differ in a region.
+        @{ From = 'Standard_D4ads_v5'; To = 'Standard_D4ds_v5'; Priced = $true }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_D4ads_v5'; Priced = $true }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_D4ds_v5'; Priced = $false }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_D2ds_v5'; Priced = $false }
+        @{ From = 'Standard_D2ds_v5'; To = 'Standard_B2s'; Priced = $false }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_E4ds_v5'; Priced = $true }
     ) {
-        InModuleScope DbHubDemo -Parameters @{ From = $From; To = $To } { Test-DemoT4SizeIncrease -From $From -To $To } | Should -Be $Larger
+        InModuleScope DbHubDemo -Parameters @{ From = $From; To = $To } { Test-DemoT4SizeIncrease -From $From -To $To } | Should -Be $Priced
     }
 
     It 'drops Phase 28''s record from the group''s tags, and doesn''t read it' {

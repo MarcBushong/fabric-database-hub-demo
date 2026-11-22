@@ -5544,7 +5544,7 @@ The read-only answer, first:
 
 ### T4's sizes with the same vCores: no price claim (2026-11-22)
 
-**Why.** 201a6666's review of 885a8d52 found the new note's middle case wrong in one region. The Azure Retail Prices API gives `Standard_D4ds_v5` and `Standard_D4ads_v5` the same hourly price in 57 of the 58 regions that sell both; in Norway West, `Standard_D4ds_v5` lists at 1.3236 USD an hour and `Standard_D4ads_v5` at 0.6214 (list prices on 2026-11-22, dated examples; [ADR 0016](adr/0016-cost-profiles.md)). So a replica there that fell back from `Standard_D4ads_v5` to `Standard_D4ds_v5` would have been told it costs the same. The claim predates 885a8d52 in T4's own fallback Warning (`DEPLOY.T4.SKU`, when it tries `Standard_D4ads_v5`) and in `t4SkuName`'s description. A check of the same API here agreed: 58 regions sell both at 4 vCores, only Norway West differs, and it differs at 2 vCores too. With it, 1f7dca70's decision on afb30e0e: pin `Invoke-DemoDotNet` as `Invoke-DemoAzCli` is, since it redirects to a temporary file the same way, and its re-review's docs Low on the destroy section.
+**Why.** 201a6666's review of 885a8d52 found the new note's middle case wrong in one region. The Azure Retail Prices API gives `Standard_D4ds_v5` and `Standard_D4ads_v5` the same hourly price in 57 of the 58 regions that sell both; in Norway West, `Standard_D4ds_v5`'s 4-vCore row lists at 1.3236 USD an hour and `Standard_D4ads_v5`'s at 0.6214 (list prices on 2026-11-22, dated examples; [ADR 0016](adr/0016-cost-profiles.md); [a later section](#moves-between-t4s-4-vcore-sizes-are-priced-2026-11-22) compares the per-vCore meters the estimates read). So a replica there that fell back from `Standard_D4ads_v5` to `Standard_D4ds_v5` would have been told it costs the same. The claim predates 885a8d52 in T4's own fallback Warning (`DEPLOY.T4.SKU`, when it tries `Standard_D4ads_v5`) and in `t4SkuName`'s description. A check of the same API here agreed: 58 regions sell both at 4 vCores, only Norway West differs, and it differs at 2 vCores too. With it, 1f7dca70's decision on afb30e0e: pin `Invoke-DemoDotNet` as `Invoke-DemoAzCli` is, since it redirects to a temporary file the same way, and its re-review's docs Low on the destroy section.
 
 **Work summary.**
 
@@ -5566,3 +5566,35 @@ The read-only answer, first:
 
 - The note and the Warning say less and point to the estimate, which prices each size from the Retail Prices API at run time.
 - The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### Moves between T4's 4-vCore sizes are priced (2026-11-22)
+
+**Why.** 201a6666's review of 4e0126d9 found the "same price" assumption outside the messages. ADR 0019 still said `Standard_D4ads_v5` has "the same vCore price", and three comments in `T4Helpers.ps1` said the two 4-vCore sizes "share the vCore price". The code acted on it: `Get-DemoT4SizeRank` gives both one rank, so `Test-DemoT4SizeIncrease` counted a move between them as no increase, and the template step's pricing of a move (`$priceMove` in `Invoke-DemoTemplateDeployment`) skipped it. With `./scripts/deploy.ps1 -FromStage Infrastructure`, which skips preflight's cost checks, such a move met neither ceiling. And `T4CostOrder` breaks their tie by the list's order, `Standard_D4ds_v5` first, which isn't cheapest first where `Standard_D4ds_v5` costs more. The reviewer also found that the `Invoke-DemoDotNet` test ran only with `-Confirm`, so it would still pass without the `$WhatIfPreference` pin.
+
+**Which prices.** The Azure Retail Prices API lists each General Purpose series two ways: a row for each size ("2 vCore", "4 vCore", each its own meter, since 2023), and a per-vCore meter ("vCore" and "1 vCore", one meter, since 2024 or 2025). The demo's estimates read the per-vCore meter, its cheapest row, times the vCores (`Select-DemoT4ComputePrice`). On 2026-11-22 (dated examples, [ADR 0016](adr/0016-cost-profiles.md)):
+
+- **The per-vCore meters** of Ddsv5 and Dadsv5 are the same in 67 of the 68 regions that sell both, Norway West included (0.155 USD a vCore-hour). The exception is a row: in Indonesia Central, Dadsv5's "vCore" row lists 0.01 where its "1 vCore" row, the same meter, lists 0.1098, so the cheapest-row rule prices `Standard_D4ads_v5` there at about a tenth of its other rows.
+- **The rows for each size** differ from the per-vCore meter times the vCores in 15 regions, mostly by about 1 % and at most 17 % (Qatar Central, Saudi Arabia East), and the two series agree there. Norway West's Ddsv5 "4 vCore" row, 1.3236, is 2.1 times its meter's 0.62, and it's the only place where the two series' rows differ.
+- **Which one a bill uses** isn't on Learn's compute page; a Learn Q&A from May 2024 reports a flexible server's bill moving to a "1 vCore" meter.
+
+So with the demo's own prices, the two sizes cost the same everywhere but Indonesia Central, where that row makes `Standard_D4ds_v5` look ten times dearer.
+
+**Work summary.**
+
+- **`Test-DemoT4SizeIncrease`** counts a move to another size of the same tier and vCores as one that can raise the price, so the template step prices it as it prices a move to a larger size: over either ceiling, or without a price, T4 keeps its size (`DEPLOY.T4.SIZE`, Ceiling), and within both it scales and says the check passed. The same size isn't a move. A move to a size `t4SkuName` sets now deletes a read replica first in this case too, as every priced move does, and the T4 track creates it again; the log says T4 "moves" rather than "grows".
+- **The tie stays, with a limitation.** The fallback's order is fixed before any size is priced: preflight picks where it starts, and each step's cost check runs right before its attempt. And by the demo's own prices, the two sizes are the same in every region but the row above. So a tie-break by price would change nothing where the size rows differ, and would act on that row. The limitations page says that the fallback can try the dearer size first.
+- **Docs:** ADR 0019 (the fallback's "(4 vCores)", the move's pricing, and the order's sentence), the three comments and the order's comment, a test's comment, the limitations page, the CHANGELOG (a new entry, and the replica entry's words on Norway West), and this report.
+- **Tests** (`DbHubDemo.T4Fallback`, `DbHubDemo.DotNetSdk`): the block that pinned "isn't priced" now prices the move to the default from `Standard_D4ads_v5`, which scales within the ceilings and keeps its size over one; a `t4SkuName` move from `Standard_D4ds_v5` to `Standard_D4ads_v5` is priced and scales; the size table has both directions and the same size; and the `Invoke-DemoDotNet` test runs with `-WhatIf` as well as `-Confirm`.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/T4Helpers.ps1`, `scripts/modules/DbHubDemo/Public/Invoke-DemoTemplateDeployment.ps1`, `tests/unit/DbHubDemo.T4Fallback.Tests.ps1`, `tests/unit/DbHubDemo.DotNetSdk.Tests.ps1`, `docs/adr/0019-t4-postgresql-flexible-server.md`, `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 1,315 passed, none failed, in DbHubDemo.T4Fallback, DbHubDemo.DotNetSdk, DbHubDemo.T4, DbHubDemo.T4Replica, DbHubDemo.Lifecycle, DbHubDemo.Tracks, DbHubDemo.Preflight, DbHubDemo.Cost, DbHubDemo.OneClick, DbHubDemo.OneCommand, and DbHubDemo.Workload. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped (run again after another session's cleanup of `%TEMP%\dbhub-*` interrupted the first run).
+- Without the fix: on 4e0126d9's `T4Helpers.ps1`, 4 tests fail (the default move's pricing, the `t4SkuName` move's, and the table's two directions); without `Invoke-DemoDotNet`'s `$WhatIfPreference` pin, its `-WhatIf` case fails ("What if: Performing the operation "Output to File"", no error text, and the temporary file left), and without its `$ConfirmPreference` pin, its `-Confirm` case does.
+- PSScriptAnalyzer: no new findings (none in the two source files, and 7 and 4 before and after in the test files, all their helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- A move between the two sizes now needs a price: when the Retail Prices API doesn't answer, T4 keeps its size that run, as for a larger size, and the next run moves it.
+- Not changed: the cheapest-row rule, which prices `Standard_D4ads_v5` in Indonesia Central from its 0.01 row. Reading the per-vCore meter's "1 vCore" row first would fix it; it's a change of its own, proposed to the coordinator.

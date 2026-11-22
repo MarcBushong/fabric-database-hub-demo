@@ -10,8 +10,9 @@ $script:T4StopJobEndedStatuses = @('Completed', 'Failed', 'Stopped', 'Suspended'
 $script:T4Sizes = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
 $script:T4FallbackSizes = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
 # The same sizes, cheapest first by tier and vCores (Burstable before General Purpose, fewer vCores first; never a price,
-# ADR 0016), for the fallback of a size t4SkuName sets (2026-11-09). Standard_D4ds_v5 and Standard_D4ads_v5 share the
-# vCore price, and the default comes first.
+# ADR 0016), for the fallback of a size t4SkuName sets (2026-11-09). Standard_D4ds_v5 and Standard_D4ads_v5 have the same
+# tier and vCores, and the default comes first; their list prices can differ in a region, so the fallback can try the
+# dearer one first there (docs/limitations.md).
 $script:T4CostOrder = @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5')
 # The states of a server that's deployed, whatever it's doing (ServerState in Servers - Get, API 2025-08-01): not Dropping
 # ("Server is being deleted") and not Provisioning ("being created"). After a failed attempt, a server in another state is
@@ -228,10 +229,11 @@ function Get-DemoT4SkuSpec {
 
 function Test-DemoT4SizeIncrease {
     <#
-    Whether moving an existing T4 from -From to -To raises its hourly price, so the move is priced first (review of PR 20,
-    2026-11-04): General Purpose costs more than Burstable, and within a tier more vCores cost more (the documented sizes:
-    Standard_B1ms, Standard_B2s, Standard_D2ds_v5, and Standard_D4ds_v5 and Standard_D4ads_v5, which share the vCore price).
-    A size it doesn't know counts as a raise, so it's priced. Pure. Internal.
+    Whether moving an existing T4 from -From to -To can raise its hourly price, so the move is priced first (review of PR
+    20, 2026-11-04): General Purpose costs more than Burstable, and within a tier more vCores cost more (the documented
+    sizes: Standard_B1ms, Standard_B2s, Standard_D2ds_v5, and Standard_D4ds_v5 and Standard_D4ads_v5). A move to another
+    size of the same tier and vCores counts too (201a6666's review, 2026-11-22): the two 4-vCore sizes are separate meters,
+    whose list prices can differ in a region. A size it doesn't know counts as a raise, so it's priced. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -244,7 +246,9 @@ function Test-DemoT4SizeIncrease {
     )
 
     try {
-        return ((Get-DemoT4SizeRank -SkuName $To) -gt (Get-DemoT4SizeRank -SkuName $From))
+        $toRank = Get-DemoT4SizeRank -SkuName $To
+        $fromRank = Get-DemoT4SizeRank -SkuName $From
+        return ($toRank -gt $fromRank -or ($toRank -eq $fromRank -and $To -cne $From))
     }
     catch {
         return $true
@@ -253,8 +257,8 @@ function Test-DemoT4SizeIncrease {
 
 function Get-DemoT4SizeRank {
     # A documented T4 size's cost class: General Purpose above Burstable, and more vCores above fewer, never a price (ADR
-    # 0016). Standard_D4ds_v5 and Standard_D4ads_v5 share one (the same vCore price). Throws for a size it doesn't know.
-    # Pure. Internal.
+    # 0016). Standard_D4ds_v5 and Standard_D4ads_v5 share one (the same tier and vCores), though their list prices can
+    # differ in a region. Throws for a size it doesn't know. Pure. Internal.
     [CmdletBinding()]
     [OutputType([int])]
     param(
@@ -275,7 +279,8 @@ function Get-DemoT4FallbackOrder {
       other documented sizes that cost as much or more, cheapest first, then the cheaper ones, nearest first, so a 4-vCore
       size tries its peer before smaller ones. Standard_B1ms: Standard_B2s, Standard_D2ds_v5, Standard_D4ds_v5,
       Standard_D4ads_v5. Standard_D4ds_v5: Standard_D4ads_v5, Standard_D2ds_v5, Standard_B2s, Standard_B1ms.
-    The order follows tier and vCores (Get-DemoT4SizeRank), never a price (ADR 0016). Pure. Internal.
+    The order follows tier and vCores (Get-DemoT4SizeRank), never a price (ADR 0016), so the two 4-vCore sizes come in the
+    list's order, Standard_D4ds_v5 first, whatever the region charges for each. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]

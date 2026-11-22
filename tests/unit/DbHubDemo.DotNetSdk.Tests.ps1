@@ -600,42 +600,47 @@ Describe 'Invoke-DemoDotNet -DotNetPath' {
         { InModuleScope DbHubDemo { Invoke-DemoDotNet -ArgumentList @('--version') -WorkingDirectory $TestDrive } } | Should -Throw '*was not found on PATH*'
     }
 
-    It 'runs for a caller with -Confirm in a non-interactive shell without asking, and leaves no temporary file (2026-11-22)' {
+    It 'runs for a caller with -<Switch> in a non-interactive shell without asking or skipping, and leaves no temporary file (2026-11-22)' -ForEach @(
+        @{ Switch = 'Confirm' }
+        @{ Switch = 'WhatIf' }
+    ) {
         # Under a caller's -Confirm, the stderr redirection (Out-File) and the temporary file's deletion asked, which a
-        # non-interactive shell refuses: for example a direct Publish-DemoWorkloadRunner -Confirm. An advanced caller with
-        # -Confirm runs one call in a pwsh -NonInteractive child, with this PowerShell as the stand-in dotnet, writing to
+        # non-interactive shell refuses: for example a direct Publish-DemoWorkloadRunner -Confirm. Under -WhatIf, both were
+        # skipped, so the error text was lost and the file stayed (201a6666's review of 4e0126d9). An advanced caller with
+        # the switch runs one call in a pwsh -NonInteractive child, with this PowerShell as the stand-in dotnet, writing to
         # both streams, and a temporary folder of its own.
-        $root = Join-Path -Path $TestDrive -ChildPath 'confirm'
+        $root = Join-Path -Path $TestDrive -ChildPath ('caller-' + $Switch)
         $temp = Join-Path -Path $root -ChildPath 'temp'
         $work = Join-Path -Path $root -ChildPath 'work'
         $null = New-Item -ItemType Directory -Path $temp, $work -Force
         $standIn = Join-Path -Path $root -ChildPath 'stand-in-dotnet.ps1'
         Set-Content -LiteralPath $standIn -Encoding ascii -Value @('[Console]::Out.WriteLine(''ran'')', '[Console]::Error.WriteLine(''stand-in warning'')', 'exit 0')
-        $child = Join-Path -Path $root -ChildPath 'run-confirm.ps1'
+        $child = Join-Path -Path $root -ChildPath 'run-caller.ps1'
         Set-Content -LiteralPath $child -Encoding ascii -Value @(
-            'param([string] $ModulePath, [string] $Shell, [string] $StandIn, [string] $Work, [string] $Temp)'
+            'param([string] $ModulePath, [string] $Shell, [string] $StandIn, [string] $Work, [string] $Temp, [string] $Switch)'
             '$env:TMP = $Temp'
             '$env:TEMP = $Temp'
             '$env:TMPDIR = $Temp'
             'Import-Module -Name $ModulePath -Force'
             '$result = & (Get-Module -Name DbHubDemo) {'
-            '    param([string] $Shell, [string] $StandIn, [string] $Work)'
-            '    function Test-DemoConfirmCaller {'
+            '    param([string] $Shell, [string] $StandIn, [string] $Work, [string] $Switch)'
+            '    function Test-DemoShouldProcessCaller {'
             '        [CmdletBinding(SupportsShouldProcess = $true)]'
             '        param([string] $Shell, [string] $StandIn, [string] $Work)'
             '        Invoke-DemoDotNet -DotNetPath $Shell -ArgumentList @(''-NoLogo'', ''-NoProfile'', ''-NonInteractive'', ''-File'', $StandIn) -WorkingDirectory $Work'
             '    }'
-            '    Test-DemoConfirmCaller -Shell $Shell -StandIn $StandIn -Work $Work -Confirm'
-            '} $Shell $StandIn $Work'
+            '    $common = @{ $Switch = $true }'
+            '    Test-DemoShouldProcessCaller -Shell $Shell -StandIn $StandIn -Work $Work @common'
+            '} $Shell $StandIn $Work $Switch'
             '''RESULT exit={0} out={1} err={2}'' -f $result.ExitCode, ([string]$result.StdOut).Trim(), ([string]$result.StdErr).Trim()'
             '''LEFT={0}'' -f @(Get-ChildItem -LiteralPath $Temp -Filter ''tmp*.tmp'' -File).Count'
         )
         $shell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $output = @(& $shell -NoProfile -NonInteractive -File $child -ModulePath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Shell $shell -StandIn $standIn -Work $work -Temp $temp 2>&1 | ForEach-Object { [string]$_ })
+        $output = @(& $shell -NoProfile -NonInteractive -File $child -ModulePath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Shell $shell -StandIn $standIn -Work $work -Temp $temp -Switch $Switch 2>&1 | ForEach-Object { [string]$_ })
         $text = $output -join "`n"
-        $text | Should -Not -Match 'NonInteractive mode' -Because 'a dotnet call never asks; its caller decides with ShouldProcess'
+        $text | Should -Not -Match 'NonInteractive mode|What if:' -Because 'a dotnet call never asks or skips; its caller decides with ShouldProcess'
         $output | Should -Contain 'RESULT exit=0 out=ran err=stand-in warning' -Because $text
-        $output | Should -Contain 'LEFT=0' -Because ('the temporary file goes without asking: {0}' -f $text)
+        $output | Should -Contain 'LEFT=0' -Because ('the temporary file goes: {0}' -f $text)
     }
 }
 
