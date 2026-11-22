@@ -490,12 +490,16 @@ describe("T5's normalized RU consumption at 100 %", () => {
     });
 
     // The shared finestPerInterval (a390db00): a remainder of a coarser save spans only part of its interval, and its value
-    // is that interval's highest. The words name the save's interval, never the remainder's span.
-    it("names the interval of the save a remainder comes from, not its own span", () => {
+    // is the highest in its own minutes. The review of 96abcf65, after F4's grain: they're what the words give, never the
+    // save's interval beside them ("keeps the highest in each 15-minute interval … the interval from 17:00 to 17:03").
+    it("gives a remainder its own minutes, never the interval of the save it comes from", () => {
         const piece = { ...point(COSMOS_METRICS.normalizedRu, "17:00:00", 100, 3 * 60_000), grainMs: 15 * 60_000 };
         const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [piece] });
-        expect(a.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval");
-        expect(a.rootCause?.statement).toContain("the interval from 17:00 to 17:03 UTC");
+        expect(a.rootCause?.statement).toContain("(the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each interval) reached 100 % in at least one second of the interval from 17:00 to 17:03 UTC");
+        expect(a.rootCause?.statement).not.toMatch(/15-minute|3-minute/);
+        // A whole interval keeps its save's words.
+        const whole = analyzeThroughput({ from: at("17:00:00"), to: at("17:15:00"), metrics: [{ ...piece, intervalMs: 15 * 60_000 }] });
+        expect(whole.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval) reached 100 % in at least one second of the interval from 17:00 to 17:15 UTC");
     });
 
     // Final tests' check of ddebd4c3 (F6): "each of the 9 intervals from 15:31 to 15:42" read as all 11 at 100 %, and the 429s

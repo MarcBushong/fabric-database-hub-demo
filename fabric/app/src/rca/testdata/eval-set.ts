@@ -49,7 +49,9 @@ export const EVAL_WINDOWS: Record<EvalData, { from: string; to: string }> = {
  * supported there), and the notebook's SCENARIO_SIGNALS doesn't map them. Every other scenario's families are the
  * scoreboard's (expectedFamilies), and so is the rest of the rule (ADR 0031): an episode of one of its families on its
  * target, in the bin that holds its start or later, before TELEMETRY_LAG_MINUTES after its end or the start of the next
- * fault on its target that raises the same signal, whichever comes first (inSearch, searchEndOf).
+ * fault on its target that raises the same signal, whichever comes first (inSearch, searchEndOf), or one still open at its
+ * start, in the bin that holds that start. An episode has no values per bin, so a one-bin dip at the fault's start is in it,
+ * and its level is the notebook's, not the scoreboard's bound over its baseline: eval.test.ts pins what that leaves apart.
  */
 export const T4_BEATS: Record<string, { families: string[]; target?: string }> = {
     "replica-lag": { families: ["replica_lag"], target: "T4-replica" },

@@ -592,7 +592,10 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     };
     const first = signalOf(families[0] ?? "");
     const unmeasured = (status: StatusName, note: string): FaultScore => ({ ...base, family: families[0] ?? "", signal: first?.label ?? scenario, kind: first?.kind ?? "decimal", status, note });
-    if (target !== "T1" && target !== "T2" && target !== "T3") return unmeasured("Not supported", `${target}'s beats show in its Azure Monitor metrics, which the history keeps per capture, not per request.`);
+    // T4's and T5's beats have no signal the notebook reads: their row names the fault, never the first family a keyword in
+    // its name gives (the review of 96abcf65: "connection" made T4's connection surge "Buffer IO (PAGEIOLATCH) waits", as the
+    // notebook's own fallback does).
+    if (target !== "T1" && target !== "T2" && target !== "T3") return { ...unmeasured("Not supported", `${target}'s beats show in its Azure Monitor metrics, which the history keeps per capture, not per request.`), signal: scenarioTitle(scenario) };
 
     const targetBins = ctx.bins.filter((b) => b.target === target).sort((a, b) => a.at.getTime() - b.at.getTime());
     const step = stepAround(targetBins, injectedAt.getTime(), injectedEnd.getTime());

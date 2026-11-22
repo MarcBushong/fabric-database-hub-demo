@@ -14,11 +14,13 @@ import {
     aggregate,
     cosmosEpisodes,
     detectionBound,
+    expectedFamilies,
     howMeasured,
     minutesText,
     nextInjection,
     planEvents,
     postgresEpisodes,
+    scenarioTitle,
     scorePlan,
     stateAt,
     summarize,
@@ -149,6 +151,20 @@ describe("the business lens", () => {
 });
 
 describe("the scoreboard", () => {
+    // The review of 96abcf65: T4's connection surge read "Buffer IO (PAGEIOLATCH) waits" in the Signal column, the first
+    // family a keyword in its name gives ("connect-io-n"), as the notebook's own fallback does; T5's storm read its raw ID.
+    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 10, 18), run(`${SESSION}:01`, "T5", "incident:ru-storm", 30, 40)];
+        const scores = scorePlan(toPlans(runs)[0], { bins: [], beats: [], runs });
+        expect(scores.map((s) => [s.status, s.signal])).toEqual([
+            ["Not supported", "Connection surge (capacity maxed)"],
+            ["Not supported", scenarioTitle("ru-storm")],
+        ]);
+        expect(scenarioTitle("ru-storm")).not.toBe("ru-storm");
+        // The keyword fallback stays as the notebook has it: it scores nothing on T4, whose faults aren't measured.
+        expect(expectedFamilies("connection-surge")).toEqual(["io"]);
+    });
+
     it("groups the faults under their session, newest first, and leaves out the baseline and failed requests", () => {
         const plans = toPlans(RUNS);
         expect(plans.map((p) => `${p.kind}:${p.label}:${p.faults.length}`)).toEqual(["session:Session 7f3a9c21:4", "request:CPU pressure on T1:1"]);
@@ -739,10 +755,22 @@ describe("the postmortem", () => {
             // The sections above stay the filter's, and the queries behind the key's part end the postmortem.
             expect(markdown.slice(0, markdown.indexOf("## What the demo injected"))).not.toMatch(/Memory grant|Plan regression|IO pressure|T4 \(Reporting\)/);
             expect(markdown).toContain(`And the answer key's, for the targets this page's filter hides:\n\n\`\`\`dax\n// ${postgresSeriesQuery().title}\nEVALUATE`);
-            // A session whose every fault the filter hides never says its plan injected nothing.
+            // A session whose every fault the filter hides never says its plan injected nothing, nor that nothing was injected:
+            // its Summary, Impact, and Follow-ups speak of the targets the filter shows, and the Summary points to the key (the
+            // review of 96abcf65: they said "No fault was injected in this window" beside the key's list of its faults).
             const none = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all, rca: investigated, hidden: null }).markdown;
-            expect(none).not.toContain("injected nothing");
+            expect(none).not.toMatch(/injected nothing|No fault was injected|nothing was injected|Nothing was injected/);
+            expect(sectionOf(none, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides, and the answer key below lists them.\n");
+            expect(sectionOf(none, "Impact on ContosoCare")).toContain("No measured impact on the targets this page's filter shows: the session's faults are all on targets it hides.");
+            expect(sectionOf(none, "Follow-ups")).toContain("- None from the data on the targets this page's filter shows: the session's faults are all on targets it hides.");
             expect(sectionOf(none, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
+            // Without the RCA tables, the same, with no key to point to; the Cause, which lists what was injected then, too.
+            const plain = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all }).markdown;
+            expect(plain).not.toMatch(/injected nothing|No fault was injected|nothing was injected|Nothing was injected|answer key/);
+            expect(sectionOf(plain, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides.\n");
+            expect(sectionOf(plain, "Cause")).toContain("None of the session's faults is on the targets this page's filter shows.");
+            // A window with no fault on any target still says so.
+            expect(sectionOf(buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: [{ ...shown, faults: [] }] }).markdown, "Summary")).toContain("- No fault was injected in this window: Scenario Runs has no incident request in it.");
             // Without the investigation, the answer key is the release's: what the filter shows.
             expect(buildPostmortem({ ...filtered, plans: all, hidden }).markdown).not.toMatch(/filter hides|Memory grant|Connection surge/);
         });

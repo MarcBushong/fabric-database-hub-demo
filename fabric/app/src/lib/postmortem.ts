@@ -123,14 +123,18 @@ const faultTitle = (run: SessionRun) => scenarioTitle(scenarioOf(run));
 
 const NOT_MEASURED = "Not measured: the telemetry didn't load.";
 
+/** The targets the page's filter shows, which the postmortem's measured sections read. */
+const SHOWN = "on the targets this page's filter shows";
+
 /**
  * Why the impact table is empty, from what was measured (F23), said of every fault only when it's so of every fault: the
  * notebook's own check, when it saw every one; "not visible by its rule", when every one was measured and wasn't;
- * otherwise what the follow-ups give each fault.
+ * otherwise what the follow-ups give each fault. With no fault on the targets the page's filter shows, while the plan has
+ * some on targets it hides, it says so of the shown ones only (the review of 96abcf65).
  */
-function noImpactText(scores: readonly FaultScore[], unscored: boolean): string {
+function noImpactText(scores: readonly FaultScore[], unscored: boolean, filtered: boolean): string {
     if (unscored) return NOT_MEASURED;
-    if (scores.length === 0) return "No measured impact: nothing was injected or measured in this window.";
+    if (scores.length === 0) return filtered ? `No measured impact ${SHOWN}: the session's faults are all on targets it hides.` : "No measured impact: nothing was injected or measured in this window.";
     if (scores.every((s) => s.status === "Pass" && !s.bound)) return "No impact in business words: the notebook's own check saw these faults' signals, and their bins aren't in this view.";
     if (scores.every((s) => s.status === "Warning" && s.bound)) return "No measured impact: no fault's signal was visible by its rule in this window; the follow-ups say what each one's signal reached.";
     return "No measured impact in this view; the follow-ups say what was measured for each fault, or why it wasn't.";
@@ -234,7 +238,18 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("## Summary", "");
     const unscored = unscoredOf(plan, scores);
     const injected = scores.length + unscored.length;
-    if (injected === 0) lines.push("- No fault was injected in this window: Scenario Runs has no incident request in it.");
+    // The plan's faults on the targets the page's filter hides, from Scenario Runs before the filter (the reviews of
+    // b4370565 and 96abcf65): the sections below read the filter's targets, so with none of its faults shown, they never say
+    // that nothing was injected. With the RCA tables, the answer key lists them, as the investigation reads every target.
+    const twin = input.plans?.find((p) => p.key === plan.key);
+    const hiddenFaults = twin ? twin.faults.filter((f) => !plan.faults.some((g) => g.requestId === f.requestId)) : [];
+    const keyed = !!input.rca && input.rca !== "request";
+    const filtered = injected === 0 && hiddenFaults.length > 0;
+    if (filtered) {
+        const targets = [...new Set(hiddenFaults.map((f) => f.target))].sort();
+        const where = targets.length <= 2 ? targets.join(" and ") : `${targets.slice(0, -1).join(", ")}, and ${targets[targets.length - 1]}`;
+        lines.push(`- None of the session's faults is ${SHOWN}: its ${hiddenFaults.length} fault${hiddenFaults.length === 1 ? " is" : "s are"} on ${where}, which the filter hides${keyed ? ", and the answer key below lists them" : ""}.`);
+    } else if (injected === 0) lines.push("- No fault was injected in this window: Scenario Runs has no incident request in it.");
     if (scores.length > 0) {
         const targets = [...new Set(scores.map((s) => s.target))].sort().join(", ");
         lines.push(
@@ -271,7 +286,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         ...episodes.map((e) => ({ at: e.visibleAt, target: e.target, impact: e.impact })),
     ].sort((a, b) => a.at.getTime() - b.at.getTime());
     lines.push("## Impact on ContosoCare", "");
-    if (impacts.length === 0) lines.push(noImpactText(scores, unscored.length > 0));
+    if (impacts.length === 0) lines.push(noImpactText(scores, unscored.length > 0, filtered));
     else lines.push(...table(["Service", "Target", "What it felt", "Measured signal"], impacts.map((i) => [i.impact.service, i.target, i.impact.headline.replace(/^[^:]+:\s*/, ""), i.impact.evidence])));
     lines.push("");
 
@@ -279,14 +294,12 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     // and then what the demo injected, in a section of its own, labeled as the answer key. Without them, what was injected.
     const others = input.rca && input.rca !== "request" ? faultsFromOtherPlans(input.plans ?? [], plan, input.rca) : [];
     // The answer key reads every target, as the investigation does, whatever the page's filter shows (the review of
-    // b4370565): the session's faults on the targets it hides, from Scenario Runs before the filter, and T4's and T5's
-    // episodes there, which the dialog loads. The sections above stay the filter's.
-    const twin = input.rca && input.rca !== "request" ? input.plans?.find((p) => p.key === plan.key) : undefined;
-    const hiddenFaults = twin ? twin.faults.filter((f) => !plan.faults.some((g) => g.requestId === f.requestId)) : [];
-    const hidden = input.rca && input.rca !== "request" ? (input.hidden ?? null) : null;
+    // b4370565): the session's faults on the targets it hides (worked out above), and T4's and T5's episodes there, which the
+    // dialog loads. The sections above stay the filter's.
+    const hidden = keyed ? (input.hidden ?? null) : null;
     const hiddenEpisodes = hidden?.episodes ?? [];
     const hiddenLines = [
-        ...hiddenFaults.map((r) => `- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`),
+        ...(keyed ? hiddenFaults : []).map((r) => `- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`),
         ...hiddenEpisodes.map((e) => {
             const end = e.recoveredAt ?? e.endAt;
             return `- **${e.signal}** on ${e.target} (${serviceName(e.target)}), ${end ? `${time(e.visibleAt)} to ${time(end)} UTC` : `from ${time(e.visibleAt)} UTC`}, an episode in its Azure Monitor metrics.`;
@@ -308,7 +321,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
             ...hiddenLines,
         );
     }
-    if (injected === 0 && episodes.length === 0 && hiddenLines.length === 0) injectedLines.push(others.length > 0 ? "This session's plan injected nothing." : "Nothing was injected in this window.");
+    if (injected === 0 && episodes.length === 0 && hiddenLines.length === 0) injectedLines.push(filtered ? `None of the session's faults is ${SHOWN}.` : others.length > 0 ? "This session's plan injected nothing." : "Nothing was injected in this window.");
     if (others.length > 0) {
         injectedLines.push(
             "",
@@ -376,7 +389,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     if (episodes.some((e) => e.target === "T4-replica")) follow.push("**Reports' DR copy (T4's read replica):** long reports on the replica hold back its replay; run them elsewhere, or accept the lag.");
     // Said only when it's so: every fault and every episode has a measured recovery (each one that hasn't is listed above).
     const everyRecovered = scores.length + episodes.length > 0 && scores.every((s) => s.recoveredAt) && episodes.every((e) => e.recoveredAt);
-    if (follow.length === 0) follow.push(everyRecovered ? "None from the data: every signal showed and recovered." : "None from the data: nothing was injected or measured in this window.");
+    if (follow.length === 0) follow.push(everyRecovered ? "None from the data: every signal showed and recovered." : filtered ? `None from the data ${SHOWN}: the session's faults are all on targets it hides.` : "None from the data: nothing was injected or measured in this window.");
     lines.push(...follow.map((f) => `- ${f}`), "");
 
     lines.push("## How this was measured", "");

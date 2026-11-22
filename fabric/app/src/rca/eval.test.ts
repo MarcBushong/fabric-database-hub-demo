@@ -6,8 +6,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Bin, SessionRun } from "@/data/model";
+import { toAgentBeats, toBins, toIncidents, toSessions, toWaitBins, withCategoryWaits, type Bin, type SessionRun } from "@/data/model";
+import { agentLoopQuery, incidentWaitsQuery, incidentsQuery, seriesQuery, sessionsQuery, type Filters } from "@/data/queries";
 import { expectedFamilies, inSearch, scenarioOf, scorePlan, searchEndOf, toPlans } from "@/lib/scoreboard";
+import { sampleRows } from "@/preview/sample-data";
+import { SESSION_KEY } from "@/preview/sample-session";
 import { episodesFromBins } from "./detector";
 import { answerKeyOf, fixtureEvidence, namesAScenario, scenarioIds } from "./testdata/contract";
 import { EVAL_SET, EVAL_WINDOWS, NO_KEY_ROW, NOT_GRADABLE, T4_BEATS, type EvalCase, type EvalData } from "./testdata/eval-set";
@@ -82,22 +85,31 @@ interface Listed {
     target: string;
     family: string;
     start: string;
+    /** Its recovery, or null when its end isn't known: its data ended, or broke off, first. */
+    end: string | null;
+    /** Its last sample at its level: with no known end, as far as it's known to have lasted. */
+    last: string;
 }
 
 /**
- * The episode that catches a fault by the scoreboard's rule, or null: the first of one of its families on its target that
- * starts in the bin that holds the fault's start or later, before TELEMETRY_LAG_MINUTES after its end or the start of the
- * next fault on its target that raises the same signal, whichever comes first.
+ * The episode that catches a fault by the scoreboard's rule, and when, or null: one of its families on its target at its
+ * level in the bin that holds the fault's start or later, before TELEMETRY_LAG_MINUTES after its end or the start of the
+ * next fault on its target that raises the same signal, whichever comes first. One that starts in those minutes catches it
+ * in the bin that holds its start; one still open at the fault's start, in the bin that holds that start, where the
+ * scoreboard's first bin at its level is too (the review of 96abcf65: a deadlock storm right after a blocking chain, in one
+ * episode with it, was missed). With no known end, an episode is open only as far as its last sample at its level.
  */
-function catchOf(fault: SessionRun, faults: readonly SessionRun[], episodes: readonly Listed[]): Listed | null {
+function catchOf(fault: SessionRun, faults: readonly SessionRun[], episodes: readonly Listed[]): { episode: Listed; at: number } | null {
     const scenario = scenarioOf(fault);
     const target = T4_BEATS[scenario]?.target ?? fault.target;
     const from = (fault.windowStart as Date).getTime();
+    const fromBin = Math.floor(from / BIN) * BIN;
+    const open = (e: Listed) => binOf(e.start) < fromBin && (e.end !== null ? Date.parse(e.end) > from : binOf(e.last) >= fromBin);
     const hits = familiesOf(scenario).flatMap((family) => {
         const to = searchEndOf(fault, family, faults, familiesOf);
-        return episodes.filter((e) => e.target === target && e.family === family && inSearch(binOf(e.start), BIN, from, to));
+        return episodes.filter((e) => e.target === target && e.family === family && (inSearch(binOf(e.start), BIN, from, to) || open(e))).map((episode) => ({ episode, at: Math.max(binOf(episode.start), fromBin) }));
     });
-    return hits.sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0] ?? null;
+    return hits.sort((a, b) => a.at - b.at || Date.parse(a.episode.start) - Date.parse(b.episode.start))[0] ?? null;
 }
 
 interface Graded {
@@ -118,6 +130,9 @@ async function grade(data: EvalData, key: Run[] = runsOf(data)): Promise<Graded>
     const { from, to } = EVAL_WINDOWS[data];
     const found = await toolsFor(data).investigate("find_incidents", { from, to });
     if (typeof found === "string") throw new Error(found);
+    // Each listed incident's last sample at its level, from the detector's own list for the same minutes.
+    const lasts = new Map((await toolsFor(data).episodes(new Date(from), new Date(to))).map((e) => [e.key, e.last.toISOString()]));
+    const listed: Listed[] = found.episodes.map((e) => ({ key: e.key, target: e.target, family: e.family, start: e.start, end: e.end, last: lasts.get(e.key) ?? e.start }));
     const name = (r: Run) => `${r.scenario} ${r.target} ${clock(r.start)}`;
     const within = (r: Run) => r.start.getTime() >= Date.parse(from) && r.start.getTime() < Date.parse(to);
     const inMinutes = key.filter(within);
@@ -127,16 +142,16 @@ async function grade(data: EvalData, key: Run[] = runsOf(data)): Promise<Graded>
     const runs = inMinutes.map((r, i) => {
         if (notGradable[r.scenario]) return `${name(r)}: not graded (${notGradable[r.scenario]})`;
         if (familiesOf(r.scenario).length === 0) return `${name(r)}: no rule`;
-        const e = catchOf(faults[i], faults, found.episodes);
-        if (!e) return `${name(r)}: missed`;
-        caught.add(e.key);
-        return `${name(r)}: caught by ${e.key} after ${Math.max(0, Date.parse(e.start) - r.start.getTime()) / 1000} s`;
+        const c = catchOf(faults[i], faults, listed);
+        if (!c) return `${name(r)}: missed`;
+        caught.add(c.episode.key);
+        return `${name(r)}: caught by ${c.episode.key} after ${Math.max(0, Date.parse(c.episode.start) - r.start.getTime()) / 1000} s`;
     });
     // The families the key grades: a fixture's key records every run, so all of them; a live key file, its runs' only.
     const graded = new Set(inMinutes.filter((r) => !notGradable[r.scenario]).flatMap((r) => familiesOf(r.scenario).map((f) => `${T4_BEATS[r.scenario]?.target ?? r.target}|${f}`)));
     const complete = data === "t1" || data === "t4";
     const keyless = NO_KEY_ROW[data] ?? {};
-    const unexplained = found.episodes.filter((e) => !caught.has(e.key));
+    const unexplained = listed.filter((e) => !caught.has(e.key));
     const gradedHere = (e: Listed) => complete || graded.has(`${e.target}|${e.family}`);
     return {
         runs,
@@ -269,32 +284,83 @@ describe("the evaluation set grades by the scoreboard's rule (ADR 0031)", () => 
     const blockedIn = (minutes: readonly number[]): Bin[] =>
         Array.from({ length: 151 }, (_, i) => i - 60).map((m) => ({ at: at(m), target: "T1" as const, cpu: 20, blocked: minutes.includes(m) ? 3 : 0, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null }));
 
-    it("catches what the scoreboard sees in the same telemetry, and nothing else: the bin that holds a fault's start, 14 and exactly 15 minutes after its end, and the next fault that raises its signal", () => {
-        const cases = [
+    /** The detector's episodes in some bins, as the grading lists them. */
+    const listedOf = (bins: readonly Bin[]): Listed[] => episodesFromBins(bins).map((e) => ({ key: e.key, target: e.target, family: e.family, start: e.start.toISOString(), end: e.end ? e.end.toISOString() : null, last: e.last.toISOString() }));
+    const scoreboardOf = (plan: ReturnType<typeof toPlans>[number], context: Parameters<typeof scorePlan>[1]) => Object.fromEntries(scorePlan(plan, context).map((s) => [s.key.slice(-2), s.status === "Pass" ? s.visibleAt : null]));
+    const evaluationOf = (faults: readonly SessionRun[], episodes: readonly Listed[]) => Object.fromEntries(faults.map((f) => [f.requestId.slice(-2), ((c) => (c ? new Date(c.at) : null))(catchOf(f, faults, episodes))]));
+
+    it("catches what the scoreboard sees in the same telemetry, and nothing else: the bin that holds a fault's start, 14 and exactly 15 minutes after its end, the next fault that raises its signal, and a signal already up at its start, a bin early only after a one-bin dip there", () => {
+        const pair = [fault("00", "blocking-chain", 0, 10), fault("01", "deadlock-storm", 11, 21)];
+        const cases: Array<{ name: string; faults: SessionRun[]; blocked: number[]; expected: Record<string, Date | null>; scoreboard?: Record<string, Date | null> }> = [
             { name: "the bin that holds its start", faults: [fault("00", "blocking-chain", 0.5, 10)], blocked: [0, 1, 2], expected: { "00": at(0) } },
             { name: "14 minutes after its end", faults: [fault("00", "blocking-chain", 0, 10)], blocked: [24], expected: { "00": at(24) } },
             { name: "exactly 15 minutes after its end", faults: [fault("00", "blocking-chain", 0, 10)], blocked: [25], expected: { "00": null } },
-            { name: "after the next fault that raises its signal", faults: [fault("00", "blocking-chain", 0, 10), fault("01", "deadlock-storm", 11, 21)], blocked: [12, 13, 14, 15, 16, 17, 18], expected: { "00": null, "01": at(12) } },
+            { name: "after the next fault that raises its signal", faults: pair, blocked: [12, 13, 14, 15, 16, 17, 18], expected: { "00": null, "01": at(12) } },
+            // The review of 96abcf65: a storm whose blocking runs on from the chain's is in the chain's episode, open at its
+            // start, which the set took for nothing.
+            { name: "a signal already up at its start", faults: pair, blocked: Array.from({ length: 21 }, (_, i) => i + 1), expected: { "00": at(1), "01": at(11) } },
+            // With one bin's dip at the storm's start, the episode runs on across it (two samples under its level end one),
+            // and has no values per bin: the set catches the storm at its start's bin, the scoreboard at the bin after the dip.
+            { name: "a dip of one bin at its start", faults: pair, blocked: [...Array.from({ length: 10 }, (_, i) => i + 1), ...Array.from({ length: 10 }, (_, i) => i + 12)], expected: { "00": at(1), "01": at(11) }, scoreboard: { "00": at(1), "01": at(12) } },
         ];
         for (const c of cases) {
             const runs = [session, ...c.faults];
             const bins = blockedIn(c.blocked);
             const plan = toPlans(runs).find((p) => p.key === SESSION)!;
-            const scoreboard = Object.fromEntries(scorePlan(plan, { bins, beats: [], runs }).map((s) => [s.key.slice(-2), s.status === "Pass" ? s.visibleAt : null]));
-            const episodes = episodesFromBins(bins).map((e) => ({ key: e.key, target: e.target, family: e.family, start: e.start.toISOString() }));
-            const evaluation = Object.fromEntries(c.faults.map((f) => [f.requestId.slice(-2), ((e) => (e ? new Date(binOf(e.start)) : null))(catchOf(f, c.faults, episodes))]));
-            expect(evaluation, c.name).toEqual(scoreboard);
-            expect(evaluation, c.name).toEqual(c.expected);
+            expect(scoreboardOf(plan, { bins, beats: [], runs }), c.name).toEqual(c.scoreboard ?? c.expected);
+            expect(evaluationOf(c.faults, listedOf(bins)), c.name).toEqual(c.expected);
         }
     });
 
-    it("counts an episode in the bin that holds its start, and reads a scenario's families as the scoreboard does", () => {
+    it("counts an episode in the bin that holds its start, and one still open at the fault's start, and reads a scenario's families as the scoreboard does", () => {
         const f = fault("00", "locking-blocking", 0.5, 10);
-        const episode = (family: string, start: Date) => ({ key: `T1-${family}-${start.toISOString()}`, target: "T1", family, start: start.toISOString() });
-        // 13:30:10 is in the bin that holds the fault's start, 13:30:30; 13:29:40 is in the bin before.
-        expect(catchOf(f, [f], [episode("blocking", new Date(T0 + 10_000))])).not.toBeNull();
+        const episode = (family: string, start: Date, end: Date | null = null, last = start): Listed => ({ key: `T1-${family}-${start.toISOString()}`, target: "T1", family, start: start.toISOString(), end: end ? end.toISOString() : null, last: last.toISOString() });
+        // 13:30:10 is in the bin that holds the fault's start, 13:30:30; 13:29:40 is in the bin before, and over before it.
+        expect(catchOf(f, [f], [episode("blocking", new Date(T0 + 10_000))])?.at).toEqual(T0);
         expect(catchOf(f, [f], [episode("blocking", new Date(T0 - 20_000))])).toBeNull();
+        expect(catchOf(f, [f], [episode("blocking", at(-5), at(0))])).toBeNull();
+        // Recovered right at the fault's start: its first sample back under its level is that instant, so it's not open.
+        expect(catchOf(f, [f], [episode("blocking", at(-5), new Date(T0 + 30_000))])).toBeNull();
+        // Still open at its start: recovered after it, or with no known end, last at its level in the bin that holds it.
+        expect(catchOf(f, [f], [episode("blocking", at(-5), at(1))])?.at).toEqual(T0);
+        expect(catchOf(f, [f], [episode("blocking", at(-5), null, at(0))])?.at).toEqual(T0);
+        expect(catchOf(f, [f], [episode("blocking", at(-5), null, at(-1))])).toBeNull();
         // Locking and blocking raises blocked processes (the notebook's SCENARIO_SIGNALS): a deadlock alone doesn't catch it.
         expect(catchOf(f, [f], [episode("deadlock", at(2))])).toBeNull();
+    });
+
+    // The review of 96abcf65: on the preview's sample session, 7 of its 35 faults graded otherwise than the scoreboard's
+    // scorePlan, which reads the same bins. Every one is caught or missed alike now; six are caught a bin apart, each for
+    // a reason the set can't read: its episodes have no values per bin, its levels are the notebook's episode levels, not
+    // the scoreboard's bounds over their baselines, and it reads no Database Agent beat.
+    it("grades the preview's sample session as its scoreboard does: all 35 faults caught or missed alike, and six a bin apart, each for its reason", () => {
+        const filters: Filters = { targets: ["T1", "T2", "T3"], window: null };
+        const runs = toSessions(sampleRows(sessionsQuery(filters)));
+        const plan = toPlans(runs).find((p) => p.key === SESSION_KEY)!;
+        const plain = toBins(sampleRows(seriesQuery(filters)));
+        const around = { start: new Date(plan.start.getTime() - 30 * MIN), end: new Date(plan.end.getTime() + 45 * MIN) };
+        const bins = (["T1", "T2", "T3"] as const).flatMap((t) => withCategoryWaits(plain.filter((b) => b.target === t), toWaitBins(sampleRows(incidentWaitsQuery({ target: t, ...around })))));
+        const scoreboard = scoreboardOf(plan, { bins, beats: toAgentBeats(sampleRows(agentLoopQuery(filters))), runs, incidents: toIncidents(sampleRows(incidentsQuery(filters))) });
+        const evaluation = evaluationOf(plan.faults, listedOf(bins));
+        expect(plan.faults).toHaveLength(35);
+        const apart: Record<string, string> = {};
+        for (const [id, seen] of Object.entries(scoreboard)) {
+            const caught = evaluation[id];
+            expect(caught === null, `fault ${id}`).toBe(seen === null);
+            if (seen && caught && seen.getTime() !== caught.getTime()) apart[id] = `${(seen.getTime() - caught.getTime()) / MIN} min later on the scoreboard`;
+        }
+        expect(apart).toEqual({
+            // T1's deadlock storms, right after its blocking chains: a dip of one bin at each storm's start.
+            "05": "1 min later on the scoreboard",
+            "18": "1 min later on the scoreboard",
+            "28": "1 min later on the scoreboard",
+            // T3's Log Rate Governor waits stay at 0.05 s a minute at rest: over the detector's level, the notebook's (above
+            // 0), so the episode is open at the fault's start; under the scoreboard's bound, 1.5 times that baseline.
+            "11": "1 min later on the scoreboard",
+            "34": "1 min later on the scoreboard",
+            // T3's plan regression with the Database Agent beat: the scoreboard looks from the regression, at 14:03, and the
+            // set from the window's start, where the missing index's CPU from 14:02 is.
+            "13": "1 min later on the scoreboard",
+        });
     });
 });

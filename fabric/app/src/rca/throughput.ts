@@ -51,9 +51,13 @@ export function analyzeThroughput(input: { from: Date; to: Date; metrics: readon
     const full = normalized.filter((m) => (m.value ?? 0) >= 100);
     const peak = normalized.reduce((best, m) => ((m.value ?? 0) > (best.value ?? 0) ? m : best));
     const at100 = full.length ? full : [peak];
-    // Azure Monitor's interval, its save's: a remainder of a coarser point spans only part of it (the shared finestPerInterval's grains).
+    // Azure Monitor's interval, its save's (the shared finestPerInterval's grains). A remainder of a coarser point, or an
+    // interval its save's window cuts, spans only part of it, and its value is the highest in its own minutes, which the
+    // sentence gives: so it's never named by its save's interval beside them, as the replica's isn't (the review of
+    // 96abcf65, after F4's grain).
     const minutes = Math.round((at100[0].grainMs ?? at100[0].intervalMs ?? 60_000) / 60_000);
-    const each = at100[0].intervalUnknown ? "each interval of its save, whose length isn't known in these minutes" : `each ${minutes}-minute interval`;
+    const partial = at100.some((m) => !m.intervalUnknown && Math.round((m.intervalMs ?? 0) / 60_000) < Math.round((m.grainMs ?? m.intervalMs ?? 0) / 60_000));
+    const each = at100[0].intervalUnknown ? "each interval of its save, whose length isn't known in these minutes" : partial ? "each interval" : `each ${minutes}-minute interval`;
     // Only the intervals the sentence names (the review of 4e2c65ed: a window a minute past the episode added the next one).
     const named = (m: MetricPoint) => at100.some((n) => m.at.getTime() >= n.at.getTime() && m.at.getTime() < Math.max(end(n).getTime(), n.at.getTime() + 1));
     const sum = (rows: readonly MetricPoint[]) => rows.reduce((n, m) => n + (m.value ?? 0), 0);
