@@ -432,12 +432,18 @@ describe("a coarser point a finer save holds part of", () => {
         expect(throughput(incident)).toContain("Azure Monitor keeps the highest in each interval of its save, whose length isn't known in these minutes) reached 100 % in at least one second of the interval from 15:00 UTC:");
         expect(throughput(incident)).toContain("Azure Monitor counted 60000 requests in that interval, 3000 of them throttled (429, 5 %)");
         const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z", targets: ["T5"] }, tools);
-        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000, at 15:00:00 UTC, mostly the container's clients\)/);
+        // The review of 4667459c: never an hour's count at one second, "(3000, at 15:00:00 UTC ...)".
+        expect(errors.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000, in the interval from 15:00:00 UTC, whose length isn't known in these minutes, mostly the container's clients\)/);
+        expect(errors.findings[0].detail).toMatch(/^3000 throttled requests \(429\) on T5 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, mostly /);
         expect(errors.findings[0].evidence.map((e) => e.text)).toEqual(["429: 3000 throttled requests (429) in the interval from 15:00 UTC, whose length isn't known in these minutes (Azure Monitor)"]);
         for (const r of [incident, errors]) expect(texts(r)).not.toMatch(/1-minute|15:00(:00)? to 15:00/);
         // It stands for minutes from its start, so it isn't in the minutes that end there.
         const before = await ask("explain_errors", { from: "2026-11-20T14:40:00Z", to: "2026-11-20T15:00:00Z", targets: ["T5"] }, tools);
         expect(before.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded in the window.");
+        // Triage's count of errors that no episode holds reads the same (the review of 4667459c).
+        const failed = reading(["14:00", "15:00", "16:00", "17:00"].map((b) => ({ ...hourly(b, "connections_failed", b === "15:00" ? 7 : 0), TargetKey: "T4", ResourceName: "pgflex01" })));
+        const triaged = await ask("triage_window", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T15:20:00Z", targets: ["T4"] }, failed);
+        expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes (Azure Monitor counts included).");
     });
 
     // A peak kept around a finer save is only an upper bound of each stretch it's kept for: the replica's rise is said as

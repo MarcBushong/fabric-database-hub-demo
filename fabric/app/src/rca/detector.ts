@@ -382,7 +382,11 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Da
         const family = captureFamily(c.detail, c.target);
         if (!family) continue;
         const rule: SignalRule = RULES[family];
-        const read = episodeSamples(evidence, c.target, family, c.start, c.end ?? new Date(8.64e15)).filter((s) => s.value !== null);
+        // Where a read of the capture's tables stopped short, the episode's own samples stop too, whichever table they come
+        // from (the review of 4667459c: RCA Resource read whole beside RCA Events read to 15:00:30 gave one answer both "under
+        // its level by 15:10:00" and "still on at 15:00:30, where the read stopped").
+        const stopped = !!stop && !!readTo && stop < readTo && stop > c.start;
+        const read = episodeSamples(evidence, c.target, family, c.start, c.end ?? new Date(8.64e15)).filter((s) => s.value !== null && (!stopped || s.at <= (stop as Date)));
         const samples = c.end ? read : untilGap(read);
         const level = rule.family === "replica_lag" ? rule.floor : levelOf(rule, null);
         const hits = samples.filter((s) => meets(s.value, level, rule.strict));
@@ -390,7 +394,6 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Da
         // A one-sample episode (a deadlock count that rose) can fall between the counter's samples: its escalation states the value.
         const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
-        const stopped = !!stop && !!readTo && stop < readTo && stop > c.start;
         const ending = c.end ? {} : captureEnding(evidence, c.target, samples.length ? samples[samples.length - 1].at : c.start, samples.length < read.length, stopped ? (stop as Date) : readTo);
         // An episode with no end whose last samples are back under its level fell under by the first of them, whether its
         // capture cut it off (the review of 803f2b1a: a surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still

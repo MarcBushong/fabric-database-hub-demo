@@ -191,8 +191,8 @@ function countedErrors(evidence: Evidence, from: Date, to: Date, targets: readon
     // The window's points first: a window inside a finer save's stretch reads that save, not the coarser point around it.
     for (const m of asWholeReadings(evidence.metrics.filter((m) => targets.includes(m.target) && metricIn(m, from, to)))) {
         if (m.value === null || m.value <= 0) continue;
-        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, intervalMs: m.intervalMs, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} ${of(m)}` });
-        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, intervalMs: m.intervalMs, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) ${of(m)}` });
+        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, intervalMs: m.intervalMs, ...(m.intervalUnknown ? { intervalUnknown: true } : {}), program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} ${of(m)}` });
+        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, intervalMs: m.intervalMs, ...(m.intervalUnknown ? { intervalUnknown: true } : {}), program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) ${of(m)}` });
     }
     // PostgreSQL logs a deadlock's graph only to its server log; the capture counts them (pg_stat_database.deadlocks).
     for (const r of evidence.resource) {

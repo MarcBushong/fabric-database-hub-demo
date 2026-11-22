@@ -4,7 +4,7 @@
 // event session and Azure Monitor's counts (T4's failed connections, T5's 429s), never the workload's own account of them.
 
 import { recommend } from "./catalog";
-import { during, hhmmss, iso, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
+import { during, hhmmss, iso, openSpan, unknownFromOf, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
 
 export interface ErrorClass {
     id: string;
@@ -64,6 +64,8 @@ export interface ErrorSummary {
     first: Date;
     /** When the last one was: an event's time, or the end of the interval of an Azure Monitor count (the review of ebd1c6c3). */
     last: Date;
+    /** The start of the latest count whose interval isn't known in these minutes: the class ends in it, no one knows where (the review of 4667459c). */
+    unknownFrom: Date | null;
     intercepted: number;
     top: string;
     cause: string;
@@ -95,7 +97,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
             classId: id, title: c.title,
             count: rows.reduce((n, r) => n + (r.count ?? 1), 0),
             targets: [...new Set(rows.map((r) => r.target))],
-            first: sorted[0].at, last,
+            first: sorted[0].at, last, unknownFrom: unknownFromOf(rows),
             intercepted: rows.filter((r) => r.intercepted).reduce((n, r) => n + (r.count ?? 1), 0),
             top: [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0],
             cause: c.cause, followUp: c.followUp, recommendationIds: c.recommendationIds,
@@ -107,7 +109,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         target: c.targets[0],
         severity: c.count >= 100 ? "critical" : "warning",
         title: `${c.title}: ${stoppedAt ? "at least " : ""}${c.count}`,
-        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
+        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${c.unknownFrom ? openSpan(c.first, c.unknownFrom) : `${during(c.first, c.last)} UTC`}`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
         evidence: c.evidence,
     }));
     return { classes, findings };
@@ -117,7 +119,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
 export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Date): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
     const { classes, findings } = summarizeErrors(events, stoppedAt);
     const top = classes[0];
-    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`);
+    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${c.unknownFrom ? openSpan(c.first, c.unknownFrom) : `${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`}`);
     return {
         findings,
         rootCause: top
@@ -130,6 +132,6 @@ export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Dat
             : null,
         recommendations: recommend(...new Set(classes.flatMap((c) => c.recommendationIds))),
         nextSteps: classes.slice(0, 3).map((c) => `${c.followUp} for ${c.targets.join(", ")} (${c.title.toLowerCase()})`),
-        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
+        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), ...(c.unknownFrom ? { endsInIntervalFrom: iso(c.unknownFrom), endUnknown: true } : {}), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
     };
 }

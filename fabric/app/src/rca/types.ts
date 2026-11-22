@@ -80,6 +80,8 @@ export interface EventRow {
     count: number;
     /** An Azure Monitor count's interval (countedErrors): the count is for `at` up to `at` plus this. Absent for an event. */
     intervalMs?: number;
+    /** An Azure Monitor count whose interval isn't known in these minutes (MetricPoint.intervalUnknown): it's for an interval from `at`, of a length not known here. */
+    intervalUnknown?: boolean;
     object?: string;
     mode?: string;
     detail: string;
@@ -329,3 +331,19 @@ export const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 export const hhmmss = (d: Date) => d.toISOString().slice(11, 19);
 /** "between 16:52:10 and 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). */
 export const during = (first: Date, last: Date) => (first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `between ${hhmmss(first)} and ${hhmmss(last)}`);
+
+/**
+ * A span that ends in an Azure Monitor count's interval whose length isn't known in these minutes (MetricPoint
+ * .intervalUnknown): never an instant at its start (the review of 4667459c: a 60-minute save's count read "3000 throttled
+ * requests (429) on T5 at 15:00:00 UTC").
+ */
+export const openSpan = (first: Date, unknownFrom: Date) =>
+    first.getTime() === unknownFrom.getTime()
+        ? `in the interval from ${hhmmss(unknownFrom)} UTC, whose length isn't known in these minutes`
+        : `from ${hhmmss(first)} UTC into the interval from ${hhmmss(unknownFrom)} UTC, whose length isn't known in these minutes`;
+
+/** The latest start of the rows' counts whose interval isn't known in these minutes, or null. */
+export const unknownFromOf = (rows: ReadonlyArray<{ at: Date; intervalUnknown?: boolean }>): Date | null => {
+    const open = rows.filter((r) => r.intervalUnknown).map((r) => r.at.getTime());
+    return open.length ? new Date(Math.max(...open)) : null;
+};

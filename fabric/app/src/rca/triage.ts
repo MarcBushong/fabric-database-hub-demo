@@ -4,7 +4,7 @@
 
 import { describeEpisode } from "./detector";
 import { AZURE_MONITOR } from "./errors";
-import { asWholeReadings, hhmmss, metricIn, plural, type Episode, type Evidence, type RcaTarget } from "./types";
+import { asWholeReadings, hhmmss, metricIn, openSpan, plural, unknownFromOf, type Episode, type Evidence, type RcaTarget } from "./types";
 
 export interface Hypothesis {
     target: RcaTarget;
@@ -88,9 +88,11 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         // failed connections read "from 15:30:00 to 15:30:00").
         const first = new Date(Math.min(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime())));
         const last = new Date(Math.max(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime() + (m.intervalMs ?? 0))));
+        // A count whose interval isn't known ends in it, no one knows where (the review of 4667459c).
+        const unknownFrom = unknownFromOf(counted);
         const where = counted.length > 0 ? ` (${AZURE_MONITOR} counts included)` : "";
         // A read that stopped short counted them only up to there (the review of d431edb4).
-        const span = stoppedAt ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${plural(n, "error or cancel", "errors and cancels")} ${first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `from ${hhmmss(first)} to ${hhmmss(last)}`} UTC`;
+        const span = stoppedAt ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${plural(n, "error or cancel", "errors and cancels")} ${unknownFrom ? openSpan(first, unknownFrom) : `${first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `from ${hhmmss(first)} to ${hhmmss(last)}`} UTC`}`;
         hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);

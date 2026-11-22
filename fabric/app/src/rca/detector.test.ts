@@ -193,11 +193,11 @@ describe("the blind detector on the contract's fixtures", () => {
 // The review of 97fdf5ba: RCA Events are read up to a window's end, so an episode that relaxed after it read as one its
 // capture had cut off, with a fall and the capture's end.
 describe("a capture episode with no relaxed event in the minutes read", () => {
-    const surge = (coverageTo: string | null, totals: (s: number) => number = (s) => (s < 30 ? 30 : 10)) => {
+    const surge = (coverageTo: string | null, totals: (s: number) => number = (s) => (s < 30 ? 30 : 10), until = 110) => {
         const evidence = emptyEvidence();
         evidence.events.push({ target: "T4", at: at("15:00:00"), kind: "capture", name: "escalated", code: "T4-20261120T150000Z", count: 1, detail: "client connections 30 >= 80 % of 35 (max_connections 50 minus 15 reserved)." });
         // 30 of 35 three times, then 10, every 10 s to 15:01:50 (or the totals given).
-        for (let s = 0; s <= 110; s += 10) {
+        for (let s = 0; s <= until; s += 10) {
             const time = new Date(at("15:00:00").getTime() + s * 1000);
             for (const [metric, value] of [["connections_total", totals(s)], ["max_connections", 50], ["reserved_connections", 15]] as const) evidence.resource.push({ target: "T4", at: time, source: "RCA-PG-10", metric, value });
         }
@@ -240,6 +240,17 @@ describe("a capture episode with no relaxed event in the minutes read", () => {
         // A read of the telemetry that stopped short isn't one of the capture's tables.
         const [telemetry] = stopped(() => 30, "Telemetry Snapshots (Azure Monitor)");
         expect(describeEpisode(telemetry)).toContain("(still on at 15:20:00 UTC, where the minutes read end)");
+    });
+
+    // The review of 4667459c: RCA Resource read whole beside RCA Events read to 15:00:30, with a surge on until 15:10, gave
+    // one answer both "under its level by 15:10:00 UTC (the read stopped at 15:00:30 ...) ... in 60 of its 120 samples" and
+    // "still on at 15:00:30, where the read stopped".
+    it("reads a capture episode's own samples only up to where a read of the capture's tables stopped", () => {
+        const evidence = { ...surge("15:30:00", (s) => (s < 600 ? 30 : 10), 700), cut: [{ table: "RCA Events", until: at("15:00:30") }] };
+        const [e] = findEpisodes({ evidence }, at("14:55:00"), at("15:20:00")).filter((x) => x.family === "connections");
+        expect(e).toMatchObject({ readEnd: at("15:00:30"), readStopped: true, valued: 4, atLevel: 4 });
+        expect(e.fellBy).toBeUndefined();
+        expect(describeEpisode(e)).toContain("from 15:00:00 UTC (still on at 15:00:30 UTC, where the read stopped), peak 85.7 % at 15:00:00 UTC, in 4 samples in a row");
     });
 
     // The capture's own error and deadlock episodes have no samples of their own: neither a fall nor "still on" can be told.
