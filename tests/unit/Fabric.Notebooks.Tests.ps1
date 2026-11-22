@@ -316,7 +316,16 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
             if ($block -match 'SqlServerWaitStats|SqlServerStorageIO|CounterType == 272696576') {
                 $block | Should -Match 'prev\('
                 $block | Should -Match 'Keep = '
-                $block | Should -Not -Match 'sum\((WaitTimeMs|WaitingTasksCount|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue)\)'
+                foreach ($statement in @($block -split "`n(?=\|)")) {
+                    if ($statement -match '(?s)^\| summarize .*\bby [^\n]*, SampleTimeUTC$') {
+                        # F36: the files of a key added within one sample, by SampleTimeUTC itself, are a cumulative
+                        # counter again; the telemetry article's rule 2 forbids a sum across samples, never this one.
+                        $statement | Should -Not -Match '\b(avg|max|min)\('
+                    }
+                    else {
+                        $statement | Should -Not -Match 'sum\((WaitTimeMs|WaitingTasksCount|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue)\)'
+                    }
+                }
             }
             if ($block -match 'SqlServerWaitStats') {
                 $block | Should -Match "WaitCategory !in \('Idle', 'Unknown'\)"

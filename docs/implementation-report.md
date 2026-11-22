@@ -5235,3 +5235,52 @@ The read-only answer, first:
 - **Not run on an engine:** this structure's first run is Final tests' run on B (the bins, the window, the Estate series, and the times), then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`.
 - **The time isn't measured here.** Counted, not timed: a bin and series of the Estate query now asks the storage engine for about 3 reads, against today's 2, where da68aed5 asked for about 3 for each save of the series' history. If it's still over about 2×, the next step is one read of the saves per visual cell.
 - **The list can't hold the engine's undocumented words:** no list has `UNDER`. This change's new names are compound (`SaveList`, `AtBinSaves`, `NearSaves`, `FinerWindows`), like the names the engine already took.
+
+### F36: T3's storage IO is its files' (2026-11-22)
+
+**Why.** Final tests found, beside F35's live check, that T3's `storage_io` rows in the live test's history (dbhubrb) hold nearly the same large figure in about every other minute: about 4,010 MB read and 5,973 MB written in the first session. So T3's IO read about 765 GB in 2 hours 15 minutes, under the release's measure and F35's alike.
+
+**The cause,** from read-only queries of the telemetry endpoint (2026-11-22) over that session of 2026-11-21:
+
+- Every sample of T3 in `SqlServerStorageIO` holds 7 data and log rows: two under each of FileID 1 and 2, with the same `ResourceID`, `SqlServerInstanceName`, `DatabaseID`, and `DatabaseName`, and FileIDs 3 to 5 once each. One file of each pair is the database's own (448 MB of data and a 2 GB log on disk); the other is 16 MB, like FileIDs 3 to 5, the shape of tempdb's files. No column tells the two apart, and `MachineName` is empty.
+- It's so in all 540 samples from 15:20 to 16:50, and only on T3: T1's and T2's storage IO, and every target's waits and the notebook's four rate counters, have one row per key and sample.
+- The query took each bin's first and last sample per file key with `arg_min` and `arg_max`, which pick either row of a pair at a tie. So a series stepped between the two files' counters. A step up counted the gap between their totals as IO, about 3,889 MB read and 3,800 MB written on the log and 120 MB and 2,174 MB on the data file. A step down was dropped as a reset, and that interval's real IO with it.
+- It has been so since the first release (470514a4), so b059c91 has it, and so does the Real-Time Dashboard, which is generated from the same KQL.
+
+**Work summary.**
+
+- **The query** (`Kql/Live.StorageIoDeltas.kql`, and its byte-for-byte copy, `STORAGE_IO_KQL` in `NB_DatabaseHub_LiveActivity`): a first `summarize` adds the files of each key within a sample (by the key and `SampleTimeUTC`, with `Files = count()`). Those sums are cumulative counters again, and the rest of the query reads them. The telemetry article's rule 2 forbids a sum across samples, which this isn't. A step whose number of files changed is skipped (`F == prev(F)` in `Keep`), as a reset is, so a file that appears or goes in a window never counts its whole counter. A key with one file, as every key on T1 and T2, gives what it gave.
+- **The Real-Time Dashboard** is regenerated (`Export-DemoRealTimeDashboard`): its two IO tiles carry the new query.
+- **The notebook's description** of the storage analysis says that it adds the files.
+- **Tests** (`Fabric.Dashboard.Tests.ps1`): a new test pins the per-sample sum, ahead of the first and last samples, which read only its sums, and the file-count step in `Keep`. The two rule-2 tests, here and in `Fabric.Notebooks.Tests.ps1`, now read each pipe statement: a raw counter may be summed only in a `summarize` by `SampleTimeUTC` itself, and never averaged, maxed, or summed in any other.
+- **Docs:** the limitations (T3's IO counts the second set), troubleshooting (a save from before, and how to replace it), the Real-Time Dashboard's README, and the CHANGELOG.
+
+**Live proof,** read-only: the old and the new query on the session's SQL window, 15:19:04 to 16:59:04 UTC, in 1-minute bins.
+
+| Target and files | Before: MB read, written | After |
+|---|---|---|
+| T1, data | 58.9, 812 | the same |
+| T1, log | 30.4, 3,533.2 | the same |
+| T2, data | 502.8, 15,905.1 | the same |
+| T2, log | 0, 18,820.3 | the same |
+| T3, data | 7,070.9, 167,223.6 | 63.2, 2,548.5 |
+| T3, log | 280,726.2, 280,021.8 | 3,858.6, 3,887.2 |
+
+- T1's and T2's bins, reads, writes, and stalls are the same in every column, and T3 goes from 735,042 MB to 10,358 MB.
+- The old query gives the saved rows (15:19: 3,888.25 MB read and 3,801.25 written). The new one reads at most 7.51 MB and writes at most 1.39 MB a minute from 15:19 to 15:42.
+- T3's log read 3.86 GB in the session, as far as its counter rose between the two sessions' pair gaps (3,889 MB at 15:30, about 7,750 MB at 17:15).
+- **Over the day-long save's window** (the 24 hours to 21:33 UTC, in 15-minute bins), T1's and T2's IO is the same too (10,717.6 and 69,034.6 MB, in as many bins), and T3's goes from 442,723.4 MB to 31,558.6 MB. The new query took 2.2 and 6.7 s end to end, the old one 3.0 and 5.4 s, each run twice through the Azure CLI.
+
+**Changed files.** `scripts/modules/DbHubDemo/Kql/Live.StorageIoDeltas.kql`; `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`; `fabric/realtime/RealTimeDashboard.json` and `README.md`; `tests/unit/Fabric.Dashboard.Tests.ps1` and `Fabric.Notebooks.Tests.ps1`; `docs/limitations.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **Pester** with StrictMode, with Python: Fabric.Dashboard and Fabric.Notebooks, with the suites that read the dashboard or the notebook (DbHubDemo.DashboardData, HubKql, FabricItem, Fabric, and HistorySnapshot, and Fabric.ControlNotebook), 365 passed, 0 failed, 0 skipped. At the parent, the new test fails (no per-sample sum), and only it.
+- **PSScriptAnalyzer:** no finding in the changed test files that HEAD doesn't have. markdownlint: clean. Repo.*: 207 passed, 0 failed, 3 skipped. No live resource name is in the tree.
+
+**Risks.**
+
+- **A pair that doesn't share a sample time** would still alternate. Live, the pair shared it in 540 of 540 samples, as one collection pass gives it.
+- **T3's IO now includes the second set's,** whatever it is. If the endpoint drops it or tells it apart later, the sums follow with no change.
+- **Saves from before keep their values** ([troubleshooting](troubleshooting.md#database-hub-and-telemetry)). Under F35's finest-first rule, a later and coarser save doesn't replace a session's 1-minute rows; only a save of the same window does.
+- **The agent prompts,** for Copilot CLI and VS Code, ask the agent to write its own KQL on `SqlServerStorageIO` by the rule for cumulative counters. On T3, that KQL meets the same pair. This commit doesn't change them.
