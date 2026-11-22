@@ -5858,3 +5858,32 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - vitest: the file's 18 tests pass. typecheck and eslint: clean. markdownlint: clean. The added lines are ASCII, and the comments keep the file's 120-column wrap.
 
 **Risks.** None: comments and docs.
+
+### F35 design (i): a kept value per row, groundwork (2026-11-22)
+
+**Why.** F35's query-time version was withdrawn: on Final tests' long history, the 7-day Performance query took 6.84 times today's, or failed at F4's memory limit ([ADR 0014](adr/0014-notebook-role-and-capacity.md)). Design (i) moves the rule to save time: each row of the history's telemetry snapshots gets the value it keeps, so the model sums kept values and its measure stays simple. The owner decides on (i) on Monday. Until then, the coordinator asked for groundwork only: the rule in Python, reduced to a kept value per row, checked on shared cases against the TypeScript rule (`finest-per-interval.ts`, with `snapshot-value.ts` as the per-row reference), with no notebook, model, or script change.
+
+**Work summary.**
+
+- **`fabric/history/kept_value.py`** (new): the rule, in Python 3's standard library only (no Spark or pandas), so a notebook cell, a Livy statement, and the tests can run the same code. `kept_values(rows)` gives each row its kept value:
+  - a point (a save's rows of a series at one bin) that no finer save's rows reach keeps each row's value;
+  - a point that finer saves' rows cover keeps None in each row;
+  - otherwise a total keeps what's left of it after the finer rows in its interval, never below 0, split over its rows by their values (evenly when they sum to 0), and a maximum or an average keeps each row's value only where it's higher than theirs;
+  - off the bin grid, and for a row with no bin, the newest capture's rows keep their values.
+  `bin_values(rows, kept)` reads them as the model would, per series and bin: the sum for a total, and the highest of each save's sum for a maximum or an average.
+- **The shared cases** (`fabric/history/kept-value-cases.json`, new): `fabric/app/src/data/kept-value-cases.test.ts` writes them from `snapshotValues` with `DBHUB_WRITE_KEPT_VALUE_CASES=1`, and otherwise checks that the file is current. 14 named cases (among them the reviews' and Final tests' probes: 15:15's 810, the replica lag's 34 and 8, the stop save's 4,500, the partial-row bound's 4,320, and the peaks' 30 and 70, each pinned) and 20 seeded random histories: 34 cases, 1,207 bins.
+- **The Python check** (`tests/unit/Fabric.History.Tests.ps1`, new): every bin of the shared cases has the TypeScript rule's value within 1e-9 of the larger, the bin lists match, and Python's lists of analyses and metrics equal TypeScript's; a 2:1 split of a remainder over two files, a covered point's None, and a lone point kept whole; and the times as the app reads them. It's skipped when no Python 3 answers `--version` (`DBHUB_TEST_PYTHON` names one).
+- **Not used yet:** no notebook, model, script, or doc other than this report changes. The design note with the estimate is in the coordinator's material for decision 3.
+
+**Changed files.** New: `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json`, `fabric/app/src/data/kept-value-cases.test.ts`, and `tests/unit/Fabric.History.Tests.ps1`. This report.
+
+**Validation.**
+
+- vitest: the shared cases' test passes (6 tests), and the app's whole suite passed (392 of 392) before the base moved from 4a6a7b36 to 4e0126d9, which changed no app code; typecheck and lint are clean. Pester with StrictMode: `Fabric.History` passes (3) with Python 3.11.9, and skips all 3 where `python3` and `python` are only the Windows Store's aliases, as on this PC. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped. PSScriptAnalyzer: no findings in the new test file. markdownlint: clean. The new files are ASCII, with LF line endings.
+- **The cases catch the rule's parts** (each changed in a copy of the module): with the older save winning on the same grain, 180 bins differ; with the coarser save winning, 538; with a total's remainder not clamped at 0, 50; with a peak never kept in part, 6. A remainder split evenly instead of by the rows' values changes no bin, since a bin sums its rows; the per-row test catches it.
+- **One part they can't catch:** the dense-cover shortcut (a point whose finer rows fill every slot of its interval is covered without building pieces) changes no bin when removed. It's equivalent to the general path, which reaches the same answer, so it's kept to mirror the TypeScript rule, as an optimization.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- Python's float sums follow TypeScript's order (rows and inserts as written), so the bins match to 1e-9 of the larger; a notebook that reorders rows before the rule could differ in the last digits.
