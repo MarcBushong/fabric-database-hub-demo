@@ -8832,6 +8832,11 @@ function Add-DbHubRcaHandoff {
                 $state['pending'] = @(@($state['pending']) + $added.ToArray())
                 $state['final'] = $false
                 $Status['rca'] = $state
+                # The stop's RCA.PENDING line takes them too (finding 4 of the live check of 4e2c65ed).
+                $lines = @(Get-DbHubRcaStopLineList -Settings $Context.Settings -Status $Status -NowUtc (Get-DbHubUtcNow))
+                if ($lines.Count -gt 0) {
+                    $Status['rcaLines'] = $lines
+                }
             }
             $null = Write-DbHubSessionStatus -Context $Context -Status $Status
             return $added.Count
@@ -9436,6 +9441,94 @@ function Invoke-DbHubCapture {
 
 $script:DbHubStopStatusPlan = @('acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5', 'rcaEarlier')
 
+function Get-DbHubRcaStopLeftLine {
+    <#
+    .SYNOPSIS
+    The RCA.PENDING line of a session's stop (Final tests' live check of 4e2c65ed, finding 4: Stop now's RCA.CAPTURE lines
+    said what it captured from 18:49 to 18:53, and nothing said that 18:21 to 18:49 was still on the VMs): what the stop
+    leaves there, which start takes it, and until when, as the next start's own backlog of the stop's status gives them
+    (Get-DbHubRcaBacklog) and in the words of that start's RCA.EARLIER lines. $null when the stop leaves nothing.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $session = [string]$Status['sessionId']
+    $entries = @(@((Get-DbHubRcaBacklog -Settings $Settings -Previous $Status -SessionId '' -NowUtc $NowUtc).Entries) | Where-Object { $null -ne $_ })
+    $own = @($entries | Where-Object { [string]$_['sessionId'] -eq $session }) | Select-Object -First 1
+    if ($null -eq $own) {
+        return $null
+    }
+    $time = { param([datetime] $Utc) '{0} UTC' -f $Utc.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
+    # Within a line's 400 characters (ConvertTo-DbHubSafeText), both parts on both VMs, behind earlier sessions.
+    $parts = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $pending = @($own['pending'])
+    if ($pending.Count -gt 0) {
+        # The documents' own times (each ID starts with when its capture began): the minutes they hold begin there.
+        $first = @($pending | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'documentId') } | Sort-Object | Select-Object -First 1)[0]
+        $began = [datetime]::ParseExact($first.Substring(0, 16), 'yyyyMMdd\THHmmss\Z', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        $vms = @($pending | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'vm') } | Where-Object { $_ } | Select-Object -Unique)
+        # The queue a start fetches from, as Invoke-DbHubRcaEarlier keeps it: bundles no saved index lists first, then
+        # documents in the order the runner deletes them; one session's per start.
+        $unsaved = @($entries | Where-Object { $_['mustFetch'] }).Count
+        $order = @($entries | Where-Object { @($_['pending']).Count -gt 0 -and -not $_['mustFetch'] } | Sort-Object -Property { $_['expiresUtc'] })
+        $ahead = [array]::IndexOf($order, $own) + $unsaved
+        $turn = 'which the next session''s start fetches'
+        if ($own['mustFetch']) {
+            $turn = 'which a later start fetches with its bundles'
+        }
+        elseif ($ahead -gt 0) {
+            $turn = 'which a later start fetches, behind {0} earlier session(s), one per start' -f $ahead
+        }
+        $parts.Add(('{0} document(s) on {1} not fetched whole, the first from {2} UTC, {3}, until {4}' -f $pending.Count, ($vms -join ' and '), $began.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture), $turn, (& $time $own['expiresUtc'])))
+    }
+    if (@($own['leftVms']).Count -gt 0) {
+        $parts.Add(('the capture on {0} that no export took, for the next start that sends activity there, until {1}' -f (@($own['leftVms']) -join ' and '), (& $time $own['heldUntilUtc'])))
+    }
+    if ($parts.Count -eq 0) {
+        if (-not $own['mustFetch']) {
+            return $null
+        }
+        $message = 'This session''s bundles in the control vault aren''t in a saved index yet: a later session''s start lists them in its index, which Run all saves with this session''s history.'
+    }
+    else {
+        $deletes = 'when the runner deletes each'
+        if ($parts.Count -eq 1) {
+            $deletes = @('when the runner deletes it', 'when the runner deletes them')[[int]($pending.Count -gt 0)]
+        }
+        $message = 'Still on the VMs, for this session''s history: {0}, {1}.' -f ($parts -join '; and '), $deletes
+    }    return [ordered]@{ step = 'RCA.PENDING'; status = 'Info'; message = (ConvertTo-DbHubSafeText -Text $message); fix = '' }
+}
+
+function Get-DbHubRcaStopLineList {
+    # A stopped status's rcaLines, with its RCA.PENDING line as its rca state gives it now, in place of the one it had: a
+    # re-check can hand the stopped session more after its stop wrote them (Add-DbHubRcaHandoff).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $lines = @(@($Status['rcaLines']) | Where-Object { $null -ne $_ -and [string](Get-DbHubMember -InputObject $_ -Name 'step') -ne 'RCA.PENDING' })
+    $left = Get-DbHubRcaStopLeftLine -Settings $Settings -Status $Status -NowUtc $NowUtc
+    if ($null -ne $left) {
+        $lines += $left
+    }
+    return $lines
+}
+
 function Write-DbHubStopStatus {
     # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
     # what failed, for the control notebook. Only when a session is known (the request's or the group's DbHubSessionId).
@@ -9523,6 +9616,13 @@ function Write-DbHubStopStatus {
             $state['pending'] = @(@($state['pending']) + $added)
             $state['final'] = $false
             $status['rca'] = $state
+        }
+    }
+    # What the stop leaves on the VMs, which start takes it, and until when, after the notebook's other lines (finding 4).
+    if ($status.Contains('rca')) {
+        $lines = @(Get-DbHubRcaStopLineList -Settings $Context.Settings -Status $status -NowUtc $now)
+        if ($lines.Count -gt 0) {
+            $status['rcaLines'] = $lines
         }
     }
     $null = Write-DbHubSessionStatus -Context $Context -Status $status

@@ -3378,6 +3378,28 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $t2 = $status.rcaLines | Where-Object step -EQ 'RCA.CAPTURE.T2'
         $t2.status | Should -Be 'Warning'
         $t2.message | Should -Match '^T2: not exported\. archost01 takes one Run Command at a time'
+        ($status.rcaLines | Where-Object step -EQ 'RCA.PENDING').message | Should -Match '^Still on the VMs, for this session''s history: the capture on archost01 that no export took, for the next start that sends activity there, until \d{4}-\d\d-\d\d \d\d:\d\d UTC, when the runner deletes it\.$'
+    }
+
+    It 'says what a stop leaves on the VMs, which start takes it, and until when, behind an earlier session''s evidence (finding 4 of the live check of 4e2c65ed)' {
+        $now = [datetime]::new(2026, 11, 21, 18, 55, 0, [System.DateTimeKind]::Utc)
+        $earlier = [ordered]@{ sessionId = 'fedcba9876543210fedcba9876543210'; pending = @([ordered]@{ documentId = '20261119T100000Z-sqlvm01-0001'; parts = 1; sha256 = ('a' * 64); vm = 'sqlvm01' }); leftVms = @(); expiresUtc = '2026-11-25T10:00:00Z' }
+        $state = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @((New-TestPending -DocumentId $script:fixtureIds[1] -Vm 'sqlvm01'), (New-TestPending -DocumentId $script:fixtureIds[0] -Vm 'sqlvm01')); leftVms = @('archost01'); final = $false; finalRan = $true; status = 'Warning'; message = ''; boundVms = @() }
+        $status = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = ''; acceptedUtc = '2026-11-21T18:00:00Z'; metrics = [ordered]@{ status = 'Pass' }; rca = $state; rcaEarlierPending = @($earlier) }
+        $line = Get-DbHubRcaStopLeftLine -Settings (New-TestContext).Settings -Status $status -NowUtc $now
+        $line.step | Should -Be 'RCA.PENDING'
+        $line.status | Should -Be 'Info'
+        $line.message | Should -Be 'Still on the VMs, for this session''s history: 2 document(s) on sqlvm01 not fetched whole, the first from 16:50 UTC, which a later start fetches, behind 1 earlier session(s), one per start, until 2026-11-28 18:55 UTC; and the capture on archost01 that no export took, for the next start that sends activity there, until 2026-12-21 18:00 UTC, when the runner deletes each.'
+        # Its lines keep one such line, the newest.
+        $status['rcaLines'] = @([ordered]@{ step = 'RCA.EXPORT'; status = 'Warning'; message = 'm'; fix = '' }, [ordered]@{ step = 'RCA.PENDING'; status = 'Info'; message = 'older'; fix = '' })
+        $lines = @(Get-DbHubRcaStopLineList -Settings (New-TestContext).Settings -Status $status -NowUtc $now)
+        @($lines | ForEach-Object { $_['step'] }) | Should -Be @('RCA.EXPORT', 'RCA.PENDING')
+        $lines[1]['message'] | Should -Be $line.message
+        # Nothing left there: no line.
+        $state['pending'] = @()
+        $state['leftVms'] = @()
+        $state['final'] = $true
+        Get-DbHubRcaStopLeftLine -Settings (New-TestContext).Settings -Status $status -NowUtc $now | Should -BeNullOrEmpty
     }
 
     It 'sends the T2 host its stop''s export beside an Rca Run Command more than an hour old that Azure keeps listing while it deletes it (review of 242a3ef7)' {
@@ -3492,6 +3514,11 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @('20261120T170000Z-sqlvm01-0002@sqlvm01')
         ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').message | Should -Match '1 document\(s\) weren''t fetched whole in time; they stay on sqlvm01 for the next export'
         ($status.rcaLines | Where-Object step -EQ 'RCA.EXPORT').fix | Should -Be 'What''s still on the VMs stays there, and a later session''s start exports it, one earlier session''s per start; that start''s RCA.EARLIER lines say until when.'
+        # Finding 4 of the live check of 4e2c65ed: what the stop leaves on the VMs, which start takes it, and until when.
+        $left = $status.rcaLines | Where-Object step -EQ 'RCA.PENDING'
+        $left.status | Should -Be 'Info'
+        $left.message | Should -Be ('Still on the VMs, for this session''s history: 1 document(s) on sqlvm01 not fetched whole, the first from 17:00 UTC, which the next session''s start fetches, until {0} UTC, when the runner deletes them.' -f $script:clock.AddDays(7).ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture))
+        @($status.rcaLines | ForEach-Object step)[-1] | Should -Be 'RCA.PENDING'
         $status.rca.finalRan | Should -BeTrue -Because 'its final export ran on every VM, so the next start sends none: it fetches the document''s parts'
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
         $index = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json).rca
@@ -3675,6 +3702,10 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $status = Get-SessionStatus
         $status.phase | Should -Be 'stopped'
         @($status.rca.pending | ForEach-Object { '{0}@{1}' -f $_.documentId, $_.vm }) | Should -Be @(('{0}@archost01' -f $id))
+        # Finding 4 of that live check: the stop's lines say so, with the re-check's document, which start takes it, and until when.
+        $left = @($status.rcaLines | Where-Object step -EQ 'RCA.PENDING')
+        $left.Count | Should -Be 1
+        $left[0].message | Should -Match '^Still on the VMs, for this session''s history: 1 document\(s\) on archost01 not fetched whole, the first from 14:20 UTC, which the next session''s start fetches, until \d{4}-\d\d-\d\d \d\d:\d\d UTC, when the runner deletes them\.$'
     }
 
     It 'keeps the stop''s export off the T2 host while a running re-check''s Run Command is listed there, never two at once (review of 242a3ef7)' {
