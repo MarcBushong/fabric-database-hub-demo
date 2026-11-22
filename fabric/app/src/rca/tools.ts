@@ -8,7 +8,7 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bi
 import { analyzeConnections } from "./connections";
 import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
-import { RcaReadError } from "./loader";
+import { MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { analyzeThroughput } from "./throughput";
@@ -90,6 +90,8 @@ export interface Telemetry {
     intervals?: ReadonlyMap<string, number>;
     /** The coarsest interval of the history's points at each time, before one point per interval is kept (sources.ts's coarsestIntervals): a key's own point. */
     keyIntervals?: ReadonlyMap<string, number>;
+    /** The reads that had more rows than they take: their latest rows weren't read (sources.ts's paged Azure Monitor read). */
+    cut?: readonly string[];
 }
 
 export interface InvestigationDeps {
@@ -204,7 +206,7 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     const notCaptured = [
         ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence for ${hhmmss(c.from)}-${hhmmss(c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
         ...unknown,
-        ...(g.evidence.cut ?? []).map((table) => `${table}: the window holds more rows than one query returns, so its latest rows weren't read; ask about a narrower window`),
+        ...(g.evidence.cut ?? []).map((table) => `${table}: the window holds more rows than ${table === MONITOR_TABLE ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so its latest rows weren't read; ask about a narrower window`),
     ];
     return {
         tool,
@@ -297,7 +299,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
     async function gather(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<Gathered> {
         const lead = new Date(from.getTime() - LEAD_MINUTES * MIN);
         const [loaded, telemetry] = await Promise.all([deps.load(lead, to, targets), deps.telemetry ? deps.telemetry(lead, to, targets) : Promise.resolve<Telemetry>({})]);
-        const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)] };
+        // A read at its limit, the RCA tables' or Azure Monitor's, is said in what wasn't captured, never used silently.
+        const cut = [...(loaded.cut ?? []), ...(telemetry.cut ?? [])];
+        const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)], ...(cut.length ? { cut } : {}) };
         const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals }, from, to).filter((e) => targets.includes(e.target));
         return { evidence, episodes, keyIntervals: telemetry.keyIntervals };
     }

@@ -3,10 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { ANSWER_KEY_TABLES } from "@/copilot/answer-key";
 import { QueryFailure } from "@/data/query-client";
 import type { QuerySpec } from "@/data/queries";
-import { loadEvidence, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
+import { loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
 import { createRcaSources, finestPerInterval } from "./sources";
 import { createInvestigationTools } from "./tools";
-import { pointKey } from "./types";
+import { emptyEvidence, pointKey } from "./types";
 
 const at = (hhmm: string) => new Date(`2026-11-20T${hhmm}:00Z`);
 const lag = (bucket: string, value: number, capturedAt: string) => ({
@@ -81,6 +81,37 @@ describe("the investigations' sources", () => {
         const result = await tools.investigate("explain_errors", {});
         expect(typeof result === "string" ? result : result.window).toMatchObject({ fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" });
         expect(typeof result === "string" ? [] : result.notCaptured).toContain("RCA Events: the window holds more rows than one query returns, so its latest rows weren't read; ask about a narrower window");
+    });
+
+    // The coordinator's note on the shared finestPerInterval: the read stops at MONITOR_ROW_LIMIT rows, oldest first, so one
+    // at the limit silently lost its newest rows, the incident's own minutes.
+    it("read Azure Monitor's metrics a page at a time, each from the last bucket before it, and say when a window holds more than its pages", async () => {
+        const metrics = ["NormalizedRUConsumption", "TotalRequests", "ThrottledRequests", "ProvisionedThroughput"];
+        const start = Date.parse("2026-11-20T00:00:00Z");
+        // A row a minute for each metric: 1,500 minutes, 6,000 rows in all, as the DAX orders them.
+        const all = (minutes: number) =>
+            Array.from({ length: minutes }, (_, m) =>
+                metrics.map((Metric, i) => ({ Bucket: new Date(start + m * 60_000).toISOString().slice(0, 19), TargetKey: "T5", ResourceName: "cosmos01", Metric, Value: 10 + i, Unit: "Count", WindowStart: "2026-11-20T00:00:00", WindowEnd: "2026-11-21T02:00:00", CapturedAt: "2026-11-21T02:05:00" })),
+            ).flat();
+        const pages = (rows: ReturnType<typeof all>) =>
+            vi.fn(async (spec: QuerySpec) => {
+                const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
+                const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
+                return rows.filter((r) => Date.parse(`${r.Bucket}Z`) >= from).slice(0, spec.rowLimit);
+            });
+        const complete = pages(all(1500));
+        const telemetry = await createRcaSources(complete).telemetry(new Date(start), new Date(start + 1500 * 60_000), ["T5"]);
+        expect(complete).toHaveBeenCalledTimes(2);
+        expect(telemetry.cosmos?.points.length).toBe(6000);
+        expect(new Set(telemetry.cosmos?.points.map((p) => `${p.metric}|${p.at.getTime()}`)).size).toBe(6000);
+        expect(telemetry.cut).toBeUndefined();
+        // More than its pages hold: the rest isn't read, and the window's investigations say so.
+        const endless = pages(all(6000));
+        const sources = createRcaSources(endless);
+        const tools = createInvestigationTools({ load: async () => emptyEvidence(), telemetry: sources.telemetry, timeZone: "UTC", latestDay: new Date(start), latest: new Date(start + 6000 * 60_000) });
+        const result = await tools.investigate("explain_errors", { from: "2026-11-20T00:00:00Z", to: "2026-11-24T04:00:00Z", targets: ["T5"] });
+        expect(endless).toHaveBeenCalledTimes(MONITOR_PAGES);
+        expect(typeof result === "string" ? [] : result.notCaptured).toContain(`Telemetry Snapshots (Azure Monitor): the window holds more rows than its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return, so its latest rows weren't read; ask about a narrower window`);
     });
 
     // Live, 2026-11-21: Power BI answered 429 to the app's reads. A telemetry read that failed left its part empty, so the

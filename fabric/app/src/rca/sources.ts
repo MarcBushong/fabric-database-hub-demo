@@ -7,7 +7,7 @@ import { toBins, toCosmosCapture, toPostgresCapture, toWaitBins, withCategoryWai
 import { incidentSeriesQuery, incidentWaitsQuery, type QuerySpec } from "@/data/queries";
 import { isMissingInModel } from "@/data/retry";
 import { SQL_TARGETS } from "@/lib/dax";
-import { loadEvidence, MONITOR_ROW_LIMIT, RcaReadError, rcaMonitorDax, type DaxLog } from "./loader";
+import { loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError, rcaMonitorDax, type DaxLog } from "./loader";
 import { toDate } from "./rows";
 import type { Telemetry } from "./tools";
 import { pointKey, type Evidence, type RcaTarget } from "./types";
@@ -150,12 +150,34 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
         }
     }
 
+    /**
+     * Azure Monitor's rows for a window, a page at a time. A query returns at most MONITOR_ROW_LIMIT rows, oldest first, so
+     * one at the limit had lost its newest rows: the incident's own minutes (the coordinator's note on the shared
+     * finestPerInterval). The next page reads on from the last bucket the page had, whole, in place of that bucket's rows.
+     * After MONITOR_PAGES pages, the rest isn't read, and the window's investigations say so (cut).
+     */
+    async function readMonitor(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<{ rows: Row[]; cut: boolean }> {
+        const rows: Row[] = [];
+        let start = from;
+        for (let page = 0; page < MONITOR_PAGES; page++) {
+            const dax = rcaMonitorDax(start, to, targets);
+            if (!dax) return { rows, cut: false };
+            const got = await read(MONITOR_TABLE, spec("Azure Monitor metrics", dax, MONITOR_ROW_LIMIT));
+            if (got.length < MONITOR_ROW_LIMIT) return { rows: [...rows, ...got], cut: false };
+            const last = toDate(got[got.length - 1].Bucket);
+            // A page all of one bucket can't read on.
+            if (!last || last.getTime() <= start.getTime()) return { rows: [...rows, ...got], cut: true };
+            for (const row of got) if ((toDate(row.Bucket)?.getTime() ?? 0) < last.getTime()) rows.push(row);
+            start = last;
+        }
+        return { rows, cut: true };
+    }
+
     return {
         load: (from, to, targets) => loadEvidence((dax, rowLimit) => run(spec("RCA evidence", dax, rowLimit)), from, to, targets, { onDax }),
         async telemetry(from, to, targets) {
             const sql = SQL_TARGETS.filter((t) => targets.includes(t));
-            const monitor = rcaMonitorDax(from, to, targets);
-            const [bins, monitorRows] = await Promise.all([
+            const [bins, monitor] = await Promise.all([
                 Promise.all(
                     sql.map(async (target) => {
                         const range = { target, start: from, end: to };
@@ -163,9 +185,9 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
                         return withCategoryWaits(toBins(series, target), toWaitBins(waits));
                     }),
                 ),
-                monitor ? read("Telemetry Snapshots (Azure Monitor)", spec("Azure Monitor metrics", monitor, MONITOR_ROW_LIMIT)) : Promise.resolve([]),
+                readMonitor(from, to, targets),
             ]);
-            return { bins: bins.flat(), ...monitorTelemetry(monitorRows) };
+            return { bins: bins.flat(), ...monitorTelemetry(monitor.rows), ...(monitor.cut ? { cut: [MONITOR_TABLE] } : {}) };
         },
     };
 }

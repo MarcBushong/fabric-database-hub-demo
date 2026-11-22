@@ -83,12 +83,18 @@ export const RCA_PRESENCE_DAX = `EVALUATE ROW ( "Rows", COUNTROWS ( '${RCA_SPEC.
 /** The Azure Monitor targets: T4, its read replica, and T5, whose metrics the history keeps as analyses postgresql and cosmosdb. */
 export const MONITOR_TARGETS = ["T4", "T4-replica", "T5"] as const satisfies readonly RcaTarget[];
 
-/** The most Azure Monitor rows one window returns: a 1-minute grain, about ten metrics, and overlapping captures. */
+/** The most Azure Monitor rows one query returns: a 1-minute grain, about ten metrics, and overlapping captures. */
 export const MONITOR_ROW_LIMIT = 5000;
+
+/** The most queries, a page each, that one window's Azure Monitor read makes (sources.ts): as many rows as an RCA table's most. */
+export const MONITOR_PAGES = 4;
+
+/** The Azure Monitor read's name in the logs and in what wasn't captured. */
+export const MONITOR_TABLE = "Telemetry Snapshots (Azure Monitor)";
 
 /**
  * Every capture's Azure Monitor metrics for the window's T4, replica, and T5 (Telemetry Snapshots only), oldest first, or
- * null when the window has none of them. Captures can overlap: sources.ts keeps the newest of each bin, as the measures do.
+ * null when the window has none of them. Captures can overlap: sources.ts keeps one point per interval, the finest.
  */
 export function rcaMonitorDax(from: Date, to: Date, targets: readonly RcaTarget[]): string | null {
     const keys = MONITOR_TARGETS.filter((t) => targets.includes(t));
