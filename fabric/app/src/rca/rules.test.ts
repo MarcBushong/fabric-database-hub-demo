@@ -247,7 +247,7 @@ describe("T4's connections against the limit, by what held them", () => {
         ["CONN-LOCK-WAIT", surge(29, 2, 3, 20), ["PG-LOCK-TIMEOUT", "PG-IDLE-TIMEOUT", "PG-POOL"], "20 of the 35 at the peak waited on a lock (9 ran a query, 2 sat idle, 3 sat idle in a transaction)"],
         ["CONN-IDLE-IN-TX", surge(4, 10, 20, 0), ["PG-IDLE-TIMEOUT", "PG-POOL"], "20 of the 35 at the peak sat idle in a transaction, and at least 20 in every sample (4 ran a query, 10 sat idle, none waited on a lock)"],
         ["CONN-IDLE", surge(2, 32, 0, 0), ["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"], "Most of them sat idle: 32 of the 35 at the peak, and at least 32 in every sample (2 ran a query, none sat idle in a transaction, none waited on a lock)"],
-        // Queries filled every slot: only then more slots (the live check of 4e2c65ed: failed connections, its old trigger, don't count refusals).
+        // Queries filled every slot: only then more slots (the live check of 4e2c65ed: failed connections, its old trigger, counted none of the refusals).
         ["CONN-ACTIVE", surge(29, 5, 0, 1), ["PG-POOL", "PG-CPU", "PG-MAXCONN"], "Most of them ran a query: 29 of the 35 at the peak, 1 of them waiting on a lock (5 sat idle, none sat idle in a transaction)"],
     ])("%s: says what held the slots, with its recommendations", (ruleId, resource, ids, held) => {
         const a = ask(resource);
@@ -257,19 +257,19 @@ describe("T4's connections against the limit, by what held them", () => {
         // Final tests' live check of 4e2c65ed: Azure Monitor's failed connections stayed at 0 through the workload's refused
         // attempts, so no refusal is inferred from them; every slot in use says a client connecting then was refused.
         expect(a.rootCause?.statement).toContain("Every usable slot was in use in 3 samples between 15:30:00 and 15:30:20 UTC (35 of 35), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).");
-        expect(a.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; it doesn't count refusals at the connection limit, so the capture can't say how many there were.");
+        expect(a.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit, so the capture can't say how many there were.");
         expect(a.rootCause?.statement).not.toMatch(/No client was refused|no client asked/);
         expect(a.recommendations.map((r) => r.id)).toEqual(ids);
     });
 
     it("says what Azure Monitor's failed connections count, never the refusals at the limit, and whether one is known below it", () => {
         const a = ask(surge(2, 32, 0, 0), failed(6));
-        expect(a.rootCause?.statement).toContain("Azure Monitor counted 6 failed connections in its interval from 15:30 to 15:35 UTC; it doesn't count refusals at the connection limit, so these failed for another reason, and how many clients were refused isn't known.");
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 6 failed connections in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit, so these may have failed for another reason, and how many clients were refused isn't known.");
         expect(a.recommendations.map((r) => r.id)).toEqual(["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"]);
         // Every sample under the limit: the slots may have filled between them (live: for 0.1 s, between two of 34 of 35).
         const below = ask(surge(2, 30, 0, 0));
         expect(below.rootCause?.statement).toContain("The capture's samples saw at most 33 of the 35 usable slots in use; between them the slots may have filled, so whether a client was refused isn't known.");
-        expect(below.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; it doesn't count refusals at the connection limit.");
+        expect(below.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit.");
     });
 
     // 3732317d's review: the states leave out the capture's own connection, and the total doesn't, so they add up to one
@@ -299,7 +299,7 @@ describe("T4's connections against the limit, by what held them", () => {
     it("says exactly what isn't captured: who held the connections, how many were refused, and the states when only the total was counted", () => {
         const a = ask(surge(2, 32, 0, 0));
         expect(a.notCaptured).toEqual([
-            "T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and Azure Monitor's failed connections don't count them.",
+            "T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and in this demo's live check Azure Monitor's failed connections counted none of them.",
             "T4: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.",
         ]);
         const totals = surge(2, 32, 0, 0).filter((r) => ["connections_total", "max_connections", "reserved_connections"].includes(r.metric));
@@ -315,8 +315,14 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(a.rootCause?.statement).toContain(
             "in 3 waves at 80 % of the limit or more between 15:30:00 and 15:31:10 UTC, with peaks of 35, 34, and 33 and the connections falling to 8 and 8 between them; 5 of the 9 samples from 15:30:00 to 15:31:20 UTC were at that level.",
         );
-        expect(a.rootCause?.statement).toContain("The capture ended at 15:31:20 UTC while it was still on (it recorded no end), so what came after isn't known.");
-        expect(a.details).toMatchObject({ captureEnded: "2026-11-20T15:31:20Z", waves: [{ peak: 35, lowBefore: null }, { peak: 34, lowBefore: 8 }, { peak: 33, lowBefore: 8 }] });
+        // The review of 803f2b1a: its last sample, 14, was under the level, so it fell, and wasn't "still on".
+        expect(a.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the capture ended at 15:31:20 UTC, before it could confirm the end.");
+        expect(a.rootCause?.statement).not.toMatch(/still on/);
+        expect(a.details).toMatchObject({ captureEnded: "2026-11-20T15:31:20Z", fellUnder: "2026-11-20T15:31:20Z", waves: [{ peak: 35, lowBefore: null }, { peak: 34, lowBefore: 8 }, { peak: 33, lowBefore: 8 }] });
+        // Its last sample at the level: still on.
+        const on = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), openEnded: true });
+        expect(on.rootCause?.statement).toContain("The capture ended at 15:31:10 UTC while it was still on (it recorded no end), so what came after isn't known.");
+        expect(on.details).toMatchObject({ fellUnder: null });
     });
 });
 

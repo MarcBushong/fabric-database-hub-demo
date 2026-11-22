@@ -3,9 +3,10 @@
 // 80 % of the limit or more), the sessions the capture sampled in those minutes (RCA-PG-01, only while a client waits on a
 // lock), and Azure Monitor's failed connections (connections_failed, a total per interval). PostgreSQL refuses a
 // connection past the limit (SQLSTATE 53300) and doesn't queue it, so a refused client never reaches the server's views,
-// and Azure Monitor's failed connections don't count those refusals either (Final tests' live check of 4e2c65ed: the
-// workload recorded 48 refused attempts while the metric stayed at 0): when every slot was in use, a client connecting
-// then would have been refused, and how many were isn't known.
+// and in this demo's live check Azure Monitor's failed connections counted none of those refusals either (Final tests'
+// check of 4e2c65ed: the workload recorded 48 refused attempts while the metric stayed at 0; Learn documents the metric
+// only as the number of failed connections): when every slot was in use, a client connecting then would have been
+// refused, and how many were isn't known.
 // The rules, by what held the slots:
 //   CONN-LOCK-WAIT      many waited on a lock: the connections piled up behind a blocker (explain_locking names it)
 //   CONN-IDLE-IN-TX     many sat idle in a transaction: the application left transactions open
@@ -182,7 +183,15 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
                 : `, and was at ${pct} % of the limit or more in ${atLevel.length} of the ${between} samples between ${hhmmss(first.at)} and ${hhmmss(last.at)} UTC (${span(last.at.getTime() - first.at.getTime())})`;
     }
     const lastSample = samples[samples.length - 1];
-    const cutOff = input.openEnded ? ` The capture ended at ${hhmmss(lastSample.at)} UTC while it was still on (it recorded no end), so what came after isn't known.` : "";
+    // A surge the capture never ended: still on only when its last sample was at the level. Its samples back under the
+    // level after its last at it say when it fell (the review of 803f2b1a: 32, 8, and 8 of 35 read as "still on").
+    const lastAtLevel = level !== null ? [...samples].reverse().find((s) => s.total >= level) : undefined;
+    const fell = input.openEnded && lastAtLevel && lastSample.at > lastAtLevel.at ? samples.find((s) => s.at > lastAtLevel.at) : undefined;
+    const cutOff = !input.openEnded
+        ? ""
+        : fell
+          ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the capture ended at ${hhmmss(lastSample.at)} UTC, before it could confirm the end.`
+          : ` The capture ended at ${hhmmss(lastSample.at)} UTC while it was still on (it recorded no end), so what came after isn't known.`;
 
     // Every usable slot in use: a client connecting then would have been refused, and nothing here counts how many were
     // (Final tests' live check of 4e2c65ed: Azure Monitor's failed connections stayed at 0 through 48 such refusals). When
@@ -200,13 +209,13 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
         failed.length === 0
             ? ""
             : failedCount > 0
-              ? ` Azure Monitor counted ${plural(failedCount, "failed connection")} in ${intervals}; it doesn't count refusals at the connection limit, so these failed for another reason${full.length ? ", and how many clients were refused isn't known" : ""}.`
-              : ` Azure Monitor's failed-connection count stayed at 0 in ${intervals}; it doesn't count refusals at the connection limit${full.length ? ", so the capture can't say how many there were" : ""}.`;
+              ? ` Azure Monitor counted ${plural(failedCount, "failed connection")} in ${intervals}; in this demo's live check it counted none of the refusals at the connection limit, so these may have failed for another reason${full.length ? ", and how many clients were refused isn't known" : ""}.`
+              : ` Azure Monitor's failed-connection count stayed at 0 in ${intervals}; in this demo's live check it counted none of the refusals at the connection limit${full.length ? ", so the capture can't say how many there were" : ""}.`;
     if (limit !== null) {
         notCaptured.push(
             full.length
-                ? `${target}: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and Azure Monitor's failed connections don't count them.`
-                : `${target}: whether a client was refused at the connection limit isn't captured: the slots may have filled between the capture's samples, PostgreSQL refuses a client before it reaches a session, and Azure Monitor's failed connections don't count those refusals.`,
+                ? `${target}: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and in this demo's live check Azure Monitor's failed connections counted none of them.`
+                : `${target}: whether a client was refused at the connection limit isn't captured: the slots may have filled between the capture's samples, PostgreSQL refuses a client before it reaches a session, and in this demo's live check Azure Monitor's failed connections counted none of those refusals.`,
         );
     }
 
@@ -269,7 +278,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
         notCaptured.push(`${target}: the connections' states (active, idle, idle in a transaction) weren't captured, only their total.`);
     }
     // More slots only when queries filled them all: idle or blocked connections fill them otherwise, and Azure Monitor's
-    // failed connections, its trigger before, don't count refusals at the limit (Final tests' live check of 4e2c65ed).
+    // failed connections, its trigger before, counted none of the refusals at the limit in the live check of 4e2c65ed.
     if (full.length > 0 && ruleId === "CONN-ACTIVE") ids.push("PG-MAXCONN");
 
     // Who held them: only the sessions the capture sampled, which are the ones not idle, and only while a client waited on a lock.
@@ -314,6 +323,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
             samplesAtLimit: full.length,
             failedConnections: failed.length ? failedCount : null,
             captureEnded: input.openEnded ? iso(lastSample.at) : null,
+            fellUnder: fell ? iso(fell.at) : null,
         },
     };
 }

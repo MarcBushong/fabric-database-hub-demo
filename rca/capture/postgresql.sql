@@ -234,8 +234,8 @@ ORDER BY t.seq_tup_read DESC;
 -- state leave the observer out: its session is always running this query, which read as a client running one in every
 -- sample (Final tests' live check of 4e2c65ed). So active, idle, and idle_in_transaction add up to at most one less than
 -- client_connections, and waiting_lock is a part of active.
--- Refused attempts (SQLSTATE 53300) never reach the server's views, and Azure Monitor's connections_failed doesn't count
--- them either (live, 2026-11-21: 48 refused attempts, none counted), so nothing here counts them.
+-- Refused attempts (SQLSTATE 53300) never reach the server's views, and in this demo's live check Azure Monitor's
+-- connections_failed counted none of them (2026-11-21: 48 refused attempts, none counted), so nothing here counts them.
 SELECT clock_timestamp() AS captured_at,
        current_setting('max_connections')::integer AS max_connections,
        current_setting('superuser_reserved_connections')::integer

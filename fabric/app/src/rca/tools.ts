@@ -111,8 +111,8 @@ const REPLICA_REREADS = 3;
 const REPLICA_STEP_MINUTES = 15;
 /** Azure Monitor's ProvisionedThroughput is hourly: a point stands for its hour. */
 const HOUR = 60 * MIN;
-/** How far after a listed key's time its episode may start when its own minutes read it differently: T5's 15-minute intervals, the coarsest the history keeps. */
-const KEY_SLACK_MS = 15 * MIN;
+/** Each Azure Monitor family's own metric, whose point at a key's time gives the key's first interval. */
+const FAMILY_METRIC: Readonly<Record<string, string>> = { replica_lag: LAG_METRIC, cpu: POSTGRES_METRICS.cpu, throttling: COSMOS_METRICS.throttled, ru: COSMOS_METRICS.normalizedRu };
 
 function windowOf(args: Record<string, unknown>, deps: InvestigationDeps): { from: Date; to: Date; at?: Date } | string {
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
@@ -489,16 +489,22 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         }
         const g = await gather(from, to, targets);
         let chosen = key ? g.episodes.filter((e) => e.key === key) : g.episodes.filter((e) => e.start <= to && (e.end ?? e.last) >= from);
-        // A key listed over other minutes can read differently in its own: Azure Monitor's coarser intervals of another
-        // capture can join two of its episodes into one, or stand apart from the capture's own episode (Final tests' live
-        // check of 4e2c65ed: T5's 12:15 and 12:30 read as one episode from 12:15, so 12:30's key had none). The episode of its
-        // target and signal that holds the key's time is the same incident, or else the first to start within KEY_SLACK_MS
-        // after it (the coarsest interval the history keeps), so every listed key resolves; details.readAs says which.
+        // A key listed over other minutes can read differently in its own (Final tests' live check of 4e2c65ed: T5's 12:15
+        // and 12:30 read as one episode from 12:15, so 12:30's key had none). The episode of its target and signal that holds
+        // the key's time is the same incident; or one that starts later, but within the interval of the key's own point,
+        // as the capture's stall from 16:17:12 does within Azure Monitor's 5 minutes from 16:15. Never a later incident of
+        // its own: a key with nothing in its minutes read as a storm 10 minutes later (the review of 803f2b1a). Which one,
+        // details.readAs says, and so does what wasn't captured.
         const same = key && chosen.length === 0 ? g.episodes.filter((e) => e.target === targets[0] && e.family === family) : [];
         const holds = same.filter((e) => e.start <= from && (e.end ?? e.last) >= from);
-        const readAs = holds.length ? holds : same.filter((e) => e.start > from && e.start.getTime() - from.getTime() <= KEY_SLACK_MS).slice(0, 1);
+        const metric = FAMILY_METRIC[family];
+        const keyInterval = metric ? Math.max(0, ...g.evidence.metrics.filter((m) => m.target === targets[0] && m.metric === metric && m.at.getTime() === from.getTime()).map((m) => m.intervalMs ?? 0)) : 0;
+        const readAs = holds.length ? holds : same.filter((e) => e.start > from && e.start.getTime() < from.getTime() + keyInterval).slice(0, 1);
         if (readAs.length) chosen = readAs;
         if (key && chosen.length === 0) return `No episode ${JSON.stringify(key)}: call find_incidents for the keys.`;
+        const readNote = readAs.length
+            ? [`${key}: in its own minutes, the history has no incident with this key; it reads as ${readAs.map((e) => e.key).join(" and ")}, which ${holds.length ? "holds its time" : "starts within the interval of its own point"}, so this report is that one's.`]
+            : [];
         const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.last).getTime()))) } : { from, to };
         const base = envelope("explain_incident", span.from, span.to, targets, deps, g);
         if (chosen.length === 0) {
@@ -521,7 +527,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
         // incident's own note says it once.
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
-        const notCaptured = [...new Set([...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
+        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded from ${hhmmss(e.start)} to ${hhmmss(e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {

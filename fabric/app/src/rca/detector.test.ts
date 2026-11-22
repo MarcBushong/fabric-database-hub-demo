@@ -67,6 +67,10 @@ describe("the blind detector's rule", () => {
         const series: Sample[] = [0, 0, 0, 0, 0, 3, 0, 3, 3, 0, 0, 0].map((value, i) => ({ at: m(i), value }));
         const episodes = detect("T1", series, MIN, RULES.blocking, "test");
         expect(episodes.map((e) => [e.start, e.end])).toEqual([[m(5), m(9)]]);
+        // The review of 803f2b1a: with its dip, it wasn't "3 samples in a row", and neither was T3's CPU at 95, 96, 60, 97 %.
+        expect(describeEpisode(episodes[0])).toContain("in 3 of its 4 samples");
+        const [dip] = cpuOf(cpuBins((i) => [95, 96, 60, 97][i - 40] ?? 60));
+        expect(describeEpisode(dip)).toContain("in 3 of its 4 samples (Database Hub's telemetry)");
     });
 });
 

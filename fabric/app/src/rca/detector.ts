@@ -350,6 +350,10 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
         // A one-sample episode (a deadlock count that rose) can fall between the counter's samples: its escalation states the value.
         const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
+        // An episode the capture never relaxed whose last samples are back under its level fell under by the first of them:
+        // a surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still on" (the review of 803f2b1a).
+        const lastHit = hits[hits.length - 1];
+        const after = !c.end && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
         out.push({
             key: `${c.target}-${family}-${stamp(c.start)}`,
             target: c.target,
@@ -359,6 +363,7 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
             start: c.start,
             end: c.end,
             last: hits.length ? hits[hits.length - 1].at : c.start,
+            ...(after.length ? { fellBy: after[0].at, captureEnd: after[after.length - 1].at } : {}),
             peak: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? stated : (peak?.value ?? 0),
             peakAt: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? c.start : (peak?.at ?? c.start),
             level,
@@ -522,16 +527,19 @@ export function describeEpisode(e: Episode): string {
     const span = e.end
         ? `from ${t(e.start)} to ${t(e.end)} UTC`
         : capture
-          ? `from ${t(e.start)} UTC (the capture ended while it was still on, so its end isn't known)`
+          ? e.fellBy
+              ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the capture ended at ${t(e.captureEnd ?? e.fellBy)} UTC, before it could confirm the end)`
+              : `from ${t(e.start)} UTC (the capture ended while it was still on, so its end isn't known)`
           : `from ${t(e.start)} UTC (its end isn't known: the data ${e.last.getTime() === e.start.getTime() ? "has one sample" : "ends or breaks off first"})`;
     // The capture's samples between an episode's start and end aren't all at the level when it came in waves (the live
-    // check of 4e2c65ed: four waves of a connection surge read as "32 samples in a row").
+    // check of 4e2c65ed: four waves of a connection surge read as "32 samples in a row"), and neither are the telemetry's
+    // with a dip (the review of 803f2b1a: T3's CPU at 95, 96, 60, and 97 % read as "3 samples in a row").
     const how =
         e.support === "single sample"
             ? "in one sample, far over its level: low confidence"
             : e.support === "sparse"
               ? `in ${e.atLevel} samples, ${e.unknown} of the samples between them without a value`
-              : capture && e.valued > e.atLevel
+              : e.valued > e.atLevel
                 ? `in ${e.atLevel} of its ${e.valued} samples`
                 : `in ${e.atLevel} samples in a row`;
     return `${e.target}: ${e.signal} ${e.level === 0 ? "above zero" : `over ${round(e.level)}${unit}`} ${span}, peak ${round(e.peak)}${unit} at ${t(e.peakAt)} UTC, ${how} (${e.source}).`;

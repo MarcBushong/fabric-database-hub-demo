@@ -82,10 +82,10 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
         // The live series ran in 4 waves, with drops to 8 to 10 connections between them, never one continuous surge.
         expect(s).toContain("in 4 waves at 80 % of the limit or more between 15:26:41 and 15:34:11 UTC, with peaks of 35, 33, 33, and 33 and the connections falling to 8, 8, and 8 between them; 32 of the 53 samples from 15:26:41 to 15:35:41 UTC were at that level.");
         expect(s).toContain("Every usable slot was in use in 4 samples between 15:26:51 and 15:27:21 UTC (35 of 35), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).");
-        expect(s).toContain("Azure Monitor's failed-connection count stayed at 0 in its 3 intervals from 15:25 to 15:40 UTC; it doesn't count refusals at the connection limit, so the capture can't say how many there were.");
+        expect(s).toContain("Azure Monitor's failed-connection count stayed at 0 in its 3 intervals from 15:25 to 15:40 UTC; in this demo's live check it counted none of the refusals at the connection limit, so the capture can't say how many there were.");
         expect(r.findings).toHaveLength(1);
         expect(r.recommendations.map((x) => x.id)).toEqual(["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"]);
-        expect(r.notCaptured).toContain("T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and Azure Monitor's failed connections don't count them.");
+        expect(r.notCaptured).toContain("T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and in this demo's live check Azure Monitor's failed connections counted none of them.");
         const details = part(r, "explain_connections");
         expect(details).toMatchObject({ limit: 35, maxConnections: 50, reserved: 15, failedConnections: 0, samplesAtLimit: 4, peak: { at: "2026-11-21T15:26:51Z", total: 35, idle: 34 } });
         expect((details?.waves as unknown[]).length).toBe(4);
@@ -133,7 +133,7 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
             const s = r.rootCause?.statement ?? "";
             expect(s, e.key).not.toMatch(/No client was refused|no client asked|none (was|were) refused/i);
             expect(s, e.key).toContain("The capture's samples saw at most 34 of the 35 usable slots in use; between them the slots may have filled, so whether a client was refused isn't known.");
-            expect(s, e.key).toMatch(/Azure Monitor's failed-connection count stayed at 0 in its \d+ intervals? from .* UTC; it doesn't count refusals at the connection limit\./);
+            expect(s, e.key).toMatch(/Azure Monitor's failed-connection count stayed at 0 in its \d+ intervals? from .* UTC; in this demo's live check it counted none of the refusals at the connection limit\./);
         }
     });
 
@@ -142,11 +142,14 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
         expect(cut.end ?? null).toBeNull();
         expect(cut.last.getTime()).toBeLessThanOrEqual(live("18:53:22").getTime());
         expect(Math.round(cut.peak * 10) / 10).toBe(97.1);
-        expect(describeEpisode(cut)).toContain("(the capture ended while it was still on, so its end isn't known)");
+        // The review of 803f2b1a: its last samples read 32, 8, and 8 of 35, so it wasn't "still on": it fell under the level
+        // by 18:53:12, and the capture ended at 18:53:22, before its 60 s under 70 % could confirm the end.
+        expect(describeEpisode(cut)).toContain("from 18:51:52 UTC, under its level by 18:53:12 UTC (the capture ended at 18:53:22 UTC, before it could confirm the end)");
         const r = await ask("explain_incident", { episodeKey: LIVE_KEYS.connectionsCutOff });
         const s = r.rootCause!.statement;
         expect(s).toMatch(/^T4's client connections reached 34 of the 35 slots clients can use .* at 18:51:52 UTC, /);
-        expect(s).toContain("The capture ended at 18:53:22 UTC while it was still on (it recorded no end), so what came after isn't known.");
+        expect(s).toContain("The connections fell under 80 % of the limit by 18:53:12 UTC; the capture ended at 18:53:22 UTC, before it could confirm the end.");
+        expect(s).not.toMatch(/still on/);
         expect(s).not.toMatch(/19:\d\d/);
     });
 
@@ -194,9 +197,15 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
             const result = r as InvestigationResult;
             expect(result.rootCause !== null || result.notCaptured.length > 0, key).toBe(true);
         }
-        // A key from an earlier list still reads as the incident that holds its time.
+        // A key from an earlier list still reads as the incident that holds its time, and says so where the view and
+        // Copilot look (the review of 803f2b1a); a later one only within the interval of the key's own point.
         const joined = (await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T123000Z" })) as InvestigationResult;
         expect(joined.details?.readAs).toEqual({ key: "T5-ru-20261121T123000Z", as: ["T5-ru-20261121T121500Z"] });
         expect(joined.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
+        expect(joined.notCaptured[0]).toBe("T5-ru-20261121T123000Z: in its own minutes, the history has no incident with this key; it reads as T5-ru-20261121T121500Z, which holds its time, so this report is that one's.");
+        const stall = (await tools().investigate("explain_incident", { episodeKey: "T4-replica-replica_lag-20261121T161500Z" })) as InvestigationResult;
+        expect(stall.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T161500Z", as: [LIVE_KEYS.replicaFirst] });
+        expect(stall.notCaptured[0]).toContain(`it reads as ${LIVE_KEYS.replicaFirst}, which starts within the interval of its own point`);
+        expect(await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T150000Z" })).toMatch(/^No episode /);
     });
 });

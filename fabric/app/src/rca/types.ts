@@ -233,6 +233,9 @@ export interface Episode {
     end: Date | null;
     /** The last sample at the level. */
     last: Date;
+    /** A capture episode the capture never relaxed, with samples back under its level after `last`: the first of them, and the capture's last sample. */
+    fellBy?: Date;
+    captureEnd?: Date;
     peak: number;
     peakAt: Date;
     level: number;

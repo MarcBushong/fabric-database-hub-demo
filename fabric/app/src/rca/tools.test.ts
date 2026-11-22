@@ -231,6 +231,22 @@ describe("every family the RCA explains", () => {
         expect(r.recommendations).toEqual([]);
     });
 
+    // The review of 803f2b1a: a key with nothing in its own minutes read as the first storm within 15 minutes after it,
+    // a different incident, and said so nowhere the view or Copilot looks.
+    it("answers No episode for a key whose minutes hold no incident, rather than a later storm's", async () => {
+        const points = Array.from({ length: 30 }, (_, i) => [
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.normalizedRu, value: i >= 15 && i < 18 ? 100 : 30 },
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.requests, value: 1000 },
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.throttled, value: i >= 15 && i < 18 ? 200 : 0 },
+        ]).flat();
+        const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("16:05:00"), windowStart: at("15:30:00"), windowEnd: at("16:00:00"), intervalMinutes: 1, points };
+        const deps = tools({ evidence: emptyEvidence(), telemetry: { cosmos } });
+        expect(await deps.investigate("explain_incident", { episodeKey: "T5-ru-20261120T153500Z" })).toBe('No episode "T5-ru-20261120T153500Z": call find_incidents for the keys.');
+        const storm = await ask("explain_incident", { episodeKey: "T5-ru-20261120T154500Z" }, deps);
+        expect(storm.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
+        expect(storm.details?.readAs).toBeUndefined();
+    });
+
     // The re-review of bb70161f: an RU episode 30 minutes or more into its hour read the history from 30 minutes before it,
     // so it missed the hour's provisioned throughput, stamped with the hour's start.
     it("reads the hour's provisioned throughput for an RU episode late in the hour", async () => {
