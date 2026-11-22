@@ -177,6 +177,17 @@ describe("finestPerInterval, the history's overlapping saves (F35)", () => {
         expect(intervals.has(pointKey("T5", "TotalRequests", at("15:30")))).toBe(false);
     });
 
+    // The review of 2e1a6d0b: a second pass reads the 4-minute stretch from 15:41 as the day save's step, and loses 468 requests.
+    it("refuses its own output as input, and gives the same rows as read the same result again", () => {
+        const session = point({ ...T5_SESSION, WindowStart: "2026-11-21T15:31:00", WindowEnd: "2026-11-21T15:41:00" }, "T5", "cosmos01", "TotalRequests", "Count");
+        const day = point(T5_DAY, "T5", "cosmos01", "TotalRequests", "Count");
+        const rows = [day("15:15", 103), day("15:30", 27630), day("15:45", 23858), ...REQUESTS.filter(([bucket]) => bucket >= "15:31" && bucket <= "15:40").map(([bucket, value]) => session(bucket, value))];
+        const first = finestPerInterval(rows);
+        expect(() => finestPerInterval(first.kept)).toThrow(/as read, once/);
+        expect(() => finestPerInterval([...rows, first.kept.find((r) => hhmm(r) === "15:41") as Row])).toThrow(/as read, once/);
+        expect(finestPerInterval(rows).kept.map((r) => [hhmm(r), r.Value])).toEqual(first.kept.map((r) => [hhmm(r), r.Value]));
+    });
+
     it("tells totals from peaks by the producers' own aggregations", () => {
         const root = join(process.cwd(), "..", "..");
         const cosmos = readFileSync(join(root, "scripts", "modules", "DbHubDemo", "Private", "CosmosHistoryHelpers.ps1"), "utf8");

@@ -117,6 +117,9 @@ function bucketAt(original: unknown, ms: number): unknown {
     return /[zZ]$|[+-]\d\d:?\d\d$/.test(text) ? `${core}Z` : core;
 }
 
+/** The rows finestPerInterval made (its moved and split copies), so it can refuse them as input. */
+const MADE = new WeakSet<object>();
+
 /**
  * The history's binned points, one per interval: Azure Monitor's metrics of T4, its read replica, and T5, or the notebook's
  * SQL telemetry, with no off-grid analysis. The history keeps every save, each at its own grain (1 to 1,440 minutes), so
@@ -139,8 +142,15 @@ function bucketAt(original: unknown, ms: number): unknown {
  * day-long save's 15-minute totals beside the session's own 1-minute points, so T5's requests counted twice. Dropping
  * every coarser point that overlaps would have lost the replica's 34 s of lag from 16:57 to 17:00, after the session's
  * window ended. Assumes nested, aligned grids: each grain divides the next, counted from midnight UTC.
+ *
+ * Call it once, on the history's rows as read: its output isn't valid input. A second pass would infer a save's step from
+ * its remainders' starts (a 4-minute stretch from 15:41 makes a 15-minute save's step 4) and lose what they hold, so it
+ * throws when it's given a row it made.
  */
 export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; intervals: Map<string, number>; grains: Map<string, number>; sources: Map<string, string>; upperBounds: Set<string> } {
+    if (rows.some((row) => MADE.has(row))) {
+        throw new Error("finestPerInterval takes the history's rows as read, once: these include its own output, which a second pass would read as a save's own rows.");
+    }
     const familyOf = (row: Row) => (row.TargetKey === "T5" ? "cosmos" : row.TargetKey === "T4" || row.TargetKey === "T4-replica" ? "postgres" : "sql");
     const captureOf = (row: Row) => `${String(row.CapturedAt)}|${familyOf(row)}`;
     const seriesOf = (row: Row) => `${String(row.TargetKey)}|${String(row.AnalysisKey ?? "")}|${String(row.Metric)}`;
@@ -193,6 +203,7 @@ export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; interval
     const keyOf = (p: Point, at: number) => pointKey(String(p.row.TargetKey), String(p.row.Metric), new Date(at));
     const keep = (p: Point, start: number, end: number, value: number | null, piece?: { upper: boolean }) => {
         const row = start === p.at && value === p.value && !piece ? p.row : { ...p.row, Bucket: bucketAt(p.row.Bucket, start), Value: value };
+        if (row !== p.row) MADE.add(row);
         kept.push({ row, at: start });
         if (p.grain <= 0) return;
         const key = keyOf(p, start);
