@@ -5430,3 +5430,19 @@ The read-only answer, first:
 
 - Until a write-time fix, the history report's telemetry, the app's T1 to T3 charts, and Ask's T1 to T3 sums count overlapping saves twice, as in the release. Limitations says where, and the workaround.
 - A later fix's live proof needs checks again: 55de8cc3 has the queries and their driver.
+
+### 759e6360's review: where the known issue shows (2026-11-22)
+
+**Why.** The review of 759e6360 found one Low. Limitations' "Where it doesn't" listed Mission Control's cards and replay without limiting them to T4 and T5, while part 1 changed only those targets' cards, replay lanes, and episodes. Mission Control's T1 to T3 cards take their Waits from the Estate query (`sqlHealth`), and the replay's and kiosk's T1 to T3 lanes and the scoreboard's T1 to T3 scores take the series query's bins, all from the model. "Where it shows" left out the Performance page among others.
+
+**Work summary.**
+
+- **Where it shows:** the history report's telemetry; the app's T1 to T3 views, which read the model's totals through the Estate, series, waits, incident, and daily trend queries: the Overview, Estate, Performance, Incidents, and Trends pages, Mission Control's T1 to T3 cards (their Waits), the scoreboard's T1 to T3 bins and scores, and the replay's and kiosk's T1 to T3 lanes; and Ask's T1 to T3 sums. The Readiness page reads the Estate query only for the telemetry's lag, so it isn't listed.
+- **Where it doesn't:** the T4 and T5 pages, Mission Control's T4 and T5 cards, the replay's and kiosk's T4 and T5 lanes, and T4's and T5's measured episodes.
+- The CHANGELOG's part 1 entry said "Mission Control's cards and replay" too, and now says the same as limitations.
+
+**Changed files.** `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** Pester with StrictMode: Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks, 133 passed, 3 skipped. markdownlint: clean.
+
+**Risks.** None new.
