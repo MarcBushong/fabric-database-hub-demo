@@ -12,13 +12,19 @@ BeforeAll {
     $zero = '00000000-0000-0000-0000-000000000000'
     $tableFiles = @(Get-ChildItem -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/tables') -Filter '*.tmdl' -File)
 
-    # Strips // comments without cutting a string: a DAX string ("...", with "" inside) or, in TypeScript, a '...', "...",
-    # or `...` string, where a backslash escapes. A DAX name can't hold a slash
-    # (https://learn.microsoft.com/dax/dax-syntax-reference), so outside a string, // starts a comment.
+    # Strips comments in one pass from the start, so a // or /* inside a string, a name, or another comment, or a double
+    # quote inside a name, is text there and can't hide the code after it.
+    # - DAX: "..." strings, with "" inside, also across lines; 'table' and [column] names, which can't hold an apostrophe,
+    #   a slash, a bracket, or a control character such as a newline, but can hold a double quote
+    #   (https://learn.microsoft.com/dax/dax-syntax-reference); and // and /* */ comments. The DAX query view's page
+    #   lists those two, not -- (https://learn.microsoft.com/power-bi/transform-model/dax-query-view), so a -- line is
+    #   kept whole: a name in it is still checked, and a double quote in it opens no string.
+    # - TypeScript: '...', "...", and `...` strings, where a backslash escapes, and // and /* */ comments.
+    # A /* */ comment becomes a space, so the words on either side stay apart.
     $script:stripComments = {
         param([string] $Text, [bool] $TypeScript)
-        $strings = if ($TypeScript) { '''(?:[^''\\\n]|\\.)*''|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`' } else { '"(?:[^"\n]|"")*"' }
-        [regex]::Replace($Text, $strings + '|//[^\n]*', [System.Text.RegularExpressions.MatchEvaluator] { param($Match) if ($Match.Value.StartsWith('//')) { '' } else { $Match.Value } })
+        $kept = if ($TypeScript) { '''(?:[^''\\\n]|\\[\s\S])*''|"(?:[^"\\\n]|\\[\s\S])*"|`(?:[^`\\]|\\[\s\S])*`' } else { '"(?:[^"]|"")*"|''[^''\n]*''|\[[^\]\n]*\]|--[^\n]*' }
+        [regex]::Replace($Text, '(?<kept>' + $kept + ')|(?<block>/\*[\s\S]*?\*/)|//[^\n]*', [System.Text.RegularExpressions.MatchEvaluator] { param($Match) if ($Match.Groups['kept'].Success) { $Match.Value } elseif ($Match.Groups['block'].Success) { ' ' } else { '' } })
     }
 
     # Every measure: table, name, the /// description above it, and its properties.
@@ -292,33 +298,6 @@ Describe 'Snapshot Value: each interval from its finest save (F35)' {
         }
     }
 
-    It 'times faster forms of Snapshot Value beside the model''s own other measures (checks/f35/candidates, temporary)' {
-        # Each candidate query defines its own Snapshot Value first, then every measure it evaluates or reads, with the TMDL's
-        # expressions, so a timing compares the base measure alone.
-        $tmdlText = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
-        $tmdlMeasure = {
-            param([string] $Name)
-            $quoted = "'" + $Name.Replace("'", "''") + "'"
-            & $script:squash ([regex]::Match($tmdlText, ("(?ms)^ {{4}}measure (?:{0}|{1}) =\n(.*?)(?=^ {{0,8}}\S)" -f [regex]::Escape($quoted), [regex]::Escape($Name))).Groups[1].Value)
-        }
-        $files = @(Get-ChildItem -LiteralPath (Join-Path -Path $script:checks -ChildPath 'candidates') -Filter '*.dax' -File)
-        @($files | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('c1-bins.dax', 'c1-estate.dax', 'c1-t5.dax', 'c1-window.dax', 'c2-bins.dax', 'c2-estate.dax', 'c2-t5.dax', 'c2-window.dax')
-        foreach ($file in $files) {
-            $text = [System.IO.File]::ReadAllText($file.FullName)
-            $blocks = @([regex]::Matches($text, "(?ms)^    MEASURE 'Telemetry Snapshots'\[([^\]]+)\] =\n(.*?)(?=^    MEASURE |^EVALUATE)"))
-            $names = @($blocks | ForEach-Object { $_.Groups[1].Value })
-            $names[0] | Should -BeIn @('Snapshot Value', 'Snapshot Value F35') -Because $file.Name
-            & $script:squash $blocks[0].Groups[2].Value | Should -Not -BeExactly (& $tmdlMeasure 'Snapshot Value') -Because $file.Name
-            foreach ($block in @($blocks | Select-Object -Skip 1 | Where-Object { $_.Groups[1].Value -ne 'Replica Lag Peak (s)' })) {
-                & $script:squash $block.Groups[2].Value | Should -BeExactly (& $tmdlMeasure $block.Groups[1].Value) -Because ('{0} [{1}]' -f $file.Name, $block.Groups[1].Value)
-            }
-            if ($names[0] -eq 'Snapshot Value') {
-                $code = & $script:stripComments $text $false
-                $referenced = @([regex]::Matches($code, "(?<!['\w\]])\[([^\]@][^\]]*)\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'Value' } | Sort-Object -Unique)
-                @($referenced | Where-Object { $names -notcontains $_ }) | Should -BeNullOrEmpty -Because $file.Name
-            }
-        }
-    }
 }
 
 Describe 'DAX variable names' {
@@ -382,6 +361,34 @@ Describe 'DAX variable names' {
         $tsStripped = & $script:stripComments $ts $true
         @([regex]::Matches($tsStripped, '\bVAR\s+([^\s=]+)\s*=', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }) -join ',' | Should -BeExactly 'Under'
         $tsStripped | Should -BeLikeExactly "*'https://x' + ""a//b""*"
+    }
+
+    It 'finds every name after a /* */ comment, a string across lines, and a name or -- line with a double quote in it' {
+        $dax = @(
+            '/* https://x */ VAR A1 = 1'
+            'VAR A2 = "a string'
+            'across two lines, https://x" VAR A3 = 3'
+            '/* one'
+            'two // three */ VAR A4 = 4 VAR/* a comment is a space */A5 = 5'
+            'VAR A6 = ''Odd "Table''[Col] VAR A7 = "https://x" VAR A8 = 8'
+            'VAR A9 = [Say "x] VAR A10 = "https://x" VAR A11 = 11'
+            '-- a "quote, and VAR A12 = 12 is still read'
+            'VAR A13 = "https://x" VAR A14 = 14 /* VAR Hidden = 0 */ // VAR Hidden = 0'
+        ) -join "`n"
+        $names = { param([string] $Code) @([regex]::Matches($Code, '\bVAR\s+([^\s=]+)\s*=', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }) -join ',' }
+        & $names (& $script:stripComments $dax $false) | Should -BeExactly 'A1,A2,A3,A4,A5,A6,A7,A8,A9,A10,A11,A12,A13,A14'
+        $ts = @(
+            '/* https://x */ var T1 = 1'
+            '/** an odd ` in a doc comment */'
+            'const q = `var T2 = 2 // the query''s own text'
+            'VAR T3 = "https://x" VAR T4 = 4`'
+            'const s = ''it\''s // text'' + "a\"b // text" // var Hidden = 0'
+            'const u = ''a line \'
+            'continued // text''; var T5 = 5'
+        ) -join "`n"
+        $tsStripped = & $script:stripComments $ts $true
+        & $names $tsStripped | Should -BeExactly 'T1,T2,T3,T4,T5'
+        $tsStripped.Contains('''it\''s // text'' + "a\"b // text"') | Should -BeTrue
     }
 }
 

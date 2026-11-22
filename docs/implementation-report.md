@@ -5337,3 +5337,40 @@ The read-only answer, first:
 
 - **Not run on an engine:** the timing run is also their first parse.
 - **Whether either meets the bar** is for the timing to say. C1 leaves most of a bin's work where another save's window reaches its interval, as a session's own minutes have the day-long save's window over them, and C2 takes those too. If neither does, the next step is the producer-side alternative.
+
+### F35 part 2's speed candidates withdrawn, and the names test reads comments in one pass (2026-11-22)
+
+**Why.**
+
+- **The candidates:** Final tests timed 4361ad4e's two candidates on B's model in one lease. Both gave 30392d79's answers: the bins 6,933 of 6,933, the window 32 of 32 (C2's within 8.2e-16), and the Estate and T5 answers byte-identical. Both were slower:
+
+  | End to end, against today's query (medians of 5 warm, interleaved runs) | Estate | T5 |
+  |---|---|---|
+  | da68aed5's measure, with `Under` renamed | 2.12× | 1.68× |
+  | 30392d79's measure | 2.51× | 1.87× |
+  | C1 | 2.75× | 3.30× |
+  | C2 | 2.79× | 3.42× |
+
+  C1 lost most on T5. Final tests points at its Azure Monitor interval: a `MINX` with up to 8 `MOD`s over every bin of each save near a bin, at each bin, where the ladder's `ISEMPTY ( FILTER ( … ) )` tests can stop early. The coordinator's decision: the speed work stops, neither candidate is adopted, and the TMDL keeps 30392d79's measure. Final tests now times da68aed5's and 30392d79's forms on a synthetic month of history, which decides between them, and whether the write-time version is needed.
+- **The stripper:** the review of 5eac6f95 and 4361ad4e found that the names test could still miss a name. A `//` inside a `/* */` comment, or inside a DAX string across lines, cut the rest of its line, so `/* https://x */ VAR Under = 1` passed. No file had it.
+
+**Work summary.**
+
+- The candidates folder and its temporary test are gone, and the checks' README no longer points at them.
+- The names test's stripper reads each file once, from the start, so whatever a string, a name, or a comment holds is text there:
+  - **DAX:** strings, with `""` inside and across lines; `'table'` and `[column]` names, which can hold a double quote but not a newline ([DAX syntax](https://learn.microsoft.com/dax/dax-syntax-reference)); and `//` and `/* */` comments. A `--` line is kept whole, since the DAX query view's page lists only those two ([DAX query view](https://learn.microsoft.com/power-bi/transform-model/dax-query-view)): a name in it is still checked, and a double quote in it opens no string.
+  - **TypeScript:** strings, where a backslash escapes, a line's end included; and `//` and `/* */` comments.
+  - A `/* */` comment becomes a space, so the words on either side stay apart.
+
+**Changed files.** `fabric/powerbi/checks/f35/candidates/` (removed), `fabric/powerbi/checks/f35/README.md`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- A new test reads 14 VAR names in DAX and 5 in TypeScript, each after one of those forms. With 4361ad4e's stripper, it misses 6 of the DAX names and reads one inside a comment. It also fails with any one of the new stripper's seven parts taken out.
+- On the 21 files the names test reads (the model's tables, the DAX checks, and the app's `queries.ts`), the new stripper finds the same 505 VAR names and the same measure references as the old one. Its only change to their text is in `queries.ts`: it strips the 35 doc comments, whose 30 backticks the old one read as template literals. They happened to pair up.
+- Pester with StrictMode: Fabric.PowerBI 22 passed, 1 skipped, and with Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks, 155 passed, 4 skipped. PSScriptAnalyzer: no new findings. markdownlint: clean.
+
+**Risks.**
+
+- A VAR in a `--` comment is checked like code: at worst, a false alarm.
+- F35 part 2's speed is unchanged: 30392d79's measure, at 2.51 times today's Estate time and 1.87 times T5's in that lease, until the long-history timing decides.
