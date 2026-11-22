@@ -3411,6 +3411,40 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $there | Should -Be $here
     }
 
+    It 'keeps equal times in the backlog''s order in the queue a start writes for later starts, in Windows PowerShell 5.1 too (the re-review of 087e096a)' {
+        $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $IsWindows -or -not $powershell) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
+            return
+        }
+        # Three earlier sessions whose documents the runner deletes at the same time: a later start fetches the first of equal
+        # times, and a stop's RCA.PENDING line counts the others ahead of its own, so the queue keeps their order. With settings
+        # from before the export, the start fetches none of them, and only writes the queue.
+        $probe = {
+            param([string] $Common, [string] $SettingsJson)
+            . $Common
+            $settings = ConvertFrom-DbHubSetting -Json $SettingsJson
+            $settings.rcaScriptTemplate = ''
+            $now = New-Object -TypeName DateTime -ArgumentList 2026, 11, 22, 18, 0, 0, ([System.DateTimeKind]::Utc)
+            $context = Initialize-DbHubContext -Settings $settings -JobId 'aaaaaaaa-0000-0000-0000-00000000000a' -NowUtc $now
+            $make = { param([string] $Id, [string] $Document) [ordered]@{ sessionId = $Id; pending = @([ordered]@{ documentId = $Document; parts = 1; sha256 = ('a' * 64); vm = 'sqlvm01' }); leftVms = @(); boundVms = @(); expiresUtc = $now.AddDays(5); heldUntilUtc = $now.AddDays(20); startUtc = $null; endUtc = $null; rca = $null; previous = $false; known = $true; mustFetch = $false } }
+            $entries = @((& $make ('a' * 32) '20261120T100000Z-sqlvm01-0001'), (& $make ('b' * 32) '20261120T110000Z-sqlvm01-0001'), (& $make ('c' * 32) '20261120T120000Z-sqlvm01-0001'))
+            $status = [ordered]@{ schemaVersion = 1; sessionId = '0123456789abcdef0123456789abcdef'; phase = 'starting'; steps = @() }
+            Invoke-DbHubRcaEarlier -Context $context -Status $status -Entry $entries
+            return ((@($status['rcaEarlierPending']) | ForEach-Object { ([string]$_['sessionId']).Substring(0, 1) }) -join ',')
+        }
+        $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
+        $here = & $probe $common $script:settingsJson
+        $inputFile = Join-Path -Path $TestDrive -ChildPath 'queue.json'
+        Set-Content -LiteralPath $inputFile -Value (ConvertTo-Json -InputObject @{ common = $common; settings = $script:settingsJson; probe = $probe.ToString() } -Depth 4) -Encoding utf8
+        $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common `$in.settings; [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$out))" -f $inputFile
+        $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
+        $LASTEXITCODE | Should -Be 0
+        $there = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]($output | Select-Object -Last 1)).Trim()))
+        $there | Should -Be 'a,b,c'
+        $there | Should -Be $here
+    }
+
     It 'writes a stopped session''s RCA.PENDING line again when a re-check routes another session''s documents ahead of its own (the transport review of f99451f7)' {
         $state = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(New-TestPending -DocumentId $script:fixtureIds[1] -Vm 'sqlvm01'); leftVms = @(); final = $false; finalRan = $true; status = 'Warning'; message = ''; boundVms = @() }
         $older = 'Still on the VMs, for this session''s history: 1 document(s) on sqlvm01 not fetched whole, the first from 17:00 UTC, which the next session''s start fetches, until 2026-11-03 14:00 UTC, when the runner deletes them.'

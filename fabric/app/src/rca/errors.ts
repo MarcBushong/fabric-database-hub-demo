@@ -4,7 +4,7 @@
 // event session and Azure Monitor's counts (T4's failed connections, T5's 429s), never the workload's own account of them.
 
 import { recommend } from "./catalog";
-import { during, hhmmss, iso, openCountWords, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
+import { during, hhmmss, iso, openCountWords, openKnownCount, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
 
 export interface ErrorClass {
     id: string;
@@ -64,9 +64,9 @@ export interface ErrorSummary {
     first: Date;
     /** When the last one was: an event's time, or the end of the interval of an Azure Monitor count (the review of ebd1c6c3). */
     last: Date;
-    /** Its counts whose interval isn't known in these minutes (the reviews of 4667459c and 11b7c4b9), apart from the known ones, never added: their total, the first one's start, and how many intervals; null when it has none. */
+    /** Its counts whose interval isn't known in these minutes (the reviews of 4667459c and 11b7c4b9), apart from the known ones in words: their total, the first one's start, and how many intervals; null when it has none. */
     open: { count: number; from: Date; intervals: number } | null;
-    /** Its known counts: their total and span; null when it has none. */
+    /** Its known counts: their total and span; null when it has none. With `open`, `count` adds them only when they end before its interval begins (the re-review of 087e096a). */
     known: { count: number; first: Date; last: Date } | null;
     intercepted: number;
     top: string;
@@ -90,7 +90,8 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         // An Azure Monitor count stands for its whole interval: 10382 429s counted at 12:15 and 12:30 in 15-minute intervals
         // ran to 12:45, not 12:30 (the review of ebd1c6c3).
         const last = new Date(Math.max(...rows.map((r) => r.at.getTime() + (r.intervalMs ?? 0))));
-        // Counts of an interval whose length isn't known in these minutes stand apart: such an interval may hold the known ones.
+        // Counts of an interval whose length isn't known in these minutes stand apart in words: such an interval may hold the
+        // known ones. Its count adds them only when they end before it begins (openKnownCount).
         const sum = (list: readonly EventRow[]) => list.reduce((n, r) => n + (r.count ?? 1), 0);
         const openRows = rows.filter((r) => r.intervalUnknown);
         const knownRows = rows.filter((r) => !r.intervalUnknown);
@@ -103,7 +104,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         }
         return {
             classId: id, title: c.title,
-            count: open && known ? Math.max(open.count, known.count) : sum(rows),
+            count: open ? openKnownCount(open, known) : sum(rows),
             targets: [...new Set(rows.map((r) => r.target))],
             first: sorted[0].at, last, open, known,
             intercepted: rows.filter((r) => r.intercepted).reduce((n, r) => n + (r.count ?? 1), 0),
@@ -140,6 +141,6 @@ export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Dat
             : null,
         recommendations: recommend(...new Set(classes.flatMap((c) => c.recommendationIds))),
         nextSteps: classes.slice(0, 3).map((c) => `${c.followUp} for ${c.targets.join(", ")} (${c.title.toLowerCase()})`),
-        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), ...(c.open ? { endUnknown: true, inIntervalOfUnknownLength: { count: c.open.count, from: iso(c.open.from), intervals: c.open.intervals }, known: c.known ? c.known.count : 0 } : {}), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
+        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), ...(c.open ? { endUnknown: true, inIntervalOfUnknownLength: { count: c.open.count, from: iso(c.open.from), intervals: c.open.intervals }, known: c.known ? c.known.count : 0, ...(c.known ? { knownFirst: iso(c.known.first), knownLast: iso(c.known.last) } : {}) } : {}), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
     };
 }

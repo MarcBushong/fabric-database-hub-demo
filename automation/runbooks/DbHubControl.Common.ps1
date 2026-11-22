@@ -8627,9 +8627,10 @@ function Invoke-DbHubRcaEarlier {
             $listedFor[$session]++
         }
         # The queue for later starts: bundles no saved index lists first, then documents in the order the runner deletes
-        # them, then capture only held.
+        # them, then capture only held. Equal times keep the backlog's order, which a start's fetch and a stop's RCA.PENDING
+        # line count on: Windows PowerShell 5.1's Sort-Object reverses equal elements (the re-review of 087e096a).
         $remaining = @($entries | Where-Object { @($_['pending']).Count -gt 0 -or @($_['leftVms']).Count -gt 0 -or $_['mustFetch'] })
-        $order = @($remaining | Where-Object { @($_['pending']).Count -gt 0 -and -not $_['mustFetch'] } | Sort-Object -Property { $_['expiresUtc'] })
+        $order = @($remaining | Where-Object { @($_['pending']).Count -gt 0 -and -not $_['mustFetch'] } | Sort-Object -Property @{ Expression = { $_['expiresUtc'] } }, @{ Expression = { [System.Array]::IndexOf($remaining, $_) } })
         $queued = @(@($remaining | Where-Object { $_['mustFetch'] }) + $order + @($remaining | Where-Object { @($_['pending']).Count -eq 0 -and -not $_['mustFetch'] }))
         $carried = @($queued | ForEach-Object { ConvertTo-DbHubRcaCarry -Entry $_ } | Where-Object { $null -ne $_ })
         if ($carried.Count -gt 0) {

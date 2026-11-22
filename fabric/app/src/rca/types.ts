@@ -332,6 +332,11 @@ export const hhmmss = (d: Date) => d.toISOString().slice(11, 19);
 /** "between 16:52:10 and 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). */
 export const during = (first: Date, last: Date) => (first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `between ${hhmmss(first)} and ${hhmmss(last)}`);
 
+/** Whether the known counts all end by the time the interval whose length isn't known begins, so it can't hold them. */
+function knownBefore(open: { from: Date }, known: { count: number; last: Date } | null): boolean {
+    return !!known && known.count > 0 && known.last.getTime() <= open.from.getTime();
+}
+
 /**
  * Azure Monitor counts of an interval whose length isn't known in these minutes (MetricPoint.intervalUnknown), in words,
  * beside the counts whose interval is known, and never added to them: such an interval may hold them (the reviews of
@@ -343,6 +348,16 @@ export function openCountWords(open: { count: number; from: Date; intervals: num
     const where = `${open.count}${what ? ` ${what}` : ""} ${open.intervals > 1 ? `in ${open.intervals} intervals` : "in the interval"} from ${hhmmss(open.from)} UTC, whose length isn't known in these minutes`;
     if (!known || known.count === 0) return where;
     const span = `${hhmmss(known.first)} to ${hhmmss(known.last)} UTC`;
-    if (known.last.getTime() <= open.from.getTime()) return `${where}, after the ${known.count} counted from ${span}`;
+    if (knownBefore(open, known)) return `${where}, after the ${known.count} counted from ${span}`;
     return `${where}, which may hold ${known.first < open.from ? "some of " : ""}the ${known.count} counted from ${span}`;
+}
+
+/**
+ * The count of a class with counts of an interval whose length isn't known (the re-review of 087e096a), for its ranking and
+ * severity: both when the known ones end before that interval begins, since they can't overlap (100 counted from 14:40 to
+ * 15:00 and 3,000 from 15:00 are 3,100), and otherwise the larger, since that interval may hold the known ones.
+ */
+export function openKnownCount(open: { count: number; from: Date }, known: { count: number; last: Date } | null): number {
+    if (!known || known.count === 0) return open.count;
+    return knownBefore(open, known) ? open.count + known.count : Math.max(open.count, known.count);
 }

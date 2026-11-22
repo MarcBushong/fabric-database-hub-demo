@@ -9,8 +9,9 @@ import RcaPage from "@/pages/RcaPage";
 import { sampleRows } from "@/preview/sample-data";
 import { sampleRcaRows } from "@/preview/sample-rca";
 import { LIVE_KEYS, live, liveSources } from "@/rca/testdata/live-rb-2233e0ae";
+import { analyzeErrorsResult } from "@/rca/errors";
 import { createInvestigationTools } from "@/rca/tools";
-import type { InvestigationResult } from "@/rca/types";
+import type { EventRow, InvestigationResult } from "@/rca/types";
 import { RcaReport } from "@/rca/view/RcaReport";
 import { answerKeyInContext } from "@/test/blind";
 import { renderWithApp, type FakeQueryClient } from "@/test/render";
@@ -160,5 +161,34 @@ describe("the report's root cause, never blank", () => {
         expect(screen.getByText("The capture and the telemetry hold no cause for these minutes.")).toBeInTheDocument();
         expect(screen.queryByText(/see what wasn't captured below/)).toBeNull();
         expect(screen.queryByRole("heading", { name: "Not captured" })).toBeNull();
+    });
+});
+
+// The re-review of 087e096a: the errors table showed each class's count and "first to last" alone, so an hour's 3,000 429s
+// read "15:00 to 15:00", 3,000 and the 1,600 it may hold read "3,000", and 100 counted before it read "3,000" too.
+describe("the report's errors table", () => {
+    const incident: InvestigationResult = { tool: "explain_incident", version: 1, window: { fromUtc: "2026-11-20T14:40:00Z", toUtc: "2026-11-20T15:30:00Z" }, targets: ["T4", "T5"], episodes: [], findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: [] };
+    const minute = (hm: string, i: number) => new Date(Date.parse(`2026-11-20T${hm}:00Z`) + i * 60_000);
+    const count = (target: "T4" | "T5", at: Date, n: number, interval: number | "unknown"): EventRow => ({ target, at, kind: "error", name: "Azure Monitor", code: target === "T5" ? "429" : "connections_failed", count: n, ...(interval === "unknown" ? { intervalUnknown: true } : { intervalMs: interval }), detail: "Azure Monitor's count" });
+    /** The table's rows, each cell's text, as the report shows explain_errors' classes for these counts. */
+    const rowsOf = (events: EventRow[]) => {
+        const errors: InvestigationResult = { ...incident, tool: "explain_errors", ...analyzeErrorsResult(events) };
+        renderWithApp(<RcaReport incident={incident} errors={errors} timeZone="UTC" logs={[]} />);
+        const section = screen.getByRole("heading", { name: "Errors in these minutes" }).closest("section")!;
+        const rows = within(within(section).getByRole("table")).getAllByRole("row").slice(1);
+        const cells = rows.map((r) => within(r).getAllByRole("cell").slice(1, 4).map((c) => c.textContent));
+        cleanup();
+        return cells;
+    };
+    const hour = minute("15:00", 0);
+
+    it("shows counts of an interval whose length isn't known apart, from that interval's start with its length unknown", () => {
+        expect(rowsOf([count("T4", hour, 7, "unknown")])).toEqual([["7 in an interval of unknown length", "T4", "from 15:00 UTC (15:00 UTC), length unknown"]]);
+        const inside = Array.from({ length: 16 }, (_, i) => count("T5", minute("15:14", i), 100, 60_000));
+        expect(rowsOf([count("T5", hour, 3000, "unknown"), ...inside])).toEqual([["3,000 in an interval of unknown length, which may hold the 1,600 counted", "T5", "from 15:00 UTC (15:00 UTC), length unknown; counted 15:14 UTC (15:14 UTC) to 15:30 UTC (15:30 UTC)"]]);
+        const before = Array.from({ length: 20 }, (_, i) => count("T5", minute("14:40", i), 5, 60_000));
+        expect(rowsOf([count("T5", hour, 3000, "unknown"), ...before])).toEqual([["3,100: 100 counted, then 3,000 in an interval of unknown length", "T5", "14:40 UTC (14:40 UTC) to 15:00 UTC (15:00 UTC), then from 15:00 UTC (15:00 UTC), length unknown"]]);
+        // Known counts alone, as before.
+        expect(rowsOf(before)).toEqual([["100", "T5", "14:40 UTC (14:40 UTC) to 15:00 UTC (15:00 UTC)"]]);
     });
 });

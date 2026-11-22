@@ -7,7 +7,7 @@ import { bothTimes } from "../time";
 import type { ChainNodeView } from "../tools";
 import type { InvestigationResult, Recommendation } from "../types";
 import { ChainTree } from "./ChainTree";
-import { episodeOf } from "./facts";
+import { episodeOf, errorClassCells, type ErrorClassRow } from "./facts";
 
 interface Tree {
     target: string;
@@ -17,17 +17,6 @@ interface Tree {
     depth: number;
     width: number;
     root: ChainNodeView;
-}
-
-interface ErrorClass {
-    class: string;
-    title: string;
-    count: number;
-    targets: string[];
-    first: string;
-    last: string;
-    intercepted?: number;
-    top?: string;
 }
 
 interface Part {
@@ -110,7 +99,7 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
     const trees = ((locking?.trees as Tree[] | undefined) ?? []).filter((t) => !episode || t.target === episode.target);
     const series = ((locking?.series as Array<{ target: string; at: string; blocked: number }> | undefined) ?? []).filter((p) => !episode || p.target === episode.target);
     const lag = (replica?.lag as Array<{ at: string; seconds: number }> | undefined) ?? [];
-    const classes = (errors?.details?.classes as ErrorClass[] | undefined) ?? [];
+    const classes = (errors?.details?.classes as ErrorClassRow[] | undefined) ?? [];
     const also = (incident.details?.alsoInTheseMinutes as string[] | undefined) ?? [];
     // The errors' window and an incident's parts each say "no RCA capture recorded" for their own minutes: one per target is enough.
     const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA capture recorded/.exec(s)?.[1];
@@ -208,17 +197,18 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
                             </tr>
                         </thead>
                         <tbody>
-                            {classes.map((c) => (
-                                <tr key={c.class}>
-                                    <td>{c.title}</td>
-                                    <td>{c.count.toLocaleString("en-US")}</td>
-                                    <td>{c.targets.join(", ")}</td>
-                                    <td>
-                                        {bothTimes(new Date(c.first), timeZone)} to {bothTimes(new Date(c.last), timeZone)}
-                                    </td>
-                                    <td>{c.top ? <code className="rca-code">{c.top}</code> : "—"}</td>
-                                </tr>
-                            ))}
+                            {classes.map((c) => {
+                                const cells = errorClassCells(c, timeZone);
+                                return (
+                                    <tr key={c.class}>
+                                        <td>{c.title}</td>
+                                        <td>{cells.count}</td>
+                                        <td>{c.targets.join(", ")}</td>
+                                        <td>{cells.when}</td>
+                                        <td>{c.top ? <code className="rca-code">{c.top}</code> : "—"}</td>
+                                    </tr>
+                                );
+                            })}
                         </tbody>
                     </table>
                 ) : (

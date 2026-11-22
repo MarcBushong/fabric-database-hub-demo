@@ -465,6 +465,28 @@ describe("a coarser point a finer save holds part of", () => {
         expect((triaged.details!.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === "errors")?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes, which may hold the 16 counted from 15:14:00 to 15:30:00 UTC (Azure Monitor counts included).");
     });
 
+    // The re-review of 087e096a: known counts that end before an interval of unknown length begins can't be in it, but the
+    // class counted only the larger, so 100 429s from 14:40 and 3,000 from 15:00 ranked as 3,000, under 3,050 failed
+    // connections. They're added for its count, rank, and severity, and for triage's, while its words still say them apart.
+    it("adds known counts that end before an interval of unknown length begins, for a class's rank and severity, and for triage", async () => {
+        const clock = (start: string, i: number) => new Date(Date.parse(`2026-11-20T${start}:00Z`) + i * 60_000).toISOString().slice(11, 16);
+        const hourly = save("18:05", "14:00", "18:00");
+        const hour = (metric: string, value: number) => ["14:00", "15:00", "16:00", "17:00"].map((b) => hourly(b, metric, b === "15:00" ? value : 0));
+        const minutes = (from: string, to: string, n: number, metric: string, each: (i: number) => number) => Array.from({ length: n }, (_, i) => save("15:15", from, to)(clock(from, i), metric, each(i)));
+        const onT4 = <T extends object>(r: T) => ({ ...r, TargetKey: "T4", ResourceName: "pgflex01" });
+        const asked = { from: "2026-11-20T14:40:00Z", to: "2026-11-20T15:10:00Z" };
+        const ranked = await ask("explain_errors", { ...asked, targets: ["T4", "T5"] }, reading([...hour(THROTTLED, 3000), ...minutes("14:40", "15:00", 20, THROTTLED, () => 5), ...minutes("14:40", "15:10", 30, "connections_failed", (i) => (i === 5 ? 3050 : 0)).map(onT4)]));
+        expect((ranked.details!.classes as Array<{ class: string; count: number }>).map((c) => [c.class, c.count])).toEqual([["throttled", 3100], ["connection-refused", 3050]]);
+        expect(ranked.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(3000 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, after the 100 counted from 14:40:00 to 15:00:00 UTC, mostly /);
+        const severe = await ask("explain_errors", { ...asked, targets: ["T5"] }, reading([...hour(THROTTLED, 60), ...minutes("14:50", "15:00", 10, THROTTLED, () => 5)]));
+        expect((severe.details!.classes as Array<{ count: number }>)[0].count).toBe(110);
+        expect(severe.findings[0].severity).toBe("critical");
+        const triaged = await ask("triage_window", { ...asked, targets: ["T4"] }, reading([...hour("connections_failed", 7), ...minutes("14:40", "15:00", 20, "connections_failed", () => 1)].map(onT4)));
+        const errors = (triaged.details!.hypotheses as Array<{ family: string; summary: string; score: number }>).find((h) => h.family === "errors");
+        expect(errors?.summary).toBe("T4: 7 errors and cancels in the interval from 15:00:00 UTC, whose length isn't known in these minutes, after the 20 counted from 14:40:00 to 15:00:00 UTC (Azure Monitor counts included).");
+        expect(errors?.score).toBe(5.4);
+    });
+
     // A peak kept around a finer save is only an upper bound of each stretch it's kept for: the replica's rise is said as
     // Azure Monitor's highest over the whole interval, never as the highest in either stretch.
     it("says the replica's lag kept around a finer save as Azure Monitor's highest over its whole interval", async () => {
