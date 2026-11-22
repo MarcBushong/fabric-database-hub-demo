@@ -120,6 +120,15 @@ const RESULT_CHARS = 60_000;
 const MIN = 60_000;
 /** The detector's baselines read the minutes before a window. */
 const LEAD_MINUTES = 30;
+/**
+ * A key's minutes are read from this much earlier than its time, besides LEAD_MINUTES: the episodes before it then have
+ * baselines of their own, as in the list that gave the key, and the detector leaves them out of its baseline. Read from
+ * the key's own time, a CPU incident on T2 that the day's list gave from 16:19 started a sample later, at 16:20, so its
+ * key had none (Final tests' check of ddebd4c3, F1).
+ */
+const KEY_LEAD_MINUTES = 30;
+/** One sample of the telemetry: Database Hub's bins are a minute, and the capture's samples are finer. */
+const ONE_SAMPLE_MS = 60_000;
 /** How many more times the replica's lag is read while its rise runs past the minutes read, and how far past their end an unrecovered rise is read each time: at most 4 reads, 45 minutes past the first. */
 const REPLICA_REREADS = 3;
 const REPLICA_STEP_MINUTES = 15;
@@ -221,9 +230,14 @@ const episodeView = (e: Episode) => ({
     peak: `${Math.round(e.peak * 10) / 10}${e.unit === "%" ? " %" : ` ${e.unit}`}`,
 });
 
-/** The note for a target with no capture in a window, and whether a line is one: an incident says it once. */
+/**
+ * The note for a target with no capture in a window, and whether a line is one: an incident says it once. A line is one in
+ * either form: none recorded, or a coverage row marked not captured, as T5's are in B's model ("no RCA evidence for"), which
+ * a part reading wider minutes said again for a span after the storm had ended (Final tests' check of ddebd4c3, F2).
+ */
 const noCaptureNote = (t: RcaTarget, from: Date, to: Date) => `${t}: no RCA capture recorded for ${hhmmss(from)}-${hhmmss(to)} UTC; only the telemetry (Telemetry Snapshots) is known`;
-const isNoCaptureNote = (t: RcaTarget, line: string) => line.startsWith(`${t}: no RCA capture recorded for `) && line.endsWith("; only the telemetry (Telemetry Snapshots) is known");
+const isNoCaptureNote = (t: RcaTarget, line: string) =>
+    (line.startsWith(`${t}: no RCA capture recorded for `) && line.endsWith("; only the telemetry (Telemetry Snapshots) is known")) || line.startsWith(`${t}: no RCA evidence for `);
 
 function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarget[], deps: InvestigationDeps, g: Gathered, at?: Date): InvestigationResult {
     const coverage = g.evidence.coverage.filter((c) => targets.includes(c.target) && c.to >= from && c.from <= to);
@@ -545,12 +559,13 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             ({ from, to } = w);
             targets = [target];
         }
-        const g = await gather(from, to, targets);
+        const g = await gather(key ? new Date(from.getTime() - KEY_LEAD_MINUTES * MIN) : from, to, targets);
         let chosen = key ? g.episodes.filter((e) => e.key === key) : g.episodes.filter((e) => e.start <= to && (e.end ?? e.last) >= from);
         // A key listed over other minutes can read differently in its own (Final tests' live check of 4e2c65ed: T5's 12:15
         // and 12:30 read as one episode from 12:15, so 12:30's key had none). The episode of its target and signal that holds
         // the key's time is the same incident; or one that starts later, but within the interval of the key's own point,
-        // as the capture's stall from 16:17:12 does within Azure Monitor's 5 minutes from 16:15. Never a later incident of
+        // as the capture's stall from 16:17:12 does within Azure Monitor's 5 minutes from 16:15, or within a sample of its
+        // time, where a baseline read otherwise first saw it (Final tests' check of ddebd4c3, F1). Never a later incident of
         // its own: a key with nothing in its minutes read as a storm 10 minutes later (the review of 803f2b1a). Which one,
         // details.readAs says, and so does what wasn't captured.
         const same = key && chosen.length === 0 ? g.episodes.filter((e) => e.target === targets[0] && e.family === family) : [];
@@ -562,11 +577,12 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const keyInterval = metric
             ? Math.max(0, g.keyIntervals?.get(pointKey(targets[0], metric, from)) ?? 0, ...g.evidence.metrics.filter((m) => m.target === targets[0] && m.metric === metric && m.at.getTime() === from.getTime()).map((m) => m.intervalMs ?? 0))
             : 0;
-        const readAs = holds.length ? holds : same.filter((e) => e.start > from && e.start.getTime() < from.getTime() + keyInterval).slice(0, 1);
+        const withinPoint = (e: Episode) => e.start.getTime() < from.getTime() + keyInterval;
+        const readAs = holds.length ? holds : same.filter((e) => e.start > from && (withinPoint(e) || e.start.getTime() <= from.getTime() + ONE_SAMPLE_MS)).slice(0, 1);
         if (readAs.length) chosen = readAs;
         if (key && chosen.length === 0) return `No episode ${JSON.stringify(key)}: call find_incidents for the keys.`;
         const readNote = readAs.length
-            ? [`${key}: in its own minutes, the history has no incident with this key; it reads as ${readAs.map((e) => e.key).join(" and ")}, which ${holds.length ? "holds its time" : "starts within the interval of its own point"}, so this report is that one's.`]
+            ? [`${key}: in its own minutes, the history has no incident with this key; it reads as ${readAs.map((e) => e.key).join(" and ")}, which ${holds.length ? "holds its time" : withinPoint(readAs[0]) ? "starts within the interval of its own point" : "starts a sample after its time"}, so this report is that one's.`]
             : [];
         const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.readEnd ?? e.last).getTime()))) } : { from, to };
         const base = envelope("explain_incident", span.from, span.to, targets, deps, g);

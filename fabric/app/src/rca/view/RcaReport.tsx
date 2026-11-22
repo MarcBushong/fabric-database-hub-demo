@@ -101,8 +101,9 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
     const lag = (replica?.lag as Array<{ at: string; seconds: number }> | undefined) ?? [];
     const classes = (errors?.details?.classes as ErrorClassRow[] | undefined) ?? [];
     const also = (incident.details?.alsoInTheseMinutes as string[] | undefined) ?? [];
-    // The errors' window and an incident's parts each say "no RCA capture recorded" for their own minutes: one per target is enough.
-    const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA capture recorded/.exec(s)?.[1];
+    // The errors' window and an incident's parts each say a target has no capture for their own minutes, in either form (no
+    // capture recorded, or a coverage row marked not captured): one per target is enough.
+    const noCapture = (s: string) => /^(T1|T2|T3|T4|T4-replica|T5): no RCA (?:capture recorded|evidence) for /.exec(s)?.[1];
     const said = new Set<string>();
     const notCaptured = [...new Set([...incident.notCaptured, ...(errors?.notCaptured ?? [])])].filter((s) => {
         const target = noCapture(s);

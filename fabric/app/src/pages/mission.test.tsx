@@ -131,7 +131,7 @@ describe("Mission Control", () => {
         it(
             `offers no Copilot draft for a lone incident request, whose minutes are its fault's own, ${state} (the re-review of feb64ad3)`,
             async () => {
-                const { copilot } = renderWithApp(<MissionControlPage />, { client: sampleClient(), rca, rcaError, view: { session: "s5" } });
+                renderWithApp(<MissionControlPage />, { client: sampleClient(), rca, rcaError, view: { session: "s5" } });
                 const write = await screen.findByRole("button", { name: "Write the postmortem" });
                 await waitFor(() => expect(write).toBeEnabled());
                 fireEvent.click(write);
@@ -140,9 +140,8 @@ describe("Mission Control", () => {
                 const lead = dialog.querySelector(".pm-lead")?.textContent ?? "";
                 expect(lead).toContain("There's no Draft with Copilot for a lone incident request, only for a session: a request's minutes are its fault's own, so they'd tell the chat where to look.");
                 expect(lead.includes("The Root cause page finds the incidents from the signals alone and explains each one.")).toBe(points);
-                // The app's own Markdown stays, with no sign-in.
+                // The app's own Markdown stays, with no sign-in. What the page's Asks hand the chat is ask-blind's to check.
                 expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled();
-                expect(copilot.ask).not.toHaveBeenCalled();
             },
             SLOW,
         );

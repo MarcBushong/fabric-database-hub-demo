@@ -162,6 +162,16 @@ describe("the report's root cause, never blank", () => {
         expect(screen.queryByText(/see what wasn't captured below/)).toBeNull();
         expect(screen.queryByRole("heading", { name: "Not captured" })).toBeNull();
     });
+
+    // Final tests' check of ddebd4c3 (F2): a coverage row marked not captured says "no RCA evidence for", and the errors'
+    // minutes said it again, for a span after the storm had ended. One per target, in either form.
+    it("says once per target that it wasn't captured, in either form", () => {
+        const incident: InvestigationResult = { tool: "explain_incident", version: 1, window: { fromUtc: "2026-11-21T15:46:00Z", toUtc: "2026-11-21T15:55:00Z" }, targets: ["T5"], episodes: [], findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: ["T5: no RCA evidence for 15:27:09-15:55:03 UTC"] };
+        const errors: InvestigationResult = { ...incident, tool: "explain_errors", notCaptured: ["T5: no RCA evidence for 15:55:03-16:24:58 UTC", "T5: no RCA capture recorded for 15:46:00-15:56:00 UTC; only the telemetry (Telemetry Snapshots) is known"] };
+        renderWithApp(<RcaReport incident={incident} errors={errors} timeZone="UTC" logs={[]} />);
+        const gaps = screen.getByRole("region", { name: "Not captured" });
+        expect(within(gaps).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
+    });
 });
 
 // The re-review of 087e096a: the errors table showed each class's count and "first to last" alone, so an hour's 3,000 429s

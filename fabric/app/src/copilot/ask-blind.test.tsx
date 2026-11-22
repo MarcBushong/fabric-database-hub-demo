@@ -15,8 +15,8 @@ import ReplayPage from "@/pages/ReplayPage";
 import ScoreboardPage from "@/pages/ScoreboardPage";
 import TrendsPage from "@/pages/TrendsPage";
 import type { ViewState } from "@/lib/view-state";
-import { FIXTURES, renderWithApp } from "@/test/render";
-import { answerKeyInContext } from "@/test/blind";
+import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
+import { answerKeyInContext, faultMinutesInContext, type FaultMinutes } from "@/test/blind";
 import { findIncidentsAsk, triageAsk } from "@/rca/entry";
 import type { AskContext } from "./contract";
 import { checkDax } from "./tools";
@@ -24,9 +24,13 @@ import { checkDax } from "./tools";
 // ADR 0031, decision 7 (the coordinator's call, 2026-11-20): the chat is blind, so no page hands it the demo's answer
 // key. Every "Ask Copilot", "Ask why", and Copilot draft passes measured data only, never an answer-key table or a
 // measure that reads one (run_dax would refuse to query it again), never a scenario's name or what was injected. The
-// drill-downs count too, and so does the postmortem's draft.
+// drill-downs count too, and so does the postmortem's draft. Nor does any Ask aim the chat at a lone incident request's
+// minutes, which are its fault's own: the re-review of ff5753e2 found them in the waits the Asks' DAX read.
 const injected = FIXTURES["incident-windows"].find((r) => r.Scenario) ?? FIXTURES["incident-windows"][0];
-type Case = { name: string; Page: ComponentType; view?: Partial<ViewState>; postmortem?: boolean; live?: "sample" };
+/** A lone incident request on T1, outside any session, beside the fixtures' session. */
+const LONE = { RequestId: "r7", RequestedAt: "2026-10-20T14:59:00", TargetKey: "T1", Profile: "incident:blocking-chain", DurationMin: 30, Intensity: 5, Concurrency: 2, Dispatch: "webhook", Status: "Pass", Message: "", WindowStart: "2026-10-20T15:00:00", WindowEnd: "2026-10-20T15:30:00" };
+const LONE_MINUTES: FaultMinutes[] = [{ target: "T1", start: new Date("2026-10-20T15:00:00Z"), end: new Date("2026-10-20T15:30:00Z") }];
+type Case = { name: string; Page: ComponentType; view?: Partial<ViewState>; postmortem?: boolean; live?: "sample"; lone?: boolean };
 const CASES: Case[] = [
     { name: "Overview", Page: OverviewPage },
     { name: "Overview, with Database Hub live", Page: OverviewPage, live: "sample" },
@@ -46,7 +50,9 @@ const CASES: Case[] = [
     { name: "Manage", Page: ManagePage },
     { name: "Live views", Page: LinksPage },
     { name: "Mission Control", Page: MissionControlPage, postmortem: true },
+    { name: "Mission Control, a lone incident request in focus", Page: MissionControlPage, view: { session: "r7" }, lone: true },
     { name: "Scoreboard", Page: ScoreboardPage, postmortem: true },
+    { name: "Scoreboard, a lone incident request among its newest plans", Page: ScoreboardPage, postmortem: true, lone: true },
     { name: "Session replay", Page: ReplayPage, postmortem: true },
 ];
 
@@ -85,8 +91,9 @@ const ASKS = new RegExp(`^(Ask\\b|${OVERVIEW_PROMPT.replace(/[?.]/g, "\\$&")}$)`
 afterEach(() => cleanup());
 
 /** Renders a page, waits for its data, and clicks every Ask on it (the postmortem's draft too, when asked): the contexts it handed the chat. */
-async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>; rca?: boolean; postmortem?: boolean; live?: "sample" } = {}): Promise<AskContext[]> {
-    const { copilot } = renderWithApp(<Page />, { view: options.view, rca: options.rca, live: options.live });
+async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>; rca?: boolean; postmortem?: boolean; live?: "sample"; lone?: boolean } = {}): Promise<AskContext[]> {
+    const client = options.lone ? fakeQueryClient({ "scenario-runs": [...FIXTURES["scenario-runs"], LONE] }) : undefined;
+    const { copilot } = renderWithApp(<Page />, { view: options.view, rca: options.rca, live: options.live, client });
     await waitFor(() => expect(document.querySelectorAll('[aria-busy="true"]').length).toBe(0), { timeout: 4000 });
     for (const button of screen.queryAllByRole("button", { name: ASKS })) {
         if (!(button as HTMLButtonElement).disabled) fireEvent.click(button);
@@ -101,18 +108,21 @@ async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>;
     return vi.mocked(copilot.ask).mock.calls.map(([ctx]) => ctx);
 }
 
-const leaksIn = (contexts: readonly AskContext[]) => contexts.map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", leak: answerKeyInContext(ctx) })).filter((x) => x.leak !== null);
+const leaksIn = (contexts: readonly AskContext[]) =>
+    contexts.map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", leak: answerKeyInContext(ctx) ?? faultMinutesInContext(ctx, LONE_MINUTES) })).filter((x) => x.leak !== null);
 
 /** The contexts whose DAX run_dax would refuse to run again: none may end in a refusal (decision 7), plain ASCII included (the hardening of 9f3d35f). */
 const refusedIn = (contexts: readonly AskContext[]) =>
     contexts.filter((ctx) => ctx.dax).map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", refusal: checkDax(ctx.dax) })).filter((x) => x.refusal !== null);
 
 describe("every Ask is blind (ADR 0031)", () => {
-    for (const { name, Page, view, postmortem, live } of CASES) {
+    for (const { name, Page, view, postmortem, live, lone } of CASES) {
         it(`${name}: hands the chat measured data only, and DAX that run_dax runs`, async () => {
-            const contexts = await askAll(Page, { view, postmortem, live });
+            const contexts = await askAll(Page, { view, postmortem, live, lone });
             expect(leaksIn(contexts)).toEqual([]);
             expect(refusedIn(contexts)).toEqual([]);
+            // The cases with the lone request hand the chat something, so the check above has something to read.
+            if (lone) expect(contexts.length).toBeGreaterThan(0);
         });
     }
 

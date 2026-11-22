@@ -120,7 +120,10 @@ export interface MissionData {
     postgres: PostgresCapture | null;
     /** The queries behind it, for the DAX, Ask Copilot, and the postmortem. */
     specs: QuerySpec[];
-    /** Its measured queries only, with no answer-key table or measure: what Ask Copilot hands the chat (ADR 0031). */
+    /**
+     * Its measured queries only, with no answer-key table or measure, and waits for the session in focus only, never a lone
+     * incident request's minutes: what Ask Copilot hands the chat (ADR 0031).
+     */
     askSpecs: QuerySpec[];
     loading: boolean;
     /** The sessions query's failure, with no sessions loaded before: without it there's no plan. */
@@ -154,6 +157,18 @@ function waitSpecsFor(plans: readonly Plan[], selected: readonly FilterTarget[])
         }
     }
     return out;
+}
+
+/**
+ * The waits Ask Copilot hands the chat (ADR 0031, decision 7): the session in focus, over its own minutes, on every SQL
+ * target in the filter, whatever it injected where. Never a lone incident request's minutes, which are its fault's own, nor
+ * the other plans the scoreboard shows for its aggregates.
+ */
+function askWaitSpecsFor(plan: Plan | null, selected: readonly FilterTarget[]): QuerySpec[] {
+    if (plan?.kind !== "session") return [];
+    const start = new Date(plan.start.getTime() - 30 * MIN);
+    const end = new Date(plan.end.getTime() + 45 * MIN);
+    return (["T1", "T2", "T3"] as const).filter((target) => selected.includes(target)).map((target) => incidentWaitsQuery({ target, start, end }));
 }
 
 /** Everything the Wave 1 pages show, for the plan in focus and, for the scoreboard's aggregates, the newest `others` plans. */
@@ -267,9 +282,10 @@ export function useMission(others = 0): MissionData {
     );
     const pgSeriesAskSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null), [view.targets]);
     const cosmosSeriesAskSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null), [view.targets]);
+    const askWaitSpecs = useMemo(() => askWaitSpecsFor(plan, filters.targets), [plan, filters.targets]);
     const askSpecs = useMemo(
-        () => [seriesSpec, ...waitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec].filter((s): s is QuerySpec => s !== null),
-        [seriesSpec, waitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec],
+        () => [seriesSpec, ...askWaitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec].filter((s): s is QuerySpec => s !== null),
+        [seriesSpec, askWaitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec],
     );
 
     // The sessions query's failure with nothing loaded before leaves no plan (the page's empty state says it); every other

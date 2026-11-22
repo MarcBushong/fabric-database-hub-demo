@@ -274,6 +274,46 @@ describe("every family the RCA explains", () => {
         expect(storm.details?.readAs).toBeUndefined();
     });
 
+    // Final tests' check of ddebd4c3 (F1): read from its own time, a CPU incident on T2 that the day's list gave from 16:19
+    // started a sample later, because the episode before it had no baseline of its own any more, so its key had none.
+    it("answers a key of Database Hub's telemetry as the list that gave it reads it, and one a sample before an incident as that one", async () => {
+        const cpu = (m: number) => (m >= 49 && m <= 63 ? 50 : m === 79 ? 20 : m === 81 || m === 82 ? 35 : m >= 80 && m <= 86 ? 30 : 5);
+        const bins = Array.from({ length: 111 }, (_, m) => ({ at: minute("15:00:00", m), target: "T2" as const, cpu: cpu(m), blocked: null, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null }));
+        const deps = createInvestigationTools({
+            load: async () => emptyEvidence(),
+            // As the telemetry query reads it: only the bins in the minutes asked for.
+            telemetry: async (from, to) => ({ bins: bins.filter((b) => b.at >= from && b.at <= to) }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+        });
+        const listed = (await deps.episodes(at("15:30:00"), at("17:00:00"), ["T2"])).filter((e) => e.family === "cpu").map((e) => e.key);
+        expect(listed).toEqual(["T2-cpu-20261120T154900Z", "T2-cpu-20261120T161900Z"]);
+        const r = await ask("explain_incident", { episodeKey: "T2-cpu-20261120T161900Z" }, deps);
+        expect(r.details?.episodes).toMatchObject([{ key: "T2-cpu-20261120T161900Z" }]);
+        expect(r.details?.readAs).toBeUndefined();
+        // A key a sample before an incident's start reads as that incident, and says so; two samples before, it has none.
+        const early = await ask("explain_incident", { episodeKey: "T2-cpu-20261120T161800Z" }, deps);
+        expect(early.details?.readAs).toEqual({ key: "T2-cpu-20261120T161800Z", as: ["T2-cpu-20261120T161900Z"] });
+        expect(early.notCaptured[0]).toBe("T2-cpu-20261120T161800Z: in its own minutes, the history has no incident with this key; it reads as T2-cpu-20261120T161900Z, which starts a sample after its time, so this report is that one's.");
+        expect(await deps.investigate("explain_incident", { episodeKey: "T2-cpu-20261120T161700Z" })).toMatch(/^No episode /);
+    });
+
+    // Final tests' check of ddebd4c3 (F2): T5's coverage rows are marked not captured ("no RCA evidence for"), and a storm
+    // that ended at 15:55 had its part read to 15:56, into the next row, which it said again, after the storm had ended.
+    it("says once that an incident's target wasn't captured, also when its part reads into the next coverage row", async () => {
+        const points = Array.from({ length: 40 }, (_, i) => [
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.normalizedRu, value: i >= 16 && i <= 24 ? 100 : 30 },
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.requests, value: 1000 },
+            { at: minute("15:30:00", i), metric: COSMOS_METRICS.throttled, value: i >= 16 && i <= 24 ? 200 : 0 },
+        ]).flat();
+        const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("16:15:00"), windowStart: at("15:30:00"), windowEnd: at("16:10:00"), intervalMinutes: 1, points };
+        const row = (from: string, to: string) => ({ target: "T5" as const, from: at(from), to: at(to), captured: false, sources: [], gaps: [] });
+        const evidence: Evidence = { ...emptyEvidence(), coverage: [row("15:27:09", "15:55:03"), row("15:55:03", "16:24:58")] };
+        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261120T154600Z" }, tools({ evidence, telemetry: { cosmos } }));
+        expect(r.window).toMatchObject({ fromUtc: "2026-11-20T15:46:00Z", toUtc: "2026-11-20T15:55:00Z" });
+        expect(r.notCaptured.filter((line) => line.startsWith("T5: no RCA"))).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
+    });
+
     // The re-review of bb70161f: an RU episode 30 minutes or more into its hour read the history from 30 minutes before it,
     // so it missed the hour's provisioned throughput, stamped with the hour's start.
     it("reads the hour's provisioned throughput for an RU episode late in the hour", async () => {

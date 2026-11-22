@@ -219,8 +219,9 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         expect([sum(COSMOS_METRICS.requests), sum(COSMOS_METRICS.throttled)]).toEqual([24820, 13222]);
         expect(r.rootCause?.statement).toContain("reached 100 % in at least one second of each of the 9 intervals from 15:31 to 15:42 UTC");
         expect(r.rootCause?.statement).toContain("Azure Monitor counted 24820 requests in those intervals, 13222 of them throttled (429, 53.3 %)");
-        // One "no RCA capture" note for T5, the incident's, not its part's too (the coordinator's note on 803f2b1a).
-        expect(r.notCaptured.filter((line) => line.startsWith("T5: no RCA capture recorded"))).toEqual(["T5: no RCA capture recorded for 15:31:00-15:42:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
+        // One note that T5 wasn't captured, the incident's, not its part's too (the coordinator's note on 803f2b1a), in the
+        // form B's model gives it: T5's coverage rows are marked not captured (Final tests' check of ddebd4c3, F2).
+        expect(r.notCaptured.filter((line) => /^T5: no RCA (capture recorded|evidence)/.test(line))).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
     });
 
     // The re-review of bb70161f: the storm from 15:46 read T5's history from 15:16, so it missed 15:00's hourly provisioned
@@ -229,6 +230,9 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         const r = await ask("explain_incident", { episodeKey: "T5-ru-20261121T154600Z" });
         expect(r.rootCause?.statement).toContain("At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition");
         expect(r.notCaptured.join(" ")).not.toMatch(/provisioned throughput/);
+        // Final tests' check of ddebd4c3 (F2): its part, reading wider minutes, also said "no RCA evidence for 15:55:03-16:24:58
+        // UTC", after the storm had ended. The incident says it once, for its own minutes.
+        expect(r.notCaptured.filter((line) => line.startsWith("T5: no RCA"))).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
     });
 
     it("resolves every incident find_incidents lists over the day, also where its own minutes read it differently", async () => {
