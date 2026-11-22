@@ -78,9 +78,9 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
  * - One finer save has a row in every one of its intervals across it: it's covered, and left out.
  * - Otherwise, from the finer saves' rows in its interval, ranked by save (the finest first, then the newest), each row
  *   keeps what the shared function keeps (all of it with nothing earlier under it, nothing when earlier rows cover it, or
- *   else what's left of it), the fourth and later saves against the first three. Then a point that those rows cover is
- *   left out; a total stays as what's left of it, and a maximum or an average only when it's higher than every one of
- *   them that wasn't covered itself.
+ *   else what's left of it), against every earlier save's rows, as finestPerInterval takes each point against every one
+ *   it kept before. Then a point that those rows cover is left out; a total stays as what's left of it, and a maximum or
+ *   an average only when it's higher than every one of them that wasn't covered itself.
  * Totals add, and maxima and averages take the highest; a remainder shows at its own bin's start. Off the bin grid, the
  * newest capture. A row with no bin is a save only, a marker with its rows' extent in First, Last, and Count.
  */
@@ -190,10 +190,12 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
                 if (from >= to) [from, to] = [at, at + s.grain * MINUTE];
                 pieces.push({ save: s, value: v, from, to, rank: 1 + finer.filter((q) => finerThan(q, s)).length, kept: v, taken: v });
             }
-            // The first save's rows keep all they hold; each later level's, what finestPerInterval keeps of them.
+            // The first save's rows keep all they hold; each later save's, what finestPerInterval keeps of them against
+            // every earlier save's rows.
             let earlier = pieces.filter((p) => p.rank === 1);
-            for (const level of [2, 3, 4]) {
-                const rows = pieces.filter((p) => (level < 4 ? p.rank === level : p.rank >= 4));
+            const levels = [...new Set(pieces.map((p) => p.rank))].filter((level) => level > 1).sort((a, b) => a - b);
+            for (const level of levels) {
+                const rows = pieces.filter((p) => p.rank === level);
                 for (const r of rows) {
                     const under = earlier.filter((u) => u.from < r.to && u.to > r.from);
                     const covered = covers(under, r.from, r.to);

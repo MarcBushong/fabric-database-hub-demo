@@ -5621,3 +5621,29 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 **Risks.**
 
 - Which meter Azure bills isn't on Learn's compute page. Where a series' two per-vCore rows differ, the estimate reads the "1 vCore" row, which can be the dearer, as in UAE Central.
+
+### F35's per-bin reference takes every finer save against every earlier one (2026-11-22)
+
+**Why.** A fresh reviewer of 79a35e57, the groundwork's fixes, found that `snapshotValues` (`fabric/app/src/data/snapshot-value.ts`) differs from `finestPerInterval`, the shared function the app's T4 and T5 views read. `snapshotValues` is F35's per-bin reference, which this branch kept when the query-time version was withdrawn.
+
+- `snapshotValues` took the fourth and later finer saves in a coarser point's interval against the first three only, where `finestPerInterval` takes each point against every one it kept before. Where those later saves overlap each other, a coarser total lost their shared time twice.
+- In the groundwork's named case, four 1-minute saves and a 5-minute one in a day save's 15:15 bin, `snapshotValues` gave 848 ms from 15:15 to 15:30 and `finestPerInterval` 900. So `f35Check`, documented to agree with `finestPerInterval`, read LockWaitS as 0.848 s against 0.9.
+- The review found rank 4 and later routine with the real producers, about 1.6 % of points on a typical day and 12 % on a busy one, though the double loss itself appeared in none of 700 simulated two-day histories.
+- The coordinator's decision: remove the divergence, so design (i) matches the app's views exactly, with nothing in `limitations.md`.
+
+**Work summary.**
+
+- **`snapshotValues`** takes each finer save's rows in a coarser point's interval against every earlier save's rows there, in the same order as before (the finest first, then the newest), as `finestPerInterval` does. Its notes say so.
+- **A test:** the named case's saves, in the test file's own terms. The day's 15:15 bin is 780, its 900 less the minutes' 130 beside the newest save's minute, where it was 728; and `f35Check`'s model equals finest from 15:15 to 15:30, 0.9 s.
+- **What doesn't change:** the app's views, which don't call `snapshotValues` (only its tests do, and the shared cases' test on the groundwork branch); the model; and every doc a user reads. So there's no CHANGELOG entry.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- vitest: the new test fails with the previous rule ("expected 728 to be 780"), where the file's other 14 pass, and passes with this one. The app's whole suite: 387 of 387, in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.**
+
+- None for deployments: neither the app nor the model runs the reference.
+- A coarser point's later saves are each taken against more rows than before, at most every earlier save's rows in its interval, as `finestPerInterval` takes them already.

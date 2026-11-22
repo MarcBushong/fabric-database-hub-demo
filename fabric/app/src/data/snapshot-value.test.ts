@@ -259,4 +259,25 @@ describe("F35's per-bin rule in TypeScript, the reference for a fix of the histo
             expectWindow(rows);
         });
     });
+
+    // The review of 79a35e57: snapshotValues took the fourth and later finer saves against the first three only, so where
+    // they overlapped each other, a coarser total lost that time twice; finestPerInterval takes each point against every one
+    // kept before it. Four 1-minute saves and a 5-minute one in the day save's 15:15 bin: the third and fourth saves' minutes
+    // hold all of the 5-minute 15:20, so it keeps nothing, and the day keeps 15:25 to 15:30, its 900 less the minutes' 130.
+    it("takes each finer save against every earlier one, as finestPerInterval does: five finer saves in one 15-minute bin", () => {
+        const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
+        const rows = [
+            ...minutes("15:15", [10, 10, 10]).map(lock(save("2026-11-21T16:05:00", "2026-11-21T15:15:00", "2026-11-21T15:18:00"))),
+            ...minutes("15:16", [12, 12, 12, 12]).map(lock(save("2026-11-21T16:04:00", "2026-11-21T15:16:00", "2026-11-21T15:20:00"))),
+            ...minutes("15:18", [14, 14, 14, 14]).map(lock(save("2026-11-21T16:03:00", "2026-11-21T15:18:00", "2026-11-21T15:22:00"))),
+            ...minutes("15:20", [16, 16, 16, 16, 16]).map(lock(save("2026-11-21T16:02:00", "2026-11-21T15:20:00", "2026-11-21T15:25:00"))),
+            ...every("15:15", 5, [70, 80]).map(lock(save("2026-11-21T16:20:00", "2026-11-21T14:00:00", "2026-11-21T16:10:00"))),
+            ...every("15:00", 15, [900, 900, 900, 900]).map(lock(SQL_DAY)),
+        ];
+        // The day's 770 beside the newest save's minute, 10. Against the first three only, it was 718: 728 here.
+        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(780);
+        const { model, finest } = f35Check(rows, at("15:15"), at("15:30")).measures.T1.LockWaitS;
+        expect(model).toBeCloseTo(0.9, 9);
+        expect(finest).toBeCloseTo(0.9, 9);
+    });
 });
