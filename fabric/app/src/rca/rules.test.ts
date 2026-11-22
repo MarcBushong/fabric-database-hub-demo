@@ -168,6 +168,50 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         expect(a.reads).toEqual({ from: at("16:18:50"), to: at("16:26:05") });
     });
 
+    // The review of ebd1c6c3: a rise's minutes start a minute before its last replay, so they held the stall before it,
+    // and the first conflict in them, that stall's lock, was named as this one's cause.
+    it("names a rise's conflict only from when its own replay stood still, never the stall a minute before it", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: string, since: string | null, holder?: number) =>
+            samples.push({
+                target: "T4-replica",
+                at: at(t),
+                side: "replica",
+                sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000,
+                receivedNotReplayedBytes: since === null ? 0 : 4096,
+                ...(holder ? { conflictRelation: "demo.replica_lag_marks", conflictWantedMode: "AccessExclusiveLock", conflictWaitStart: at(holder === 111 ? "16:00:01" : "16:01:21"), conflictHolder: holder, conflictHolderMode: "AccessShareLock" } : {}),
+            });
+        const every5 = (from: string, to: string, f: (t: string) => void) => {
+            for (let t = at(from).getTime(); t <= at(to).getTime(); t += 5_000) f(new Date(t).toISOString().slice(11, 19));
+        };
+        // The first stall, held by session 111, and its recovery; the second, from a last replay at 16:01:20, held by 222.
+        every5("16:00:10", "16:01:00", (t) => add(t, "16:00:00", 111));
+        every5("16:01:05", "16:01:15", (t) => add(t, null));
+        every5("16:01:25", "16:01:40", (t) => add(t, "16:01:20"));
+        every5("16:01:45", "16:03:00", (t) => add(t, "16:01:20", 222));
+        every5("16:03:05", "16:04:00", (t) => add(t, null));
+        const a = analyzeReplicaLag({ at: at("16:02:30"), metrics: [], samples, events: [] });
+        expect(a.rise?.lastReplay).toEqual(at("16:01:20"));
+        expect(a.rootCause?.ruleIds).toEqual(["REPL-REPLAY-CONFLICT"]);
+        expect(a.rootCause?.statement).toContain("from 16:01:21 UTC, which a query on the replica held (AccessShareLock; session 222)");
+        expect(a.rootCause?.statement).not.toContain("session 111");
+    });
+
+    // The review of ebd1c6c3: the rise was read from the first point at or after the asked time less a minute, so a time in
+    // one rise read as the one a minute before it.
+    it("reads the rise at the asked time from the last point at or before it, never the one a minute before", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: string, since: string | null) => samples.push({ target: "T4-replica", at: at(t), side: "replica", sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000, receivedNotReplayedBytes: 0 });
+        for (let s = 5; s <= 40; s += 5) add(`16:00:${String(s).padStart(2, "0")}`, "16:00:00");
+        add("16:00:45", null);
+        add("16:00:50", null);
+        for (let s = 0; s <= 55; s += 5) add(`16:01:${String(s).padStart(2, "0")}`, "16:00:55");
+        add("16:02:00", null);
+        const a = analyzeReplicaLag({ at: at("16:01:30"), metrics: [], samples, events: [] });
+        expect(a.rise?.lastReplay).toEqual(at("16:00:55"));
+        expect(a.rise?.peak.at).toEqual(at("16:01:55"));
+    });
+
     // The re-review of bb70161f: with the capture from 16:16:12, partway through a stall from 16:13:00, the rise "rose
     // from 16:10:00", the start of Azure Monitor's interval before it, counting from a last replay at 16:13:00.
     it("starts a rise whose first point is one of Azure Monitor's intervals at the capture's first sample, or says that interval", () => {
@@ -281,7 +325,8 @@ describe("T4's connections against the limit, by what held them", () => {
         );
         expect(a.rootCause?.statement).toContain("Most of them sat idle: 34 of the 36 at the peak, and at least 34 in every sample (1 ran a query, none sat idle in a transaction, none waited on a lock).");
         expect(a.rootCause?.statement).toContain("(up to 36 connections, over the 35), so a client connecting then would have been refused");
-        expect(a.rootCause?.evidence[0].text).toBe("36 client connections of 35 (103 %): 1 active, 34 idle, 0 idle in a transaction, 0 waiting on a lock, and the capture's own");
+        // The review of ebd1c6c3: its evidence read "36 client connections of 35 (103 %)".
+        expect(a.rootCause?.evidence[0].text).toBe("36 client connections, over the 35 usable: 1 active, 34 idle, 0 idle in a transaction, 0 waiting on a lock, and the capture's own");
     });
 
     // Before 3732317d, the capture's own query was one of the active in every sample: a row whose states add up to its total.
@@ -306,6 +351,8 @@ describe("T4's connections against the limit, by what held them", () => {
         const b = ask(totals, []);
         expect(b.rootCause).toMatchObject({ ruleIds: ["CONN-STATES-UNKNOWN"], confidence: "low" });
         expect(b.notCaptured).toEqual(expect.arrayContaining([expect.stringMatching(/^T4: the connections' states .* weren't captured, only their total\.$/), "T4: Azure Monitor's failed connections aren't in the history for 15:30:00-15:31:00 UTC."]));
+        // The review of ebd1c6c3: its evidence gave "0 active, 0 idle, …" for the states it says weren't captured.
+        expect(b.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %), the capture's own among them; their states weren't captured, only the total");
     });
 
     it("describes a surge in waves by their peaks and the troughs between them, and one the capture never ended by where it ended", () => {

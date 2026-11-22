@@ -78,6 +78,8 @@ export interface EventRow {
     severity?: number;
     intercepted?: boolean;
     count: number;
+    /** An Azure Monitor count's interval (countedErrors): the count is for `at` up to `at` plus this. Absent for an event. */
+    intervalMs?: number;
     object?: string;
     mode?: string;
     detail: string;
@@ -236,6 +238,8 @@ export interface Episode {
     /** A capture episode the capture never relaxed, with samples back under its level after `last`: the first of them, and the capture's last sample. */
     fellBy?: Date;
     captureEnd?: Date;
+    /** A capture episode not relaxed when the minutes read end, while its capture still ran: where they end. Its end is after them. */
+    readEnd?: Date;
     peak: number;
     peakAt: Date;
     level: number;

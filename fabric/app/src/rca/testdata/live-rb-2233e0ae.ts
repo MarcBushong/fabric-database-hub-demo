@@ -2,8 +2,8 @@
 // connection surges, and T5's normalized RU, as the investigations read them. These are the history model's own rows
 // (live-rb-2233e0ae.rows.json), which Final tests' harness read through the app's own DAX at 4e2c65ed
 // (evidence/rca-rb-4e2c65ed/rca-dax-rows.json), deduplicated, and decoded here as the app decodes them: the loader's row
-// mappers (ROW_MAPPERS) for the RCA tables, and the telemetry query's newest capture per bin (toPostgresCapture,
-// toCosmosCapture) for Azure Monitor's. Each read keeps the rows its DAX would: a table by its time column, RCA Coverage
+// mappers (ROW_MAPPERS) for the RCA tables, and Azure Monitor's as the telemetry query's rows are (monitorTelemetry: one
+// point per interval, and the coarsest at each time). Each read keeps the rows its DAX would: a table by its time column, RCA Coverage
 // by overlap, and Telemetry Snapshots by bucket. They replace the rows rebuilt from the live answers, whose connection
 // states were modeled (the review of 4e2c65ed). What the file leaves out is in its note.
 // live-rb-2233e0ae.answer-key.json is the answer key's record of the same surges, for grading in the tests only: the RCA
@@ -13,9 +13,8 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { toCosmosCapture, toPostgresCapture } from "@/data/model";
 import { ROW_MAPPERS, toDate } from "../rows";
-import { finestPerInterval } from "../sources";
+import { monitorTelemetry } from "../sources";
 import { PHASE_1_TABLES, RCA_SPEC, type RcaTableKey } from "../spec";
 import type { Telemetry } from "../tools";
 import { emptyEvidence, type Evidence, type RcaTarget } from "../types";
@@ -91,12 +90,8 @@ export function liveSources(env: LiveEnv = "rb"): { load: (from: Date, to: Date,
                 const at = toDate(row.Bucket);
                 return !!at && at >= from && at <= to;
             };
-            const { kept: rows, intervals } = finestPerInterval(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
-            return {
-                postgres: toPostgresCapture(rows.filter((r) => r.TargetKey === "T4" || r.TargetKey === "T4-replica")),
-                cosmos: toCosmosCapture(rows.filter((r) => r.TargetKey === "T5")),
-                intervals,
-            };
+            const { postgres, cosmos, intervals, keyIntervals } = monitorTelemetry(monitor.filter((row) => targets.includes(row.TargetKey as RcaTarget) && inside(row)));
+            return { postgres, cosmos, intervals, keyIntervals };
         },
     };
 }

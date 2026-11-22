@@ -335,8 +335,40 @@ function untilGap(samples: readonly Sample[]): Sample[] {
     return out;
 }
 
-/** The capture's own episodes, measured from its samples. */
-export function episodesFromCapture(evidence: Evidence): Episode[] {
+/**
+ * The end of the capture's coverage that holds a time: its rows for the target (rca_coverage, one per export), each
+ * starting no more than CAPTURE_RUN_GAP_MS after the one before, from the row that holds it, or ended at most that long
+ * before it. Undefined when no row does.
+ */
+function coverageEnd(evidence: Evidence, target: RcaTarget, at: Date): Date | undefined {
+    const rows = evidence.coverage.filter((c) => c.target === target && c.captured).sort((a, b) => a.from.getTime() - b.from.getTime());
+    let end: number | undefined;
+    for (const r of rows) {
+        if (end === undefined) {
+            if (r.from.getTime() <= at.getTime() && r.to.getTime() >= at.getTime() - CAPTURE_RUN_GAP_MS) end = r.to.getTime();
+        } else if (r.from.getTime() <= end + CAPTURE_RUN_GAP_MS) {
+            end = Math.max(end, r.to.getTime());
+        }
+    }
+    return end === undefined ? undefined : new Date(end);
+}
+
+/**
+ * Why a capture episode has no relaxed event in the minutes read (rca_events is read up to their end): its capture
+ * stopped, when its samples broke off at a gap of more than CAPTURE_RUN_GAP_MS, or its coverage ended before the minutes
+ * read do (without coverage, when its samples stopped more than that before their end); or else the minutes read end
+ * first, while the capture still ran: it was still on then, and its end is after them (the review of 97fdf5ba: a window
+ * ending mid-surge read as a surge Stop now cut off, with a fall and the capture's end).
+ */
+function captureEnding(evidence: Evidence, target: RcaTarget, last: Date, gapped: boolean, readTo: Date | undefined): { readEnd?: Date } {
+    if (gapped || !readTo) return {};
+    const ran = coverageEnd(evidence, target, last);
+    const running = ran !== undefined ? ran.getTime() >= readTo.getTime() : readTo.getTime() - last.getTime() <= CAPTURE_RUN_GAP_MS;
+    return running ? { readEnd: readTo } : {};
+}
+
+/** The capture's own episodes, measured from its samples. `readTo` is where the minutes read end. */
+export function episodesFromCapture(evidence: Evidence, readTo?: Date): Episode[] {
     const out: Episode[] = [];
     for (const c of captureEpisodes(evidence)) {
         const family = captureFamily(c.detail, c.target);
@@ -350,10 +382,11 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
         // A one-sample episode (a deadlock count that rose) can fall between the counter's samples: its escalation states the value.
         const stated = hits.length === 0 ? Number(/(?:rose by|^\S+) ([\d.]+)/.exec(c.detail)?.[1]) : NaN;
         const support = supportOf(Math.max(1, hits.length), 0);
-        // An episode the capture never relaxed whose last samples are back under its level fell under by the first of them:
-        // a surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still on" (the review of 803f2b1a).
+        const ending = c.end ? {} : captureEnding(evidence, c.target, samples.length ? samples[samples.length - 1].at : c.start, samples.length < read.length, readTo);
+        // An episode its capture cut off whose last samples are back under its level fell under by the first of them: a
+        // surge cut off by Stop now read 32, 8, and 8 of 35 and wasn't "still on" (the review of 803f2b1a).
         const lastHit = hits[hits.length - 1];
-        const after = !c.end && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
+        const after = !c.end && !ending.readEnd && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
         out.push({
             key: `${c.target}-${family}-${stamp(c.start)}`,
             target: c.target,
@@ -363,6 +396,7 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
             start: c.start,
             end: c.end,
             last: hits.length ? hits[hits.length - 1].at : c.start,
+            ...ending,
             ...(after.length ? { fellBy: after[0].at, captureEnd: after[after.length - 1].at } : {}),
             peak: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? stated : (peak?.value ?? 0),
             peakAt: Number.isFinite(stated) && stated > (peak?.value ?? 0) ? c.start : (peak?.at ?? c.start),
@@ -493,7 +527,7 @@ function rowsCover(evidence: Evidence, target: RcaTarget, from: Date, to: Date):
  */
 export function findEpisodes(input: DetectorInput, from: Date, to: Date): Episode[] {
     const { evidence } = input;
-    const byCapture = episodesFromCapture(evidence);
+    const byCapture = episodesFromCapture(evidence, to);
     const byRows = cpuFromResourceRows(evidence);
     const byEvents = episodesFromEvents(evidence);
     const byBins = episodesFromBins(input.bins ?? []);
@@ -524,12 +558,21 @@ export function describeEpisode(e: Episode): string {
     const unit = e.unit === "%" ? " %" : ` ${e.unit}`;
     const round = (v: number) => (Math.abs(v) >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
     const capture = e.source === SOURCES.capture;
+    // An episode the capture had no samples of its own for (its errors, PostgreSQL's deadlock counts) can't say whether it
+    // was still on (the review of 97fdf5ba).
+    const own = e.valued > 0;
     const span = e.end
         ? `from ${t(e.start)} to ${t(e.end)} UTC`
         : capture
-          ? e.fellBy
-              ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the capture ended at ${t(e.captureEnd ?? e.fellBy)} UTC, before it could confirm the end)`
-              : `from ${t(e.start)} UTC (the capture ended while it was still on, so its end isn't known)`
+          ? e.readEnd
+              ? own
+                  ? `from ${t(e.start)} UTC (still on at ${t(e.readEnd)} UTC, where the minutes read end)`
+                  : `from ${t(e.start)} UTC (the capture hadn't recorded its end by ${t(e.readEnd)} UTC, where the minutes read end)`
+              : e.fellBy
+                ? `from ${t(e.start)} UTC, under its level by ${t(e.fellBy)} UTC (the capture ended at ${t(e.captureEnd ?? e.fellBy)} UTC, before it could confirm the end)`
+                : own
+                  ? `from ${t(e.start)} UTC (the capture ended while it was still on, so its end isn't known)`
+                  : `from ${t(e.start)} UTC (the capture ended before it recorded an end, and whether it was still on isn't known)`
           : `from ${t(e.start)} UTC (its end isn't known: the data ${e.last.getTime() === e.start.getTime() ? "has one sample" : "ends or breaks off first"})`;
     // The capture's samples between an episode's start and end aren't all at the level when it came in waves (the live
     // check of 4e2c65ed: four waves of a connection surge read as "32 samples in a row"), and neither are the telemetry's

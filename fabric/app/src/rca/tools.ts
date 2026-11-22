@@ -88,6 +88,8 @@ export interface Telemetry {
     cosmos?: CosmosCapture | null;
     /** Each Azure Monitor point's own interval, by pointKey (sources.ts's pointIntervals); the capture's otherwise. */
     intervals?: ReadonlyMap<string, number>;
+    /** The coarsest interval of the history's points at each time, before one point per interval is kept (sources.ts's coarsestIntervals): a key's own point. */
+    keyIntervals?: ReadonlyMap<string, number>;
 }
 
 export interface InvestigationDeps {
@@ -159,8 +161,8 @@ function countedErrors(evidence: Evidence, from: Date, to: Date, targets: readon
     const out: EventRow[] = [];
     for (const m of evidence.metrics) {
         if (!targets.includes(m.target) || !metricIn(m, from, to) || m.value === null || m.value <= 0) continue;
-        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} in the interval (Azure Monitor)` });
-        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) in the interval (Azure Monitor)` });
+        if (m.metric === POSTGRES_METRICS.failed) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "connections_failed", count: m.value, intervalMs: m.intervalMs, program: `${m.target}'s clients`, detail: `${plural(m.value, "failed connection")} in the interval (Azure Monitor)` });
+        if (m.metric === COSMOS_METRICS.throttled) out.push({ target: m.target, at: m.at, kind: "error", name: AZURE_MONITOR, code: "429", count: m.value, intervalMs: m.intervalMs, program: "the container's clients", detail: `${plural(m.value, "throttled request")} (429) in the interval (Azure Monitor)` });
     }
     // PostgreSQL logs a deadlock's graph only to its server log; the capture counts them (pg_stat_database.deadlocks).
     for (const r of evidence.resource) {
@@ -174,6 +176,7 @@ function countedErrors(evidence: Evidence, from: Date, to: Date, targets: readon
 interface Gathered {
     evidence: Evidence;
     episodes: Episode[];
+    keyIntervals?: ReadonlyMap<string, number>;
 }
 
 const episodeView = (e: Episode) => ({
@@ -296,7 +299,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const [loaded, telemetry] = await Promise.all([deps.load(lead, to, targets), deps.telemetry ? deps.telemetry(lead, to, targets) : Promise.resolve<Telemetry>({})]);
         const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)] };
         const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals }, from, to).filter((e) => targets.includes(e.target));
-        return { evidence, episodes };
+        return { evidence, episodes, keyIntervals: telemetry.keyIntervals };
     }
 
     async function locking(args: Record<string, unknown>): Promise<InvestigationResult | string> {
@@ -414,10 +417,10 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         };
     }
 
-    /** T4's connections against the limit, explained by what held them (connections.ts). An episode the capture never ended (openEnded) says so. */
-    async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false): Promise<InvestigationResult> {
+    /** T4's connections against the limit, explained by what held them (connections.ts). An episode its capture cut off (openEnded) says so, and one still on where the minutes read end (readEnd) says that. */
+    async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false, readEnd?: Date): Promise<InvestigationResult> {
         const g = await gather(from, to, [target]);
-        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded });
+        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded, readEnd });
         const base = envelope("explain_connections", from, to, [target], deps, g);
         return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
     }
@@ -458,10 +461,13 @@ export function createInvestigationTools(deps: InvestigationDeps) {
      */
     async function explainEpisode(e: Episode): Promise<InvestigationResult | string | null> {
         const end = e.end ?? e.last;
-        const span = { from: e.start.toISOString(), to: new Date(end.getTime() + MIN).toISOString(), targets: [e.target] };
+        // An episode still on where the minutes read end is read to there, so its part tells the same end as its episode
+        // (the review of 97fdf5ba: one answer said two).
+        const until = e.readEnd && e.readEnd > e.start ? e.readEnd : new Date(end.getTime() + MIN);
+        const span = { from: e.start.toISOString(), to: until.toISOString(), targets: [e.target] };
         if (e.family === "blocking" || e.family === "deadlock") return locking(span);
         if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN));
-        if (e.family === "connections") return connectionsAt(e.target, e.start, new Date(end.getTime() + MIN), !e.end);
+        if (e.family === "connections") return connectionsAt(e.target, e.start, until, !e.end && !e.readEnd, e.readEnd);
         if (e.family === "ru") return throughputAt(e.start, new Date(end.getTime() + MIN));
         if (e.family === "errors" || e.family === "throttling") return errors(span);
         return null;
@@ -497,15 +503,20 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // details.readAs says, and so does what wasn't captured.
         const same = key && chosen.length === 0 ? g.episodes.filter((e) => e.target === targets[0] && e.family === family) : [];
         const holds = same.filter((e) => e.start <= from && (e.end ?? e.last) >= from);
+        // The key's own point is the coarsest the history holds at its time, before one point per interval is kept: a key an
+        // earlier list made from the day-long save's 15 minutes at 15:30 reads as the storm from 15:31 in them, though the
+        // point kept at 15:30 is a minute (the review of 97fdf5ba).
         const metric = FAMILY_METRIC[family];
-        const keyInterval = metric ? Math.max(0, ...g.evidence.metrics.filter((m) => m.target === targets[0] && m.metric === metric && m.at.getTime() === from.getTime()).map((m) => m.intervalMs ?? 0)) : 0;
+        const keyInterval = metric
+            ? Math.max(0, g.keyIntervals?.get(pointKey(targets[0], metric, from)) ?? 0, ...g.evidence.metrics.filter((m) => m.target === targets[0] && m.metric === metric && m.at.getTime() === from.getTime()).map((m) => m.intervalMs ?? 0))
+            : 0;
         const readAs = holds.length ? holds : same.filter((e) => e.start > from && e.start.getTime() < from.getTime() + keyInterval).slice(0, 1);
         if (readAs.length) chosen = readAs;
         if (key && chosen.length === 0) return `No episode ${JSON.stringify(key)}: call find_incidents for the keys.`;
         const readNote = readAs.length
             ? [`${key}: in its own minutes, the history has no incident with this key; it reads as ${readAs.map((e) => e.key).join(" and ")}, which ${holds.length ? "holds its time" : "starts within the interval of its own point"}, so this report is that one's.`]
             : [];
-        const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.last).getTime()))) } : { from, to };
+        const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.readEnd ?? e.last).getTime()))) } : { from, to };
         const base = envelope("explain_incident", span.from, span.to, targets, deps, g);
         if (chosen.length === 0) {
             return { ...base, notCaptured: [...base.notCaptured, `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} to ${hhmmss(to)} UTC: the detector found no episode there.`], details: { nothingAbnormal: true } };

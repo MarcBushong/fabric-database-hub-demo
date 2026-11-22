@@ -128,7 +128,7 @@ function wavesOf(samples: readonly ConnectionSample[], level: number, trough: nu
     return waves;
 }
 
-export function analyzeConnections(input: { target: RcaTarget; from: Date; to: Date; resource: readonly ResourcePoint[]; sessions: readonly SessionSample[]; metrics: readonly MetricPoint[]; openEnded?: boolean }): ConnectionAnalysis {
+export function analyzeConnections(input: { target: RcaTarget; from: Date; to: Date; resource: readonly ResourcePoint[]; sessions: readonly SessionSample[]; metrics: readonly MetricPoint[]; openEnded?: boolean; readEnd?: Date }): ConnectionAnalysis {
     const { target, from, to } = input;
     const notCaptured: string[] = [];
     const samples = connectionSamples(input.resource, target, from, to);
@@ -183,15 +183,18 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
                 : `, and was at ${pct} % of the limit or more in ${atLevel.length} of the ${between} samples between ${hhmmss(first.at)} and ${hhmmss(last.at)} UTC (${span(last.at.getTime() - first.at.getTime())})`;
     }
     const lastSample = samples[samples.length - 1];
-    // A surge the capture never ended: still on only when its last sample was at the level. Its samples back under the
-    // level after its last at it say when it fell (the review of 803f2b1a: 32, 8, and 8 of 35 read as "still on").
+    // A surge its capture cut off (openEnded): still on only when its last sample was at the level. Its samples back under
+    // the level after its last at it say when it fell (the review of 803f2b1a: 32, 8, and 8 of 35 read as "still on"). One
+    // the capture still watched where the minutes read end (readEnd) was on then, its end after them (the review of 97fdf5ba).
     const lastAtLevel = level !== null ? [...samples].reverse().find((s) => s.total >= level) : undefined;
     const fell = input.openEnded && lastAtLevel && lastSample.at > lastAtLevel.at ? samples.find((s) => s.at > lastAtLevel.at) : undefined;
-    const cutOff = !input.openEnded
-        ? ""
-        : fell
-          ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the capture ended at ${hhmmss(lastSample.at)} UTC, before it could confirm the end.`
-          : ` The capture ended at ${hhmmss(lastSample.at)} UTC while it was still on (it recorded no end), so what came after isn't known.`;
+    const cutOff = input.readEnd
+        ? ` It was still on at ${hhmmss(input.readEnd)} UTC, where the minutes read end.`
+        : !input.openEnded
+          ? ""
+          : fell
+            ? ` The connections fell under ${pct} % of the limit by ${hhmmss(fell.at)} UTC; the capture ended at ${hhmmss(lastSample.at)} UTC, before it could confirm the end.`
+            : ` The capture ended at ${hhmmss(lastSample.at)} UTC while it was still on (it recorded no end), so what came after isn't known.`;
 
     // Every usable slot in use: a client connecting then would have been refused, and nothing here counts how many were
     // (Final tests' live check of 4e2c65ed: Azure Monitor's failed connections stayed at 0 through 48 such refusals). When
@@ -300,8 +303,14 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     }
 
     const statement = `${reached}${held}.${cutOff} ${cause}${who}${fullText}${monitorText}`;
+    // The peak's sample as evidence: its states only when the capture counted them (the review of ebd1c6c3: "0 active, 0
+    // idle, …" where they weren't), and a total past the limit as such, never "36 of 35 (103 %)".
+    const ofLimit = limit === null ? "" : peak.total > limit ? `, over the ${limit} usable` : ` of ${limit} (${share} %)`;
+    const peakText = states
+        ? `${peak.total} client connections${ofLimit}: ${active} active, ${idle} idle, ${idleInTx} idle in a transaction, ${waiting} waiting on a lock, and the capture's own`
+        : `${peak.total} client connections${ofLimit}, the capture's own among them; their states weren't captured, only the total`;
     const evidence: EvidenceRef[] = [
-        ref(peak, `${peak.total} client connections${limit ? ` of ${limit} (${share} %)` : ""}: ${active} active, ${idle} idle, ${idleInTx} idle in a transaction, ${waiting} waiting on a lock, and the capture's own`),
+        ref(peak, peakText),
         ...(first.at.getTime() !== peak.at.getTime() ? [ref(first, `${first.total} client connections`)] : []),
         ...(last.at.getTime() !== peak.at.getTime() ? [ref(last, `${last.total} client connections`)] : []),
         ...failedRefs,
@@ -322,8 +331,9 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
             waves: waves.map((w) => ({ from: iso(w.from.at), to: iso(w.to.at), peak: w.peak.total, lowBefore: w.low })),
             samplesAtLimit: full.length,
             failedConnections: failed.length ? failedCount : null,
-            captureEnded: input.openEnded ? iso(lastSample.at) : null,
+            captureEnded: input.openEnded && !input.readEnd ? iso(lastSample.at) : null,
             fellUnder: fell ? iso(fell.at) : null,
+            readEnd: input.readEnd ? iso(input.readEnd) : null,
         },
     };
 }

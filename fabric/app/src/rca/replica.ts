@@ -56,6 +56,8 @@ export interface LagRise {
 
 const round1 = (v: number) => Math.round(v * 10) / 10;
 const endOf = (p: LagPoint) => p.at.getTime() + (p.intervalMs ?? 0);
+/** When replay last advanced, by a point: its time less its lag (for an Azure Monitor interval, the earliest it can be). */
+const sinceOf = (p: LagPoint) => p.at.getTime() - p.value * 1000;
 /** Azure Monitor's interval in minutes, for the words: "5". */
 const minutesOf = (p: LagPoint) => Math.round((p.intervalMs ?? 0) / 60_000);
 /** Coarser than a minute: Azure Monitor's value is the interval's highest, not the lag at its start. */
@@ -109,22 +111,28 @@ export function lagSeries(metrics: readonly MetricPoint[], samples: readonly Rep
 }
 
 /**
- * The rise around `at`: back to where the lag was last under `floor`, forward to its peak and its recovery. When the lag at
- * `at` is under the floor, the rise is the last one in the series before it at the floor or above, else the first after
- * it; with none, there's no lag to explain, and this returns null (the review of 34a9732: it once called a 0.6 s point,
- * minutes after the real spike, a rise). An Azure Monitor point stands for its whole interval. A rise that hasn't
- * recovered in these minutes keeps every point it has (live, 2026-11-21: it once ended at its first peak).
+ * The rise around `at`, from the series' last point at or before it (an Azure Monitor point stands for its whole interval):
+ * back to where the lag was last under `floor`, forward to its peak and its recovery. Under the floor there, `at` can still
+ * be in a stall that began after that point: the next point at the floor is its rise when its last replay was at or
+ * before `at` (the review of ebd1c6c3: asked at 16:21:00, within the second stall, it explained the blip before it, from
+ * a sample at 16:20:42 of 0.3 s, though the next, 21.6 s at 16:21:12, counted from a last replay at 16:20:51). Otherwise
+ * the rise is the last one before it at the floor or above, else the first after it; with none, there's no lag to
+ * explain, and this returns null (the review of 34a9732: it once called a 0.6 s point, minutes after the real spike, a
+ * rise). A rise that hasn't recovered in these minutes keeps every point it has (live, 2026-11-21: it once ended at its
+ * first peak).
  */
 export function lagRise(series: LagSeries, at: Date, floor = 5): LagRise | null {
     const lag = series.points;
     if (lag.length === 0) return null;
-    let i = lag.findIndex((p) => endOf(p) >= at.getTime() - 60_000);
-    if (i < 0) i = lag.length - 1;
+    const t = at.getTime();
+    let i = 0;
+    for (let k = 0; k < lag.length && lag[k].at.getTime() <= t; k++) i = k;
     if (lag[i].value < floor) {
+        const after = lag.findIndex((p, k) => k > i && p.value >= floor);
         let before = i;
         while (before >= 0 && lag[before].value < floor) before--;
-        const after = lag.findIndex((p, k) => k > i && p.value >= floor);
-        if (before >= 0) i = before;
+        if (after >= 0 && sinceOf(lag[after]) <= t) i = after;
+        else if (before >= 0) i = before;
         else if (after >= 0) i = after;
         else return null;
     }
@@ -143,7 +151,6 @@ export function lagRise(series: LagSeries, at: Date, floor = 5): LagRise | null 
     const last = rising[rising.length - 1];
     const slope = rising.length >= 2 && last.value > first.value ? (last.value - first.value) / ((last.at.getTime() - first.at.getTime()) / 1000) : null;
     const run = lag.slice(s, e + 1);
-    const sinceOf = (q: LagPoint) => q.at.getTime() - q.value * 1000;
     const sampled = run.filter((q) => q.source === "RCA Replica");
     return {
         start: lag[s].at,
@@ -263,7 +270,10 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const inWindow = input.samples.filter((s) => s.at.getTime() >= from && s.at.getTime() <= to);
     const replica = inWindow.filter((s) => s.side === "replica");
     const primary = inWindow.filter((s) => s.side === "primary");
-    const conflicts = replica.filter((s) => s.conflictRelation && s.conflictHolder !== undefined);
+    // A conflict is this rise's only from when its replay stood still: the minute before it can hold the last stall's
+    // (the review of ebd1c6c3).
+    const stoodFrom = (rise.lastReplay ?? rise.stalledSince).getTime();
+    const conflicts = replica.filter((s) => s.conflictRelation && s.conflictHolder !== undefined && s.at.getTime() >= stoodFrom);
     const conflict = conflicts[0];
     const waitStart = conflicts.find((s) => s.conflictWaitStart)?.conflictWaitStart;
     const backlog = Math.max(0, ...replica.map((s) => s.receivedNotReplayedBytes ?? 0));

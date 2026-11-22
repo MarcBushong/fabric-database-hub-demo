@@ -62,6 +62,7 @@ export interface ErrorSummary {
     count: number;
     targets: RcaTarget[];
     first: Date;
+    /** When the last one was: an event's time, or the end of the interval of an Azure Monitor count (the review of ebd1c6c3). */
     last: Date;
     intercepted: number;
     top: string;
@@ -82,6 +83,9 @@ export function summarizeErrors(events: readonly EventRow[]): { classes: ErrorSu
     const classes: ErrorSummary[] = [...groups.entries()].map(([id, rows]) => {
         const c = classOf(rows[0]);
         const sorted = rows.sort((a, b) => a.at.getTime() - b.at.getTime());
+        // An Azure Monitor count stands for its whole interval: 10382 429s counted at 12:15 and 12:30 in 15-minute intervals
+        // ran to 12:45, not 12:30 (the review of ebd1c6c3).
+        const last = new Date(Math.max(...rows.map((r) => r.at.getTime() + (r.intervalMs ?? 0))));
         const tally = new Map<string, number>();
         for (const r of rows) {
             const who = r.module ?? r.program ?? r.detail.slice(0, 60);
@@ -91,7 +95,7 @@ export function summarizeErrors(events: readonly EventRow[]): { classes: ErrorSu
             classId: id, title: c.title,
             count: rows.reduce((n, r) => n + (r.count ?? 1), 0),
             targets: [...new Set(rows.map((r) => r.target))],
-            first: sorted[0].at, last: sorted[sorted.length - 1].at,
+            first: sorted[0].at, last,
             intercepted: rows.filter((r) => r.intercepted).reduce((n, r) => n + (r.count ?? 1), 0),
             top: [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0],
             cause: c.cause, followUp: c.followUp, recommendationIds: c.recommendationIds,

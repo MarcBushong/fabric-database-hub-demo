@@ -71,6 +71,16 @@ describe("the replica's lag (finding 1)", () => {
         expect(r.rootCause?.statement).toContain("session 6553");
         expect(r.rootCause?.statement).not.toContain("session 5883");
     });
+
+    // The review of ebd1c6c3: asked in the second stall's first minute, before the capture's escalation at 16:21:42, the
+    // chat explained the 12.5 s blip before it, by the first stall's lock: it read from the first sample at or after the
+    // time less a minute, 16:20:42's 0.3 s, though the next, 21.6 s at 16:21:12, counted from a last replay at 16:20:51.
+    it.each(["2026-11-21T16:21:00Z", "2026-11-21T16:21:20Z", "2026-11-21T16:21:42Z"])("gives the chat the second stall's finding when asked at %s, in its first minute", async (time) => {
+        const view = await ask("explain_incident", { episodeKey: LIVE_KEYS.replicaSecond });
+        const chat = await ask("explain_replica_lag", { at: time });
+        expect(chat.rootCause).toEqual(view.rootCause);
+        expect(chat.findings).toEqual(view.findings);
+    });
 });
 
 describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", () => {
@@ -158,6 +168,23 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
         const hypotheses = r.details?.hypotheses as Array<{ family: string; nextTool: string; episodeKey?: string }>;
         expect(hypotheses.find((h) => h.family === "connections")).toMatchObject({ nextTool: "explain_incident", episodeKey: LIVE_KEYS.connections });
     });
+
+    // The review of 97fdf5ba: RCA Events are read up to a window's end, so a surge that relaxed after it read as one its
+    // capture cut off, with a fall and an end: "under its level by 15:30:21 (the capture ended at 15:30:51 …)", though the
+    // next wave read 33 at 15:31:01, the capture relaxed it at 15:35:11, and T4's coverage in the same read ran to 15:55.
+    it("says a surge or a stall the minutes read end in was still on then, never that its capture ended it", async () => {
+        const summary = (r: InvestigationResult, family: string) => (r.details?.hypotheses as Array<{ family: string; summary: string }>).find((h) => h.family === family)?.summary;
+        expect(summary(await ask("triage_window", { at: "2026-11-21T15:26:00Z", targets: ["T4"] }), "connections")).toContain("from 15:26:41 UTC (still on at 15:31:00 UTC, where the minutes read end)");
+        expect(summary(await ask("find_incidents", { at: "2026-11-21T15:28:00Z", targets: ["T4"] }), "connections")).toContain("from 15:26:41 UTC (still on at 15:33:00 UTC, where the minutes read end)");
+        // It relaxed at 16:20:03, after the minutes read: not "ended at 16:19:58".
+        expect(summary(await ask("triage_window", { at: "2026-11-21T16:15:00Z", targets: ["T4-replica"] }), "replica_lag")).toContain("from 16:17:12 UTC (still on at 16:20:00 UTC, where the minutes read end)");
+        // One end in one answer: its episode's, and its explanation's.
+        const r = await ask("explain_incident", { target: "T4", from: "2026-11-21T15:21:00Z", to: "2026-11-21T15:31:00Z" });
+        for (const text of [...(r.details?.episodes as Array<{ text: string }>).map((e) => e.text), r.rootCause!.statement]) {
+            expect(text).toContain("still on at 15:31:00 UTC, where the minutes read end");
+            expect(text).not.toMatch(/the capture ended|under its level by|fell under/);
+        }
+    });
 });
 
 describe("T5's normalized RU and every listed incident (the live check of 4e2c65ed)", () => {
@@ -207,5 +234,29 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         expect(stall.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T161500Z", as: [LIVE_KEYS.replicaFirst] });
         expect(stall.notCaptured[0]).toContain(`it reads as ${LIVE_KEYS.replicaFirst}, which starts within the interval of its own point`);
         expect(await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T150000Z" })).toMatch(/^No episode /);
+    });
+
+    // The review of 97fdf5ba: keys the list gave T5's session storms until ebd1c6c3, from the day-long save's 15-minute
+    // points, answered "No episode" once a key's interval came from the 1-minute point kept at its time. The RCA page keeps
+    // a selected key in its address and its remembered view.
+    it.each([
+        ["T5-ru-20261121T153000Z", LIVE_KEYS.ru],
+        ["T5-throttling-20261121T153000Z", "T5-throttling-20261121T153100Z"],
+        ["T5-ru-20261121T154500Z", "T5-ru-20261121T154600Z"],
+        ["T5-throttling-20261121T154500Z", "T5-throttling-20261121T154600Z"],
+    ])("still reads %s, a key from the day-long save's 15 minutes, as the storm in them", async (key, as) => {
+        const r = await ask("explain_incident", { episodeKey: key });
+        expect(r.details?.readAs).toEqual({ key, as: [as] });
+        expect(r.notCaptured[0]).toContain("which starts within the interval of its own point");
+    });
+
+    // The review of ebd1c6c3: the 429s' span ended at the last count's start: "10382, 12:15:00 to 12:30:00 UTC", though
+    // 6,522 of them were counted for 12:30 to 12:45, and "15:31:00 to 15:42:00" for 1-minute counts that ran to 15:43.
+    it("gives the 429s' span to the end of the last count's interval", async () => {
+        const day = await ask("explain_errors", { from: "2026-11-21T12:10:00Z", to: "2026-11-21T12:50:00Z", targets: ["T5"] });
+        expect(day.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(10382, 12:15:00 to 12:45:00 UTC,/);
+        const storm = await ask("explain_incident", { episodeKey: "T5-throttling-20261121T153100Z" });
+        expect(storm.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(14593, 15:31:00 to 15:43:00 UTC,/);
+        expect(storm.findings[0].detail).toContain("on T5 between 15:31:00 and 15:43:00 UTC");
     });
 });
