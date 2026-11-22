@@ -57,7 +57,7 @@ function score(e: Episode): number {
 
 const inWindow = (at: Date, from: Date, to: Date) => at >= from && at <= to;
 
-export function triageWindow(input: { evidence: Evidence; episodes: readonly Episode[] }, from: Date, to: Date, targets: readonly RcaTarget[]): Triage {
+export function triageWindow(input: { evidence: Evidence; episodes: readonly Episode[] }, from: Date, to: Date, targets: readonly RcaTarget[], stoppedAt?: Date): Triage {
     const episodes = input.episodes.filter((e) => targets.includes(e.target) && e.start <= to && (e.end ?? e.last) >= from);
     const hypotheses: Hypothesis[] = episodes.map((e) => ({
         target: e.target,
@@ -88,7 +88,9 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         const first = new Date(Math.min(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime())));
         const last = new Date(Math.max(...events.map((e) => e.at.getTime()), ...counted.map((m) => m.at.getTime() + (m.intervalMs ?? 0))));
         const where = counted.length > 0 ? ` (${AZURE_MONITOR} counts included)` : "";
-        hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} to ${hhmmss(last)} UTC${where}.`, nextTool: "explain_errors" });
+        // A read that stopped short counted them only up to there (the review of d431edb4).
+        const span = stoppedAt ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} to ${hhmmss(last)} UTC`;
+        hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);
     const flagged = new Set(hypotheses.map((h) => h.target));

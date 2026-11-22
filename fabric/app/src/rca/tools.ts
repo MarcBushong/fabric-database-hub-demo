@@ -14,7 +14,7 @@ import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
+import { emptyEvidence, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -95,8 +95,8 @@ export interface Telemetry {
     upperBounds?: ReadonlySet<string>;
     /** The coarsest interval of the history's points at each time, before one point per interval is kept (sources.ts's coarsestIntervals): a key's own point. */
     keyIntervals?: ReadonlyMap<string, number>;
-    /** The reads that had more rows than they take: their latest rows weren't read (sources.ts's paged Azure Monitor read). */
-    cut?: readonly string[];
+    /** The reads that had more rows than they take, by table: what they hold from `until` on wasn't read (sources.ts's paged Azure Monitor read). */
+    cut?: ReadonlyArray<{ table: string; until: Date }>;
 }
 
 export interface InvestigationDeps {
@@ -216,7 +216,7 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     const notCaptured = [
         ...coverage.flatMap((c) => (c.captured ? c.gaps.map((gap) => `${c.target}: ${gap}`) : [`${c.target}: no RCA evidence for ${hhmmss(c.from)}-${hhmmss(c.to)} UTC${c.gaps.length ? ` (${c.gaps.join("; ")})` : ""}`])),
         ...unknown,
-        ...(g.evidence.cut ?? []).map((table) => `${table}: the window holds more rows than ${table === MONITOR_TABLE ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so its latest rows weren't read; ask about a narrower window`),
+        ...(g.evidence.cut ?? []).map((c) => `${c.table}: the window holds more rows than ${c.table === MONITOR_TABLE ? `its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return` : "one query returns"}, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`),
     ];
     return {
         tool,
@@ -368,8 +368,14 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const g = await gather(w.from, w.to, targets);
         const events = [...g.evidence.events.filter((e) => targets.includes(e.target) && e.at >= w.from && e.at <= w.to), ...countedErrors(g.evidence, w.from, w.to, targets)];
         const base = envelope("explain_errors", w.from, w.to, targets, deps, g, w.at);
-        const a = analyzeErrorsResult(events);
-        return { ...base, ...a, notCaptured: events.length === 0 ? [...base.notCaptured, "No errors, cancels, failed connections, or 429s were recorded in the window."] : base.notCaptured };
+        // A read that stopped short holds only what came before: what it didn't find, and what it counted, only up to there
+        // (the review of d431edb4: a read cut at 11:16 said no errors were recorded, beside 300,000 429s after it).
+        const stop = readStoppedAt(g.evidence);
+        const a = analyzeErrorsResult(events, stop ?? undefined);
+        const none = stop
+            ? `No errors, cancels, failed connections, or 429s were recorded up to ${hhmmss(stop)} UTC, where the read stopped; what came after it wasn't read.`
+            : "No errors, cancels, failed connections, or 429s were recorded in the window.";
+        return { ...base, ...a, notCaptured: events.length === 0 ? [...base.notCaptured, none] : base.notCaptured };
     }
 
     async function replica(args: Record<string, unknown>): Promise<InvestigationResult | string> {
@@ -386,11 +392,11 @@ export function createInvestigationTools(deps: InvestigationDeps) {
      * one stall two ways; the review of 4e2c65ed: one more read left a 14-minute stall unrecovered when asked about its
      * first minute). A rise that the history still shows unrecovered after them is reported as it stands.
      */
-    async function replicaAt(at: Date, from: Date, to: Date): Promise<InvestigationResult> {
+    async function replicaAt(at: Date, from: Date, to: Date, askedTo?: Date): Promise<InvestigationResult> {
         const targets: RcaTarget[] = ["T4", "T4-replica"];
         const analyze = async (w: { from: Date; to: Date }) => {
             const g = await gather(w.from, w.to, targets);
-            const a = analyzeReplicaLag({ at, metrics: g.evidence.metrics.filter((m) => metricIn(m, w.from, w.to)), samples: g.evidence.replica.filter((r) => r.at >= w.from && r.at <= w.to), events: g.evidence.events });
+            const a = analyzeReplicaLag({ at, metrics: g.evidence.metrics.filter((m) => metricIn(m, w.from, w.to)), samples: g.evidence.replica.filter((r) => r.at >= w.from && r.at <= w.to), events: g.evidence.events, askedTo });
             return { w, g, a };
         };
         let r = await analyze({ from, to });
@@ -457,14 +463,17 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         if (typeof w === "string") return w;
         const targets = targetsOf(args);
         const g = await gather(w.from, w.to, targets);
-        const t = triageWindow(g, w.from, w.to, targets);
+        const stop = readStoppedAt(g.evidence);
+        const t = triageWindow(g, w.from, w.to, targets, stop ?? undefined);
         const base = envelope(tool, w.from, w.to, targets, deps, g, w.at);
+        // Quiet, or nothing abnormal, only up to where a read stopped short (the review of d431edb4).
+        const upTo = stop ? { readStoppedAt: iso(stop), quietUpTo: iso(stop), ...(t.hypotheses.length === 0 ? { nothingAbnormalUpTo: iso(stop) } : {}) } : {};
         return {
             ...base,
             findings: t.hypotheses.map((h) => ({ ruleId: `TRIAGE-${h.family.toUpperCase()}`, target: h.target, severity: h.score >= 9 ? "critical" : "warning", title: h.summary, detail: `Next: ${h.nextTool}${h.episodeKey ? ` (episodeKey ${h.episodeKey})` : ""}.`, evidence: [] })),
             rootCause: null,
             nextSteps: t.hypotheses.slice(0, 3).map((h) => `${h.nextTool} for ${h.target}${h.episodeKey ? ` (episode ${h.episodeKey})` : ""}`),
-            details: { hypotheses: t.hypotheses, quiet: t.quiet, nothingAbnormal: t.hypotheses.length === 0 },
+            details: { hypotheses: t.hypotheses, quiet: t.quiet, nothingAbnormal: t.hypotheses.length === 0 && !stop, ...upTo },
         };
     }
 
@@ -480,7 +489,8 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const until = e.readEnd && e.readEnd > e.start ? e.readEnd : new Date(end.getTime() + MIN);
         const span = { from: e.start.toISOString(), to: until.toISOString(), targets: [e.target] };
         if (e.family === "blocking" || e.family === "deadlock") return locking(span);
-        if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN));
+        // Its rise is read whole, past the minutes asked about when it ran on after them, which it says (the review of 2e19adfc).
+        if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN), e.readEnd);
         if (e.family === "connections") return connectionsAt(e.target, e.start, until, !e.end && !e.readEnd, e.readEnd);
         if (e.family === "ru") return throughputAt(e.start, new Date(end.getTime() + MIN));
         if (e.family === "errors" || e.family === "throttling") return errors(span);
@@ -533,7 +543,12 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.readEnd ?? e.last).getTime()))) } : { from, to };
         const base = envelope("explain_incident", span.from, span.to, targets, deps, g);
         if (chosen.length === 0) {
-            return { ...base, notCaptured: [...base.notCaptured, `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} to ${hhmmss(to)} UTC: the detector found no episode there.`], details: { nothingAbnormal: true } };
+            // Nothing abnormal only up to where a read stopped short (the review of d431edb4).
+            const stop = readStoppedAt(g.evidence);
+            const nothing = stop
+                ? `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} up to ${hhmmss(stop)} UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.`
+                : `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} to ${hhmmss(to)} UTC: the detector found no episode there.`;
+            return { ...base, notCaptured: [...base.notCaptured, nothing], details: stop ? { nothingAbnormal: false, nothingAbnormalUpTo: iso(stop), readStoppedAt: iso(stop) } : { nothingAbnormal: true } };
         }
         const parts = (await Promise.all(chosen.map(explainEpisode))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
         // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and its cause isn't captured.

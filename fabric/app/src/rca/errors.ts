@@ -72,8 +72,8 @@ export interface ErrorSummary {
     evidence: EvidenceRef[];
 }
 
-/** Errors in a window by class, most first. Attentions and 429s count as errors here, as a DBA reads them. */
-export function summarizeErrors(events: readonly EventRow[]): { classes: ErrorSummary[]; findings: Finding[] } {
+/** Errors in a window by class, most first. Attentions and 429s count as errors here, as a DBA reads them. With `stoppedAt`, a read that stopped short: each count is at least what's read, through where it stopped (the review of d431edb4). */
+export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): { classes: ErrorSummary[]; findings: Finding[] } {
     const relevant = events.filter((e) => e.kind === "error" || e.kind === "attention");
     const groups = new Map<string, EventRow[]>();
     for (const e of relevant) {
@@ -106,22 +106,23 @@ export function summarizeErrors(events: readonly EventRow[]): { classes: ErrorSu
         ruleId: `ERR-${c.classId.toUpperCase()}`,
         target: c.targets[0],
         severity: c.count >= 100 ? "critical" : "warning",
-        title: `${c.title}: ${c.count}`,
-        detail: `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
+        title: `${c.title}: ${stoppedAt ? "at least " : ""}${c.count}`,
+        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
         evidence: c.evidence,
     }));
     return { classes, findings };
 }
 
-/** The errors investigation's part of an InvestigationResult: the classes, and the biggest one's usual cause. */
-export function analyzeErrorsResult(events: readonly EventRow[]): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
-    const { classes, findings } = summarizeErrors(events);
+/** The errors investigation's part of an InvestigationResult: the classes, and the biggest one's usual cause. With `stoppedAt`, the read stopped short there. */
+export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Date): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
+    const { classes, findings } = summarizeErrors(events, stoppedAt);
     const top = classes[0];
+    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.count}, ${hhmmss(c.first)} to ${hhmmss(c.last)} UTC`);
     return {
         findings,
         rootCause: top
             ? {
-                  statement: `Most errors were ${top.title.toLowerCase()} (${top.count}, ${hhmmss(top.first)} to ${hhmmss(top.last)} UTC, mostly ${top.top}). ${top.cause} The cause behind them is what ${top.followUp} finds for the same minutes.`,
+                  statement: `Most errors were ${top.title.toLowerCase()} (${span(top)}, mostly ${top.top}). ${top.cause} The cause behind them is what ${top.followUp} finds for the same minutes.`,
                   confidence: "medium",
                   ruleIds: [`ERR-${top.classId.toUpperCase()}`],
                   evidence: top.evidence,
@@ -129,6 +130,6 @@ export function analyzeErrorsResult(events: readonly EventRow[]): Pick<Investiga
             : null,
         recommendations: recommend(...new Set(classes.flatMap((c) => c.recommendationIds))),
         nextSteps: classes.slice(0, 3).map((c) => `${c.followUp} for ${c.targets.join(", ")} (${c.title.toLowerCase()})`),
-        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), intercepted: c.intercepted, top: c.top })) },
+        details: { classes: classes.map((c) => ({ class: c.classId, title: c.title, count: c.count, targets: c.targets, first: iso(c.first), last: iso(c.last), intercepted: c.intercepted, top: c.top })), ...(stoppedAt ? { countsAtLeast: true, readStoppedAt: iso(stoppedAt) } : {}) },
     };
 }

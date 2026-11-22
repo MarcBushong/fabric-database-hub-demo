@@ -6,7 +6,7 @@ import type { QuerySpec } from "@/data/queries";
 import { loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, RCA_MAX_ROWS, RCA_ROW_LIMIT, RcaReadError, rcaDax, rcaMonitorDax, rcaRowLimit } from "./loader";
 import { createRcaSources, finestPerInterval } from "./sources";
 import { createInvestigationTools } from "./tools";
-import { emptyEvidence, pointKey } from "./types";
+import { emptyEvidence, pointKey, type InvestigationResult } from "./types";
 
 const at = (hhmm: string) => new Date(`2026-11-20T${hhmm}:00Z`);
 const lag = (bucket: string, value: number, capturedAt: string) => ({
@@ -72,17 +72,19 @@ describe("the investigations' sources", () => {
         expect(run).toHaveBeenCalledTimes(1);
     });
 
-    it("size each table's row limit to the window, and say when a table had more rows than it", async () => {
+    it("size each table's row limit to the window, and say when a table had more rows than it, from where its read stopped", async () => {
         expect(rcaRowLimit(at("17:00"), at("17:20"))).toBe(RCA_ROW_LIMIT);
         expect(rcaRowLimit(at("15:30"), at("17:30"))).toBe(4 * RCA_ROW_LIMIT);
         expect(rcaRowLimit(new Date("2026-11-19T17:00:00Z"), at("17:00"))).toBe(RCA_MAX_ROWS);
-        const full = Array.from({ length: RCA_ROW_LIMIT }, () => ({}));
+        // Oldest first, as the DAX orders them: the read stopped at its last row's time, 17:12 (the review of d431edb4).
+        const full = Array.from({ length: RCA_ROW_LIMIT }, (_, i) => ({ "Event Time UTC": `2026-11-20T17:${String(Math.floor((12 * i) / RCA_ROW_LIMIT)).padStart(2, "0")}:00` }));
+        full[full.length - 1]["Event Time UTC"] = "2026-11-20T17:12:00";
         const evidence = await loadEvidence(async (dax) => (dax.includes("'RCA Events'") ? full : []), at("17:00"), at("17:20"), ["T1"]);
-        expect(evidence.cut).toEqual(["RCA Events"]);
+        expect(evidence.cut).toEqual([{ table: "RCA Events", until: at("17:12") }]);
         const tools = createInvestigationTools({ load: async () => evidence, timeZone: "UTC", latestDay: at("00:00"), latest: at("17:20") });
         const result = await tools.investigate("explain_errors", {});
         expect(typeof result === "string" ? result : result.window).toMatchObject({ fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" });
-        expect(typeof result === "string" ? [] : result.notCaptured).toContain("RCA Events: the window holds more rows than one query returns, so its latest rows weren't read; ask about a narrower window");
+        expect(typeof result === "string" ? [] : result.notCaptured).toContain("RCA Events: the window holds more rows than one query returns, so what it holds from 17:12:00 UTC on wasn't read; ask about a narrower window");
     });
 
     // The coordinator's note on the shared finestPerInterval: the read stops at MONITOR_ROW_LIMIT rows, oldest first, so one
@@ -107,13 +109,51 @@ describe("the investigations' sources", () => {
         expect(telemetry.cosmos?.points.length).toBe(6000);
         expect(new Set(telemetry.cosmos?.points.map((p) => `${p.metric}|${p.at.getTime()}`)).size).toBe(6000);
         expect(telemetry.cut).toBeUndefined();
-        // More than its pages hold: the rest isn't read, and the window's investigations say so.
+        // More than its pages hold: the rest isn't read, and the window's investigations say so, from where the read stopped.
         const endless = pages(all(6000));
         const sources = createRcaSources(endless);
         const tools = createInvestigationTools({ load: async () => emptyEvidence(), telemetry: sources.telemetry, timeZone: "UTC", latestDay: new Date(start), latest: new Date(start + 6000 * 60_000) });
         const result = await tools.investigate("explain_errors", { from: "2026-11-20T00:00:00Z", to: "2026-11-24T04:00:00Z", targets: ["T5"] });
         expect(endless).toHaveBeenCalledTimes(MONITOR_PAGES);
-        expect(typeof result === "string" ? [] : result.notCaptured).toContain(`Telemetry Snapshots (Azure Monitor): the window holds more rows than its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return, so its latest rows weren't read; ask about a narrower window`);
+        expect(typeof result === "string" ? [] : result.notCaptured).toContain(`Telemetry Snapshots (Azure Monitor): the window holds more rows than its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return, so what it holds from 11:16:00 UTC on wasn't read; ask about a narrower window`);
+    });
+
+    // The review of d431edb4: a read cut short still backed "nothing found" and its counts as if it had read the whole
+    // window. The reviewer's probe: T5's 4 metrics a minute over 6,000 minutes, the read stopped by its pages at minute
+    // 4,996 (11:16 on the fourth day), with 500 429s a minute only in the last 600 minutes, or from minute 4,900.
+    it("say what a read cut short didn't find, and what it counted, only up to where it stopped", async () => {
+        const start = Date.parse("2026-11-20T00:00:00Z");
+        const rows = (throttledFrom: number) =>
+            Array.from({ length: 6000 }, (_, m) =>
+                (
+                    [
+                        ["NormalizedRUConsumption", 10],
+                        ["ThrottledRequests", m >= throttledFrom ? 500 : 0],
+                        ["TotalRequestUnits", 100],
+                        ["TotalRequests", 1000],
+                    ] as const
+                ).map(([Metric, Value]) => ({ Bucket: new Date(start + m * 60_000).toISOString().slice(0, 19), TargetKey: "T5", ResourceName: "cosmos01", Metric, Value, Unit: "Count", WindowStart: "2026-11-20T00:00:00", WindowEnd: "2026-11-24T04:00:00", CapturedAt: "2026-11-24T04:05:00" })),
+            ).flat();
+        const pager = (all: ReturnType<typeof rows>) => async (spec: QuerySpec) => {
+            const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
+            const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
+            return all.filter((r) => Date.parse(`${r.Bucket}Z`) >= from).slice(0, spec.rowLimit);
+        };
+        const tools = (throttledFrom: number) => createInvestigationTools({ load: async () => emptyEvidence(), telemetry: createRcaSources(pager(rows(throttledFrom))).telemetry, timeZone: "UTC", latestDay: new Date(start), latest: new Date(start + 6000 * 60_000) });
+        const window = { from: "2026-11-20T00:00:00Z", to: "2026-11-24T04:00:00Z", targets: ["T5"] };
+        const late = tools(5400);
+        const listed = (await late.investigate("find_incidents", window)) as InvestigationResult;
+        expect(listed.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-23T11:16:00Z", quiet: ["T5"], quietUpTo: "2026-11-23T11:16:00Z" });
+        const errors = (await late.investigate("explain_errors", window)) as InvestigationResult;
+        expect(errors.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded up to 11:16:00 UTC, where the read stopped; what came after it wasn't read.");
+        expect(errors.notCaptured.join(" ")).not.toMatch(/recorded in the window/);
+        const incident = (await late.investigate("explain_incident", { target: "T5", from: window.from, to: window.to })) as InvestigationResult;
+        expect(incident.notCaptured).toContain("Nothing abnormal on T5 from 00:00:00 up to 11:16:00 UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.");
+        expect(incident.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-23T11:16:00Z" });
+        // Counted up to where it stopped: at least, never as if it ended there.
+        const counted = (await tools(4900).investigate("explain_errors", window)) as InvestigationResult;
+        expect(counted.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(at least 48000, 09:40:00 through 11:16:00 UTC, where the read stopped, mostly the container's clients\)/);
+        expect(counted.findings[0].title).toBe("Throttled requests (429): at least 48000");
     });
 
     // Live, 2026-11-21: Power BI answered 429 to the app's reads. A telemetry read that failed left its part empty, so the

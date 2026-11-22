@@ -3,7 +3,7 @@
 // Detection reads only the detection tables and the telemetry: never the answer key (rca/blind-detection.json).
 
 import { isMissingInModel, retryHint } from "@/data/retry";
-import { ROW_MAPPERS } from "./rows";
+import { ROW_MAPPERS, toDate } from "./rows";
 import { PHASE_1_TABLES, RCA_SPEC, TARGET_KEY, type RcaTableKey } from "./spec";
 import { emptyEvidence, type Evidence, type RcaTarget } from "./types";
 
@@ -151,7 +151,9 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
                 const map = ROW_MAPPERS[key] as (get: (field: string) => unknown) => unknown;
                 const mapped = rows.map((row) => map((field) => (fields[field] ? row[fields[field].model] : undefined))).filter((r) => r !== null);
                 (evidence[key] as unknown[]).push(...mapped);
-                if (rows.length >= limit) (evidence.cut ??= []).push(spec.model);
+                // Rows come oldest first: one at the limit read up to its last row's time, whose rows may be only some of them
+                // (the review of d431edb4: what it says it found holds only up to there).
+                if (rows.length >= limit) (evidence.cut ??= []).push({ table: spec.model, until: toDate(rows[rows.length - 1][fields[spec.time].model]) ?? to });
                 options.onDax?.({ table: spec.model, query, rows: rows.length, ms: Date.now() - started });
             } catch (err) {
                 options.onDax?.({ table: spec.model, query, rows: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });

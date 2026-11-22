@@ -220,7 +220,7 @@ function refText(p: LagPoint): string {
     return coarse(p) ? `Read Replica Lag ${round1(p.value)} s, its highest from ${hhmmss(p.at).slice(0, 5)} to ${hhmmss(new Date(endOf(p))).slice(0, 5)} UTC` : `Read Replica Lag ${round1(p.value)} s`;
 }
 
-export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoint[]; samples: readonly ReplicaSample[]; events: readonly EventRow[] }): ReplicaAnalysis {
+export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoint[]; samples: readonly ReplicaSample[]; events: readonly EventRow[]; askedTo?: Date }): ReplicaAnalysis {
     const notCaptured: string[] = [];
     const series = lagSeries(input.metrics, input.samples);
     if (series.points.length === 0) {
@@ -258,9 +258,12 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const startPoint = rise.points.find((p) => p.at.getTime() === rise.start.getTime());
     const firstSample = rise.points.find((p) => p.source === "RCA Replica" && p.at >= rise.start && p.value >= 5);
     const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose in the ${spanOf(startPoint)} minutes from ${hhmmss(startPoint.at)} UTC`) : `rose from ${hhmmss(rise.start)}`;
+    // The rise is read whole, past the minutes asked about when it runs on after them, and says so (the review of 2e19adfc:
+    // asked about 16:10 to 16:18, its episode read "peak 96.6 s at 16:17:57", and its cause "176.7 s at 16:19:17").
+    const past = input.askedTo && rise.end > input.askedTo ? ` (read past the minutes asked about, which end at ${hhmmss(input.askedTo)} UTC, to ${rise.recovered ? "its recovery at " : ""}${hhmmss(rise.end)} UTC)` : "";
     const shape = coarse(rise.peak)
-        ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}`
-        : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}`;
+        ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}${past}`
+        : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}${past}`;
     if (coarse(rise.peak)) notCaptured.push(`Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`);
     const from = rise.stalledSince.getTime() - 60_000;
     const to = rise.end.getTime() + 60_000;

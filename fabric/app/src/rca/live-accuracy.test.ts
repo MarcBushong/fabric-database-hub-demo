@@ -169,6 +169,17 @@ describe("T4's connection surges (finding 2, and the live check of 4e2c65ed)", (
         expect(hypotheses.find((h) => h.family === "connections")).toMatchObject({ nextTool: "explain_incident", episodeKey: LIVE_KEYS.connections });
     });
 
+    // The review of 2e19adfc: asked about 16:10 to 16:18, the episode read "still on at 16:18:00 … peak 96.6 s at 16:17:57",
+    // while its cause, read on to the rise's recovery, read "176.7 s at 16:19:17": two peaks in one answer, unsaid.
+    it("says when the replica's explanation reads past the minutes asked about, to the rise's recovery", async () => {
+        const r = await ask("explain_incident", { target: "T4-replica", from: "2026-11-21T16:10:00Z", to: "2026-11-21T16:18:00Z" });
+        expect((r.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 16:17:12 UTC (still on at 16:18:00 UTC, where the minutes read end), peak 96.6 s at 16:17:57 UTC");
+        expect(r.rootCause?.statement).toMatch(/to 176\.7 s at 16:19:17 UTC .*\(read past the minutes asked about, which end at 16:18:00 UTC, to its recovery at 16:19:27 UTC\): replay stood still\./);
+        // Asked about minutes that hold the whole rise, it says nothing of the kind.
+        const whole = await ask("explain_incident", { target: "T4-replica", from: "2026-11-21T16:10:00Z", to: "2026-11-21T16:21:00Z" });
+        expect(whole.rootCause?.statement).not.toMatch(/read past/);
+    });
+
     // The review of 97fdf5ba: RCA Events are read up to a window's end, so a surge that relaxed after it read as one its
     // capture cut off: "(the capture ended at 15:30:51 …)", though the next wave read 33 at 15:31:01, the capture relaxed it
     // at 15:35:11, and T4's coverage in the same read ran to 15:55. The review of 858c50c2: it read "still on" then, though

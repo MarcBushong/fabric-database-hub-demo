@@ -183,11 +183,14 @@ export interface Evidence {
     waits: WaitDelta[];
     coverage: Coverage[];
     metrics: MetricPoint[];
-    /** The RCA tables whose query returned as many rows as it may: their latest rows weren't read (loader.ts). */
-    cut?: string[];
+    /** The reads that returned as many rows as they may, by table: what they hold from `until` on wasn't read (loader.ts, sources.ts). */
+    cut?: Array<{ table: string; until: Date }>;
 }
 
 export const emptyEvidence = (): Evidence => ({ sessions: [], events: [], resource: [], replica: [], waits: [], coverage: [], metrics: [] });
+
+/** Where the evidence's reads stopped, the earliest of its cut reads: nothing from then on was read. Null when every read was whole. */
+export const readStoppedAt = (evidence: Evidence): Date | null => (evidence.cut?.length ? new Date(Math.min(...evidence.cut.map((c) => c.until.getTime()))) : null);
 
 /** One fact a conclusion rests on: the table, the time, and what it says. The chat cites these. */
 export interface EvidenceRef {

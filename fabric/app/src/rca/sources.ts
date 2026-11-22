@@ -113,23 +113,23 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
      * Azure Monitor's rows for a window, a page at a time. A query returns at most MONITOR_ROW_LIMIT rows, oldest first, so
      * one at the limit had lost its newest rows: the incident's own minutes (the coordinator's note on the shared
      * finestPerInterval). The next page reads on from the last bucket the page had, whole, in place of that bucket's rows.
-     * After MONITOR_PAGES pages, the rest isn't read, and the window's investigations say so (cut).
+     * After MONITOR_PAGES pages, the rest isn't read, and the window's investigations say so, from where it stopped (until).
      */
-    async function readMonitor(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<{ rows: Row[]; cut: boolean }> {
+    async function readMonitor(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<{ rows: Row[]; until: Date | null }> {
         const rows: Row[] = [];
         let start = from;
         for (let page = 0; page < MONITOR_PAGES; page++) {
             const dax = rcaMonitorDax(start, to, targets);
-            if (!dax) return { rows, cut: false };
+            if (!dax) return { rows, until: null };
             const got = await read(MONITOR_TABLE, spec("Azure Monitor metrics", dax, MONITOR_ROW_LIMIT));
-            if (got.length < MONITOR_ROW_LIMIT) return { rows: [...rows, ...got], cut: false };
+            if (got.length < MONITOR_ROW_LIMIT) return { rows: [...rows, ...got], until: null };
             const last = toDate(got[got.length - 1].Bucket);
-            // A page all of one bucket can't read on.
-            if (!last || last.getTime() <= start.getTime()) return { rows: [...rows, ...got], cut: true };
+            // A page all of one bucket can't read on: what it has of that bucket may be only some of it.
+            if (!last || last.getTime() <= start.getTime()) return { rows, until: start };
             for (const row of got) if ((toDate(row.Bucket)?.getTime() ?? 0) < last.getTime()) rows.push(row);
             start = last;
         }
-        return { rows, cut: true };
+        return { rows, until: start };
     }
 
     return {
@@ -146,7 +146,7 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
                 ),
                 readMonitor(from, to, targets),
             ]);
-            return { bins: bins.flat(), ...monitorTelemetry(monitor.rows), ...(monitor.cut ? { cut: [MONITOR_TABLE] } : {}) };
+            return { bins: bins.flat(), ...monitorTelemetry(monitor.rows), ...(monitor.until ? { cut: [{ table: MONITOR_TABLE, until: monitor.until }] } : {}) };
         },
     };
 }
