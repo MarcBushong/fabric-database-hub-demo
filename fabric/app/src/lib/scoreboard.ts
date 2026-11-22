@@ -331,9 +331,41 @@ function signalKey(family: string): string {
     return family === "deadlock" ? "blocking" : family;
 }
 
+/** Whether a recorded fault is built to raise the signal a family reads, by the families `familiesOf` gives each scenario. */
+function raisesBy(run: SessionRun, family: string, familiesOf: (scenario: string) => readonly string[]): boolean {
+    return familiesOf(scenarioOf(run)).some((f) => signalKey(f) === signalKey(family));
+}
+
 /** Whether a recorded fault is built to raise the signal a family reads. */
 function raises(run: SessionRun, family: string): boolean {
-    return expectedFamilies(scenarioOf(run)).some((f) => signalKey(f) === signalKey(family));
+    return raisesBy(run, family, expectedFamilies);
+}
+
+/**
+ * Whether a bin of `stepMs` that starts at `t` is in a search from `from` to `to`: the bin that holds `from` counts, and
+ * none that starts at `to` or later. The scoreboard's rule; ADR 0031's evaluation set grades blind episodes by it too.
+ */
+export function inSearch(t: number, stepMs: number, from: number, to: number): boolean {
+    return t + stepMs > from && t < to;
+}
+
+/**
+ * When the next fault on a fault's target that raises the same signal starts, at or after the end of its window (deadlocks
+ * and blocking are one signal): the scoreboard looks for its signal, and for its recovery, only until then. `familiesOf` is
+ * the notebook's map; ADR 0031's evaluation set adds T4's beats, which the scoreboard doesn't grade.
+ */
+export function nextRaisingStart(run: SessionRun, family: string, runs: readonly SessionRun[], familiesOf: (scenario: string) => readonly string[] = expectedFamilies): number | undefined {
+    const end = (run.windowEnd as Date).getTime();
+    return runs
+        .filter((r) => isFault(r) && r.target === run.target && r.requestId !== run.requestId && raisesBy(r, family, familiesOf))
+        .map((r) => (r.windowStart as Date).getTime())
+        .filter((t) => t >= end)
+        .sort((a, b) => a - b)[0];
+}
+
+/** Where the scoreboard's search for a fault's signal of one family ends: TELEMETRY_LAG_MINUTES after its window, or where the next fault that raises it starts. */
+export function searchEndOf(run: SessionRun, family: string, runs: readonly SessionRun[], familiesOf: (scenario: string) => readonly string[] = expectedFamilies): number {
+    return Math.min((run.windowEnd as Date).getTime() + TELEMETRY_LAG_MINUTES * MIN, nextRaisingStart(run, family, runs, familiesOf) ?? Number.POSITIVE_INFINITY);
 }
 
 /** The beat of the Database Agent loop for the fault: its own finding, or, for a plan regression, the beat whose window overlaps it on the same target. */
@@ -374,7 +406,7 @@ function firstRun(bins: readonly Bin[], signal: Signal, bound: Bound, from: numb
     let previous: number | null = null;
     for (const b of bins) {
         const t = b.at.getTime();
-        if (t + stepMs <= from || t >= to) continue;
+        if (!inSearch(t, stepMs, from, to)) continue;
         const contiguous = previous === null || t - previous <= stepMs * 1.5;
         if (meets(signal.read(b), bound)) {
             if (!runStart || !contiguous) {
@@ -410,7 +442,7 @@ function levelOf(bins: readonly Bin[], signal: Signal, bound: Bound, from: numbe
     let previous: number | null = null;
     for (const b of bins) {
         const t = b.at.getTime();
-        if (t + stepMs <= from || t >= to) continue;
+        if (!inSearch(t, stepMs, from, to)) continue;
         const v = signal.read(b);
         seen.bins++;
         if (v !== null) {
@@ -576,12 +608,7 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     // Every fault on this target that raises the same signal sets its hot windows: the baseline comes from outside them.
     // Faults that raise it at the same time share its signal; the search stops where the next one after this window starts.
     const faultsHere = ctx.runs.filter((r) => isFault(r) && r.target === target);
-    const successorOf = (family: string) =>
-        faultsHere
-            .filter((r) => r.requestId !== run.requestId && raises(r, family))
-            .map((r) => (r.windowStart as Date).getTime())
-            .filter((t) => t >= injectedEnd.getTime())
-            .sort((a, b) => a - b)[0];
+    const successorOf = (family: string) => nextRaisingStart(run, family, ctx.runs);
     const near = { from: injectedAt.getTime() - BASELINE_REACH_MINUTES * MIN, to: injectedEnd.getTime() + BASELINE_REACH_MINUTES * MIN };
     const detections: Detection[] = [];
     const measurable: string[] = [];
@@ -593,8 +620,7 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
         const baseline = baselineOf(signal, baselineBins, hot, near);
         const bound = detectionBound(family, baseline);
         if (!bound) continue;
-        const next = successorOf(family);
-        const searchEnd = Math.min(injectedEnd.getTime() + lagMs, next ?? Number.POSITIVE_INFINITY);
+        const searchEnd = searchEndOf(run, family, ctx.runs);
         const at = firstRun(targetBins, signal, bound, injectedAt.getTime(), searchEnd, stepMs);
         if (at) detections.push({ family, signal, bound, baseline, at, searchEnd });
         else if (!detections.length && family === measurable[0]) detections.push({ family, signal, bound, baseline, at: new Date(Number.NaN), searchEnd });

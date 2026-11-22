@@ -4,7 +4,8 @@
 //
 // The data: the contract's two fixtures (T1's blocking chain; T4's locking and its replica's stall, from a real local
 // PostgreSQL primary and standby), and B's and A's live rows (dbhubrb's session 2233e0ae and dbhubra, 2026-11-21), each
-// with its answer key. B's key file records only the connection surges, so its other cases check facts, not the key.
+// with its answer key. B's key file records only the connection surges, and not the one from 18:51, whose session Stop
+// now cut off, so its other cases check facts, not the key.
 
 /** Which data a case reads: a contract fixture, or an environment's live rows. */
 export type EvalData = "t1" | "t4" | "rb" | "ra";
@@ -32,24 +33,37 @@ export interface EvalCase {
     note?: string;
 }
 
-/** Each dataset's minutes, for the incident list the grading reads. */
+/**
+ * Each dataset's minutes, for the incident list the grading reads: the fixtures' own, and the whole day of B's and A's live
+ * rows, so no run their keys record is left out (the review of b4370565: B's run from 19:30 was, and nothing said so).
+ */
 export const EVAL_WINDOWS: Record<EvalData, { from: string; to: string }> = {
     t1: { from: "2026-11-20T16:45:00Z", to: "2026-11-20T17:10:00Z" },
     t4: { from: "2026-11-20T16:55:00Z", to: "2026-11-20T17:25:00Z" },
-    rb: { from: "2026-11-21T15:20:00Z", to: "2026-11-21T17:00:00Z" },
-    ra: { from: "2026-11-21T13:00:00Z", to: "2026-11-21T14:30:00Z" },
+    rb: { from: "2026-11-21T00:00:00Z", to: "2026-11-21T23:59:59Z" },
+    ra: { from: "2026-11-21T00:00:00Z", to: "2026-11-21T23:59:59Z" },
 };
 
 /**
- * How a run is caught (ADR 0031's scoreboard rule): a blind episode of one of its families starts on its target between
- * its start and 15 minutes after its end. Phase 2 grades the ones that need its waits.
+ * The families of T4's beats, with the target each shows on: the scoreboard doesn't grade them (a fault on T4 is Not
+ * supported there), and the notebook's SCENARIO_SIGNALS doesn't map them. Every other scenario's families are the
+ * scoreboard's (expectedFamilies), and so is the rest of the rule (ADR 0031): an episode of one of its families on its
+ * target, in the bin that holds its start or later, before TELEMETRY_LAG_MINUTES after its end or the start of the next
+ * fault on its target that raises the same signal, whichever comes first (inSearch, searchEndOf).
  */
-export const CAUGHT_BY: Record<string, { families: string[]; target?: string } | { phase: 2; why: string }> = {
-    "blocking-chain": { families: ["blocking"] },
-    "locking-blocking": { families: ["blocking", "deadlock"] },
+export const T4_BEATS: Record<string, { families: string[]; target?: string }> = {
     "replica-lag": { families: ["replica_lag"], target: "T4-replica" },
     "connection-surge": { families: ["connections", "errors"] },
-    "log-flush-waits": { phase: 2, why: "its signal is T1's WRITELOG waits, which Phase 2's explain_waits reads; the capture has no episode for it" },
+};
+
+/** Runs a dataset's key records that its data can't grade, with why: neither caught nor missed. */
+export const NOT_GRADABLE: Partial<Record<EvalData, Record<string, string>>> = {
+    t1: { "log-flush-waits": "its family, tran_log, comes from Database Hub's wait categories, and the t1 fixture's tools get no telemetry, only the capture" },
+};
+
+/** Episodes of a family the key grades that its file has no run for, though the demo ran one, with why: never a false alarm. */
+export const NO_KEY_ROW: Partial<Record<EvalData, Record<string, string>>> = {
+    rb: { "T4-connections-20261121T185152Z": "the surge from 18:51 ran in session ea2b7967, which Stop now cut off, so B's key file has no row for it" },
 };
 
 const t1 = { from: "2026-11-20T16:45:00Z", to: "2026-11-20T17:10:00Z" };
@@ -201,6 +215,6 @@ export const EVAL_SET: EvalCase[] = [
         mustContain: ['"nothingAbnormal":true'],
         mustNotContain: ["TRIAGE-"],
         key: null,
-        note: "B's last surge run ended at 16:34, before these minutes.",
+        note: "B's key has no surge run in these minutes: its third ends at 16:34:13 UTC, and its fourth starts at 19:30:04 UTC.",
     },
 ];

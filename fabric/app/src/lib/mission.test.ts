@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
 import type { Row } from "@/data/query-client";
-import { seriesQuery, sessionsQuery } from "@/data/queries";
+import { postgresSeriesQuery, seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
 import { postgresHealth } from "@/lib/health";
 import { buildPostmortem, causeWindow, nextSessionStart, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
@@ -667,7 +667,7 @@ describe("the postmortem", () => {
             const next = "session:abcdef12-1111-2222-3333-444444444444";
             // The review's lone request after the session, before the next one's start; one that began just before the
             // session; one that ended 14 minutes before it, whose signal can still show; and what's out: one that ended 16
-            // minutes before it, and the next session's own fault.
+            // minutes before it, one that ended exactly 15 before it (the review of b4370565), and the next session's own fault.
             const runs = [
                 ...RUNS,
                 run("r12", "T2", "incident:io-pressure", 92, 100),
@@ -676,6 +676,7 @@ describe("the postmortem", () => {
                 run("r13", "T1", "incident:cpu-pressure", -5, 5),
                 run("r14", "T3", "incident:cpu-pressure", -30, -14),
                 run("r15", "T3", "incident:cpu-pressure", -40, -16),
+                run("r16", "T2", "incident:cpu-pressure", -35, -15),
             ];
             const plans = toPlans(runs);
             const first = plans.find((p) => p.key === SESSION)!;
@@ -693,13 +694,57 @@ describe("the postmortem", () => {
                     "",
                 ].join("\n"),
             );
-            expect(key).not.toMatch(/12:50|15:06/);
+            expect(key).not.toMatch(/12:50|12:55|15:06/);
             // The Cause stays blind, and so does Copilot's draft: neither gets them.
             expect(sectionOf(markdown, "Cause")).not.toMatch(/pressure|lone incident request|Outside this session/);
             expect(postmortemAsk({ ...input, plan: first, plans, rca: investigated })).toEqual(postmortemAsk({ ...input, plan: first }));
-            // A session that injected nothing says so of its own plan only; without an investigation, nothing is added.
-            expect(sectionOf(buildPostmortem({ ...input, plan: { ...first, faults: [] }, scores: [], beat: null, plans, rca: investigated }).markdown, "What the demo injected (answer key)")).toContain("This session's plan injected nothing.\n\n**Outside this session:**");
+            // A session whose plan injected nothing says so of its own plan only; without an investigation, nothing is added.
+            const quiet = toPlans(runs.filter((r) => !r.requestId.startsWith(`${SESSION}:`)));
+            const empty = quiet.find((p) => p.key === SESSION)!;
+            expect(sectionOf(buildPostmortem({ ...input, plan: empty, scores: [], beat: null, plans: quiet, rca: investigated }).markdown, "What the demo injected (answer key)")).toContain("This session's plan injected nothing.\n\n**Outside this session:**");
             expect(buildPostmortem({ ...input, plan: first, plans }).markdown).not.toContain("Outside this session");
+        });
+
+        it("lists the session's faults and T4's and T5's episodes on targets the page's filter hides in the answer key, since the investigation reads every target (the review of b4370565)", () => {
+            // The period's runs before the filter, with a lone request on T4 after the session. The page's filter shows T1
+            // only, so its plan, scores, and beat are T1's, as use-mission builds them.
+            const runs = [...RUNS, run("r12", "T4", "incident:connection-surge", 92, 100)];
+            const all = toPlans(runs);
+            const shown = toPlans(runs.filter((r) => !r.profile.startsWith("incident:") || r.target === "T1")).find((p) => p.key === SESSION)!;
+            const filtered = { ...input, plan: shown, scores: input.scores.filter((s) => s.target === "T1"), beat: null };
+            const cpu = [20, 85, 90, 88, 20, 20].map((value, i) => ({ at: at(60 + i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value }));
+            const pg: PostgresCapture = { capturedAt: null, windowStart: at(60), windowEnd: at(90), intervalMinutes: 5, servers: {}, points: cpu };
+            const hidden = { episodes: postgresEpisodes(pg), specs: [postgresSeriesQuery()], errors: ["T5's Azure Monitor capture couldn't be read for this key, so its episodes aren't in it: The model didn't answer."] };
+            expect(hidden.episodes).toHaveLength(1);
+            const recovered = (hidden.episodes[0].recoveredAt ?? hidden.episodes[0].endAt)?.toISOString().slice(11, 16);
+            const investigated = { ...rca, to: at(95) };
+            const { markdown } = buildPostmortem({ ...filtered, plans: all, rca: investigated, hidden });
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain(
+                [
+                    "**On targets this page's filter hides:** the investigation above reads every target, so the key does too, though the sections above leave these out:",
+                    "",
+                    "- **Memory grant pressure** on T2 (Front desk), 13:40 to 13:48 UTC.",
+                    "- **Plan regression (automatic plan correction)** on T3 (Scheduling), 14:00 to 14:30 UTC.",
+                    "- **IO pressure** on T2 (Front desk), 14:10 to 14:18 UTC.",
+                    `- **CPU** on T4 (Reporting), 14:35 to ${recovered} UTC, an episode in its Azure Monitor metrics.`,
+                    "- T5's Azure Monitor capture couldn't be read for this key, so its episodes aren't in it: The model didn't answer.",
+                    "",
+                ].join("\n"),
+            );
+            // The filter's own fault is above them, once.
+            expect(key.match(/Deep blocking chain and lock escalation/g)).toHaveLength(1);
+            // Another plan's fault on a hidden target is outside this session, as on any other.
+            expect(key).toContain("- **Connection surge (capacity maxed)** on T4 (Reporting), 15:02 to 15:10 UTC: a lone incident request.");
+            // The sections above stay the filter's, and the queries behind the key's part end the postmortem.
+            expect(markdown.slice(0, markdown.indexOf("## What the demo injected"))).not.toMatch(/Memory grant|Plan regression|IO pressure|T4 \(Reporting\)/);
+            expect(markdown).toContain(`And the answer key's, for the targets this page's filter hides:\n\n\`\`\`dax\n// ${postgresSeriesQuery().title}\nEVALUATE`);
+            // A session whose every fault the filter hides never says its plan injected nothing.
+            const none = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all, rca: investigated, hidden: null }).markdown;
+            expect(none).not.toContain("injected nothing");
+            expect(sectionOf(none, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
+            // Without the investigation, the answer key is the release's: what the filter shows.
+            expect(buildPostmortem({ ...filtered, plans: all, hidden }).markdown).not.toMatch(/filter hides|Memory grant|Connection surge/);
         });
     });
 

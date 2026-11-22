@@ -102,6 +102,11 @@ export function useQueryList(specs: readonly QuerySpec[]): ListState {
 export interface MissionData {
     /** The sessions and lone incident requests in the period, newest first. */
     plans: Plan[];
+    /**
+     * The same on every target, before the page's filter: the postmortem's answer key reads them, as its blind investigation
+     * reads every target (the review of b4370565).
+     */
+    allPlans: Plan[];
     /** The session in focus: the view's, or the newest. */
     plan: Plan | null;
     /** Its faults, scored. */
@@ -210,6 +215,7 @@ export function useMission(others = 0): MissionData {
 
     const runs = useMemo(() => toSessions(sessionRows).filter((r) => !r.profile.startsWith("incident:") || keepTarget(r.target, view.targets)), [sessionRows, view.targets]);
     const plans = useMemo(() => toPlans(runs), [runs]);
+    const allPlans = useMemo(() => toPlans(toSessions(sessionRows)), [sessionRows]);
     const sessionsLoaded = Boolean(sessions.data ?? sessions.stale);
     const requested = view.session ? (plans.find((p) => p.key === view.session) ?? null) : null;
     // A session the address asks for that isn't in this period (or doesn't exist) shows as missing, never as another one.
@@ -355,6 +361,7 @@ export function useMission(others = 0): MissionData {
 
     return {
         plans,
+        allPlans,
         plan,
         scores: plan ? (scored.get(plan.key) ?? []) : [],
         scored,

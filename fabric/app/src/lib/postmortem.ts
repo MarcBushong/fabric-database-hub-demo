@@ -54,11 +54,25 @@ export interface PostmortemInput {
     /** The next session's start, from the session control's record: the Cause's minutes end there at the latest. */
     nextSessionStart?: Date | null;
     /**
-     * Every plan in the period, from Scenario Runs: after the blind Cause, the answer key also lists other plans' faults
-     * that reach into its minutes, labeled as outside this session. The investigation never reads them.
+     * Every plan in the period, from Scenario Runs, on every target, before the page's filter: after the blind Cause, the
+     * answer key also lists the session's faults on targets the filter hides, and other plans' faults that reach into its
+     * minutes, labeled as outside this session, since the investigation reads every target (the reviews of feb64ad3 and
+     * b4370565). The investigation never reads them.
      */
     plans?: readonly Plan[];
+    /** T4's and T5's episodes on targets the page's filter hides, which the dialog loads for the answer key. */
+    hidden?: HiddenCaptures | null;
     generatedAt: Date;
+}
+
+/** What the answer key reads on the targets the page's filter hides, which the page doesn't load (the review of b4370565). */
+export interface HiddenCaptures {
+    /** T4's and T5's episodes in the plan's window, from their Azure Monitor captures. */
+    episodes: readonly MeasuredEpisode[];
+    /** The queries behind them. */
+    specs: readonly QuerySpec[];
+    /** Each capture that couldn't be read, and why. */
+    errors: readonly string[];
 }
 
 export interface Postmortem {
@@ -264,14 +278,37 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     // The Cause (ADR 0031, section 9): with the RCA tables, what the blind investigation found, the way a DBA would find it,
     // and then what the demo injected, in a section of its own, labeled as the answer key. Without them, what was injected.
     const others = input.rca && input.rca !== "request" ? faultsFromOtherPlans(input.plans ?? [], plan, input.rca) : [];
+    // The answer key reads every target, as the investigation does, whatever the page's filter shows (the review of
+    // b4370565): the session's faults on the targets it hides, from Scenario Runs before the filter, and T4's and T5's
+    // episodes there, which the dialog loads. The sections above stay the filter's.
+    const twin = input.rca && input.rca !== "request" ? input.plans?.find((p) => p.key === plan.key) : undefined;
+    const hiddenFaults = twin ? twin.faults.filter((f) => !plan.faults.some((g) => g.requestId === f.requestId)) : [];
+    const hidden = input.rca && input.rca !== "request" ? (input.hidden ?? null) : null;
+    const hiddenEpisodes = hidden?.episodes ?? [];
+    const hiddenLines = [
+        ...hiddenFaults.map((r) => `- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`),
+        ...hiddenEpisodes.map((e) => {
+            const end = e.recoveredAt ?? e.endAt;
+            return `- **${e.signal}** on ${e.target} (${serviceName(e.target)}), ${end ? `${time(e.visibleAt)} to ${time(end)} UTC` : `from ${time(e.visibleAt)} UTC`}, an episode in its Azure Monitor metrics.`;
+        }),
+        ...(hidden?.errors ?? []).map((m) => `- ${m}`),
+    ];
     const injectedLines: string[] = [];
     if (injected > 0) {
         injectedLines.push("Every fault was injected on purpose by the demo's session control (NB_DatabaseHub_Control), bounded in time, inside the ContosoCare database only, on sessions tagged `ContosoCare.Demo/`:", "");
         for (const s of scores) injectedLines.push(`- **${s.title}** on ${s.target} (${serviceName(s.target)}), ${time(s.injectedAt)} to ${time(s.injectedEnd)} UTC.`);
         for (const r of unscored) injectedLines.push(`- **${faultTitle(r)}** on ${r.target} (${serviceName(r.target)}), ${time(r.windowStart)} to ${time(r.windowEnd)} UTC.`);
     }
-    if (episodes.length > 0) injectedLines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
-    if (injected === 0 && episodes.length === 0) injectedLines.push(others.length > 0 ? "This session's plan injected nothing." : "Nothing was injected in this window.");
+    if (episodes.length + hiddenEpisodes.length > 0) injectedLines.push(`${injected > 0 ? "\n" : ""}T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.`);
+    if (hiddenLines.length > 0) {
+        injectedLines.push(
+            ...(injectedLines.length > 0 ? [""] : []),
+            "**On targets this page's filter hides:** the investigation above reads every target, so the key does too, though the sections above leave these out:",
+            "",
+            ...hiddenLines,
+        );
+    }
+    if (injected === 0 && episodes.length === 0 && hiddenLines.length === 0) injectedLines.push(others.length > 0 ? "This session's plan injected nothing." : "Nothing was injected in this window.");
     if (others.length > 0) {
         injectedLines.push(
             "",
@@ -365,6 +402,8 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     lines.push("```dax", dax ?? "// No query.", "```", "");
     const investigated = input.rca && input.rca !== "request" ? input.rca.queries : [];
     if (investigated.length > 0) lines.push("And the investigation's, behind the Cause, each once:", "", "```dax", investigated.map((q) => `// ${q.title}\n${q.dax}`).join("\n\n"), "```", "");
+    const keyQueries = hidden ? joinDax(hidden.specs) : undefined;
+    if (keyQueries) lines.push("And the answer key's, for the targets this page's filter hides:", "", "```dax", keyQueries, "```", "");
 
     return { title, fileName: postmortemFileName(plan, input.generatedAt), markdown: lines.join("\n") };
 }

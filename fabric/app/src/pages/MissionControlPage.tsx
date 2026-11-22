@@ -68,7 +68,7 @@ export default function MissionControlPage() {
     }));
     const openPostmortem = () => {
         if (!plan) return;
-        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), plans: data.plans, generatedAt: new Date() });
+        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), plans: data.allPlans, generatedAt: new Date() });
     };
     const running = manage.mode === "run" ? manage.running : null;
     const windowText = plan ? `${formatDayUtc(plan.start)} ${formatTimeUtc(plan.start)}–${formatTimeUtc(plan.end)} UTC` : "";

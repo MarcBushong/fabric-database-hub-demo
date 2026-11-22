@@ -270,6 +270,45 @@ describe("Mission Control", () => {
         );
     }
 
+    // The investigation reads every target, so the answer key does too, whatever the page's filter shows (the review of
+    // b4370565): the session's own faults on T3, and T4's and T5's episodes, which the page doesn't load when it hides them.
+    // Each page that writes the postmortem hands it the period's plans before the filter.
+    for (const [name, Page, targets, hides] of [
+        ["Mission Control", MissionControlPage, ["T1", "T2"], true],
+        ["the scoreboard", ScoreboardPage, ["T1", "T2"], true],
+        ["the replay", ReplayPage, ["T1", "T2"], true],
+        ["Mission Control", MissionControlPage, ["T1", "T2", "T3", "T4", "T5"], false],
+    ] as const) {
+        it(
+            `lists the session's faults and T4's and T5's episodes in the answer key with the filter on ${targets.join(", ")}, from ${name} (the review of b4370565)`,
+            async () => {
+                const client = sampleRcaClient(Promise.resolve());
+                renderWithApp(<Page />, { client, rca: true, view: { session: SESSION_KEY, targets: [...targets] } });
+                const write = await screen.findByRole("button", { name: "Write the postmortem" });
+                await waitFor(() => expect(write).toBeEnabled());
+                const loaded = ["postgres-series", "cosmos-series", "cosmos-findings"].filter((id) => client.ran.includes(id));
+                expect(loaded).toEqual(hides ? [] : ["postgres-series", "cosmos-series", "cosmos-findings"]);
+                fireEvent.click(write);
+                const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+                await waitFor(() => expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled(), { timeout: 20000 });
+                const text = dialog.textContent ?? "";
+                // The session's first fault on T3, in the key either way, and the note on T4's and T5's episodes.
+                expect(text).toMatch(/on T3 \(Scheduling\), 13:31 to 13:43 UTC\./);
+                expect(text).toContain("T4's and T5's beats aren't in Scenario Runs; their episodes come from their own Azure Monitor metrics, as captured at the session's end.");
+                // Shown, T3's faults and T4's and T5's episodes are in the timeline above; hidden, the key lists them.
+                expect(/on T4 \(Reporting\), \d\d:\d\d to \d\d:\d\d UTC, an episode in its Azure Monitor metrics\./.test(text)).toBe(hides);
+                expect(/on T5 \(Patient events\), \d\d:\d\d to \d\d:\d\d UTC, an episode in its Azure Monitor metrics\./.test(text)).toBe(hides);
+                for (const target of ["T3", "T5"]) expect([...dialog.querySelectorAll("td")].some((td) => td.textContent === target), target).toBe(!hides);
+                expect(text.includes("On targets this page's filter hides: the investigation above reads every target, so the key does too, though the sections above leave these out:")).toBe(hides);
+                expect(text.includes("And the answer key's, for the targets this page's filter hides:")).toBe(hides);
+                // Only what the filter hides is loaded again, for the key.
+                expect(client.ran.filter((id) => id === "postgres-series").length).toBe(1);
+                expect(client.ran.filter((id) => id === "cosmos-findings").length).toBe(1);
+            },
+            SLOW,
+        );
+    }
+
     it(
         "never investigates a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)",
         async () => {

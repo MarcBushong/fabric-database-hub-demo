@@ -158,7 +158,7 @@ export default function ScoreboardPage() {
                         <PostmortemButton
                             ready={Boolean(plan) && !data.loading}
                             scoreError={data.scoreError}
-                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), plans: data.plans, generatedAt: new Date() })}
+                            onClick={() => plan && setPostmortem({ plan, scores, episodes, beat: data.beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), plans: data.allPlans, generatedAt: new Date() })}
                         />
                         <Button size="small" icon={<HeartPulse20Regular />} onClick={() => navigate("mission", { session: view.session })}>
                             Mission Control

@@ -10,19 +10,56 @@ import { ArrowDownload16Regular, Copy16Regular, Dismiss20Regular, Sparkle16Fille
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
+import { toCosmosCapture, toPostgresCapture } from "@/data/model";
+import { cosmosFindingsQuery, cosmosSeriesQuery, postgresSeriesQuery, type QuerySpec } from "@/data/queries";
+import type { QueryClient } from "@/data/query-client";
 import { QueryClientContext } from "@/data/use-query";
 import { copyText } from "@/lib/clipboard";
 import { downloadText } from "@/lib/csv";
-import { buildPostmortem, causeWindow, draftsWithCopilot, postmortemAsk, postmortemTitle, type PostmortemInput } from "@/lib/postmortem";
+import { buildPostmortem, causeWindow, draftsWithCopilot, postmortemAsk, postmortemTitle, type HiddenCaptures, type PostmortemInput } from "@/lib/postmortem";
+import { cosmosEpisodes, episodesIn, postgresEpisodes, type MeasuredEpisode, type Plan } from "@/lib/scoreboard";
 import { createRcaClient } from "@/rca/client";
 import { blindCauses, type BlindCauses } from "@/rca/postmortem";
 import { MarkdownView } from "./parts";
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/**
+ * T4's and T5's episodes in a plan's window on the targets the page's filter hides, for the answer key (the review of
+ * b4370565): the investigation reads every target, and the page loads their captures only when its filter shows them. A
+ * capture that can't be read is said in the key, never taken for a quiet target.
+ */
+async function hiddenCaptures(client: QueryClient, hidden: ReadonlyArray<"T4" | "T5">, plan: Plan): Promise<HiddenCaptures> {
+    const specs: QuerySpec[] = [];
+    const found: MeasuredEpisode[] = [];
+    const errors: string[] = [];
+    const missing = (target: string, err: unknown) => `${target}'s Azure Monitor capture couldn't be read for this key, so its episodes aren't in it: ${message(err)}`;
+    if (hidden.includes("T4")) {
+        const series = postgresSeriesQuery();
+        specs.push(series);
+        try {
+            found.push(...postgresEpisodes(toPostgresCapture((await client.run(series)).rows)));
+        } catch (err) {
+            errors.push(missing("T4", err));
+        }
+    }
+    if (hidden.includes("T5")) {
+        const series = cosmosSeriesQuery();
+        const findings = cosmosFindingsQuery();
+        specs.push(series, findings);
+        try {
+            const [s, f] = await Promise.all([client.run(series), client.run(findings)]);
+            found.push(...cosmosEpisodes(toCosmosCapture(s.rows), f.rows));
+        } catch (err) {
+            errors.push(missing("T5", err));
+        }
+    }
+    return { episodes: episodesIn(found, plan).sort((a, b) => a.visibleAt.getTime() - b.visibleAt.getTime()), specs, errors };
+}
+
 /** Open while `input` is set; its `generatedAt` is when the viewer asked for it. */
 export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | null; onClose: () => void }) {
-    const { notify, rca, rcaError } = useApp();
+    const { notify, rca, rcaError, view } = useApp();
     const copilot = useCopilot();
     const queryClient = useContext(QueryClientContext);
     // With the RCA tables, the Cause is the blind investigation of a session's minutes, once each time it's asked for; a
@@ -31,7 +68,10 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
     const minutes = useMemo(() => (input ? causeWindow(input.plan, input.nextSessionStart ?? null) : null), [input]);
     const investigates = minutes !== null && rca === true && queryClient !== null;
     const key = input ? `${input.plan.key}|${input.generatedAt.toISOString()}` : "";
-    const [investigated, setInvestigated] = useState<{ key: string; value: BlindCauses } | null>(null);
+    // The investigation reads every target, so its answer key does too: T4's and T5's captures, which the page loads only
+    // when its filter shows them, load here when it hides them (the review of b4370565).
+    const hiddenTargets = useMemo(() => (["T4", "T5"] as const).filter((t) => !view.targets.includes(t)), [view.targets]);
+    const [investigated, setInvestigated] = useState<{ key: string; value: BlindCauses; hidden: HiddenCaptures } | null>(null);
     useEffect(() => {
         if (!input || !minutes || rca !== true || !queryClient) return;
         const asked = `${input.plan.key}|${input.generatedAt.toISOString()}`;
@@ -39,15 +79,14 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
         let alive = true;
         // Closed or asked again: the investigation explains no further incident.
         const stop = new AbortController();
-        blindCauses(createRcaClient(queryClient, { timeZone: "UTC" }), from, to, stop.signal).then(
-            (value) => alive && setInvestigated({ key: asked, value }),
-            (err: unknown) => alive && setInvestigated({ key: asked, value: { from, to, causes: [], notCaptured: [], queries: [], error: message(err) } }),
-        );
+        const cause = blindCauses(createRcaClient(queryClient, { timeZone: "UTC" }), from, to, stop.signal).catch((err: unknown): BlindCauses => ({ from, to, causes: [], notCaptured: [], queries: [], error: message(err) }));
+        const hidden = hiddenCaptures(queryClient, hiddenTargets, input.plan).catch((err: unknown): HiddenCaptures => ({ episodes: [], specs: [], errors: [`T4's and T5's captures couldn't be read for this key: ${message(err)}`] }));
+        void Promise.all([cause, hidden]).then(([value, captures]) => alive && setInvestigated({ key: asked, value, hidden: captures }));
         return () => {
             alive = false;
             stop.abort();
         };
-    }, [input, minutes, queryClient, rca]);
+    }, [input, minutes, queryClient, rca, hiddenTargets]);
     // The blind Cause; "request" for a lone request's pointer to the Root cause page; undefined while it's investigated;
     // null for the Cause as it was, without the RCA tables. A failed check of the tables is said in the Cause, never taken
     // for their absence.
@@ -60,7 +99,8 @@ export function PostmortemDialog({ input, onClose }: { input: PostmortemInput | 
         return null;
     }, [input, minutes, investigates, investigated, key, rca, rcaError]);
     const investigating = cause === undefined;
-    const postmortem = useMemo(() => (input && cause !== undefined ? buildPostmortem({ ...input, rca: cause }) : null), [input, cause]);
+    const hiddenFound = investigates && investigated && investigated.key === key ? investigated.hidden : null;
+    const postmortem = useMemo(() => (input && cause !== undefined ? buildPostmortem({ ...input, rca: cause, hidden: hiddenFound }) : null), [input, cause, hiddenFound]);
     const causeText = cause === null ? "what was injected" : cause === "request" ? "what was injected, labeled as the answer key, with the Root cause page for the cause" : "a blind investigation of the session's minutes for the Cause, as on the Root cause page, then what was injected, labeled as the answer key";
     // A lone incident request's minutes are its fault's own, so only a session's postmortem has a draft. Its line points to
     // the Root cause page when the navigation lists it: with the RCA tables, or when their check failed (AppShell).

@@ -29,9 +29,9 @@ export interface FaultMinutes {
 const DAX_TIME = /DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/g;
 const ISO_TIME = /\b(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/g;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-/** formatDayUtc's "20 Oct", with the year and a clock time, as the postmortem writes it, or with none, as formatDateTimeUtc does. */
+/** A day and month followed by a clock time, with the year between them, as the postmortem's draft writes it, or without it, as formatDateTimeUtc does. */
 const DAY_TIME = new RegExp(`\\b(\\d{1,2}) (${MONTHS.join("|")})(?: (\\d{4}))? (\\d{2}):(\\d{2})\\b`, "g");
-/** agent-prompts' "between 15:00 and 15:30 UTC on 2026-10-20": the clock times before " UTC on" a day. */
+/** agent-prompts' "between 15:00 and 15:30 UTC on 2026-10-20": the clock times before " UTC on" an ISO day. */
 const ON_DAY = / UTC on (\d{4})-(\d{2})-(\d{2})\b/g;
 const CLOCK = /\b(\d{2}):(\d{2})(?::(\d{2}))?\b/g;
 /** The padding the app's own reads put around a plan's minutes: 30 minutes before, 45 after (use-mission's waits). */
@@ -39,9 +39,12 @@ const BEFORE = 30 * 60_000;
 const AFTER = 45 * 60_000;
 
 /**
- * Every time a text names, in the forms the app writes: ISO ("2026-10-20T15:00:00Z", "2026-10-20 15:00"), formatDayUtc's
- * "20 Oct 2026 15:00" (read in each fault's year when it has none), and "15:00 and 15:30 UTC on 2026-10-20" (the
- * re-review of ab1d2d41: the ISO form alone missed the postmortem's draft and agent-prompts' windowPhrase).
+ * The times a text names in the three forms ADR 0031's test reads (the re-review of ab1d2d41): ISO
+ * ("2026-10-20T15:00:00Z", "2026-10-20 15:00"); a day and month followed by a clock time, with or without the year between
+ * them ("20 Oct 2026 15:00", "20 Oct 15:30 UTC"), in each fault's year when it names none; and the clock times before "UTC
+ * on" an ISO day ("between 15:00 and 15:30 UTC on 2026-10-20"). It reads no other form: not "UTC on" a day and month, a
+ * clock time with no day, a range's second time after a day and month, or an episode key's time (the review of dbee7d53,
+ * and the confirmation review of bf0e885b).
  */
 function timesIn(text: string, years: readonly number[]): number[] {
     const out: number[] = [];
@@ -58,7 +61,7 @@ function timesIn(text: string, years: readonly number[]): number[] {
 /**
  * A fault's minutes in a context (the re-review of ff5753e2): a query in its DAX that reads the fault's target over minutes
  * that reach into the fault's, with the padding the app puts around them, or a time in those minutes in its prompt or
- * title. Names alone don't show it: the window is the answer key's too.
+ * title, in one of the forms timesIn reads. Names alone don't show it: the window is the answer key's too.
  */
 export function faultMinutesInContext(ctx: AskContext, faults: readonly FaultMinutes[]): string | null {
     const within = (at: number, f: FaultMinutes) => at >= f.start.getTime() - BEFORE && at <= f.end.getTime() + AFTER;
