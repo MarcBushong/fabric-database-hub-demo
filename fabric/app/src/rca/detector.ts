@@ -319,6 +319,22 @@ function connectionShare(evidence: Evidence, target: RcaTarget): Sample[] {
     });
 }
 
+/**
+ * A capture episode's samples while its capture ran: from its first, up to a gap longer than CAPTURE_RUN_GAP_MS, where the
+ * capture stopped (the session's stop, or the VMs'). An episode the capture never relaxed ends there, never across the gap
+ * into a later session's samples (Final tests' live check of 4e2c65ed: a surge Stop now cut off read the next session's,
+ * 37 minutes later, as its own).
+ */
+export const CAPTURE_RUN_GAP_MS = 90_000;
+function untilGap(samples: readonly Sample[]): Sample[] {
+    const out: Sample[] = [];
+    for (const s of samples) {
+        if (out.length && s.at.getTime() - out[out.length - 1].at.getTime() > CAPTURE_RUN_GAP_MS) break;
+        out.push(s);
+    }
+    return out;
+}
+
 /** The capture's own episodes, measured from its samples. */
 export function episodesFromCapture(evidence: Evidence): Episode[] {
     const out: Episode[] = [];
@@ -326,7 +342,8 @@ export function episodesFromCapture(evidence: Evidence): Episode[] {
         const family = captureFamily(c.detail, c.target);
         if (!family) continue;
         const rule: SignalRule = RULES[family];
-        const samples = episodeSamples(evidence, c.target, family, c.start, c.end ?? new Date(8.64e15)).filter((s) => s.value !== null);
+        const read = episodeSamples(evidence, c.target, family, c.start, c.end ?? new Date(8.64e15)).filter((s) => s.value !== null);
+        const samples = c.end ? read : untilGap(read);
         const level = rule.family === "replica_lag" ? rule.floor : levelOf(rule, null);
         const hits = samples.filter((s) => meets(s.value, level, rule.strict));
         const peak = samples.reduce<Sample | null>((best, s) => (best === null || (s.value ?? -Infinity) > (best.value ?? -Infinity) ? s : best), null);
@@ -474,12 +491,21 @@ export function describeEpisode(e: Episode): string {
     const t = (d: Date) => d.toISOString().slice(11, 19);
     const unit = e.unit === "%" ? " %" : ` ${e.unit}`;
     const round = (v: number) => (Math.abs(v) >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
-    const span = e.end ? `from ${t(e.start)} to ${t(e.end)} UTC` : `from ${t(e.start)} UTC (its end isn't known: the data ${e.last.getTime() === e.start.getTime() ? "has one sample" : "ends or breaks off first"})`;
+    const capture = e.source === SOURCES.capture;
+    const span = e.end
+        ? `from ${t(e.start)} to ${t(e.end)} UTC`
+        : capture
+          ? `from ${t(e.start)} UTC (the capture ended while it was still on, so its end isn't known)`
+          : `from ${t(e.start)} UTC (its end isn't known: the data ${e.last.getTime() === e.start.getTime() ? "has one sample" : "ends or breaks off first"})`;
+    // The capture's samples between an episode's start and end aren't all at the level when it came in waves (the live
+    // check of 4e2c65ed: four waves of a connection surge read as "32 samples in a row").
     const how =
         e.support === "single sample"
             ? "in one sample, far over its level: low confidence"
             : e.support === "sparse"
               ? `in ${e.atLevel} samples, ${e.unknown} of the samples between them without a value`
-              : `in ${e.atLevel} samples in a row`;
+              : capture && e.valued > e.atLevel
+                ? `in ${e.atLevel} of its ${e.valued} samples`
+                : `in ${e.atLevel} samples in a row`;
     return `${e.target}: ${e.signal} ${e.level === 0 ? "above zero" : `over ${round(e.level)}${unit}`} ${span}, peak ${round(e.peak)}${unit} at ${t(e.peakAt)} UTC, ${how} (${e.source}).`;
 }

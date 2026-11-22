@@ -4569,6 +4569,34 @@ With them, at the coordinator's request: high contrast's selected and hovered na
   - **A claim the data doesn't support:** "No client was refused ... so no client asked for one while every slot was taken". Learn documents `connections_failed` only as "Number of failed connections", so it may not count refusals at the limit; the answer now says only what Azure Monitor counted. Live, the capture saw 35 of 35 slots taken while Azure Monitor counted no failed connection, yet the connection-surge scenario's README expects failed connections above 0 (not yet proven live). That contradiction is for the live checks to settle; the scenario is unchanged.
   - **The fixture:** the surge's split by state is marked as modeled where it's built, and `live-accuracy.test.ts`'s `CONN-IDLE` at high confidence rests on it until Final tests' rows from B's model replace it.
   - **Tests:** 14 new or changed tests fail against 4e2c65ed's code. Each fix alone fails its own: the neighbor check, the repeat (with 1 re-read), `metricIn`, and the named intervals' sums.
+- **Final tests' live check of 4e2c65ed, on B's model (2026-11-21), and the re-review of bb70161f.** The evidence is in Final tests' `files/evidence/rca-4e2c65ed-checks.md`.
+  - **Passed:**
+    - **Finding 1:** the view and `explain_replica_lag` agree at 16:17:12, 16:18:30, and 16:19:30 UTC: `REPL-REPLAY-CONFLICT` at high confidence, held by session 5883. The second stall has its own holder, 6553.
+    - **The other families** read as they did at 94a17ff7.
+    - **The surges' classification:** all 9 read `CONN-IDLE`, as RCA-PG-10's raw counts give.
+  - **Found, for finding 2, and fixed here:**
+    - **"No client was refused" was wrong.** The connection-surge scenario's answer key recorded 48 refused attempts ("too many connections") on B, while `connections_failed` stayed at 0 throughout, so Azure Monitor doesn't count refusals at the connection limit. The answer no longer infers anything about refusals from it:
+      - when a sample saw every usable slot in use, it says a client connecting then would have been refused (SQLSTATE 53300), and that the capture can't say how many were;
+      - when no sample reached the limit, it says the slots may have filled between the samples, so whether a client was refused isn't known. The answer key's refusals came in fills of about 0.1 s, which the 10-s samples never saw: A's surges peaked at 34 of 35 in the samples;
+      - more connections (`PG-MAXCONN`) are recommended only when running queries filled every slot; the failed connections were its trigger;
+      - the answer key stays in the tests, as the grading reference for B's surges and A's two. The app never reads it.
+    - **A surge Stop now cut off was merged with the next session's.** `T4-connections-20261121T185152Z` has no relaxed event, and the detector read its capture with no end (`c.end ?? 8.64e15`, from before 4e2c65ed). So it read "36 of 35 at 19:30:16 … 45 min 44 s", across 37 minutes without samples. An episode the capture never ended now ends at its own capture's last sample before a gap of more than 90 s, and says that the capture ended while it was still on. Every family the capture's own episodes open is read that way (`episodesFromCapture`).
+    - **"Stayed at 80 % … 32 samples (7 min 30 s)" hid 4 waves,** with drops to 8 connections between them. The answer gives the shape now: the waves at 80 % of the limit or more, their peaks (35, 33, 33, and 33), the troughs between them, and the 32 of 53 samples at that level.
+    - **`T5-ru-20261121T123000Z` was listed, but answered "No episode"** (at 94a17ff7 too).
+      - **Why:** the telemetry query keeps each bin's newest capture with that capture's own interval, so Azure Monitor's 15-minute and 1-minute intervals from different captures read differently over different windows. Over the day, `find_incidents` listed 12:30 apart from 12:15; in 12:30's own minutes, the two are one episode, from 12:15.
+      - **The fix:** `explain_incident` reads the episode of the same target and signal that holds the key's time, or else the first to start within 15 minutes after it, and says which (`readAs`). Every key `find_incidents` lists over B's 11:00 to 20:00 UTC resolves, `T4-replica-replica_lag-20261121T161500Z` among them, an Azure Monitor key that the capture's episode replaces in its own minutes.
+      - **Left for Phase 2:** bins that read the same over every window need a change to the telemetry query, which the Estate page shares.
+    - **T5's counts, checked against the real rows:** from 15:30 to 15:42, the 10 intervals at 100 % hold 52,450 requests, 27,815 of them throttled (53 %), which the answer now says. 4e2c65ed's 55,152 and 29,186 (52.9 %) also counted 15:34, 15:38, 15:42, and 15:43, which weren't at 100 % (the review of 4e2c65ed).
+  - **The re-review of bb70161f: 3 Low.**
+    - **The hour's provisioned throughput:** Azure Monitor keeps it hourly, stamped with the hour's start, and an RU episode read T5's history from 30 minutes before it. One that began 30 minutes or more into its hour, about half of them, missed it: it said the throughput wasn't known, and left out why a new key wouldn't help. T5's history is read from the start of the episode's hour now.
+    - **The no-chain note** said the capture's sentinel saw the blocking whenever the window overlapped captured minutes, even for blocking that only Database Hub's telemetry saw, before the capture ran. It says so now only for the capture's own episode, or one whose minutes the capture covered. Otherwise, it says the blocking is in Database Hub's telemetry only, and the capture wasn't running then.
+    - **A rise from an Azure Monitor interval:** when the capture started, or resumed after a gap, partway through a stall, the rise "rose from" the interval's start, for example "from 16:10:00" for a stall from 16:13:00. It starts now at the capture's first sample ("from 16:16:12 …, counting from its last replay at 16:13:00"). With no capture sample, it's said as the interval: "rose in the 5 minutes from 16:10:00 UTC".
+  - **The fixtures are the real rows now,** which Final tests read through the app's own DAX at 4e2c65ed, redacted, and decoded here as the app decodes them. The deployments' resource names are generic (`pgflex01`, `pgreplica01`, `cosmos01`), and the replica's standby name and the run token are placeholders:
+    - B's (`rca/testdata/live-rb-2233e0ae.rows.json`, about 284 KB): the capture's events, RCA-PG-10 in the minutes of 5 surges, the replica's samples from 16:00 to 16:40 UTC, the coverage, and Azure Monitor's T4, replica, and T5 series;
+    - A's (`live-ra-4e2c65ed.rows.json`, about 60 KB): its 2 surges.
+
+    They replace the rows rebuilt from the live answers, and the modeled split by state: `CONN-IDLE` at high confidence follows the real counts. Left out: RCA Sessions, T4's lock-wait capture episodes, RCA-PG-03, RCA-PG-10 outside the surges' minutes, and the telemetry the RCA doesn't read. Each environment's answer-key file holds its surges' rows, the grading reference only.
+  - **Tests:** 16 new or changed tests fail with bb70161f's four modules. Each part alone fails its own: the gap that ends an episode, the waves, the key's fallback, the hour's look-back (also on B's real storm from 15:45), the note's provenance, and the rise's first sample.
 
 **Merge note: the session control's job minutes, for whoever merges second.** The release's follow-ups (fae05b4, after d644cdd) count the session control's Automation minutes differently: 5 Run all sessions at 80 minutes, 520 minutes a month with the nightly safety stop's 120, of which 20 are billed, $0.04. The coordinator's decision: the light-use month counts 5 Run all sessions, the owner's main path. With both branches, a session's jobs take at most:
 
@@ -4715,6 +4743,19 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
   - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
 
   markdownlint found no issue in 152 files.
+- **The live check of 4e2c65ed, and the re-review of bb70161f:** `npm run verify` passed: typecheck, lint, Vitest's 539 tests in 33 files, the license check (136 production packages), and the build. With bb70161f's four modules under the new tests, 16 fail. Each part alone fails its own test:
+  - with no gap ending an episode the capture never ended, the cut-off surge;
+  - with no waves, the two wave tests;
+  - with no fallback for a key, every listed key;
+  - with no look-back to the hour's start, the provisioned throughput;
+  - with the note's provenance left out, the blocking before the capture;
+  - with the rise from the interval's start, its first sample.
+
+  Under strict mode, with the Azure CLI guard, 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI:
+  - the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract` (whose scan finds no answer-key name or scenario ID in the changed modules), and `Agent.PromptPack` (775);
+  - `DbHubDemo.FabricApp` and `FabricAppSignIn` (204).
+
+  PSScriptAnalyzer found nothing in 392 files; markdownlint found no issue in 152 files.
 
 **Risks.** [ADR 0031's risks](adr/0031-incident-rca.md#risks). Step 1.8 retired the three that only it could:
 

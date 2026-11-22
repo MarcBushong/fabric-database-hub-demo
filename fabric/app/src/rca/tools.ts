@@ -6,7 +6,7 @@
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { analyzeConnections } from "./connections";
-import { describeEpisode, findEpisodes } from "./detector";
+import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
 import { RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
@@ -109,6 +109,8 @@ const REPLICA_REREADS = 3;
 const REPLICA_STEP_MINUTES = 15;
 /** Azure Monitor's ProvisionedThroughput is hourly: a point stands for its hour. */
 const HOUR = 60 * MIN;
+/** How far after a listed key's time its episode may start when its own minutes read it differently: T5's 15-minute intervals, the coarsest the history keeps. */
+const KEY_SLACK_MS = 15 * MIN;
 
 function windowOf(args: Record<string, unknown>, deps: InvestigationDeps): { from: Date; to: Date; at?: Date } | string {
     const str = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
@@ -300,18 +302,23 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const a = analyzeLocking(sessions, events, w.at);
         const base = envelope("explain_locking", w.from, w.to, targets, deps, g, w.at);
         // Blocked processes the detector saw, on a target the capture covered, with no chain in its samples: say why there's
-        // none, rather than leave the cause blank (live, 2026-11-21's audit).
+        // none, rather than leave the cause blank (live, 2026-11-21's audit). The sentinel saw them only when the episode is
+        // the capture's or its own minutes were captured; Database Hub's telemetry can see blocking before the capture runs
+        // (the re-review of bb70161f).
         const pg = (t: RcaTarget) => t === "T4" || t === "T4-replica";
-        const chainless = targets.filter(
-            (t) =>
-                g.episodes.some((e) => e.target === t && e.family === "blocking" && e.start <= w.to && (e.end ?? e.last) >= w.from) &&
-                !a.episodes.some((e) => e.target === t) &&
-                g.evidence.coverage.some((c) => c.target === t && c.captured && c.from <= w.to && c.to >= w.from),
-        );
-        const noChain = chainless.map(
-            (t) =>
-                `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
-        );
+        const covered = (t: RcaTarget, from: Date, to: Date) => g.evidence.coverage.some((c) => c.target === t && c.captured && c.from <= to && c.to >= from);
+        const noChain = targets.flatMap((t) => {
+            const seen = g.episodes.filter((e) => e.target === t && e.family === "blocking" && e.start <= w.to && (e.end ?? e.last) >= w.from);
+            if (seen.length === 0 || a.episodes.some((e) => e.target === t) || !covered(t, w.from, w.to)) return [];
+            if (seen.some((e) => e.source === SOURCES.capture || covered(t, e.start, e.end ?? e.last))) {
+                return [
+                    `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(w.to)} UTC left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
+                ];
+            }
+            const from = new Date(Math.min(...seen.map((e) => e.start.getTime())));
+            const to = new Date(Math.max(...seen.map((e) => (e.end ?? e.last).getTime())));
+            return [`${t}: the blocked processes from ${hhmmss(from)} to ${hhmmss(to)} UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.`];
+        });
         return {
             ...base,
             findings: a.findings,
@@ -399,17 +406,22 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         };
     }
 
-    /** T4's connections against the limit, explained by what held them (connections.ts). */
-    async function connectionsAt(target: RcaTarget, from: Date, to: Date): Promise<InvestigationResult> {
+    /** T4's connections against the limit, explained by what held them (connections.ts). An episode the capture never ended (openEnded) says so. */
+    async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false): Promise<InvestigationResult> {
         const g = await gather(from, to, [target]);
-        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics });
+        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded });
         const base = envelope("explain_connections", from, to, [target], deps, g);
         return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
     }
 
-    /** T5's normalized RU consumption at 100 %, explained from Azure Monitor's counts (throughput.ts). */
+    /**
+     * T5's normalized RU consumption at 100 %, explained from Azure Monitor's counts (throughput.ts). It's read from at
+     * most 30 minutes into the window's hour, so the hour's provisioned throughput, an hourly point stamped with the hour's
+     * start, is in it (the re-review of bb70161f: a window from 15:45 read from 15:15 and missed 15:00's).
+     */
     async function throughputAt(from: Date, to: Date): Promise<InvestigationResult> {
-        const g = await gather(from, to, ["T5"]);
+        const hour = Math.floor(from.getTime() / HOUR) * HOUR;
+        const g = await gather(new Date(Math.min(from.getTime(), hour + LEAD_MINUTES * MIN)), to, ["T5"]);
         const a = analyzeThroughput({ from, to, metrics: g.evidence.metrics });
         const base = envelope("explain_throughput", from, to, ["T5"], deps, g);
         return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
@@ -441,7 +453,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const span = { from: e.start.toISOString(), to: new Date(end.getTime() + MIN).toISOString(), targets: [e.target] };
         if (e.family === "blocking" || e.family === "deadlock") return locking(span);
         if (e.family === "replica_lag") return replicaAt(e.peakAt, new Date(Math.min(e.start.getTime(), e.peakAt.getTime() - e.peak * 1000) - 5 * MIN), new Date(end.getTime() + 10 * MIN));
-        if (e.family === "connections") return connectionsAt(e.target, e.start, new Date(end.getTime() + MIN));
+        if (e.family === "connections") return connectionsAt(e.target, e.start, new Date(end.getTime() + MIN), !e.end);
         if (e.family === "ru") return throughputAt(e.start, new Date(end.getTime() + MIN));
         if (e.family === "errors" || e.family === "throttling") return errors(span);
         return null;
@@ -452,12 +464,14 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         let from: Date;
         let to: Date;
         let targets: RcaTarget[];
+        let family = "";
         if (key) {
             const m = KEY.exec(key);
             if (!m) return `No episode ${JSON.stringify(key)}: call find_incidents for the keys.`;
             from = new Date(Date.UTC(+m[3], +m[4] - 1, +m[5], +m[6], +m[7], +m[8]));
             to = new Date(from.getTime() + 120 * MIN);
             targets = [m[1] as RcaTarget];
+            family = m[2];
         } else {
             const w = windowOf(args, deps);
             const target = RCA_TARGETS.includes(args.target as RcaTarget) ? (args.target as RcaTarget) : null;
@@ -466,7 +480,16 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             targets = [target];
         }
         const g = await gather(from, to, targets);
-        const chosen = key ? g.episodes.filter((e) => e.key === key) : g.episodes.filter((e) => e.start <= to && (e.end ?? e.last) >= from);
+        let chosen = key ? g.episodes.filter((e) => e.key === key) : g.episodes.filter((e) => e.start <= to && (e.end ?? e.last) >= from);
+        // A key listed over other minutes can read differently in its own: Azure Monitor's coarser intervals of another
+        // capture can join two of its episodes into one, or stand apart from the capture's own episode (Final tests' live
+        // check of 4e2c65ed: T5's 12:15 and 12:30 read as one episode from 12:15, so 12:30's key had none). The episode of its
+        // target and signal that holds the key's time is the same incident, or else the first to start within KEY_SLACK_MS
+        // after it (the coarsest interval the history keeps), so every listed key resolves; details.readAs says which.
+        const same = key && chosen.length === 0 ? g.episodes.filter((e) => e.target === targets[0] && e.family === family) : [];
+        const holds = same.filter((e) => e.start <= from && (e.end ?? e.last) >= from);
+        const readAs = holds.length ? holds : same.filter((e) => e.start > from && e.start.getTime() - from.getTime() <= KEY_SLACK_MS).slice(0, 1);
+        if (readAs.length) chosen = readAs;
         if (key && chosen.length === 0) return `No episode ${JSON.stringify(key)}: call find_incidents for the keys.`;
         const span = chosen.length ? { from: new Date(Math.min(...chosen.map((e) => e.start.getTime()))), to: new Date(Math.max(...chosen.map((e) => (e.end ?? e.last).getTime()))) } : { from, to };
         const base = envelope("explain_incident", span.from, span.to, targets, deps, g);
@@ -498,6 +521,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
+                ...(readAs.length ? { readAs: { key, as: readAs.map((e) => e.key) } } : {}),
                 alsoInTheseMinutes: others.map((c) => c.statement),
                 parts: parts.map((p) => ({ tool: p.tool, details: p.details })),
             },

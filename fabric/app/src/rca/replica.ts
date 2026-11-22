@@ -241,9 +241,15 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const back = rise.recovered ? `${rise.source === "RCA Replica" ? "," : ""} and was back to ${round1(rise.recovered.value)} s ${when(rise.recovered)}` : "";
     const grew = rise.slope !== null ? `; it grew ${rise.slope} s per second` : "";
     const since = rise.source === "RCA Replica" && rise.lastReplay ? `, counting from its last replay at ${hhmmss(rise.lastReplay)} UTC` : "";
+    // A rise whose first point is one of Azure Monitor's intervals (the capture started, or resumed, partway through the
+    // stall) starts at the capture's first sample in it, or is said as that interval (the re-review of bb70161f: it once
+    // "rose from 16:10:00", an interval's start, counting from a last replay at 16:13:00).
+    const startPoint = rise.points.find((p) => p.at.getTime() === rise.start.getTime());
+    const firstSample = rise.points.find((p) => p.source === "RCA Replica" && p.at >= rise.start && p.value >= 5);
+    const rose = startPoint && coarse(startPoint) ? (firstSample ? `rose from ${hhmmss(firstSample.at)}` : `rose in the ${minutesOf(startPoint)} minutes from ${hhmmss(startPoint.at)} UTC`) : `rose from ${hhmmss(rise.start)}`;
     const shape = coarse(rise.peak)
         ? `${nameOf(rise.peak)} reached ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${back}${grew}`
-        : `${nameOf(rise.peak)} rose from ${hhmmss(rise.start)} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}`;
+        : `${nameOf(rise.peak)} ${rose} to ${round1(rise.peak.value)} s ${when(rise.peak)} (${values})${since}${back}${grew}`;
     if (coarse(rise.peak)) notCaptured.push(`Azure Monitor's Read Replica Lag is in ${minutesOf(rise.peak)}-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only.`);
     const from = rise.stalledSince.getTime() - 60_000;
     const to = rise.end.getTime() + 60_000;

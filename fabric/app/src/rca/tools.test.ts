@@ -230,6 +230,38 @@ describe("every family the RCA explains", () => {
         expect(r.rootCause?.statement).toMatch(/reached 100 % in at least one second of each of the 3 intervals from 17:00 to 17:03 UTC: .* Azure Monitor counted 3000 requests in those intervals, none of them throttled\./);
         expect(r.recommendations).toEqual([]);
     });
+
+    // The re-review of bb70161f: an RU episode 30 minutes or more into its hour read the history from 30 minutes before it,
+    // so it missed the hour's provisioned throughput, stamped with the hour's start.
+    it("reads the hour's provisioned throughput for an RU episode late in the hour", async () => {
+        const points = Array.from({ length: 60 }, (_, i) => [
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.normalizedRu, value: i >= 45 && i < 48 ? 100 : 30 },
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.requests, value: 1000 },
+            { at: minute("17:00:00", i), metric: COSMOS_METRICS.throttled, value: i >= 45 && i < 48 ? 100 : 0 },
+        ]).flat();
+        const capture: CosmosCapture = { account: "cosmos01", capturedAt: at("18:05:00"), windowStart: at("17:00:00"), windowEnd: at("18:00:00"), intervalMinutes: 1, points: [...points, { at: at("17:00:00"), metric: COSMOS_METRICS.provisioned, value: 400 }] };
+        // As the telemetry query reads it: only the buckets in the window.
+        const deps = createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => ({ cosmos: { ...capture, points: capture.points.filter((p) => p.at >= from && p.at <= to) } }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+        });
+        const [episode] = (await deps.episodes(at("17:40:00"), at("17:55:00"), ["T5"])).filter((e) => e.family === "ru");
+        const r = await ask("explain_incident", { episodeKey: episode.key }, deps);
+        expect(r.rootCause?.statement).toContain("At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition unless it holds more than 50 GB");
+        expect(r.notCaptured.join(" ")).not.toMatch(/Nor is its provisioned throughput/);
+    });
+
+    // The re-review of bb70161f: blocking that Database Hub's telemetry saw before the capture ran was said to be the
+    // capture's sentinel's.
+    it("says the capture wasn't running when the blocking came from Database Hub's telemetry before it", async () => {
+        const bins = Array.from({ length: 20 }, (_, i) => ({ at: minute("15:05:00", i), target: "T1" as const, cpu: 20, blocked: i >= 7 && i <= 13 ? 3 : 0, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null }));
+        const evidence: Evidence = { ...emptyEvidence(), coverage: [{ target: "T1", from: at("15:20:00"), to: at("16:00:00"), captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }] };
+        const r = await ask("explain_locking", { at: "2026-11-20T15:19:00Z", targets: ["T1"] }, tools({ evidence, telemetry: { bins } }));
+        expect(r.notCaptured).toContain("T1: the blocked processes from 15:12:00 to 15:19:00 UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.");
+        expect(r.notCaptured.join(" ")).not.toMatch(/its 30-s sentinel saw/);
+    });
 });
 
 // The review of 4e2c65ed: one more read left a stall that hadn't recovered by the end of the minutes read as it stood, so
