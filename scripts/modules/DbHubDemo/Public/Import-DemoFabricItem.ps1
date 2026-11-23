@@ -55,8 +55,8 @@ function Import-DemoFabricItem {
 
     .PARAMETER CreateOnly
     Create the item only when the workspace has none with its name; one that exists is left as it is, and the record
-    is Not selected (Phase 26a: deploy.ps1 imports missing notebooks without asking, and updates existing ones only
-    when fabric.importNotebooks is true).
+    is Not selected (Phase 26a; configure-fabric.ps1 -NewNotebooksOnly, and Import-DemoFabricNotebook -KeepEdited for a
+    notebook that's missing).
 
     .PARAMETER Note
     A sentence added to the record's message, for example why the item was imported.

@@ -455,7 +455,7 @@
           "$ref": "#/$defs/uuid"
         },
         "importNotebooks": {
-          "description": "Whether deploy.ps1 also updates the demo's notebooks when they're already in the workspace. False: deploy.ps1 imports only the notebooks that are missing, so a new workspace or lakehouse gets them without asking, and edits made in Fabric are kept. True: it creates or updates both on every deploy. Running configure-fabric.ps1 yourself always creates or updates them.",
+          "description": "Whether deploy.ps1 updates the demo's notebooks in the workspace even when someone edited them. False: deploy.ps1 imports a notebook that's missing, brings one that nobody edited up to date (one whose code is a version the demo published), and keeps an edited one (since 2026-11-23; before, it kept every notebook that was there). True: it creates or updates both on every deploy, edited or not. Running configure-fabric.ps1 yourself always creates or updates them.",
           "type": "boolean",
           "default": false
         },

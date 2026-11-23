@@ -1203,6 +1203,11 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
     }
 
+    It 'brings the demo''s notebooks that nobody edited up to date while fabric.importNotebooks is false, and keeps an edited one: the Fabric stage asks configure-fabric.ps1 for -KeepEditedNotebooks (follow-ups decision 2a, 2026-11-23)' {
+        $null = Invoke-DemoDeployment -Config $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['KeepEditedNotebooks'] -and -not $PesterBoundParameters.ContainsKey('NewNotebooksOnly') }
+    }
+
     It 'starts the Insights app''s sign-in before its stages and runs the app''s step after the report; a failed app never stops the stage or keeps the run from DONE (-Sequential, 2026-11-05)' {
         # Every requirement passes, so the outcome turns on the app alone.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
@@ -1651,6 +1656,26 @@ Describe 'Invoke-DemoDeployment' {
         $script:order.Clear()
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
         $script:order | Should -Not -Contain 'KeyVault' -Because 'the default path creates no vault'
+    }
+}
+
+Describe 'Invoke-DemoFabricStage: the notebook mode it gives configure-fabric.ps1 (follow-ups decision 2a, 2026-11-23)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    It 'asks for -KeepEditedNotebooks while fabric.importNotebooks is false, every notebook with -ImportNotebooks, and no import with neither' {
+        # -KeepEditedNotebooks: a notebook that nobody edited is brought up to date, and an edited one is kept. With
+        # -ImportNotebooks (fabric.importNotebooks true, or deploy.ps1 -ImportNotebooks), every notebook is updated, edited
+        # or not; with neither (validate.ps1's checklist), none is imported.
+        $script:modes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRepositoryScript -MockWith { $script:modes.Add((@($Argument.Keys | Where-Object { [string]$_ -in 'KeepEditedNotebooks', 'NewNotebooksOnly', 'SkipNotebookImport' } | Sort-Object) -join ',')) }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } {
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks -ImportNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config
+        }
+        $script:modes.ToArray() | Should -Be @('KeepEditedNotebooks', '', 'SkipNotebookImport')
     }
 }
 

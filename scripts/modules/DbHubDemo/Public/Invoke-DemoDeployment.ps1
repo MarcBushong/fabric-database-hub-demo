@@ -942,7 +942,7 @@ function Invoke-DemoDeployment {
                 # new workspace has none. Then the Insights app, part of every deployment (2026-11-05), whose step never stops
                 # the stage or keeps the run from DONE (Invoke-DemoInsightsAppStep).
                 $fabricContent = Get-DemoFabricContentSha256
-                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
+                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -KeepEditedNotebooks -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'A Fabric or Database Hub check failed.' 'Read the HUB.* and FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'

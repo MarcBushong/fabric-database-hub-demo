@@ -757,8 +757,8 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else, and none of the demo''s notebooks, keeps a first run''s rule'
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
-        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds a missing notebook, brings one that nobody edited up to date, and keeps an edited one \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them all\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds the notebooks that are missing, and brings one that nobody edited up to date'
 
         $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
         $unlisted = Join-Path -Path $TestDrive -ChildPath ('unlisted.{0}.json' -f [guid]::NewGuid().ToString('N'))
@@ -945,7 +945,7 @@ Describe 'A second environment''s Fabric workspace (2026-11-19, the final tests'
         (Get-DemoConfig -Path $script:path)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
         $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
         $workspace.status | Should -Be 'Warning'
-        $workspace.message | Should -Match 'exists; the scripts use it, and deploy\.ps1 adds only the notebooks that are missing\. Whether another demo environment records it couldn''t be checked \(HTTP 503: ServiceUnavailable\), so it may be another environment''s\.$'
+        $workspace.message | Should -Match 'exists; the scripts use it, and deploy\.ps1 adds the notebooks that are missing, and brings one that nobody edited up to date\. Whether another demo environment records it couldn''t be checked \(HTTP 503: ServiceUnavailable\), so it may be another environment''s\.$'
         $workspace.remediation | Should -Be ('If it''s another environment''s, run {0} -Force -Prefix dbhub -WorkspaceName <a name no other environment uses>. deploy.ps1 checks again before it creates anything (DEPLOY.FABRIC.SHARED).' -f (Get-InitCommand $script:path))
     }
 }
@@ -1580,7 +1580,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
         $saved.Result.status | Should -Be 'Warning'
         $saved.Result.message | Should -Match 'T4''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
-        $saved.Result.remediation | Should -Match '^Run \./scripts/configure-fabric\.ps1, which updates the notebook \(fabric\.importNotebooks is false, so deploy\.ps1 keeps the workspace''s copy\)\. T4''s metrics are kept in out/history-pending'
+        $saved.Result.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook unless someone edited it; \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates that notebook alone, edited or not\. T4''s metrics are kept in out/history-pending' -Because 'deploy.ps1 brings an unedited notebook up to date, and the fix leaves NB_DatabaseHub_Deployment as it is (2026-11-23)'
         $saved.PostgresDropped | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('POSTGRES_METRICS') }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq '13131313-1313-1313-1313-131313131313' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'POSTGRES_METRICS' }
