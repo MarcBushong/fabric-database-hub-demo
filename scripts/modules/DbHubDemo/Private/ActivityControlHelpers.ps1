@@ -2546,7 +2546,8 @@ function Remove-DemoActivityControlResource {
     .SYNOPSIS
     Deletes the control's Azure resources one by one (the Automation account with its runbooks, schedules, and webhook;
     the identity; the vault, then purges it), and the group only when nothing else is left in it (it may also hold
-    the GitHub OIDC identity, ADR 0002). Returns CONTROL.REMOVE.RESOURCES. Internal.
+    the GitHub OIDC identity, ADR 0002). Each is read first: one that's already gone, for example after destroy.ps1, is
+    named as already gone, not deleted (2026-11-22). Returns CONTROL.REMOVE.RESOURCES. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     [OutputType([object])]
@@ -2563,20 +2564,36 @@ function Remove-DemoActivityControlResource {
         return (New-DemoResult -CheckId 'CONTROL.REMOVE.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0}, {1}, and {2} would be deleted and the vault purged; {3} would be deleted only if nothing else is left in it.' -f $Name.AutomationAccount, $Name.Identity, $Name.KeyVault, $Name.ResourceGroup) -DocUrl $doc)
     }
     $done = [System.Collections.Generic.List[string]]::new()
+    $gone = [System.Collections.Generic.List[string]]::new()
     $failed = [System.Collections.Generic.List[string]]::new()
+    # Each resource is read first, so one that's already gone is called that, and gets no delete: Resource Manager answers
+    # a delete of a resource that doesn't exist with success (204 No Content), or with 404 when its group is gone too. After
+    # destroy.ps1 had deleted the control (2026-11-22, live), -Remove listed all three as deleted.
+    $remove = {
+        param([string] $Label, [string] $Url)
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url $Url
+        if ($read.Missing) {
+            $gone.Add($Label)
+            return
+        }
+        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url $Url
+        if ($delete.Ok) {
+            $done.Add($Label)
+        }
+        elseif ($delete.Missing) {
+            $gone.Add($Label)
+        }
+        else {
+            $failed.Add(('{0}: {1}' -f $Label, $delete.Error))
+        }
+    }
     # The Automation account goes last (2026-11-17): its runbooks say which environment the control serves, which a
     # destroy.ps1 that runs again after an interruption reads before it deletes anything.
     foreach ($item in @(
             @{ Label = $Name.Identity; Url = (Get-DemoActivityControlUrl -Id $Name.IdentityId -ApiVersion '2024-11-30') }
             @{ Label = $Name.KeyVault; Url = (Get-DemoActivityControlUrl -Id $Name.KeyVaultId -ApiVersion '2026-02-01') }
         )) {
-        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url $item.Url
-        if ($delete.Ok -or $delete.Missing) {
-            $done.Add($item.Label)
-        }
-        else {
-            $failed.Add(('{0}: {1}' -f $item.Label, $delete.Error))
-        }
+        & $remove $item.Label $item.Url
     }
     $purge = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method post -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.KeyVault/locations/{1}/deletedVaults/{2}/purge?api-version=2026-02-01' -f $Name.SubscriptionId, [string]$Config['location'], $Name.KeyVault)
     $blocking = $failed.Count
@@ -2587,13 +2604,7 @@ function Remove-DemoActivityControlResource {
         $failed.Add(('purge: {0}' -f $purge.Error))
     }
     if ($blocking -eq 0) {
-        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id $Name.AutomationAccountId -ApiVersion '2024-10-23')
-        if ($delete.Ok -or $delete.Missing) {
-            $done.Add($Name.AutomationAccount)
-        }
-        else {
-            $failed.Add(('{0}: {1}' -f $Name.AutomationAccount, $delete.Error))
-        }
+        & $remove $Name.AutomationAccount (Get-DemoActivityControlUrl -Id $Name.AutomationAccountId -ApiVersion '2024-10-23')
     }
     else {
         $failed.Add(('{0}: kept until the rest is deleted' -f $Name.AutomationAccount))
@@ -2616,8 +2627,24 @@ function Remove-DemoActivityControlResource {
             $groupNote = (' {0} was kept: it holds {1} other resource(s): {2}.' -f $Name.ResourceGroup, $others.Count, (($others | Select-Object -First 5) -join ', '))
         }
     }
+    elseif (Test-DemoAzNotFound -Text ([string]$listed.StdErr)) {
+        $groupNote = (' {0} is already gone.' -f $Name.ResourceGroup)
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($done.Count -gt 0) {
+        $parts.Add(('Deleted: {0}.' -f ($done -join ', ')))
+    }
+    if ($gone.Count -gt 0) {
+        $parts.Add(('Already gone: {0}.' -f ($gone -join ', ')))
+    }
+    if ($parts.Count -eq 0) {
+        $parts.Add('Nothing was deleted.')
+    }
+    if ($failed.Count -gt 0) {
+        $parts.Add(('Failed: {0}.' -f ($failed -join '; ')))
+    }
     $status = if ($failed.Count -gt 0) { 'Fail' } else { 'Pass' }
-    return (New-DemoResult -CheckId 'CONTROL.REMOVE.RESOURCES' -Area 'workload' -Target 'subscription' -Status $status -Message ('Deleted: {0}.{1}{2}' -f ($done -join ', '), $(if ($failed.Count) { ' Failed: ' + ($failed -join '; ') + '.' } else { '' }), $groupNote) -Remediation $(if ($failed.Count) { 'Run setup-activity-control.ps1 -Remove again.' } else { '' }) -DocUrl $doc)
+    return (New-DemoResult -CheckId 'CONTROL.REMOVE.RESOURCES' -Area 'workload' -Target 'subscription' -Status $status -Message (($parts -join ' ') + $groupNote) -Remediation $(if ($failed.Count) { 'Run setup-activity-control.ps1 -Remove again.' } else { '' }) -DocUrl $doc)
 }
 
 function Remove-DemoActivityControlFabric {

@@ -114,6 +114,10 @@ BeforeAll {
     function Invoke-FakeArm([string] $Method, [string] $Url, [string] $Body, [string] $Query = '') {
         $path = ([uri]$Url).AbsolutePath
         $query = [uri]::UnescapeDataString(([uri]$Url).Query) + $Query
+        # The control's group gone (2026-11-22: destroy.ps1 deletes it once it's empty): everything in it is a 404.
+        if ($script:controlGroupGone -and $path -match '/resourceGroups/rg-dbhub-control(/|$)') {
+            return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+        }
         switch -Regex ($path) {
             '/providers/Microsoft\.Authorization/permissions$' {
                 $actions = if ($script:canAssign) { @('*') } else { @('*/read') }
@@ -158,6 +162,10 @@ BeforeAll {
             }
             '/userAssignedIdentities/' {
                 if (-not $script:identityExists) {
+                    # Resource Manager answers a delete of a resource that doesn't exist with 204 No Content.
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
                     return (Get-NotFound 'id-dbhub-automation')
                 }
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ principalId = $script:identityPrincipal } }))
@@ -190,6 +198,9 @@ BeforeAll {
             }
             '/automationAccounts/aa-dbhub-control$' {
                 if (-not $script:accountExists) {
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
                     return (Get-NotFound 'aa-dbhub-control')
                 }
                 return (New-AzResult -StdOut '{"name":"aa-dbhub-control"}')
@@ -225,6 +236,12 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/vaults/kv-dbhub-ctl-[0-9a-f]{6}$' {
+                if (-not $script:vaultExists) {
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
+                    return (Get-NotFound 'kv-dbhub-ctl')
+                }
                 # systemData (2026-11-19): who last changed the vault, as Azure records it, which names the environment's deployer.
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ publicNetworkAccess = $script:vaultAccess }; systemData = $script:vaultSystemData } -Depth 4))
             }
@@ -337,6 +354,9 @@ BeforeAll {
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 4))
             }
             '/deletedVaults/.+/purge$' {
+                if (-not $script:vaultPurgeable) {
+                    return (Get-NotFound 'kv-dbhub-ctl')
+                }
                 return (New-AzResult -StdOut '{}')
             }
         }
@@ -368,6 +388,9 @@ BeforeAll {
         $script:secretExists = $true
         $script:accountExists = $true
         $script:groupExists = $true
+        $script:vaultExists = $true
+        $script:vaultPurgeable = $true
+        $script:controlGroupGone = $false
         $script:leftInGroup = 0
         $script:vaultAccess = 'Enabled'
         $script:vaultSystemData = $null
@@ -443,6 +466,9 @@ BeforeAll {
                 # The group's resources by name (2026-11-17): a deleted account's runbook can still be listed for a moment,
                 # and doesn't count; $script:leftInGroup is what else is there.
                 'resource list*' {
+                    if ($script:controlGroupGone) {
+                        return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+                    }
                     $names = @('aa-dbhub-control/DbHub-Control') + @(if ($script:leftInGroup -gt 0) { 1..$script:leftInGroup | ForEach-Object { 'id-github-oidc-{0}' -f $_ } })
                     return (New-AzResult -StdOut (ConvertTo-Json -InputObject @($names) -Compress))
                 }
@@ -1795,6 +1821,30 @@ Describe 'Removing the control (setup-activity-control.ps1 -Remove)' {
         $null = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
         @($script:azCalls | Where-Object { $_ -like 'group delete --name rg-dbhub-control*' }).Count | Should -Be 1
         @($script:ops | Where-Object { $_ -like 'fabric *' }) | Should -BeNullOrEmpty -Because '-SkipFabric leaves Fabric alone'
+    }
+
+    It 'says which resources were already gone, and sends them no delete: <Case>' -ForEach @(
+        # Live, 2026-11-22: after destroy.ps1 had deleted the control, -Remove -Force -SkipFabric said "Deleted: " for all
+        # three. Resource Manager answers a delete of what doesn't exist with 204, or 404 when its group is gone too.
+        @{ Case = 'everything gone, the group too, as after destroy.ps1'; Identity = $false; Vault = $false; Account = $false; GroupGone = $true; Left = 0; Deleted = @(); Expected = 'Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control is already gone.' }
+        @{ Case = 'everything gone, the group kept for what else it holds'; Identity = $false; Vault = $false; Account = $false; GroupGone = $false; Left = 1; Deleted = @(); Expected = 'Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control was kept: it holds 1 other resource(s): id-github-oidc-1.' }
+        @{ Case = 'only the identity gone'; Identity = $false; Vault = $true; Account = $true; GroupGone = $false; Left = 0; Deleted = @('vaults', 'automationAccounts'); Expected = 'Deleted: {vault}, the vault purge, aa-dbhub-control. Already gone: id-dbhub-automation. rg-dbhub-control was empty and is being deleted.' }
+    ) {
+        $script:identityExists = $Identity
+        $script:vaultExists = $Vault
+        $script:vaultPurgeable = $Vault
+        $script:secretExists = $Vault
+        $script:accountExists = $Account
+        $script:controlGroupGone = $GroupGone
+        $script:leftInGroup = $Left
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ($Expected -replace '\{vault\}', (Get-ControlName (New-ControlConfig)).KeyVault)
+        # The resources themselves, not the role assignments on the vault's secrets, which the roles' removal deletes.
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'a resource that''s already gone gets no delete'
     }
 }
 

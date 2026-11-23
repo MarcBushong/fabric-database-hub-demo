@@ -5698,3 +5698,35 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **`deploy.ps1 -Sequential`** still runs the template's loader under its fixed name (`bootstrap.bicep:69`), as the review of F31 chose, so an update with it creates the name again. The default path doesn't use it.
 - **A loader held back by something else** still waits 15 minutes, gets the watchdog's restart, and runs once more, as here.
 - **The review of F31's live proof** still has to run: this is evidence of the cause, not of the fix.
+
+### The session control's removal says what was already gone (2026-11-22)
+
+**Why.** The final tests ran `./scripts/setup-activity-control.ps1 -Remove -Force -SkipFabric` after `./scripts/destroy.ps1` had deleted the session control (`DESTROY.CONTROL.RESOURCES` **Pass**, the group empty and being deleted). `CONTROL.REMOVE.RESOURCES` said "Deleted:" for the identity, the vault, and the Automation account, which were already gone.
+
+- **The cause:** `Remove-DemoActivityControlResource` listed a delete as done when it succeeded or when Azure answered that the resource wasn't there.
+- **And a success isn't proof either:** Resource Manager answers a delete of a resource that doesn't exist with 204 No Content while its group exists, which the Azure CLI reports as a success, so "Deleted" can't come from the delete's answer alone.
+- **`destroy.ps1` uses the same code** for `DESTROY.CONTROL.RESOURCES`, so a rerun after an interruption could say the same.
+
+**Work summary.**
+
+- **Each resource is read first:** the identity, the vault, and the Automation account, each with the API version its delete uses.
+  - One that's already gone gets no delete and is listed under "Already gone".
+  - One that's there is deleted as before. "Deleted" lists the deletes that succeeded, and one that Azure answers isn't there, deleted meanwhile, goes under "Already gone" too.
+  - A read that fails for another reason, access for example, leaves the delete to say what happened, as before.
+- **The message:** "Deleted: ..." and "Already gone: ...", each only when it has something, or "Nothing was deleted." when neither has; then "Failed: ...", and the group's note. When the group itself is gone, the note says it's already gone, where it said nothing.
+- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses.
+- **Docs:** the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`; `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` (its fake answers a delete of what doesn't exist with 204, as Resource Manager does, and a group that's gone with 404 for everything in it); the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The new test,** three cases through `Invoke-DemoActivityControlSetup -Remove -Force -SkipFabric`: everything gone with the group, as after `destroy.ps1`; everything gone with the group kept for what else it holds; and only the identity gone. Each checks the whole message and that nothing that's gone gets a delete. With the previous code all three fail: they say "Deleted:" for what was gone.
+- Pester with StrictMode: DbHubDemo.ActivityControl, DbHubDemo.Destroy, DbHubDemo.Teardown, and DbHubDemo.SafetyStop, 364 passed, and 1 failed that fails the same way with the previous code: Teardown's "stay out of the static run" starts a child `pwsh` that imports Pester 5.9.1 by version, which on this PC resolves to a copy without `Pester.ps1`. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+- PSScriptAnalyzer: no findings in the two changed PowerShell files, before or after. markdownlint: clean. The changed files are ASCII, with LF line endings.
+
+**Risks.**
+
+- **Three more reads per removal,** one per resource; each is one Resource Manager GET.
+- **A read Azure refuses** goes to the delete as before, so a resource that was gone then reads as deleted, as before the change.
+- **Not run live:** the next `-Remove` after a `destroy.ps1`, or on a control that's there, shows it.
