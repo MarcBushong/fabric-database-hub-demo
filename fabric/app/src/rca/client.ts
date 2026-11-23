@@ -127,7 +127,7 @@ export function createRcaClient(client: QueryClient, options: RcaClientOptions =
                 (value) => (tools = value),
                 () =>
                     latest().then((at) =>
-                        createInvestigationTools({ load: sources.load, telemetry: sources.telemetry, timeZone, latestDay: dayIn(at ?? now(), timeZone), latest: at ?? undefined, now }),
+                        createInvestigationTools({ load: sources.load, telemetry: sources.telemetry, sidecar: sources.sidecar, timeZone, latestDay: dayIn(at ?? now(), timeZone), latest: at ?? undefined, now }),
                     ),
             ),
     };

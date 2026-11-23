@@ -78,11 +78,11 @@ async function ask(name: string, args: Record<string, unknown>, deps = tools()):
 }
 
 describe("the investigation tools in the dock", () => {
-    it("are six, and with the dock's own four they fit the relay's limits", () => {
-        expect(INVESTIGATION_TOOL_NAMES).toEqual(["find_incidents", "triage_window", "explain_incident", "explain_locking", "explain_errors", "explain_replica_lag"]);
+    it("are seven, and with the dock's own four they fit the relay's limits", () => {
+        expect(INVESTIGATION_TOOL_NAMES).toEqual(["find_incidents", "triage_window", "explain_incident", "explain_locking", "explain_errors", "explain_replica_lag", "explain_queries"]);
         const all = [...toolSpecs({ estate: true }), ...INVESTIGATION_TOOL_SPECS];
-        expect(all).toHaveLength(10);
-        expect(validateTools(all)).toHaveLength(10);
+        expect(all).toHaveLength(11);
+        expect(validateTools(all)).toHaveLength(11);
         // Blind: no spec mentions what was planned.
         expect(JSON.stringify(INVESTIGATION_TOOL_SPECS)).not.toMatch(/inject|Scenario|scenario/);
     });
@@ -934,7 +934,7 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         const sentences = INVESTIGATION_PLAYBOOK.split(/(?<=[.:])\s+/).filter((s) => LACKS.test(s));
         expect(sentences.length).toBeGreaterThan(0);
         for (const s of sentences) expect(s, s).toMatch(/^Never say that a target has no Query Store|Azure Cosmos DB \(T5\) has no Query Store/);
-        expect(INVESTIGATION_PLAYBOOK).toContain("this history doesn't hold Query Store's per-query statistics yet, which is the capture's limit, not the target's");
-        expect(INVESTIGATION_PLAYBOOK).not.toMatch(/comes later/);
+        expect(INVESTIGATION_PLAYBOOK).toContain("it names the queries and plans behind the incident from Query Store's evidence when this history holds it (details.queryStore), and otherwise says why, about this history, never the target");
+        expect(INVESTIGATION_PLAYBOOK).not.toMatch(/comes later|doesn't hold Query Store's per-query statistics yet/);
     });
 });

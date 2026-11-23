@@ -3,11 +3,22 @@
 // investigations and gives it their window, episodes, and envelope; this file holds what's its own: its parameters, its
 // arguments' checks, the minutes it reads (the hour before, for a baseline), and its answer.
 
-import { BASELINE_MINUTES, QS_INTERVAL_MINUTES, QUERY_RANKS, analyzeQueries, type QueryIncident, type QueryRank, type QueryStoreDetails } from "./queries";
-import type { SidecarEvidence } from "./sidecar";
-import { hhmmss, isRcaTarget, RCA_TARGETS, type Episode, type InvestigationResult, type RcaTarget, type ResourcePoint } from "./types";
+import { BASELINE_MINUTES, QS_INTERVAL_MINUTES, QUERY_RANKS, analyzeQueries, queryStoreOf, type QueryIncident, type QueryRank, type QueryStoreAnalysis, type QueryStoreDetails } from "./queries";
+import { unexplainedByQuery } from "./query-store";
+import { emptySidecar, type SidecarEvidence } from "./sidecar";
+import type { SidecarTableKey } from "./spec";
+import { fromTo, hhmmss, isRcaTarget, RCA_TARGETS, type Episode, type InvestigationResult, type RcaTarget, type ResourcePoint } from "./types";
 
 export const EXPLAIN_QUERIES = "explain_queries";
+
+/** The sidecar's tables a Query Store answer reads: all but T4's connections. */
+export const QUERY_STORE_TABLES: readonly SidecarTableKey[] = ["queryStats", "queryWaits", "queryPlans", "queryEvents", "queryCoverage"];
+
+/** The ones a blocking chain's lock waits read (QS-LOCK-WAITS): the statistics, their waits, and the plans. */
+export const LOCK_WAIT_TABLES: readonly SidecarTableKey[] = ["queryStats", "queryWaits", "queryPlans"];
+
+/** The sidecar's rows of some minutes and targets, from the given tables (sources.ts's sidecar, through the history connector). */
+export type SidecarRead = (from: Date, to: Date, targets: readonly RcaTarget[], tables?: readonly SidecarTableKey[]) => Promise<SidecarEvidence>;
 
 /** Its description, before the investigations' common sentences (tools.ts adds them). */
 export const EXPLAIN_QUERIES_DESCRIPTION =
@@ -52,6 +63,55 @@ export function cpuIncidentIn(episodes: readonly Episode[], target: RcaTarget, f
     return e ? { family: e.family, start: e.start, end: e.end, last: e.last } : undefined;
 }
 
+/**
+ * An incident's minutes for Query Store: from the sample before its first one at its level, since what raised it happened
+ * after that sample (T3's new plan was compiled 49 s before its CPU incident's first busy minute), to its end.
+ */
+export function incidentMinutes(e: Pick<Episode, "start" | "end" | "readEnd" | "last">, sampleMs = 60_000): { from: Date; to: Date } {
+    return { from: new Date(e.start.getTime() - sampleMs), to: e.end ?? e.readEnd ?? e.last };
+}
+
+/** A sidecar read that failed, said as such: never as no rows, which would read as a quiet Query Store. */
+export function readFailure(target: RcaTarget, from: Date, to: Date, err: unknown): string {
+    return `${target}: Query Store's evidence ${fromTo(from, to)} UTC couldn't be read, so nothing about those minutes' queries is concluded: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+/**
+ * Query Store's evidence for an incident the telemetry found (CPU, a wait class), from what the capture saved of it: queries.ts's
+ * rules over the incident's minutes, with the incident itself; or why it couldn't be read. A read replica and T5 read nothing.
+ */
+export async function incidentQueries(e: Episode, read: SidecarRead, resource: readonly ResourcePoint[], now: Date): Promise<{ analysis: QueryStoreAnalysis } | { failed: string }> {
+    const { from, to } = incidentMinutes(e);
+    const kind = queryStoreOf(e.target);
+    let sidecar = emptySidecar();
+    if (kind === "sql" || kind === "postgresql") {
+        const w = queryReadWindow(from, to);
+        try {
+            sidecar = await read(w.from, w.to, [e.target], QUERY_STORE_TABLES);
+        } catch (err) {
+            return { failed: readFailure(e.target, from, to, err) };
+        }
+    }
+    return { analysis: analyzeQueries({ target: e.target, from, to, sidecar, resource, incident: { family: e.family, start: e.start, end: e.end, last: e.last }, now }) };
+}
+
+/** The last sentence of an incident's cause when Query Store's evidence names no query: why, about this history, never the target. */
+export function unexplainedWords(e: Pick<Episode, "target">, a: QueryStoreAnalysis | null): string {
+    if (!a) return "Which queries drove it isn't known: this history's Query Store evidence couldn't be read.";
+    switch (a.details.recorded) {
+        case "yes":
+            return "Query Store's evidence in this history names no query behind it: explain_queries gives its top queries for those minutes.";
+        case "pending":
+            return "Which queries drove it isn't in this history yet: Query Store's minutes were pending publication when the capture read them.";
+        case "no-rows":
+            return "Which queries drove it isn't in this history: the capture holds no Query Store statistics for those minutes.";
+        case "model-missing":
+            return "Which queries drove it isn't in this history: its model doesn't have Query Store's tables yet.";
+        default:
+            return unexplainedByQuery(e);
+    }
+}
+
 export interface ExplainQueriesInput {
     args: QueryArgs;
     from: Date;
@@ -59,7 +119,7 @@ export interface ExplainQueriesInput {
     /** The investigations' envelope for the window and the target (tools.ts's): its window, episodes, and what wasn't captured. */
     base: InvestigationResult;
     /** The sidecar's rows of some minutes (loader.ts's loadSidecar, through the history connector). */
-    sidecar: (from: Date, to: Date, targets: readonly RcaTarget[]) => Promise<SidecarEvidence>;
+    sidecar: SidecarRead;
     /** The window's episodes and RCA Resource rows, which tools.ts gathered. */
     episodes: readonly Episode[];
     resource: readonly ResourcePoint[];
@@ -70,7 +130,7 @@ export interface ExplainQueriesInput {
 export async function explainQueries(input: ExplainQueriesInput): Promise<InvestigationResult & { details: QueryStoreDetails }> {
     const { args, from, to, base } = input;
     const read = queryReadWindow(from, to);
-    const sidecar = await input.sidecar(read.from, read.to, [args.target]);
+    const sidecar = await input.sidecar(read.from, read.to, [args.target], QUERY_STORE_TABLES);
     const a = analyzeQueries({ target: args.target, from, to, sidecar, resource: input.resource, incident: cpuIncidentIn(input.episodes, args.target, from, to), rankBy: args.rankBy, queryId: args.queryId, now: input.now });
     // A read at its limit holds only up to there, as the RCA tables' (tools.ts's envelope).
     const cut = (sidecar.cut ?? []).map((c) => `${c.table}: the window holds more rows than one query returns, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`);

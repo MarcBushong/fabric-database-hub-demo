@@ -2,23 +2,25 @@
 // reads the RCA evidence and the telemetry through the history connector (DAX, executeQuery only), finds the window's
 // incidents with the blind detector, applies the deterministic rules, and returns facts with their times, a root cause
 // with its confidence, the catalog's recommendations, next steps, and what wasn't captured. Blind: nothing here reads
-// what anyone planned or ran. The relay forwards at most 16 tools (ask-relay/src/protocol.ts): the dock's 4 and these 6.
+// what anyone planned or ran. The relay forwards at most 16 tools (ask-relay/src/protocol.ts): the dock's 4 and these 7.
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { analyzeConnections } from "./connections";
 import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
+import { EXPLAIN_QUERIES, EXPLAIN_QUERIES_DESCRIPTION, EXPLAIN_QUERIES_PROPS, explainQueries, incidentQueries, LOCK_WAIT_TABLES, queryArgs, queryReadWindow, readFailure, unexplainedWords, type SidecarRead } from "./explain-queries";
 import { RCA_CATEGORY_IDS, RCA_SEVERITY_IDS, type RcaCategory, type RcaSeverity } from "./facet-ids";
 import { categoryOf, facetArgs, FAR_PERCENT, FAR_TIMES, LONG_MINUTES, matches, severityOf } from "./facets";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
+import { analyzeQueries, queryStoreOf, type QueryStoreAnalysis } from "./queries";
 import { queryStoreNextStep, queryStoreNote, queryStoreQuery, unexplainedByQuery, type QueryStoreQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { asWholeReadings, dateTime, emptyEvidence, fromTo, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, sameSecond, sameUtcDay, spanEnds, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
+import { asWholeReadings, dateTime, emptyEvidence, fromTo, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, sameSecond, sameUtcDay, spanEnds, type Confidence, type Episode, type EventRow, type Evidence, type Finding, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -99,6 +101,16 @@ export const INVESTIGATION_TOOL_SPECS: ToolSpec[] = [
         description: "Why T4's read replica lagged around a time: the lag's rise, peak, and recovery (Read Replica Lag, or the replica's own replay samples), and the reason: catch-up after a restart, replay standing still behind a lock a replica query held (hot standby conflict), slow replay, WAL not shipped, or an idle primary; with the replica query, the relation, both lock modes, the WAL rate, and max_standby_streaming_delay." + COMMON,
         parameters: { type: "object", properties: { at: TIME, minutesBefore: WINDOW_PROPS.minutesBefore, minutesAfter: WINDOW_PROPS.minutesAfter }, required: ["at"], additionalProperties: false },
     },
+    {
+        name: EXPLAIN_QUERIES,
+        description: EXPLAIN_QUERIES_DESCRIPTION + COMMON,
+        parameters: {
+            type: "object",
+            properties: { ...EXPLAIN_QUERIES_PROPS, at: WINDOW_PROPS.at, from: WINDOW_PROPS.from, to: WINDOW_PROPS.to, minutesBefore: WINDOW_PROPS.minutesBefore, minutesAfter: WINDOW_PROPS.minutesAfter },
+            required: ["target"],
+            additionalProperties: false,
+        },
+    },
 ];
 
 export const INVESTIGATION_TOOL_NAMES: readonly string[] = INVESTIGATION_TOOL_SPECS.map((s) => s.name);
@@ -140,6 +152,12 @@ export interface InvestigationDeps {
      * (query-store.ts); the current time by default. Not the history's newest time, which stays put while the demo is stopped.
      */
     now?: () => Date;
+    /**
+     * Query Store's evidence of a window, what the capture saved of it (the sidecar: loader.ts's loadSidecar through the
+     * history connector). With it, explain_queries answers, and CPU, the wait classes, and a blocking chain's statements are
+     * explained from it; without it, explain_queries says so, and the others say what query-store.ts says.
+     */
+    sidecar?: SidecarRead;
 }
 
 const RESULT_CHARS = 60_000;
@@ -386,7 +404,7 @@ export function bounded(result: InvestigationResult, limit = RESULT_CHARS): stri
 
 const RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
 
-/** The episodes Phase 1 explains with a cause from the capture or the metrics; the others are telemetry-only for now. */
+/** The episodes a part explains with a cause from the capture or the metrics; the others (CPU, the wait classes) from Query Store's evidence when this history holds it, else from the telemetry alone. */
 export const EXPLAINED_FAMILIES: readonly string[] = ["blocking", "deadlock", "replica_lag", "errors", "connections", "throttling", "ru"];
 
 /** One session of a chain, head first, with what a DBA reads off it: what it ran, who ran it, its wait, and its lock. */
@@ -462,6 +480,37 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         return { evidence, episodes, keyIntervals: telemetry.keyIntervals, servers };
     }
 
+    /**
+     * Query Store's lock waits in the chains' minutes, per target whose Query Store records them (QS-LOCK-WAITS: the queries
+     * that waited on locks in those intervals, with their longest execution), and any read that failed, which is said and
+     * concludes nothing. Without the sidecar, none.
+     */
+    async function lockWaitsOf(chains: ReadonlyArray<{ target: RcaTarget; first: Date; last: Date }>): Promise<{ findings: Finding[]; notCaptured: string[] }> {
+        const read = deps.sidecar;
+        if (!read) return { findings: [], notCaptured: [] };
+        const spans = new Map<RcaTarget, { from: Date; to: Date }>();
+        for (const c of chains) {
+            const kind = queryStoreOf(c.target);
+            if (kind !== "sql" && kind !== "postgresql") continue;
+            const s = spans.get(c.target);
+            spans.set(c.target, s ? { from: c.first < s.from ? c.first : s.from, to: c.last > s.to ? c.last : s.to } : { from: c.first, to: c.last });
+        }
+        const now = (deps.now ?? (() => new Date()))();
+        const found = await Promise.all(
+            [...spans].map(async ([target, { from, to }]) => {
+                const w = queryReadWindow(from, to);
+                try {
+                    const sidecar = await read(w.from, w.to, [target], LOCK_WAIT_TABLES);
+                    const a = analyzeQueries({ target, from, to, sidecar, incident: { family: "blocking", start: from, end: to, last: to }, now });
+                    return { findings: a.findings.filter((f) => f.ruleId === "QS-LOCK-WAITS"), notCaptured: [] };
+                } catch (err) {
+                    return { findings: [], notCaptured: [readFailure(target, from, to, err)] };
+                }
+            }),
+        );
+        return { findings: found.flatMap((f) => f.findings), notCaptured: found.flatMap((f) => f.notCaptured) };
+    }
+
     async function locking(args: Record<string, unknown>): Promise<InvestigationResult | string> {
         const w = windowOf(args, deps);
         if (typeof w === "string") return w;
@@ -496,13 +545,16 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             const to = new Date(Math.max(...seen.map((e) => (e.end ?? e.last).getTime())));
             return [`${t}: the blocked processes ${fromTo(from, to)} UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.`];
         });
+        // The statements behind the chains, from Query Store's evidence of their minutes (QS-LOCK-WAITS), beside the chains
+        // the capture sampled; a read that failed is said, and the chains stand.
+        const lockWaits = await lockWaitsOf(a.episodes);
         return {
             ...base,
-            findings: a.findings,
+            findings: [...a.findings, ...lockWaits.findings],
             rootCause: a.rootCause,
             recommendations: a.recommendations,
             nextSteps: a.nextSteps,
-            notCaptured: [...base.notCaptured, ...noChain],
+            notCaptured: [...base.notCaptured, ...noChain, ...lockWaits.notCaptured],
             details: {
                 chain: a.chainLines,
                 chains: a.episodes.map((e) => ({ target: e.target, head: e.headSession, kind: e.headKind, blocked: e.peak.blocked, depth: e.peak.depth, width: e.peak.width, formations: e.cycles, first: iso(e.first), last: iso(e.last), activeAtAskedTime: !!w.at && e.first.getTime() - 15000 <= w.at.getTime() && w.at.getTime() <= e.last.getTime() + 15000 })),
@@ -665,8 +717,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
 
     /**
      * One episode's investigation, by its family: each family that EXPLAINED_FAMILIES lists has its own here. CPU and the
-     * wait classes have only the telemetry in Phase 1. A replica's lag is read from its own minutes, from before replay
-     * last advanced (its peak less its lag) to past its end, and explained as explain_replica_lag explains any time in it.
+     * wait classes have none: incident() explains them from Query Store's evidence. A replica's lag is read from its own
+     * minutes, from before replay last advanced (its peak less its lag) to past its end, and explained as explain_replica_lag
+     * explains any time in it.
      */
     async function explainEpisode(e: Episode, stop?: Date | null): Promise<InvestigationResult | string | null> {
         const end = e.end ?? e.last;
@@ -742,36 +795,52 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         }
         const stopped = readStoppedAt(g.evidence);
         const parts = (await Promise.all(chosen.map((e) => explainEpisode(e, stopped)))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
-        // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and which queries drove
-        // it isn't in this history, which is the capture's limit, never the target's (query-store.ts): live, the chat read
-        // "isn't captured yet" as "T1 doesn't have Query Store" (the owner, 2026-11-23).
+        // A signal no part investigates (CPU, the wait classes): the episode is the fact, and Query Store's evidence, what the
+        // capture saved of it (the sidecar), names the queries behind it when this history holds them (explain-queries.ts).
+        // Otherwise it says why, about this history, never the target: live, the chat read "isn't captured yet" as "T1
+        // doesn't have Query Store" (the owner, 2026-11-23). Without the sidecar, query-store.ts's words.
         const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
+        // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
+        const now = (deps.now ?? (() => new Date()))();
+        const read = deps.sidecar;
+        const byQuery = read ? await Promise.all(telemetryOnly.map((e) => incidentQueries(e, read, g.evidence.resource, now))) : telemetryOnly.map(() => null);
+        const analysisOf = (i: number): QueryStoreAnalysis | null => {
+            const q = byQuery[i];
+            return q && "analysis" in q ? q.analysis : null;
+        };
+        const evidenced = (i: number) => analysisOf(i)?.details.recorded === "yes";
         const causes = [
             ...parts.filter((p) => p.rootCause).map((p) => p.rootCause!),
-            ...telemetryOnly.map((e) => ({
-                statement: `${describeEpisode(e)} ${unexplainedByQuery(e)}`,
-                confidence: "low" as Confidence,
-                ruleIds: ["TELEMETRY-ONLY"],
-                evidence: [{ table: e.source === "the RCA capture" ? "RCA Resource" : "Telemetry Snapshots", at: iso(e.peakAt), target: e.target, text: `${e.signal} ${Math.round(e.peak * 10) / 10} ${e.unit} (peak)` }],
-            })),
+            ...telemetryOnly.map((e, i) => {
+                const evidence = [{ table: e.source === "the RCA capture" ? "RCA Resource" : "Telemetry Snapshots", at: iso(e.peakAt), target: e.target, text: `${e.signal} ${Math.round(e.peak * 10) / 10} ${e.unit} (peak)` }];
+                const found = analysisOf(i)?.rootCause;
+                if (found) return { statement: `${describeEpisode(e)} ${found.statement}`, confidence: found.confidence, ruleIds: found.ruleIds, evidence: [...evidence, ...found.evidence] };
+                return { statement: `${describeEpisode(e)} ${byQuery[i] ? unexplainedWords(e, analysisOf(i)) : unexplainedByQuery(e)}`, confidence: "low" as Confidence, ruleIds: ["TELEMETRY-ONLY"], evidence };
+            }),
         ].sort((a, b) => RANK[b.confidence] - RANK[a.confidence]);
         const [rootCause, ...others] = causes;
         // Each part reads its own minutes, a little wider than the incident's, so its envelope said the incident's "no RCA
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
         // incident's own note says it once.
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
-        // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
-        const now = (deps.now ?? (() => new Date()))();
-        const queryStoreQueries = telemetryOnly.map((e) => queryStoreQuery(e, now)).filter((q): q is QueryStoreQuery => q !== null);
-        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => queryStoreNote(e, now))])];
+        // The ready-to-run query of the target's own Query Store, and the next step that names it, for the minutes this
+        // history holds no evidence of; where it does, its rules' next steps.
+        const queryStoreQueries = telemetryOnly.map((e, i) => (evidenced(i) ? null : queryStoreQuery(e, now))).filter((q): q is QueryStoreQuery => q !== null);
+        const queryNotes = telemetryOnly.flatMap((e, i) => {
+            const q = byQuery[i];
+            return q === null ? [queryStoreNote(e, now)] : "failed" in q ? [q.failed] : q.analysis.notCaptured;
+        });
+        const querySteps = telemetryOnly.flatMap((e, i) => (evidenced(i) ? analysisOf(i)!.nextSteps : [queryStoreNextStep(e, now)].filter((s): s is string => s !== null)));
+        const analyses = telemetryOnly.map((_, i) => analysisOf(i)).filter((a): a is QueryStoreAnalysis => a !== null);
+        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...queryNotes])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
             ...base,
-            findings: parts.flatMap((p) => p.findings),
+            findings: [...parts.flatMap((p) => p.findings), ...analyses.flatMap((a) => a.findings)],
             rootCause: rootCause ?? null,
-            recommendations: [...new Map(parts.flatMap((p) => p.recommendations).map((r) => [r.id, r])).values()],
-            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...telemetryOnly.map((e) => queryStoreNextStep(e, now)).filter((s): s is string => s !== null)])],
+            recommendations: [...new Map([...parts.flatMap((p) => p.recommendations), ...analyses.flatMap((a) => a.recommendations)].map((r) => [r.id, r])).values()],
+            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...querySteps])],
             notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
@@ -779,10 +848,24 @@ export function createInvestigationTools(deps: InvestigationDeps) {
                 // Each next step's ready-to-run, read-only query of the target's own Query Store for those minutes, while it keeps
                 // them (query-store.ts): built from the episode's target, family, and times only.
                 ...(queryStoreQueries.length ? { queryStoreQueries } : {}),
+                // Query Store's evidence of those minutes in this history, as explain_queries gives it (queries.ts's views).
+                ...(analyses.length ? { queryStore: analyses.map((a) => a.details) } : {}),
                 alsoInTheseMinutes: others.map((c) => c.statement),
                 parts: parts.map((p) => ({ tool: p.tool, details: p.details })),
             },
         };
+    }
+
+    /** explain_queries: Query Store's evidence for one target's window, from the sidecar, on the investigations' envelope. */
+    async function queries(args: Record<string, unknown>): Promise<InvestigationResult | string> {
+        const q = queryArgs(args);
+        if (typeof q === "string") return q;
+        const w = windowOf(args, deps);
+        if (typeof w === "string") return w;
+        if (!deps.sidecar) return "This app doesn't read Query Store's evidence: explain_incident and run_dax on the telemetry are what it has.";
+        const g = await gather(w.from, w.to, [q.target]);
+        const base = envelope(EXPLAIN_QUERIES, w.from, w.to, [q.target], deps, g, w.at);
+        return explainQueries({ args: q, from: w.from, to: w.to, base, sidecar: deps.sidecar, episodes: g.episodes, resource: g.evidence.resource, now: (deps.now ?? (() => new Date()))() });
     }
 
     const handlers: Record<string, (args: Record<string, unknown>) => Promise<InvestigationResult | string>> = {
@@ -792,6 +875,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         explain_locking: locking,
         explain_errors: errors,
         explain_replica_lag: replica,
+        [EXPLAIN_QUERIES]: queries,
     };
 
     return {
