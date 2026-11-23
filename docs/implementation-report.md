@@ -5975,7 +5975,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - **The bind:** a sidecar export that comes before `rca export` binds the span as that export would. A span not bound yet takes the caller's session, or none, when it's still capturing, holds unsealed rows, or has sidecars sealed before any bind. So its sidecars are sealed with that session, or take it before they're first offered, and `rca export` keeps it.
   - **`rca ack --document <id>[,<id>...]`:** exits with 0, also for an ID the runner doesn't hold, which its one line names, so a deferred acknowledgement never fails. It exits with 1 for anything that isn't a sidecar's ID, and for a failure. A host with no store holds none.
   - **`rca part`** prints a sidecar's parts for a `-sidecar` ID.
-  - **`rca export`** seals at its commit point, and prints what it printed before.
+  - **`rca export`** seals at its commit point, and prints what it printed before. Its sealing can delay it, though, by up to 30 s: it waits for the sidecar store's lock while a span's sealing at its close holds it, as at a stop. A sealing that can't take the lock is logged, and never fails the export (a correction from the review of 54cb2a9d).
   - **The construction site** (`SidecarRuntime`):
     - T1 to T3's observers take the store's sink, so A1's reader runs;
     - T4's take its Query Store source, A2's, with its watermark under the store's root;
@@ -6020,3 +6020,45 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **T4's backfill during a save's `rca sidecar-export`,** optional in T1a's spec, isn't wired: the observer's next start backfills. The README should say so.
 - **`rca ack`'s line** is the runner's own, as the contract leaves it. The README's command row still says exit code 0 only; a failure exits with 1.
 - **The live check (S12):** the exit codes and the line on exit code 2 through a managed Run Command, and T1 to T4's Query Store reads through the construction site on the VMs.
+
+### The review of 54cb2a9d (T1b, 2026-11-23)
+
+**Why.** The review of T1b's wiring (54cb2a9d, with 60405b98) found it SHIP:
+- v1 is untouched, and there's no deadlock;
+- the bind is correct, the exit codes match, and `rca part` is safe.
+
+It asked for two fixes, each with a test, and corrected one claim.
+
+- **Low: the sidecar export's bind changed the ledger without its lock.** `SidecarCommands.Bind` read the ledger holding only `export.lock`. A read of a ledger it can't parse moves it aside, rebuilds it, and writes it (`SidecarStore.ReadLedger`). So beside a span's sealing at its close, which holds the sidecar store's `ledger.lock`, a corrupt ledger could be rebuilt over the sealer's fresh one. That would lose acknowledgements, budgets, and binds, and seal rows twice.
+  - **Now** the bind holds the sidecar store's lock for all of its run, as `rca export`'s commit point does: export lock first, then the ledger's.
+  - **Also closed:** no sealing takes a span's rows between the bind's read of the ledger and its bind of that span.
+- **Each page sealed and waited again.** T2a sends `--final` with every page, so a span still capturing cost the 60-second wait once a page, against the stop's and the re-checks' bounds.
+  - **Page 1 is the export:** it waits, binds, seals, and keeps the index it lists, in `sidecars\index.json`.
+  - **A later page** is that page of the kept index: the same sidecars on the same pages, with the same states, status, and message, and no wait, bind, or sealing, whatever `--final` says.
+  - **A sidecar gone since** (acknowledged and deleted, or expired) is left out of its page, and the pages stay the index's.
+  - **Without a kept index,** a later page lists the store's sidecars as they are, with nothing sealed or new, and leaves the count of those that expired unread to the next first page.
+  - **The contract:** C0 adds the rule, so T2a and T2c-1 go on sending `--final` harmlessly.
+- **The correction:** the sidecar can delay `rca export` by up to 30 s, waiting for the sidecar store's lock behind a span's sealing at its close, as at a stop, though it never fails it. The entry above now says so.
+
+**Changed files.** `Rca/Sidecar/SidecarCommands.cs`, `SidecarIndex.cs` (the index an export keeps, and its pages), and `SidecarRuntime.cs`; `Cli/CommandLine.Rca.cs` (the options' help); `RcaSidecarWiringTests.cs`; this report.
+
+**Validation.**
+
+- **The runner,** one class at a time, all passed: `RcaSidecarWiringTests` 19, `RcaSidecarCodecTests` 19, `RcaV1PinTests` 2, `RcaLaneTests` 13, `RcaExportTests` 34, `RcaBlindTests` 5, `ProgramTests` 16, and T1a's `RcaSidecarStoreTests` 14 and `RcaSidecarSealerTests` 25.
+- **Proven to fail without the change, by six mutations,** each caught by its test:
+  - the bind without the lock;
+  - a later page that exports again;
+  - a later page without the kept index;
+  - a gone sidecar listed;
+  - the fallback taking the expired count;
+  - the index never kept.
+- **The new tests:**
+  - **The bind:** while a sealing holds the lock with an unreadable ledger, the bind waits, and the ledger stays as it is. Once the lock is free, it's rebuilt once.
+  - **Two pages:** page 2, with `--final` and a span still capturing, takes milliseconds. It seals none of the rows that came since, and lists page 1's index with its states, status, and message.
+  - **A page past the last, a gone sidecar, and no kept index.**
+- **The leak check** prints nothing.
+
+**Risks.**
+
+- **A later page from a caller whose first page another caller's export replaced** lists that export's index: the same positions, and later sidecars at its end. Nothing is lost; what a save misses is offered again at the next export.
+- **`sidecars\index.json`** is the runner's own file, not a sidecar: T1a's retention and rebuild read only `*.json.gz`.

@@ -37,6 +37,9 @@ internal sealed class SidecarRuntime
 
     public EvidenceStore Evidence => Store.Evidence;
 
+    /// <summary>The runner's log, for the commands that use this runtime.</summary>
+    public RunnerLog Log => log;
+
     public SidecarStore Store { get; }
 
     public SidecarSealer Sealer { get; }

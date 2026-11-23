@@ -98,10 +98,10 @@ internal static partial class CommandLine
             return ExitCodes.Success;
         });
 
-        var sidecarExport = new Command("sidecar-export", "Seal Query Store's evidence that the observer captured since the previous sealing into sidecars, one a span, and print one page of the sidecars to fetch, new and pending: one line, DBHUBDEMO-RCAS-INDEX <json>. Exit code 0; 2 when no sidecar is new or pending, with the line printed too, and its status standing (a Warning counts sidecars that expired unread); 1 when the export failed.");
-        var sidecarSession = new Option<string>("--session") { Description = "The control session's ID (32 lowercase hex, the resource group's DbHubSessionId), or none outside a control session. A span no export has bound yet takes it, as 'rca export' binds one.", Required = true };
-        var sidecarFinal = new Option<bool>("--final") { Description = "The session's end: first wait up to 60 seconds for the observer to end its capture, so its last Query Store reads are in." };
-        var sidecarPage = new Option<int>("--page") { Description = "The page of the index to print, from 1: 8 sidecars a page, the oldest sealed first.", DefaultValueFactory = _ => 1 };
+        var sidecarExport = new Command("sidecar-export", "Seal Query Store's evidence that the observer captured since the previous sealing into sidecars, one a span, and print one page of the sidecars to fetch, new and pending: one line, DBHUBDEMO-RCAS-INDEX <json>. Page 1 is the export: it waits, binds, seals, and keeps the index it lists; a later page prints a page of that index, with no wait and no sealing. Exit code 0; 2 when no sidecar is new or pending, with the line printed too, and its status standing (a Warning counts sidecars that expired unread); 1 when the export failed.");
+        var sidecarSession = new Option<string>("--session") { Description = "The control session's ID (32 lowercase hex, the resource group's DbHubSessionId), or none outside a control session. On page 1, a span no export has bound yet takes it, as 'rca export' binds one.", Required = true };
+        var sidecarFinal = new Option<bool>("--final") { Description = "The session's end: page 1 first waits up to 60 seconds for the observer to end its capture, so its last Query Store reads are in. A later page never waits." };
+        var sidecarPage = new Option<int>("--page") { Description = "The page of the index to print, from 1: 8 sidecars a page, the oldest sealed first. Page 1 (the default) is the export itself; a later page is a page of the index page 1 kept.", DefaultValueFactory = _ => 1 };
         var sidecarStore = RcaStoreOption();
         sidecarExport.Options.Add(sidecarSession);
         sidecarExport.Options.Add(sidecarFinal);

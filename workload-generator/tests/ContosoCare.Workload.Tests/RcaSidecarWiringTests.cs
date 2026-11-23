@@ -308,11 +308,105 @@ public sealed class RcaSidecarWiringTests : IDisposable
         clock.Set(clock.Now.AddMinutes(5));
         Assert.Single(runtime.Sealer.SealAll().Sealed);
 
+        // A later page with no export's index kept lists the sidecars as they are, and leaves the count to the next first page.
+        var (later, laterLine, _) = CliHarness.Invoke("rca", "sidecar-export", "--session", "none", "--page", "2", "--rca-store", storeRoot);
+        Assert.Equal((2, "Not selected"), (later, Index(laterLine)["status"]!.GetValue<string>()));
+
         var (exit, line, _) = CliHarness.Invoke("rca", "sidecar-export", "--session", "none", "--rca-store", storeRoot);
 
         var index = Index(line);
         Assert.Equal((2, "Warning", 0), (exit, index["status"]!.GetValue<string>(), index["pages"]!.GetValue<int>()));
         Assert.Contains("1 sidecar expired unread", index["message"]!.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OnlyAnExportsFirstPageWaitsAndSealsAndItsLaterPagesArePagesOfItsIndex()
+    {
+        // The review of 54cb2a9d: a caller sends --final with every page. Page 1 is the export; a later page is a page of the
+        // index page 1 kept: no wait for a span still capturing, no sealing of rows that came since, and its states, status,
+        // and message. The final wait runs on the store's clock: here the system's.
+        var store = new EvidenceStore(Path.Combine(root, "store"), TimeProvider.System, host: "sqlvm01");
+        var runtime = new SidecarRuntime(store, "1.0.0", RunnerLog.Null);
+        var start = DateTimeOffset.UtcNow.AddHours(-3);
+        for (var i = 0; i < 9; i++)
+        {
+            ClosedSpan(store, start.AddMinutes(10 * i), runtime.Sink);
+        }
+
+        Assert.Equal(9, runtime.Sealer.SealAll().Sealed.Count);
+        ClosedSpan(store, start.AddMinutes(100), runtime.Sink);
+
+        var first = SidecarCommands.Export(runtime, Session, final: true, TimeSpan.Zero, 1);
+        Assert.Equal((1, 2, 8, "Pass"), (first.Page, first.Pages, first.Documents.Count, first.Status));
+        Assert.All(first.Documents, d => Assert.Equal(SidecarIndex.Pending, d.State));
+
+        // Rows that came since page 1, and a span still capturing.
+        var late = ClosedSpan(store, start.AddMinutes(110), runtime.Sink);
+        var open = store.Open(DateTimeOffset.UtcNow.AddMinutes(-1));
+        open.Began("T1", DateTimeOffset.UtcNow.AddMinutes(-1));
+        try
+        {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var second = SidecarCommands.Export(runtime, Session, final: true, TimeSpan.FromSeconds(4), 2);
+            watch.Stop();
+
+            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"Page 2 waited {watch.Elapsed}.");
+            Assert.True(EvidenceStore.HoldsUnsealedRows(late));
+            Assert.Equal((2, 2, "Pass"), (second.Page, second.Pages, second.Status));
+            Assert.Equal([SidecarIndex.Pending, SidecarIndex.New], second.Documents.Select(d => d.State));
+            Assert.Equal(first.Message.Replace("Page 1 of 2.", "Page 2 of 2.", StringComparison.Ordinal), second.Message);
+            Assert.Empty(first.Documents.Select(d => d.DocumentId).Intersect(second.Documents.Select(d => d.DocumentId)));
+            var line = second.Line();
+            Assert.Empty(RcaSchemas.Errors(RcaSchemas.Transport, line[(SidecarParts.IndexMarker.Length + 1)..]));
+
+            // A page past the last is empty; a sidecar gone since the index (acknowledged and deleted, or expired) is left
+            // out of its page, and the pages stay the index's.
+            var past = SidecarCommands.Export(runtime, Session, final: true, TimeSpan.FromSeconds(4), 3);
+            Assert.Equal((0, 2, 0), (past.Documents.Count, past.Pages, past.ExitCode));
+            File.Delete(runtime.Store.DocumentPath(second.Documents[0].DocumentId)!);
+            Assert.Equal([second.Documents[1].DocumentId], SidecarCommands.Export(runtime, Session, final: false, TimeSpan.Zero, 2).Documents.Select(d => d.DocumentId));
+
+            // Without a kept index, a later page lists the store's sidecars as they are, still sealing nothing.
+            File.Delete(Path.Combine(runtime.Store.Directory, SidecarCommands.IndexFile));
+            var unkept = SidecarCommands.Export(runtime, Session, final: true, TimeSpan.FromSeconds(4), 2);
+            Assert.True(EvidenceStore.HoldsUnsealedRows(late));
+            Assert.Equal([second.Documents[1].DocumentId], unkept.Documents.Select(d => d.DocumentId));
+            Assert.All(unkept.Documents, d => Assert.Equal(SidecarIndex.Pending, d.State));
+        }
+        finally
+        {
+            open.Close(DateTimeOffset.UtcNow);
+        }
+    }
+
+    [Fact]
+    public async Task TheSidecarExportsBindTouchesTheLedgerOnlyUnderItsLock()
+    {
+        // The review of 54cb2a9d: a sealing holds the sidecar store's lock while the ledger can't be read. The bind waits for
+        // the lock, and never moves the ledger aside, or writes a rebuilt one, under that sealing; once the lock is free, its
+        // read rebuilds the ledger, once.
+        var clock = new ManualTime(From);
+        var store = new EvidenceStore(Path.Combine(root, "store"), clock, host: "sqlvm01");
+        var runtime = new SidecarRuntime(store, "1.0.0", RunnerLog.Null);
+        ClosedSpan(store, From, runtime.Sink);
+        clock.Set(From.AddMinutes(4));
+        Assert.Single(runtime.Sealer.SealAll().Sealed);
+        const string Unreadable = "{ \"version\": 1, \"sidecars\": [";
+        File.WriteAllText(runtime.Store.LedgerPath, Unreadable);
+        var asides = SidecarStore.LedgerFile + ".unreadable-*";
+
+        Task bind;
+        using (runtime.Store.Lock())
+        {
+            bind = Task.Run(() => SidecarCommands.Bind(runtime, Session), TestContext.Current.CancellationToken);
+            Assert.NotSame(bind, await Task.WhenAny(bind, Task.Delay(TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken)));
+            Assert.Equal(Unreadable, File.ReadAllText(runtime.Store.LedgerPath));
+            Assert.Empty(Directory.GetFiles(runtime.Store.Directory, asides));
+        }
+
+        await bind.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.Single(Directory.GetFiles(runtime.Store.Directory, asides));
+        Assert.Single(runtime.Store.ReadLedger().Sidecars);
     }
 
     [Fact]
