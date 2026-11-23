@@ -182,6 +182,34 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
             }
         }
     }
+    It 'accepts a minimal sidecar, and refuses one with an evidence document''s ID, an evidence table, the answer key, or no coverage' {
+        $evidence = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/t1-blocking-chain.evidence.json') -Raw
+        # A fresh copy of the evidence fixture's header each time, as a sidecar with one coverage row.
+        $sidecar = {
+            $document = $evidence | ConvertFrom-Json -AsHashtable
+            $document.Remove('answerKey')
+            $document['kind'] = 'ContosoCare.RcaSidecar'
+            $document['documentId'] = $document['documentId'] + '-sidecar'
+            $document['targets'] = @('T1')
+            $document['strings'] = @('T1')
+            $document['tables'] = [ordered]@{ rca_query_coverage = [ordered]@{ rows = 1; columns = [ordered]@{ target = @(0); window_start_utc = @(0); window_end_utc = @(900000); backfill = @($false) } } }
+            return $document
+        }
+        $valid = { param($Document) Test-Json -Json ($Document | ConvertTo-Json -Depth 20 -Compress) -SchemaFile $sidecarSchemaPath -ErrorAction SilentlyContinue }
+        & $valid (& $sidecar) | Should -BeTrue
+        $evidenceId = & $sidecar
+        $evidenceId['documentId'] = $evidenceId['documentId'] -replace '-sidecar$', ''
+        & $valid $evidenceId | Should -BeFalse
+        $evidenceTable = & $sidecar
+        $evidenceTable['tables']['rca_coverage'] = $evidenceTable['tables']['rca_query_coverage']
+        & $valid $evidenceTable | Should -BeFalse
+        $withKey = & $sidecar
+        $withKey['answerKey'] = [ordered]@{ strings = @(); tables = [ordered]@{} }
+        & $valid $withKey | Should -BeFalse
+        $noCoverage = & $sidecar
+        $noCoverage['tables'] = [ordered]@{}
+        & $valid $noCoverage | Should -BeFalse
+    }
 }
 
 Describe 'The Incident RCA contract: document fixtures (ADR 0031)' {

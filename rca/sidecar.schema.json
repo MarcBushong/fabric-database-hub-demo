@@ -96,7 +96,7 @@
       "items": {
         "$ref": "#/$defs/target"
       },
-      "description": "The targets this document covers, each with an RCA Coverage row."
+      "description": "The targets this document covers, each with an RCA Query Coverage row."
     },
     "epochUtc": {
       "$ref": "#/$defs/utc"
@@ -108,9 +108,9 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "rca_coverage"
+        "rca_query_coverage"
       ],
-      "description": "The sidecar's tables (history-tables.json, document sidecar); a table with no rows is left out.",
+      "description": "The sidecar's tables (history-tables.json, document sidecar), by lakehouse name. A table with no rows is left out; rca_query_coverage never is.",
       "properties": {
         "rca_query_stats": {
           "description": "RCA Query Stats (rca_query_stats): One Query Store plan's runtime statistics over one Query Store interval on one target, as one read saw it (on PostgreSQL, one role's query: its rows are per query). A later read of the same interval holds the same plan's counts or more, so readers keep the latest read of each target, interval, login, query, and plan (rca/README.md, Query Store).",
@@ -573,9 +573,9 @@
     },
     "documentId": {
       "type": "string",
-      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$",
-      "maxLength": 80,
-      "description": "<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>."
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar$",
+      "maxLength": 88,
+      "description": "<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>-sidecar: an evidence document's form with -sidecar after it, so the two kinds' IDs never meet."
     },
     "target": {
       "enum": [
