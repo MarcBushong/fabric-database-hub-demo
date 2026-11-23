@@ -2096,10 +2096,11 @@ function Stop-DbHubDemo {
         if ($null -eq $yielded -and (($replicaThere -and $replicaGoes) -or $busy.By -eq 'session')) {
             # The session's evidence for the Incident RCA first (ADR 0031), while the VMs still run: its bundles go into the
             # vault before the metrics' final version, which lists them. Bounded (rca.stopMinutes); what isn't exported by
-            # then stays on the VMs, and the next session's start exports it. The Query Store sidecars' tail follows the
-            # evidence within the same bound (-SidecarTail, 2026-11-23), and the final version points to their index.
+            # then stays on the VMs, and the next session's start exports it. Only the stop's own flow ends the capture
+            # (-EndCapture, O1) and takes the Query Store sidecars' tail after the evidence within the same bound
+            # (-SidecarTail, 2026-11-23), with their index, which the final version points to.
             if ($null -eq $OnlyVm) {
-                $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId -SidecarTail
+                $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId -EndCapture -SidecarTail
             }
             $rcaIndex = $null
             $sidecarPointer = $null
@@ -6448,7 +6449,11 @@ function Get-DbHubRcaListed {
     session's re-check's last parts. A name whose time is more than an hour old is in Stale, not Names (review of 242a3ef7):
     Get-DbHubRcaRoom deletes it, finished or not, and Azure can go on listing one it's deleting (F31), which held the host
     up for every later export. No export runs that long: its deadline is at most 30 minutes, and a Run Command's time-out
-    at most 1,020 s. It deletes nothing.
+    at most 1,020 s. With -AnyBusy (the Query Store sidecar's and the acknowledgements' Run Commands; review of 9d094b70),
+    it lists them with their instance views, and Busy names every other Run Command there, whatever its name, that's in
+    flight (provisioningState Creating or Updating, or executionState Pending or Running) or being deleted: a session's
+    own dispatch Run Command on the T2 host still runs while its start's acknowledgements and sidecars could go, and the
+    host takes one at a time. A name whose time is more than an hour old isn't Busy, as above. It deletes nothing.
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/list-by-virtual-machine
     #>
     param(
@@ -6456,31 +6461,75 @@ function Get-DbHubRcaListed {
         [object] $Context,
 
         [Parameter(Mandatory = $true)]
-        [string] $VmName
+        [string] $VmName,
+
+        [switch] $AnyBusy
     )
 
     $settings = $Context.Settings
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
-    $list = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands' -f (Get-DbHubDemoPath -Settings $settings), $VmName) -ApiVersion $version
+    $path = '{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands' -f (Get-DbHubDemoPath -Settings $settings), $VmName
+    if ($AnyBusy) {
+        $path += '?$expand=instanceView'
+    }
+    $list = Invoke-DbHubArm -Context $Context -Method GET -Path $path -ApiVersion $version
     $names = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $stale = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $busy = New-Object -TypeName 'System.Collections.Generic.List[string]'
     if ($list.StatusCode -ne 200) {
-        return [pscustomobject]@{ Ok = $false; Names = $names.ToArray(); Stale = $stale.ToArray() }
+        return [pscustomobject]@{ Ok = $false; Names = $names.ToArray(); Stale = $stale.ToArray(); Busy = $busy.ToArray() }
     }
     $prefix = [string]$settings.runCommandPrefix + 'rca-'
     foreach ($item in @(Get-DbHubMember -InputObject $list.Body -Name 'value')) {
         $name = [string](Get-DbHubMember -InputObject $item -Name 'name')
-        if (-not $name.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
-            continue
-        }
         $stamp = [DateTime]::MinValue
-        if ($name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$stamp) -and $stamp.AddHours(1) -lt $Context.NowUtc) {
-            $stale.Add($name)
+        $old = $name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$stamp) -and $stamp.AddHours(1) -lt $Context.NowUtc
+        if ($name.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+            if ($old) {
+                $stale.Add($name)
+            }
+            else {
+                $names.Add($name)
+            }
             continue
         }
-        $names.Add($name)
+        if ($AnyBusy -and -not $old) {
+            $properties = Get-DbHubMember -InputObject $item -Name 'properties'
+            $provisioning = [string](Get-DbHubMember -InputObject $properties -Name 'provisioningState')
+            $execution = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $properties -Name 'instanceView') -Name 'executionState')
+            if ($provisioning -in 'Creating', 'Updating', 'Deleting' -or $execution -in 'Pending', 'Running') {
+                $busy.Add($name)
+            }
+        }
     }
-    return [pscustomobject]@{ Ok = $true; Names = $names.ToArray(); Stale = $stale.ToArray() }
+    return [pscustomobject]@{ Ok = $true; Names = $names.ToArray(); Stale = $stale.ToArray(); Busy = $busy.ToArray() }
+}
+
+function Test-DbHubRcaHostFree {
+    # Whether a sidecar's or an acknowledgement's Run Command may go to a VM that takes one at a time (R871; review of
+    # 9d094b70): Azure lists none of the export's Run Commands there, and no other Run Command, whatever its name, in
+    # flight or being deleted (Get-DbHubRcaListed -AnyBusy), nor, until -StaleUntilUtc, an hour-old one of the export's
+    # being deleted. Returns Free, and Failed when the VM's Run Commands couldn't be listed.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [AllowNull()]
+        [object] $StaleUntilUtc = $null
+    )
+
+    $listed = Get-DbHubRcaListed -Context $Context -VmName $VmName -AnyBusy
+    if (-not $listed.Ok) {
+        return [pscustomobject]@{ Free = $false; Failed = $true }
+    }
+    $free = @($listed.Names).Count -eq 0 -and @(Get-DbHubMember -InputObject $listed -Name 'Busy').Count -eq 0
+    if ($free -and @($listed.Stale).Count -gt 0 -and $StaleUntilUtc -is [datetime] -and (Get-DbHubUtcNow) -lt $StaleUntilUtc) {
+        $free = $false
+    }
+    return [pscustomobject]@{ Free = $free; Failed = $false }
 }
 
 function ConvertFrom-DbHubRcaOutput {
@@ -9347,10 +9396,12 @@ function Update-DbHubSessionRca {
     another job wrote it meanwhile, the state goes into that newer copy, while the session still runs. Once the session's
     stop has begun (Set-DbHubStopBegun), it writes no more bundles, and what it found goes to that stop
     (Add-DbHubRcaHandoff), so the next session's start exports it (review of 15ad76d). The Query Store sidecars
-    (2026-11-23) come after the evidence, within the same rca.recheckMinutes (Invoke-DbHubRcaSidecarSession), into the
-    status's rcaSidecar with their RCA.SIDECAR.EXPORT step; a sidecar bundle the stop's beginning keeps out of the status
-    needs no handoff, since its sidecars stay on the VMs, which offer them again. Never throws. Returns
-    Outcome (NoSession, NotSupported, Late, Exported, Nothing, Changed, Failed) and Note.
+    (2026-11-23) come only once the evidence is saved, within what it left of the same rca.recheckMinutes
+    (Invoke-DbHubRcaSidecarSession), in an update of their own (review of 9d094b70: a stop that begins during their fetch
+    takes the evidence as saved): the status's rcaSidecar with their RCA.SIDECAR.EXPORT step, written only while the
+    session's stop hasn't begun. Otherwise the stop fetches them itself, and a sidecar bundle the re-check wrote stays out
+    of its index, which needs no handoff: the VMs offer those sidecars again. Never throws. Returns Outcome (NoSession,
+    NotSupported, Late, Exported, Nothing, Changed, Failed), the evidence's, and Note.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status and evidence, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
     param(
@@ -9383,7 +9434,6 @@ function Update-DbHubSessionRca {
         }
         $readUpdated = [string]$status['updatedUtc']
         $before = ConvertTo-DbHubRcaState -State $status['rca'] -SessionId $session
-        $sidecarBefore = ConvertTo-DbHubRcaSidecarState -State $status['rcaSidecar'] -SessionId $session
         $held = @(Get-DbHubRcaHeldByEarlier -Status $status)
         # One bound for the evidence and the Query Store sidecars after it (2026-11-23).
         $deadline = (Get-DbHubUtcNow).AddMinutes($bounds.RecheckMinutes)
@@ -9392,8 +9442,6 @@ function Update-DbHubSessionRca {
         # holds (review of 93243d6): it would take that session's capture. Nothing captured before the session began
         # (review of 02d398a): its start, and when the session before it ended.
         $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Minutes $bounds.RecheckMinutes -DeadlineUtc $deadline -Earlier $status['rca'] -SkipVm $held -OutsideFromUtc (ConvertTo-DbHubUtc -Value $status['rcaPreviousEndUtc']) -OutsideToUtc (ConvertTo-DbHubUtc -Value $status['acceptedUtc']) -PollSeconds $PollSeconds -WhileRunning
-        # The Query Store sidecars, after the evidence and within what it left of the bound, with the same fences.
-        $sidecar = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId $session -Earlier $status['rcaSidecar'] -DeadlineUtc $deadline -SkipVm $held -WhileRunning -PollSeconds $PollSeconds
         $write = $status
         $again = Read-DbHubSessionStatusCopy -Context $Context
         if (-not (Test-DbHubRcaRecheckOpen -Status $again -SessionId $session -StopMinutes $bounds.StopMinutes)) {
@@ -9414,45 +9462,130 @@ function Update-DbHubSessionRca {
         if ([string]$again['updatedUtc'] -ne $readUpdated) {
             $write = $again
         }
-        $changed = @($done.State['bundles']).Count -ne @($before['bundles']).Count -or @($done.State['pending']).Count -ne @($before['pending']).Count -or @($sidecar.State['bundles']).Count -ne @($sidecarBefore['bundles']).Count
+        $changed = @($done.State['bundles']).Count -ne @($before['bundles']).Count -or @($done.State['pending']).Count -ne @($before['pending']).Count
         $write['rca'] = $done.State
-        $write['rcaSidecar'] = $sidecar.State
         # Another session's documents this export found go to that session's entry, for a later start (review of 93243d6).
         if ((Add-DbHubRcaElsewhere -Status $write -Document @($done.Others) -NowUtc (Get-DbHubUtcNow)) -gt 0) {
             $changed = $true
         }
-        $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
-        foreach ($step in @($write['steps'])) {
-            $null = $known.Add(('{0}|{1}' -f [string](Get-DbHubMember -InputObject $step -Name 'step'), [string](Get-DbHubMember -InputObject $step -Name 'message')))
-        }
-        # RCA.SIDECAR.EXPORT comes with only what's new or wrong already (Invoke-DbHubRcaSidecarSession).
-        foreach ($line in @(@($done.Lines) + @($sidecar.Lines))) {
-            # A re-check that found nothing new says nothing.
-            if ($line.Status -eq 'Not selected' -or ($line.Step -eq 'RCA.EXPORT' -and $line.Status -eq 'Pass' -and $done.New -eq 0)) {
-                continue
-            }
-            $state = 'Pass'
-            if ($line.Status -in 'Warning', 'Fail') {
-                $state = 'Warning'
-            }
-            if ($known.Add(('{0}|{1}' -f $line.Step, (ConvertTo-DbHubSafeText -Text $line.Message)))) {
-                Add-DbHubSessionStep -Status $write -Step $line.Step -State $state -Message $line.Message -Fix $line.Fix
-                $changed = $true
-            }
+        if (Add-DbHubRcaRecheckStep -Status $write -Line @($done.Lines) -NewDocuments $done.New) {
+            $changed = $true
         }
         $outcome = 'Nothing'
         if (@($done.State['bundles']).Count -gt @($before['bundles']).Count) {
             $outcome = 'Exported'
         }
-        if (-not $changed) {
-            return [pscustomobject]@{ Outcome = $outcome; Note = '' }
+        $note = ''
+        if ($changed) {
+            $null = Write-DbHubSessionStatus -Context $Context -Status $write
+            $note = ' The session''s evidence: {0}' -f [string]$done.State['message']
         }
-        $null = Write-DbHubSessionStatus -Context $Context -Status $write
-        return [pscustomobject]@{ Outcome = $outcome; Note = (' The session''s evidence: {0}' -f [string]$done.State['message']) }
+        # The Query Store sidecars (2026-11-23), once the evidence is saved, within what it left of the bound and with the
+        # same fences, in an update of their own (review of 9d094b70): slow sidecars never keep a re-check's evidence from
+        # the session's stop.
+        if ($bounds.Sidecars) {
+            Update-DbHubSessionSidecar -Context $Context -SessionId $session -Earlier $write['rcaSidecar'] -DeadlineUtc $deadline -SkipVm $held -StopMinutes $bounds.StopMinutes -PollSeconds $PollSeconds
+        }
+        return [pscustomobject]@{ Outcome = $outcome; Note = $note }
     }
     catch {
         Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at this re-check: {0}' -f $_.Exception.Message)
         return [pscustomobject]@{ Outcome = 'Failed'; Note = '' }
+    }
+}
+
+function Add-DbHubRcaRecheckStep {
+    # A re-check's RCA lines (Step, Status, Message, Fix) into the session's status as steps (Update-DbHubSessionRca):
+    # only what's new or wrong, each once, since the status keeps the steps of every re-check. A Warning or a Fail is a
+    # Warning, the rest Pass; Not selected, and an RCA.EXPORT Pass that found nothing new, say nothing. Returns whether it
+    # added one.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Adds steps to an in-memory status only.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]] $Line = @(),
+
+        [int] $NewDocuments = 0
+    )
+
+    $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    foreach ($step in @($Status['steps'])) {
+        $null = $known.Add(('{0}|{1}' -f [string](Get-DbHubMember -InputObject $step -Name 'step'), [string](Get-DbHubMember -InputObject $step -Name 'message')))
+    }
+    $added = $false
+    foreach ($item in @(@($Line) | Where-Object { $null -ne $_ })) {
+        if ($item.Status -eq 'Not selected' -or ($item.Step -eq 'RCA.EXPORT' -and $item.Status -eq 'Pass' -and $NewDocuments -eq 0)) {
+            continue
+        }
+        $state = 'Pass'
+        if ($item.Status -in 'Warning', 'Fail') {
+            $state = 'Warning'
+        }
+        if ($known.Add(('{0}|{1}' -f $item.Step, (ConvertTo-DbHubSafeText -Text $item.Message)))) {
+            Add-DbHubSessionStep -Status $Status -Step $item.Step -State $state -Message $item.Message -Fix $item.Fix
+            $added = $true
+        }
+    }
+    return $added
+}
+
+function Update-DbHubSessionSidecar {
+    <#
+    .SYNOPSIS
+    A re-check's Query Store sidecars (2026-11-23; review of 9d094b70), after its evidence is saved: what the VMs offer
+    that the session hasn't bundled yet (Invoke-DbHubRcaSidecarSession -WhileRunning, within -DeadlineUtc, the re-check's
+    bound, never on a VM in -SkipVm), then the status's rcaSidecar and its RCA.SIDECAR.EXPORT step in the status's copy as
+    it is then, only while the session still runs and its stop hasn't begun (Test-DbHubRcaRecheckOpen). Once the stop has
+    begun, it writes nothing: the stop fetches the sidecars itself, and the VMs offer the ones this re-check bundled
+    again, since only a save acknowledges them. Never throws.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status and sidecar bundles, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId,
+
+        [AllowNull()]
+        [object] $Earlier = $null,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $DeadlineUtc,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]] $SkipVm = @(),
+
+        [int] $StopMinutes = 6,
+
+        [int] $PollSeconds = 10
+    )
+
+    try {
+        $before = ConvertTo-DbHubRcaSidecarState -State $Earlier -SessionId $SessionId
+        $sidecar = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId $SessionId -Earlier $before -DeadlineUtc $DeadlineUtc -SkipVm $SkipVm -WhileRunning -PollSeconds $PollSeconds
+        $latest = Read-DbHubSessionStatusCopy -Context $Context
+        if (-not (Test-DbHubRcaRecheckOpen -Status $latest -SessionId $SessionId -StopMinutes $StopMinutes)) {
+            if ([int]$sidecar.New -gt 0) {
+                Write-DbHubLog -Context $Context -Message ('The session''s stop began while this re-check fetched its Query Store sidecars, so its {0} sidecar(s) stay out of the session''s status; the stop fetches them, since the VMs offer them until a save acknowledges them.' -f $sidecar.New)
+            }
+            return
+        }
+        $changed = @($sidecar.State['bundles']).Count -ne @($before['bundles']).Count
+        $latest['rcaSidecar'] = $sidecar.State
+        if (Add-DbHubRcaRecheckStep -Status $latest -Line @($sidecar.Lines)) {
+            $changed = $true
+        }
+        if ($changed) {
+            $null = Write-DbHubSessionStatus -Context $Context -Status $latest
+        }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s Query Store sidecars weren''t fetched at this re-check: {0}' -f $_.Exception.Message)
     }
 }
 
@@ -9482,12 +9615,13 @@ function Invoke-DbHubRcaStop {
     bundles and pending documents from its status's copy. Returns State, Index, and Lines (Invoke-DbHubRcaSessionExport),
     or $null without a session or with settings that predate the export. Never throws.
     The stop sends no Run Command to stop the profiles (Stop-DbHubDemo), so the workload runs on until the VMs deallocate:
-    its export asks each runner to end the capture first (-EndCapture; O1, 2026-11-23), so the observer's last minutes go
-    into the session's history with the rest, and a VM where they don't is named (RCA.PENDING).
-    The Query Store sidecars (2026-11-23, Invoke-DbHubRcaSidecarStop): with -SidecarTail, which only Stop-DbHubDemo, the
-    stop's own flow, passes, the stop's tail after the evidence, within the same rca.stopMinutes; then the session's
-    sidecar bundle index, whose pointer goes into the metrics' final version. The result's Sidecar has State, Pointer, and
-    Lines.
+    with -EndCapture, its export asks each runner to end the capture first (O1, 2026-11-23), so the observer's last
+    minutes go into the session's history with the rest, and a VM where they don't is named (RCA.PENDING).
+    The Query Store sidecars (2026-11-23, Invoke-DbHubRcaSidecarStop): with -SidecarTail, the stop's tail after the
+    evidence, within the same rca.stopMinutes, then the session's sidecar bundle index, whose pointer goes into the
+    metrics' final version; without it, neither (review of 9d094b70). The result's Sidecar has State, Pointer, and Lines.
+    Only Stop-DbHubDemo, the stop's own flow, passes the two switches: a caller that ends a session another one took over
+    must neither end the newer session's capture nor write an index that nothing points to.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -9500,6 +9634,8 @@ function Invoke-DbHubRcaStop {
         [string] $SessionId = '',
 
         [int] $PollSeconds = 10,
+
+        [switch] $EndCapture,
 
         [switch] $SidecarTail
     )
@@ -9537,7 +9673,7 @@ function Invoke-DbHubRcaStop {
         }
         # One bound for the evidence and the sidecars after it (2026-11-23).
         $deadline = (Get-DbHubUtcNow).AddMinutes($bounds.StopMinutes)
-        $export = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -DeadlineUtc $deadline -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds -HostNotBeforeUtc $hostAfter -EndCapture
+        $export = Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -DeadlineUtc $deadline -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds -HostNotBeforeUtc $hostAfter -EndCapture:$EndCapture
         $sidecar = Invoke-DbHubRcaSidecarStop -Context $Context -SessionId $session -Earlier $sidecarEarlier -DeadlineUtc $deadline -SkipVm $skip -HostNotBeforeUtc $hostAfter -Tail:$SidecarTail -PollSeconds $PollSeconds
         $export | Add-Member -NotePropertyName 'Sidecar' -NotePropertyValue $sidecar -Force
         return $export
@@ -9807,9 +9943,10 @@ function Invoke-DbHubRcaSidecarExport {
     Lines, its part lines in order), Left (by document ID: Vm, and Why it wasn't fetched), and Fenced.
 
     .DESCRIPTION
-    The evidence export's fences hold here too (Invoke-DbHubRcaExport): the T2 host gets its first Run Command only once
-    Azure lists no other export Run Command there (Get-DbHubRcaListed), the evidence's own last ones included, and is Busy
-    at the deadline otherwise; -WhileRunning (a session's re-check) sends nothing once that session's stop has begun
+    The evidence export's fences hold here too (Invoke-DbHubRcaExport), with the T2 host's tighter (review of 9d094b70):
+    each of its Run Commands goes only once Azure lists no other there (Test-DbHubRcaHostFree), the evidence's own last
+    ones and a session's own dispatch included, and the host is Busy at the deadline when the first can't go; -WhileRunning
+    (a session's re-check) sends nothing once that session's stop has begun
     (Test-DbHubRcaRecheckOpen, before each Run Command); and a VM in -SkipVm (an earlier session holds its capture that no
     export took) gets none, because a sidecar export binds a span to its session as an export does. Outcomes: Exported,
     Partial, Nothing, Held, Busy, OldRunner, OldBundle, Failed, TimedOut, NotRunning, NoRoom. The runner's own Warning on its
@@ -9899,7 +10036,9 @@ function Invoke-DbHubRcaSidecarExport {
         return (-not $fence.Closed)
     }
     # A VM's first Run Command: none once the session's stop has begun, and on the T2 host none while Azure lists another
-    # export Run Command there, or, up to DbHubRcaStaleWaitSeconds from this export's start, hour-old ones being deleted.
+    # Run Command there (Test-DbHubRcaHostFree: the export's, or any other in flight or being deleted, such as a session's
+    # own dispatch; review of 9d094b70), or, up to DbHubRcaStaleWaitSeconds from this export's start, hour-old ones of the
+    # export's being deleted.
     $start = {
         param([object] $State)
         $State.Waiting = $false
@@ -9914,13 +10053,9 @@ function Invoke-DbHubRcaSidecarExport {
                 $State.Waiting = $true
                 return
             }
-            $listed = Get-DbHubRcaListed -Context $Context -VmName $State.Vm
-            $State.ListFailed = -not $listed.Ok
-            if (-not $listed.Ok -or @($listed.Names).Count -gt 0) {
-                $State.Waiting = $true
-                return
-            }
-            if (@($listed.Stale).Count -gt 0 -and (Get-DbHubUtcNow) -lt $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)) {
+            $clear = Test-DbHubRcaHostFree -Context $Context -VmName $State.Vm -StaleUntilUtc $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)
+            $State.ListFailed = $clear.Failed
+            if (-not $clear.Free) {
                 $State.Waiting = $true
                 return
             }
@@ -10023,7 +10158,7 @@ function Invoke-DbHubRcaSidecarExport {
         if (@($OnlyVm).Count -gt 0 -and $entry.Vm -notin $OnlyVm) {
             continue
         }
-        $state = [pscustomobject]@{ Vm = $entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Waiting = $false; ListFailed = $false; Started = $false; AllPages = 1; Read = 0; Unread = 0; Full = $false; Sequence = 0; Offered = 0; Seen = (New-Object -TypeName 'System.Collections.Generic.HashSet[string]'); Warning = '' }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Waiting = $false; ListFailed = $false; Started = $false; AllPages = 1; Read = 0; Unread = 0; Full = $false; Sequence = 0; Offered = 0; Seen = (New-Object -TypeName 'System.Collections.Generic.HashSet[string]'); Warning = ''; Sends = 0; Interrupted = $false }
         $hosts.Add($state)
         if ($entry.Vm -in @($SkipVm)) {
             $state.Outcome = 'Held'
@@ -10079,7 +10214,7 @@ function Invoke-DbHubRcaSidecarExport {
                         '{0} takes one Run Command at a time (R871), and its Run Commands couldn''t be listed in this export''s time, so no sidecar was fetched from it; its sidecars wait on it for the next export.' -f $state.Vm
                     }
                     else {
-                        '{0} takes one Run Command at a time (R871), and another export Run Command was still there when this export''s time was up, so no sidecar was fetched from it; its sidecars wait on it for the next export.' -f $state.Vm
+                        '{0} takes one Run Command at a time (R871), and another Run Command was still there when this export''s time was up, so no sidecar was fetched from it; its sidecars wait on it for the next export.' -f $state.Vm
                     }
                     continue
                 }
@@ -10143,6 +10278,17 @@ function Invoke-DbHubRcaSidecarExport {
                     $state.Queue.Clear()
                     break
                 }
+                # Each later Run Command on the T2 host as its first (review of 9d094b70): none while Azure lists another
+                # there, whatever its name, such as a dispatch another job sent meanwhile; this one waits at the front.
+                if ($state.OneAtATime -and $state.Sends -gt 0) {
+                    $clear = Test-DbHubRcaHostFree -Context $Context -VmName $state.Vm -StaleUntilUtc $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)
+                    if (-not $clear.Free) {
+                        $state.Queue.Insert(0, $item)
+                        $state.Interrupted = $true
+                        break
+                    }
+                    $state.Interrupted = $false
+                }
                 if ($item.Kind -eq 'page') {
                     $name = '{0}rca-{1}-i{2:d2}-{3}' -f $prefix, $state.Vm, $item.Page, $stamp
                     $request = [ordered]@{ sessionId = $SessionId; final = ($finalExport -and $item.Page -eq 1); page = $item.Page; timeoutSeconds = $bounds.ExportSeconds }
@@ -10158,6 +10304,7 @@ function Invoke-DbHubRcaSidecarExport {
                 if (Send-DbHubRunCommand -Context $Context -VmName $state.Vm -Name $name -Script $text -TimeoutSeconds $seconds -ConflictDelaySeconds 10) {
                     $state.InFlight.Add([pscustomobject]@{ Name = $name; Kind = $item.Kind; Page = $item.Page; DocumentId = $item.DocumentId; Part = $item.Part; Sequence = $item.Sequence })
                     $state.Free--
+                    $state.Sends++
                     $taken++
                 }
                 elseif ($item.Kind -eq 'page') {
@@ -10191,6 +10338,11 @@ function Invoke-DbHubRcaSidecarExport {
     }
     $answers = New-Object -TypeName 'System.Collections.Generic.List[object]'
     foreach ($state in $hosts) {
+        # A page the deadline or a busy host kept back (review of 9d094b70) waits on the VM with the ones after it.
+        $pending = @($state.Queue | Where-Object { $_.Kind -eq 'page' }) | Select-Object -First 1
+        if ($null -ne $pending -and $state.Started -and -not $state.Outcome) {
+            $state.Unread = [System.Math]::Max([int]$state.Unread, [System.Math]::Max(1, $state.AllPages - $pending.Page + 1))
+        }
         $mine = @($fetched.Values | Where-Object { $_.Vm -eq $state.Vm })
         $waiting = @($left.Values | Where-Object { $_.Vm -eq $state.Vm }).Count
         $outcome = $state.Outcome
@@ -10210,11 +10362,19 @@ function Invoke-DbHubRcaSidecarExport {
                 $partCount += [int]$sidecar.Reference['parts']
             }
             $message = '{0}: {1} sidecar(s) in {2} part(s).' -f $state.Vm, $mine.Count, $partCount
-            if ($state.Blocked) {
-                $message = '{0} Azure didn''t delete a Run Command on {1} twice, so it got no more parts in this export (R871).' -f $message, $state.Vm
-            }
         }
-        $answers.Add([pscustomobject]@{ Vm = $state.Vm; Outcome = $outcome; Message = $message; Offered = [int]$state.Offered; Fetched = $mine.Count; Left = $waiting; Unread = [int]$state.Unread; Full = [bool]$state.Full; Warning = [string]$state.Warning })
+        # Why a T2 host that started got no more Run Commands (R871), which the session's line says.
+        $note = ''
+        if ($state.Blocked) {
+            $note = 'Azure didn''t delete a Run Command on {0} twice, so it got no more sidecar Run Commands in this export (R871).' -f $state.Vm
+        }
+        elseif ($state.Interrupted) {
+            $note = 'Another Run Command was on {0} when this export''s time was up, so it got no more sidecar Run Commands in this export (R871).' -f $state.Vm
+        }
+        if ($note -and $outcome -in 'Exported', 'Partial') {
+            $message = '{0} {1}' -f $message, $note
+        }
+        $answers.Add([pscustomobject]@{ Vm = $state.Vm; Outcome = $outcome; Message = $message; Offered = [int]$state.Offered; Fetched = $mine.Count; Left = $waiting; Unread = [int]$state.Unread; Full = [bool]$state.Full; Warning = [string]$state.Warning; Note = $note })
     }
     return [pscustomobject]@{ Hosts = $answers.ToArray(); Fetched = $fetched; Left = $left; Fenced = [bool]$fence.Closed }
 }
@@ -10410,6 +10570,11 @@ function Invoke-DbHubRcaSidecarSession {
                     $extra.Add([string]$item.Warning)
                     $problem = $true
                 }
+                if ([string](Get-DbHubMember -InputObject $item -Name 'Note')) {
+                    $extra.Add([string](Get-DbHubMember -InputObject $item -Name 'Note'))
+                    $problem = $true
+                    $waiting = $true
+                }
                 # A VM that doesn't run between a session's start and its end keeps its sidecars for its next export, and the
                 # session's host check says it stopped; nor is a VM an earlier session holds an export problem.
                 if ($item.Outcome -in 'OldBundle', 'OldRunner', 'Failed', 'TimedOut', 'Busy', 'NoRoom' -or ($Final -and $item.Outcome -eq 'NotRunning')) {
@@ -10584,7 +10749,9 @@ function Invoke-DbHubRcaSidecarStop {
     A session's stop's part of the Query Store sidecars (2026-11-23): with -Tail (Stop-DbHubDemo's own flow), the tail
     after the evidence, within the stop's bound (Invoke-DbHubRcaSidecarSession -Final, page 1 with --final); then the
     session's sidecar bundle index, a re-check's and a start's bundles included, and the pointer for the metrics' final
-    version (Write-DbHubRcaSidecarIndex). Returns State, Pointer, and Lines (RCA.SIDECAR.EXPORT). Never throws.
+    version (Write-DbHubRcaSidecarIndex). Without -Tail, neither (review of 9d094b70): nothing would point to that index,
+    and the sidecars stay on the VMs, which offer them again; it returns -Earlier's state with no pointer. Returns State,
+    Pointer, and Lines (RCA.SIDECAR.EXPORT). Never throws.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -10612,13 +10779,14 @@ function Invoke-DbHubRcaSidecarStop {
     )
 
     $state = ConvertTo-DbHubRcaSidecarState -State $Earlier -SessionId $SessionId
+    if (-not $Tail) {
+        return [pscustomobject]@{ State = $state; Pointer = $null; Lines = @() }
+    }
     $lines = @()
     try {
-        if ($Tail) {
-            $done = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId $SessionId -Earlier $state -DeadlineUtc $DeadlineUtc -Final -SkipVm $SkipVm -HostNotBeforeUtc $HostNotBeforeUtc -PollSeconds $PollSeconds
-            $state = $done.State
-            $lines = @($done.Lines)
-        }
+        $done = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId $SessionId -Earlier $state -DeadlineUtc $DeadlineUtc -Final -SkipVm $SkipVm -HostNotBeforeUtc $HostNotBeforeUtc -PollSeconds $PollSeconds
+        $state = $done.State
+        $lines = @($done.Lines)
         $written = Write-DbHubRcaSidecarIndex -Context $Context -State $state
         return [pscustomobject]@{ State = $written.State; Pointer = $written.Pointer; Lines = $lines }
     }
@@ -10725,10 +10893,11 @@ function Send-DbHubRcaAck {
     --document <id>,...' (the VM-side control's RcaAck action) for all of the VM's IDs in one managed Run Command, so the
     runner stops offering what the history holds before the start's sidecar fetch there. The runner reports an ID it
     acknowledged before, or doesn't keep, without an error (45f947b7), so a Pass from the VM the IDs name counts each as
-    sent. At most -Seconds: on the T2 host, which takes one
-    Run Command at a time (R871), it goes only once Azure lists no other export Run Command there, and it returns once
-    Azure no longer lists it, so the next one there doesn't run beside it. Returns Sent (the IDs the runner took), Outcome
-    ('' when it took them; OldBundle, OldRunner, Busy, NoRoom, Failed, TimedOut), and Message (why not). Never throws.
+    sent. At most -Seconds: on the T2 host, which takes one Run Command at a time (R871), it goes only once Azure lists no
+    other Run Command there (Test-DbHubRcaHostFree, review of 9d094b70: whatever its name, such as the session's own
+    dispatch), and it returns once Azure no longer lists it, so the next one there doesn't run beside it. Returns Sent (the
+    IDs the runner took), Outcome ('' when it took them; OldBundle, OldRunner, Busy, NoRoom, Failed, TimedOut), and
+    Message (why not). Never throws.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -10757,14 +10926,18 @@ function Send-DbHubRcaAck {
         $oneAtATime = @(Get-DbHubRcaHost -Settings $settings | Where-Object { $_.Vm -eq $VmName -and $_.OneAtATime }).Count -gt 0
         if ($oneAtATime) {
             while ($true) {
-                $listed = Get-DbHubRcaListed -Context $Context -VmName $VmName
-                $stale = @($listed.Stale).Count -gt 0 -and (Get-DbHubUtcNow) -lt $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)
-                if ($listed.Ok -and @($listed.Names).Count -eq 0 -and -not $stale) {
+                $clear = Test-DbHubRcaHostFree -Context $Context -VmName $VmName -StaleUntilUtc $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)
+                if ($clear.Free) {
                     break
                 }
                 if ((Get-DbHubUtcNow) -ge $deadline) {
                     $answer.Outcome = 'Busy'
-                    $answer.Message = '{0} takes one Run Command at a time (R871), and another export Run Command was still there in the time the start had for its acknowledgements' -f $VmName
+                    $answer.Message = if ($clear.Failed) {
+                        '{0} takes one Run Command at a time (R871), and its Run Commands couldn''t be listed in the time the start had for its acknowledgements' -f $VmName
+                    }
+                    else {
+                        '{0} takes one Run Command at a time (R871), and another Run Command was still there in the time the start had for its acknowledgements' -f $VmName
+                    }
                     return $answer
                 }
                 Start-Sleep -Seconds $PollSeconds
