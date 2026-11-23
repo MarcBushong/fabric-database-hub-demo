@@ -135,10 +135,15 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
         return events;
     }
 
-    /// <summary>The same on T4.</summary>
+    /// <summary>
+    /// The same on T4, on a connection that opens as the observer's do (<see cref="PgCaptureConnector.Startup"/>): its
+    /// search_path names dbhubdemo_rca_observer, so RCA-PG-14 leaves this statement out of Query Store's evidence on any
+    /// role (rca/README.md, What the capture leaves out), and it sends nothing else (its limits in the startup packet, no
+    /// type loading: every column is a built-in type).
+    /// </summary>
     internal static async Task<IReadOnlyList<RunEvent>> ReadPgAsync(PgConnectionOpener opener, string runId, CancellationToken cancellationToken)
     {
-        await using var connection = await opener.OpenAsync(SessionNames.ForControl("rca-key"), cancellationToken).ConfigureAwait(false);
+        await using var connection = await opener.OpenAsync(SessionNames.ForControl("rca-key"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time LIMIT 200;";
         command.Parameters.Add(new Npgsql.NpgsqlParameter("run_id", runId));

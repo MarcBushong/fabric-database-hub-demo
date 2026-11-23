@@ -296,7 +296,9 @@ ORDER BY s.name;
 -- whole. A wait sample with no event is a backend on CPU, not waiting (pg_stat_activity's wait_event_type, which the
 -- view's events follow), so it isn't counted. A row whose text Query Store didn't keep is evidence.
 -- Left out, by two fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
--- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row), whose text
+-- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row; the runner's T4
+-- control connections open the same way, so theirs are left out too, but for one the server refused the marker to,
+-- which opens without it after a Warning, rca.marker-refused; no workload session ever carries it), whose text
 -- carries the marker, or, in a row of the observer's own role (current_user: the workload runs as the same role, and
 -- Query Store keeps one row per role and query, which is why $7 holds nothing the workload sends too), whose text is one
 -- of $7's once comments are stripped, white space collapsed, and a final semicolon dropped, which also catches what the

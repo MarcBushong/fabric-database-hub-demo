@@ -1458,7 +1458,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public async Task OnlyTheObserversConnectionsCarryTheMarkerAndTheirLimitsInTheirStartupPacket()
+    public async Task MarkedConnectionsCarryTheMarkerAndTheirLimitsInTheirStartupPacketAndAPlainOneNone()
     {
         using var server = new ListeningPostgres();
         var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
@@ -1482,9 +1482,18 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 SplitOptions(startup["options"]));
         }
 
-        // Any other connection the runner opens carries no options and loads types: Npgsql's type loading comes first.
+        // The harness's T4 control connections open the same way, with the control limits (the scan below checks each).
+        var control = server.AcceptAsync(TestContext.Current.CancellationToken);
+        await (await new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(Sql.SessionNames.ForControl("status"), TestContext.Current.CancellationToken, retry: false, silent: PgCaptureConnector.Startup)).DisposeAsync();
+        var (marked, controlSent) = await control;
+        Assert.Empty(controlSent);
+        Assert.Equal(
+            ["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer", "-c", string.Create(CultureInfo.InvariantCulture, $"statement_timeout={Postgres.PgSessionLimits.Control.StatementTimeoutMs}")],
+            SplitOptions(marked["options"]).Take(4));
+
+        // A plain open, as the workload's sessions use, carries no options and loads types: Npgsql's type loading comes first.
         var other = server.AcceptAsync(TestContext.Current.CancellationToken);
-        await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/control/status", TestContext.Current.CancellationToken, retry: false));
+        await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c", TestContext.Current.CancellationToken, retry: false));
         var (plain, sent) = await other;
         Assert.False(plain.ContainsKey("options"));
         Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("search_path") ?? string.Empty, StringComparison.Ordinal);
@@ -1551,6 +1560,231 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.All(sent, s => Assert.Contains(s, PgObserverStatements.All));
     }
 
+    [Fact]
+    public async Task TheAnswerKeysReadOnT4OpensAsTheObserversDoAndRcaPg14LeavesItOut()
+    {
+        // The recorder reads a run's events after each run. Its connection opens as the observer's do: the marker and the
+        // limits in the startup packet, no type loading, and nothing sent but its own statement, whose columns are built-in
+        // types (timestamptz, varchar, integer, varchar).
+        var at = new DateTimeOffset(2026, 11, 20, 17, 5, 30, 125, TimeSpan.Zero);
+        using var server = new ListeningPostgres(_ =>
+        [
+            ("event_time", 1184u, Wire.Timestamp(at)),
+            ("event_name", 1043u, Wire.Text("step-started")),
+            ("session_id", 23u, Wire.Int32(4321)),
+            ("detail", 1043u, Wire.Text("a test's detail")),
+        ]);
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
+        var events = await Rca.AnswerKey.AnswerKeyRecorder.ReadPgAsync(new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null), "20261120170000-t4-0a0b0c", TestContext.Current.CancellationToken);
+        var (startup, sent) = await accepted;
+
+        Assert.Equal(new Sql.RunEvent(at, "step-started", 4321, "a test's detail"), Assert.Single(events));
+        var options = SplitOptions(startup["options"]);
+        Assert.Equal(["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer"], options.Take(2));
+        Assert.Contains(options, o => o.StartsWith("statement_timeout=", StringComparison.Ordinal));
+        var statement = Assert.Single(sent);
+        Assert.All(server.ResultFormats, f => Assert.Equal(new short[] { 1 }, f));
+
+        // RCA-PG-14 leaves its row out by the search_path the server records for it, whatever the role; its text is on no list.
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var searchPath = options[1]["search_path=".Length..];
+        Assert.True(rule.LeftOut(statement, searchPath, none, ownRole: false));
+        Assert.True(rule.LeftOut(statement, searchPath, none));
+        Assert.False(rule.LeftOut(statement, WorkloadPath, none));
+        Assert.DoesNotContain(PgObserverStatements.All, s => rule.Normalize(s) == rule.Normalize(statement));
+    }
+
+    [Theory]
+    [InlineData("Completed", 3)]
+    [InlineData("Running", null)]
+    public async Task TheReseedRepeatsOnlyACompletedSeedWhoseStatusItChecksItself(string status, int? expected)
+    {
+        // The reseed's read takes the status with the scale and checks it here, so its statement has a shape of its own
+        // (the next test): demo.fn_seed_scale(), which the workload calls every step, has the status in its WHERE.
+        using var server = new ListeningPostgres(_ => [("scale", 23u, Wire.Int32(3)), ("status", 1043u, Wire.Text(status))]);
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
+        int? scale;
+        await using (var connection = await new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(Sql.SessionNames.ForControl("reset"), TestContext.Current.CancellationToken, retry: false, silent: PgCaptureConnector.Startup))
+        {
+            scale = await new Postgres.PgDemoDatabase(connection).GetSeedScaleAsync(TestContext.Current.CancellationToken);
+        }
+
+        await accepted.WaitAsync(AcceptTimeout, TestContext.Current.CancellationToken);
+        Assert.Equal(expected, scale);
+    }
+
+    [Fact]
+    public void NoStatementAMarkedConnectionRunsHasTheShapeOfOneTheWorkloadRuns()
+    {
+        // Query Store keeps one row per database, role, and query ID, with one search_path, and the harness's marked control
+        // connections run as the workload's role. A statement they run (their own, or one inside a function they call) with
+        // the query ID of one the workload runs (its own, or one inside its functions) would share the workload's row, and
+        // RCA-PG-14 could leave the workload's executions out with the harness's. QueryShape stands in for the query ID.
+        var source = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
+        var opens = PostgreSqlOpens(source);
+        var sites = PostgreSqlTexts(source);
+        var databaseMarked = DemoDatabaseMarked(source, opens);
+        var (functions, _) = RealSources();
+        var inlined = InlinedSqlFunctions();
+
+        // The marked side: what marked connections send, with the PgScripts calls PgDemoDatabase makes on its connection
+        // (the reseed's seed), the observer's statements, and the statements of every function those call.
+        var scripts = DemoDatabaseScripts(source);
+        var markedSites = sites.Where(s => s.Literal && (Classify(s, opens, databaseMarked) == "marked" || (s.File == "Postgres/PgScripts.cs" && scripts.Contains(s.Member)))).ToList();
+        var marked = markedSites.SelectMany(s => SqlStatements(s.Text).Select(t => (Where: $"{s.File}:{s.Line}", Text: t)))
+            .Concat(PgObserverStatements.All.Select(t => (Where: "the observer's catalog", Text: t)))
+            .ToList();
+        marked.AddRange(CalledStatements(marked.Select(m => m.Text), functions, inlined, harness: true));
+
+        // The workload side: its own texts, and the statements of the functions they call, but the harness's.
+        var workloadSites = sites.Where(s => s.Literal && Classify(s, opens, databaseMarked) == "workload" && !markedSites.Contains(s)).ToList();
+        var workload = workloadSites.SelectMany(s => SqlStatements(s.Text).Select(t => (Where: $"{s.File}:{s.Line}", Text: t))).ToList();
+        workload.AddRange(CalledStatements(workload.Select(w => w.Text), functions, inlined, harness: false));
+
+        Assert.True(scripts.Count > 0 && markedSites.Count >= 20 && marked.Count >= 60, $"The marked side has {markedSites.Count} texts and {marked.Count} statements: the scan no longer reads it.");
+        Assert.True(workloadSites.Count >= 15 && workload.Count >= 60, $"The workload side has {workloadSites.Count} texts and {workload.Count} statements: the scan no longer reads it.");
+        Assert.All(markedSites.Concat(workloadSites), s => Assert.Equal(s.Text, WithoutSqlComments(s.Text)));
+
+        // The review's case, which the shapes must see as one: the reseed's earlier read and fn_seed_scale()'s SELECT.
+        Assert.Contains(
+            QueryShape("SELECT scale FROM demo.seed_state WHERE seed_state_id = 1 AND status = 'Completed';"),
+            BodyStatements(Assert.Single(functions, f => f.Name == "demo.fn_seed_scale").Source).Select(QueryShape));
+
+        // The comparison leaves out the statements that read no table and call none of the demo's functions (a RETURN QUERY
+        // of variables, a snapshot clear): they carry no evidence, and their query IDs turn on their variables' types and
+        // numbers, which a shape can't see.
+        var shapes = workload.ToLookup(w => QueryShape(w.Text), w => w.Where, StringComparer.Ordinal);
+
+        var shared = marked.Select(m => (m.Where, m.Text, Shape: QueryShape(m.Text)))
+            .Where(m => TouchesTheDemo().IsMatch(m.Shape) && shapes.Contains(m.Shape))
+            .Select(m => $"{m.Where}: {m.Text}{Environment.NewLine}    as in {string.Join(", ", shapes[m.Shape].Distinct(StringComparer.Ordinal))}")
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        Assert.True(shared.Count == 0, "A marked connection runs a statement with the shape of one the workload runs:" + Environment.NewLine + string.Join(Environment.NewLine, shared));
+    }
+
+    [Fact]
+    public async Task AControlConnectionWhoseMarkerIsRefusedOpensPlainAfterOneWarningAndTheAnswerKeysReadDoesNot()
+    {
+        // A server that refuses the startup packet's options with an error of its own, as T4 would if it took none.
+        using var server = new ListeningPostgres { RefuseOptions = ("42501", "permission denied to set parameter \"search_path\"") };
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var log = new RunnerLog(output);
+        var opener = new Postgres.PgConnectionOpener(endpoint, log);
+        var cancellationToken = TestContext.Current.CancellationToken;
+
+        // A harness's control connection: refused, one Warning with the server's message, then one plain open, with no options
+        // and the same name. Npgsql tries a refused startup once more itself before it gives up, so every attempt but the
+        // last carries the marker. This server answers no type loading, which a plain open starts with, so the plain open
+        // then fails after its startup.
+        var open = opener.OpenAsync(Sql.SessionNames.ForControl("reset"), cancellationToken, retry: false, silent: PgCaptureConnector.Startup, plainIfRefused: true);
+        var attempts = await AcceptWhileAsync(server, open, cancellationToken);
+        var failure = await Assert.ThrowsAnyAsync<Exception>(() => open);
+        Assert.IsNotType<Npgsql.PostgresException>(failure);
+
+        Assert.True(attempts.Count >= 2, $"{attempts.Count} attempt(s): the plain open wasn't tried.");
+        Assert.All(attempts.SkipLast(1), a => Assert.Contains(PgCaptureConnector.ObserverSchema, a.Startup["options"], StringComparison.Ordinal));
+        var (plain, sent) = attempts[^1];
+        Assert.False(plain.ContainsKey("options"));
+        Assert.Equal(Sql.SessionNames.ForControl("reset"), plain["application_name"]);
+        Assert.Contains(sent, q => q.Contains("SELECT version()", StringComparison.Ordinal));
+        var warning = Assert.Single(output.ToString().Split('\n'), l => l.Contains(" rca.marker-refused ", StringComparison.Ordinal));
+        Assert.Contains(" WRN ", warning, StringComparison.Ordinal);
+        Assert.Contains("PostgreSQL error 42501: permission denied to set parameter", warning, StringComparison.Ordinal);
+
+        // The answer key's read has no fallback, so its statement never reaches Query Store unmarked: every attempt carries
+        // the marker, and the read fails with the server's refusal.
+        var read = Rca.AnswerKey.AnswerKeyRecorder.ReadPgAsync(opener, "20261120170000-t4-0a0b0c", cancellationToken);
+        var keyAttempts = await AcceptWhileAsync(server, read, cancellationToken);
+        var error = await Assert.ThrowsAsync<Npgsql.PostgresException>(() => read);
+        Assert.Equal("42501", error.SqlState);
+        Assert.NotEmpty(keyAttempts);
+        Assert.All(keyAttempts, a => Assert.Contains(PgCaptureConnector.ObserverSchema, a.Startup["options"], StringComparison.Ordinal));
+        Assert.All(keyAttempts, a => Assert.Empty(a.Queries));
+        Assert.Single(output.ToString().Split('\n'), l => l.Contains(" rca.marker-refused ", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("28P01", "password authentication failed for user \"runner\"")]
+    [InlineData("3D000", "database \"contosocare\" does not exist")]
+    public async Task AnAuthorizationOrDatabaseErrorAtAControlConnectionsOpenIsNoRefusedMarker(string sqlState, string message)
+    {
+        // Errors the startup options can't cause, which a plain open would get too: no Warning that blames the marker, and
+        // no plain open.
+        using var server = new ListeningPostgres { RefuseOptions = (sqlState, message) };
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        using var output = new StringWriter(CultureInfo.InvariantCulture);
+        using var log = new RunnerLog(output);
+        var cancellationToken = TestContext.Current.CancellationToken;
+
+        var open = new Postgres.PgConnectionOpener(endpoint, log).OpenAsync(Sql.SessionNames.ForControl("status"), cancellationToken, retry: false, silent: PgCaptureConnector.Startup, plainIfRefused: true);
+        var attempts = await AcceptWhileAsync(server, open, cancellationToken);
+        var error = await Assert.ThrowsAsync<Npgsql.PostgresException>(() => open);
+
+        Assert.Equal(sqlState, error.SqlState);
+        Assert.NotEmpty(attempts);
+        Assert.All(attempts, a => Assert.Contains(PgCaptureConnector.ObserverSchema, a.Startup["options"], StringComparison.Ordinal));
+        Assert.DoesNotContain("rca.marker-refused", output.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ARunsOwnSessionNeverOpensWithTheObserversMarker()
+    {
+        // RCA-PG-14 leaves out every row whose search_path names the marker, on any role, so a run's session with it would
+        // take the workload's statements out of Query Store's evidence: the opener refuses before it connects.
+        using var server = new ListeningPostgres();
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        var opener = new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null);
+        foreach (var session in new[] { Sql.SessionNames.ForRun("healthy-baseline", "20261120170000-t4-0a0b0c"), ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c" })
+        {
+            var error = await Assert.ThrowsAsync<ArgumentException>(() => opener.OpenAsync(session, TestContext.Current.CancellationToken, retry: false, silent: PgCaptureConnector.Startup, plainIfRefused: true));
+            Assert.Equal("silent", error.ParamName);
+        }
+
+        Assert.False(server.Pending);
+    }
+
+    [Fact]
+    public void EveryPostgreSqlTextTheRunnerSendsIsTheObserversTheWorkloadsOrAKnownPendingOne()
+    {
+        // Every connection the runner opens to T4, and every PostgreSQL text in its code outside the workload's own functions
+        // (database/postgresql): its SQL literals, and the command texts it sets from an expression. A connection is marked
+        // (it opens with PgCaptureConnector.Startup, whose marker RCA-PG-14 leaves out on any role: the observer's, and the
+        // harness's control connections), a workload session (never marked), the read replica's (which records nothing in
+        // Query Store), or a known pending one. A text is sent only on marked connections, is the workload's (a call of the
+        // workload database's own functions, or a workload session's own statement), is sent only to the replica, or is a
+        // known pending one. Any other fails, with where it is.
+        var root = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
+        var opens = PostgreSqlOpens(root);
+        var sites = PostgreSqlTexts(root);
+        var databaseMarked = DemoDatabaseMarked(root, opens);
+        Assert.True(opens.Count >= 15, $"The scan found only {opens.Count} connections to T4: it no longer reads the runner's code.");
+        Assert.True(sites.Count >= 40, $"The scan found only {sites.Count} PostgreSQL texts: it no longer reads the runner's code.");
+
+        var unclassified = opens.Where(o => ClassifyOpen(o) is null).Select(o => $"{o.File}:{o.Line} ({o.Member}): {o.Opener}.OpenAsync({o.Arguments})")
+            .Concat(sites.Where(s => Classify(s, opens, databaseMarked) is null).Select(s => $"{s.File}:{s.Line} ({s.Member}): {s.Text}"))
+            .ToList();
+        Assert.True(unclassified.Count == 0, "A connection to T4, or a PostgreSQL text, that's neither marked, the workload's, nor the replica's:" + Environment.NewLine + string.Join(Environment.NewLine, unclassified));
+        Assert.Equal(MarkedOpens, new SortedSet<string>(opens.Where(o => ClassifyOpen(o) == "marked").Select(o => o.File + " " + o.Member), StringComparer.Ordinal));
+        Assert.Equal(PlainIfRefusedOpens, new SortedSet<string>(opens.Where(o => o.Arguments.Contains("plainIfRefused:", StringComparison.Ordinal)).Select(o => o.File + " " + o.Member), StringComparer.Ordinal));
+        Assert.Subset(MarkedOpens, PlainIfRefusedOpens);
+        Assert.Equal(["Postgres/PgConnection.cs"], RunnerSources(root).Where(s => NpgsqlConnectionSource().IsMatch(CodeOnly(s.Source))).Select(s => s.File));
+        Assert.Equal(
+            PendingSites,
+            new SortedSet<string>(opens.Where(o => ClassifyOpen(o) == "pending").Select(o => o.File + " " + o.Member).Concat(sites.Where(s => Classify(s, opens, databaseMarked) == "pending").Select(s => s.File + " " + s.Member)), StringComparer.Ordinal));
+        Assert.True(databaseMarked, "A PgDemoDatabase is built on a connection that doesn't open with the observer's marker.");
+        Assert.All(sites.Where(s => s.File is "Postgres/PgDemoDatabase.cs" or "Rca/Observer/PgCapture.cs" || s.Member is "ReadPgAsync" or "WarmupT4Async"), s => Assert.Equal("marked", Classify(s, opens, databaseMarked)));
+    }
+
     // ---- Helpers -----------------------------------------------------------------------------------------------------
 
     /// <summary>The workload's own search_path on T4: the server's default.</summary>
@@ -1560,6 +1794,508 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static readonly string[] MarkedFunction = ["fn_harness_event"];
 
     private static readonly string[] OtherTable = ["patients"];
+
+    /// <summary>
+    /// The runner's connections to T4 that open with the observer's marker (the coordinator's decision, 2026-11-23): the
+    /// observer's, the answer key's read, and the harness's control connections (a run's control connection and reset's,
+    /// status's, warmup's, and stop's).
+    /// </summary>
+    private static readonly SortedSet<string> MarkedOpens = new(StringComparer.Ordinal)
+    {
+        "Cli/CommandLine.Postgres.cs StatusT4Async",
+        "Cli/CommandLine.Postgres.cs WarmupT4Async",
+        "Cli/CommandLine.cs StopCommand",
+        "Postgres/PgScenarioRunner.cs ResetAsync",
+        "Postgres/PgScenarioRunner.cs RunAsync",
+        "Rca/AnswerKey/AnswerKeyRecorder.cs ReadPgAsync",
+        "Rca/Observer/PgCapture.cs OpenAsync",
+    };
+
+    /// <summary>
+    /// The marked connections that open once more without the marker when the server refuses it (the coordinator's
+    /// decision, 2026-11-23): the harness's control connections, so its runs, resets, stops, status, and warmup don't
+    /// depend on the startup options. Never the observer's or the answer key's, whose statements must not reach Query
+    /// Store unmarked.
+    /// </summary>
+    private static readonly SortedSet<string> PlainIfRefusedOpens = new(StringComparer.Ordinal)
+    {
+        "Cli/CommandLine.Postgres.cs StatusT4Async",
+        "Cli/CommandLine.Postgres.cs WarmupT4Async",
+        "Cli/CommandLine.cs StopCommand",
+        "Postgres/PgScenarioRunner.cs ResetAsync",
+        "Postgres/PgScenarioRunner.cs RunAsync",
+    };
+
+    private static readonly TimeSpan AcceptTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The runner's PostgreSQL work whose leave-out stays pending (the coordinator's decision, 2026-11-23): T4's setup, as
+    /// the Microsoft Entra administrator at a deploy, on connections of its own, and the statements only it sends; the
+    /// harness-table rule and the live probes cover it. ProfileHost (O1's) has nothing here: it opens no connection to T4,
+    /// since T4's activity profile is a file on T1, and its T4 runs and resets go through PgScenarioRunner's marked
+    /// connections.
+    /// </summary>
+    private static readonly SortedSet<string> PendingSites = new(StringComparer.Ordinal)
+    {
+        "Cli/CommandLine.Postgres.cs SetupT4Async",
+        "Postgres/PgScripts.cs ApplyAsync",
+        "Postgres/PgScripts.cs EnsureEntraRoleAsync",
+        "Postgres/PgScripts.cs GrantRunnerAsync",
+        "Postgres/PgScripts.cs RoleExistsAsync",
+        "Postgres/PgScripts.cs VerifyScenarioFunctionsAsync",
+    };
+
+    /// <summary>A PostgreSQL text in the runner's code: where it is, and whether it's a literal (else the expression a command text is set from).</summary>
+    private sealed record SqlText(string File, int Line, string Member, string Text, bool Literal);
+
+    /// <summary>A connection the runner opens to T4: where, its opener ("new" when inline, else its variable), and its arguments.</summary>
+    private sealed record PgOpen(string File, int Line, string Member, string Opener, string Arguments);
+
+    /// <summary>A class member: where its declaration starts, its name, and its text up to the next member's.</summary>
+    private sealed record SourceMember(int Start, string Name, string Text);
+
+    /// <summary>
+    /// Every PostgreSQL text under <paramref name="root"/>: its SQL string literals, and the command texts set from an
+    /// expression, in the runner's PostgreSQL code (Postgres/, CommandLine.Postgres.cs, PgCapture.cs) and in any member
+    /// elsewhere that uses Npgsql or the runner's PostgreSQL types.
+    /// </summary>
+    private static List<SqlText> PostgreSqlTexts(string root)
+    {
+        var texts = new List<SqlText>();
+        foreach (var (file, source) in RunnerSources(root))
+        {
+            var members = SourceMembers(source);
+            var whole = file.StartsWith("Postgres/", StringComparison.Ordinal) || file is "Cli/CommandLine.Postgres.cs" or "Rca/Observer/PgCapture.cs";
+            SourceMember? PostgreSql(int offset)
+            {
+                var member = Member(members, offset, source);
+                return whole || PostgreSqlTypes().IsMatch(CommentLine().Replace(member.Text, string.Empty)) ? member : null;
+            }
+
+            foreach (var (offset, text) in StringLiterals(source))
+            {
+                var statement = WhiteSpace().Replace(text, " ").Trim();
+                if (SqlStart().IsMatch(statement) && PostgreSql(offset) is { } member)
+                {
+                    texts.Add(new SqlText(file, LineOf(source, offset), member.Name, statement, Literal: true));
+                }
+            }
+
+            foreach (var command in CommandTextExpression().Matches(source).Concat(BatchCommandExpression().Matches(source)))
+            {
+                var expression = command.Groups["expression"].Value.Trim();
+                var sql = StringLiterals(expression).Any(l => SqlStart().IsMatch(WhiteSpace().Replace(l.Text, " ").Trim()));
+                if (!sql && PostgreSql(command.Index) is { } member)
+                {
+                    texts.Add(new SqlText(file, LineOf(source, command.Index), member.Name, expression, Literal: false));
+                }
+            }
+        }
+
+        return texts;
+    }
+
+    /// <summary>
+    /// Every connection the runner opens to T4 or its replica: each OpenAsync on a PgConnectionOpener, inline or through a
+    /// receiver declared as one (in its member, its file, or, for another type's property, the runner), with its member,
+    /// its opener, and its arguments as written. Receivers of the types that open nothing of T4's themselves are passed
+    /// over: SQL Server's openers and connections, the observer's ICaptureConnector (whose implementations' own opens are
+    /// these), and PgConnectionOpener's own NpgsqlConnection in PgConnection.cs. Any other OpenAsync is listed with an
+    /// "unresolved" opener, so the scan fails on it: a receiver of another type or of none it can find, a call's result,
+    /// or a method group.
+    /// </summary>
+    private static List<PgOpen> PostgreSqlOpens(string root)
+    {
+        var sources = RunnerSources(root);
+        var runner = string.Join("\n", sources.Select(s => CodeOnly(s.Source)));
+        var opens = new List<PgOpen>();
+        foreach (var (file, source) in sources)
+        {
+            var code = CodeOnly(source);
+            var members = SourceMembers(source);
+            foreach (Match group in OpenMethodGroup().Matches(code))
+            {
+                opens.Add(new PgOpen(file, LineOf(source, group.Index), Member(members, group.Index, source).Name, "unresolved: a method group", string.Empty));
+            }
+
+            foreach (Match call in OpenCall().Matches(code))
+            {
+                var member = Member(members, call.Index, source);
+                var receiver = call.Groups["receiver"].Value;
+
+                // A name is declared in its member or its file; another object's property (x.Name) may be declared anywhere.
+                var before = call.Groups["receiver"].Index - 1;
+                while (before >= 0 && char.IsWhiteSpace(code[before]))
+                {
+                    before--;
+                }
+
+                var property = call.Groups["receiver"].Success && before >= 0 && code[before] == '.';
+                var type = call.Groups["type"].Success ? call.Groups["type"].Value
+                    : call.Groups["receiver"].Success ? Resolved(DeclaredTypes(code.Substring(member.Start, member.Text.Length), receiver, code)) ?? Resolved(DeclaredTypes(code, receiver, code)) ?? (property ? Resolved(DeclaredTypes(runner, receiver, runner)) : null)
+                    : null;
+                if (type is "SqlConnectionOpener" or "SqlConnection" or "ICaptureConnector" || (type == "NpgsqlConnection" && file == "Postgres/PgConnection.cs"))
+                {
+                    continue;
+                }
+
+                var opener = type != "PgConnectionOpener"
+                    ? $"unresolved: {(call.Groups["receiver"].Success ? receiver : "the result of '" + call.Groups["other"].Value + "'")} ({type ?? "no declaration found"})"
+                    : call.Groups["type"].Success ? "new" : receiver;
+
+                // The arguments, to the parenthesis that closes them, counted in the code alone.
+                var start = call.Index + call.Length;
+                var end = start;
+                var depth = 1;
+                while (end < code.Length)
+                {
+                    depth += code[end] switch { '(' => 1, ')' => -1, _ => 0 };
+                    if (depth == 0)
+                    {
+                        break;
+                    }
+
+                    end++;
+                }
+
+                opens.Add(new PgOpen(file, LineOf(source, call.Index), member.Name, opener, WhiteSpace().Replace(source[start..end], " ").Trim()));
+            }
+        }
+
+        return opens;
+    }
+
+    /// <summary>
+    /// The types <paramref name="code"/> gives <paramref name="name"/>: a parameter's, field's, property's, local's, or
+    /// pattern variable's declared type, the type it's built as with new, or the declared return types of the methods of
+    /// <paramref name="file"/> named as the one it's set from.
+    /// </summary>
+    private static List<string> DeclaredTypes(string code, string name, string file)
+    {
+        var escaped = Regex.Escape(name);
+        var types = new List<string>();
+        foreach (Match declaration in Regex.Matches(code, @"\b(?:var\s+)?" + escaped + @"\s*=\s*(?:new\s+(?<type>[A-Za-z_]\w*)|(?:await\s+)?(?<method>[A-Za-z_]\w*))\s*\(|\b(?<type>[A-Za-z_]\w*)\??\s+" + escaped + @"\b(?=\s*[=;,){])"))
+        {
+            types.AddRange(declaration.Groups["type"].Success
+                ? [declaration.Groups["type"].Value]
+                : Regex.Matches(file, @"\b(?:Task<|ValueTask<)?(?<type>[A-Za-z_]\w*)>?\??\s+" + Regex.Escape(declaration.Groups["method"].Value) + @"\s*\(").Select(m => m.Groups["type"].Value));
+        }
+
+        return [.. types.Where(t => !NotATypeKeywords.Contains(t))];
+    }
+
+    /// <summary>One type for a receiver, erring toward T4: PgConnectionOpener, then NpgsqlConnection, then a type known to open nothing of T4's, then the first.</summary>
+    private static string? Resolved(List<string> types) =>
+        types.Count == 0 ? null
+        : types.Contains("PgConnectionOpener") ? "PgConnectionOpener"
+        : types.Contains("NpgsqlConnection") ? "NpgsqlConnection"
+        : types.FirstOrDefault(t => t is "SqlConnectionOpener" or "SqlConnection" or "ICaptureConnector") ?? types[0];
+
+    /// <summary>Words that precede a name the way a type does in a declaration, but aren't one.</summary>
+    private static readonly HashSet<string> NotATypeKeywords = new(StringComparer.Ordinal)
+    {
+        "var", "return", "await", "new", "out", "ref", "in", "is", "as", "using", "static", "readonly", "const", "private", "public", "internal", "protected", "else", "case", "yield", "throw", "not", "and", "or",
+    };
+
+    /// <summary>
+    /// What a connection to T4 is: marked (it opens with the observer's marker), a workload session (one of a run's tagged
+    /// sessions, which must never carry the marker), the replica's, pending (<see cref="PendingSites"/>), or null, as is
+    /// every open whose receiver the scan couldn't resolve.
+    /// </summary>
+    private static string? ClassifyOpen(PgOpen open)
+    {
+        if (open.Opener.StartsWith("unresolved", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var marked = open.Arguments.Contains("silent: PgCaptureConnector.Startup", StringComparison.Ordinal)
+            || (open.File == "Rca/Observer/PgCapture.cs" && open.Arguments.EndsWith(", Startup", StringComparison.Ordinal));
+        var workload = open.Arguments.StartsWith("context.ApplicationName,", StringComparison.Ordinal);
+        if (workload && marked)
+        {
+            return null;
+        }
+
+        return open.Opener == "replica" ? "replica"
+            : workload ? "workload"
+            : marked ? "marked"
+            : PendingSites.Contains(open.File + " " + open.Member) ? "pending" : null;
+    }
+
+    /// <summary>Whether every PgDemoDatabase the runner builds is built in a member whose connections to T4 are all marked, as the one it's built on is.</summary>
+    private static bool DemoDatabaseMarked(string root, List<PgOpen> opens)
+    {
+        var builds = new List<(string File, string Member)>();
+        foreach (var (file, source) in RunnerSources(root))
+        {
+            var members = SourceMembers(source);
+            builds.AddRange(DemoDatabaseBuild().Matches(CodeOnly(source)).Select(b => (file, Member(members, b.Index, source).Name)));
+        }
+
+        return builds.Count > 0
+            && builds.All(b => opens.Where(o => o.File == b.File && o.Member == b.Member).ToList() is { Count: > 0 } own && own.All(o => ClassifyOpen(o) == "marked"));
+    }
+
+    /// <summary>The runner's C# files under <paramref name="root"/>, by their path from it, in order, with their text.</summary>
+    private static List<(string File, string Source)> RunnerSources(string root)
+    {
+        var sources = new List<(string File, string Source)>();
+        foreach (var path in Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        {
+            var file = Path.GetRelativePath(root, path).Replace('\\', '/');
+            if (!file.StartsWith("obj/", StringComparison.Ordinal) && !file.StartsWith("bin/", StringComparison.Ordinal))
+            {
+                sources.Add((file, File.ReadAllText(path)));
+            }
+        }
+
+        return sources;
+    }
+
+    private static SourceMember Member(List<SourceMember> members, int offset, string source) =>
+        members.LastOrDefault(m => m.Start <= offset) ?? new SourceMember(0, "(file)", source);
+
+    /// <summary>
+    /// What a PostgreSQL text of the runner's is: marked (sent only on connections that open with the observer's marker),
+    /// the workload's, the replica's, a helper's (it sends what its callers pass, whose literals are classified where they
+    /// are), pending (<see cref="PendingSites"/>), or null.
+    /// </summary>
+    private static string? Classify(SqlText site, List<PgOpen> opens, bool databaseMarked)
+    {
+        List<PgOpen> Opens(string file, string? member = null) => [.. opens.Where(o => o.File == file && (member is null || o.Member == member))];
+
+        // The observer's: every block goes on its own connections.
+        if (site.File == "Rca/Observer/PgCapture.cs")
+        {
+            return Opens(site.File) is { Count: > 0 } capture && capture.All(o => ClassifyOpen(o) == "marked") ? "marked" : null;
+        }
+
+        // Sent only to T4's read replica, which records nothing in Query Store: every connection PgReplicaSessions opens is
+        // the replica's, and replica-lag's report and checks run there.
+        if (site.File == "Postgres/PgReplica.cs")
+        {
+            return Opens(site.File) is { Count: > 0 } replica && replica.All(o => ClassifyOpen(o) == "replica") ? "replica" : null;
+        }
+
+        if (site.File == "Postgres/ReplicaLag.cs" && site.Member is "ReportSql" or "ReportHoldsSql" or "ReplicaStateSql")
+        {
+            return "replica";
+        }
+
+        // Sent on the connection its own member opens, marked: the answer key's read, and the warmup's.
+        if (Opens(site.File, site.Member) is { Count: > 0 } own && own.All(o => ClassifyOpen(o) == "marked"))
+        {
+            return "marked";
+        }
+
+        // PgDemoDatabase's statements, the harness's bookkeeping, go on the connection it's built on.
+        if (site.File == "Postgres/PgDemoDatabase.cs" && databaseMarked)
+        {
+            return "marked";
+        }
+
+        if (site.Literal)
+        {
+            var statements = site.Text.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            // The workload's: every statement a call of the workload database's functions, wherever it's sent, or a workload
+            // session's own statement: its transactions, its reads of the business tables, and its limits.
+            if (statements.All(IsWorkloadCall)
+                || (site.File == "Postgres/PgScenarioRunner.cs" && statements.All(s => TransactionControl().IsMatch(s) || IsBusinessRead(s)))
+                || (site.File == "Postgres/PgConnection.cs" && site.Member == "LimitsCommand" && statements.All(s => s.StartsWith("SET ", StringComparison.Ordinal))))
+            {
+                return "workload";
+            }
+        }
+        else if ((site.File, site.Member, site.Text) switch
+                 {
+                     ("Postgres/PgScenarioRunner.cs", "QueryRowAsync", "sql") => "helper",
+                     ("Postgres/PgConnection.cs", "ApplyLimitsAsync", "LimitsCommand(limits)") => "workload",
+                     _ => null,
+                 } is { } known)
+        {
+            return known;
+        }
+
+        return PendingSites.Contains(site.File + " " + site.Member) ? "pending" : null;
+    }
+
+    /// <summary>A SELECT that calls one of the workload database's functions, and whose every FROM or JOIN is one.</summary>
+    private static bool IsWorkloadCall(string statement) =>
+        statement.StartsWith("SELECT ", StringComparison.Ordinal)
+        && DemoCall().IsMatch(statement)
+        && FromTargets().Matches(statement).All(m => DemoCall().Match(m.Groups["target"].Value) is { Success: true, Index: 0 });
+
+    /// <summary>A SELECT whose every FROM or JOIN is a business table (care).</summary>
+    private static bool IsBusinessRead(string statement) =>
+        statement.StartsWith("SELECT ", StringComparison.Ordinal)
+        && FromTargets().Matches(statement) is { Count: > 0 } targets
+        && targets.All(m => m.Groups["target"].Value.StartsWith("care.", StringComparison.Ordinal));
+
+    private static int LineOf(string source, int offset) => source.AsSpan(0, offset).Count('\n') + 1;
+
+    /// <summary>Each class member's declaration at the class's indentation, with its text up to the next one's.</summary>
+    private static List<SourceMember> SourceMembers(string source)
+    {
+        var starts = MemberDeclaration().Matches(source).Select(m => (m.Index, m.Groups["name"].Value)).ToList();
+        return [.. starts.Select((s, i) => new SourceMember(s.Index, s.Value, source[s.Index..(i + 1 < starts.Count ? starts[i + 1].Index : source.Length)]))];
+    }
+
+    /// <summary>
+    /// The comments, character literals, and string literals in C# source: where each starts and ends, and a string's text
+    /// (regular, verbatim, raw, or interpolated, its holes as written); null for the others.
+    /// </summary>
+    private static List<(int Start, int End, string? Text)> Tokens(string source)
+    {
+        var tokens = new List<(int Start, int End, string? Text)>();
+        var i = 0;
+        while (i < source.Length)
+        {
+            var start = i;
+            if (string.CompareOrdinal(source, i, "//", 0, 2) == 0)
+            {
+                var end = source.IndexOf('\n', i);
+                i = end < 0 ? source.Length : end;
+                tokens.Add((start, i, null));
+            }
+            else if (string.CompareOrdinal(source, i, "/*", 0, 2) == 0)
+            {
+                var end = source.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                i = end < 0 ? source.Length : end + 2;
+                tokens.Add((start, i, null));
+            }
+            else if (source[i] == '\'')
+            {
+                i++;
+                while (i < source.Length && source[i] != '\'')
+                {
+                    i += source[i] == '\\' ? 2 : 1;
+                }
+
+                i = Math.Min(i + 1, source.Length);
+                tokens.Add((start, i, null));
+            }
+            else if (source[i] is '"' or '$' or '@')
+            {
+                var quote = i;
+                while (quote < source.Length && source[quote] is '$' or '@')
+                {
+                    quote++;
+                }
+
+                if (quote < source.Length && source[quote] == '"')
+                {
+                    var prefix = source[i..quote];
+                    var (end, text) = ReadLiteral(source, quote, prefix.Contains('@', StringComparison.Ordinal), prefix.Contains('$', StringComparison.Ordinal));
+                    tokens.Add((start, end, text));
+                    i = end;
+                }
+                else
+                {
+                    i = Math.Max(quote, i + 1);
+                }
+            }
+            else
+            {
+                i++;
+            }
+        }
+
+        return tokens;
+    }
+
+    /// <summary>C# string literals with their offsets; comments and character literals skipped.</summary>
+    private static List<(int Offset, string Text)> StringLiterals(string source) =>
+        [.. Tokens(source).Where(t => t.Text is not null).Select(t => (t.Start, t.Text!))];
+
+    /// <summary>The source with its comments and literals blanked, its lines kept, so a pattern or a parenthesis matches code only, at the same offset.</summary>
+    private static string CodeOnly(string source)
+    {
+        var code = source.ToCharArray();
+        foreach (var (start, end, _) in Tokens(source))
+        {
+            for (var i = start; i < end; i++)
+            {
+                if (code[i] is not ('\n' or '\r'))
+                {
+                    code[i] = ' ';
+                }
+            }
+        }
+
+        return new string(code);
+    }
+
+    /// <summary>The literal whose first quote is at <paramref name="quote"/>: where it ends, and its text.</summary>
+    private static (int End, string Text) ReadLiteral(string source, int quote, bool verbatim, bool interpolated)
+    {
+        var quotes = 0;
+        while (quote + quotes < source.Length && source[quote + quotes] == '"')
+        {
+            quotes++;
+        }
+
+        if (quotes >= 3)
+        {
+            var close = source.IndexOf(new string('"', quotes), quote + quotes, StringComparison.Ordinal);
+            return close < 0 ? (source.Length, source[(quote + quotes)..]) : (close + quotes, source[(quote + quotes)..close]);
+        }
+
+        var text = new System.Text.StringBuilder();
+        var i = quote + 1;
+        while (i < source.Length)
+        {
+            var c = source[i];
+            var next = i + 1 < source.Length ? source[i + 1] : '\0';
+            if (c == '"' && verbatim && next == '"')
+            {
+                text.Append('"');
+                i += 2;
+            }
+            else if (c == '"' || (c == '\n' && !verbatim))
+            {
+                return (c == '"' ? i + 1 : i, text.ToString());
+            }
+            else if (c == '\\' && !verbatim)
+            {
+                text.Append(next switch { 'n' => '\n', 'r' => '\r', 't' => '\t', _ => next });
+                i += 2;
+            }
+            else if (interpolated && (c is '{' or '}') && next == c)
+            {
+                text.Append(c);
+                i += 2;
+            }
+            else if (interpolated && c == '{')
+            {
+                // A hole, as written, up to its closing brace, with any string in it read whole.
+                var depth = 0;
+                do
+                {
+                    if (source[i] == '"')
+                    {
+                        var (end, _) = ReadLiteral(source, i, verbatim: false, interpolated: false);
+                        text.Append(source, i, end - i);
+                        i = end;
+                        continue;
+                    }
+
+                    depth += source[i] switch { '{' => 1, '}' => -1, _ => 0 };
+                    text.Append(source[i]);
+                    i++;
+                }
+                while (depth > 0 && i < source.Length);
+            }
+            else
+            {
+                text.Append(c);
+                i++;
+            }
+        }
+
+        return (i, text.ToString());
+    }
 
     /// <summary>
     /// database/postgresql's functions and tables as RCA-PG-16 reads them from the catalog: each function's source (its
@@ -1584,6 +2320,298 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
 
         return (functions, tables);
+    }
+
+    /// <summary>
+    /// database/postgresql's IMMUTABLE SQL functions whose body is one SELECT of an expression, with no FROM: PostgreSQL
+    /// inlines them into the statements that call them (https://wiki.postgresql.org/wiki/Inlining_of_SQL_functions), so
+    /// they never run as statements of their own.
+    /// </summary>
+    private static HashSet<string> InlinedSqlFunctions()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in Directory.GetFiles(RepositoryPaths.Combine("database", "postgresql"), "*.sql"))
+        {
+            var text = File.ReadAllText(file).Replace("\r\n", "\n", StringComparison.Ordinal);
+            foreach (Match header in FunctionHeader().Matches(text))
+            {
+                var body = DollarBody().Match(text, header.Index + header.Length);
+                var attributes = text[(header.Index + header.Length)..body.Index];
+                if (SqlLanguage().IsMatch(attributes) && Immutable().IsMatch(attributes)
+                    && SqlStatements(WithoutSqlComments(body.Groups["body"].Value)) is [var only]
+                    && only.StartsWith("SELECT ", StringComparison.OrdinalIgnoreCase) && !FromClause().IsMatch(only))
+                {
+                    names.Add(header.Groups["name"].Value);
+                }
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// The statements of every function in <paramref name="functions"/> that <paramref name="texts"/> call, and of those
+    /// they call in turn, each with its function's name: the harness's functions too when <paramref name="harness"/> is
+    /// true, and never an inlined one, which runs inside its caller's statement.
+    /// </summary>
+    private static List<(string Where, string Text)> CalledStatements(IEnumerable<string> texts, List<(string Name, bool Marked, string Source)> functions, HashSet<string> inlined, bool harness)
+    {
+        var byName = functions.ToLookup(f => f.Name, StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pending = new Queue<string>(texts);
+        var statements = new List<(string Where, string Text)>();
+        while (pending.TryDequeue(out var text))
+        {
+            foreach (Match call in FunctionCall().Matches(WithoutSqlComments(text)))
+            {
+                var name = call.Groups["name"].Value;
+                if (inlined.Contains(name) || !seen.Add(name))
+                {
+                    continue;
+                }
+
+                foreach (var function in byName[name].Where(f => harness || !f.Marked))
+                {
+                    statements.AddRange(BodyStatements(function.Source).Select(s => (function.Name, s)));
+                    pending.Enqueue(function.Source);
+                }
+            }
+        }
+
+        return statements;
+    }
+
+    /// <summary>The PgScripts members PgDemoDatabase calls on its own connection: the reseed's seed.</summary>
+    private static HashSet<string> DemoDatabaseScripts(string root) =>
+        new(ScriptCall().Matches(CodeOnly(File.ReadAllText(Path.Combine(root, "Postgres", "PgDemoDatabase.cs")))).Select(m => m.Groups["member"].Value), StringComparer.Ordinal);
+
+    /// <summary>
+    /// The statements a PL/pgSQL or SQL function's body runs through the executor, which Query Store records: each SQL
+    /// statement, a PERFORM as the SELECT it runs, and an expression (an assignment's, a declaration's, a condition's, a
+    /// RETURN's) as its SELECT when it holds a subquery; PL/pgSQL evaluates the others itself, as simple expressions
+    /// (https://www.postgresql.org/docs/18/plpgsql-implementation.html#PLPGSQL-PLAN-CACHING). A sketch of PL/pgSQL, not
+    /// a parser: enough for <see cref="QueryShape"/>.
+    /// </summary>
+    private static List<string> BodyStatements(string body)
+    {
+        var statements = new List<string>();
+        foreach (var piece in BodyPieces(WithoutSqlComments(body)))
+        {
+            var match = BodyStatement().Match(WhiteSpace().Replace(piece, " ").Trim());
+            if (match.Groups["sql"].Success)
+            {
+                statements.Add(match.Groups["sql"].Value);
+            }
+            else if (match.Groups["perform"].Success)
+            {
+                statements.Add("SELECT " + match.Groups["perform"].Value);
+            }
+            else if (match.Groups["expression"].Success && Subquery().IsMatch(match.Groups["expression"].Value))
+            {
+                statements.Add("SELECT " + match.Groups["expression"].Value);
+            }
+        }
+
+        return statements;
+    }
+
+    /// <summary>
+    /// A PL/pgSQL body's pieces, each a statement, a condition, or a declaration: split at each semicolon, and at THEN,
+    /// ELSE, LOOP, BEGIN, DECLARE, and EXCEPTION outside parentheses and CASE expressions. Its words come lower case.
+    /// </summary>
+    private static List<string> BodyPieces(string code)
+    {
+        var pieces = new List<string>();
+        var piece = new System.Text.StringBuilder();
+        var depth = 0;
+        var cases = 0;
+        var i = 0;
+        while (i < code.Length)
+        {
+            var c = code[i];
+            if (c is '\'' or '"')
+            {
+                var end = QuoteEnd(code, i);
+                piece.Append(code, i, end - i);
+                i = end;
+            }
+            else if (char.IsLetter(c) || c == '_')
+            {
+                var end = i + 1;
+                while (end < code.Length && (char.IsLetterOrDigit(code[end]) || code[end] is '_' or '$'))
+                {
+                    end++;
+                }
+
+                var word = code[i..end].ToLowerInvariant();
+                i = end;
+                if (word == "case")
+                {
+                    cases++;
+                }
+                else if (word == "end" && cases > 0)
+                {
+                    cases--;
+                }
+                else if (depth == 0 && cases == 0 && word is "then" or "else" or "loop" or "begin" or "declare" or "exception")
+                {
+                    Flush();
+                    continue;
+                }
+
+                piece.Append(word);
+            }
+            else if (c == ';' && depth == 0)
+            {
+                Flush();
+                cases = 0;
+                i++;
+            }
+            else
+            {
+                depth = c switch { '(' => depth + 1, ')' => Math.Max(0, depth - 1), _ => depth };
+                piece.Append(c);
+                i++;
+            }
+        }
+
+        Flush();
+        return pieces;
+
+        void Flush()
+        {
+            var text = piece.ToString().Trim();
+            if (text.Length > 0)
+            {
+                pieces.Add(text);
+            }
+
+            piece.Clear();
+        }
+    }
+
+    /// <summary>
+    /// A statement's shape, standing in for its query ID, which PostgreSQL computes from the parsed statement without its
+    /// constants' values, its aliases' names, or PL/pgSQL's INTO targets
+    /// (https://www.postgresql.org/docs/18/runtime-config-statistics.html#GUC-COMPUTE-QUERY-ID): lower case, comments and
+    /// white space gone, each constant, parameter, and PL/pgSQL variable a ?, a SELECT's INTO gone, and each alias, a
+    /// table's or a column's, gone with the qualifiers that use it. It doesn't see types, so it errs toward a match.
+    /// </summary>
+    private static string QueryShape(string statement)
+    {
+        var text = WhiteSpace().Replace(SqlLiteral().Replace(WithoutSqlComments(statement), "?").ToLowerInvariant(), " ").Trim().TrimEnd(';').TrimEnd();
+        text = ShapeNumber().Replace(ShapeParameter().Replace(IntoTargets().Replace(text, string.Empty), "?"), "?");
+        var aliases = AliasAs().Matches(text).Concat(BareAlias().Matches(text)).Select(m => m.Groups["alias"].Value).ToHashSet(StringComparer.Ordinal);
+        text = BareAlias().Replace(AliasAs().Replace(text, string.Empty), m => m.Groups["head"].Value);
+        text = aliases.Aggregate(text, (shape, alias) => Regex.Replace(shape, @"\b" + Regex.Escape(alias) + @"\.(?=[\w*])", string.Empty));
+        return WhiteSpace().Replace(PunctuationSpace().Replace(text, string.Empty), " ").Trim();
+    }
+
+    /// <summary>A text's statements: split at each semicolon outside a quoted string, trimmed, the empty ones dropped.</summary>
+    private static List<string> SqlStatements(string text)
+    {
+        var statements = new List<string>();
+        var start = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\'')
+            {
+                i = QuoteEnd(text, i) - 1;
+            }
+            else if (text[i] == ';')
+            {
+                statements.Add(text[start..i].Trim());
+                start = i + 1;
+            }
+        }
+
+        statements.Add(text[start..].Trim());
+        return [.. statements.Where(s => s.Length > 0)];
+    }
+
+    /// <summary>SQL without its comments (-- to the line's end, and /* */), its quoted strings and identifiers as they are.</summary>
+    private static string WithoutSqlComments(string text)
+    {
+        var code = new System.Text.StringBuilder(text.Length);
+        var i = 0;
+        while (i < text.Length)
+        {
+            if (text[i] is '\'' or '"')
+            {
+                var end = QuoteEnd(text, i);
+                code.Append(text, i, end - i);
+                i = end;
+            }
+            else if (text[i] == '-' && i + 1 < text.Length && text[i + 1] == '-')
+            {
+                var end = text.IndexOf('\n', i);
+                i = end < 0 ? text.Length : end;
+            }
+            else if (text[i] == '/' && i + 1 < text.Length && text[i + 1] == '*')
+            {
+                var end = text.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                i = end < 0 ? text.Length : end + 2;
+                code.Append(' ');
+            }
+            else
+            {
+                code.Append(text[i++]);
+            }
+        }
+
+        return code.ToString();
+    }
+
+    /// <summary>Just past the quoted string or identifier that starts at <paramref name="start"/>, a doubled quote inside it kept.</summary>
+    private static int QuoteEnd(string text, int start)
+    {
+        var quote = text[start];
+        var i = start + 1;
+        while (i < text.Length)
+        {
+            if (text[i] == quote)
+            {
+                if (i + 1 < text.Length && text[i + 1] == quote)
+                {
+                    i += 2;
+                    continue;
+                }
+
+                return i + 1;
+            }
+
+            i++;
+        }
+
+        return text.Length;
+    }
+
+    /// <summary>
+    /// Accepts each connection <paramref name="client"/> makes until it has ended (a client makes them one after another,
+    /// each waiting for the server's answer), and returns their startups and what they sent, in order. None is left
+    /// waiting after it.
+    /// </summary>
+    private static async Task<List<(Dictionary<string, string> Startup, List<string> Queries)>> AcceptWhileAsync(ListeningPostgres server, Task client, CancellationToken cancellationToken)
+    {
+        var accepted = new List<(Dictionary<string, string> Startup, List<string> Queries)>();
+        using var ended = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        ended.CancelAfter(TimeSpan.FromMinutes(1));
+        var watcher = client.ContinueWith(_ => ended.CancelAfter(TimeSpan.FromSeconds(1)), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try
+        {
+            while (true)
+            {
+                accepted.Add(await server.AcceptAsync(ended.Token));
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+        }
+
+        Assert.True(client.IsCompleted, "The client didn't end within a minute.");
+        await watcher;
+        Assert.False(server.Pending);
+        return accepted;
     }
 
     /// <summary>A startup packet's options as the server splits them: at white space, a backslash escaping the next character.</summary>
@@ -1640,6 +2668,104 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
     [GeneratedRegex(@"\s+")]
     private static partial Regex WhiteSpace();
+
+    /// <summary>A text that starts as SQL does: a statement's keyword, as the runner writes it.</summary>
+    [GeneratedRegex(@"^(?:SELECT|INSERT|UPDATE|DELETE|WITH|BEGIN|COMMIT|ROLLBACK|SET|RESET|GRANT|REVOKE|CALL|DO|LOCK|TRUNCATE|VACUUM|ANALYZE|CREATE|ALTER|DROP|EXPLAIN|START|SAVEPOINT|RELEASE|COPY|LISTEN|NOTIFY|DISCARD|PREPARE|EXECUTE|DEALLOCATE|DECLARE|FETCH|CLOSE|MOVE|COMMENT|REFRESH|REINDEX|CLUSTER|CHECKPOINT|LOAD|IMPORT|SECURITY)(?![\w-])")]
+    private static partial Regex SqlStart();
+
+    [GeneratedRegex(@"\bCommandText\s*=\s*(?<expression>[^;]+);")]
+    private static partial Regex CommandTextExpression();
+
+    [GeneratedRegex(@"\bnew\s+NpgsqlBatchCommand\s*\((?<expression>[^()]*(?:\([^()]*\)[^()]*)*)\)")]
+    private static partial Regex BatchCommandExpression();
+
+    [GeneratedRegex(@"\b(?:Npgsql\w*|PgConnectionOpener|PgDemoDatabase|PgScripts|PgCaptureConnector|PgReplicaSessions)\b")]
+    private static partial Regex PostgreSqlTypes();
+
+    /// <summary>A class member's declaration at the class's indentation (four spaces, file-scoped namespaces), with its name.</summary>
+    [GeneratedRegex(@"^ {4}(?:(?:public|private|internal|protected|static|async|override|sealed|readonly|const|partial|new|virtual|abstract|required|unsafe|extern|file)\s+)+(?:(?:class|record|struct|interface|enum)\s+)?[^\r\n=;{]*?\b(?<name>[A-Za-z_]\w*)\s*(?:<[^>()\r\n]*>)?\s*(?:\(|=>|=(?!=)|\{|;|\r?$)", RegexOptions.Multiline)]
+    private static partial Regex MemberDeclaration();
+
+    /// <summary>
+    /// An OpenAsync call, in code alone, on what's before it: an object built inline (its type), a name (its receiver), or
+    /// anything else (a call's result, an indexer, a cast), whose type the scan can't read.
+    /// </summary>
+    [GeneratedRegex(@"(?:\bnew\s+(?<type>[A-Za-z_]\w*)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)|\b(?<receiver>[A-Za-z_]\w*)|(?<other>[^\s\w]))\s*[!?]?\s*\.\s*OpenAsync\s*\(")]
+    private static partial Regex OpenCall();
+
+    /// <summary>OpenAsync named without a call: a method group, whose arguments the scan can't read.</summary>
+    [GeneratedRegex(@"\.\s*OpenAsync\b(?!\s*\()")]
+    private static partial Regex OpenMethodGroup();
+
+    /// <summary>Where an Npgsql connection can come from other than PgConnectionOpener's own.</summary>
+    [GeneratedRegex(@"\bnew\s+NpgsqlConnection\b|\bNpgsqlDataSource|\.\s*CloneWith\s*\(|\bOpenConnection(?:Async)?\s*\(")]
+    private static partial Regex NpgsqlConnectionSource();
+
+    [GeneratedRegex(@"\bnew\s+PgDemoDatabase\s*\(")]
+    private static partial Regex DemoDatabaseBuild();
+
+    [GeneratedRegex(@"^\s*//.*$", RegexOptions.Multiline)]
+    private static partial Regex CommentLine();
+
+    [GeneratedRegex(@"\bdemo\.[a-z_][a-z0-9_]*\s*\(")]
+    private static partial Regex DemoCall();
+
+    [GeneratedRegex(@"\b(?:FROM|JOIN)\s+(?<target>[^\s,]+)")]
+    private static partial Regex FromTargets();
+
+    [GeneratedRegex(@"^(?:BEGIN|ROLLBACK|COMMIT)\b")]
+    private static partial Regex TransactionControl();
+
+    [GeneratedRegex(@"\bLANGUAGE\s+sql\b", RegexOptions.IgnoreCase)]
+    private static partial Regex SqlLanguage();
+
+    [GeneratedRegex(@"\bIMMUTABLE\b", RegexOptions.IgnoreCase)]
+    private static partial Regex Immutable();
+
+    [GeneratedRegex(@"\bFROM\b", RegexOptions.IgnoreCase)]
+    private static partial Regex FromClause();
+
+    [GeneratedRegex(@"\bSELECT\b", RegexOptions.IgnoreCase)]
+    private static partial Regex Subquery();
+
+    /// <summary>A call of a function in the demo's schemas, by its schema-qualified name.</summary>
+    [GeneratedRegex(@"\b(?<name>(?:demo|care)\.[a-z_]\w*)\s*\(", RegexOptions.IgnoreCase)]
+    private static partial Regex FunctionCall();
+
+    [GeneratedRegex(@"\bPgScripts\.(?<member>\w+)\s*\(\s*connection\b")]
+    private static partial Regex ScriptCall();
+
+    /// <summary>A body piece that runs a statement: its SQL, a PERFORM's expression, or an expression PL/pgSQL evaluates.</summary>
+    [GeneratedRegex(@"^(?:return\s+query\s+(?<sql>(?:select|with|values)\b.*)|for\s+\w+\s+in\s+(?<sql>(?:select|with)\b.*)|perform\s+(?<perform>.+)|(?<sql>(?:select|insert|update|delete|with|truncate|values|lock)\b.*)|(?:if|elsif|while|exit\s+when|continue\s+when|return(?!\s+(?:next|query)\b))\s+(?<expression>.+)|[a-z_][\w.]*(?:\[[^\]]*\])?\s*:?=\s*(?<expression>.+)|[a-z_]\w*\s+(?:constant\s+)?[a-z_][\w.%]*(?:\s*\([^)]*\))?(?:\s*\[\])?(?:\s+not\s+null)?\s*(?::=|=|default)\s*(?<expression>.+))$", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex BodyStatement();
+
+    [GeneratedRegex(@"'(?:[^']|'')*'")]
+    private static partial Regex SqlLiteral();
+
+    /// <summary>A SELECT's, or a RETURNING's, INTO with its PL/pgSQL targets; never an INSERT's INTO.</summary>
+    [GeneratedRegex(@"(?<!\binsert\s)\binto\s+(?:strict\s+)?[a-z_]\w*(?:\s*,\s*[a-z_]\w*)*(?=\s+from\b|\s*$)")]
+    private static partial Regex IntoTargets();
+
+    /// <summary>A parameter, Npgsql's (@name) or PostgreSQL's ($1), or a PL/pgSQL variable or parameter (v_, p_).</summary>
+    [GeneratedRegex(@"@\w+|\$\d+|\b[pv]_\w+\b")]
+    private static partial Regex ShapeParameter();
+
+    [GeneratedRegex(@"(?<![\w$.?])\d+(?:\.\d+)?(?![\w.])")]
+    private static partial Regex ShapeNumber();
+
+    [GeneratedRegex(@"\bas\s+(?<alias>[a-z_]\w*)")]
+    private static partial Regex AliasAs();
+
+    /// <summary>A table's alias written without AS, after FROM, JOIN, or UPDATE.</summary>
+    [GeneratedRegex(@"(?<head>\b(?:from|join|update)\s+(?:only\s+)?(?!set\b)[a-z_][\w.]*)\s+(?!(?:where|join|inner|left|right|full|cross|natural|on|using|group|order|limit|offset|union|except|intersect|set|returning|having|window|for|lateral|tablesample|fetch|into|values|and|or|then|else|end|loop|as|with|default|select|when|is|not|in|between|like|ilike|similar)\b)(?<alias>[a-z_]\w*)\b")]
+    private static partial Regex BareAlias();
+
+    [GeneratedRegex(@"\s+(?=[^\w\s])|(?<=[^\w\s])\s+")]
+    private static partial Regex PunctuationSpace();
+
+    /// <summary>A shape that reads or writes a table, or calls a function of the demo's schemas.</summary>
+    [GeneratedRegex(@"\b(?:from|join|into|update|delete|truncate)\b|\b(?:demo|care)\.")]
+    private static partial Regex TouchesTheDemo();
 
     private QueryWatermark Watermark() => new(root, "T4");
 
@@ -2294,6 +3420,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
 
+        /// <summary>When set, a startup packet with options gets this error, as a server refuses a startup, and is closed.</summary>
+        public (string SqlState, string Message)? RefuseOptions { get; init; }
+
+        /// <summary>Whether a client is waiting for the next accept: an attempt nothing has answered yet.</summary>
+        public bool Pending => listener.Pending();
+
         /// <summary>The result formats each Bind asked for, in order (1 is binary).</summary>
         public List<short[]> ResultFormats { get; } = [];
 
@@ -2323,6 +3455,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 }
 
                 break;
+            }
+
+            if (RefuseOptions is { } refusal && startup.ContainsKey("options"))
+            {
+                // ErrorResponse: severity, its untranslated form, the SQLSTATE, and the message, each a field of its own.
+                await stream.WriteAsync(Message('E', [.. ErrorField('S', "FATAL"), .. ErrorField('V', "FATAL"), .. ErrorField('C', refusal.SqlState), .. ErrorField('M', refusal.Message), 0]), cancellationToken);
+                return (startup, []);
             }
 
             await stream.WriteAsync(Message('R', Int32(0)), cancellationToken);
@@ -2469,6 +3608,8 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
 
         private static byte[] CString(string text) => [.. System.Text.Encoding.UTF8.GetBytes(text), 0];
+
+        private static byte[] ErrorField(char code, string value) => [(byte)code, .. CString(value)];
 
         private static string CStringAt(byte[] payload, int start)
         {
