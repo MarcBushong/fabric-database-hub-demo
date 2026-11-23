@@ -5933,7 +5933,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 **Work summary.**
 
-- **`kept_value.py`** takes each finer save's rows against every earlier save's rows, as `snapshotValues` now does.
+- **`kept_value.py`** takes each finer save's rows against every earlier save's rows, as `snapshotValues` now does, for the finer saves whose rows reach the part of the interval that the coarser save's window keeps. [A later section](#f35-design-i-groundwork-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) ranks those whose rows reach only the part it cuts off too.
 - **The shared cases,** written again from the TypeScript rule: only the named case changes, its name and its 15:15 bin, from 728 to 780, so 15:15 to 15:30 totals 900. The other 44 are unchanged, the 10 random cases with 5 saves included: none of them has the double loss.
 - **Parity with `finestPerInterval`,** a new test: each series' total or peak, hour by hour, from `snapshotValues`' bins and from `finestPerInterval`'s kept points, given the rows as `f35Check` gives them. That's 105 hours (76 of totals, 29 of peaks) in 44 cases; the 45th is off the bin grid, which `finestPerInterval` never sees.
   - The two agree on all but one hour, and that difference isn't about ranks. In `random 11`, the newer of two 900-minute saves holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. `finestPerInterval` reads a save's step from its bins, 30 minutes here, where `snapshotValues` reads the notebook's 15 from its window, so 15:00 to 16:00 peaks at 29 by one and 43 by the other. The test pins that one difference, so any other fails it.
@@ -5962,3 +5962,31 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 - None for existing deployments: nothing runs this code yet.
 - Where a save's bins don't show its step, as in `random 11`, this rule and `finestPerInterval` read the save differently. The notebook's saves show it through their other series.
+
+### F35 design (i) groundwork: a finer save where a window cuts the interval off (2026-11-22)
+
+**Why.** The review of 4944e22d and of the section above's change found taking each rank against every earlier one correct in both rules, with two Lows. The first is in both rules, and older than that change: a coarser point ranked only the finer saves whose rows reach the part of its interval that its save's window keeps. So a finer point that straddles the window's cut kept all it held, and the coarser remainder lost the minutes they share twice. [The follow-ups' section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) has the reviewer's case and when it happens; 67f08e7d changed `snapshotValues` there, and this makes the same change here. The second Low, the explanation of the step difference that the parity test pins, has a commit of its own.
+
+**Work summary.**
+
+- **`kept_value.py`** chooses a coarser point's finer saves by its whole interval: the saves the index finds from its bin to the bin's end, whose rows reach that interval. The check that one finer save covers it, and its own remainder, stay on the part its window keeps, as in `snapshotValues`.
+- **The shared cases,** written again from the TypeScript rule: the reviewer's case, "a finer save only where a coarser save's window cuts its interval off", with a pin: its 15:15 bin is 28, and 15:15 to 15:30 totals 96. The file's diff inserts that case's 33 lines and changes nothing else: 46 cases and 1,720 bins, where there were 45 and 1,712.
+- **Parity with `finestPerInterval`** now covers 106 hours (77 of totals, 29 of peaks) in 45 cases, and still differs only at `random 11`'s hour. The test's comment says what the previous choice gave in the new case: 136 and 156 from 15:00 to 16:00.
+- **This report:** the section above no longer says `kept_value.py` takes every finer save as `snapshotValues` does without that limit. The design note's rank paragraph says so too, in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, and this report.
+
+**Validation.**
+
+- **It fails without the change:** with 6c9d9b75's `kept_value.py`, `Fabric.History` fails on the new case alone, whose 15:15 bin is 8 where the cases have 28. With this one, it passes on Python 3.11.9 and 3.10.11.
+- **And without 67f08e7d's:** with `snapshotValues`' previous choice, in a scratch copy, the cases test fails three ways: the file (that bin, 8 where it holds 28), the pin, and parity (136 and 156).
+- **The reviewer's checks, in Python:** on the follow-ups' section's 30 histories of the three producers with the review's timing (97,438 rows), `kept_values` and `bin_values` give each of `snapshotValues`' 63,330 bins the same value, where the previous rule differs in 36 bins, in 22 histories. None of the 45 earlier cases' 1,712 bins changes.
+- **The same answers, indexed or not:** with the same change in 88ece0f9's unindexed port, the two give the same kept values on the 46 cases and on 2,000 random histories of every kind (387,283 rows).
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 682, 7 of them in the new case; a remainder not clamped at 0, 98; a peak never kept in part, 7; ranks 4 and later dropped, 1; the fourth and later against the first three, 1; and finer saves chosen by the part a window keeps, 1, the new case's 15:15 bin. An even split changes no bin, and the per-row test catches it; the dense-cover shortcut changes none.
+- **The cost:** the every-rank section's two 90-day mixes, best of 3 runs, in each of five rounds, with Python 3.11 on this PC. The daily mix took 1.03 to 1.26 s, against 0.93 to 1.06 s with the previous choice; the busy one, 1.45 to 1.65 s against 1.34 to 1.79 s. The medians differ by 0.07 s and 0.04 s, within the rounds' spread, and the kept values are the same.
+- **And:** vitest, the cases file's 9 tests and the app's whole suite, 397 of 397 in 22 files; typecheck and eslint clean; markdownlint clean; the changed code files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- As in `snapshotValues`, more finer saves are ranked where a window cuts a coarser interval: those whose rows reach the part it cuts off. An answer changes only where one of their rows straddles the cut.

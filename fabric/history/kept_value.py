@@ -233,7 +233,10 @@ def _own(bin_at, save, value, saves, points, adds):
     end = min(bin_at + length, save.end)
     if start >= end:
         start, end = bin_at, bin_at + length
-    finer = [s for s in saves.reaching(start, end) if _finer_than(s, save) and s.row_from < end and s.row_to > start]
+    # The finer saves whose rows reach any part of its interval, the part its window cuts off too: a finer row that straddles
+    # the cut is taken against every one of them, as finestPerInterval takes it (the review of 4944e22d). The cover check and
+    # the point's own remainder stay on the part its window keeps.
+    finer = [s for s in saves.reaching(bin_at, bin_at + length) if _finer_than(s, save) and s.row_from < bin_at + length and s.row_to > bin_at]
     if not finer:
         return value
     if any(s.dense and s.row_from <= start + EPSILON and s.row_to >= end - EPSILON for s in finer):

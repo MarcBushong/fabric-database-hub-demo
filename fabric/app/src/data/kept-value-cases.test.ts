@@ -166,6 +166,18 @@ const NAMED: Case[] = [
             ...series(daySave("21:30"), "T1", "wait_deltas", "Lock", "15:00", 15, repeat(900, 4)),
         ],
     },
+    {
+        // The review of 4944e22d: a finer save whose rows fall only in the part of a coarser interval that the coarser save's
+        // window cuts off. Background load of 4 a minute; a session from 15:16 to 15:22 at 10 a minute, saved every minute;
+        // stop-demo.ps1 -SaveHistory at 15:24, whose 15:20 bin is cut to 15:20 to 15:24; and the next day's update at 15:22,
+        // whose day save's window starts at 15:22. The data hold 96 from 15:15 to 15:30.
+        name: "a finer save only where a coarser save's window cuts its interval off",
+        rows: [
+            ...series(save("15:23", "15:16", "15:22"), "T1", "counter_deltas", "Batch Requests/sec", "15:16", 1, repeat(10, 6)),
+            ...series(save("15:24:30", "03:24", "15:24"), "T1", "counter_deltas", "Batch Requests/sec", "15:15", 5, [44, 28]),
+            ...series({ captured: s("15:33", 1), start: s("15:22"), end: s("15:22", 1) }, "T1", "counter_deltas", "Batch Requests/sec", "15:15", 15, [32, 60]),
+        ],
+    },
 ];
 
 /** A seeded generator (mulberry32), so the random cases are the same on every run. */
@@ -376,6 +388,13 @@ describe("F35 design (i)'s shared cases", () => {
         expect(totalOf("five finer saves", "15:15", "15:30")).toBe(900);
     });
 
+    it("ranks a finer save whose rows fall only where a coarser save's window cuts its interval off: 96 from 15:15 to 15:30", () => {
+        // The stop save's 15:20 keeps 8 beside the session's minutes, so the day's 15:15 keeps 24 for 15:24 to 15:30: with
+        // the stop save's 15:15, 4, its bin is 28. Without the session's save ranked there, it was 8, and 76 in all.
+        expect(valueAt("a finer save only where", "15:15")).toBe(28);
+        expect(totalOf("a finer save only where", "15:15", "15:30")).toBe(96);
+    });
+
     it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, on every case", () => {
         const differ: string[] = [];
         let compared = 0;
@@ -393,7 +412,8 @@ describe("F35 design (i)'s shared cases", () => {
         // so the save is coarser than the older one and left out at 15:30, where the older save's 7 is kept; snapshotValues
         // reads the notebook's 15 from its window, so the newer save is the finer and its 43 is kept. A save of the
         // notebook's holds every series of its targets, MaxCPU in each bin they ran, which shows its step. With the fourth
-        // and later saves against the first three, the named case differed too: 3,548 and 3,600 from 15:00 to 16:00.
+        // and later saves against the first three, the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00;
+        // with finer saves chosen by the part of an interval that a window keeps, the window-cut case did: 136 and 156.
         expect(differ).toEqual(["random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29"]);
         expect(compared).toBeGreaterThan(CASES.length);
     });
