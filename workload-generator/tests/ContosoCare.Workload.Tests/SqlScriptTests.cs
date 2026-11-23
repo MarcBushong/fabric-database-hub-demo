@@ -294,6 +294,34 @@ public sealed class SqlScriptTests
     }
 
     [Fact]
+    public void PlanRegressionsSwitchIsQuietCheckedAndTriedAgainBounded()
+    {
+        // F26 (2026-11-21, live): sp_recompile only drops the lookup's cached plan, and its next run compiles it with that
+        // run's patients, so another worker's lookup that compiled around the switch put plan A back within the same second.
+        // The other workers now stay out from 2 seconds before each switch, worker 1 reads the cached plan afterward and
+        // switches again at most twice more, and a switch that doesn't hold, or can't be read, is plan-switch-unverified.
+        var regression = ProcedureText("frontdesk.usp_refresh_visit_summaries");
+        Assert.Contains("@switch_gap_ms int = 20000, @switch_attempts_max int = 3", regression, StringComparison.Ordinal);
+        Assert.Contains("IF @worker > 1 AND @since >= -2000 AND", regression, StringComparison.Ordinal);
+        Assert.DoesNotContain("@quiet_until", regression, StringComparison.Ordinal);
+        Assert.Contains("CROSS APPLY sys.dm_exec_text_query_plan(s.plan_handle, 0, -1)", regression, StringComparison.Ordinal);
+        Assert.Contains("CHARINDEX(N'Index=\"[ix_appointments_patient]\"', p.query_plan)", regression, StringComparison.Ordinal);
+        Assert.Contains("ELSE IF @scans = 0 AND @switch_attempts < @switch_attempts_max", regression, StringComparison.Ordinal);
+        foreach (var name in new[] { "plan-switch", "plan-switch-retry", "plan-switch-unverified" })
+        {
+            Assert.Contains("@event_name = '" + name + "'", regression, StringComparison.Ordinal);
+        }
+
+        // The plan read can't end the run before it puts FORCE_LAST_GOOD_PLAN back: it's inside a TRY block.
+        var read = regression.IndexOf("FROM sys.dm_exec_procedure_stats", StringComparison.Ordinal);
+        Assert.True(read > 0 && regression.LastIndexOf("BEGIN TRY", read, StringComparison.Ordinal) > regression.LastIndexOf("END TRY", read, StringComparison.Ordinal), "the plan read is inside BEGIN TRY");
+        // Each attempt runs the one switch: its recompile, then the lookup for every patient, never after the response.
+        Assert.Equal(1, CountOccurrences(regression, "@first_patient = 1, @last_patient = @patients"));
+        Assert.Contains("IF @worker = 1 AND @responded = 0 AND @attempt_at IS NOT NULL", regression, StringComparison.Ordinal);
+        Assert.Equal(2, CountOccurrences(regression, "EXEC demo.usp_release_auto_tuning_hold @run_id = @run_id"));
+    }
+
+    [Fact]
     public void SetupRaisesOnlyPlanRegressionsEarlierDefaultToItsCatalogLimit()
     {
         // 2026-11-18 (review): a T3 set up before the Database Agent beat keeps plan-regression at 1200 seconds, and

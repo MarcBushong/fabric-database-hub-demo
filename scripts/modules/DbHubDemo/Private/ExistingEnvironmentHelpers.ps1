@@ -908,8 +908,9 @@ function Resolve-DemoRecoveredNotebookImport {
     Pure. Internal.
 
     .DESCRIPTION
-    A first run gives a workspace that exists false, so deploy.ps1 adds only the notebooks that are missing and keeps
-    edits made in Fabric. But an update republishes the notebooks (README, "Upgrading an existing demo"), and the
+    A first run gives a workspace that exists false, so deploy.ps1 adds the notebooks that are missing, brings one that
+    nobody edited up to date, and keeps edits made in Fabric (follow-ups decision 2a, 2026-11-23). But an update
+    republishes the notebooks, edited or not (README, "Upgrading an existing demo"), and the
     configuration that was lost had true when its first run created the workspace. So a recovered environment's own
     workspace gets true:
     1. the one its resource group records (DbHubFabricWorkspaceId);
@@ -953,7 +954,7 @@ function Resolve-DemoRecoveredNotebookImport {
     )
 
     $answer = { param([bool] $Import, [string] $Reason) [pscustomobject]@{ Import = $Import; Reason = $Reason } }
-    $keep = 'so deploy.ps1 adds only the notebooks that are missing and keeps the copies there (./scripts/configure-fabric.ps1 updates them)'
+    $keep = 'so deploy.ps1 adds a missing notebook, brings one that nobody edited up to date, and keeps an edited one (./scripts/configure-fabric.ps1 updates them all)'
     if (-not $Listed) {
         return (& $answer $true 'Fabric couldn''t be read, so, as for a workspace that doesn''t exist yet, deploy.ps1 imports the notebooks or updates them')
     }

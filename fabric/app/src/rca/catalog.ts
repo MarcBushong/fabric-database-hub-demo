@@ -103,7 +103,7 @@ export const RECOMMENDATIONS: Record<string, Recommendation> = Object.fromEntrie
             "Automatic tuning (FORCE_LAST_GOOD_PLAN)", `${L}/sql/relational-databases/automatic-tuning/automatic-tuning`),
         R("CPU-AUTO-CORRECT", "Keep automatic plan correction (FORCE_LAST_GOOD_PLAN) on",
             "Azure SQL Database then forces the last good plan by itself when a plan change regresses, and verifies it.",
-            "None for Azure SQL Database's default; it was held off on purpose in this demo beat.",
+            "None where it's on, as Azure SQL Database's default has it; where someone turned it off, find out why before turning it back on.",
             "Automatic tuning in Azure SQL Database", `${L}/azure/azure-sql/database/automatic-tuning-overview`),
         R("CPU-MISSING-INDEX", "Review and add the missing index the optimizer suggests",
             "The lookup then seeks instead of scanning the table on every call.",

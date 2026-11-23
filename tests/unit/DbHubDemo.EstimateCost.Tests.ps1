@@ -41,6 +41,8 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $true; Reason = 'the nightly safety stop is in place'; Missing = ''; Fix = '' } }
         # T5's free tier (2026-11-18, ADR 0027), read the same way.
         Mock -ModuleName DbHubDemo Get-DemoT5FreeTierStatus { $true }
+        # Whether T5 has, or gets, its private endpoint (2026-11-21, ADR 0027), read the same way: here an account that has one.
+        Mock -ModuleName DbHubDemo Get-DemoT5PrivateEndpointStatus { $true }
         # T5's container lifecycle (2026-11-19, ADR 0027): the resource group's DbHubT5Container tag, and with Session, what
         # deletes the container after a session (review of ab91ee5): here the session control's role.
         Mock Get-DemoDeploymentState { [pscustomobject]@{ Exists = $true; T5Container = 'Session' } }
@@ -146,6 +148,7 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Get-DemoDefenderPlan -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5FreeTierStatus -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5PrivateEndpointStatus -Times 0 -Exactly
         Should -Invoke Get-DemoDeploymentState -Times 0 -Exactly
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('T5ContainerLifecycle') } -Because 'the estimate''s default, Session, applies'
     }
@@ -187,5 +190,18 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Invoke-TestEstimate
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq 'T5''s container lifecycle couldn''t be read, so the estimate assumes the container exists only during a session. AuthorizationFailed' }
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('T5ContainerLifecycle') }
+    }
+
+    It 'prices T5''s private endpoint as the account has it, and as an upper bound when that can''t be told (2026-11-21, ADR 0027)' {
+        # An account without one: public network access limited to T1's subnet, as T3 in public mode.
+        Mock -ModuleName DbHubDemo Get-DemoT5PrivateEndpointStatus { $false }
+        $null = & $script:entry -ConfigPath (New-TestConfigFile) -NetworkMode public -OutputPath (Join-Path -Path $TestDrive -ChildPath 'estimate.jsonl')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5PrivateEndpointStatus -Times 1 -Exactly -ParameterFilter { $NetworkMode -eq 'public' }
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters.ContainsKey('T5PrivateEndpoint') -and $T5PrivateEndpoint -eq $false }
+        Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T5''s private endpoint and private DNS zone: it has none*' }
+        # A new account, whose answer only preflight's policy read gives: not passed, so the estimate prices them.
+        Mock -ModuleName DbHubDemo Get-DemoT5PrivateEndpointStatus { $null }
+        Invoke-TestEstimate
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('T5PrivateEndpoint') }
     }
 }

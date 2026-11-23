@@ -8,7 +8,7 @@ import { scaleLinear } from "d3-scale";
 import { Button, ToggleButton, Tooltip } from "@fluentui/react-components";
 import { Share16Regular, Next16Regular, Pause16Filled, Play16Filled, Previous16Regular } from "@fluentui/react-icons";
 
-import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
+import { POSTGRES_METRICS, postgresSeries, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
 import { serviceOf } from "@/lib/business";
 import { TARGETS } from "@/lib/estate";
 import { formatNumber, formatTimeUtc, type NumberKind } from "@/lib/format";
@@ -19,7 +19,7 @@ import type { EstateTarget } from "@/lib/view-state";
 import { mapNodes } from "./nodes";
 import { ServiceMap, type Lens } from "./ServiceMap";
 import { SessionRibbon } from "./SessionRibbon";
-import { ribbonRange } from "./timeline";
+import { cosmosLanePoints, ribbonRange } from "./timeline";
 
 const MIN = 60000;
 const SPEEDS = [1, 2, 4, 8] as const;
@@ -100,18 +100,14 @@ function lanesOf(bins: readonly Bin[], scores: readonly FaultScore[], episodes: 
         bands: bandsFor("T4"),
         note: lag.length + pgCpu.length === 0 ? "Its latest capture isn't from this session" : undefined,
     });
-    const ru = cosmosSeries(cosmos, COSMOS_METRICS.normalizedRu)
-        .filter((p) => inRange(p.at.getTime()))
-        .map((p) => ({ t: p.at.getTime(), v: p.value }));
-    const throttled = cosmosSeries(cosmos, COSMOS_METRICS.throttled)
-        .filter((p) => inRange(p.at.getTime()))
-        .map((p) => ({ t: p.at.getTime(), v: p.value }));
+    const { ru, throttled } = cosmosLanePoints(cosmos, from, to);
     lanes.push({
         target: "T5",
         title: `T5 · ${TARGETS.T5.name}`,
         series: [
             { name: "Normalized RU", kind: "percent", shape: "area", max: 100, points: ru },
-            { name: "429s", kind: "int", shape: "line", points: throttled },
+            // Per minute where the window holds saves at different intervals (cosmosLanePoints), and named so.
+            { name: (cosmos?.saves ?? 1) > 1 ? "429s a minute" : "429s", kind: "int", shape: "line", points: throttled },
         ],
         bands: bandsFor("T5"),
         note: ru.length === 0 ? "Its latest capture isn't from this session" : undefined,

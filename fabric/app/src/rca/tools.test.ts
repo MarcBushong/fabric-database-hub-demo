@@ -8,6 +8,8 @@ import { decodeEvidence } from "./evidence";
 import { LAG_METRIC } from "./replica";
 import { monitorTelemetry } from "./sources";
 import { emptyListNote } from "./view/facts";
+import { INVESTIGATION_PLAYBOOK } from "./playbook";
+import { QUERY_STORE_RETENTION_DAYS } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
@@ -172,6 +174,81 @@ describe("incidents, blind", () => {
             expect(out.text.length).toBeLessThanOrEqual(60_000);
             expect(namesAScenario(out.text), name).toEqual([]);
             expect(out.text, name).not.toMatch(/inject/i);
+        }
+    });
+});
+
+// The owner's feedback on the Root cause page (2026-11-23): the chat slices the incidents by the page's own facets.
+describe("the Root cause page's facets, in the chat", () => {
+    it("gives each incident its category, and its severity with the measurements behind it", async () => {
+        const found = await ask("find_incidents", { from: "11:50", to: "12:20" });
+        const t1 = found.episodes.find((e) => e.key === "T1-blocking-20261120T165230Z");
+        expect(t1).toMatchObject({ category: "blocking", severity: "high", severityReason: "High: peak 7 processes, four times its level or more (it opens on any, so 4 or more), there for 6.8 minutes in all; over its level for 9.1 minutes, 5 or more; high confidence." });
+        for (const e of found.episodes) {
+            expect(["blocking", "deadlocks", "cpu", "waits", "errors", "connections", "replica_lag", "throttling", "io"], e.key).toContain(e.category);
+            expect(e.severityReason.startsWith(`${e.severity[0].toUpperCase()}${e.severity.slice(1)}: peak `), e.key).toBe(true);
+        }
+        // The servers the telemetry named, for the targets asked about only.
+        expect(found.details!.servers).toEqual({ T5: "cosmos01" });
+        expect((await ask("find_incidents", { from: "11:50", to: "12:20", targets: ["T1"] })).details!.servers).toBeUndefined();
+    });
+
+    it("filters by category and severity beside targets, counts what they leave out, and keeps the window's own verdicts", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replica = await ask("find_incidents", { from: "11:50", to: "12:20", categories: ["replica_lag"] });
+        expect(replica.episodes.map((e) => e.key)).toEqual(["T4-replica-replica_lag-20261120T171200Z"]);
+        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [], targets: [] });
+        const leftOut = replica.details!.leftOut as { episodes: number; byCategory: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - 1);
+        expect(Object.values(leftOut.byCategory).reduce((a, b) => a + b, 0)).toBe(leftOut.episodes);
+        // No incident matches, but the window wasn't quiet: nothingAbnormal and quiet are about every incident in it.
+        const low = await ask("triage_window", { from: "11:50", to: "12:20", categories: ["cpu"] });
+        expect(low.episodes).toEqual([]);
+        expect(low.findings).toEqual([]);
+        expect(low.details).toMatchObject({ nothingAbnormal: false, quiet: all.details!.quiet, leftOut: { episodes: all.episodes.length } });
+        // Each hypothesis has the facets it's filtered by, and a finding's severity is its incident's.
+        const hypotheses = all.details!.hypotheses as Array<{ category: string; severity: string; family: string }>;
+        expect(all.findings.map((f) => f.severity)).toEqual(hypotheses.map((h) => ({ high: "critical", medium: "warning", low: "info" })[h.severity]));
+        expect(hypotheses.find((h) => h.family === "blocking")).toMatchObject({ category: "blocking", severity: "high" });
+        const high = await ask("triage_window", { from: "11:50", to: "12:20", severities: ["high"], targets: ["T1", "T5"] });
+        expect((high.details!.hypotheses as Array<{ severity: string; target: string }>).every((h) => h.severity === "high" && ["T1", "T5"].includes(h.target))).toBe(true);
+        // An episode's severityReason is in the episode list once, never again in its hypothesis (the review of 90e9d914).
+        expect((all.details!.hypotheses as Array<Record<string, unknown>>).filter((h) => h.episodeKey && "severityReason" in h)).toEqual([]);
+    });
+
+    // The review of 90e9d914: targets narrowed the read, so a triage of the replica's high incidents said nothing abnormal,
+    // and none left out, beside the window's incidents on other targets.
+    it("takes targets as a facet too: the verdicts stay the whole window's, and what it leaves out on other targets is counted", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replicaHigh = await ask("triage_window", { from: "11:50", to: "12:20", targets: ["T4-replica"], severities: ["high"] });
+        const kept = all.episodes.filter((e) => e.target === "T4-replica" && e.severity === "high");
+        expect(replicaHigh.episodes.map((e) => e.key)).toEqual(kept.map((e) => e.key));
+        expect(replicaHigh.details).toMatchObject({ nothingAbnormal: all.details!.nothingAbnormal, quiet: all.details!.quiet, filters: { categories: [], severities: ["high"], targets: ["T4-replica"] } });
+        expect(all.details!.nothingAbnormal).toBe(false);
+        const leftOut = replicaHigh.details!.leftOut as { episodes: number; hypotheses: number; notCaptured: number; byTarget: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - kept.length);
+        expect(leftOut.byTarget.T1).toBe(all.episodes.filter((e) => e.target === "T1").length);
+        expect(leftOut.hypotheses).toBe((all.details!.hypotheses as unknown[]).length - (replicaHigh.details!.hypotheses as unknown[]).length);
+        // What wasn't captured is the targets' asked about; the other targets' lines are counted.
+        expect(replicaHigh.notCaptured.filter((line) => /^T(1|2|3|4|5): /.test(line))).toEqual([]);
+        expect(leftOut.notCaptured).toBe(all.notCaptured.length - replicaHigh.notCaptured.length);
+        // A target it doesn't have is refused, as a category is.
+        expect(await tools().run("triage_window", { from: "11:50", to: "12:20", targets: ["T9"] })).toEqual({ ok: false, text: 'targets takes T1, T2, T3, T4, T4-replica, T5; ["T9"] isn\'t one of them.' });
+    });
+
+    it("refuses a category or a severity it doesn't have, so a filtered list is never taken for the whole one", async () => {
+        const deps = tools();
+        expect(await deps.run("find_incidents", { from: "11:50", to: "12:20", categories: ["locking"] })).toEqual({
+            ok: false,
+            text: 'categories takes blocking, deadlocks, cpu, waits, errors, connections, replica_lag, throttling, io; ["locking"] isn\'t one of them.',
+        });
+        expect((await deps.run("triage_window", { at: "11:56", severities: ["critical"] })).ok).toBe(false);
+        for (const name of ["find_incidents", "triage_window"]) {
+            const spec = INVESTIGATION_TOOL_SPECS.find((s) => s.name === name)!.parameters as { properties: Record<string, { items?: { enum?: string[] }; description?: string }> };
+            expect(spec.properties.categories.items?.enum, name).toEqual(["blocking", "deadlocks", "cpu", "waits", "errors", "connections", "replica_lag", "throttling", "io"]);
+            expect(spec.properties.severities.items?.enum, name).toEqual(["high", "medium", "low"]);
+            // The rule as severityOf applies it: the time at the far mark, in all.
+            expect(spec.properties.severities.description, name).toContain("where far is 4 times its level, or 90 % of a capacity: high (at or over far for 5 minutes or more in all), medium (far at its peak, or over its level 5 minutes or more), low (neither)");
         }
     });
 });
@@ -689,5 +766,131 @@ describe("a coarser point a finer save holds part of", () => {
         const lag = await ask("explain_replica_lag", { at: "2026-11-20T15:31:00Z" }, tools);
         expect(lag.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 15-minute interval\) reached 120 s in the 15 minutes from 15:30:00 UTC /);
         expect(texts(lag)).not.toMatch(/in the (3|7) minutes from 15:(30|38)/);
+    });
+});
+
+// The owner, 2026-11-23: the chat read "the CPU's cause (Query Store's plans, waits per query) isn't captured yet" as "T1
+// doesn't have Query Store". A cause the capture doesn't explain yet says what this history lacks, per target, and never
+// what the target lacks, with where the target's own Query Store has it as its next step.
+describe("Query Store, in the words of a cause the capture doesn't explain yet", () => {
+    /** A claim that a target has no Query Store, or that it's off. */
+    const LACKS = /(?:has no|hasn't got|doesn't have|does not have|lacks|without)(?: a| any| its)? Query Store|Query Store (?:is|was) (?:off|disabled|not (?:on|enabled|turned on))|Query Store (?:isn't|wasn't) (?:on|enabled|turned on)|no Query Store/i;
+    const busy = (m: number) => (m >= 40 && m < 50 ? 95 : 10);
+    const bin = (target: "T1" | "T2" | "T3", m: number, waits?: Record<string, number>) => ({ at: minute("15:00:00", m), target, cpu: waits ? 10 : busy(m), blocked: 0, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null, ...(waits ? { waits } : {}) });
+    const bins = [
+        ...Array.from({ length: 60 }, (_, m) => bin("T1", m)),
+        ...Array.from({ length: 60 }, (_, m) => bin("T3", m)),
+        // T2's buffer latch waits, a wait class, beside a quiet CPU.
+        ...Array.from({ length: 60 }, (_, m) => bin("T2", m, { "Buffer Latch": m >= 40 && m < 50 ? 30 : 0 })),
+    ];
+    const postgres: PostgresCapture = {
+        capturedAt: at("16:05:00"),
+        windowStart: at("15:00:00"),
+        windowEnd: at("16:00:00"),
+        intervalMinutes: 1,
+        servers: {},
+        points: (["T4", "T4-replica"] as const).flatMap((target) => Array.from({ length: 60 }, (_, m) => ({ at: minute("15:00:00", m), target, server: target === "T4" ? "pgflex01" : "pgreplica01", metric: "cpu_percent", value: busy(m) }))),
+    };
+    // The viewer's clock: the same day, within every target's Query Store retention, unless a test moves it.
+    const toolsAt = (now: Date) =>
+        createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => ({ bins: bins.filter((b) => b.at >= from && b.at <= to), postgres }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+            now: () => now,
+        });
+    const deps = toolsAt(at("18:00:00"));
+    async function incidentOn(target: RcaTarget, family: string, tools = deps): Promise<InvestigationResult> {
+        const [episode] = (await tools.episodes(at("15:30:00"), at("16:00:00"), [target])).filter((e) => e.family === family);
+        expect(episode, `${target} ${family}`).toBeDefined();
+        return ask("explain_incident", { episodeKey: episode.key }, tools);
+    }
+    const SQL_LEARN = "https://learn.microsoft.com/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store";
+    const PG_LEARN = "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store";
+
+    it("says on T1 to T3 that this history doesn't hold Query Store's statistics yet, the capture's limit, and where the target's own has them", async () => {
+        for (const target of ["T1", "T3"] as const) {
+            const r = await incidentOn(target, "cpu");
+            expect(r.rootCause?.ruleIds).toEqual(["TELEMETRY-ONLY"]);
+            expect(r.rootCause?.statement).toMatch(new RegExp(`UTC\\b.*Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of ${target}\\.$`));
+            expect(r.notCaptured).toContain(`${target}: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${target}'s: Query Store on ${target} keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's ${target}.QUERYSTORE says whether it's on.`);
+            expect(r.nextSteps).toContain(`Read Query Store on ${target} for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC: its Top Resource Consuming Queries and Regressed Queries reports on ContosoCare in SQL Server Management Studio, or sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
+        }
+        const latch = await incidentOn("T2", "latch");
+        expect(latch.notCaptured).toContain("T2: which queries drove the buffer latch waits isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T2's: Query Store on T2 keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's T2.QUERYSTORE says whether it's on.");
+        expect(latch.nextSteps).toContain(`Read Query Store on T2 for the queries that waited on Buffer Latch from 15:40:00 to 15:50:00 UTC: its Query Wait Statistics report on ContosoCare in SQL Server Management Studio, or sys.query_store_wait_stats and sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
+    });
+
+    it("says the same on T4, in its azure_sys database at every size but Burstable, and that a read replica's queries are in neither", async () => {
+        const t4 = await incidentOn("T4", "cpu");
+        expect(t4.rootCause?.statement).toMatch(/Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of T4\.$/);
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: at every size but Burstable, where Learn advises against it, Query Store on T4 keeps those minutes' per-query statistics and wait samples in its azure_sys database for 7 days, and validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.nextSteps).toContain(`Read Query Store on T4 for the queries that took the most time from 15:40:00 to 15:50:00 UTC, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_LEARN}).`);
+        const replica = await incidentOn("T4-replica", "cpu");
+        expect(replica.rootCause?.statement).toMatch(/Which queries drove it is in neither this history nor Query Store, which doesn't record a read replica's queries\.$/);
+        expect(replica.notCaptured).toContain(`T4-replica: which queries drove the CPU is in neither this history nor Query Store: Query Store doesn't record the queries a read replica runs (${PG_LEARN}), and the capture samples the replica's sessions only while its replay stands still.`);
+        expect(replica.nextSteps.join(" ")).not.toMatch(/Query Store/);
+    });
+
+    // The review of 319b3ae1: past a target's retention, "keeps those minutes" was false, and the next step sent the owner to
+    // an empty view, which reads as "Query Store is off". 14 days on T1 to T3, 7 on T4, counted on the viewer's clock.
+    it("says when the target's Query Store no longer keeps those minutes, and gives no next step then", async () => {
+        // 8 days later: T4 keeps 7, T1 14.
+        const week = toolsAt(new Date("2026-11-28T16:00:00Z"));
+        const t4 = await incidentOn("T4", "cpu", week);
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're more than 7 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        const t1 = await incidentOn("T1", "cpu", week);
+        expect(t1.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T1 for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC/)]));
+        // 15 days later: past T1's too.
+        const later = await incidentOn("T1", "cpu", toolsAt(new Date("2026-12-05T16:00:00Z")));
+        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're more than 14 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
+        expect(later.nextSteps.join(" ")).not.toMatch(/Query Store/);
+    });
+
+    // The re-review of bbdcd05c: the whole day after a retention ran out, the note said "they're 7 days old" beside "no longer
+    // keeps", from the age rounded down.
+    it("says the minutes are more than the retention old, the whole day after it ran out, and keeps them up to its last minute", async () => {
+        // The incident ends at 15:50:00 UTC on 2026-11-20.
+        const lastMinute = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-27T15:50:00Z")));
+        expect(lastMinute.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T4 /)]));
+        const t4 = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-28T09:50:00Z")));
+        expect(t4.notCaptured.join(" ")).toContain("it keeps 7 days, and they're more than 7 days old.");
+        expect(t4.notCaptured.join(" ")).not.toMatch(/they're 7 days old/);
+        expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        for (const target of ["T1", "T3"] as const) {
+            const kept = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:50:00Z")));
+            expect(kept.nextSteps, target).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`^Read Query Store on ${target} `))]));
+            const r = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:51:00Z")));
+            expect(r.notCaptured.join(" "), target).toContain("it keeps 14 days (less when it fills up), and they're more than 14 days old.");
+            expect(r.nextSteps.join(" "), target).not.toMatch(/Query Store/);
+        }
+    });
+
+    it("counts T1 to T3's 14 days from their configure scripts, and leaves T4's retention at Learn's 7-day default", () => {
+        for (const target of ["sqlvm01", "arcsql01", "azuresql"]) {
+            const script = readFileSync(resolve(import.meta.dirname, `../../../../database/${target}/030-configure.sql`), "utf8");
+            expect(script, target).toMatch(new RegExp(`STALE_QUERY_THRESHOLD_DAYS = ${QUERY_STORE_RETENTION_DAYS.sql}\\b`));
+        }
+        expect(QUERY_STORE_RETENTION_DAYS.postgresql).toBe(7);
+        expect(readFileSync(resolve(import.meta.dirname, "../../../../infra/modules/pgflex01.bicep"), "utf8")).not.toMatch(/retention_period_in_days/);
+    });
+    it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {
+        const results = [
+            ...(await Promise.all([incidentOn("T1", "cpu"), incidentOn("T2", "latch"), incidentOn("T3", "cpu"), incidentOn("T4", "cpu"), incidentOn("T4-replica", "cpu")])),
+            await ask("triage_window", { from: "2026-11-20T15:30:00Z", to: "2026-11-20T16:00:00Z" }, deps),
+            await ask("find_incidents", { from: "2026-11-20T15:30:00Z", to: "2026-11-20T16:00:00Z" }, deps),
+        ];
+        const text = JSON.stringify(results);
+        expect(text).not.toMatch(LACKS);
+        expect(text).not.toMatch(/isn't captured yet|plans and waits per query|plans, waits per query/);
+        expect(namesAScenario(text)).toEqual([]);
+        // The playbook says it only as what never to say, and for the documented exception: Azure Cosmos DB has none.
+        const sentences = INVESTIGATION_PLAYBOOK.split(/(?<=[.:])\s+/).filter((s) => LACKS.test(s));
+        expect(sentences.length).toBeGreaterThan(0);
+        for (const s of sentences) expect(s, s).toMatch(/^Never say that a target has no Query Store|Azure Cosmos DB \(T5\) has no Query Store/);
+        expect(INVESTIGATION_PLAYBOOK).toContain("this history doesn't hold Query Store's per-query statistics yet, which is the capture's limit, not the target's");
+        expect(INVESTIGATION_PLAYBOOK).not.toMatch(/comes later/);
     });
 });

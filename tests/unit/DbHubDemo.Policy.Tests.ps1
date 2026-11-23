@@ -269,6 +269,7 @@ Describe 'Get-DemoPolicyConstraint' {
         $expected = [ordered]@{
             INVENTORY     = 'Warning'
             SQLPUBLIC     = 'Pass'
+            COSMOSPUBLIC  = 'Pass'
             SQLENTRAONLY  = 'Pass'
             VMSIZE        = 'Pass'
             RESOURCETYPES = 'Pass'
@@ -410,22 +411,80 @@ Describe 'Get-DemoPolicyConstraint' {
     It 'warns, skips the other checks, and assumes private mode when the assignments cannot be read' {
         $script:listFails = $true
         $policy = Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'auto' })
-        $policy.Results.checkId | Should -Be @('PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC')
+        $policy.Results.checkId | Should -Be @('PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC', 'PREFLIGHT.POLICY.COSMOSPUBLIC')
         (Get-Check $policy 'INVENTORY').status | Should -Be 'Warning'
         (Get-Check $policy 'INVENTORY').message | Should -Match 'AuthorizationFailed'
         $sql = Get-Check $policy 'SQLPUBLIC'
         $sql.status | Should -Be 'Warning'
         $sql.evidence.effectiveNetworkMode | Should -Be 'private'
         $sql.evidence.assumed | Should -BeTrue
+        # T5 keeps its private endpoint too (2026-11-21): a read that fails never drops it.
+        (Get-Check $policy 'COSMOSPUBLIC').evidence.privateEndpointRequired | Should -BeTrue
     }
 
     It 'passes a subscription with no policy assignments and resolves auto to public' {
         $script:assignments = @()
         $policy = Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'auto' })
-        $policy.Results.checkId | Should -Be @('PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC', 'PREFLIGHT.POLICY.VMSIZE', 'PREFLIGHT.POLICY.RESOURCETYPES')
-        $policy.Results.status | Should -Be @('Pass', 'Pass', 'Pass', 'Pass')
+        $policy.Results.checkId | Should -Be @('PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC', 'PREFLIGHT.POLICY.COSMOSPUBLIC', 'PREFLIGHT.POLICY.VMSIZE', 'PREFLIGHT.POLICY.RESOURCETYPES')
+        $policy.Results.status | Should -Be @('Pass', 'Pass', 'Pass', 'Pass', 'Pass')
         (Get-Check $policy 'SQLPUBLIC').evidence.effectiveNetworkMode | Should -Be 'public'
+        # And a new T5 needs no private endpoint (2026-11-21, ADR 0027).
+        $cosmos = Get-Check $policy 'COSMOSPUBLIC'
+        $cosmos.evidence.privateEndpointRequired | Should -BeFalse
+        $cosmos.evidence.reason | Should -Be 'None'
+        $cosmos.message | Should -Match 'Database Hub''s Security page then lists T5''s public network access, as it does T3''s'
         $policy.Complete | Should -BeTrue
+    }
+
+    It 'keeps T5''s private endpoint under <Case> (2026-11-21, ADR 0027)' -ForEach @(
+        @{ Case = 'a Deny of Azure Cosmos DB public network access'; Then = @{ effect = 'Deny' }; Condition = @{ allOf = @(@{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' }, @{ field = 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess'; notEquals = 'Disabled' }) } }
+        @{ Case = 'a Modify that turns it off'; Then = @{ effect = 'Modify'; details = @{ roleDefinitionIds = @('/providers/Microsoft.Authorization/roleDefinitions/role'); operations = @(@{ operation = 'addOrReplace'; field = 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess'; value = 'Disabled' }) } }; Condition = @{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' } }
+        @{ Case = 'a Modify whose value its assignment sets, so it may turn it off later'; Then = @{ effect = 'Modify'; details = @{ roleDefinitionIds = @('/providers/Microsoft.Authorization/roleDefinitions/role'); operations = @(@{ operation = 'addOrReplace'; field = 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess'; value = "[parameters('access')]" }) } }; Condition = @{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' } }
+    ) {
+        $script:definitions = @{ "$mg/policyDefinitions/cosmos-public" = New-Definition -DisplayName 'Azure Cosmos DB should disable public network access (example)' -Condition $Condition -Then $Then -Parameters @{ access = @{ type = 'String' } } }
+        $script:assignments = @(@{ name = 'cosmos-public'; properties = @{ displayName = 'Cosmos public access'; scope = $subscriptionScope; enforcementMode = 'Default'; policyDefinitionId = "$mg/policyDefinitions/cosmos-public" } })
+        $policy = Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'public' })
+        ($policy.Rules | Where-Object Policy -eq 'Azure Cosmos DB should disable public network access (example)').Category | Should -Be 'COSMOSPUBLIC'
+        $check = Get-Check $policy 'COSMOSPUBLIC'
+        $check.status | Should -Be 'Pass'
+        $check.evidence.privateEndpointRequired | Should -BeTrue
+        $check.evidence.reason | Should -Be 'Policy'
+        $check.evidence.policies | Should -Be 'Azure Cosmos DB should disable public network access (example)'
+        $check.message | Should -Match '^Azure Policy turns Azure Cosmos DB public network access off or denies it \(Azure Cosmos DB should disable public network access \(example\)\), so T5 keeps a private endpoint in snet-pe'
+    }
+
+    It 'keeps a new T5''s private endpoint when the policies can''t all be read, and needs none under a Deny that T5''s public settings never meet (2026-11-21, ADR 0027)' {
+        $script:assignments = @(@{ name = 'locked'; properties = @{ displayName = 'Locked'; scope = $subscriptionScope; enforcementMode = 'Default'; policyDefinitionId = "$mg/policyDefinitions/locked-definition" } })
+        $unread = Get-Check (Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'public' })) 'COSMOSPUBLIC'
+        $unread.evidence.privateEndpointRequired | Should -BeTrue
+        $unread.evidence.reason | Should -Be 'Unknown'
+        $unread.evidence.complete | Should -BeFalse
+        $unread.message | Should -Match '^Not every policy that applies could be read, so a new T5 gets a private endpoint'
+        # T5's virtual network filter is on in public mode, so a Deny of accounts without one never applies to it.
+        $script:definitions = @{ "$mg/policyDefinitions/cosmos-filter" = New-Definition -DisplayName 'Azure Cosmos DB accounts need a network filter (example)' -Condition @{ allOf = @(@{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' }, @{ field = 'Microsoft.DocumentDB/databaseAccounts/isVirtualNetworkFilterEnabled'; equals = $false }) } -Then @{ effect = 'Deny' } }
+        $script:assignments = @(@{ name = 'cosmos-filter'; properties = @{ displayName = 'Cosmos filter'; scope = $subscriptionScope; enforcementMode = 'Default'; policyDefinitionId = "$mg/policyDefinitions/cosmos-filter" } })
+        $filtered = Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'public' })
+        ($filtered.Rules | Where-Object Policy -eq 'Azure Cosmos DB accounts need a network filter (example)').Category | Should -Not -Be 'COSMOSPUBLIC'
+        (Get-Check $filtered 'COSMOSPUBLIC').evidence.privateEndpointRequired | Should -BeFalse
+        # The built-in "Azure Cosmos DB accounts should have firewall rules" (862e97cf, version 2.1.0, its condition as Azure
+        # Policy's GitHub repository has it; Deny by default) denies an account with public access on only when its virtual
+        # network filter is off, so T5's public settings meet it.
+        $firewallRules = @{ allOf = @(
+                @{ field = 'type'; equals = 'Microsoft.DocumentDB/databaseAccounts' }
+                @{ anyOf = @(@{ field = 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess'; exists = 'false' }, @{ field = 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess'; equals = 'Enabled' }) }
+                @{ anyOf = @(@{ field = 'Microsoft.DocumentDB/databaseAccounts/isVirtualNetworkFilterEnabled'; exists = 'false' }, @{ field = 'Microsoft.DocumentDB/databaseAccounts/isVirtualNetworkFilterEnabled'; equals = 'false' }) }
+                @{ allOf = @(
+                        @{ anyOf = @(@{ field = 'Microsoft.DocumentDB/databaseAccounts/ipRules'; exists = 'false' }, @{ count = @{ field = 'Microsoft.DocumentDB/databaseAccounts/ipRules[*]' }; equals = 0 }) }
+                        @{ anyOf = @(@{ field = 'Microsoft.DocumentDB/databaseAccounts/ipRangeFilter'; exists = 'false' }, @{ field = 'Microsoft.DocumentDB/databaseAccounts/ipRangeFilter'; equals = '' }) }
+                        @{ anyOf = @(@{ count = @{ field = 'Microsoft.DocumentDB/databaseAccounts/privateEndpointConnections[*]'; where = @{ field = 'Microsoft.DocumentDB/databaseAccounts/privateEndpointConnections[*].privateLinkServiceConnectionState.status'; equals = 'Approved' } }; less = 1 }) }
+                    ) }
+            ) }
+        $script:definitions = @{ "$mg/policyDefinitions/cosmos-firewall" = New-Definition -DisplayName 'Azure Cosmos DB accounts should have firewall rules' -Condition $firewallRules -Then @{ effect = "[parameters('effect')]" } -Parameters @{ effect = @{ type = 'String'; defaultValue = 'Deny' } } }
+        $script:assignments = @(@{ name = 'cosmos-firewall'; properties = @{ displayName = 'Cosmos firewall rules'; scope = $subscriptionScope; enforcementMode = 'Default'; policyDefinitionId = "$mg/policyDefinitions/cosmos-firewall" } })
+        $firewall = Get-DemoPolicyConstraint -Config (New-TestConfig -Override @{ networkMode = 'public' })
+        @($firewall.Rules | Where-Object Policy -eq 'Azure Cosmos DB accounts should have firewall rules').Count | Should -Be 1 -Because 'the rule is read, with its Deny'
+        ($firewall.Rules | Where-Object Policy -eq 'Azure Cosmos DB accounts should have firewall rules').Category | Should -Not -Be 'COSMOSPUBLIC'
+        (Get-Check $firewall 'COSMOSPUBLIC').evidence.privateEndpointRequired | Should -BeFalse
     }
 }
 

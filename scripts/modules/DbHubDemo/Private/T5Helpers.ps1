@@ -324,6 +324,313 @@ function Resolve-DemoT5FreeTier {
     return (& $make $true 'Pass' ('No account in the subscription has the free tier, so T5 is created with it: the first {0} RU/s and {1} GB are free, which covers T5''s {2} RU/s.' -f $cosmos['freeTierRUs'], $cosmos['freeTierStorageGB'], $cosmos['throughputRUs']) 'Free')
 }
 
+function Get-DemoT5PolicyAccess {
+    <#
+    .SYNOPSIS
+    What the policies mean for a new T5's network (2026-11-21, ADR 0027): whether it needs a private endpoint, with
+    PREFLIGHT.POLICY.COSMOSPUBLIC's status and message. Returns Required, Reason, Policies, Status, and Message. Pure.
+    Internal.
+
+    .DESCRIPTION
+    As T3 does, a private endpoint only when something needs it:
+    - networkMode private: the endpoint (Reason NetworkMode).
+    - A policy that turns Azure Cosmos DB public network access off (Modify) or denies an account with it on (Deny), the
+      COSMOSPUBLIC category of Get-DemoPolicyRuleCategory: the endpoint, which works under it (Reason Policy).
+    - The policies couldn't all be read, or weren't read (-NotRead): the endpoint, which works under any policy (Reason
+      Unknown).
+    - Preflight's what-if found that Azure Policy denies a T5 with public network access (-Denied, Azure's reason), under
+      a policy the inventory doesn't read, such as one assigned to the resource group: the endpoint (Reason Policy; the
+      review of fae05b4, 2026-11-22).
+    - Otherwise none (Reason None): public network access on, limited to T1's subnet through its service endpoint.
+    An existing account keeps what it has, whatever this says, unless a policy needs the endpoint
+    (Resolve-DemoT5NetworkAccess).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('public', 'private')]
+        [string] $NetworkMode,
+
+        [AllowEmptyCollection()]
+        [string[]] $Policy = @(),
+
+        [bool] $Complete = $false,
+
+        [switch] $NotRead,
+
+        [string] $Why = '',
+
+        [string] $Denied = ''
+    )
+
+    $policies = @($Policy | Where-Object { $_ } | Select-Object -Unique)
+    $make = {
+        param([bool] $Required, [string] $Reason, [string] $Status, [string] $Message)
+        [pscustomobject]@{ Required = $Required; Reason = $Reason; Policies = $policies; Status = $Status; Message = $Message }
+    }
+    $kept = 'so T5 keeps a private endpoint in snet-pe, with public network access off'
+    if ($NetworkMode -eq 'private') {
+        return (& $make $true 'NetworkMode' $(if ($NotRead) { 'Not selected' } else { 'Pass' }) ('networkMode is private, {0}, as T3 does.' -f $kept))
+    }
+    if ($Denied) {
+        return (& $make $true 'Policy' 'Pass' ('The what-if found that Azure Policy denies T5 with public network access ({0}), under a policy the inventory doesn''t read (one assigned to the resource group, say), so T5 is deployed behind a private endpoint in snet-pe, with public network access off, which works under it. Its endpoint and private DNS zone bill all month (estimate-cost.ps1 prices them).' -f (Protect-DemoText -Text $Denied.TrimEnd('.'))))
+    }
+    if ($policies.Count -gt 0) {
+        $list = (@($policies | Select-Object -First 3) -join '; ') + $(if ($policies.Count -gt 3) { '; and {0} more' -f ($policies.Count - 3) } else { '' })
+        return (& $make $true 'Policy' 'Pass' ('Azure Policy turns Azure Cosmos DB public network access off or denies it ({0}), {1}, which works under it. Its endpoint and private DNS zone bill all month (estimate-cost.ps1 prices them).' -f $list, $kept))
+    }
+    if ($NotRead -or -not $Complete) {
+        $what = if ($NotRead) { 'The policy inventory didn''t run' } else { 'Not every policy that applies could be read' }
+        return (& $make $true 'Unknown' $(if ($NotRead) { 'Not selected' } else { 'Pass' }) ('{0}{1}, so a new T5 gets a private endpoint in snet-pe, with public network access off, which works under any policy; its endpoint and private DNS zone bill all month. An existing T5 keeps what it has (DEPLOY.T5.NETWORK).' -f $what, $(if ($Why) { ' ({0})' -f $Why.TrimEnd('.') } else { '' })))
+    }
+    return (& $make $false 'None' 'Pass' 'No policy turns Azure Cosmos DB public network access off or denies it, so in public mode a new T5 has no private endpoint: its public network access is on, limited to T1''s subnet through that subnet''s service endpoint, as T3''s, which saves the endpoint and its private DNS zone. Database Hub''s Security page then lists T5''s public network access, as it does T3''s. An existing T5 keeps what it has (DEPLOY.T5.NETWORK).')
+}
+
+function Resolve-DemoT5NetworkAccess {
+    <#
+    .SYNOPSIS
+    Whether this deployment keeps T5 behind a private endpoint (the template's t5PrivateAccess), and DEPLOY.T5.NETWORK, which
+    says why (2026-11-21, ADR 0027). Returns PrivateAccess, Reason, and Result. A read. Internal.
+
+    .DESCRIPTION
+    - networkMode private: the endpoint, as T3 (Reason NetworkMode).
+    - An existing account keeps what it has, so an update changes nothing in T5's network: public network access off (an
+      account with its private endpoint, as every account deployed before 2026-11-21) keeps its endpoint and DNS zone, and
+      snet-sqlvm keeps its service endpoints (Reason Existing); on keeps T1's subnet rule (Reason ExistingPublic), unless a
+      policy now needs the endpoint (Reason Policy).
+    - A new account (Get-DemoT5State: NotFound): the endpoint when a policy needs it, or when the policies couldn't all be
+      read or weren't (-Policy, PREFLIGHT.POLICY.COSMOSPUBLIC's evidence; none at all counts as not read: Reason
+      PolicyUnknown); otherwise public network access limited to T1's subnet through its service endpoint (Reason Public).
+    - An account that couldn't be read, or is being deleted: the endpoint, which works in every case (Reason Unread).
+    - -PolicyFound, what the template step found that preflight didn't (the review of fae05b4, 2026-11-22): Azure Policy
+      denied T5 with public network access (Denied, Azure's reason in -PolicyFoundText), or turned it off when the template
+      deployed it, with no endpoint (Modified). Either way the endpoint, which works under the policy, deployed again in
+      the same run (Reason Policy).
+    -AccountState is Get-DemoT5State's answer when the caller has read it already.
+    Sources: https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints,
+    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint (checked 2026-11-21), and
+    https://learn.microsoft.com/azure/governance/policy/concepts/effect-modify and
+    https://learn.microsoft.com/azure/governance/policy/concepts/effect-deny (checked 2026-11-22).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('public', 'private')]
+        [string] $NetworkMode,
+
+        [AllowNull()]
+        [object] $Policy = $null,
+
+        [string] $DeploymentId = '',
+
+        [AllowNull()]
+        [object] $AccountState = $null,
+
+        [ValidateSet('', 'Denied', 'Modified')]
+        [string] $PolicyFound = '',
+
+        [string] $PolicyFoundText = ''
+    )
+
+    $cosmos = Get-DemoCosmosSetting
+    $current = if ($null -ne $AccountState) { $AccountState } else { Get-DemoT5State -Config $Config -DeploymentId $DeploymentId }
+    $names = Get-DemoMemberValue -InputObject $current -Name 'Names'
+    $accountName = [string](Get-DemoMemberValue -InputObject $names -Name 'AccountName')
+    $endpointName = [string](Get-DemoMemberValue -InputObject $names -Name 'PrivateEndpointName')
+    $exists = [bool](Get-DemoMemberValue -InputObject $current -Name 'Exists')
+    $state = [string](Get-DemoMemberValue -InputObject $current -Name 'State')
+    $public = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+    $required = Get-DemoMemberValue -InputObject $Policy -Name 'privateEndpointRequired'
+    $policyReason = [string](Get-DemoMemberValue -InputObject $Policy -Name 'reason')
+    $policies = @(foreach ($item in (Get-DemoMemberList -InputObject $Policy -Name 'policies')) { if ($item) { [string]$item } })
+    $policyText = if ($policies.Count -gt 0) { ' ({0})' -f ((@($policies | Select-Object -First 3) -join '; ') + $(if ($policies.Count -gt 3) { '; and {0} more' -f ($policies.Count - 3) } else { '' })) } else { '' }
+    $label = if ($accountName) { 'T5 ({0})' -f $accountName } else { 'T5' }
+    $make = {
+        param([bool] $Private, [string] $Reason, [string] $Status, [string] $Message, [string] $Remediation = '')
+        $evidence = [ordered]@{ account = $accountName; privateAccess = $Private; reason = $Reason; networkMode = $NetworkMode; existed = $exists; publicNetworkAccess = $public; privateEndpoint = $(if ($Private) { $endpointName } else { '' }); policies = $policies }
+        if ($PolicyFound) {
+            $evidence['policyFound'] = $PolicyFound
+        }
+        $doc = if ($Private) { [string]$cosmos['docUrls']['privateEndpoint'] } else { [string]$cosmos['docUrls']['vnetServiceEndpoint'] }
+        [pscustomobject]@{ PrivateAccess = $Private; Reason = $Reason; Result = (New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $doc) }
+    }
+    $endpointText = 'its private endpoint {0} in snet-pe, with public network access off' -f $endpointName
+    if ($NetworkMode -eq 'private') {
+        return (& $make $true 'NetworkMode' 'Pass' ('{0} is reached through {1}: networkMode is private, as for T3.' -f $label, $endpointText))
+    }
+    if ($PolicyFound) {
+        $found = if ($PolicyFound -eq 'Denied') { 'Azure Policy denied it with public network access ({0})' -f $(if ($PolicyFoundText) { Protect-DemoText -Text $PolicyFoundText.TrimEnd('.') } else { 'RequestDisallowedByPolicy' }) } else { 'Azure Policy turned its public network access off when the template deployed it, and it had no private endpoint for T1 to reach it through' }
+        return (& $make $true 'Policy' 'Pass' ('{0} is reached through {1}: {2}, under a policy that preflight didn''t find (one assigned to the resource group, say), so this run deployed it again with the endpoint, which works under it. Its endpoint and private DNS zone bill all month (estimate-cost.ps1 prices them).' -f $label, $endpointText, $found))
+    }
+    if ($exists -and $public -ine 'Enabled') {
+        return (& $make $true 'Existing' 'Pass' ('{0} keeps {1}, and its private DNS zone: an update changes nothing in an existing account''s network. In public mode, a new T5 gets none unless a policy needs it (ADR 0027).' -f $label, $endpointText))
+    }
+    if ($exists) {
+        if ($policyReason -eq 'Policy') {
+            return (& $make $true 'Policy' 'Pass' ('{0} moves to a private endpoint ({1}), because Azure Policy now turns Azure Cosmos DB public network access off or denies it{2}.' -f $label, $endpointText, $policyText))
+        }
+        return (& $make $false 'ExistingPublic' 'Pass' ('{0} keeps its network as it is: public network access on, limited to T1''s subnet (snet-sqlvm) through that subnet''s service endpoint, as T3''s, with no private endpoint. T5.NETWORK checks it.' -f $label))
+    }
+    if ($state -ne 'NotFound') {
+        $problem = [string](Get-DemoMemberValue -InputObject $current -Name 'Error')
+        return (& $make $true 'Unread' 'Warning' ('{0} couldn''t be read ({1}), so it keeps, or gets, {2}, which works in every case.' -f $label, $(if ($problem) { Protect-DemoText -Text $problem } else { 'its state is {0}' -f $(if ($state) { $state } else { 'unknown' }) }), $endpointText) 'Nothing to do: the next ./scripts/deploy.ps1 reads it again.')
+    }
+    if ($required -is [bool] -and -not $required) {
+        return (& $make $false 'Public' 'Pass' ('{0} has no private endpoint: networkMode is public, and no policy turns Azure Cosmos DB public network access off or denies it, so its public network access is on, limited to T1''s subnet (snet-sqlvm) through that subnet''s service endpoint, as T3''s. That saves the endpoint and its private DNS zone; Database Hub''s Security page lists T5''s public network access, as it does T3''s. T5.NETWORK checks it.' -f $label))
+    }
+    if ($policyReason -eq 'Policy') {
+        return (& $make $true 'Policy' 'Pass' ('{0} is reached through {1}, because Azure Policy turns Azure Cosmos DB public network access off or denies it{2}.' -f $label, $endpointText, $policyText))
+    }
+    return (& $make $true 'PolicyUnknown' 'Pass' ('{0} gets {1}: not every policy that applies was read (PREFLIGHT.POLICY.COSMOSPUBLIC), and the endpoint works under any policy.' -f $label, $endpointText))
+}
+
+function Get-DemoT5PrivateEndpointStatus {
+    <#
+    .SYNOPSIS
+    Whether T5 has, or gets, its private endpoint and private DNS zone, for the cost estimate (Get-DemoCostEstimate
+    -T5PrivateEndpoint; 2026-11-21, ADR 0027): $true, $false, or $null when T5 is off or it can't be told, which the estimate
+    prices as an upper bound. Resolve-DemoT5NetworkAccess's answer, with -Policy when preflight has it; without it, a new
+    account's answer isn't known (only preflight reads the policies). Never throws. A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [ValidateSet('', 'public', 'private')]
+        [string] $NetworkMode = '',
+
+        [AllowNull()]
+        [object] $Policy = $null,
+
+        [string] $DeploymentId = '',
+
+        [AllowNull()]
+        [object] $AccountState = $null
+    )
+
+    if (-not (Test-DemoT5Enabled -Config $Config)) {
+        return $null
+    }
+    try {
+        $mode = if ($NetworkMode) { $NetworkMode } elseif ([string]$Config['networkMode'] -in 'public', 'private') { [string]$Config['networkMode'] } else { '' }
+        $current = if ($null -ne $AccountState) { $AccountState } else { Get-DemoT5State -Config $Config -DeploymentId $DeploymentId }
+        if (-not $mode) {
+            # networkMode auto, not resolved here: an existing account says what it has; a new one isn't known.
+            if ([bool](Get-DemoMemberValue -InputObject $current -Name 'Exists')) {
+                return ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess') -ine 'Enabled')
+            }
+            return $null
+        }
+        $resolved = Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode $mode -Policy $Policy -AccountState $current
+        if ($resolved.Reason -eq 'Unread' -or ($resolved.Reason -eq 'PolicyUnknown' -and $null -eq $Policy)) {
+            return $null
+        }
+        return [bool]$resolved.PrivateAccess
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('Whether T5 has a private endpoint couldn''t be read, so the estimate prices it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $null
+    }
+}
+
+function Get-DemoT5SubnetServiceEndpoint {
+    <#
+    .SYNOPSIS
+    Whether T1's subnet, snet-sqlvm, has the Microsoft.AzureCosmosDB service endpoint now (the review of 31ccf40, 2026-11-22),
+    which a T5 without a private endpoint needs: only the service endpoint sends the subnet's identity to Azure Cosmos DB,
+    and the account's virtual network rule refuses every other source (403). Returns Present ($true, $false, or $null when
+    it can't be read), State (the endpoint's provisioningState), Subnet, and Error. -SubnetId names the subnet, a T5 virtual
+    network rule's; without it, the demo's own snet-sqlvm. A read. Never throws. Internal.
+    Sources: https://learn.microsoft.com/cli/azure/network/vnet/subnet#az-network-vnet-subnet-show and
+    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint (checked 2026-11-22).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $SubnetId = ''
+    )
+
+    $group = Get-DemoResourceGroupName -Config $Config
+    $network = 'vnet-{0}-{1}' -f $Config['prefix'], $Config['environment']
+    $subnet = 'snet-sqlvm'
+    if ($SubnetId -match '(?i)^/subscriptions/[^/]+/resourceGroups/(?<group>[^/]+)/providers/Microsoft\.Network/virtualNetworks/(?<network>[^/]+)/subnets/(?<subnet>[^/]+)$') {
+        $group = $Matches['group']
+        $network = $Matches['network']
+        $subnet = $Matches['subnet']
+    }
+    $make = {
+        param([object] $Present, [string] $State = '', [string] $Problem = '')
+        [pscustomobject]@{ Present = $Present; State = $State; Subnet = $subnet; Error = $Problem }
+    }
+    try {
+        $read = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('network', 'vnet', 'subnet', 'show', '--resource-group', $group, '--vnet-name', $network, '--name', $subnet, '--output', 'json') -AllowFailure
+        if ($read.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$read.StdOut)) {
+            $problem = Protect-DemoText -Text ([string]$read.StdErr).Trim()
+            if ($problem -match '(?i)ResourceNotFound|ParentResourceNotFound|ResourceGroupNotFound|\(404\)') {
+                return (& $make $false '' $problem)
+            }
+            return (& $make $null '' $(if ($problem) { $problem } else { 'no answer' }))
+        }
+        $value = [string]$read.StdOut | ConvertFrom-Json -Depth 32
+        # Assigned first: Get-DemoMemberList returns its array as one object.
+        $endpoints = Get-DemoMemberList -InputObject $value -Name 'serviceEndpoints'
+        $cosmos = $endpoints | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'service') -ieq 'Microsoft.AzureCosmosDB' } | Select-Object -First 1
+        if ($null -eq $cosmos) {
+            return (& $make $false)
+        }
+        return (& $make $true ([string](Get-DemoMemberValue -InputObject $cosmos -Name 'provisioningState')))
+    }
+    catch {
+        return (& $make $null '' (Protect-DemoText -Text $_.Exception.Message))
+    }
+}
+
+function Test-DemoT5WasPublic {
+    <#
+    .SYNOPSIS
+    Whether T5's account has public network access on now, before this deployment (the review of 31ccf40, 2026-11-22): the
+    template's t5WasPublic, which keeps snet-sqlvm's Azure Cosmos DB service endpoint, in either network mode, while the
+    account moves to its private endpoint. A move that Azure refuses (a policy the endpoint doesn't satisfy, say) then
+    leaves T5 as it was, reachable, and the next deployment drops the service endpoint once the account reads public
+    network access off. -AccountState is Get-DemoT5State's answer, $null when it couldn't be read: then snet-sqlvm decides,
+    because the demo gives it that service endpoint only for a public T5, so a T5 with its private endpoint never gets one
+    (Get-DemoT5SubnetServiceEndpoint; a subnet that can't be read counts as without). False with T5 off and for a new
+    account. Never throws. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $AccountState = $null
+    )
+
+    if (-not (Test-DemoT5Enabled -Config $Config)) {
+        return $false
+    }
+    if ([bool](Get-DemoMemberValue -InputObject $AccountState -Name 'Exists')) {
+        $public = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $AccountState -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+        return ($public -ieq 'Enabled')
+    }
+    if ([string](Get-DemoMemberValue -InputObject $AccountState -Name 'State') -eq 'NotFound') {
+        return $false
+    }
+    return ((Get-DemoT5SubnetServiceEndpoint -Config $Config).Present -eq $true)
+}
+
 function Test-DemoT5FreeTierRefusal {
     <#
     .SYNOPSIS
@@ -1017,7 +1324,8 @@ function Remove-DemoT5Container {
     <#
     .SYNOPSIS
     Deletes T5's container through Azure Resource Manager (2026-11-19, ADR 0027), so its provisioned throughput stops
-    billing until a session creates it again; the account, the database, the private endpoint, and the DNS zone stay.
+    billing until a session creates it again; the account and the database stay, with the private endpoint and the DNS zone
+    when it has them.
     Returns Outcome (Deleted, Missing, Failed, or WhatIf), Seconds, and Error. It doesn't check the lifecycle:
     Invoke-DemoT5ContainerStop does. Internal.
     Source: https://learn.microsoft.com/rest/api/cosmos-db-resource-provider/sql-resources/delete-sql-container
@@ -1281,7 +1589,7 @@ function Get-DemoT5LifecycleText {
         return [pscustomobject]@{ Status = 'Warning'; Text = $text; Fix = ('Run ./scripts/stop-demo.ps1 after each session. Or an Owner runs, once: {0}; from then on Run all, the session''s end, and the nightly safety stop delete it too.' -f $grant) }
     }
     if ($value -ceq $script:T5LifecycleSession) {
-        $text = 'T5''s container exists only during a session{0}: start-demo.ps1 and Run all create it, and stop-demo.ps1, the session''s end, and the nightly safety stop delete it, so its {1} RU/s bill only while the demo runs. The session control''s role ("{2}") can create it again, and the account, its database, private endpoint, and DNS zone stay, so Database Hub keeps T5 in its estate.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.RoleName
+        $text = 'T5''s container exists only during a session{0}: start-demo.ps1 and Run all create it, and stop-demo.ps1, the session''s end, and the nightly safety stop delete it, so its {1} RU/s bill only while the demo runs. The session control''s role ("{2}") can create it again, and the account and its database stay, with its private endpoint and DNS zone when it has them, so Database Hub keeps T5 in its estate.' -f $(if ($Lifecycle.Changed) { ' from now on' } else { '' }), $ru, $Lifecycle.RoleName
         return [pscustomobject]@{ Status = 'Pass'; Text = $text; Fix = '' }
     }
     $cost = if ($FreeTier) { 'which costs nothing on the free tier' } else { 'so its {0} RU/s bill around the clock (estimate-cost.ps1 prices them)' -f $ru }
@@ -1437,8 +1745,9 @@ function Invoke-DemoT5ContainerStop {
 
     .DESCRIPTION
     An Azure Cosmos DB account has no stop or pause, and a container's throughput can't be taken away, only deleted with
-    it. The account, its database (no throughput of its own), its private endpoint and DNS zone, and T1's data-plane role
-    (scoped to the account) stay, so Database Hub keeps T5 in its estate, and its Azure Monitor metrics stay readable.
+    it. The account, its database (no throughput of its own), its private endpoint and DNS zone when it has them (2026-11-21),
+    and T1's data-plane role (scoped to the account) stay, so Database Hub keeps T5 in its estate, and its Azure Monitor
+    metrics stay readable.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -1472,7 +1781,10 @@ function Invoke-DemoT5ContainerStop {
     $free = [bool](Get-DemoMemberValue -InputObject $State -Name 'FreeTier')
     $lifecycle = Resolve-DemoT5ContainerLifecycle -Config $Config -Purpose Stop -State $DeploymentState -WhatIf:$WhatIfPreference
     $evidence = [ordered]@{ account = [string]$names.AccountName; container = [string]$names.ContainerName; lifecycle = [string]$lifecycle.Lifecycle; freeTier = $free; throughputRUs = $ru }
-    $stays = 'its private endpoint and private DNS zone bill between sessions (estimate-cost.ps1 prices them)'
+    # 2026-11-21 (ADR 0027): an account with public network access on (T1's subnet rule) has no private endpoint, so then
+    # nothing of T5 bills between sessions.
+    $publicAccess = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $State -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+    $stays = if ($publicAccess -ieq 'Enabled') { 'nothing of T5 bills between sessions: it has no private endpoint (DEPLOY.T5.NETWORK)' } else { 'only its private endpoint and private DNS zone bill between sessions (estimate-cost.ps1 prices them)' }
     if ([string]$lifecycle.Lifecycle -cne $script:T5LifecycleSession) {
         $said = Get-DemoT5LifecycleText -Lifecycle $lifecycle -FreeTier $free -ConfigPath $ConfigPath
         $evidence['outcome'] = 'Kept'
@@ -1485,10 +1797,10 @@ function Invoke-DemoT5ContainerStop {
     $doc = [string]$cosmos['docUrls']['deleteContainer']
     switch ([string]$removed.Outcome) {
         'Deleted' {
-            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} was deleted ({1} seconds), so its {2} RU/s stop billing until the next session creates it again (start-demo.ps1 or Run all). The account stays, so Database Hub keeps T5 in its estate, and only {3}.' -f $names.ContainerName, $removed.Seconds, $ru, $stays) -Evidence $evidence -DocUrl $doc)
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} was deleted ({1} seconds), so its {2} RU/s stop billing until the next session creates it again (start-demo.ps1 or Run all). The account stays, so Database Hub keeps T5 in its estate, and {3}.' -f $names.ContainerName, $removed.Seconds, $ru, $stays) -Evidence $evidence -DocUrl $doc)
         }
         'Missing' {
-            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} isn''t there (an earlier stop deleted it), so nothing of T5 bills but {1}.' -f $names.ContainerName, $stays) -Evidence $evidence -DocUrl $doc)
+            return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5''s container {0} isn''t there (an earlier stop deleted it), so {1}.' -f $names.ContainerName, $stays) -Evidence $evidence -DocUrl $doc)
         }
         'WhatIf' {
             return (New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message ('What if: T5''s container {0} would be deleted; the next session creates it again.' -f $names.ContainerName) -Evidence $evidence -DocUrl $doc)
@@ -1754,9 +2066,12 @@ function Invoke-DemoT5WarmUp {
     and a new assignment can take a few minutes before the data plane honours it; a new private endpoint's DNS record
     too. So a refusal (401 or 403), a name that doesn't resolve, a time-out, or a retryable status (408, 429, 449, 503) is
     tried again every -RetrySeconds until -WaitMinutes pass; anything else is the answer. Each attempt is one action Run
-    Command on sqlvm01 (Invoke-DemoWorkloadCommand), so it never runs beside another one there.
+    Command on sqlvm01 (Invoke-DemoWorkloadCommand), so it never runs beside another one there. -ServiceEndpoint
+    (2026-11-21): T5 is reached through T1's subnet's service endpoint and its virtual network rule (T5.NETWORK's path),
+    which Learn says can take up to 15 minutes to come into effect, with a 403 meanwhile, so the wait is 20 minutes at least.
     Sources: https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-unauthorized,
-    https://learn.microsoft.com/rest/api/cosmos-db/http-status-codes-for-cosmosdb
+    https://learn.microsoft.com/rest/api/cosmos-db/http-status-codes-for-cosmosdb,
+    https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1768,11 +2083,17 @@ function Invoke-DemoT5WarmUp {
         [int] $WaitMinutes = 10,
 
         [ValidateRange(5, 300)]
-        [int] $RetrySeconds = 45
+        [int] $RetrySeconds = 45,
+
+        [switch] $ServiceEndpoint
     )
 
     $cosmos = Get-DemoCosmosSetting
     $docUrl = [string]$cosmos['docUrls']['dataPlaneRbac']
+    if ($ServiceEndpoint) {
+        $WaitMinutes = [System.Math]::Max($WaitMinutes, 20)
+    }
+    $path = if ($ServiceEndpoint) { 'through T1''s subnet''s service endpoint' } else { 'through the private endpoint' }
     $deadline = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
     $attempts = 0
     $run = $null
@@ -1794,20 +2115,25 @@ function Invoke-DemoT5WarmUp {
         if (-not $transient -or [DateTime]::UtcNow.AddSeconds($RetrySeconds) -ge $deadline) {
             break
         }
-        Write-DemoLog -Message ('T5: T1 can''t reach the Cosmos DB account yet (attempt {0}); trying again in {1} seconds, for at most {2} minutes, while its data-plane role and private DNS name come into effect.' -f $attempts, $RetrySeconds, $WaitMinutes)
+        Write-DemoLog -Message ('T5: T1 can''t reach the Cosmos DB account yet (attempt {0}); trying again in {1} seconds, for at most {2} minutes, while its data-plane role and {3} come into effect.' -f $attempts, $RetrySeconds, $WaitMinutes, $(if ($ServiceEndpoint) { 'T1''s subnet''s service endpoint' } else { 'private DNS name' }))
         Start-Sleep -Seconds $RetrySeconds
     }
     $record = if ($null -ne $run) { @($run.Records) | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -like 'WORKLOAD.T5.WARMUP*' } | Select-Object -Last 1 } else { $null }
     $evidence = [ordered]@{ attempts = $attempts; waitMinutes = $WaitMinutes; exitCode = $(if ($null -ne $run) { $run.ExitCode } else { $null }) }
     if ($null -ne $run -and $run.Status -in 'Pass', 'Warning') {
         $said = [string](Get-DemoMemberValue -InputObject $record -Name 'message')
-        $message = 'T1''s managed identity reads and writes T5 with its data-plane role (Cosmos DB Built-in Data Contributor), through the private endpoint{0}.{1}' -f $(if ($attempts -gt 1) { ' after {0} attempts' -f $attempts } else { '' }), $(if ($said) { ' Runner: ' + $said } else { '' })
+        $message = 'T1''s managed identity reads and writes T5 with its data-plane role (Cosmos DB Built-in Data Contributor), {0}{1}.{2}' -f $path, $(if ($attempts -gt 1) { ' after {0} attempts' -f $attempts } else { '' }), $(if ($said) { ' Runner: ' + $said } else { '' })
         return (New-DemoResult -CheckId 'WORKLOAD.T5.WARMUP' -Area 'workload' -Target 'T5' -Status $run.Status -Message $message -Evidence $evidence -DocUrl $docUrl)
     }
     $why = (ConvertTo-DemoPlainText -Value $text).Trim()
     if ($why.Length -gt 600) {
         $why = '...' + $why.Substring($why.Length - 600)
     }
-    $remediation = 'Run ./scripts/deploy.ps1 again: the template assigns T1''s identity the data-plane role, and a new assignment can take a few minutes. If it keeps failing, check that sqlvm01 resolves the account''s documents host to the private endpoint (privatelink.documents.azure.com) and that ./scripts/validate.ps1 -Area T5 passes T5.ACCESS.'
+    $remediation = if ($ServiceEndpoint) {
+        'Run ./scripts/deploy.ps1 again: the template assigns T1''s identity the data-plane role, and a new assignment, or T1''s subnet''s new service endpoint, can take up to 15 minutes. If it keeps failing, check that ./scripts/validate.ps1 -Area T5 passes T5.NETWORK (T5''s virtual network rule allows snet-sqlvm) and T5.ACCESS.'
+    }
+    else {
+        'Run ./scripts/deploy.ps1 again: the template assigns T1''s identity the data-plane role, and a new assignment can take a few minutes. If it keeps failing, check that sqlvm01 resolves the account''s documents host to the private endpoint (privatelink.documents.azure.com) and that ./scripts/validate.ps1 -Area T5 passes T5.ACCESS.'
+    }
     return (New-DemoResult -CheckId 'WORKLOAD.T5.WARMUP' -Area 'workload' -Target 'T5' -Status 'Fail' -Message ('T1 couldn''t read and write T5 with its managed identity ({0} attempt(s)): {1}' -f $attempts, $(if ($why) { $why } else { 'the runner gave no reason' })) -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
 }

@@ -170,6 +170,16 @@ Describe 'T1 associated services (Analysis Services and Integration Services)' {
         $script:agentRestarts | Should -Be 0
     }
 
+    It 'notes the restart setup asks for, by design, as information, so a new T1 stays a Pass (2026-11-23)' {
+        $script:uninstallExit = 3010
+        $context = New-TestSqlVmContext
+        $step = @(Get-DemoSqlVmStepPlan -Context $context | Where-Object Name -eq 'AssociatedServices')
+        Invoke-DemoVmStateMachine -Step $step -Generation 'g1' | Should -Be 'Ready'
+
+        @((Get-DemoVmState)['warnings'] | Where-Object { $_ }).Count | Should -Be 0 -Because 'a restart that setup asks for is expected'
+        @((Get-DemoVmState)['notes']) | Should -Be @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
+    }
+
     It 'warns without trying to uninstall when the image has no setup media' {
         Mock -CommandName Test-Path -ParameterFilter { $LiteralPath -eq 'C:\SQLServerFull\setup.exe' } -MockWith { $false }
         $result = Disable-DemoSqlVmAssociatedService -Context (New-TestSqlVmContext)
@@ -324,7 +334,7 @@ Describe 'T1 automatic sign-in secret (ADR 0009, live finding 2026-11-06)' {
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep -Armed 1 }
         $armed = Clear-DemoSqlVmAutoLogonSecret -Context $script:context
         $armed.Outcome | Should -Be 'Done'
-        @($armed.WarningMessage)[0] | Should -Match 'automatic sign-in was armed on sqlvm01'
+        @($armed.TransientWarningMessage)[0] | Should -Match 'automatic sign-in was armed on sqlvm01' -Because 'what the cleanup did is a one-off note (the F24 review)'
         ([System.IO.File]::ReadAllText($script:record) | ConvertFrom-Json).found | Should -Be 'Armed'
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep -Pass $false -Lone 1 -Left 1 }

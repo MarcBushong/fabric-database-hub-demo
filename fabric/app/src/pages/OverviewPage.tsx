@@ -12,7 +12,7 @@ import { LiveNow } from "@/components/LiveNow";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
-import { FAMILY_LABEL, newestSessionWindow, toBins, toCaptureFindings, toChecks, toCosmosCapture, toFindings, toIncidents, toPostgresCapture, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
+import { FAMILY_LABEL, latestCosmosCapture, latestPostgresCapture, newestSessionWindow, toBins, toCaptureFindings, toChecks, toFindings, toIncidents, toPostgresFindings, toReadinessSummary, toSessions, toTargets, toWaitFlows } from "@/data/model";
 import {
     cosmosFindingsQuery,
     cosmosSeriesQuery,
@@ -29,7 +29,7 @@ import {
 } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { buildAskContext, measuredFindings } from "@/lib/ask";
-import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber } from "@/lib/format";
+import { formatAgoShort, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth } from "@/lib/health";
 import { coverageInsight, dominantWaitInsight, freshnessInsight, lagInsight } from "@/lib/insights";
 import { worstStatus } from "@/lib/status";
@@ -103,9 +103,9 @@ export default function OverviewPage() {
     const checks = useMemo(() => toChecks(checksState.data?.rows ?? []), [checksState.data]);
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
     const sessionWindow = useMemo(() => newestSessionWindow(sessions), [sessions]);
-    const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
+    const capture = useMemo(() => latestPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
-    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmos = useMemo(() => latestCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
     const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
 
     const health = useMemo(() => {
@@ -197,7 +197,7 @@ export default function OverviewPage() {
                         />
                         <KpiTile
                             label="Demo readiness"
-                            value={hasRun && readiness !== null ? `${Math.round(readiness * 100)} %` : "–"}
+                            value={hasRun && readiness !== null ? percent(readiness) : "–"}
                             status={hasRun ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null}
                             sub={hasRun ? `${summary.failed} failed · ${summary.manual} manual · ${summary.warnings} warnings` : "Run all in NB_DatabaseHub_Control fills this"}
                             onOpen={() => navigate("readiness")}

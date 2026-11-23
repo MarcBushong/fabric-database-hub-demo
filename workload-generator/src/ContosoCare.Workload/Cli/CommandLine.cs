@@ -419,31 +419,13 @@ internal static partial class CommandLine
                 var flags = await database.GetStopFlagsAsync(cancellationToken).ConfigureAwait(false);
                 var sessions = await database.GetDemoSessionsAsync(null, cancellationToken).ConfigureAwait(false);
                 var space = await database.GetSpaceAsync(cancellationToken).ConfigureAwait(false);
+                var queryStore = await database.ReadQueryStoreAsync(cancellationToken).ConfigureAwait(false);
                 var now = DateTimeOffset.UtcNow;
                 var host = HostLaneStatus.ForThisMachine(parseResult.GetValue(hostFile) ?? HostLanesFile.DefaultPath, endpoint.Target, ProfileHost.IsActive(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default));
                 var output = parseResult.InvocationConfiguration.Output;
                 if (parseResult.GetValue(json))
                 {
-                    var document = new JsonObject
-                    {
-                        ["target"] = endpoint.Target.ToString(),
-                        ["profile"] = new JsonObject
-                        {
-                            ["name"] = profile.Name,
-                            ["setAt"] = DemoDatabase.Format(profile.SetAt),
-                            ["setBy"] = profile.SetBy,
-                            ["expiresAt"] = profile.ExpiresAt is { } expires ? DemoDatabase.Format(expires) : null,
-                            ["description"] = ProfileHost.Describe(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default),
-                        },
-                        ["runs"] = new JsonArray([.. runs.Select(RunNode)]),
-                        ["stopRequests"] = new JsonArray([.. flags.Select(f => (JsonNode)new JsonObject { ["scenario"] = f.ScenarioId, ["requestedAt"] = f.RequestedAt is { } at ? DemoDatabase.Format(at) : null, ["requestedBy"] = f.RequestedBy })]),
-                        ["demoSessions"] = sessions is null ? null : new JsonArray([.. sessions.Select(s => (JsonNode)new JsonObject { ["sessionId"] = s.SessionId, ["applicationName"] = s.ProgramName, ["status"] = s.Status, ["openTransactions"] = s.OpenTransactions, ["blockedBy"] = s.BlockingSessionId, ["waitType"] = s.WaitType })]),
-                        ["dataHeadroomMb"] = space.DataHeadroomMb,
-                        ["logHeadroomMb"] = space.LogHeadroomMb,
-
-                        // Last, so the tail of the output that a Run Command keeps still holds it (validation's WORKLOAD.<target>.HOST).
-                        ["host"] = host.ToNode(),
-                    };
+                    var document = SqlStatusNode(endpoint.Target, profile, ProfileHost.Describe(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default), runs, flags, sessions, space, queryStore, host);
                     output.WriteLine(document.ToJsonString(OutputOptions));
                     return ExitCodes.Success;
                 }
@@ -452,6 +434,7 @@ internal static partial class CommandLine
                 output.WriteLine($"Profile:  {ProfileHost.Describe(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default)}");
                 output.WriteLine($"Host:     [{host.Status}] {host.Message}");
                 output.WriteLine(string.Create(CultureInfo.InvariantCulture, $"Headroom: data {space.DataHeadroomMb?.ToString(CultureInfo.InvariantCulture) ?? "uncapped"} MB, log {space.LogHeadroomMb?.ToString(CultureInfo.InvariantCulture) ?? "managed or uncapped"} MB"));
+                output.WriteLine($"Query Store: {QueryStoreText(queryStore)}");
                 output.WriteLine(sessions is null ? "Sessions: not visible (needs VIEW SERVER STATE or VIEW DATABASE STATE)" : string.Create(CultureInfo.InvariantCulture, $"Sessions: {sessions.Count} live demo session(s), {sessions.Count(s => s.OpenTransactions > 0)} with an open transaction, {sessions.Count(s => s.BlockingSessionId is > 0)} blocked"));
                 foreach (var flag in flags)
                 {

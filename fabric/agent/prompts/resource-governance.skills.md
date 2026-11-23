@@ -39,7 +39,7 @@ Using the telemetry agent instructions, adapt sample query 5 to {target} for {in
 ### 2. Queued IO and gaps
 
 ```text
-For {target} over {incidentWindow}, write a KQL query on SqlServerStorageIO that reports the delta of queued read and write stalls per file, following the rule for cumulative counters, then list any gaps longer than two minutes in the CPU samples and say whether they could be the database pausing. Don't change anything.
+For {target} over {incidentWindow}, write a KQL query on SqlServerStorageIO that reports the delta of queued read and write stalls per file, following the rule for cumulative counters, then list any gaps longer than two minutes in the CPU samples and say whether they could be the database pausing. On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID. Don't change anything.
 ```
 
 ### 3. Which governed resource ran out, with the SQL diagnostics skill

@@ -903,8 +903,9 @@ function New-DemoT4OffResult {
     <#
     .SYNOPSIS
     DEPLOY.T4.OFF (2026-11-09): T4 is never out of a deployment silently. A Fail, because DONE needs T4, with the exact
-    reason and fix (Get-DemoT4OffReason: Azure refused every size, with a Region access request or t4SkuName as the fix).
-    $null when T4 is deployed. Pure. Internal.
+    reason and fix (Get-DemoT4OffReason: Azure refused every size, with a Region access request or t4SkuName as the fix,
+    or, over the subscription's vCore quota, DEPLOY.T4.SKU's fix: F37, 2026-11-22). $null when T4 is deployed. Pure.
+    Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
     [CmdletBinding()]
@@ -923,7 +924,14 @@ function New-DemoT4OffResult {
     if (-not $reason) {
         return $null
     }
-    return (New-DemoResult -CheckId 'DEPLOY.T4.OFF' -Area 't4' -Target 'T4' -Status 'Fail' -Message $reason -Evidence ([ordered]@{ recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') }) -Remediation 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you in the region, then run ./scripts/deploy.ps1, which tries again.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
+    # Azure refused a size over the subscription's vCore quota (F37, 2026-11-22): the fix is DEPLOY.T4.SKU's, room in the
+    # quota, more quota, or another region, rather than a Region access request alone.
+    $refused = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string]$_.status -eq 'Fail' }) | Select-Object -Last 1
+    $fix = 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you in the region, then run ./scripts/deploy.ps1, which tries again.'
+    if ($null -ne $refused -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $refused -Name 'evidence') -Name 'overQuota') -and [string]$refused.remediation) {
+        $fix = [string]$refused.remediation
+    }
+    return (New-DemoResult -CheckId 'DEPLOY.T4.OFF' -Area 't4' -Target 'T4' -Status 'Fail' -Message $reason -Evidence ([ordered]@{ recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') }) -Remediation $fix -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
 }
 function Get-DemoDoneRequirement {
     <#

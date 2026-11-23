@@ -634,7 +634,7 @@ function Get-DemoPolicyRuleCategory {
     Classifies one kept policy rule for the preflight policy checks.
 
     .DESCRIPTION
-    Internal. Returns MFA, SQLPUBLIC, SQLENTRAONLY, DEFENDER, EXTENSIONS, PUBLICIP, STORAGE, VMSIZE,
+    Internal. Returns MFA, SQLPUBLIC, SQLENTRAONLY, COSMOSPUBLIC (2026-11-21), DEFENDER, EXTENSIONS, PUBLICIP, STORAGE, VMSIZE,
     RESOURCETYPES, OTHER (any other rule that can apply to a resource type the demo creates: -ResourceType, every type
     by default), or UNRELATED.
     #>
@@ -677,6 +677,32 @@ function Get-DemoPolicyRuleCategory {
     }
     if ($effect -eq 'Deny' -and @($fields | Where-Object { $_ -match '^Microsoft\.Sql/servers/(administrators\.azureADOnlyAuthentication|azureADOnlyAuthentications/azureADOnlyAuthentication)$' }).Count -gt 0) {
         return 'SQLENTRAONLY'
+    }
+
+    # T5 (2026-11-21, ADR 0027): a policy that turns Azure Cosmos DB public network access off (Modify, a value that's
+    # Disabled or can't be told), or denies an account with it on, or with its network filter as T5 sets it in public mode
+    # (Deny, unless its condition is provably false for that account), keeps T5's private endpoint. A rule this can't
+    # evaluate counts, so T5 keeps the endpoint rather than fail to deploy.
+    $cosmosPublicAccess = '^Microsoft\.DocumentDB/databaseAccounts/publicNetworkAccess$'
+    if ($effect -eq 'Modify') {
+        # Assigned first: Get-DemoMemberValue keeps a list whole, so @() around the call would nest it.
+        $cosmosOperations = Get-DemoMemberValue -InputObject $details -Name 'operations'
+        foreach ($operation in @($cosmosOperations)) {
+            if ($operation -isnot [System.Collections.IDictionary]) {
+                continue
+            }
+            $field = Resolve-DemoPolicyExpression -Value $operation['field'] -Parameter $Rule.Parameters
+            $value = Resolve-DemoPolicyExpression -Value $operation['value'] -Parameter $Rule.Parameters
+            if ($field.Known -and [string]$field.Value -match $cosmosPublicAccess -and (-not $value.Known -or [string]$value.Value -eq 'Disabled')) {
+                return 'COSMOSPUBLIC'
+            }
+        }
+    }
+    if ($effect -eq 'Deny' -and @($fields | Where-Object { $_ -match '^Microsoft\.DocumentDB/databaseAccounts/(publicNetworkAccess|isVirtualNetworkFilterEnabled|virtualNetworkRules|ipRules|networkAclBypass)' }).Count -gt 0) {
+        $facts = @{ type = 'Microsoft.DocumentDB/databaseAccounts'; 'Microsoft.DocumentDB/databaseAccounts/publicNetworkAccess' = 'Enabled'; 'Microsoft.DocumentDB/databaseAccounts/isVirtualNetworkFilterEnabled' = $true }
+        if ((Test-DemoPolicyCondition -Condition $Rule.Condition -Fact $facts -Parameter $Rule.Parameters) -ne $false) {
+            return 'COSMOSPUBLIC'
+        }
     }
 
     if ($effect -eq 'DeployIfNotExists') {

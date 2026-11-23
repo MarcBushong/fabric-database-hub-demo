@@ -11,7 +11,7 @@ import { useAuth } from "./hooks/auth.context";
 import { sqlTargets } from "./lib/estate";
 import { useMediaQuery } from "./lib/hooks";
 import type { AppRuntime } from "./lib/runtime-config";
-import { isEmbedded, loadSavedView, mergeView, parseHash, replaceAddress, saveView, toHash, windowRange, type PageId, type ViewState } from "./lib/view-state";
+import { isEmbedded, loadSavedView, openView, parseHash, replaceAddress, saveView, toHash, windowRange, type PageId, type ViewState } from "./lib/view-state";
 import { AppShell } from "./shell/AppShell";
 
 const MissionControlPage = lazy(() => import("./pages/MissionControlPage"));
@@ -49,7 +49,7 @@ const PAGE_COMPONENTS: Record<PageId, ComponentType> = {
 function initialView(): ViewState {
     const fromHash = typeof window !== "undefined" ? parseHash(window.location.hash) : {};
     const saved = typeof window !== "undefined" ? loadSavedView(window.localStorage) : {};
-    return mergeView(saved, fromHash);
+    return openView(saved, fromHash);
 }
 
 export interface AppProps {
@@ -165,7 +165,7 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
     const setView = useCallback((patch: Partial<ViewState>) => setViewState((v) => ({ ...v, ...patch })), []);
     const navigate = useCallback(
         (page: PageId, patch: Partial<ViewState> = {}) => {
-            setViewState((v) => ({ ...v, page, target: null, incident: null, replay: null, category: null, ...patch }));
+            setViewState((v) => ({ ...v, page, target: null, incident: null, replay: null, category: null, rcaFilters: null, ...patch }));
             document.getElementById("main")?.scrollTo?.({ top: 0 });
         },
         [],

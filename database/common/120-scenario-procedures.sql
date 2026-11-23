@@ -1652,6 +1652,14 @@ GO
 -- frontdesk.usp_visit_summary's own queries are touched, and only by reading. Azure SQL Database only: SQL Server
 -- 2022 Standard (T1, T2) has no automatic tuning, and the runner there can't recompile or unforce.
 --
+-- The switch is checked (F26, 2026-11-21): sp_recompile only drops the cached plan, and the lookup's next run compiles
+-- it with its own patients (Learn: sp_recompile), so a lookup of another worker that compiled around the switch could put
+-- plan A back within the same second. The other workers now stay out from 2 seconds before the switch, so worker 1's
+-- compilation is the only one. Then worker 1 reads the lookup's cached plan (sys.dm_exec_procedure_stats,
+-- sys.dm_exec_text_query_plan): one that still seeks ix_appointments_patient is switched again, 20 and 40 seconds later,
+-- in the other workers' quiet windows then. Events: plan-switch, plan-switch-retry, or plan-switch-unverified, a Warning
+-- that the regression didn't start, or couldn't be checked.
+--
 -- The Database Agent beat (2026-11-18, the showcase's second cycle on T3): @hold_auto_correction = 1 turns
 -- FORCE_LAST_GOOD_PLAN off for the run, after demo.auto_tuning_hold records how it was, so the regression lasts until
 -- Database Agents raises its issue (about 15 minutes after a condition starts, Learn). @respond_percent > 0 is the manual
@@ -1686,7 +1694,7 @@ BEGIN
     IF @pause_ms IS NULL OR @pause_ms NOT BETWEEN 0 AND 1000
         THROW 50171, N'@pause_ms must be between 0 (from the intensity) and 1000.', 1;
 
-    DECLARE @switch_at datetime2(3), @quiet_until datetime2(3), @respond_at datetime2(3) = NULL;
+    DECLARE @switch_at datetime2(3), @respond_at datetime2(3) = NULL;
     DECLARE @patients int, @first int, @last int, @visits int, @minutes int, @r bigint;
     DECLARE @good bigint = 0, @regressed bigint = 0, @after_response bigint = 0, @switched bit = 0, @unforced int = 0;
     DECLARE @pause datetime = CASE WHEN @pause_ms > 0 THEN DATEADD(millisecond, @pause_ms, CAST(0 AS datetime)) ELSE demo.fn_pause(@intensity, 400, 0) END;
@@ -1697,9 +1705,13 @@ BEGIN
     DECLARE @held bit = 0, @was_held bit = 0, @released bit = 0, @restored nvarchar(60), @prior nvarchar(60);
     DECLARE @responded bit = 0, @responded_after_seconds int = 0, @already_forced bit = 0;
     DECLARE @response_query_id bigint = NULL, @forced_plan_id bigint = NULL, @regressed_plan_id bigint = NULL, @response_detail nvarchar(400);
+    -- The switch's attempts (F26): at @switch_at and @switch_gap_ms apart, @switch_attempts_max at most; each checked once
+    -- the other workers have run the lookup again for 2 seconds. @switch_verified: 1 the regression runs (or automatic
+    -- tuning has corrected it already), 0 it doesn't or couldn't be read, -1 not checked (the run ended or responded first).
+    DECLARE @switch_gap_ms int = 20000, @switch_attempts_max int = 3, @switch_attempts int = 0, @switch_verified int = -1;
+    DECLARE @attempt_at datetime2(3) = NULL, @verify_at datetime2(3) = NULL, @scans int, @since bigint, @switch_detail nvarchar(400);
 
     SET @switch_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @good_percent / 100 AS int), @started);
-    SET @quiet_until = DATEADD(second, 5, @switch_at);
     IF @respond_percent > 0
         SET @respond_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @respond_percent / 100 AS int), @started);
 
@@ -1750,10 +1762,70 @@ BEGIN
         BEGIN
             SET @switched = 1;
             IF @worker = 1
+                SET @attempt_at = @switch_at;
+        END;
+
+        IF @worker = 1 AND @responded = 0 AND @attempt_at IS NOT NULL AND SYSUTCDATETIME() >= @attempt_at
+        BEGIN
+            -- From here the next compilation sees every patient, so the cached plan scans.
+            SET @switch_attempts += 1;
+            EXEC sys.sp_recompile @objname = N'frontdesk.usp_visit_summary';
+            EXEC frontdesk.usp_visit_summary @first_patient = 1, @last_patient = @patients, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+            -- Checked once the other workers have run the lookup again for 2 seconds (their quiet window ends 5 seconds after
+            -- the attempt), and at least 2 seconds from now.
+            SET @verify_at = DATEADD(second, 7, @attempt_at);
+            IF @verify_at < DATEADD(second, 2, SYSUTCDATETIME())
+                SET @verify_at = DATEADD(second, 2, SYSUTCDATETIME());
+            SET @attempt_at = NULL;
+        END;
+
+        IF @worker = 1 AND @responded = 0 AND @verify_at IS NOT NULL AND SYSUTCDATETIME() >= @verify_at
+        BEGIN
+            -- Is the plan the lookup runs now the scanning one? Plan A seeks ix_appointments_patient; plan B scans
+            -- care.appointments and names no other index. A plan that can't be read leaves it unknown. Plan A that automatic
+            -- tuning forced already (FORCE_LAST_GOOD_PLAN on) means the regression ran and was corrected.
+            SET @verify_at = NULL;
+            SET @scans = NULL;
+            SET @switch_detail = NULL;
+            BEGIN TRY
+                SELECT TOP (1) @scans = CASE WHEN CHARINDEX(N'Index="[ix_appointments_patient]"', p.query_plan) > 0 THEN 0 ELSE 1 END
+                FROM sys.dm_exec_procedure_stats AS s
+                CROSS APPLY sys.dm_exec_text_query_plan(s.plan_handle, 0, -1) AS p
+                WHERE s.database_id = DB_ID() AND s.object_id = @lookup AND p.query_plan IS NOT NULL
+                ORDER BY s.last_execution_time DESC;
+                IF @scans = 0 AND EXISTS (
+                    SELECT 1 FROM sys.query_store_plan AS p INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+                    WHERE q.object_id = @lookup AND p.is_forced_plan = 1)
+                    SET @scans = 2;
+            END TRY
+            BEGIN CATCH
+                SET @switch_detail = LEFT(ERROR_MESSAGE(), 200);
+            END CATCH;
+            IF @scans IN (1, 2)
             BEGIN
-                -- From here the next compilation sees every patient, so the cached plan scans.
-                EXEC sys.sp_recompile @objname = N'frontdesk.usp_visit_summary';
-                EXEC frontdesk.usp_visit_summary @first_patient = 1, @last_patient = @patients, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+
+                SET @switch_verified = 1;
+                SET @switch_detail = CASE WHEN @scans = 1
+                    THEN CONCAT(N'The lookup''s cached plan scans care.appointments: the regression runs (switch ', @switch_attempts, N' of ', @switch_attempts_max, N').')
+                    ELSE N'The regression ran, and automatic tuning has forced plan A back already (FORCE_LAST_GOOD_PLAN).' END;
+                EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch', @session_id = @@SPID, @detail = @switch_detail;
+            END;
+            ELSE IF @scans = 0 AND @switch_attempts < @switch_attempts_max
+            BEGIN
+                SET @attempt_at = DATEADD(millisecond, @switch_gap_ms * @switch_attempts, @switch_at);
+                SET @switch_detail = CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after switch ', @switch_attempts,
+                    N': another compilation put plan A back, so the switch runs again ', @switch_gap_ms * @switch_attempts / 1000, N' seconds after the first.');
+                EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-retry', @session_id = @@SPID, @detail = @switch_detail;
+            END;
+            ELSE
+            BEGIN
+                SET @switch_verified = 0;
+                SET @switch_detail = LEFT(CASE WHEN @scans = 0
+                    THEN CONCAT(N'The regression didn''t start: the lookup''s cached plan still seeks ix_appointments_patient after ', @switch_attempts,
+                        N' switches, so CPU stays low. The next run tries again.')
+                    ELSE CONCAT(N'Whether the regression started couldn''t be checked: ', ISNULL(@switch_detail, N'the lookup''s plan isn''t in the plan cache'),
+                        N'. CPU shows it: it rises within minutes when it did.') END, 400);
+                EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-unverified', @session_id = @@SPID, @detail = @switch_detail;
             END;
         END;
 
@@ -1800,8 +1872,12 @@ BEGIN
             END;
         END;
 
-        -- The other workers stay out of the switch's few seconds, so the lookup compiles for every patient.
-        IF @worker > 1 AND SYSUTCDATETIME() >= @switch_at AND SYSUTCDATETIME() < @quiet_until
+        -- The other workers stay out of the lookup from 2 seconds before each of worker 1's switches until 5 seconds after it,
+        -- so the lookup compiles only for every patient then (F26): a lookup that was compiling around the switch, with its
+        -- few patients, could put plan A back. Windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them
+        -- or not, since the workers don't talk to each other.
+        SET @since = DATEDIFF_BIG(millisecond, @switch_at, SYSUTCDATETIME());
+        IF @worker > 1 AND @since >= -2000 AND @since < CAST(@switch_gap_ms AS bigint) * (@switch_attempts_max - 1) + 5000 AND (@since + 2000) % @switch_gap_ms < 7000
             WAITFOR DELAY '00:00:01';
         ELSE
         BEGIN
@@ -1835,6 +1911,8 @@ BEGIN
         responded_after_seconds = @responded_after_seconds, forced_plan_id = ISNULL(@forced_plan_id, 0),
         regressed_plan_id = ISNULL(@regressed_plan_id, 0), already_forced = CAST(@already_forced AS int),
         restored_auto_correction = CAST(@released AS int),
+        switch_attempts = CASE WHEN @worker = 1 THEN @switch_attempts END,
+        switch_verified = CASE WHEN @worker = 1 THEN @switch_verified END,
         forced_now = CAST(CASE WHEN EXISTS (
             SELECT 1 FROM sys.query_store_plan AS p INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
             WHERE q.object_id = @lookup AND p.is_forced_plan = 1) THEN 1 ELSE 0 END AS bit),

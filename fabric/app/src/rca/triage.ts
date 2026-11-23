@@ -4,11 +4,17 @@
 
 import { describeEpisode } from "./detector";
 import { AZURE_MONITOR, summarizeErrors } from "./errors";
+import type { RcaCategory, RcaSeverity } from "./facet-ids";
+import { categoryOf, COUNTED_ERRORS_SEVERITY, severityOf } from "./facets";
 import { asWholeReadings, fromTo, metricIn, openCountWords, plural, spanEnds, type Episode, type EventRow, type Evidence, type RcaTarget } from "./types";
 
 export interface Hypothesis {
     target: RcaTarget;
     family: string;
+    /** Its category and severity, as the Root cause page's facets give them (facets.ts). */
+    category: RcaCategory;
+    severity: RcaSeverity;
+    severityReason: string;
     score: number;
     summary: string;
     /** The tool that explains it; run_dax on the telemetry for a signal Phase 1 doesn't investigate yet. */
@@ -59,14 +65,20 @@ const inWindow = (at: Date, from: Date, to: Date) => at >= from && at <= to;
 
 export function triageWindow(input: { evidence: Evidence; episodes: readonly Episode[] }, from: Date, to: Date, targets: readonly RcaTarget[], stoppedAt?: Date): Triage {
     const episodes = input.episodes.filter((e) => targets.includes(e.target) && e.start <= to && (e.end ?? e.last) >= from);
-    const hypotheses: Hypothesis[] = episodes.map((e) => ({
-        target: e.target,
-        family: e.family,
-        score: Math.round(score(e) * 10) / 10,
-        summary: describeEpisode(e),
-        nextTool: NEXT_TOOL[e.family] ?? "run_dax",
-        episodeKey: e.key,
-    }));
+    const hypotheses: Hypothesis[] = episodes.map((e) => {
+        const s = severityOf(e);
+        return {
+            target: e.target,
+            family: e.family,
+            category: categoryOf(e.family),
+            severity: s.severity,
+            severityReason: s.reason,
+            score: Math.round(score(e) * 10) / 10,
+            summary: describeEpisode(e),
+            nextTool: NEXT_TOOL[e.family] ?? "run_dax",
+            episodeKey: e.key,
+        };
+    });
     // T5's 429s and its normalized RU at 100 % are one incident to a DBA: the throttling, with its RU in the same words.
     for (const ru of hypotheses.filter((h) => h.family === "ru")) {
         const episode = episodes.find((e) => e.key === ru.episodeKey);
@@ -110,7 +122,7 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
               : classes.length === 1
                 ? openCountWords(opened[0].open!, opened[0].known, errorsOrCancels(opened[0].open!.count))
                 : `${plural(n, "error or cancel", "errors and cancels")}: ${classes.map((c) => (c.open ? openCountWords(c.open, c.known, c.title.toLowerCase()) : `${c.count} ${c.title.toLowerCase()} ${fromTo(c.first, c.last)} UTC`)).join("; ")}`;
-        hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
+        hypotheses.push({ target, family: "errors", category: "errors", severity: COUNTED_ERRORS_SEVERITY.severity, severityReason: COUNTED_ERRORS_SEVERITY.reason, score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);
     const flagged = new Set(hypotheses.map((h) => h.target));

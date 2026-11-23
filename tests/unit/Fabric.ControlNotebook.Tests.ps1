@@ -49,8 +49,9 @@ BeforeAll {
         (@($lines | Where-Object { $_.Trim() -and $_ -notmatch '^\s*//' }) -join "`n").Trim()
     }
 
-    # The notebook as deploy.ps1 imports it, for a demo whose VMs shut down at 19:00 in the zone given.
-    function Get-FilledNotebook([string] $Zone = 'UTC', [string] $Prefix = '') {
+    # The notebook as deploy.ps1 imports it, for a demo whose VMs shut down at 19:00 in the zone given; -ControlProblem is
+    # what deploy.ps1 found missing in the session control (F29).
+    function Get-FilledNotebook([string] $Zone = 'UTC', [string] $Prefix = '', [string] $ControlProblem = '') {
         $filledConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $filledConfig['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $filledConfig['autoShutdownTime'] = '1900'
@@ -58,12 +59,12 @@ BeforeAll {
         if ($Prefix) {
             $filledConfig['prefix'] = $Prefix
         }
-        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig } {
+        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig; Problem = $ControlProblem } {
             $controlName = Get-DemoActivityControlName -Config $Config
             $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $controlName -IdentityClientId '99999999-9999-9999-9999-999999999999'
-            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub'
+            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub' -ControlProblem $Problem
         }
-        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix)
+        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}{2}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix, $(if ($ControlProblem) { '-problem' } else { '' }))
         [System.IO.File]::WriteAllBytes($file, [System.Convert]::FromBase64String($definition.Definition['parts'][0]['payload']))
         return $file
     }
@@ -172,7 +173,7 @@ VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
 # job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
 # copy from before the Incident RCA), or Failed; or Completed with the staged file's check raising (review of 37a546bc).
 RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed", "rcajobunchecked")
-RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail") + RCA_JOB_SCENARIOS
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail", "takenoverrca") + RCA_JOB_SCENARIOS
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
 DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
@@ -303,6 +304,20 @@ if scenario == "stoppedlost":
     VAULT["dbhub-session-status"] = json.dumps(stopped_status("b" * 32, ended, kept=False))
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "b" * 32, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=90)),
                                                  "endUtc": iso(ended), "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+if scenario == "takenoverstop":
+    # Session dddd...'s end passed 5 minutes ago, and its end's stop hasn't come: a start-demo.ps1 session took over from it
+    # (2026-11-20), and the app's Stop now runs now, inside the takeover window.
+    RUNBOOK.update(session="d" * 32, accepted=Clock.now - real_dt.timedelta(minutes=95), minutes=90)
+    VAULT["dbhub-session-status"] = json.dumps(running_status("d" * 32, RUNBOOK["accepted"], 90))
+if scenario == "takenoveragain":
+    # Session dddd...'s end, 5 minutes ago, found a start-demo.ps1 session that took over, and stopped nothing (2026-11-20);
+    # Stop now again, inside the takeover window.
+    ended = Clock.now - real_dt.timedelta(minutes=5)
+    RUNBOOK.update(session="d" * 32, accepted=ended - real_dt.timedelta(minutes=90), minutes=90)
+    taken = stopped_status("d" * 32, ended, running_status("d" * 32, RUNBOOK["accepted"], 90))
+    taken.update(stoppedBy="session end", takenOver={"by": "start-demo", "autoStopUtc": iso(ended + real_dt.timedelta(hours=3))},
+                 done=["nothing stopped: a start-demo.ps1 session took over from this one", "busy marker cleared"])
+    VAULT["dbhub-session-status"] = json.dumps(taken)
 if scenario == "endedrunning":
     # Session cccc...'s end passed 10 minutes ago, and nothing stopped it: the run that was ending it was cancelled first.
     RUNBOOK.update(session="c" * 32, accepted=Clock.now - real_dt.timedelta(minutes=100), minutes=90)
@@ -332,8 +347,21 @@ def runbook(body):
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "starting", "acceptedUtc": iso(Clock.now), "steps": []})
     elif action == "stop":
         session = body.get("sessionId") or ""
+        if not session and scenario in ("takenoverstop", "takenoveragain"):
+            # A stop with no session ID writes the stopped status of the session the group names (DbHubSessionId).
+            session = json.loads(VAULT["dbhub-session-status"]).get("sessionId") or ""
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
+        if (scenario in ("takenover", "takenoverrca") or (scenario == "takenoverstop" and body.get("sessionId"))) and session:
+            # A start-demo.ps1 session took over from this one (2026-11-20): the runbook stops nothing at its end, and says
+            # when that session's auto-stop stops the demo (Complete-DbHubTakenOverSession). With the RCA (takenoverrca),
+            # that end exports the session's evidence, as a stop does (the RCA release's merge).
+            until = iso(Clock.now + real_dt.timedelta(hours=3))
+            VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "session end", "failed": [],
+                                                        "done": ["nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at " + until,
+                                                                 "the history's metrics saved to the control vault", "busy marker cleared"],
+                                                        "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."},
+                                                        "takenOver": {"by": "start-demo", "autoStopUtc": until}})
         if session and scenario in RCA_SCENARIOS:
             # A runbook with the Incident RCA (ADR 0031): the stop's export, and each target's capture line, for the notebook.
             stopped = json.loads(VAULT["dbhub-session-status"])
@@ -402,10 +430,23 @@ def vault_read(name):
             status = running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"])
             if scenario == "sessioncosmos":
                 status = with_t5(status, RUNBOOK["accepted"] + real_dt.timedelta(minutes=4))
+            if scenario == "t2late":
+                # T2's Run Command hadn't ended when the session started (2026-11-20): a guest after a cold start.
+                status["dispatchPending"] = ["T2"]
+                status["steps"].append({"step": "Times", "state": "Info", "atUtc": iso(Clock.now), "fix": "",
+                                        "message": "T2: its activity isn't set on archost01 yet (a VM or guest that has just started can take minutes), so T2's times count from when it is; the live view says when."})
             if scenario == "earlierrca":
                 # The start exported session dddd...'s evidence, which its own stop didn't (ADR 0031).
                 RUNNING_EARLIER[0] = status["rcaEarlier"] = rca_bundle_index("d" * 32, ["3" * 32])
             VAULT[name] = json.dumps(status)
+        elif scenario == "t2late" and current.get("phase") == "running" and current.get("dispatchPending") \
+                and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=22):
+            # The start's follow-up (Wait-DbHubSessionDispatch): T2's activity was set 12 minutes after its dispatch.
+            current["dispatchUtc"]["T2"] = iso(RUNBOOK["accepted"] + real_dt.timedelta(minutes=22))
+            current["dispatchPending"] = []
+            current["steps"].append({"step": "Times", "state": "Info", "atUtc": iso(Clock.now), "fix": "",
+                                     "message": "T2: its activity was set on archost01 12 minutes after Azure accepted the Run Command that sends it, so T2's times count from then."})
+            VAULT[name] = json.dumps(current)
         elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
                 and not any(step.get("step") == "Host" for step in current.get("steps") or []):
             # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
@@ -415,8 +456,16 @@ def vault_read(name):
     return VAULT[name]
 
 
+class Py4JJavaError(Exception):
+    """What notebookutils raises when Key Vault refuses a read (live on dbhubra, 2026-11-21)."""
+
+
 class Credentials:
     def getSecret(self, vault, name):
+        # "nocontrol", "nocontrolstop", and "novault": the vault refuses every read (F29: on dbhubra, the session control's
+        # setup stopped at its template, so nobody was given its secrets).
+        if scenario in ("nocontrol", "nocontrolstop", "novault"):
+            raise Py4JJavaError("An error occurred while calling z:notebookutils.credentials.getSecret: Forbidden")
         return vault_read(name)
 
     def getToken(self, audience):
@@ -552,8 +601,12 @@ with contextlib.redirect_stdout(buffer):
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
+                          "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
                           "stoppedlate": {"STOP_NOW": True},
-                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
+                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False},
+                          "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150},
+                          "askedfraction": {"DURATION_MINUTES": 45.5}, "askednone": {"DURATION_MINUTES": None}, "askedtext": {"DURATION_MINUTES": "abc"},
+                          "askedstring": {"DURATION_MINUTES": "90"}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
             if index == 2:
@@ -789,13 +842,66 @@ try:
     out.append({"ok": True, "body": json.dumps(build_request("stop", catalog=catalog))})
 except ValueError as error:
     out.append({"ok": False, "error": str(error)})
+# A whole number however it arrives (the review of F33): DURATION_MINUTES, intensity, and concurrency as text or as a whole
+# float go as the int; anything else is refused, as before.
+REQUESTED_BY = "notebook"
+for action, kwargs in [
+    ("session", dict(session_id=sid, duration_minutes="90")),
+    ("session", dict(session_id=sid, duration_minutes=" 90 ")),
+    ("session", dict(session_id=sid, duration_minutes=90.0)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "deadlock-storm", "intensity": "8", "concurrency": 3.0}], duration_minutes="20")),
+    ("session", dict(session_id=sid, duration_minutes=45.5)),
+    ("session", dict(session_id=sid, duration_minutes=None)),
+    ("session", dict(session_id=sid, duration_minutes="abc")),
+    ("session", dict(session_id=sid, duration_minutes=True)),
+    ("session", dict(session_id=sid, duration_minutes="20")),
+    ("session", dict(session_id=sid, duration_minutes=150.0)),
+    ("session", dict(session_id=sid, duration_minutes="9_0")),
+    ("session", dict(session_id=sid, duration_minutes="\u0669\u0660")),
+    ("run", dict(activities=[{"target": "T1", "scenario": "cpu-pressure", "intensity": 8.5}], duration_minutes=20)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "cpu-pressure", "intensity": True}], duration_minutes=20)),
+]:
+    try:
+        out.append({"ok": True, "body": json.dumps(build_request(action, catalog=catalog, **kwargs), separators=(",", ":"))})
+    except ValueError as error:
+        out.append({"ok": False, "error": str(error)})
+# The plan and the request read a session's DURATION_MINUTES the same way (session_minutes): at 09:00, with the day ahead,
+# the plan goes ahead exactly when the request is built, and for the same minutes.
+nine = dt.datetime(2026, 11, 14, 9, 0, tzinfo=dt.timezone.utc)
+values = (list(range(-5, 201)) + [minutes + 0.5 for minutes in range(25, 125)] + [float(minutes) for minutes in range(25, 125)] +
+          [str(minutes) for minutes in range(25, 125)] +
+          [" 30 ", "+90", "90.0", "120.", "", "abc", "1e2", "9_0", None, True, False, [90], float("nan"), float("inf")])
+disagree = []
+for value in values:
+    plan = session_plan(nine, value, catalog)
+    try:
+        built = build_request("session", duration_minutes=value, catalog=catalog, session_id=sid)["durationMinutes"]
+    except ValueError:
+        built = None
+    if plan["ok"] != (built is not None) or (built is not None and (type(built) is not int or built != plan["asked"])):
+        disagree.append(repr(value))
+print(json.dumps({"values": len(values), "disagree": disagree}))
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false, $true, $true, $false)
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false, $true, $true, $true, $false, $false, $false, $false, $true, $true, $false, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $false, $false, $false)
+        # A whole number however it arrives (the review of F33): it goes as the int, and the runbook accepts it (below).
+        foreach ($index in 34, 35, 36) {
+            $results[$index].body | Should -BeExactly '{"action":"session","requestedBy":"notebook","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":90}'
+        }
+        $results[37].body | Should -BeExactly '{"action":"run","requestedBy":"notebook","durationMinutes":20,"activities":[{"target":"T1","scenario":"deadlock-storm","intensity":8,"concurrency":3}]}'
+        # A fraction, None, text that isn't a whole number, a bool, or a whole number outside the bounds, as before.
+        foreach ($index in 38..45) {
+            $results[$index].error | Should -Match 'DURATION_MINUTES must be a whole number from 30 to 120'
+        }
+        $results[46].error | Should -Match 'intensity must be a whole number from 1 to 10'
+        $results[47].error | Should -Match 'intensity must be a whole number from 1 to 10'
+        $agreement = ($output | Select-Object -Last 2 | Select-Object -First 1) | ConvertFrom-Json
+        $agreement.values | Should -BeGreaterThan 500
+        @($agreement.disagree) | Should -BeNullOrEmpty -Because 'the plan and the request read DURATION_MINUTES the same way (session_minutes)'
         # Run from the Insights app's Manage (ADR 0029): REQUESTED_BY names the verified caller, within the runbook's name rule.
         $results[31].body | Should -BeExactly '{"action":"session","requestedBy":"app/ops@contoso.example","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":90}'
         $results[32].body | Should -BeExactly '{"action":"reset","requestedBy":"app/ops@contoso.example","targets":["T1"]}'
@@ -844,7 +950,7 @@ print(json.dumps(out))
         }
     }
 
-    It 'plans a session as the runbook does: before the VMs'' auto-shutdown, after whole showcase cycles when it''s cut short, and refused under 30 minutes' {
+    It 'plans a session as the runbook does: before the VMs'' auto-shutdown, after whole showcase cycles when it''s cut short, and refused under 30 minutes, naming the duration asked when that''s why (F33)' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
@@ -862,6 +968,21 @@ out = {}
 for label, hour, minute in (("morning", 9, 0), ("capped", 17, 45), ("short", 18, 20), ("late", 18, 40)):
     plan = ns["session_plan"](dt.datetime(2026, 11, 14, hour, minute, tzinfo=dt.timezone.utc), 90, catalog)
     out[label] = {"minutes": plan["minutes"], "ok": plan["ok"], "end": plan["endUtc"].strftime("%H:%M"), "lines": ns["plan_lines"](plan, catalog)}
+# The duration asked, outside 30 to 120 minutes (F33): at 14:20, at 18:40 too, and with no auto-shutdown configured.
+for label, hour, minute, asked, rules in (("asked20", 14, 20, 20, {}), ("asked20late", 18, 40, 20, {}), ("asked150", 9, 0, 150, {}),
+                                          ("asked20none", 14, 20, 20, {"autoShutdownTime": ""})):
+    shown = dict(catalog, session=dict(catalog.get("session") or {}, **rules))
+    plan = ns["session_plan"](dt.datetime(2026, 11, 14, hour, minute, tzinfo=dt.timezone.utc), asked, shown)
+    out[label] = {"ok": plan["ok"], "out": plan["durationOut"], "lines": ns["plan_lines"](plan, shown)}
+# DURATION_MINUTES however it arrives (the review of F33): a whole number as an int, a whole float, or text of one; anything
+# else is refused before the request, and quoted as it was given.
+for label, value in (("fraction", 45.5), ("none", None), ("text", "abc"), ("bool", True), ("fraction20", 20.5), ("text20", "20"),
+                     ("float150", 150.0)):
+    plan = ns["session_plan"](dt.datetime(2026, 11, 14, 14, 20, tzinfo=dt.timezone.utc), value, catalog)
+    out[label] = {"ok": plan["ok"], "out": plan["durationOut"], "lines": ns["plan_lines"](plan, catalog)}
+out["fractionLate"] = ns["plan_lines"](ns["session_plan"](dt.datetime(2026, 11, 14, 18, 40, tzinfo=dt.timezone.utc), 45.5, catalog), catalog)
+nine = dt.datetime(2026, 11, 14, 9, 0, tzinfo=dt.timezone.utc)
+out["as90"] = [ns["plan_lines"](ns["session_plan"](nine, value, catalog), catalog) == out["morning"]["lines"] for value in ("90", " 90 ", 90.0)]
 print(json.dumps(out))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
@@ -880,6 +1001,38 @@ print(json.dumps(out))
         $plan.short.lines[0] | Should -Match 'after 1 whole 30-minute showcase cycle,'
         $plan.late.ok | Should -BeFalse
         $plan.late.lines[0] | Should -Match 'Nothing is started: the VMs'' nightly auto-shutdown is at 19:00 \(UTC\), too soon for a session of at least 30 minutes'
+        # F33 (live, 2026-11-21): 20 minutes asked at 14:20 was refused as if the auto-shutdown at 19:00 were too soon.
+        $plan.asked20.ok | Should -BeFalse
+        $plan.asked20.out | Should -Be 'short'
+        @($plan.asked20.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20.', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        # Named only when it's what leaves too little time, as at 18:40.
+        @($plan.asked20late.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20. The VMs'' nightly auto-shutdown at 19:00 (UTC) is too soon for one now, too.', 'Fix: set DURATION_MINUTES to 30 or more, and Run all again earlier in the day, or set autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        # Over the showcase's 120: before, it read "runs 120 of the 150 minutes asked ... before the VMs' nightly
+        # auto-shutdown", and then the session's request failed; the runbook refuses it too.
+        $plan.asked150.ok | Should -BeFalse
+        $plan.asked150.out | Should -Be 'long'
+        @($plan.asked150.lines) | Should -Be @('Nothing is started: a session runs at most 120 minutes, and you asked for 150.', 'Fix: set DURATION_MINUTES to 120 or less, then Run all again.')
+        # Without an auto-shutdown, it read "This session runs 20 minutes" while it sent nothing.
+        @($plan.asked20none.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for 20.', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        # The review of F33: the plan read DURATION_MINUTES with int(), so 45.5 was "This session runs 45 minutes" and the
+        # request then raised a ValueError; None and "abc" raised in the plan; True was "you asked for 1". Now a value that
+        # isn't a whole number is refused before anything is sent, quoted as it was given.
+        $notWhole = 'Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again.'
+        foreach ($case in @(@('fraction', '45.5'), @('none', 'None'), @('text', '"abc"'), @('bool', 'True'), @('fraction20', '20.5'))) {
+            $result = $plan.($case[0])
+            $result.ok | Should -BeFalse -Because $case[0]
+            $result.out | Should -Be 'notWhole' -Because $case[0]
+            @($result.lines) | Should -Be @(('Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for {0}.' -f $case[1]), $notWhole) -Because $case[0]
+        }
+        # A whole number given as text or as a float, outside the bounds: the bound it's past, quoted as it was given.
+        $plan.text20.out | Should -Be 'short'
+        @($plan.text20.lines) | Should -Be @('Nothing is started: a session runs at least 30 minutes, and you asked for "20".', 'Fix: set DURATION_MINUTES to 30 or more, then Run all again.')
+        $plan.float150.out | Should -Be 'long'
+        @($plan.float150.lines) | Should -Be @('Nothing is started: a session runs at most 120 minutes, and you asked for 150.0.', 'Fix: set DURATION_MINUTES to 120 or less, then Run all again.')
+        # The auto-shutdown is named too when it also leaves too little time.
+        @($plan.fractionLate) | Should -Be @('Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45.5. The VMs'' nightly auto-shutdown at 19:00 (UTC) is too soon for one now, too.', 'Fix: set DURATION_MINUTES to a whole number from 30 to 120, and Run all again earlier in the day, or set autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        # "90", " 90 ", and 90.0 plan as 90 does.
+        @($plan.as90) | Should -Be @($true, $true, $true)
     }
 
     It 'lists the showcase''s beats as the runner plans them: cycles from each target''s start, T4''s tier, and its replica' {
@@ -1059,6 +1212,68 @@ print(json.dumps(out))
         @($out.none).Count | Should -Be 0
     }
 
+    It 'says whether T3''s regression started, from T3''s CPU after the agent beat''s switch, once and before the response (F26)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $filled = Get-FilledNotebook -Zone 'UTC'
+        $driver = Join-Path -Path $TestDrive -ChildPath 'agent-regression.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import contextlib, datetime as dt, io, json, sys, types
+fake_requests = types.ModuleType("requests")
+fake_requests.RequestException = Exception
+sys.modules["requests"], sys.modules["pandas"] = fake_requests, types.ModuleType("pandas")
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+for index in range(3):
+    exec(cells[index], ns)
+ns["CATALOG"] = ns["load_catalog"](ns["CATALOG_JSON"])
+regress = dt.datetime(2026, 11, 21, 21, 17, 0, tzinfo=dt.timezone.utc)
+beat = {"agent": True, "regressUtc": regress, "respondUtc": regress + dt.timedelta(minutes=22.5)}
+
+def run(cpu, minutes, telemetry=True):
+    calls = []
+    def fake(start, end):
+        calls.append([(start - regress).total_seconds() / 60, (end - regress).total_seconds() / 60])
+        return cpu
+    ns["t3_cpu"] = fake
+    state, buffer = {}, io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        for minute in minutes:
+            ns["agent_regression"](beat, regress + dt.timedelta(minutes=minute), state, telemetry)
+    return {"printed": buffer.getvalue(), "result": list(state.get("regression") or []), "calls": calls,
+            "summary": ns["agent_summary"](beat, state, regress + dt.timedelta(minutes=40))}
+
+out = {"flat": run((6.0, ""), [5, 9, 10, 12]),
+       "runs": run((97.0, ""), [9]),
+       "late": run((None, ""), [9, 15, 20, 21]),
+       "noTelemetry": run((6.0, ""), [9], telemetry=False),
+       "afterResponse": run((6.0, ""), [23])}
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $filled 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $out = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        # Live (dbhubfn at bf010ed): the switch didn't hold and T3's CPU stayed at 6%. Its telemetry is read once, for the 5
+        # minutes from a minute after the switch, as soon as it can be in.
+        ($out.flat.calls | ForEach-Object { $_ -join '..' }) | Should -Be @('1..6')
+        $out.flat.result[0] | Should -Be 'Warning'
+        $out.flat.result[1] | Should -Be 'T3''s regression didn''t start: its CPU was 6% in the 5 minutes after the switch at 21:17, so Database Agents has no issue to raise this session, and the response at 21:39 has nothing to fix. T3''s run says why: its plan-switch-unverified event in demo.scenario_run_events. Fix: the next session runs the beat again.'
+        ($out.flat.printed.Trim() -split "`n").Count | Should -Be 1
+        $out.flat.summary[0] | Should -Be ('The Database Agent loop''s regression: Warning: ' + $out.flat.result[1])
+        $out.flat.summary[1] | Should -Match '^The Database Agent loop: T3''s response ran at 21:39 '
+        $out.runs.result | Should -Be @('Pass', 'T3''s regression runs: its CPU was 97% in the 5 minutes after the switch at 21:17, and Database Agents raises its issue about 15 minutes after it started.')
+        @($out.runs.summary).Count | Should -Be 1
+        # Telemetry that doesn't come: asked again until 20 minutes after the switch, then nothing, since the response says so.
+        @($out.late.calls).Count | Should -Be 3
+        $out.late.printed | Should -BeNullOrEmpty
+        @($out.late.result).Count | Should -Be 0
+        @($out.noTelemetry.calls).Count | Should -Be 0
+        @($out.afterResponse.calls).Count | Should -Be 0
+    }
+
     It 'runs a whole session on Run all: the start, the guide, the end, the stop, and its history, with one session ID' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
@@ -1119,6 +1334,99 @@ print(json.dumps(out))
         $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive'
         $report.printed | Should -Match 'NB_DatabaseHub_LiveActivity runs in this notebook''s Spark session to save session [0-9a-f]{8}''s history\.'
         $report.printed | Should -Match 'Pass: the history is saved'
+    }
+
+    It 'says that a start-demo.ps1 session took over at the session''s end, stops nothing, and still saves the session''s history (2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenover' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        $report.printed | Should -Match 'Taken over: a start-demo\.ps1 session runs the demo now, so nothing was stopped; its auto-stop stops it at \d\d:\d\d \(UTC\), and Stop now again, or \./scripts/stop-demo\.ps1, stops it sooner\. This session''s history is saved below\.'
+        $report.printed | Should -Match 'Done: the history''s metrics saved to the control vault\.'
+        $report.printed | Should -Not -Match 'Stopped: nothing stopped'
+        $report.printed | Should -Not -Match 'the VMs and T4 are already stopped'
+        $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive \(until \d\d:\d\d\)\.'
+        @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any end'
+        $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
+    }
+    It 'saves a taken-over session''s Incident RCA evidence with its history, and says what its end exported (the RCA release''s merge)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoverrca' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        $report.printed | Should -Match 'Taken over: a start-demo\.ps1 session runs the demo now, so nothing was stopped'
+        $report.printed | Should -Match 'RCA\.EXPORT Pass: 2 evidence documents in 4 parts from sqlvm01\.'
+        $report.printed | Should -Match 'RCA\.CAPTURE\.T1 Pass: T1: captured from 16:50 to 17:05 UTC\.'
+        $report.printed | Should -Not -Match 'the control''s runbook is from before'
+        @($report.refs).Count | Should -Be 1
+        $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
+        $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+        $report.staged[0].document.sessionId | Should -Be $report.sent[0].sessionId
+    }
+    It 'stops everything when Stop now comes inside a taken-over session''s end, and when it comes again after that end (the re-review of 2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The app's Stop now 5 minutes after the session's planned end, before its end's stop came: the runbook takes it for
+        # that end, so the notebook sends a stop with no session ID, which stops the start-demo.ps1 session too.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoverstop' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('stop', 'stop')
+        $report.sent[0].sessionId | Should -Be ('d' * 32)
+        $report.sent[1].PSObject.Properties.Name | Should -Not -Contain 'sessionId' -Because 'the runbook never takes a stop with no session ID for a session''s end'
+        $report.printed | Should -Match 'A start-demo\.ps1 session took over from this one, so Stop now stops that session too\.'
+        $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped, sqlvm01 deallocated\.'
+        $report.printed | Should -Not -Match 'Taken over: '
+        $report.printed | Should -Match 'the VMs and T4 are already stopped'
+        @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any Stop now'
+        # Stop now again, after an end that stopped nothing: the status says stopped, so its stop has no session ID.
+        $again = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoveragain' -Start '2026-11-14T14:00:00Z'
+        $again.error | Should -BeNullOrEmpty
+        @($again.sent | ForEach-Object action) | Should -Be @('stop')
+        $again.sent[0].PSObject.Properties.Name | Should -Not -Contain 'sessionId'
+        $again.printed | Should -Match 'No session runs \(its status says stopped\), so Stop now stops whatever runs\.'
+    }
+
+    It 'says Run all starts nothing because the session control isn''t set up, with deploy.ps1''s fix, not the vault''s permissions (F29, live 2026-11-21)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # What deploy.ps1 found on dbhubra (Get-DemoControlGap's Problem), filled into CONTROL_PROBLEM at import.
+        $problem = './scripts/deploy.ps1 found on 2026-11-21 11:40 UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up. Fix: Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two. Then run ./scripts/deploy.ps1 again. Meanwhile ./scripts/start-demo.ps1 runs a session from a PC, and ./scripts/stop-demo.ps1 stops the demo.'
+        $path = Get-FilledNotebook -Zone 'UTC' -ControlProblem $problem
+        $report = Invoke-Simulation -Path $path -Scenario 'nocontrol' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.sent | Should -BeNullOrEmpty
+        $report.printed | Should -Match ('Manual action required: Run all starts nothing: the secret dbhub-session-status couldn''t be read \(Py4JJavaError\): the session control isn''t set up\. {0}' -f [regex]::Escape($problem))
+        $report.printed | Should -Not -Match 'Key Vault Secrets User|the control vault didn''t answer|managed private endpoint'
+        @($report.refs).Count | Should -Be 0
+        # Stop now: the webhook's URL can't be read either, and it says why once, with the same fix.
+        $stop = Invoke-Simulation -Path $path -Scenario 'nocontrolstop' -Start '2026-11-14T14:00:00Z'
+        $stop.error | Should -BeNullOrEmpty
+        $stop.sent | Should -BeNullOrEmpty
+        $stop.printed | Should -Match 'The session''s status couldn''t be read, so Stop now asks the session control to stop whatever runs\.'
+        $stop.printed | Should -Match ('Manual action required: the webhook URL couldn''t be read from Key Vault \(Py4JJavaError\): the session control isn''t set up\. {0}' -f [regex]::Escape($problem))
+        $stop.printed | Should -Not -Match 'Key Vault Secrets User|No session runs'
+        ([regex]::Matches($stop.printed, [regex]::Escape($problem))).Count | Should -Be 1
+        # Without what deploy.ps1 found (a control that's set up), the vault's answer, as before.
+        $vault = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'novault' -Start '2026-11-14T14:00:00Z'
+        $vault.error | Should -BeNullOrEmpty
+        $vault.sent | Should -BeNullOrEmpty
+        $vault.printed | Should -Match 'Manual action required: the control vault didn''t answer: the secret dbhub-session-status couldn''t be read \(Py4JJavaError\): you need Key Vault Secrets User on it'
+        $vault.printed | Should -Not -Match 'isn''t set up'
+        # And a problem that a later fix made stale changes nothing when the vault answers (it only explains a failure).
+        $fixed = Invoke-Simulation -Path $path -Scenario 'session' -Start '2026-11-14T14:00:00Z'
+        $fixed.error | Should -BeNullOrEmpty
+        @($fixed.sent | ForEach-Object action) | Should -Contain 'session'
+        $fixed.printed | Should -Not -Match 'isn''t set up'
     }
 
     It 'saves the history of another environment''s session with that environment''s names, not the activity notebook''s defaults' {
@@ -1278,6 +1586,12 @@ print(json.dumps(out))
     It 'runs Run all in <Case>' -ForEach @(
         @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
         @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
+        @{ Case = 'a duration under a session''s 30 minutes: nothing starts, and it names the duration, not the auto-shutdown (F33, live 2026-11-21)'; Scenario = 'askedshort'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at least 30 minutes, and you asked for 20\.\s+Fix: set DURATION_MINUTES to 30 or more, then Run all again\.' }
+        @{ Case = 'a duration over a session''s 120 minutes: nothing starts, and it names the duration, rather than a plan cut short by the auto-shutdown and a request that fails (F33)'; Scenario = 'askedlong'; Start = '2026-11-14T09:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs at most 120 minutes, and you asked for 150\.\s+Fix: set DURATION_MINUTES to 120 or less, then Run all again\.' }
+        @{ Case = 'a duration that isn''t a whole number: nothing starts, and it quotes the duration, rather than plan 45 minutes and then fail the request (F33''s review)'; Scenario = 'askedfraction'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45\.5\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'no duration: nothing starts, and it says so, rather than a TypeError (F33''s review)'; Scenario = 'askednone'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for None\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'a duration that isn''t a number: nothing starts, and it quotes it, rather than a ValueError (F33''s review)'; Scenario = 'askedtext'; Start = '2026-11-14T14:20:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for "abc"\.\s+Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again\.' }
+        @{ Case = 'a duration given as text, as a pipeline or the Fabric job API can pass it: the session runs it (F33''s review)'; Scenario = 'askedstring'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 90 minutes, until 15:30 \(UTC\)\.' }
         @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
         @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
         @{ Case = 'an earlier session''s T5 metrics alone in the vault: its history is saved with them (2026-11-18)'; Scenario = 'leftovercosmos'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
@@ -1365,6 +1679,16 @@ print(json.dumps(out))
         }
         if ($Scenario -in 'active', 'stopnow') {
             $report.sent[0].sessionId | Should -Be ('a' * 32)
+        }
+        if ($Scenario -in 'askedshort', 'askedlong', 'askedfraction', 'askednone', 'askedtext') {
+            # The duration asked is the cause (F33): neither the auto-shutdown nor a plan cut short by it is named, and no
+            # plan says a session runs (the review of F33: 45.5 read "This session runs 45 minutes", then the request failed).
+            $report.printed | Should -Not -Match 'too soon|minutes asked|This session runs'
+        }
+        if ($Scenario -eq 'askedstring') {
+            # "90" goes as the int 90, which the runbook accepts (Test-DbHubControlRequest), not as text.
+            $report.sent[0].durationMinutes | Should -BeOfType ([long])
+            $report.sent[0].durationMinutes | Should -Be 90
         }
         if ($Scenario -eq 'stoppedend') {
             # A plain stop for whatever runs, then that session's history, with its metrics and window, after its telemetry.
@@ -2113,6 +2437,30 @@ print(json.dumps({"plan": flow(), "oldRunbook": flow(old_runbook=True), "whole":
         ($report.statusReads - $old.statusReads) | Should -BeGreaterThan 10
     }
 
+    It 'holds T2''s beats while its activity isn''t set, then counts them, and the history''s, from when it was (2026-11-20)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 't2late' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Match 'T2: its activity isn''t set on its VM yet \(a guest that has just started can take minutes\), so its times above come later by as much; the live view prints them once it''s set\.'
+        $report.printed | Should -Match 'Times\s+Info\s+T2: its activity was set on archost01 12 minutes after Azure accepted the Run Command that sends it'
+        $moved = $report.printed.IndexOf('T2''s beats count from when its activity was set: ')
+        $moved | Should -BeGreaterThan 0
+        $firstT2 = [regex]::Match($report.printed, 'Now: T2 ')
+        $firstT2.Success | Should -BeTrue
+        $firstT2.Index | Should -BeGreaterThan $moved -Because 'no T2 beat is announced before its activity is set'
+        $report.printed | Should -Match 'Pass: the history is saved'
+        $plan = $report.refs[0].args.SESSION_PLAN | ConvertFrom-Json
+        $accepted = ([datetime]$plan.startUtc).ToUniversalTime()
+        $t2 = @($plan.beats | Where-Object target -EQ 'T2')
+        $t2.Count | Should -BeGreaterThan 0
+        (([datetime]$t2[0].startUtc).ToUniversalTime() - $accepted).TotalMinutes | Should -Be 24 -Because 'T2''s first beat starts 2 minutes into its showcase, set 22 minutes after the session was accepted'
+        $t1 = @($plan.beats | Where-Object target -EQ 'T1')
+        (([datetime]$t1[0].startUtc).ToUniversalTime() - $accepted).TotalMinutes | Should -Be 4 -Because 'T1''s times didn''t move'
+    }
+
     It 'shows nothing new from a status that runbooks from before 2026-11-16 wrote, which has no host steps and no runCommands' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
@@ -2191,7 +2539,8 @@ class Credentials:
 notebookutils = types.SimpleNamespace(credentials=Credentials())
 
 namespace = {"notebookutils": notebookutils, "KEY_VAULT_URL": "https://kv-test-ctl-abc123.vault.azure.net/", "WEBHOOK_SECRET_NAME": "dbhub-activity-webhook",
-             "RESOURCE_GROUP": "rg-dbhub-demo", "DEMO_DATABASE": "ContosoCare", "T1_VM_NAME": "sqlvm01", "T2_MACHINE_NAME": "arcsql01", "T3_SERVER_PREFIX": "azuresql01-"}
+             "RESOURCE_GROUP": "rg-dbhub-demo", "DEMO_DATABASE": "ContosoCare", "T1_VM_NAME": "sqlvm01", "T2_MACHINE_NAME": "arcsql01", "T3_SERVER_PREFIX": "azuresql01-",
+             "CONTROL_PROBLEM": ""}
 exec(open(sys.argv[1], encoding="utf-8").read(), namespace)
 exec(open(sys.argv[2], encoding="utf-8").read(), namespace)
 report = {}
@@ -2268,6 +2617,20 @@ Describe 'The notebook deploy.ps1 imports' {
         # Without the demo's lakehouse, the copy names none, and the history runs as a job (the fallback).
         $source | Should -Match '(?m)^DEMO_LAKEHOUSE_ID = ""'
         $filled['metadata'].Contains('dependencies') | Should -BeFalse
+        # Nothing missing in the session control: no problem, which also clears one an earlier run put there (F29).
+        $source | Should -Match '(?m)^CONTROL_PROBLEM = ""\s+#'
+    }
+
+    It 'fills CONTROL_PROBLEM with what deploy.ps1 found missing in the session control, as a Python string (F29)' {
+        $problem = './scripts/deploy.ps1 found on 2026-11-21 11:40 UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up. Fix: Free an Automation account in westus3 ("destroy.ps1" on an old environment). Then run ./scripts/deploy.ps1 again.'
+        $notebookDefinition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $script:config; Json = $script:settingsJson; Problem = $problem } {
+            Get-DemoActivityControlNotebook -Name (Get-DemoActivityControlName -Config $Config) -Setting ($Json | ConvertFrom-Json -AsHashtable) -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -ControlProblem $Problem
+        }
+        $filled = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($notebookDefinition.Definition['parts'][0]['payload'])) | ConvertFrom-Json -AsHashtable -Depth 64
+        $source = (@(@($filled['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join '')
+        $line = [regex]::Match($source, '(?m)^CONTROL_PROBLEM = (".*?[^\\]")\s+# what deploy\.ps1 found missing').Groups[1].Value
+        $line | Should -Not -BeNullOrEmpty
+        ($line | ConvertFrom-Json) | Should -BeExactly $problem
     }
 
     It 'attaches the demo''s lakehouse as the copy''s default lakehouse, so its history can run in the notebook''s own session' {

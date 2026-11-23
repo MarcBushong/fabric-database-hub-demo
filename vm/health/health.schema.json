@@ -23,6 +23,7 @@
     "generation": { "description": "<bundle SHA-256 prefix>-<loader run UTC>; a new generation re-checks every step.", "type": "string" },
     "instructions": { "type": "array", "items": { "type": "string" } },
     "warnings": { "description": "For example, media trusted on first use because no SHA-256 was pinned.", "type": "array", "items": { "type": "string" } },
+    "notes": { "description": "Since 2026-11-23: what a new VM's bootstrap gives by design, as information, each naming its step: a sign-in cleanup that cleared an event log, the restart SQL Server setup asked for, T1's sysadmin recovery, or Jumpstart's image checked by its pinned SHA-256. Unlike warnings, they leave a Ready VM's status Pass. The next bootstrap generation clears them.", "type": "array", "items": { "type": "string" } },
     "rebootCount": { "type": "integer", "minimum": 0 },
     "startedUtc": { "type": ["string", "null"] },
     "updatedUtc": { "type": "string" },

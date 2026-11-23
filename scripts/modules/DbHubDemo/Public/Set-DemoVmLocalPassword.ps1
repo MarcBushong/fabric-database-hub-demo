@@ -107,7 +107,7 @@ finally {
         Register-DemoSecret -Value $plainText
         $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($plainText))
         $plainText = $null
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-HostPassword' -Script $script -Parameter @{ UserName = $userName } -ProtectedParameter @{ PasswordBase64 = $encoded } -TimeoutSeconds 300 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-HostPassword' -Script $script -Parameter @{ UserName = $userName } -ProtectedParameter @{ PasswordBase64 = $encoded } -TimeoutSeconds 300 -FreshAction -Confirm:$false
         $encoded = $null
     }
     catch {

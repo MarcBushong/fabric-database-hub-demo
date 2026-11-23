@@ -122,7 +122,7 @@ function Invoke-DemoBootstrapLoaderRun {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -StartTimeoutSeconds $StartTimeoutSeconds -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -StartTimeoutSeconds $StartTimeoutSeconds -FreshAction -Confirm:$false
     }
     catch {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} could not run: {1}' -f $VmName, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run deploy.ps1 -Resume; a conflict with an extension that a policy installs clears within minutes.' -DocUrl $docUrl)
@@ -1466,7 +1466,9 @@ function Invoke-DemoDeploymentTrack {
                         & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'No workload runner was deployed to T1 (-SkipRunner), so T1''s access to T5 wasn''t tried.'
                         break
                     }
-                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10))))
+                    # Through T1's subnet's service endpoint (2026-11-21), the warmup waits for its virtual network rule too.
+                    $viaRule = [string](Get-DemoMemberValue -InputObject (@($checks | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'T5.NETWORK' }) | Select-Object -First 1 | ForEach-Object { $_.evidence }) -Name 'path') -eq 'ServiceEndpoint'
+                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10)) -ServiceEndpoint:$viaRule))
                 }
                 'T1/Activity' {
                     $current = Get-DemoDeploymentState -Config $Config
@@ -1842,7 +1844,7 @@ function Invoke-DemoDeploymentTrack {
                     # keeps it queued, on the status page; one still queued then is followed after the history model's step.
                     $historyWait = [int](& $option 'HistoryRunWaitMinutes' 45)
                     $historyFollow = [int](& $option 'HistoryFollowMinutes' 45)
-                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
+                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -KeepEditedNotebooks -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
                     # A first history run that didn't complete is never a Fail: the history snapshot at the run's end runs it again.
                     $firstRun = Get-DemoHistoryFirstRun -Result $fabric
                     Set-DemoHistoryFirstRunWarning -FirstRun $firstRun

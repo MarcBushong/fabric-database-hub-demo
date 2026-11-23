@@ -251,7 +251,9 @@ function Get-DemoSignInStepResult {
         return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message $steps[0] -Instruction $steps)
     }
     if ($cleared.Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage ('The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')))
+        # What the cleanup did, once, and by design after Arc onboarding: a note, as information, which the next bootstrap
+        # generation clears (the F24 review, 2026-11-20; the expected-notes decision, 2026-11-23).
+        return (New-DemoVmStepResult -Outcome 'Done' -NoteMessage ('The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')))
     }
     return $null
 }
@@ -559,7 +561,13 @@ function Invoke-DemoGuestSqlQuery {
 
     return (Invoke-Command -VMName $Name -Credential $Credential -ArgumentList $GuestToolsFolder, $Query, $Database -ErrorAction Stop -ScriptBlock {
             param($Folder, $Text, $DatabaseName)
-            Import-Module -Name (Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1') -Force
+            $manifest = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            # A new guest's first check comes before the database step copies its tools in (Copy-DemoGuestTool): said
+            # plainly, so the step's check can tell it from a failure (2026-11-20).
+            if (-not (Test-Path -LiteralPath $manifest)) {
+                throw ('The guest has no demo tools at {0} yet; the database step copies them in.' -f $Folder)
+            }
+            Import-Module -Name $manifest -Force
             Invoke-DemoVmSql -Query $Text -Database $DatabaseName -TimeoutSeconds 3600
         })
 }

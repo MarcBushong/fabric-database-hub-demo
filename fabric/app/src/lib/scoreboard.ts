@@ -8,12 +8,12 @@
 // Hub shows the telemetry 3 to 15 minutes after its sample time. Pure, so the tests pin every number.
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
-import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, SESSION_PROFILES, throttledRuns } from "@/data/model";
+import { COSMOS_METRICS, cosmosSeries, grainMinutes, oneReadingEach, POSTGRES_METRICS, postgresSeries, replicaCatchUp, SESSION_PROFILES, spanMinutes, throttledRuns } from "@/data/model";
 import type { Row } from "@/data/query-client";
 import { impactOf, type Impact } from "./business";
 import { engineOf } from "./estate";
 import { formatLevel, formatNumberDigits, formatTimeUtc, toDate, type NumberKind } from "./format";
-import { FAMILY_SIGNAL, REPLICA_LAG_WARNING_SECONDS, signalValue } from "./insights";
+import { FAMILY_SIGNAL, POSTGRES_MAX_CONNECTIONS, POSTGRES_RESERVED_CONNECTIONS, POSTGRES_USABLE_CONNECTIONS, REPLICA_LAG_WARNING_SECONDS, signalValue } from "./insights";
 import { SCENARIOS } from "./scenarios";
 import { quantile } from "./stats";
 import type { StatusName } from "./status";
@@ -58,6 +58,9 @@ export const SCENARIO_SIGNALS: Readonly<Record<string, readonly string[]>> = {
     "slow-consumer": ["network"],
     "capacity-max": ["cpu", "io"],
     "plan-regression": ["cpu"],
+    // T4's connection surge (F34): its Connections (active_connections) at the slots clients can use, never its Failed
+    // connections, which didn't count its refused attempts live (2026-11-21).
+    "connection-surge": ["connections"],
 };
 
 /** The families a scenario raises: the notebook's map, or its keywords for a scenario it doesn't list. */
@@ -72,8 +75,16 @@ export function expectedFamilies(scenario: string): string[] {
         ["log", "log_rate"],
         ["index", "cpu"],
     ];
-    return [...new Set(words.filter(([word]) => scenario.includes(word)).map(([, family]) => family))].sort();
+    // A keyword starts one of the scenario's words, as the notebook matches it: "io" in io-pressure, never inside
+    // "connection" or "transaction" (F34: connection-surge and idle-in-transaction read as IO).
+    const parts = scenario.split("-");
+    return [...new Set(words.filter(([word]) => parts.some((part) => part.startsWith(word))).map(([, family]) => family))].sort();
 }
+
+/** Families measured in a capture of a target's Azure Monitor metrics rather than in bins: their signal's name and unit. */
+const CAPTURE_SIGNALS: Readonly<Record<string, { label: string; kind: NumberKind }>> = {
+    connections: { label: "active connections", kind: "int" },
+};
 
 interface Rule {
     floor: number;
@@ -287,6 +298,8 @@ export interface ScoreContext {
     /** Every recorded run in the period: the faults of other plans set the baselines' windows, and resets answer. */
     runs: readonly SessionRun[];
     incidents?: readonly Incident[];
+    /** T4's latest capture of its Azure Monitor metrics: connection-surge's Connections (F34). */
+    postgres?: PostgresCapture | null;
 }
 
 /**
@@ -591,10 +604,12 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
         recoveryWord: "",
     };
     const first = signalOf(families[0] ?? "");
-    const unmeasured = (status: StatusName, note: string): FaultScore => ({ ...base, family: families[0] ?? "", signal: first?.label ?? scenario, kind: first?.kind ?? "decimal", status, note });
-    // T4's and T5's beats have no signal the notebook reads: their row names the fault, never the first family a keyword in
-    // its name gives (the review of 96abcf65: "connection" made T4's connection surge "Buffer IO (PAGEIOLATCH) waits", as the
-    // notebook's own fallback does).
+    const captured = CAPTURE_SIGNALS[families[0] ?? ""];
+    const unmeasured = (status: StatusName, note: string): FaultScore => ({ ...base, family: families[0] ?? "", signal: first?.label ?? captured?.label ?? scenario, kind: first?.kind ?? captured?.kind ?? "decimal", status, note });
+    if (target === "T4" && families[0] === "connections") return scoreConnectionSurge(base, ctx.postgres ?? null);
+    // T4's and T5's other beats have no signal the notebook reads: their row names the fault, never the first family a
+    // keyword in its name gives (the review of 96abcf65: "connection" made T4's connection surge "Buffer IO (PAGEIOLATCH)
+    // waits", as the notebook's own fallback did before F34, which scores that surge above).
     if (target !== "T1" && target !== "T2" && target !== "T3") return { ...unmeasured("Not supported", `${target}'s beats show in its Azure Monitor metrics, which the history keeps per capture, not per request.`), signal: scenarioTitle(scenario) };
 
     const targetBins = ctx.bins.filter((b) => b.target === target).sort((a, b) => a.at.getTime() - b.at.getTime());
@@ -734,6 +749,62 @@ export function scoreFault(run: SessionRun, planKey: string, ctx: ScoreContext):
     };
 }
 
+/**
+ * T4's connection surge (F34): visible when T4's Connections, Azure Monitor's active_connections (the highest value in each
+ * interval of T4's capture, which Database Hub's PostgreSQL dashboard charts), reach the slots clients can use in its
+ * window. Never by Failed connections: Azure Monitor didn't count the surge's refused attempts live (2026-11-21). This view
+ * reads T4's metrics in its latest capture's window (F35: from every save there), so a surge before it isn't measured here.
+ */
+function scoreConnectionSurge(base: Omit<FaultScore, "family" | "signal" | "kind" | "status" | "note">, capture: PostgresCapture | null): FaultScore {
+    const signal = CAPTURE_SIGNALS.connections;
+    const fallback = capture?.intervalMinutes ?? 5;
+    const stepMs = fallback * MIN;
+    const from = base.injectedAt.getTime();
+    const to = base.injectedEnd.getTime();
+    const points = postgresSeries(capture, "T4", POSTGRES_METRICS.connections);
+    const inWindow = points.filter((p) => p.at.getTime() + spanMinutes(p, fallback) * MIN > from && p.at.getTime() < to);
+    // Its points' own interval when saves at different grains meet (F35), the coarsest there; else the capture's step.
+    const step = (capture?.saves ?? 1) > 1 && inWindow.length > 0 ? Math.max(...inWindow.map((p) => grainMinutes(p, fallback))) : (capture?.intervalMinutes ?? null);
+    const common = { ...base, family: "connections", signal: signal.label, kind: signal.kind, binMinutes: step };
+    if (inWindow.length === 0) {
+        return { ...common, status: "Not supported", note: "No capture of T4's Azure Monitor metrics in view covers it: this view reads T4's metrics in its latest capture's window, from every save there, and the history keeps them per capture, not per request." };
+    }
+    const bound: Bound = {
+        value: POSTGRES_USABLE_CONNECTIONS,
+        strict: false,
+        minBins: 1,
+        basis: `the slots clients can use: max_connections ${POSTGRES_MAX_CONNECTIONS}, less ${POSTGRES_RESERVED_CONNECTIONS} reserved`,
+        short: "the slots clients can use",
+    };
+    const top = inWindow.reduce((a, p) => (p.value > a.value ? p : a));
+    const measured = { ...common, bound, peak: top.value, peakAt: top.at };
+    const run = runsAtOrAbove(oneReadingEach(points), bound.value, 1, stepMs).find((r) => r.from.getTime() < to && r.end.getTime() > from);
+    if (!run) {
+        return {
+            ...measured,
+            status: "Warning",
+            note: `Not visible: ${signal.label} stayed under ${formatLevel(bound.value, signal.kind)} in its window, until ${formatTimeUtc(base.injectedEnd)} UTC; its peak was ${formatLevel(top.value, signal.kind)} at ${formatTimeUtc(top.at)} UTC.`,
+        };
+    }
+    const visibleMin = minutesBetween(run.from, run.to ?? run.end);
+    const why: "ongoing" | "brokeOff" | null = run.to ? null : run.ongoing ? "ongoing" : "brokeOff";
+    const recoveryNote = !why ? "" : why === "ongoing" ? NO_RECOVERY.ongoing.note : `Its metrics break off after ${formatTimeUtc(run.last)} UTC, its last interval at its bound, so its recovery isn't measured.`;
+    return {
+        ...measured,
+        visibleAt: run.from,
+        recoveredAt: run.to,
+        ongoing: run.ongoing,
+        ttdMin: minutesBetween(base.injectedAt, run.from),
+        ttrMin: run.to ? minutesBetween(base.injectedAt, run.to) : null,
+        visibleMin,
+        status: "Pass",
+        note: `Visible: ${signal.label} ${boundText(bound, signal.kind)} (${bound.basis}) in T4's Azure Monitor metrics.${recoveryNote ? ` ${recoveryNote}` : ""}`,
+        recoveryNote,
+        recoveryWord: why ? NO_RECOVERY[why].word : "",
+        impact: impactOf({ target: "T4", family: "connections", durationMin: visibleMin, ongoing: run.ongoing, peak: top.value }),
+    };
+}
+
 /** Scores every fault of a plan. */
 export function scorePlan(plan: Plan, ctx: ScoreContext): FaultScore[] {
     return plan.faults.map((run) => scoreFault(run, plan.key, ctx));
@@ -745,7 +816,7 @@ export function scorePlan(plan: Plan, ctx: ScoreContext): FaultScore[] {
 export interface MeasuredEpisode {
     key: string;
     target: EstateTarget;
-    /** throttle (T5), replica_lag (T4's replica), cpu or connections (T4). */
+    /** throttle (T5), replica_lag (T4's replica), cpu (T4), or connections (T4's connections at the slots clients can use, F34). */
     family: string;
     signal: string;
     kind: NumberKind;
@@ -780,8 +851,9 @@ function evidenceOf(value: unknown): Record<string, unknown> {
  */
 export function cosmosEpisodes(capture: CosmosCapture | null, findingRows: readonly Row[]): MeasuredEpisode[] {
     const out: MeasuredEpisode[] = [];
-    const lastPoint = capture?.points[capture.points.length - 1]?.at ?? null;
-    const step = (capture?.intervalMinutes ?? 1) * MIN;
+    const last = capture?.points[capture.points.length - 1] ?? null;
+    const lastPoint = last?.at ?? null;
+    const step = (last ? spanMinutes(last, capture?.intervalMinutes ?? 1) : (capture?.intervalMinutes ?? 1)) * MIN;
     for (const r of findingRows) {
         const id = typeof r.FindingId === "string" ? r.FindingId : "";
         if (!id.startsWith("cosmosdb.T5.throttle.")) continue;
@@ -858,24 +930,27 @@ interface LevelRun {
     to: Date | null;
     /** Its last point at the level, plus one interval: where the run is known to end. */
     end: Date;
+    /** Its last point at the level. */
+    last: Date;
     /** True only when the capture ends while it's at the level; a run the metrics break off from has no known recovery. */
     ongoing: boolean;
     peak: number;
 }
 
-/** Runs of points at or above a level (one interval apart at most). */
-function runsAtOrAbove(points: ReadonlyArray<{ at: Date; value: number }>, level: number, minPoints: number, stepMs: number): LevelRun[] {
+/** Runs of points at or above a level (one interval apart at most), by each point's own interval when it has one (F35): its save's step for the gap, its span for its end. */
+function runsAtOrAbove(points: ReadonlyArray<{ at: Date; value: number; minutes?: number; grain?: number }>, level: number, minPoints: number, stepMs: number): LevelRun[] {
     const out: LevelRun[] = [];
-    let run: Array<{ at: Date; value: number }> = [];
+    let run: Array<{ at: Date; value: number; minutes?: number; grain?: number }> = [];
     const close = (next: { at: Date } | null, ongoing: boolean) => {
         if (run.length >= minPoints) {
-            const last = run[run.length - 1].at.getTime();
-            out.push({ from: run[0].at, to: next ? next.at : null, end: next ? next.at : new Date(last + stepMs), ongoing, peak: Math.max(...run.map((p) => p.value)) });
+            const last = run[run.length - 1];
+            out.push({ from: run[0].at, to: next ? next.at : null, end: next ? next.at : new Date(last.at.getTime() + spanMinutes(last, stepMs / MIN) * MIN), last: last.at, ongoing, peak: Math.max(...run.map((p) => p.value)) });
         }
         run = [];
     };
     for (const p of points) {
-        const gap = run.length > 0 && p.at.getTime() - run[run.length - 1].at.getTime() > stepMs * 1.5;
+        const previous = run[run.length - 1];
+        const gap = previous !== undefined && p.at.getTime() - previous.at.getTime() > grainMinutes(previous, stepMs / MIN) * MIN * 1.5;
         if (gap) close(null, false);
         if (p.value >= level) run.push(p);
         else close(p, false);
@@ -884,14 +959,14 @@ function runsAtOrAbove(points: ReadonlyArray<{ at: Date; value: number }>, level
     return out;
 }
 
-/** T4's episodes: its read replica's lag at or above 60 s (its catch-up after a restart left out), and its CPU at 80 % or more for 2 intervals. */
+/** T4's episodes: its read replica's lag at or above 60 s (its catch-up after a restart left out), its CPU at 80 % or more for 2 intervals, and its connections at the slots clients can use, connection-surge's signal (F34). */
 export function postgresEpisodes(capture: PostgresCapture | null): MeasuredEpisode[] {
     if (!capture) return [];
     const stepMs = (capture.intervalMinutes ?? 5) * MIN;
     const out: MeasuredEpisode[] = [];
     const episode = (target: EstateTarget, family: string, signal: string, kind: NumberKind, level: string, run: LevelRun): MeasuredEpisode => {
         const visibleMin = minutesBetween(run.from, run.to ?? run.end);
-        const brokeOff = `Its metrics break off after ${formatTimeUtc(new Date(run.end.getTime() - stepMs))} UTC, so its recovery isn't in the capture.`;
+        const brokeOff = `Its metrics break off after ${formatTimeUtc(run.last)} UTC, so its recovery isn't in the capture.`;
         return {
             key: `postgres:${family}:${run.from.toISOString()}`,
             target,
@@ -910,20 +985,31 @@ export function postgresEpisodes(capture: PostgresCapture | null): MeasuredEpiso
             impact: impactOf({ target, family, durationMin: visibleMin, ongoing: run.ongoing, peak: run.peak }),
         };
     };
-    const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
+    const lag = oneReadingEach(postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag));
     const caught = new Set(replicaCatchUp(capture, lag));
     const replayed = lag.filter((p) => !caught.has(p));
     for (const run of runsAtOrAbove(replayed, REPLICA_LAG_WARNING_SECONDS, 1, stepMs)) out.push(episode("T4-replica", "replica_lag", "read replica lag", "seconds", `${REPLICA_LAG_WARNING_SECONDS} s`, run));
-    const cpu = postgresSeries(capture, "T4", POSTGRES_METRICS.cpu);
+    const cpu = oneReadingEach(postgresSeries(capture, "T4", POSTGRES_METRICS.cpu));
     for (const run of runsAtOrAbove(cpu, 80, 2, stepMs)) out.push(episode("T4", "cpu", "CPU", "percent", "80 %", run));
+    // A session's connection surges (F34): its T4 beats aren't in Scenario Runs, so they show here, by T4's connections at the
+    // slots clients can use, never by its failed connections, which didn't count the surge's refused attempts live.
+    const connections = oneReadingEach(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    for (const run of runsAtOrAbove(connections, POSTGRES_USABLE_CONNECTIONS, 1, stepMs)) out.push(episode("T4", "connections", CAPTURE_SIGNALS.connections.label, "int", `${POSTGRES_USABLE_CONNECTIONS} connections`, run));
     return out.sort((a, b) => a.visibleAt.getTime() - b.visibleAt.getTime());
 }
 
-/** The episodes that overlap a plan's window (T4's and T5's captures cover the latest session they were saved with). */
-export function episodesIn(episodes: readonly MeasuredEpisode[], plan: Pick<Plan, "start" | "end">): MeasuredEpisode[] {
+/**
+ * The episodes that overlap a plan's window (T4's and T5's captures cover the latest session they were saved with). A T4
+ * connection surge that the plan records as a fault is scored there (scoreConnectionSurge), so its episode isn't listed twice.
+ */
+export function episodesIn(episodes: readonly MeasuredEpisode[], plan: Pick<Plan, "start" | "end"> & Partial<Pick<Plan, "faults">>): MeasuredEpisode[] {
     const from = plan.start.getTime();
     const to = plan.end.getTime() + TELEMETRY_LAG_MINUTES * MIN;
-    return episodes.filter((e) => e.visibleAt.getTime() < to && (e.recoveredAt ?? e.endAt ?? e.visibleAt).getTime() >= from);
+    const endOf = (e: MeasuredEpisode) => (e.recoveredAt ?? e.endAt ?? (e.ongoing ? new Date(8.64e15) : e.visibleAt)).getTime();
+    const surges = (plan.faults ?? []).filter((r) => r.target === "T4" && scenarioOf(r) === "connection-surge" && r.windowStart !== null && r.windowEnd !== null);
+    const scored = (e: MeasuredEpisode) =>
+        e.target === "T4" && e.family === "connections" && surges.some((r) => e.visibleAt.getTime() < (r.windowEnd as Date).getTime() && endOf(e) > (r.windowStart as Date).getTime());
+    return episodes.filter((e) => e.visibleAt.getTime() < to && (e.recoveredAt ?? e.endAt ?? e.visibleAt).getTime() >= from && !scored(e));
 }
 
 // ---------- Summaries and aggregates ----------

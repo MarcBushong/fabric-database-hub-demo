@@ -32,6 +32,12 @@ export interface AgentContext {
 
 export const NO_CHANGE = "Don't change anything.";
 export const PROPOSE_ONLY = "Don't apply anything; propose only.";
+/**
+ * F36: in SqlServerStorageIO, an Azure SQL database's sample can hold two files under one database and file ID, so a
+ * delta of one key's counters steps between them. Every prompt that asks for KQL on that table carries this sentence.
+ */
+export const STORAGE_IO_RULE =
+    "On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID.";
 
 /** Database Hub's telemetry keeps samples for 7 days or less. */
 export const TELEMETRY_RETENTION_DAYS = 7;
@@ -153,7 +159,7 @@ interface FamilySkills {
 const FAMILY_SKILLS: Record<string, FamilySkills> = {
     io: {
         telemetry: (where, span, database) =>
-            `Using the telemetry agent instructions, write a KQL query on SqlServerStorageIO for ${where} from ${span}. Follow the rule for cumulative counters, and for each ${database} file report the delta of reads, writes, bytes read and written, and read and write stalls. Then adapt sample query 5 to show Buffer IO and Tran Log IO waits for the same window. ${NO_CHANGE}`,
+            `Using the telemetry agent instructions, write a KQL query on SqlServerStorageIO for ${where} from ${span}. Follow the rule for cumulative counters, and for each ${database} file report the delta of reads, writes, bytes read and written, and read and write stalls. ${STORAGE_IO_RULE} Then adapt sample query 5 to show Buffer IO and Tran Log IO waits for the same window. ${NO_CHANGE}`,
         skill: "diagnose-resource-pressure",
         ask: (span) => `Read sys.dm_io_virtual_file_stats, including the queued stall columns, and tell me whether IO governance or storage was the limit from ${span}.`,
     },

@@ -493,13 +493,17 @@ function Get-DemoT4ReplicaCreateFailure {
     <#
     .SYNOPSIS
     The replica's last failed creation: the resource group deployment dbhub-t4-replica, when it failed. Returns Code
-    (SkuNotAvailable, AlreadyExists, SourceNotReady, or Other), Text, Sku, Zone, and TimeUtc, or $null. A read. Internal.
+    (SkuNotAvailable, QuotaExceeded, AlreadyExists, SourceNotReady, or Other), Text, Sku, Zone, TimeUtc, and Quota
+    (Get-DemoT4QuotaRefusal's figures for QuotaExceeded, else $null), or $null. A read. Internal.
 
     .DESCRIPTION
     The deployment's own error stops at ResourceDeploymentFailure, so the server operation's status message is read too
-    (Deployment Operations - List), as Get-DemoT4CreateFailure does for T4 (ADR 0019).
+    (Deployment Operations - List), as Get-DemoT4CreateFailure does for T4 (ADR 0019). QuotaExceeded is Learn's refusal
+    over the subscription's vCore quota ("exceeding approved {0} Cores quota"; F37, 2026-11-22), which moves the replica's
+    size fallback on as SkuNotAvailable does.
     Sources: https://learn.microsoft.com/cli/azure/deployment/group#az-deployment-group-show,
-    https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list
+    https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list,
+    https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -529,7 +533,8 @@ function Get-DemoT4ReplicaCreateFailure {
             }
         }
     }
-    $code = if ($errorText -match 'SkuNotAvailable') { 'SkuNotAvailable' } elseif ($errorText -match 'ReadReplicaAlreadyExistWithGivenName') { 'AlreadyExists' } elseif ($errorText -match 'ReadReplicaServerInUnexpectedState') { 'SourceNotReady' } else { 'Other' }
+    $quota = if ($errorText -match 'SkuNotAvailable') { $null } else { Get-DemoT4QuotaRefusal -Text $errorText }
+    $code = if ($errorText -match 'SkuNotAvailable') { 'SkuNotAvailable' } elseif ($null -ne $quota) { 'QuotaExceeded' } elseif ($errorText -match 'ReadReplicaAlreadyExistWithGivenName') { 'AlreadyExists' } elseif ($errorText -match 'ReadReplicaServerInUnexpectedState') { 'SourceNotReady' } else { 'Other' }
     $parameters = Get-DemoMemberValue -InputObject $properties -Name 'parameters'
     $stamp = Get-DemoMemberValue -InputObject $properties -Name 'timestamp'
     $timeUtc = if ($stamp -is [datetime]) { $stamp.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$stamp }
@@ -539,6 +544,7 @@ function Get-DemoT4ReplicaCreateFailure {
         Sku     = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parameters -Name 'skuName') -Name 'value')
         Zone    = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parameters -Name 'availabilityZone') -Name 'value')
         TimeUtc = $timeUtc
+        Quota   = $quota
     }
 }
 
@@ -856,14 +862,17 @@ function Complete-DemoT4ReplicaCreate {
     <#
     .SYNOPSIS
     Finishes what Start-DemoT4ReplicaCreate began: waits for the replica's creation or start, moves the size fallback on
-    when Azure refuses a size (SkuNotAvailable), records the size used (DbHubT4ReplicaSize), and returns the results:
-    <prefix>.T4.REPLICA, and <prefix>.T4.REPLICA.FALLBACK when another size or zone was used. Internal.
+    when Azure refuses a size (SkuNotAvailable, or over the subscription's vCore quota: F37, 2026-11-22), records the size
+    used (DbHubT4ReplicaSize), and returns the results: <prefix>.T4.REPLICA, and <prefix>.T4.REPLICA.FALLBACK when another
+    size or zone was used. Internal.
 
     .DESCRIPTION
-    Only SkuNotAvailable for the size the attempt sent moves the fallback on (ADR 0019's rule, ADR 0025's order); a refused
-    attempt's shell (Dropping) is waited for before the next one. Any other failure ends it: a Fail for deploy.ps1 and a
-    Warning for start-demo.ps1, which goes on without the replica. When Azure refuses every size, deploy.ps1 ends NOT DONE
-    with the fix (a Region access request); nothing is recorded, so the next run tries again.
+    Only SkuNotAvailable for the size the attempt sent moves the fallback on (ADR 0019's rule, ADR 0025's order), and, since
+    2026-11-22, Learn's refusal over the subscription's vCore quota, which skips that size in another zone: a quota is the
+    subscription's in the region, not a zone's. A refused attempt's shell (Dropping) is waited for before the next one. Any
+    other failure ends it: a Fail for deploy.ps1 and a Warning for start-demo.ps1, which goes on without the replica. When
+    Azure refuses every size, deploy.ps1 ends NOT DONE with the fix (a Region access request, or, over the quota, room in
+    it, more quota, or another region); nothing is recorded, so the next run tries again.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -914,6 +923,19 @@ function Complete-DemoT4ReplicaCreate {
         $refused.Add($item)
     }
     $notReadyRetries = 0
+    # Why Azure refused the sizes it refused, as the messages say it: SkuNotAvailable, as before, or, over the
+    # subscription's vCore quota, that with Azure's figures (F37, 2026-11-22).
+    $reasonOf = {
+        param([object[]] $Items)
+        $reasons = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in @($Items | Where-Object { $null -ne $_ })) {
+            $reason = Format-DemoT4RefusalReason -Failure $item
+            if (-not $reasons.Contains($reason)) {
+                $reasons.Add($reason)
+            }
+        }
+        if ($reasons.Count -eq 0) { 'SkuNotAvailable' } else { $reasons -join '; ' }
+    }
     while ($true) {
         $attempt = $order[$index]
         $outcome = Wait-DemoT4ReplicaTemplate -Config $Config -TimeoutMinutes ([int]$setting['createTimeoutMinutes'])
@@ -945,7 +967,7 @@ function Complete-DemoT4ReplicaCreate {
             }
             continue
         }
-        $refusedSize = $null -ne $failure -and $failure.Code -eq 'SkuNotAvailable' -and ($failure.Sku -ceq $attempt.SkuName -or -not $failure.Sku)
+        $refusedSize = $null -ne $failure -and $failure.Code -in 'SkuNotAvailable', 'QuotaExceeded' -and ($failure.Sku -ceq $attempt.SkuName -or -not $failure.Sku)
         if (-not $refusedSize) {
             $why = if ($null -ne $failure) { $failure.Text } else { 'the deployment failed, and its error couldn''t be read' }
             $evidence['attempt'] = Format-DemoT4ReplicaAttemptText -Attempt $attempt
@@ -954,13 +976,29 @@ function Complete-DemoT4ReplicaCreate {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, $evidence['attempt'], $why) -Evidence $evidence -Remediation $fix -DocUrl $docUrl))
             return $results.ToArray()
         }
-        $refused.Add([pscustomobject]@{ SkuName = $attempt.SkuName; Zone = $attempt.Zone; TimeUtc = $failure.TimeUtc })
-        Write-DemoLog -Level Warning -Message ('Azure refused {0} for T4''s read replica (SkuNotAvailable).' -f (Format-DemoT4ReplicaAttemptText -Attempt $attempt))
+        $refusedQuota = Get-DemoMemberValue -InputObject $failure -Name 'Quota'
+        $refused.Add([pscustomobject]@{ SkuName = $attempt.SkuName; Zone = $attempt.Zone; TimeUtc = $failure.TimeUtc; Quota = $refusedQuota })
+        Write-DemoLog -Level Warning -Message ('Azure refused {0} for T4''s read replica ({1}).' -f (Format-DemoT4ReplicaAttemptText -Attempt $attempt), (Format-DemoT4RefusalReason -Failure $failure))
         $index++
+        if ($null -ne $refusedQuota) {
+            # A quota is the subscription's in the region, not a zone's (F37): the same size isn't tried in another zone.
+            while ($index -lt $order.Count -and [string]$order[$index].SkuName -ceq [string]$attempt.SkuName) {
+                $index++
+            }
+        }
         if ($index -ge $order.Count) {
             $tried = @($refused | ForEach-Object { Format-DemoT4ReplicaAttemptText -Attempt $_ }) -join ', '
             $evidence['refused'] = $tried
-            $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) wasn''t created: Azure refused every size it can have (SkuNotAvailable): {1}. Database Hub''s Read replica lag stays empty.' -f $names.ServerName, $tried) -Evidence $evidence -Remediation ('Ask for access with a Region access request for Azure Database for PostgreSQL flexible server in {0} (Learn: Resolve capacity errors), then run ./scripts/{1}; nothing is recorded, so it tries every size again.' -f [string]$Config['location'], $(if ($Context.CheckPrefix -eq 'DEPLOY') { 'deploy.ps1' } else { 'start-demo.ps1' })) -DocUrl ([string]$setting['docUrls']['capacityErrors'])))
+            $script = if ($Context.CheckPrefix -eq 'DEPLOY') { 'deploy.ps1' } else { 'start-demo.ps1' }
+            $overQuota = @($refused | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'Quota') }).Count -gt 0
+            $unavailable = @($refused | Where-Object { $null -eq (Get-DemoMemberValue -InputObject $_ -Name 'Quota') }).Count -gt 0
+            $fix = if (-not $overQuota) {
+                'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server in {0} (Learn: Resolve capacity errors), then run ./scripts/{1}; nothing is recorded, so it tries every size again.' -f [string]$Config['location'], $script
+            }
+            else {
+                Get-DemoT4QuotaRemediation -Location ([string]$Config['location']) -Command ('./scripts/{0}' -f $script) -AlsoUnavailable:$unavailable
+            }
+            $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) wasn''t created: Azure refused every size it can have ({1}): {2}. Database Hub''s Read replica lag stays empty.' -f $names.ServerName, (& $reasonOf @($refused)), $tried) -Evidence $evidence -Remediation $fix -DocUrl ([string]$setting['docUrls']['capacityErrors'])))
             return $results.ToArray()
         }
         # Azure keeps a refused server as a shell for a few minutes (Dropping; ADR 0019, 2026-11-09): the next attempt,
@@ -1012,7 +1050,7 @@ function Complete-DemoT4ReplicaCreate {
         $tried = @($refused | ForEach-Object { Format-DemoT4ReplicaAttemptText -Attempt $_ }) -join ', '
         $sessionHours = [double](Get-DemoProfile).assumptions.demoHoursPerSession
         $price = Get-DemoT4ReplicaPriceText -Config $Config -SkuName $created.SkuName -AskedSku $support.SkuName -SessionHours $sessionHours
-        $notice = 'T4''s read replica was created as {0}, where T4''s size {1} was asked for, because Azure refused {2} (SkuNotAvailable). {3}' -f (Format-DemoT4ReplicaAttemptText -Attempt $created), $support.SkuName, $(if ($tried) { $tried } else { 'the first choice' }), $price
+        $notice = 'T4''s read replica was created as {0}, where T4''s size {1} was asked for, because Azure refused {2} ({4}). {3}' -f (Format-DemoT4ReplicaAttemptText -Attempt $created), $support.SkuName, $(if ($tried) { $tried } else { 'the first choice' }), $price, (& $reasonOf @($refused))
         $createdVCores = if ($created.SkuName -cmatch '^Standard_[A-Z]+(\d{1,2})[a-z_0-9]*$') { [int]$Matches[1] } else { 0 }
         $next = if ($createdVCores -gt $support.VCores) { 'Nothing to do: each session asks for T4''s size first again, and uses this larger size (recorded as DbHubT4ReplicaSize) only when Azure refuses it.' } else { 'Nothing to do: the next replica starts at this size (recorded as DbHubT4ReplicaSize), which has T4''s vCores, so Azure isn''t asked for the refused one at every session.' }
         $results.Add((New-DemoResult -CheckId ('{0}.T4.REPLICA.FALLBACK' -f $Context.CheckPrefix) -Area 'infra' -Target 'T4' -Status 'Warning' -Message $notice -Evidence ([ordered]@{ asked = $support.SkuName; created = $created.SkuName; zone = $created.Zone; refused = $tried; record = $record }) -Remediation $next -DocUrl ([string]$setting['docUrls']['capacityErrors'])))

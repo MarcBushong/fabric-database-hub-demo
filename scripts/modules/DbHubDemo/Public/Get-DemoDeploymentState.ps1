@@ -29,7 +29,9 @@ function Get-DemoDeploymentState {
     control's role can create T5's container, so it exists only during a session; AlwaysOn while it can't; in the
     DbHubT5Container tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
     nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
-    ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
+    ConvertTo-DemoBusyMarker), AutoShutdownMoved (the times the VMs' auto-shutdown is at when the busy marker's steps left
+    it away from autoShutdownTime, in DbHubAutoShutdownMoved; 2026-11-21, F25), FabricWorkspaceId and ControlWorkspaceId
+    (the Fabric workspaces this environment uses, by
     ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), T5Refused (when
     Azure didn't create T5's account and the run deployed the rest without it, in DbHubT5Refused; 2026-11-19,
     Resolve-DemoT5LeftOut), StartDemoUtc (when the last start-demo.ps1 began, in DbHubStartDemoUtc; 2026-11-19,
@@ -94,6 +96,7 @@ function Get-DemoDeploymentState {
         T5Container       = & $read 'T5Container'
         BusyUntilUtc      = & $read 'BusyUntilUtc'
         BusyBy            = & $read 'BusyBy'
+        AutoShutdownMoved = & $read 'AutoShutdownMoved'
         FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
         ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
         T5Refused         = & $read 'T5Refused'

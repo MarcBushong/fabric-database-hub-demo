@@ -380,8 +380,10 @@ function Wait-DemoUpdateStopWork {
     <#
     .SYNOPSIS
     Waits, at most -WaitMinutes in all, for work this run started that still needs a host it's about to deallocate
-    (2026-11-19). Returns Seconds, Done (what it waited for and saw end), and Left (what still ran, with where it goes on).
-    Never throws. Internal.
+    (2026-11-19). Returns Seconds, Done (what it waited for and saw end), Left (what still ran, with where it goes on),
+    and T2UploadedAt (when T2's first migration assessment uploaded, as it waited for it; '' otherwise), which the ending
+    reads to deploy the Insights app once more with T2's readiness (F18, Complete-DemoInsightsAppMigration). Never throws.
+    Internal.
 
     .DESCRIPTION
     - A bootstrap pass (vm/health/README.md): after an update's new bundle, a host's pass checks every step again, Arc
@@ -465,6 +467,7 @@ function Wait-DemoUpdateStopWork {
     }
 
     # 2. T2's first migration assessment, while T2's host runs.
+    $t2UploadedAt = ''
     $hostVm = Get-DemoHostVmName -Config $Config
     $assessment = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'T2.ARC.MIGRATIONASSESSMENT' }) | Select-Object -Last 1
     $evidence = Get-DemoMemberValue -InputObject $assessment -Name 'evidence'
@@ -511,6 +514,7 @@ function Wait-DemoUpdateStopWork {
             & $pause
         }
         if ($uploaded) {
+            $t2UploadedAt = $uploaded
             $done.Add(('T2''s first migration assessment, which uploaded at {0} after {1}' -f $uploaded, (& $minutesText ($clock.Elapsed.TotalSeconds - $since))))
         }
         elseif ($runStarted) {
@@ -520,7 +524,7 @@ function Wait-DemoUpdateStopWork {
             $left.Add(('T2''s first migration assessment didn''t start{0}; {1}' -f $(if ($problem) { ' ({0})' -f $problem.TrimEnd('.') } else { '' }), $resumes))
         }
     }
-    return [pscustomobject]@{ Seconds = [int]$clock.Elapsed.TotalSeconds; Done = $done.ToArray(); Left = $left.ToArray() }
+    return [pscustomobject]@{ Seconds = [int]$clock.Elapsed.TotalSeconds; Done = $done.ToArray(); Left = $left.ToArray(); T2UploadedAt = $t2UploadedAt }
 }
 
 function Get-DemoRunningHourlyCost {
@@ -900,7 +904,9 @@ function Invoke-DemoUpdateEndStop {
         }
     }
     $work = Wait-DemoUpdateStopWork -Config $Config -Result $Result -VmName $vms.ToArray() -WaitMinutes $WorkWaitMinutes -PollSeconds $PollSeconds
-    $evidence = [ordered]@{ waitedSeconds = [int]$work.Seconds; waitedOn = $vms.ToArray(); waitedFor = @($work.Done); left = @($work.Left) }
+    # When T2's first migration assessment uploaded as the stop waited, the ending deploys the Insights app once more with
+    # T2's readiness (F18, Complete-DemoInsightsAppMigration).
+    $evidence = [ordered]@{ waitedSeconds = [int]$work.Seconds; waitedOn = $vms.ToArray(); waitedFor = @($work.Done); left = @($work.Left); t2AssessmentUploadedAt = [string](Get-DemoMemberValue -InputObject $work -Name 'T2UploadedAt') }
     $workText = ''
     if (@($work.Done).Count -gt 0) {
         $workText += ' It waited first for {0}.' -f (& $join @($work.Done))

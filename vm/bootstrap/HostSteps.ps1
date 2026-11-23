@@ -235,7 +235,8 @@ function Save-DemoHostMedia {
     $media = Get-DemoHostMediaFile -Context $Context -MediaName $MediaName
     $download = Save-DemoVmDownload -Uri $media.Url -Path $media.Path -ExpectedSha256 $media.Sha256 -Name $media.Name
     if ($download.Warning) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $download.Warning)
+        # Media trusted on first use: a one-off note, which the next bootstrap generation clears (the F24 review, 2026-11-20).
+        return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage $download.Warning)
     }
 }
 
@@ -661,6 +662,11 @@ function Test-DemoHostDatabase {
         $status = Get-DemoHostDatabaseStatus -Context $Context
     }
     catch {
+        # A new guest has no tools for the check yet: this step's Set copies them in, so that's no warning (2026-11-20).
+        if ([string]$_.Exception.Message -match 'The guest has no demo tools at .+ yet') {
+            Write-DemoVmLog -Message 'The guest has no database tools yet; this step copies them in, then sets up ContosoCare.'
+            return $false
+        }
         Write-DemoVmLog -Level 'Warning' -Message ('Database check in the guest: {0}' -f $_.Exception.Message)
         return $false
     }
@@ -1037,6 +1043,132 @@ function Get-DemoHostGuestRebuildPath {
     return (Join-Path -Path $Context.Root -ChildPath 'guest-rebuild.json')
 }
 
+function Get-DemoHostGuestRebuildRequestPath {
+    # Where reset-demo.ps1 -RebuildGuest leaves its request (vm/bootstrap/Set-DemoGuestRebuildRequest.ps1, 2026-11-21).
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    return (Join-Path -Path $Context.Root -ChildPath 'guest-rebuild-request.json')
+}
+
+function Get-DemoHostGuestRebuildRequest {
+    <#
+    .SYNOPSIS
+    The rebuild of the guest that ./scripts/reset-demo.ps1 -RebuildGuest asked for (2026-11-21), while it's still to do:
+    the request (guest-rebuild-request.json, with its id) has no outcome, and no rebuild record carries its id yet
+    (guest-rebuild.json's requestId). $null otherwise, and when it can't be read (logged). Never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        $request = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildRequestPath -Context $Context)
+        if ($null -eq $request -or [string]$request['outcome'] -or [string]$request['id'] -notmatch '^[A-Za-z0-9-]{8,64}$') {
+            return $null
+        }
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $Context)
+        if ($null -ne $record -and [string]$record['requestId'] -eq [string]$request['id']) {
+            return $null
+        }
+        return $request
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The request to make the guest again couldn''t be read: {0}' -f (Protect-DemoVmText -Text $_.Exception.Message))
+        return $null
+    }
+}
+
+function Invoke-DemoHostGuestRebuildRequest {
+    <#
+    .SYNOPSIS
+    Acts on the rebuild that reset-demo.ps1 -RebuildGuest asked for (2026-11-21), in the GuestSource step. Refused, with the
+    request's outcome noted and nothing deleted, while the guest is held off its network on purpose (Test-DemoGuestHeldOff:
+    a golden capture in progress on this host, or a capture record that isn't released), or may hold another host's Arc
+    identity (Test-DemoGuestCopyUnsettled: a released copy never reset), each checked here again, fail closed, or when T2
+    runs a build mode (ProductKey or Developer), whose guest the image doesn't make. Otherwise the guest goes
+    as an unfinished one does (Remove-DemoHostGuest, which records the request's id), and this pass runs the configured
+    JumpstartImage mode from here on, so the image's steps make a new arcsql01 in it. Returns Action (Removed, Failed, or
+    Refused), Result (the step's result for Failed), and Note (for Refused).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request
+    )
+
+    $name = $Context.GuestName
+    $id = [string]$Request['id']
+    $refuse = {
+        param([string] $Why)
+        $Request['outcome'] = 'Refused'
+        $Request['reason'] = $Why
+        $Request['outcomeUtc'] = Get-DemoVmUtcNow
+        Write-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildRequestPath -Context $Context) -InputObject $Request
+        $note = 'The rebuild of {0} that ./scripts/reset-demo.ps1 -RebuildGuest asked for ({1}) was refused, and nothing was deleted: {2}' -f $name, $id, $Why
+        Write-DemoVmLog -Level 'Warning' -Message $note
+        [pscustomobject]@{ Action = 'Refused'; Result = $null; Note = $note }
+    }
+    if (Test-DemoGuestHeldOff -StateRoot $Context.Root) {
+        return (& $refuse 'a golden capture holds the guest (a capture in progress on this host, or a restored copy or a source that isn''t released yet). ./scripts/deploy.ps1 or a session''s start releases it; then run ./scripts/reset-demo.ps1 -RebuildGuest again.')
+    }
+    if (Test-DemoGuestCopyUnsettled -StateRoot $Context.Root) {
+        return (& $refuse 'the guest may be a copy restored from a golden snapshot whose Arc identity was never reset. ./scripts/deploy.ps1 resets it; then run ./scripts/reset-demo.ps1 -RebuildGuest again if you still need to.')
+    }
+    if ($Context.ConfiguredMode -ne 'JumpstartImage') {
+        return (& $refuse ('T2 runs {0} mode, which builds its guest from media rather than Arc Jumpstart''s image. To start T2 over, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1.' -f $Context.ConfiguredMode))
+    }
+    $source = Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)
+    $oldMode = $Context.Mode
+    if ($null -ne $source -and [string]$source['installMode']) {
+        $oldMode = [string]$source['installMode']
+    }
+    $marker = Read-DemoVmJsonFile -Path $Context.ArcMarkerPath
+    $finding = [pscustomobject]@{
+        BuildMode     = $oldMode
+        GuestVmId     = Get-DemoHostGuestVmId -Name $name
+        ArcResourceId = $(if ($null -ne $marker) { [string]$marker['resourceId'] } else { '' })
+    }
+    # PowerShell 7's ConvertFrom-Json reads an ISO time as a date; Windows PowerShell 5.1 keeps the text.
+    $requestedUtc = $Request['requestedUtc']
+    if ($requestedUtc -is [datetime]) {
+        $requestedUtc = $requestedUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $reason = 'Requested by {0} ({1}, at {2}).' -f [string]$Request['requestedBy'], $id, [string]$requestedUtc
+    $result = Remove-DemoHostGuest -Context $Context -Finding $finding -Reason $reason -RequestId $id -Confirm:$false
+    if ($null -ne $result) {
+        return [pscustomobject]@{ Action = 'Failed'; Result = $result; Note = '' }
+    }
+    Use-DemoHostConfiguredMode -Context $Context
+    return [pscustomobject]@{ Action = 'Removed'; Result = $null; Note = '' }
+}
+
+function Use-DemoHostConfiguredMode {
+    # Once the guest is gone (Remove-DemoHostGuest deleted guest-source.json too), this pass runs the configured mode, as
+    # the next one would: a kept build guest's mode went with it (2026-11-21).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    if ($Context.Mode -ne $Context.ConfiguredMode -or $Context.ModeAdopted) {
+        Write-DemoVmLog -Message ('The guest is gone, so this pass runs the configured {0} mode, not the kept guest''s {1}.' -f $Context.ConfiguredMode, $Context.Mode)
+    }
+    $Context.Mode = $Context.ConfiguredMode
+    $Context.ModeAdopted = $false
+}
+
 function Get-DemoHostGuestRebuildDetail {
     # For health.json (details.guestRebuild): the last rebuild of an unfinished guest, without its file list. $null when
     # there's none. Never throws.
@@ -1187,7 +1319,8 @@ function Remove-DemoHostGuest {
     its DPAPI-protected password. guest-rebuild.json records it (state Removing, then Removed; no secret), so a run stopped
     midway finishes it, and deploy.ps1 deletes the old guest's Arc resources in Azure (DEPLOY.T2.REBUILD). Without a data
     disk, the space check comes first, and when the image wouldn't fit, nothing is deleted. Returns a step result only for
-    that failure.
+    that failure. -RequestId (2026-11-21): a rebuild that reset-demo.ps1 -RebuildGuest asked for, of a guest that may be
+    finished; the record keeps it (requestId), so the request is done.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1199,7 +1332,10 @@ function Remove-DemoHostGuest {
 
         [string] $Reason = '',
 
-        [switch] $Resume
+        [switch] $Resume,
+
+        [ValidatePattern('^$|^[A-Za-z0-9-]{8,64}$')]
+        [string] $RequestId = ''
     )
 
     $name = $Context.GuestName
@@ -1225,7 +1361,8 @@ function Remove-DemoHostGuest {
     if (-not $Resume -or $null -eq $record) {
         $space = Get-DemoHostGuestRebuildSpace -Context $Context -Path (@($guestFolder) + $media | Where-Object { $_ })
         if (-not $space.Ok) {
-            return (New-DemoVmStepResult -Outcome 'Failed' -Message ('{0} was built in PaygWizard mode and its SQL Server setup was never finished, but the Jumpstart image wouldn''t fit on {1} after deleting it: {2:N1} GB free, {3:N1} GB freed, {4:N1} GB needed. Nothing was deleted. Set dataDiskSku to E10 in the configuration to add a data disk, or free space on {1}, then run ./scripts/deploy.ps1 again (ADR 0016).' -f $name, (Get-DemoHostSystemDrive), ($space.FreeBytes / 1GB), ($space.FreedBytes / 1GB), ($space.NeededBytes / 1GB)))
+            $why = if ($RequestId) { 'The rebuild of {0} that ./scripts/reset-demo.ps1 -RebuildGuest asked for can''t start: the Jumpstart image' -f $name } else { '{0} was built in PaygWizard mode and its SQL Server setup was never finished, but the Jumpstart image' -f $name }
+            return (New-DemoVmStepResult -Outcome 'Failed' -Message ('{0} wouldn''t fit on {1} after deleting it: {2:N1} GB free, {3:N1} GB freed, {4:N1} GB needed. Nothing was deleted. Set dataDiskSku to E10 in the configuration to add a data disk, or free space on {1}, then run ./scripts/deploy.ps1 again (ADR 0016).' -f $why, (Get-DemoHostSystemDrive), ($space.FreeBytes / 1GB), ($space.FreedBytes / 1GB), ($space.NeededBytes / 1GB)))
         }
         $oldMode = 'PaygWizard'
         $vmId = ''
@@ -1246,10 +1383,12 @@ function Remove-DemoHostGuest {
             oldMode       = $oldMode
             oldGuestVmId  = $vmId
             arcResourceId = $arcResourceId
+            requestId     = $RequestId
             removed       = @()
         }
     }
-    if (-not $PSCmdlet.ShouldProcess($name, 'Delete the unfinished guest, its disk, the build media, and its records')) {
+    $requested = [bool][string]$record['requestId']
+    if (-not $PSCmdlet.ShouldProcess($name, ('Delete the {0}guest, its disk, the build media, and its records' -f $(if ($requested) { '' } else { 'unfinished ' })))) {
         return
     }
     Write-DemoVmJsonFile -Path $recordPath -InputObject $record
@@ -1298,7 +1437,7 @@ function Remove-DemoHostGuest {
     $record['removedUtc'] = Get-DemoVmUtcNow
     $record['removed'] = @(@($record['removed']) + $removed.ToArray() | Where-Object { $_ } | Select-Object -Unique)
     Write-DemoVmJsonFile -Path $recordPath -InputObject $record
-    Write-DemoVmLog -Message ('Deleted the unfinished guest: {0}. The next steps download Arc Jumpstart''s image and make a new {1}; deploy.ps1 deletes the old guest''s Arc resources in Azure.' -f $(if ($removed.Count -gt 0) { $removed -join ', ' } else { 'nothing was left' }), $name)
+    Write-DemoVmLog -Message ('Deleted the {0}guest: {1}. The next steps download Arc Jumpstart''s image and make a new {2}; deploy.ps1 deletes the old guest''s Arc resources in Azure.' -f $(if ($requested) { '' } else { 'unfinished ' }), $(if ($removed.Count -gt 0) { $removed -join ', ' } else { 'nothing was left' }), $name)
 }
 
 function Set-DemoHostGuestSqlSetUp {
@@ -1343,10 +1482,28 @@ function Invoke-DemoHostGuestSourceStep {
 
     $rebuild = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $Context)
     if ($null -ne $rebuild -and [string]$rebuild['state'] -eq 'Removing') {
-        return (Remove-DemoHostGuest -Context $Context -Resume -Confirm:$false)
+        $resumed = Remove-DemoHostGuest -Context $Context -Resume -Confirm:$false
+        if ($null -eq $resumed) {
+            Use-DemoHostConfiguredMode -Context $Context
+        }
+        return $resumed
+    }
+    # 2026-11-21: a rebuild that reset-demo.ps1 -RebuildGuest asked for comes first; a refused one leaves a note, and the
+    # guest's source is checked as usual.
+    $note = ''
+    $request = Get-DemoHostGuestRebuildRequest -Context $Context
+    if ($null -ne $request) {
+        $handled = Invoke-DemoHostGuestRebuildRequest -Context $Context -Request $request
+        if ($handled.Action -ne 'Refused') {
+            return $handled.Result
+        }
+        $note = $handled.Note
     }
     $decision = Get-DemoHostGuestSourceState -Context $Context
     if ($decision.Ok) {
+        if ($note) {
+            return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage $note)
+        }
         return
     }
     if ($decision.Recorded -ne 'Build' -or $Context.Mode -ne 'JumpstartImage') {
@@ -1373,6 +1530,70 @@ function Invoke-DemoHostGuestSourceStep {
             return (Get-DemoHostGuestSourceFailure -Context $Context -Reason $plan.Reason)
         }
     }
+}
+
+function Test-DemoHostGuestNetwork {
+    <#
+    .SYNOPSIS
+    The GuestNetwork step's Test (2026-11-21): true when every network adapter of the guest is on the NAT switch, or when
+    the guest is held off its network on purpose (Test-DemoGuestHeldOff: a golden capture in progress on this host, or a
+    capture record that isn't released), because then the golden release, and nothing else, reconnects it, or when it may
+    hold another host's Arc identity (Test-DemoGuestCopyUnsettled: a released copy never reset), which deploy.ps1's T2
+    track resets first. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        if (Test-DemoGuestAdapterConnected -Name $Context.GuestName -SwitchName $Context.Host.SwitchName) {
+            return $true
+        }
+        return ((Test-DemoGuestHeldOff -StateRoot $Context.Root) -or (Test-DemoGuestCopyUnsettled -StateRoot $Context.Root))
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The guest''s network adapter couldn''t be read: {0}' -f (Protect-DemoVmText -Text $_.Exception.Message))
+        return $false
+    }
+}
+
+function Repair-DemoHostGuestNetwork {
+    <#
+    .SYNOPSIS
+    The GuestNetwork step's Set (2026-11-21): puts a guest's disconnected network adapters back on the NAT switch
+    (Connect-VMNetworkAdapter), so T2 reaches Azure again, unless the guest is held off its network on purpose, or may hold
+    another host's Arc identity (both checked again, fail closed: then nothing changes). The build modes create the guest
+    on the switch, and JumpstartImage's GuestFirstBoot connects it once its first boot is done; this step is the scripted
+    repair for one that something disconnected later, which T2.GUEST.STATE reports. A guest without a network adapter
+    fails the step with the fix.
+    Source: https://learn.microsoft.com/powershell/module/hyper-v/connect-vmnetworkadapter
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $name = $Context.GuestName
+    $switchName = $Context.Host.SwitchName
+    if (Test-DemoGuestHeldOff -StateRoot $Context.Root) {
+        Write-DemoVmLog -Message ('{0} stays off its network: a golden capture holds it, and its release reconnects it.' -f $name)
+        return
+    }
+    if (Test-DemoGuestCopyUnsettled -StateRoot $Context.Root) {
+        Write-DemoVmLog -Message ('{0} stays off its network: its golden record says released without a reset, and this host isn''t known to be the capture''s source, so the guest may hold the captured Arc identity. ./scripts/deploy.ps1''s T2 track resets it first.' -f $name)
+        return
+    }
+    $adapters = @(Get-VMNetworkAdapter -VMName $name -ErrorAction Stop)
+    if ($adapters.Count -eq 0) {
+        throw ('{0} has no network adapter, so it can''t reach Azure. Run ./scripts/reset-demo.ps1 -RebuildGuest, which makes the guest again from Arc Jumpstart''s image.' -f $name)
+    }
+    $disconnected = @($adapters | Where-Object { [string]$_.SwitchName -ne $switchName }).Count
+    Connect-DemoGuestAdapter -Name $name -SwitchName $switchName
+    Write-DemoVmLog -Level 'Warning' -Message ('{0} had {1} of {2} network adapter(s) off {3}, and no golden capture holds it, so they were connected again.' -f $name, $disconnected, $adapters.Count, $switchName)
 }
 
 # ---- Free space and the guest's Windows evaluation ----

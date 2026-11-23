@@ -276,6 +276,25 @@ Describe 'Agent prompt files' {
         }
     }
 
+    It 'tells the agent to add a key''s files within a sample before the deltas, in every prompt that asks for KQL on SqlServerStorageIO (F36)' {
+        # One sentence, the Insights app's STORAGE_IO_RULE: live (2026-11-21), every sample of an Azure SQL database held two
+        # files under each of FileID 1 and 2, so a delta of one key's counters stepped between them.
+        $app = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/lib/agent-prompts.ts'))
+        $rule = [regex]::Match($app, 'export const STORAGE_IO_RULE =\s*"([^"]+)";').Groups[1].Value
+        $rule | Should -Match '^On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed'
+        $app | Should -Match ([regex]::Escape('${STORAGE_IO_RULE}'))
+        $asked = 0
+        foreach ($prompt in $prompts) {
+            foreach ($block in @(Get-PromptBlock -Body $prompt.Body)) {
+                if ($block -match 'SqlServerStorageIO') {
+                    $asked++
+                    $block.Contains($rule) | Should -BeTrue -Because $prompt.Name
+                }
+            }
+        }
+        $asked | Should -Be 5
+    }
+
     It 'every scenario folder has an in-Hub and a skills prompt file with the same targets' {
         foreach ($scenario in $scenarioFolders) {
             $files = @($prompts | Where-Object { $_.FrontMatter['scenario'] -eq $scenario })

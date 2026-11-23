@@ -1,5 +1,6 @@
 // The time frame the ribbon and the replay share, so the playhead, the lanes, and the engines' charts line up.
 
+import { COSMOS_METRICS, cosmosSeries, perMinute, type CosmosCapture } from "@/data/model";
 import { formatDayUtc, formatTimeUtc } from "@/lib/format";
 import { TELEMETRY_LAG_MINUTES, type FaultScore, type MeasuredEpisode, type Plan } from "@/lib/scoreboard";
 
@@ -26,4 +27,17 @@ export function ribbonRange(plan: Pick<Plan, "start" | "end">, scores: readonly 
         to = Math.max(to, (e.recoveredAt ?? e.endAt ?? e.visibleAt).getTime());
     }
     return [from - 3 * MIN, to + 3 * MIN];
+}
+
+/**
+ * T5's lane from `from` to `to`: its normalized RU, a peak, and its 429s, per minute of each point's span where the window
+ * holds saves at different intervals (F35), as Estate charts them, so a day-long save's 15-minute total beside the
+ * session's own minutes doesn't read as a spike.
+ */
+export function cosmosLanePoints(cosmos: CosmosCapture | null, from: number, to: number): { ru: Array<{ t: number; v: number }>; throttled: Array<{ t: number; v: number }> } {
+    const lane = (points: ReadonlyArray<{ at: Date; value: number }>) => points.filter((p) => p.at.getTime() >= from && p.at.getTime() <= to).map((p) => ({ t: p.at.getTime(), v: p.value }));
+    return {
+        ru: lane(cosmosSeries(cosmos, COSMOS_METRICS.normalizedRu)),
+        throttled: lane(perMinute(cosmosSeries(cosmos, COSMOS_METRICS.throttled), cosmos)),
+    };
 }

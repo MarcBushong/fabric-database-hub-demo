@@ -38,7 +38,7 @@ Using the telemetry agent instructions, adapt sample query 5 to {target} in reso
 ### 2. Log file writes
 
 ```text
-Write a KQL query on SqlServerStorageIO for {target} over {incidentWindow}, following the rule for cumulative counters, and report for the ContosoCare log file the delta of writes, bytes written, and write stall, and the average bytes per write. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
+Write a KQL query on SqlServerStorageIO for {target} over {incidentWindow}, following the rule for cumulative counters, and report for the ContosoCare log file the delta of writes, bytes written, and write stall, and the average bytes per write. On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
 ```
 
 ### 3. The limit, with the SQL diagnostics skill

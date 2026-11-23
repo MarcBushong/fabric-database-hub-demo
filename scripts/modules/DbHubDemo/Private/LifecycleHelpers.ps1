@@ -986,6 +986,8 @@ function Test-DemoStartCost {
     }
     # T5's free tier (2026-11-18, ADR 0027), so a free-tier account isn't priced at list price.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # T5's private endpoint and DNS zone (2026-11-21): priced only when the account has them, or when that can't be told.
+    $costParameters['T5PrivateEndpoint'] = Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode ([string]$NetworkMode)
     # T5's container lifecycle (2026-11-19): its throughput bills only while the demo runs, unless it stays between sessions.
     # Priced all month only because nothing automatic deletes it (the re-review of 0590bbe), it never makes the hard ceiling
     # a Fail by itself, so start-demo.ps1 starts with a Warning.

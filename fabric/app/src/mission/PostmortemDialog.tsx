@@ -10,7 +10,7 @@ import { ArrowDownload16Regular, Copy16Regular, Dismiss20Regular, Sparkle16Fille
 
 import { useApp } from "@/app-context";
 import { useCopilot } from "@/copilot/use-copilot";
-import { toCosmosCapture, toPostgresCapture } from "@/data/model";
+import { latestCosmosCapture, latestPostgresCapture } from "@/data/model";
 import { cosmosFindingsQuery, cosmosSeriesQuery, postgresSeriesQuery, type QuerySpec } from "@/data/queries";
 import type { QueryClient } from "@/data/query-client";
 import { QueryClientContext } from "@/data/use-query";
@@ -27,7 +27,8 @@ const message = (err: unknown) => (err instanceof Error ? err.message : String(e
 /**
  * T4's and T5's episodes in a plan's window on the targets the page's filter hides, for the answer key (the review of
  * b4370565): the investigation reads every target, and the page loads their captures only when its filter shows them. A
- * capture that can't be read is said in the key, never taken for a quiet target.
+ * capture that can't be read is said in the key, never taken for a quiet target. The series queries return every save in
+ * the latest capture's window (F35), so each capture takes each interval from its finest save, as the pages' do.
  */
 async function hiddenCaptures(client: QueryClient, hidden: ReadonlyArray<"T4" | "T5">, plan: Plan): Promise<HiddenCaptures> {
     const specs: QuerySpec[] = [];
@@ -38,7 +39,7 @@ async function hiddenCaptures(client: QueryClient, hidden: ReadonlyArray<"T4" | 
         const series = postgresSeriesQuery();
         specs.push(series);
         try {
-            found.push(...postgresEpisodes(toPostgresCapture((await client.run(series)).rows)));
+            found.push(...postgresEpisodes(latestPostgresCapture((await client.run(series)).rows)));
         } catch (err) {
             errors.push(missing("T4", err));
         }
@@ -49,7 +50,7 @@ async function hiddenCaptures(client: QueryClient, hidden: ReadonlyArray<"T4" | 
         specs.push(series, findings);
         try {
             const [s, f] = await Promise.all([client.run(series), client.run(findings)]);
-            found.push(...cosmosEpisodes(toCosmosCapture(s.rows), f.rows));
+            found.push(...cosmosEpisodes(latestCosmosCapture(s.rows), f.rows));
         } catch (err) {
             errors.push(missing("T5", err));
         }

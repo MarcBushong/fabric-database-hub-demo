@@ -13,6 +13,7 @@
 // episodes; the densest source of a signal comes first (T3's 15-second resource rows before Database Hub's bins).
 
 import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, replicaCatchUp, type Bin, type CosmosCapture, type PostgresCapture } from "@/data/model";
+import { farMark } from "./facets";
 import { isRcaTable, pointKey, readStoppedAt, type Confidence, type Episode, type Evidence, type EventRow, type RcaTarget, type Support, type WholeReading } from "./types";
 
 export interface Sample {
@@ -136,6 +137,23 @@ function supportOf(atLevel: number, unknown: number): Support {
 
 const CONFIDENCE: Record<Support, Confidence> = { sustained: "high", sparse: "medium", "single sample": "low" };
 
+/**
+ * The time samples[first] to samples[last] spent at or over `mark` (Episode.farMs): each such sample counts until the next
+ * sample read (one step past the data's last), at most two steps, so a gap where the capture stopped never counts. A sample
+ * without a value counts nothing, since what the signal did in it isn't known.
+ */
+export function farTimeMs(samples: readonly Sample[], first: number, last: number, mark: number, stepMs: number): number {
+    let total = 0;
+    for (let k = first; k <= last; k++) {
+        const value = samples[k]?.value;
+        if (value === null || value === undefined || value < mark) continue;
+        const at = samples[k].at.getTime();
+        const next = k + 1 < samples.length ? samples[k + 1].at.getTime() : at + stepMs;
+        total += Math.min(next - at, 2 * stepMs);
+    }
+    return total;
+}
+
 /** The baseline at sample i: the median of the valued samples of the minutes before it (BASELINE_MINUTES), outside earlier episodes. */
 function baselineAt(samples: readonly Sample[], i: number, found: readonly Episode[], minutes: number): number | null {
     const start = samples[i].at.getTime();
@@ -231,6 +249,7 @@ export function detect(target: RcaTarget, series: readonly Sample[], stepMs: num
             atLevel,
             support,
             ...(severe ? { severe } : {}),
+            farMs: farTimeMs(samples, i, last, farMark(rule.unit, level), stepMs),
             source,
             confidence: CONFIDENCE[support],
         });
@@ -403,6 +422,9 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Da
         // its samples had fallen to 0.4 s at 16:19:27).
         const lastHit = hits[hits.length - 1];
         const after = !c.end && lastHit ? samples.filter((s) => s.at > lastHit.at) : [];
+        // The time it spent at the far mark, up to its last sample at the level, with the capture's own step past it.
+        const gaps = samples.slice(1).map((s, k) => s.at.getTime() - samples[k].at.getTime()).sort((a, b) => a - b);
+        const farMs = lastHit ? farTimeMs(samples, 0, samples.indexOf(lastHit), farMark(rule.unit, level), gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0) : 0;
         out.push({
             key: `${c.target}-${family}-${stamp(c.start)}`,
             target: c.target,
@@ -423,6 +445,7 @@ export function episodesFromCapture(evidence: Evidence, readTo?: Date, stop?: Da
             unknown: 0,
             atLevel: hits.length,
             support,
+            farMs,
             source: SOURCES.capture,
             confidence: CONFIDENCE[support],
         });

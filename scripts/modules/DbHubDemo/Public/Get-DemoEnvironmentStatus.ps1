@@ -81,9 +81,11 @@ function Get-DemoEnvironmentStatus {
       assigned, what its last run stopped, and what its last T3 check found; a Warning that names the fix when it isn't
       set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause. A
       run it waited for (Deferred, 2026-11-14) isn't a problem.
-    - STATUS.NIGHTLYSTOP (2026-11-14, Get-DemoBusyMarkerStatus), only while the busy marker's tag holds anything: a
+    - STATUS.NIGHTLYSTOP (2026-11-14, Get-DemoBusyMarkerStatus), only while the busy marker's tag holds anything, or the
+      VMs' auto-shutdown is recorded as moved (DbHubAutoShutdownMoved, 2026-11-21): a
       deploy.ps1 run the nightly stop waits for, the deferred pass dbhub-safety-deferred, and a VM auto-shutdown that's
-      moved; a Warning, with the commands that put it back, for one that's moved with no run or pass to explain it.
+      moved; a Warning, with the commands that put it back, for one that's moved with no run or pass to explain it, which a
+      Run all session ends before.
     - STATUS.FABRIC.CAPACITY, with fabric.manageCapacity true or a DbHubFabricCapacityResumed record only (Phase 26b,
       Get-DemoFabricCapacityStatus): the capacity's state, and whether start-demo.ps1 resumed it (the record, which
       stop-demo.ps1 pauses and clears). Read-only: a stale record is shown, and stop-demo.ps1 clears it.
@@ -189,6 +191,18 @@ function Get-DemoEnvironmentStatus {
                 $evidence['workload'] = $workload
             }
             $message = '{0} is running; bootstrap {1}: {2}' -f $vm, $evidence['state'], [string](Get-DemoMemberValue -InputObject $health -Name 'message')
+            # A Ready bootstrap with warnings names them, each with its step (F24, 2026-11-20).
+            $warningNote = Get-DemoHealthWarningNote -Health $health -VmName $vm
+            if ($null -ne $warningNote) {
+                $message = '{0} {1}' -f $message.TrimEnd(), $warningNote.Text
+                $evidence['warningCount'] = $warningNote.Count
+            }
+            # And its notes, by design and as information, which leave it a Pass (2026-11-23).
+            $noteText = Get-DemoHealthNoteText -Health $health
+            if ($null -ne $noteText) {
+                $message = '{0} {1}' -f $message.TrimEnd(), $noteText.Text
+                $evidence['noteCount'] = $noteText.Count
+            }
             if ($null -ne $days) {
                 $message += (' Guest evaluation days left: {0}.' -f $days)
             }

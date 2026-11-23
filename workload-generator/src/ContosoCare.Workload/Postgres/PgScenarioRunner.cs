@@ -458,7 +458,8 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     /// <summary>
     /// connection-surge: opens connections a few at a time until only headroom slots stay free below max_connections,
     /// then fills that headroom for a few seconds at most and tries overshoot more, which the server refuses (SQLSTATE
-    /// 53300: Failed connections in Database Hub), and frees the headroom again (SurgeBurst, 2026-11-03). Holds the rest
+    /// 53300, recorded in the run's events; Azure Monitor's failed connections didn't count them live, 2026-11-21), and frees
+    /// the headroom again (SurgeBurst, 2026-11-03). Holds the rest
     /// (pinging now and then), releases them all, and pauses. Repeats until the deadline. Refusals are capped per minute
     /// and per run (SurgeBounds), and a sign-in failure ends the surge, so it never repeats a failed sign-in.
     /// </summary>

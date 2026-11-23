@@ -16,7 +16,13 @@ function Invoke-DemoPreflight {
     - P2: resource providers; missing ones are registered unless -SkipProviderRegistration is set.
     - P3: region, VM sizes, nested-virtualization families, vCPU quota, and public IP quota; with a zone
       configured, that both sizes and (for demo-day and enhanced-performance) Premium SSD v2 are offered in
-      that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features.
+      that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features. And the
+      Azure Automation accounts this deployment adds, against the subscription's quota in the region
+      (Get-DemoAutomationAccountQuotaResult, PREFLIGHT.P3.AUTOMATION; F30, 2026-11-22): a Fail only for a new deployment.
+      And, for diagnosis only, the subscription's vCore usage for Azure Database for PostgreSQL in the region against T4's
+      size and its read replica's (Read-DemoPostgresQuotaUsage; F37, 2026-11-22): a log line and PREFLIGHT.T4.REPLICA's
+      quotaUsage evidence, never a status, because Azure created servers past those readings; a refusal at creation moves
+      T4's or its replica's size fallback on.
     - C6: Azure Hybrid Benefit only with the entitlement attestation.
     - P4 and P5: the Fabric tenant setting, read through the Fabric admin API when the caller is a Fabric
       administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
@@ -426,20 +432,23 @@ function Invoke-DemoPreflight {
         # Warning, since T4 is part of every deployment (2026-11-09): for a size t4SkuName sets, deploy.ps1 tries it
         # again, then its fallback; otherwise the fallback starts one step on, Standard_D4ds_v5 to Standard_D4ads_v5,
         # Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and after Standard_D2ds_v5, every size again
-        # from the default. The retry in another zone happens only in deploy.ps1, right after a refusal.
+        # from the default. The retry in another zone happens only in deploy.ps1, right after a refusal. A refusal over the
+        # subscription's vCore quota (F37, 2026-11-22) counts the same, with no zone to try: a quota is the region's.
         if (-not $t4Exists) {
             $refused = Get-DemoT4CreateFailure -Config $Config
             if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
                 $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
-                $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
+                $refusedQuota = $null -ne (Get-DemoMemberValue -InputObject $refused -Name 'Quota')
+                $refusedWhy = Format-DemoT4RefusalReason -Failure $refused
+                $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone -and -not $refusedQuota
                 if (-not $otherZone -and $t4Ladder -and $t4Pinned) {
                     # A size t4SkuName sets that Azure refused on record (2026-11-09, user-directed): deploy.ps1 tries it again,
                     # since Azure's regional capacity changes, and then its fallback; a size after it in the order (a record's)
                     # moves the start one step on, as without t4SkuName.
                     $start = if ($t4Sku -ceq $t4Pinned) { '' } else { Get-DemoT4NextSku -Config $Config -Current $t4Sku }
                     $t4Starts.Add($start)
-                    $then = if ($start) { 'starts at {0}, the next size in the fallback''s order' -f $start } else { 'tries it again, since Azure''s regional capacity changes, once more in another zone the region lists, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') }
-                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}. A Warning names the size T4 gets and both monthly estimates.' -f $t4Sku, $refused.TimeUtc, $then) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start; pinnedSku = $t4Pinned }) -Remediation 'Nothing to do: T4 is part of every deployment, and the fallback chooses its size.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                    $then = if ($start) { 'starts at {0}, the next size in the fallback''s order' -f $start } elseif ($refusedQuota) { 'tries it again, since room in the quota can come back, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') } else { 'tries it again, since Azure''s regional capacity changes, once more in another zone the region lists, and then the next size Azure accepts, cheapest first ({0})' -f (@($t4Order | Select-Object -Skip 1) -join ', ') }
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} ({3}), so deploy.ps1 {2}. A Warning names the size T4 gets and both monthly estimates.' -f $t4Sku, $refused.TimeUtc, $then, $refusedWhy) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start; pinnedSku = $t4Pinned }) -Remediation 'Nothing to do: T4 is part of every deployment, and the fallback chooses its size.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
                 }
                 elseif (-not $otherZone -and $t4Ladder) {
                     # The last size refused: every run tries the sizes again from the default (2026-11-09, T4 is required).
@@ -450,7 +459,8 @@ function Invoke-DemoPreflight {
                         'Standard_D2ds_v5' { 'goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off (PREFLIGHT.T4.FALLBACK gives its price)' }
                         default { 'tries every size again from the default, because T4 is part of every deployment and Azure''s regional capacity changes; if Azure refuses them all, the run ends NOT DONE with the fix' }
                     }
-                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if (-not $start) { 'If Azure keeps refusing them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you here.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                    $lastFix = if ($refusedQuota) { 'If Azure keeps refusing them over the quota: {0}' -f (Get-DemoT4QuotaRemediation -Location $location) } else { 'If Azure keeps refusing them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you here.' }
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} ({3}), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what, $refusedWhy) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if (-not $start) { $lastFix } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
                 }
                 else {
                     $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
@@ -473,7 +483,21 @@ function Invoke-DemoPreflight {
         $tuningWhy = if ($t4Start -and $t4Pinned) { 'deploy.ps1''s fallback starts at {0} because {1}, the size t4SkuName sets, is ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' -f $t4Start, $t4Pinned } elseif ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
         $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
         # T4's read replica (2026-11-13, ADR 0025), on the size T4 gets: a Burstable size has none (Not supported, with the fix).
-        $results.Add((New-DemoT4ReplicaPreflightResult -SkuName $tuningSku))
+        $replicaCheck = New-DemoT4ReplicaPreflightResult -SkuName $tuningSku
+        # The subscription's vCore usage for Azure Database for PostgreSQL in the region, for diagnosis only (F37,
+        # 2026-11-22): Azure didn't enforce it as reported, so it's logged and kept in this check's evidence, redacted as
+        # New-DemoResult does, and never judged; a refusal at creation moves the size fallback on, and says so.
+        try {
+            $quotaLine = Format-DemoPostgresQuotaUsageText -Usage (Read-DemoPostgresQuotaUsage -Config $Config) -SkuName $tuningSku -Location $location
+            Write-DemoLog -Message $quotaLine.Text
+            if ($replicaCheck.evidence -is [System.Collections.IDictionary]) {
+                $replicaCheck.evidence['quotaUsage'] = (Protect-DemoText -Text ($quotaLine.Evidence | ConvertTo-Json -Depth 4 -Compress)) | ConvertFrom-Json -AsHashtable
+            }
+        }
+        catch {
+            Write-DemoLog -Message ('For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in {0} couldn''t be read: {1}' -f $location, (Protect-DemoText -Text $_.Exception.Message))
+        }
+        $results.Add($replicaCheck)
     }
     else {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
@@ -547,6 +571,16 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so optional on-demand Bastion cannot be created; the deployment itself doesn''t need it.' -Remediation 'Request a public IP quota increase if you need interactive access.'
     }
 
+    # The Azure Automation accounts this deployment adds, the session control's and the nightly safety stop's (F30,
+    # 2026-11-22): a new deployment whose accounts don't fit the subscription's quota in the region stops here, before
+    # anything is created; an update never does.
+    try {
+        $results.Add((Get-DemoAutomationAccountQuotaResult -Config $Config))
+    }
+    catch {
+        Add-Check 'PREFLIGHT.P3.AUTOMATION' 'subscription' 'Warning' ('Whether this deployment''s Azure Automation accounts fit the subscription''s quota in {0} couldn''t be checked: {1}' -f $location, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do now. If Azure refuses one, DEPLOY.CONTROL or SAFETYSTOP.RESOURCES says so, with the fix.' -DocUrl 'https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits'
+    }
+
     # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,
     # which needs a Fabric administrator; for anyone else it's a reminder to confirm it, which never stops the run or
     # keeps it from DONE, and only a setting read as disabled does. P5 (Phase 26a, ADR 0021): the workspace and the
@@ -612,16 +646,32 @@ function Invoke-DemoPreflight {
     # (PREFLIGHT.POLICY.SQLPUBLIC Fail) must stop the run before anything is created.
     $configuredNetworkMode = if ($Config['networkMode']) { [string]$Config['networkMode'] } else { 'auto' }
     $network = $null
+    # T5 (2026-11-21, ADR 0027): without a complete inventory, a new T5 keeps its private endpoint, which works under any
+    # policy (PREFLIGHT.POLICY.COSMOSPUBLIC, Get-DemoT5PolicyAccess).
+    $addT5Unread = {
+        param([string] $Mode, [string] $Why, [switch] $Deferred)
+        if (Test-DemoT5Enabled -Config $Config) {
+            $t5Access = Get-DemoT5PolicyAccess -NetworkMode $Mode -NotRead -Why $Why
+            $t5Evidence = @{ privateEndpointRequired = $t5Access.Required; reason = $t5Access.Reason; policies = @(); complete = $false }
+            if ($Deferred) {
+                # The deferred inventory's own result replaces it at the end of the run (ParallelDeployment's $applyPolicy).
+                $t5Evidence['deferred'] = $true
+            }
+            Add-Check 'PREFLIGHT.POLICY.COSMOSPUBLIC' 'subscription' $t5Access.Status $t5Access.Message -Evidence $t5Evidence -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])
+        }
+    }
     if ($DeferPolicyInventory -and -not $SkipPolicyInventory -and $configuredNetworkMode -eq 'private') {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' ('Deferred: networkMode is {0}, so the policy inventory resolves nothing the template needs. deploy.ps1 runs it alongside the template and adds its results at the end; the what-if check below catches policy denials before anything is created.' -f $configuredNetworkMode) -Evidence @{ deferred = $true }
         Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('networkMode is {0}, as configured; the deferred policy inventory reports any conflict at the end of the run.' -f $configuredNetworkMode) -Evidence @{ configuredNetworkMode = $configuredNetworkMode; effectiveNetworkMode = $configuredNetworkMode; assumed = $false; policies = @(); deferred = $true }
+        & $addT5Unread 'private' 'deferred to the end of the run' -Deferred
     }
     elseif ($SkipPolicyInventory) {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         $assumption = if ($network.Assumed) { ' (private works under any policy)' } else { '' }
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' 'The policy inventory was skipped (-SkipPolicyInventory). The what-if check still catches policy denials.'
         Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('Without the policy inventory, networkMode {0} resolves to {1}{2}.' -f $network.ConfiguredMode, $network.EffectiveMode, $assumption) -Evidence @{ configuredNetworkMode = $network.ConfiguredMode; effectiveNetworkMode = $network.EffectiveMode; assumed = $network.Assumed; policies = @() }
+        & $addT5Unread $network.EffectiveMode '-SkipPolicyInventory'
     }
     else {
         try {
@@ -635,6 +685,7 @@ function Invoke-DemoPreflight {
             $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
             Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Warning' ('The policy inventory failed ({0}). The what-if check still catches policy denials.' -f $_.Exception.Message.TrimEnd('.'))
             Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' $network.Status $network.Message -Evidence @{ configuredNetworkMode = $network.ConfiguredMode; effectiveNetworkMode = $network.EffectiveMode; assumed = $network.Assumed; policies = @() } -Remediation $network.Remediation
+            & $addT5Unread $network.EffectiveMode 'the inventory failed'
         }
     }
     $effectiveNetworkMode = $network.EffectiveMode
@@ -652,7 +703,25 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.T3.FREEOFFER' 'T3' 'Warning' ('The free-offer check failed ({0}). T3 tries the free offer, and the deployment falls back to regular serverless if Azure rejects it.' -f $_.Exception.Message.TrimEnd('.')) -Evidence @{ useFreeLimit = $t3UseFreeLimit } -DocUrl $freeOfferDoc
     }
 
-    # Policy: what-if of the subscription deployment. No resources change.
+    # Policy: what-if of the subscription deployment. No resources change. T5's network as the template step decides it
+    # (2026-11-21, ADR 0027; the review of fae05b4, 2026-11-22), from the account and the policies read above
+    # (PREFLIGHT.POLICY.COSMOSPUBLIC): the what-if checks the T5 this run deploys, and the estimate below prices its endpoint
+    # and DNS zone only when it's kept. $null, T5 off or not known, is the endpoint, the template's default.
+    $t5PolicyCheck = $results | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.POLICY.COSMOSPUBLIC' } | Select-Object -First 1
+    # T5's account, read once (2026-11-22): what the template step keeps or creates, and whether the account is public now, so
+    # the what-if keeps snet-sqlvm's Azure Cosmos DB service endpoint while it moves, as the template step does
+    # (Test-DemoT5WasPublic). A read that fails leaves both to their own fallbacks.
+    $t5Account = $null
+    if (Test-DemoT5Enabled -Config $Config) {
+        try {
+            $t5Account = Get-DemoT5State -Config $Config
+        }
+        catch {
+            $t5Account = $null
+        }
+    }
+    $t5PrivateEndpoint = Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode $effectiveNetworkMode -Policy $(if ($null -ne $t5PolicyCheck) { $t5PolicyCheck.evidence } else { $null }) -AccountState $t5Account
+    $t5WasPublic = Test-DemoT5WasPublic -Config $Config -AccountState $t5Account
     if ($SkipWhatIf) {
         Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Not selected' 'The what-if policy check was skipped.'
     }
@@ -663,36 +732,70 @@ function Invoke-DemoPreflight {
         $resourceGroupName = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
         $listed = Invoke-Az -Arguments @('vm', 'list', '--resource-group', $resourceGroupName, '--query', '[].name') -Json -AllowFailure
         $existingVms = @(@($listed) | Where-Object { $_ -is [string] -and $_ -in @('sqlvm01', 'archost01', 'arcsql01') })
-        $parametersPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('dbhub-preflight-{0}.json' -f [guid]::NewGuid())
+        $runWhatIf = {
+            param([bool] $T5Private)
+            $parametersPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('dbhub-preflight-{0}.json' -f [guid]::NewGuid())
+            try {
+                # The same budget start date the deployment sends: the budget's own, which Azure never changes (Phase 28 live
+                # finding, 2026-11-02).
+                $whatIfParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; ExistingVmName = $existingVms; T1SecurityType = $t1Security.SecurityType; T3UseFreeLimit = $t3UseFreeLimit; T3AdminGroupDisplayName = $groupDisplayName; T5PrivateAccess = $T5Private; T5WasPublic = $t5WasPublic }
+                $budgetStart = Get-DemoBudgetStartDate -Config $Config
+                if ($budgetStart) {
+                    $whatIfParameters['BudgetStartDate'] = $budgetStart
+                }
+                Get-DemoDeploymentParameter @whatIfParameters | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $parametersPath -Encoding utf8NoBOM
+                $template = Join-Path -Path $script:RepoRoot -ChildPath 'infra/main.bicep'
+                $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('deployment', 'sub', 'what-if', '--location', $location, '--name', ('preflight-{0}-{1}' -f $Config['prefix'], $Config['environment']), '--template-file', $template, '--parameters', "@$parametersPath"))
+                if ($existingVms.Count -lt 2) {
+                    $throwaway = [System.Net.NetworkCredential]::new('', (New-DemoAdminPassword)).Password
+                    $arguments.AddRange([string[]]@('--parameters', "adminPassword=$throwaway"))
+                }
+                $arguments.AddRange([string[]]@('--no-pretty-print', '--output', 'json'))
+                Invoke-Az -Arguments $arguments.ToArray() -AllowFailure
+            }
+            finally {
+                Remove-Item -LiteralPath $parametersPath -Force -ErrorAction SilentlyContinue
+            }
+        }
         $whatIf = $null
+        $t5Denied = ''
         try {
-            # The same budget start date the deployment sends: the budget's own, which Azure never changes (Phase 28 live
-            # finding, 2026-11-02).
-            $whatIfParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; ExistingVmName = $existingVms; T1SecurityType = $t1Security.SecurityType; T3UseFreeLimit = $t3UseFreeLimit; T3AdminGroupDisplayName = $groupDisplayName }
-            $budgetStart = Get-DemoBudgetStartDate -Config $Config
-            if ($budgetStart) {
-                $whatIfParameters['BudgetStartDate'] = $budgetStart
+            $whatIfPrivate = $null -eq $t5PrivateEndpoint -or [bool]$t5PrivateEndpoint
+            $whatIf = & $runWhatIf $whatIfPrivate
+            # A policy that denies T5 with public network access where the inventory doesn't read it, one assigned to the
+            # resource group, say (the review of fae05b4, 2026-11-22): the what-if names T5 alone. T5 is then deployed behind
+            # its private endpoint, which works under it, so the what-if checks that instead, and COSMOSPUBLIC says so, for
+            # the template step (Resolve-DemoT5NetworkAccess) and the estimate.
+            if (-not $whatIfPrivate -and $null -ne $whatIf -and $whatIf.ExitCode -ne 0) {
+                $t5Only = Get-DemoT5OnlyFailure -Config $Config -Cause $null -ErrorText ([string]$whatIf.StdErr)
+                if ($t5Only.T5Only) {
+                    $t5Denied = [string]$t5Only.Text
+                    $t5PrivateEndpoint = $true
+                    $t5Previous = if ($null -ne $t5PolicyCheck) { $t5PolicyCheck.evidence } else { $null }
+                    # Assigned first: Get-DemoMemberList returns its array as one object.
+                    $t5PreviousPolicies = Get-DemoMemberList -InputObject $t5Previous -Name 'policies'
+                    $t5Access = Get-DemoT5PolicyAccess -NetworkMode $effectiveNetworkMode -Denied $t5Denied
+                    $t5Evidence = @{ privateEndpointRequired = $true; reason = $t5Access.Reason; policies = @($t5PreviousPolicies); complete = [bool](Get-DemoMemberValue -InputObject $t5Previous -Name 'complete'); whatIfDenied = $t5Denied }
+                    $t5Updated = New-DemoResult -CheckId 'PREFLIGHT.POLICY.COSMOSPUBLIC' -Area $(if ($null -ne $t5PolicyCheck) { [string]$t5PolicyCheck.area } else { 'preflight' }) -Target 'subscription' -Status $t5Access.Status -Message $t5Access.Message -Evidence $t5Evidence -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])
+                    if ($null -ne $t5PolicyCheck) {
+                        $results[$results.IndexOf($t5PolicyCheck)] = $t5Updated
+                    }
+                    else {
+                        $results.Add($t5Updated)
+                    }
+                    Write-DemoLog -Level Warning -Message ('The what-if found that Azure Policy denies T5 with public network access ({0}); checking T5 behind its private endpoint instead, as the template step deploys it.' -f $t5Denied)
+                    $whatIf = & $runWhatIf $true
+                }
             }
-            Get-DemoDeploymentParameter @whatIfParameters | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $parametersPath -Encoding utf8NoBOM
-            $template = Join-Path -Path $script:RepoRoot -ChildPath 'infra/main.bicep'
-            $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('deployment', 'sub', 'what-if', '--location', $location, '--name', ('preflight-{0}-{1}' -f $Config['prefix'], $Config['environment']), '--template-file', $template, '--parameters', "@$parametersPath"))
-            if ($existingVms.Count -lt 2) {
-                $throwaway = [System.Net.NetworkCredential]::new('', (New-DemoAdminPassword)).Password
-                $arguments.AddRange([string[]]@('--parameters', "adminPassword=$throwaway"))
-            }
-            $arguments.AddRange([string[]]@('--no-pretty-print', '--output', 'json'))
-            $whatIf = Invoke-Az -Arguments $arguments.ToArray() -AllowFailure
         }
         catch {
             Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Fail' ('The what-if could not run: {0}' -f $_.Exception.Message)
         }
-        finally {
-            Remove-Item -LiteralPath $parametersPath -Force -ErrorAction SilentlyContinue
-        }
+        $t5WhatIfText = if ($t5Denied) { ', with T5 behind its private endpoint, because Azure Policy denies it with public network access (PREFLIGHT.POLICY.COSMOSPUBLIC)' } else { '' }
         if ($null -ne $whatIf -and $whatIf.ExitCode -eq 0) {
             $changes = @(($whatIf.StdOut | ConvertFrom-Json -Depth 64).changes)
             $summary = $changes | Group-Object -Property changeType | ForEach-Object { '{0} {1}' -f $_.Count, $_.Name }
-            Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Pass' ('What-if succeeded with no policy denials: {0}.' -f ($summary -join ', ')) -Evidence @{ changes = $changes.Count }
+            Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Pass' ('What-if succeeded with no policy denials{0}: {1}.' -f $t5WhatIfText, ($summary -join ', ')) -Evidence @{ changes = $changes.Count; t5PolicyDenied = $t5Denied }
         }
         elseif ($null -ne $whatIf -and $whatIf.StdErr -match 'RequestDisallowedByPolicy|PolicyViolation') {
             Add-Check 'PREFLIGHT.POLICY.WHATIF' 'subscription' 'Fail' 'Azure Policy would deny part of the deployment.' -Evidence @{ error = (Protect-DemoText -Text $whatIf.StdErr.Trim()) } -Remediation 'Review the policy assignment named in the error; request an exemption or adjust the configuration (plan risk R9).'
@@ -734,6 +837,10 @@ function Invoke-DemoPreflight {
     }
     # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
     $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # T5's private endpoint and DNS zone (2026-11-21): what this run's template step keeps or creates, from the account and
+    # the policies read above (PREFLIGHT.POLICY.COSMOSPUBLIC), as Resolve-DemoT5NetworkAccess decides it, and the what-if's
+    # policy denial (the review of fae05b4, 2026-11-22).
+    $costParameters['T5PrivateEndpoint'] = $t5PrivateEndpoint
     # What deploy.ps1 can set up in this run (2026-11-19, the coordinator's option 2 and gap fix): the nightly safety stop's
     # and the session control's roles need the deployer to assign them, and to write them when they aren't current.
     $deployer = Get-DemoDeployerRolePermission -Config $Config

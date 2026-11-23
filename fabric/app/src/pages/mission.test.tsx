@@ -309,6 +309,33 @@ describe("Mission Control", () => {
         );
     }
 
+    // The answer key's T4 on a page whose filter hides it reads every save in the latest capture's window, as the pages do
+    // (F35): a later day-long save's 15-minute point never moves an episode the session's own 5-minute points give.
+    it(
+        "takes each interval of T4's hidden capture from its finest save in the answer key (F35, the RCA release's merge)",
+        async () => {
+            const at = (hhmm: string) => `2026-11-17T${hhmm}:00`;
+            const lag = (save: Record<string, string>, minutes: number, from: string, values: readonly number[]): Row[] =>
+                values.map((value, i) => ({ Bucket: new Date(Date.parse(`${at(from)}Z`) + i * minutes * 60000).toISOString().slice(0, 19), TargetKey: "T4-replica", ResourceName: "pgreplica01-sample", Metric: "physical_replication_delay_in_seconds", Value: value, Unit: "", ...save }));
+            const session = { WindowStart: at("13:30"), WindowEnd: at("15:00"), CapturedAt: at("15:06") };
+            const day = { WindowStart: "2026-11-16T19:00:00", WindowEnd: at("19:00"), CapturedAt: at("19:04") };
+            // The session's 5-minute points: 180 s at 14:20 only. The day's 15-minute ones: that peak, at 14:15.
+            const rows = [...lag(session, 5, "13:30", Array.from({ length: 18 }, (_, i) => (i === 10 ? 180 : 2))), ...lag(day, 15, "13:30", Array.from({ length: 6 }, (_, i) => (i === 3 ? 180 : 2)))];
+            const sample = sampleRcaClient(Promise.resolve());
+            const client: FakeQueryClient = { ...sample, run: vi.fn(async (spec: QuerySpec) => (spec.id === "postgres-series" ? { ...(await sample.run(spec)), rows } : sample.run(spec))) };
+            renderWithApp(<MissionControlPage />, { client, rca: true, view: { session: SESSION_KEY, targets: ["T1", "T2", "T3"] } });
+            const write = await screen.findByRole("button", { name: "Write the postmortem" });
+            await waitFor(() => expect(write).toBeEnabled());
+            fireEvent.click(write);
+            const dialog = await screen.findByRole("dialog", { name: "Postmortem: ContosoCare session 7f3a9c21" });
+            await waitFor(() => expect(within(dialog).getByRole("button", { name: "Download Markdown", hidden: true })).toBeEnabled(), { timeout: 20000 });
+            const text = dialog.textContent ?? "";
+            expect(text).toMatch(/14:20 to 14:25 UTC, an episode in its Azure Monitor metrics\./);
+            expect(text).not.toMatch(/14:15 to \d\d:\d\d UTC, an episode in its Azure Monitor metrics\./);
+        },
+        SLOW,
+    );
+
     it(
         "never investigates a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)",
         async () => {
@@ -521,6 +548,32 @@ describe("Session replay", () => {
             expect(await screen.findByRole("heading", { level: 1, name: "Session 7f3a9c21, beat by beat" }, { timeout: 15000 })).toBeInTheDocument();
             expect(await screen.findByText(/^Some of the history didn't load, so this view may be incomplete: Signals per bin and target/)).toBeInTheDocument();
             await waitFor(() => expect(screen.getByRole("button", { name: "Write the postmortem" })).toHaveAttribute("aria-disabled", "true"));
+        },
+        SLOW,
+    );
+
+    it(
+        "reads T5's 429s per minute where a day-long save's 15-minute total meets the session's own minutes (F35)",
+        async () => {
+            // The review of 3fe52edb: the lane read the day's 1,500 from 13:45 beside the session's 10 a minute before it.
+            const save = (CapturedAt: string, WindowStart: string, WindowEnd: string) => ({ CapturedAt, WindowStart, WindowEnd });
+            const session = save("2026-11-17T13:50:00", "2026-11-17T13:30:00", "2026-11-17T13:45:00");
+            const day = save("2026-11-17T14:05:00", "2026-11-16T14:00:00", "2026-11-17T14:00:00");
+            const point = (from: Record<string, string>, minute: string, metric: string, value: number): Row => ({ Bucket: `2026-11-17T${minute}:00`, TargetKey: "T5", ResourceName: "cosmos01-test", Metric: metric, Value: value, Unit: "", ...from });
+            const rows = [
+                ...Array.from({ length: 15 }, (_, m) => `13:${30 + m}`).flatMap((m) => [point(session, m, "ThrottledRequests", 10), point(session, m, "NormalizedRUConsumption", 100)]),
+                ...(
+                    [
+                        ["13:15", 0, 5],
+                        ["13:30", 150, 100],
+                        ["13:45", 1500, 100],
+                    ] as const
+                ).flatMap(([m, throttled, ru]) => [point(day, m, "ThrottledRequests", throttled), point(day, m, "NormalizedRUConsumption", ru)]),
+            ];
+            const { container } = renderWithApp(<ReplayPage />, { client: sampleClient({}, { "cosmos-series": rows }), view: { page: "replay", replay: 28 } });
+            expect(await screen.findByText("13:55", { selector: ".cr-time" }, { timeout: 15000 })).toBeInTheDocument();
+            const t5 = () => [...container.querySelectorAll(".cr-readout")].map((e) => e.textContent ?? "").find((t) => t.includes("429s"));
+            await waitFor(() => expect(t5()).toMatch(/· 429s a minute 100$/));
         },
         SLOW,
     );

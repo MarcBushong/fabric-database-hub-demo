@@ -22,6 +22,9 @@ function Test-DemoT3 {
       isn't running or its login isn't effective yet; Not selected with -SkipSqlCheck.
     - T3.AUTOTUNING (2026-11-18, from the same status query): FORCE_LAST_GOOD_PLAN, which the Database Agent beat holds
       off until its response (ConvertTo-DemoT3AutoTuningResult).
+    - T3.QUERYSTORE (2026-11-23, with -IncludeQueryStore, from the same status row): Query Store in ContosoCare is
+      READ_WRITE (ConvertTo-DemoSqlQueryStoreResult); a Fail with the measured reason's fix otherwise, and a Warning while
+      the row wasn't read. validate.ps1 passes it; deploy.ps1 doesn't, so Query Store never stops a deployment.
     - T3.AGENT (2026-11-18): what Database Agents needs from T3 that Azure shows: not one-vCore serverless, not in an
       elastic pool, the signed-in account's write access, and monitoring on (Test-DemoT3AgentReadiness); a Warning with
       the fix, never a Fail.
@@ -63,6 +66,8 @@ function Test-DemoT3 {
         [string] $DeploymentId = '',
 
         [switch] $SkipSqlCheck,
+
+        [switch] $IncludeQueryStore,
 
         [ValidateRange(0, 1800)]
         [int] $MaxLoginWaitSeconds = 120
@@ -325,6 +330,24 @@ function Test-DemoT3 {
         }
         else {
             Add-T3Result 'T3.PROPERTY' 'Fail' ('The extended property couldn''t be checked: {0}' -f $run.Message) $evidence $run.Result.remediation $hubDoc
+        }
+    }
+
+    # T3.QUERYSTORE (2026-11-23): Query Store's state from the same status row, or why it wasn't read.
+    if ($IncludeQueryStore) {
+        if ($SkipSqlCheck) {
+            $results.Add((New-DemoQueryStoreUnreadResult -Target 'T3' -Status 'Not selected' -Why 'the T-SQL status query was skipped (-SkipSqlCheck).'))
+        }
+        elseif ($null -ne $statusRow) {
+            $columns = [ordered]@{ actualState = 'query_store_state'; desiredState = 'query_store_desired_state'; readonlyReason = 'query_store_readonly_reason'; captureMode = 'query_store_capture_mode'; storageMb = 'query_store_storage_mb'; maxStorageMb = 'query_store_max_storage_mb' }
+            $state = [ordered]@{}
+            foreach ($name in $columns.Keys) {
+                $state[$name] = Get-DemoMemberValue -InputObject $statusRow -Name $columns[$name]
+            }
+            $results.Add((ConvertTo-DemoSqlQueryStoreResult -Target 'T3' -State $state -Source 'T3''s status row'))
+        }
+        else {
+            $results.Add((New-DemoQueryStoreUnreadResult -Target 'T3' -Why 'its status row wasn''t read, as T3.PROPERTY says.' -Remediation 'Fix what T3.PROPERTY names, then run ./scripts/validate.ps1 -Area T3 again.'))
         }
     }
 
