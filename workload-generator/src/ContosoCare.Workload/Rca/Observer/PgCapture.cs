@@ -9,11 +9,32 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// test role), with the observer's own application name, a 1-second lock_timeout, and a 10-second statement_timeout.
 /// Every block runs after pg_stat_clear_snapshot() in the same round trip, so no statistics view repeats an earlier
 /// snapshot (rca/capture/postgresql.sql; https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-FUNCTIONS).
+/// Every connection sets search_path to name <see cref="ObserverSchema"/> right after it opens: Query Store records each
+/// statement's search_path (query_store.qs_view), so RCA-PG-14 leaves out the observer's own statements by it, whatever
+/// text Query Store kept for them (rca/README.md, What the capture leaves out).
 /// </summary>
-internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : ICaptureConnector
+internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgSessionLimits? limits = null) : ICaptureConnector
 {
     /// <summary>The observer never waits behind what it observes: a 1-second lock timeout, 10 seconds per statement.</summary>
     internal static readonly PgSessionLimits Limits = new(10_000, 1_000, 60_000);
+
+    /// <summary>azure_sys's reads aggregate Query Store's intervals: 30 seconds per statement, still a 1-second lock timeout.</summary>
+    internal static readonly PgSessionLimits QueryStoreLimits = new(30_000, 1_000, 60_000);
+
+    /// <summary>The database where Query Store's views are (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store).</summary>
+    public const string QueryStoreDatabase = "azure_sys";
+
+    /// <summary>
+    /// A schema that exists nowhere, last in the observer's search_path, so names resolve as before (PostgreSQL ignores a
+    /// schema that doesn't exist: https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-SEARCH-PATH).
+    /// </summary>
+    public const string ObserverSchema = "dbhubdemo_rca_observer";
+
+    /// <summary>
+    /// Sets the observer's search_path for its session: the one it had, with <see cref="ObserverSchema"/> last (on T4,
+    /// <c>"$user", public, dbhubdemo_rca_observer</c>), so nothing resolves differently. Marked as the catalog's statements are.
+    /// </summary>
+    internal const string SearchPathStatement = """SELECT /* dbhubdemo:rca-observer */ set_config('search_path', concat_ws(', ', NULLIF(current_setting('search_path'), ''), 'dbhubdemo_rca_observer'), false)""";
 
     // insufficient_privilege.
     private static readonly HashSet<string> PermissionStates = ["42501"];
@@ -24,16 +45,33 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
 
     public string Description => endpoint.Describe();
 
+    /// <summary>T4's azure_sys, for Query Store's reads (RCA-PG-14 and 15): the same server, sign-in, and application name.</summary>
+    public static PgCaptureConnector QueryStore(PgEndpoint endpoint, RunnerLog log) =>
+        new(endpoint with { Database = QueryStoreDatabase }, log, QueryStoreLimits);
+
     public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
     {
+        NpgsqlConnection? connection = null;
         try
         {
             // One attempt: the observer's own loop tries again later, so a replica that doesn't exist yet costs one connect.
-            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, Limits, retry: false).ConfigureAwait(false);
+            connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false).ConfigureAwait(false);
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = SearchPathStatement;
+                command.CommandTimeout = 30;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             return new PgCaptureConnection(connection);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
+            if (connection is not null)
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+            }
+
             throw Translate(ex, connecting: true);
         }
     }

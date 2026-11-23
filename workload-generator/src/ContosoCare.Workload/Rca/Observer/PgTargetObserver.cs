@@ -1,6 +1,7 @@
 using System.Globalization;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
+using ContosoCare.Workload.Rca.QueryStore;
 
 namespace ContosoCare.Workload.Rca.Observer;
 
@@ -28,11 +29,16 @@ internal sealed class ReplicaLink
 /// (RCA-PG-04, 05). A client waiting on a lock starts blocking detail (RCA-PG-01, 02, 11 every 10 s) until 60 s
 /// without a waiter; connections at 80 % of the limit start RCA-PG-10 every 10 s until 60 s under 70 %; a deadlock
 /// count that rose takes one blocking sample; the replica's stalled replay reads the primary's side every 5 s.
+/// With a sidecar sink (rca/README.md, The sidecar), a connection episode also counts who holds the connections with each
+/// of its samples and once when it ends (RCA-PG-17), and with a Query Store source, Query Store is read on its own
+/// schedule (<see cref="PgQueryStoreCapture"/>). Neither changes what the evidence document captures.
 /// </summary>
-internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOptions options, RunnerLog log, ReplicaLink link)
+internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOptions options, RunnerLog log, ReplicaLink link, ISidecarSink? sidecar = null, PgQueryStoreSource? queryStore = null)
     : TargetObserver("T4", DemoTarget.T4, connector, options, log, "The fix: ./scripts/deploy.ps1 sets T4's runner role up again; T4's setup grants it pg_read_all_stats.")
 {
     private readonly CounterDeltas deltas = new();
+    private readonly ISidecarSink? sidecarSink = sidecar;
+    private readonly PgQueryStoreCapture? queryStoreCapture = sidecar is not null && queryStore is not null ? new PgQueryStoreCapture("T4", queryStore, sidecar, options, log) : null;
     private EpisodeTrigger lockWaits = null!;
     private EpisodeTrigger connections = null!;
     private DateTimeOffset nextSentinel;
@@ -64,7 +70,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
             var rows = await RunAsync("RCA-PG-10", now, cancellationToken).ConfigureAwait(false);
             if (rows is { Count: > 0 })
             {
-                Connections(rows[0], now);
+                await HoldersAsync(now, Connections(rows[0], now), cancellationToken).ConfigureAwait(false);
             }
 
             nextConnectionDetail = now + Every(Options.BlockingDetail);
@@ -89,12 +95,18 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
             replayAnchor = null;
         }
 
+        if (queryStoreCapture is { } queryStoreReads && now >= queryStoreReads.NextRead)
+        {
+            await SidecarAsync(() => queryStoreReads.ReadAsync(now, (block, token) => RunAsync(block, now, token, timed: false), cancellationToken)).ConfigureAwait(false);
+        }
+
         Sink.Watermark(Target, now - Options.ClockSkew);
         return Earliest(
             nextSentinel,
             detail && lockWaits.Current is not null ? nextLockDetail : null,
             detail && connections.Current is not null ? nextConnectionDetail : null,
             replayAnchor is not null ? nextReplay : null,
+            queryStoreCapture?.NextRead,
             now + Options.ReplayDetail);
     }
 
@@ -110,14 +122,18 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         nextReplay = now;
         replayAnchor = null;
         lastReplication = DateTimeOffset.MinValue;
+        queryStoreCapture?.Begin(now);
         return Task.CompletedTask;
     }
 
-    protected override Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         Close(lockWaits, now);
         Close(connections, now);
-        return Task.CompletedTask;
+        if (queryStoreCapture is { } queryStoreReads)
+        {
+            await SidecarAsync(() => queryStoreReads.EndAsync(now, (block, token) => RunAsync(block, now, token, timed: false), cancellationToken)).ConfigureAwait(false);
+        }
     }
 
     private async Task SentinelAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -125,7 +141,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         var connectionRows = await RunAsync("RCA-PG-10", now, cancellationToken).ConfigureAwait(false);
         if (connectionRows is { Count: > 0 })
         {
-            Connections(connectionRows[0], now);
+            await HoldersAsync(now, Connections(connectionRows[0], now), cancellationToken).ConfigureAwait(false);
         }
 
         var database = await RunAsync("RCA-PG-03", now, cancellationToken).ConfigureAwait(false);
@@ -165,8 +181,9 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
     /// <summary>
     /// One RCA-PG-10 sample, the sentinel's or the connection detail's (the same signal, more often; every one counts as
     /// the sentinel's for RCA Coverage). The next connection detail comes 10 s after the latest sample, so none repeats it.
+    /// Returns what the sample did to the connection episode.
     /// </summary>
-    private void Connections(CaptureValues row, DateTimeOffset now)
+    private EpisodeChange Connections(CaptureValues row, DateTimeOffset now)
     {
         const bool sentinel = true;
         var at = row.Time("captured_at") ?? now;
@@ -189,14 +206,57 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
             nextLockDetail = now;
         }
 
+        var change = EpisodeChange.None;
         if (maximum is { } max && max - reserved > 0)
         {
             var limit = max - reserved;
-            var change = connections.Observe(at, total >= 0.8 * limit, total < 0.7 * limit, () => string.Create(CultureInfo.InvariantCulture, $"client connections {total:0} >= 80 % of {limit:0} (max_connections {max:0} minus {reserved:0} reserved): connection detail (RCA-PG-10) every {Seconds(Every(Options.BlockingDetail))} s."));
+            change = connections.Observe(at, total >= 0.8 * limit, total < 0.7 * limit, () => string.Create(CultureInfo.InvariantCulture, $"client connections {total:0} >= 80 % of {limit:0} (max_connections {max:0} minus {reserved:0} reserved): connection detail (RCA-PG-10) every {Seconds(Every(Options.BlockingDetail))} s."));
             Report(connections, change, at, string.Create(CultureInfo.InvariantCulture, $"client connections under 70 % of {limit:0} for {Duration(Options.QuietFor)}: {BackToSentinel}"));
         }
 
         nextConnectionDetail = now + Every(Options.BlockingDetail);
+        return change;
+    }
+
+    /// <summary>
+    /// Who holds the connections (RCA-PG-17), into the sidecar: with every sample of a connection episode, its first
+    /// included, and once when it ends. Detail capture, so none once the observer stopped its detail on T4.
+    /// </summary>
+    private async Task HoldersAsync(DateTimeOffset now, EpisodeChange change, CancellationToken cancellationToken)
+    {
+        if (sidecarSink is not { } sink || Cadence.DetailStopped || (connections.Current is null && change != EpisodeChange.Ended))
+        {
+            return;
+        }
+
+        var rows = await RunAsync(ConnectionHolders.Block, now, cancellationToken).ConfigureAwait(false);
+        if (rows is null)
+        {
+            return;
+        }
+
+        await SidecarAsync(() =>
+        {
+            foreach (var row in ConnectionHolders.Rows(Target, rows, now))
+            {
+                sink.Write(row);
+            }
+
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>The sidecar's work, which never stops the evidence document's: a store that can't keep its rows is logged.</summary>
+    private async Task SidecarAsync(Func<Task> work)
+    {
+        try
+        {
+            await work().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log.Warn("rca.sidecar-failed", "The sidecar couldn't keep T4's rows; the evidence document's capture goes on.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
+        }
     }
 
     /// <summary>RCA-PG-01, 02, and (in detail) 11: the chains, head blocker first.</summary>
@@ -308,19 +368,24 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
 /// and the database's counters (RCA-PG-03). Replay stalled, <c>since_last_replayed_s</c> at 30 s or more with WAL
 /// received and not replayed (an idle primary alone doesn't count), starts replay detail every 5 s (RCA-PG-01, 02,
 /// 06, 07, 08, and the standby settings, RCA-PG-09, once) until it's under 5 s for 3 samples. On a standby,
-/// pg_blocking_pids returns nothing for the startup process, so replay's conflict comes from pg_locks.
+/// pg_blocking_pids returns nothing for the startup process, so replay's conflict comes from pg_locks. With a sidecar
+/// sink, Query Store's settings (RCA-PG-13) on T4's schedule and at the end: its coverage says a replica records nothing.
 /// </summary>
-internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOptions options, RunnerLog log, ReplicaLink link)
+internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOptions options, RunnerLog log, ReplicaLink link, ISidecarSink? sidecar = null, QueryStoreSchedule? schedule = null)
     : TargetObserver("T4-replica", DemoTarget.T4, connector, options, log, "The fix: ./scripts/deploy.ps1 sets T4's runner role up again; the replica copies T4's roles.")
 {
     // RCA-PG-07's causes: a query the replica cancelled for any of them counts.
     private static readonly string[] ConflictColumns = ["confl_tablespace", "confl_lock", "confl_snapshot", "confl_bufferpin", "confl_deadlock", "confl_active_logicalslot"];
 
     private readonly CounterDeltas deltas = new();
+    private readonly ISidecarSink? sidecarSink = sidecar;
+    private readonly QueryStoreSchedule queryStoreSchedule = schedule ?? QueryStoreSchedule.Default;
     private EpisodeTrigger stall = null!;
     private ReplaySample? startSample;
     private DateTimeOffset nextSentinel;
     private DateTimeOffset nextDetail;
+    private DateTimeOffset nextQueryStore;
+    private DateTimeOffset lastQueryStore;
     private double? maximumDelay;
     private string? receiverStatus;
 
@@ -349,9 +414,15 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
             startSample = null;
         }
 
+        if (sidecarSink is not null && now >= nextQueryStore)
+        {
+            nextQueryStore = queryStoreSchedule.NextRead(now);
+            await QueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
+        }
+
         link.StalledSince = detail ? stall.Current?.Start : null;
         Sink.Watermark(Target, now - Options.ClockSkew);
-        return Earliest(nextSentinel, detail && stall.Current is not null ? nextDetail : null);
+        return Earliest(nextSentinel, detail && stall.Current is not null ? nextDetail : null, sidecarSink is not null ? nextQueryStore : null);
     }
 
     protected override Task StartAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -363,14 +434,35 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
         receiverStatus = null;
         nextSentinel = now;
         nextDetail = now;
+        nextQueryStore = now;
+        lastQueryStore = now;
         return Task.CompletedTask;
     }
 
-    protected override Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         Close(stall, now);
         link.StalledSince = null;
-        return Task.CompletedTask;
+        if (sidecarSink is not null)
+        {
+            await QueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>RCA-PG-13 on the replica, untimed: its RCA Query Coverage row, which says a replica records nothing in Query Store.</summary>
+    private async Task QueryStoreAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var rows = await RunAsync(PgQueryStoreRows.Settings, now, cancellationToken, timed: false).ConfigureAwait(false);
+        try
+        {
+            sidecarSink!.Write(PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, rows));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log.Warn("rca.sidecar-failed", "The sidecar couldn't keep the replica's coverage; the evidence document's capture goes on.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
+        }
+
+        lastQueryStore = now;
     }
 
     private async Task SentinelAsync(DateTimeOffset now, CancellationToken cancellationToken)
