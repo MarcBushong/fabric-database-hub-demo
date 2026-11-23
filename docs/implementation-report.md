@@ -5511,3 +5511,76 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - No app code changed, so `npm run verify` and the B/A sweep stand as they were at a57539ed.
 
 **What its live check needs.** The entry above's, with the Variable - Get after `./scripts/deploy.ps1` in a governed tenant.
+
+### Query Store's evidence: the sidecar's contract (2026-11-23)
+
+**Why.** The owner, investigating in the Insights app's chat, was told T1 had no Query Store. T1 to T3 have it on, and the capture never read it. Unit 2 brings Query Store's evidence into the RCA. After an independent review (RETHINK) and the coordinator's decisions 1 to 7, the evidence travels in a sidecar beside the evidence document, which stays version 1, byte for byte ([ADR 0031's amendment](adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar)). This entry is the contract's step, C0, which the parallel builders started from. Ten commits on `marcbushong-microsoft-rca-query-store-evidence`, on edd01c86:
+
+- **ab515ad2, the contract:**
+  - `history-tables.json` names each table's document, `evidence` or `sidecar`, and adds the sidecar's six tables with latest-read measures;
+  - `sidecar.schema.json`;
+  - `transport.schema.json`'s sidecar kinds;
+  - the capture catalog's RCA-SQL-10, 11, 14, 15 and RCA-PG-13 to 17;
+  - the observer's marker on every catalog statement;
+  - `rca/README.md`'s sections;
+  - the consumers kept green: `RcaContract` keeps the evidence export to its own tables, `Get-DemoRcaHistoryTable -Document`, and the deployment notebook's purge.
+- **9104eb69:** the sidecar schema accepts a sidecar. Unit B found three of the evidence document's rules left in it; a test now validates a minimal sidecar and refuses evidence-shaped ones.
+- **5eeea4d1, the runner's shared seams,** so the SQL Server and PostgreSQL builders never edit one file:
+  - a block's parameters, named or positional;
+  - `TargetObserver.RunAsync` with them;
+  - `ISidecarSink`, whose default refuses an evidence table;
+  - `QueryStoreSchedule`;
+  - the shared test fake;
+  - the blind guards' scope over `Rca/QueryStore/`.
+- **e3f3c943:** 5633c574 cherry-picked, the date bomb in `Fabric.Notebooks`' staged-file case.
+- **dabe263c, the fixtures:** three sidecars (T3's plan regression, T4's Query Store beside the chain, and a sessionless connection surge), their part lines, the sidecar index, `RCA_SIDECAR_FILE`'s document, and an acknowledgement. `fixtures/README.md` says what a blind RCA finds in each.
+- **e251c2af:** a sidecar's rows go under their own session's run. Otherwise the scripts' path, which fetches a Run all session's sidecars later, would have written them under the save's run.
+- **7f208da8, after the review of the integration plan (RETHINK):**
+  - **exactly once:** a document's rows replace its earlier rows table by table, coverage last;
+  - **the acknowledgement:** it names its payload and exactly its documents, and is deferred when `stop-demo.ps1 -SaveHistory` runs the notebook after the VMs deallocate;
+  - **sealing** into `sidecars\`, which an older runner's retention never empties;
+  - **the budgets:** 64 KiB on T1's VM and 32 KiB in T2's guest;
+  - **binding:** a span bound to a session by its first export of either kind;
+  - **T4's window lost at a stop,** worded so;
+  - **T4-replica** in the coverage target's description.
+- **4083d329, unit B's three choices confirmed:**
+  - `RCA_SIDECAR_FILE` is `Files/rca/inbox/sidecar-<UTC>[-<name>].json`, pinned in `transport.schema.json`;
+  - the acknowledgement is beside it, in `Files/rca/acks/`;
+  - a run that doesn't save writes none.
+
+  And `Rca/Sidecar/` is under the blind-detection guard, with a test that fails for any runner folder under `Rca/` that's neither scanned nor exempt.
+- **27c14daa, the T3 fixture as A1's reader writes it:**
+  - every plan its statistics name has a plan row (RCA-SQL-14's `@plans`);
+  - a recommendation's first appearance is an event;
+  - an unchanged plan isn't written again.
+
+  `rca/README.md` gives the top lists' rules, and a test checks both plan rules on every sidecar fixture.
+- **84d2e92c, the interfaces between T1a and T1c,** fixed first so the two builders work at once: `Rca/Sidecar/SidecarInterfaces.cs` (`SealedSidecar`, `SidecarDraft`, `ReducedSidecar`, `ISidecarReducer`, `ISidecarCatalog`), which the blind-detection guard scans.
+
+**Changed files.**
+
+- **`rca/`:** `README.md`, `history-tables.json`, `sidecar.schema.json` (new), `transport.schema.json`, `blind-detection.json`, `capture/` (both catalogs and the README), and `fixtures/` (the sidecars, their parts, and the transport fixtures);
+- **the runner:** `Rca/RcaContract.cs`; `Rca/Observer/CaptureSource.cs`, `SqlCapture.cs`, `PgCapture.cs`, `TargetObserver.cs`; `Rca/QueryStore/` and `Rca/Sidecar/SidecarInterfaces.cs` (new); `RcaBlindTests.cs`, `RcaTestKit.cs`, and `RcaQueryStoreSeamTests.cs` (new);
+- **Fabric:** `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb` (the purge) and `fabric/README.md`;
+- **the module:** `scripts/modules/DbHubDemo/Private/OneLakeHelpers.ps1`;
+- **the tests:** `Rca.Contract`, `Fabric.Notebooks`, `Fabric.PowerBI`;
+- **the docs:** ADR 0031, `docs/deployment.md` (older code over a newer demo), and this report.
+
+**Validation.**
+
+- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 63 passed; `Fabric.PowerBI` 16 passed and 1 skipped; `DbHubDemo.PowerBI` 29 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 101 passed, its 29 pandas cases skipped on this PC; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
+- **The runner,** with SDK 10.0.403: `RcaQueryStoreSeamTests` 7, `RcaBlindTests` 5, `RcaObserverTests` 22, `RcaExportTests` 25, `RcaLaneTests` 2, `RcaNormalizerTests` 29, and `RcaTriggerTests` 9 passed; `RcaIntegrationTests`' 2 skip without a local PostgreSQL, as before. ScriptDom parses all 26 T-SQL blocks, and the 17 PostgreSQL blocks only read.
+- **Proven to fail without the change:** the folder guard, with a temporary unscanned folder; the plan rules, on the previous T3 fixture.
+- **The schemas:** `evidence.schema.json` is byte-identical to edd01c86's, and both schemas regenerate byte for byte.
+- **Lint and checks:** PSScriptAnalyzer found nothing; markdownlint 0.23.3 found no issue; the leak check prints nothing.
+- **Before the integration:** the 29 pandas cases, in a session-local venv.
+
+**Risks and what its live check needs.**
+
+- **The catalog's PostgreSQL Query Store blocks haven't run anywhere:** `azure_sys` exists only on Azure. Their proof is Final tests' live plan: `azure_sys` access through T1's identity, UTC, the leave-out rules both ways, the backfill, and each read's measured cost.
+- **Two of T4's behaviors aren't documented, so L0 measures them first,** on Tuesday:
+  - whether stopping T4 keeps the window Query Store still holds in memory;
+  - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
+- **The harness's marks (unit H) land after the realistic names' unit A.** Until then the rules leave out the capture's own statements only.
+- **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
+- **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
