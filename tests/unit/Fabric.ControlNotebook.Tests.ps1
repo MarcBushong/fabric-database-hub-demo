@@ -182,7 +182,8 @@ DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].sp
 # RCA_SIDECAR_FILE unless it's from before the sidecar ("sessionqsold"); the payloads it read; and its acknowledgements in
 # Files/rca/acks, which it writes as B's notebook does: every sidecar written, one skipped ("sessionqsskip"), or none
 # ("sessionqsnoack"). Its definition is read through Get Item Definition's long-running operation in "sessionqs".
-SIDECAR_STOP_SCENARIOS = ("sessionqs", "sessionqsold", "sessionqsskip", "sessionqsnoack", "sessionqsjob", "sessionqsfull", "sessionqslate", "sessionqslateindex")
+SIDECAR_STOP_SCENARIOS = ("sessionqs", "sessionqsold", "sessionqsskip", "sessionqsnoack", "sessionqsjob", "sessionqsfull", "sessionqslate", "sessionqslateindex",
+                          "sessionqsbadversion", "sessionqsbadindex", "sessionqsnullindex")
 FIXTURES = (sys.argv[4] + "/rca/fixtures/") if len(sys.argv) > 4 else ""
 SIDECAR_BUNDLE = json.load(open(FIXTURES + "sidecar-bundle.json", encoding="utf-8")) if FIXTURES else {}
 SIDECAR_INDEX = json.load(open(FIXTURES + "sidecar-bundle-index.json", encoding="utf-8")) if FIXTURES else {}
@@ -376,6 +377,12 @@ def runbook(body):
             return
         RUNBOOK.update(session=body["sessionId"], accepted=Clock.now, minutes=body["durationMinutes"], acks=body.get("rcaAcks"))
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "starting", "acceptedUtc": iso(Clock.now), "steps": []})
+        if scenario == "qsacksearly" and body.get("rcaAcks"):
+            # T2c-1's runbook (a114c727) first writes a result before it sends anything, then the real one with its step.
+            starting = json.loads(VAULT["dbhub-session-status"])
+            starting["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": [], "left": body["rcaAcks"]["documents"], "status": "Warning",
+                                   "message": "None of the %d sidecar acknowledgement(s) was sent: not yet: the start sends them before its exports." % len(body["rcaAcks"]["documents"])}
+            VAULT["dbhub-session-status"] = json.dumps(starting)
     elif action == "stop":
         session = body.get("sessionId") or ""
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
@@ -399,6 +406,14 @@ def runbook(body):
                 document["rca"] = rca_bundle_index(session, ["1" * 32, "2" * 32])
             if scenario in SIDECAR_STOP_SCENARIOS:
                 document["rcaSidecars"] = sidecar_pointer(session)
+                # A pointer this notebook can't use: another version, or an index that isn't a version's ID (a trailing line
+                # feed, which the contract's anchors refuse); and one that names no sidecar (a null index).
+                if scenario == "sessionqsbadversion":
+                    document["rcaSidecars"]["version"] = 2
+                if scenario == "sessionqsbadindex":
+                    document["rcaSidecars"]["index"] += "\n"
+                if scenario == "sessionqsnullindex":
+                    document["rcaSidecars"].update(index=None, documents=0, status="Not selected", message="No sidecar this session.")
             VAULT["dbhub-session-metrics"] = json.dumps(document, separators=(",", ":"))
             if scenario in SIDECAR_STOP_SCENARIOS:
                 # A runbook with Run all's sidecar path names the metrics' final version too ("sessionqslate" and
@@ -464,7 +479,7 @@ if scenario in ("leftoverqs", "stoppedqs", "earlierqs"):
 # missing.
 QS_IDS = ["20261113T140000Z-sqlvm01-0001-sidecar", "20261113T141500Z-sqlvm01-0002-sidecar", "20261113T143000Z-sqlvm01-0003-sidecar",
           "20261113T144500Z-arcsql01-0001-sidecar", "20261113T150000Z-sqlvm01-0004-sidecar"]
-if scenario == "qsacks":
+if scenario in ("qsacks", "qsacksearly"):
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T155000Z-runall-6c7d8e9f.json", [(QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
@@ -509,6 +524,12 @@ def vault_read(name):
                 status["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": left, "status": "Warning" if left else "Pass",
                                      "message": "%d sidecars acknowledged on sqlvm01, before the start's exports%s" % (
                                          len(sent), ("; %d left: arcsql01 didn't answer." % len(left)) if left else ".")}
+                if scenario == "qsacksearly":
+                    # T2c-1's real result comes with its RCA.SIDECAR.ACK step, which the status's steps print.
+                    status["rcaAcks"]["message"] = ("%d of %d sidecar acknowledgement(s) sent before the start's exports (%d on sqlvm01); the rest "
+                                                    "weren't: arcsql01 didn't answer." % (len(sent), len(documents), len(sent)))
+                    status["steps"].append({"step": "RCA.SIDECAR.ACK", "state": status["rcaAcks"]["status"], "atUtc": iso(Clock.now),
+                                            "message": status["rcaAcks"]["message"], "fix": "The control notebook keeps them, and the next Run all's start sends them again."})
             VAULT[name] = json.dumps(status)
         elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
                 and not any(step.get("step") == "Host" for step in current.get("steps") or []):
@@ -1876,6 +1897,51 @@ print(json.dumps(out))
             'Files/rca/acks/sidecar-20261113T160000Z-runall-0b0b0b0b.ack.json'
             'Files/rca/acks/sidecar-20261113T170000Z-runall-0c0c0c0c.ack.json'
         )
+    }
+
+    It 'waits for the start''s final acknowledgement result: an early one that sent nothing yet says nothing and deletes nothing (review of 90b4718c)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # T2c-1's runbook writes a result with nothing sent ("not yet") before it sends, then the real one with its step.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsacksearly' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Not -Match 'None of the \d+ sidecar acknowledgement'
+        # Once: the real result's step, which the status's steps print; the notebook adds only what it deleted.
+        @([regex]::Matches($report.printed, 'RCA\.SIDECAR\.ACK')).Count | Should -Be 1
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning 2 of 3 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01\); the rest weren''t: arcsql01 didn''t answer\.'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T160000Z-runall-4e5f6a7b.ack.json'
+            'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
+            'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'says when the metrics'' sidecar pointer is one it can''t use, and nothing when it names no sidecar: <Case> (review of 90b4718c)' -ForEach @(
+        @{ Case = 'another version'; Scenario = 'sessionqsbadversion'; Why = 'it''s ContosoCare\.RcaSidecarPointer version 2, not ContosoCare\.RcaSidecarPointer version 1' }
+        @{ Case = 'an index that isn''t a version''s ID'; Scenario = 'sessionqsbadindex'; Why = 'its index isn''t a version''s ID' }
+        @{ Case = 'a null index'; Scenario = 'sessionqsnullindex'; Why = '' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        # Nothing is read for sidecars, staged, or passed.
+        @($report.defReads) | Should -BeNullOrEmpty
+        @($report.puts) | Should -BeNullOrEmpty
+        @($report.vaultReads) | Should -Be @('dbhub-session-metrics/99999999')
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE'
+        if ($Why) {
+            $report.printed | Should -Match ('RCA\.SIDECAR Warning: session {0}''s metrics point to its Query Store sidecars in a form this notebook doesn''t read \({1}\), so they weren''t passed to its history\. They stay on the VMs, which offer them again at the next session''s exports\. Fix: \./scripts/deploy\.ps1 updates the runbooks and this notebook together\.' -f $report.sent[0].sessionId.Substring(0, 8), $Why)
+            @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR ')).Count | Should -Be 1
+        }
+        else {
+            $report.printed | Should -Not -Match 'RCA\.SIDECAR'
+        }
     }
 
     It 'never takes the Query Store sidecars'' <Case> for the metrics: no ContosoCare.Rca* version is (2026-11-23)' -ForEach @(
