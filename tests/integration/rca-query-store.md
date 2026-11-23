@@ -2,7 +2,7 @@
 
 For the live proof of the Incident RCA's Query Store sidecar. The rehearsal, then the final proof, run these against a session's window.
 
-- They're the live proof's steps S7, S10, and S11, for [ADR 0031's amendment](../../docs/adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar).
+- They're the live proof's steps S7, S10, S11, and S12, for [ADR 0031's amendment](../../docs/adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar).
 - [rca/README.md](../../rca/README.md#the-sidecar) is the contract they check.
 - They run only with the owner's go-ahead, through the Final tests session's read paths.
 
@@ -200,3 +200,14 @@ SUMMARIZECOLUMNS(
 6. **A NULL `event_type`:** how often it appears, and the waits around it.
 7. **RCA-PG-16:** the routines it lists match H's 13; the harness tables are exactly `demo.scenario_control`, `demo.scenario_runs`, and `demo.scenario_run_events`; and there's **no `unsure` row** (`dynamic_sql`, `no_source`).
 8. **H's marks on T4, deployed twice** (review-h): setup runs as the P6 role. After the net-new deployment and after the second `./scripts/deploy.ps1`, `obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness'` holds for exactly the 13 control routines, every overload, and the second run reports no error.
+
+## The scripts' transport's live checks (S12)
+
+From T2a's review (9ca9f8ab..8e2ada18). They run on the rehearsal's environment, during the run's own saves, with nothing added to the workload.
+
+1. **`rca sidecar-export` on a real runner:** the exit codes (0 with sidecars, 2 with none offerable), and the index line printed on exit code 2 too, read from a managed Run Command's last 4 KB.
+2. **Exit code 2 with a Warning, end to end** (a6c38b7f): a sidecar that expired unread makes the line's status a **Warning**. Through T2's host and its relay, the scripts report it in `<PREFIX>.RCA.SIDECAR` as `<vm>'s runner says: ...`, once per VM. If no expired sidecar happens naturally, the report says the check wasn't exercised.
+3. **T2's throughput:** the acknowledgements, the index, and the parts go one Run Command at a time on the T2 host, within the stop's 8-minute fetch. The report gives each Run Command's time there (the figure the cost estimate takes, as measured), and how the fetch drains behind a real capacity queue.
+4. **R871 on the golden guard:** when the guest's `RcaSidecars` check starts, an `RcaAck` Run Command still being deleted on the host doesn't make the check fail or run beside it.
+5. **The acknowledgement through OneLake:** the notebook's `Files/rca/acks/<payload>.ack.json`, read back by the scripts as UTF-8, names exactly the payload and its documents.
+6. **A golden capture after T2 activity:** the first `capture-t2-golden.ps1` is refused while the guest holds unsealed or unacknowledged sidecars, saying why. Then a scripts' save takes them, and the next capture succeeds.
