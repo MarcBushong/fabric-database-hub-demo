@@ -47,15 +47,40 @@ export function unexplainedByQuery(e: Pick<Episode, "target">): string {
     }
 }
 
+/**
+ * How long a target's Query Store keeps an interval: T1 to T3's STALE_QUERY_THRESHOLD_DAYS (each 030-configure.sql in database/,
+ * less when size-based cleanup runs first), T4's pg_qs.retention_period_in_days, its default, which the template doesn't
+ * set (Learn). The review of 319b3ae1: past it, the next step sent the owner to an empty view, which reads as "Query Store
+ * is off".
+ */
+export const QUERY_STORE_RETENTION_DAYS: Readonly<Record<"sql" | "postgresql", number>> = { sql: 14, postgresql: 7 };
+
+const DAY_MS = 86_400_000;
+
+/** Whether the target's Query Store still keeps the episode's minutes now, and how old they are, in whole days. */
+export function queryStoreAge(e: Pick<Episode, "target" | "end" | "last" | "readEnd">, now: Date): { kept: boolean; days: number; retentionDays: number } | null {
+    const kind = queryStoreKind(e.target);
+    if (kind !== "sql" && kind !== "postgresql") return null;
+    const ageMs = now.getTime() - (e.end ?? e.readEnd ?? e.last).getTime();
+    const retentionDays = QUERY_STORE_RETENTION_DAYS[kind];
+    return { kept: ageMs <= retentionDays * DAY_MS, days: Math.max(0, Math.floor(ageMs / DAY_MS)), retentionDays };
+}
+
 /** What wasn't captured, in words that say what this history lacks and never what the target lacks. */
-export function queryStoreNote(e: Pick<Episode, "target" | "signal">): string {
+export function queryStoreNote(e: Pick<Episode, "target" | "signal" | "end" | "last" | "readEnd">, now: Date): string {
     const t = e.target;
     const lacks = `${t}: which queries drove the ${e.signal} isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${t}'s:`;
+    const age = queryStoreAge(e, now);
+    const gone = age && !age.kept ? ` Query Store on ${t} no longer keeps those minutes either: it keeps ${age.retentionDays} days${queryStoreKind(t) === "sql" ? " (less when it fills up)" : ""}, and they're ${age.days} days old.` : "";
     switch (queryStoreKind(t)) {
         case "sql":
-            return `${lacks} Query Store on ${t} keeps those minutes' plans and per-query CPU, duration, and waits, and validate.ps1's ${t}.QUERYSTORE says whether it's on.`;
+            return gone
+                ? `${lacks}${gone} validate.ps1's ${t}.QUERYSTORE says whether it's on.`
+                : `${lacks} Query Store on ${t} keeps those minutes' plans and per-query CPU, duration, and waits for ${QUERY_STORE_RETENTION_DAYS.sql} days (less when it fills up), and validate.ps1's ${t}.QUERYSTORE says whether it's on.`;
         case "postgresql":
-            return `${lacks} at every size but Burstable, where Learn advises against it, Query Store on ${t} keeps those minutes' per-query statistics and wait samples in its azure_sys database, and validate.ps1's ${t}.QUERYSTORE says whether it's on.`;
+            return gone
+                ? `${lacks}${gone} validate.ps1's ${t}.QUERYSTORE says whether it's on.`
+                : `${lacks} at every size but Burstable, where Learn advises against it, Query Store on ${t} keeps those minutes' per-query statistics and wait samples in its azure_sys database for ${QUERY_STORE_RETENTION_DAYS.postgresql} days, and validate.ps1's ${t}.QUERYSTORE says whether it's on.`;
         case "replica":
             return `${t}: which queries drove the ${e.signal} is in neither this history nor Query Store: Query Store doesn't record the queries a read replica runs (${PG_QUERY_STORE_LEARN}), and the capture samples the replica's sessions only while its replay stands still.`;
         default:
@@ -63,18 +88,21 @@ export function queryStoreNote(e: Pick<Episode, "target" | "signal">): string {
     }
 }
 
-/** Where a DBA reads which queries drove the episode: the target's own Query Store, for the episode's minutes. Null without one. */
-export function queryStoreNextStep(e: Pick<Episode, "target" | "family" | "start" | "end" | "last" | "readEnd">): string | null {
+/**
+ * Where a DBA reads which queries drove the episode: the target's own Query Store, for the episode's minutes, while it
+ * still keeps them. Null without one, or once they're past its retention.
+ */
+export function queryStoreNextStep(e: Pick<Episode, "target" | "family" | "start" | "end" | "last" | "readEnd">, now: Date): string | null {
     const minutes = `${fromTo(e.start, e.end ?? e.readEnd ?? e.last)} UTC`;
     const category = WAIT_CATEGORY[e.family];
+    const age = queryStoreAge(e, now);
+    if (!age || !age.kept) return null;
     switch (queryStoreKind(e.target)) {
         case "sql":
             return category
                 ? `Read Query Store on ${e.target} for the queries that waited on ${category} ${minutes}: its Query Wait Statistics report on ContosoCare in SQL Server Management Studio, or sys.query_store_wait_stats and sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_QUERY_STORE_LEARN}).`
                 : `Read Query Store on ${e.target} for the queries and plans that used the CPU ${minutes}: its Top Resource Consuming Queries and Regressed Queries reports on ContosoCare in SQL Server Management Studio, or sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_QUERY_STORE_LEARN}).`;
-        case "postgresql":
-            return `Read Query Store on ${e.target} for the queries that took the most time ${minutes}, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_QUERY_STORE_LEARN}).`;
         default:
-            return null;
+            return `Read Query Store on ${e.target} for the queries that took the most time ${minutes}, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_QUERY_STORE_LEARN}).`;
     }
 }

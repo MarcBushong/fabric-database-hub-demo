@@ -302,6 +302,79 @@ function Get-DemoControlRunnerBound {
     return [ordered]@{ listed = $listed.Count; running = $running; demoSessions = $sessions }
 }
 
+function Get-DemoControlRunnerQueryStore {
+    <#
+    .SYNOPSIS
+    Query Store's state from 'status --json''s whole output on T1 to T3, read before Get-DemoControlTail cuts it
+    (2026-11-23): the result keeps 1,800 characters of stdout, and a status with runs and sessions runs past that, so
+    validate.ps1's T1.QUERYSTORE and T2.QUERYSTORE read it from here. Only its known members, each string cut to 64
+    characters escaped and the error to 200, so the node stays under 400 characters and the result inside a Run Command's
+    4 KB. $null for output without a queryStore node (another command, or a runner from before it).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    $start = $value.IndexOf('{')
+    $end = $value.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        return $null
+    }
+    try {
+        $document = $value.Substring($start, $end - $start + 1) | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($null -eq $document -or $null -eq $document.PSObject.Properties['queryStore']) {
+        return $null
+    }
+    $node = $document.queryStore
+    if ($null -eq $node -or $node -is [string]) {
+        return $null
+    }
+    # Each string as the result writes it, escaped (ConvertTo-Json: a quote takes two characters, and Windows PowerShell's
+    # serializer writes an apostrophe, <, >, or & as six), so the node's size holds whatever the runner wrote.
+    $cut = {
+        param([object] $Item, [int] $Length)
+        if ($null -eq $Item) {
+            return $null
+        }
+        $itemText = [string]$Item
+        if ($itemText.Length -gt $Length) {
+            $itemText = $itemText.Substring(0, $Length)
+        }
+        while ($itemText.Length -gt 0 -and ((ConvertTo-Json -InputObject $itemText -Compress).Length - 2) -gt $Length) {
+            $itemText = $itemText.Substring(0, $itemText.Length - 1)
+        }
+        return $itemText
+    }
+    $result = [ordered]@{}
+    foreach ($name in 'actualState', 'desiredState', 'captureMode') {
+        $result[$name] = if ($null -ne $node.PSObject.Properties[$name]) { & $cut $node.$name 64 } else { $null }
+    }
+    foreach ($name in 'readonlyReason', 'intervalMinutes', 'storageMb', 'maxStorageMb') {
+        $number = $null
+        if ($null -ne $node.PSObject.Properties[$name] -and $null -ne $node.$name) {
+            try {
+                $number = [long]$node.$name
+            }
+            catch {
+                $number = $null
+            }
+        }
+        $result[$name] = $number
+    }
+    if ($null -ne $node.PSObject.Properties['error'] -and $null -ne $node.error) {
+        $result['error'] = & $cut $node.error 200
+    }
+    return $result
+}
+
 function Get-DemoControlArgument {
     <#
     .SYNOPSIS
@@ -1401,6 +1474,11 @@ function Invoke-DemoControlRunner {
         if ($null -ne $bounds) {
             $evidence['bounds'] = $bounds
         }
+    }
+    # Query Store's state from the whole output too (T1.QUERYSTORE and T2.QUERYSTORE, 2026-11-23).
+    $runnerQueryStore = Get-DemoControlRunnerQueryStore -Text $run.StdOut
+    if ($null -ne $runnerQueryStore) {
+        $evidence['queryStore'] = $runnerQueryStore
     }
     $message = $outcome.Message
     if ($readyNote.Contains('readySeconds') -and [int]$readyNote['readySeconds'] -gt 0) {

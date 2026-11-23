@@ -525,7 +525,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
             [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 5 -Compress)))
         }
 
-        function New-RunnerStatus([int] $Runs, [string] $Target = 'T1') {
+        function New-RunnerStatus([int] $Runs, [string] $Target = 'T1', [System.Collections.IDictionary] $QueryStore = $null) {
             # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with
             # its own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584,
             # with the line breaks the runner writes on the Windows VMs (System.Text.Json's indented output uses
@@ -558,8 +558,12 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
                 demoSessions   = @()
                 dataHeadroomMb = 1834
                 logHeadroomMb  = 912
-                host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
             }
+            if ($null -ne $QueryStore) {
+                # Last but one, before the host node, as the runner writes it since 2026-11-23 (CommandLine.QueryStore.cs).
+                $document['queryStore'] = $QueryStore
+            }
+            $document['host'] = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
             return (($document | ConvertTo-Json -Depth 8) -replace '\r?\n', "`r`n")
         }
     }
@@ -809,7 +813,46 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[{"checkId":"WORKLOAD.T1.PROFILE.SET","status":"Pass","message":"ok"}]'; StdErr = '' } }
         Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('profile', 'set', '--name', 'baseline', '--json') }) -StateRoot $root
         $script:lines[0] | Should -Not -Match '"profile":\{'
+        $script:lines[0] | Should -Not -Match '"queryStore"'
         (Get-ControlResult).status | Should -Be 'Pass'
+    }
+
+    # 2026-11-23: the runner writes Query Store's state last but one, before the host node, but the kept tail of a status
+    # with runs is 1,800 characters, which loses it (the review of the Query Store design, finding 6), so the relay reads it
+    # from the whole output, bounded, for validate.ps1's T1.QUERYSTORE and T2.QUERYSTORE.
+    It 'Runner keeps Query Store''s state from the whole status with <Runs> runs, bounded, and the line within a Run Command''s 4 KB (T2''s relay takes the same step after its guest''s run)' -ForEach @(
+        @{ Target = 'T1'; Runs = 2 }
+        @{ Target = 'T1'; Runs = 5 }
+    ) {
+        $root = New-ControlRoot
+        $script:status = New-RunnerStatus -Runs $Runs -Target $Target -QueryStore ([ordered]@{ actualState = 'READ_ONLY'; desiredState = 'READ_WRITE'; readonlyReason = 65536; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 1024; maxStorageMb = 1024 })
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = $Target; arguments = @('status', '--json', '--runs', '5') }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3500 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        $result.evidence.queryStore.actualState | Should -Be 'READ_ONLY'
+        $result.evidence.queryStore.desiredState | Should -Be 'READ_WRITE'
+        $result.evidence.queryStore.readonlyReason | Should -Be 65536
+        $result.evidence.queryStore.maxStorageMb | Should -Be 1024
+        @($result.evidence.queryStore.PSObject.Properties.Name) | Should -Be @('actualState', 'desiredState', 'captureMode', 'readonlyReason', 'intervalMinutes', 'storageMb', 'maxStorageMb')
+    }
+
+    It 'Runner cuts Query Store''s strings and its error, so the node stays under 400 characters escaped' {
+        $long = '"' + ('x' * 500)
+        $node = Get-DemoControlRunnerQueryStore -Text (@{ target = 'T1'; queryStore = @{ actualState = $long; desiredState = $long; captureMode = $long; readonlyReason = 1; intervalMinutes = 15; storageMb = 2; maxStorageMb = 3; extra = $long }; host = @{ status = 'Pass' } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $node.actualState -Compress).Length - 2) | Should -BeLessOrEqual 64 -Because 'the cut is of the escaped text'
+        $node.captureMode | Should -Match '^"x+$'
+        $node.Contains('extra') | Should -BeFalse -Because 'only the known members are kept'
+        ($node | ConvertTo-Json -Compress).Length | Should -BeLessThan 400
+        $failed = Get-DemoControlRunnerQueryStore -Text (@{ queryStore = @{ error = ('300: ' + ('"' * 600)) } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $failed.error -Compress).Length - 2) | Should -BeLessOrEqual 200
+        $failed.error | Should -Match '^300: "+$'
+        $quoted = Get-DemoControlRunnerQueryStore -Text (@{ queryStore = @{ error = ("300: permission denied in database 'ContosoCare' <&> " * 20) } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $quoted.error -Compress).Length - 2) | Should -BeLessOrEqual 200 -Because 'apostrophes and <, >, & take more escaped in Windows PowerShell'
+        $failed.actualState | Should -BeNullOrEmpty
+        ($failed | ConvertTo-Json -Compress).Length | Should -BeLessThan 400 -Because 'escaped quotes double, and the error is cut to 200 characters first'
+        Get-DemoControlRunnerQueryStore -Text 'not json' | Should -BeNullOrEmpty
+        Get-DemoControlRunnerQueryStore -Text '{"target":"T1","host":{"status":"Pass"}}' | Should -BeNullOrEmpty -Because 'a runner from before it writes none'
     }
 
     It 'EnableT4: sets T4 up as the P6 group''s role, records the marker, sets the profile, and restarts the host' {

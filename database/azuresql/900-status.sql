@@ -32,6 +32,13 @@ SELECT
         FROM sys.extended_properties
         WHERE class = 0 AND name = N'MS_EnablePerformanceMonitoringPreview'),
     query_store_state = (SELECT TOP (1) actual_state_desc FROM sys.database_query_store_options),
+    -- Query Store's desired state, read-only reason, capture mode, and storage against its limit (2026-11-23):
+    -- validate.ps1's T3.QUERYSTORE, whose fix follows the measured reason.
+    query_store_desired_state = (SELECT TOP (1) desired_state_desc FROM sys.database_query_store_options),
+    query_store_readonly_reason = (SELECT TOP (1) readonly_reason FROM sys.database_query_store_options),
+    query_store_capture_mode = (SELECT TOP (1) query_capture_mode_desc FROM sys.database_query_store_options),
+    query_store_storage_mb = (SELECT TOP (1) current_storage_size_mb FROM sys.database_query_store_options),
+    query_store_max_storage_mb = (SELECT TOP (1) max_storage_size_mb FROM sys.database_query_store_options),
     force_last_good_plan_desired = (SELECT TOP (1) desired_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN'),
     force_last_good_plan_actual = (SELECT TOP (1) actual_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN'),
     auto_tuning_hold_run = @hold_run,
