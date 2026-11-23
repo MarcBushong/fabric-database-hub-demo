@@ -1194,13 +1194,17 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'Fabric'
     }
 
-    It 'doesn''t record the Fabric stage''s content as published while the history model went out in the release''s form although this checkout has the kept one (F35, design A)' {
-        # The stage's kept-value step here has no answer (Not selected, no form), as with no history yet.
+    It 'clears the Fabric stage''s record of its content while the history model went out in the release''s form although this checkout has the kept one, an earlier run''s record of the same content included (F35, design A; the re-check of 32e39e6a)' {
+        # The stage's kept-value step here has no answer (Not selected, no form), as with no history yet. An earlier run of
+        # this version recorded the same content, which tags keep unless a value replaces it.
         $script:keptDeployable = $true
-        $script:state = New-TestState @{ Stage = 'Fabric'; FabricSha256 = '' }
-        $null = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:state = New-TestState @{ FabricSha256 = ('f' * 64) }
+        $null = @(Invoke-DemoDeployment -Config $config)
         $script:order | Should -Contain 'Fabric'
-        @($script:recorded | Where-Object { $_.Contains('FabricSha256') }).Count | Should -Be 0 -Because 'the next deploy.ps1, a resume included, runs the stage again'
+        $cleared = @($script:recorded | Where-Object { $_.Contains('FabricSha256') })
+        $cleared.Count | Should -Be 1
+        $cleared[0]['FabricSha256'] | Should -BeExactly '' -Because 'an empty value clears the tag, so the next deploy.ps1, a resume included, runs the stage again'
+        $script:state.FabricSha256 | Should -BeExactly ''
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {

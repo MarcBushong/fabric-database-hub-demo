@@ -689,8 +689,8 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
             Invoke-DemoHistoryKeptValue -Config (New-TestConfig) -Token $script:token -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -RunAgain $script:trackAgain -DecidesModelForm -ProgressPath 'progress.json' -ProgressId 'Fabric.KeptValues'
         }
         # deploy.ps1's end after its history snapshot (-Snapshot, DEPLOY.FABRIC.HISTORY's outcome), whose own session works out
-        # every row, or finds no history table (-NoTable).
-        function Invoke-TestEnd([object] $Track, [string] $Snapshot = 'Saved', [switch] $NoTable) {
+        # every row, or finds no history table (-NoTable). -Extra: the track's other records, before the snapshot's.
+        function Invoke-TestEnd([object] $Track, [string] $Snapshot = 'Saved', [switch] $NoTable, [object[]] $Extra = @()) {
             if ($NoTable) {
                 Set-KeptValueRoute -Step (New-StatementAnswer 1 (New-StepLine @{ exists = $false; missing = @(); added = @(); form = 'Release'; read = 0; resolved = 0 }))
             }
@@ -698,8 +698,18 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
                 Set-KeptValueRoute
             }
             $saved = New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot'; outcome = $Snapshot }
-            InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); R = @($Track, $saved) } { Invoke-DemoKeptValueEndStep -Config $C -Result $R -ProgressPath 'progress.json' -ConfigPath 'demo.config.json' }
+            InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig); R = @(@($Track) + @($Extra) + @($saved)) } { Invoke-DemoKeptValueEndStep -Config $C -Result $R -ProgressPath 'progress.json' -ConfigPath 'demo.config.json' }
         }
+        # configure-powerbi.ps1's record of the form it deployed, word for word (the notebook and model's work, 464b542d): the
+        # kept form's Pass, or the release's Warning, whose fix is deploy.ps1 again.
+        function New-FormRecord([string] $Form) {
+            if ($Form -eq 'Kept') {
+                return (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.FORM' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Snapshot Value reads the kept values in telemetry_snapshots (F35): a minute that saves at different intervals hold counts once in the history''s totals, and a bin not worked out yet reads its most recent capture, as before.' -Evidence ([ordered]@{ form = 'Kept'; keptColumns = @('kept_value', 'resolved_at_utc') }))
+            }
+            New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.FORM' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'Snapshot Value has the release''s form: telemetry_snapshots didn''t have the kept-value columns, or the step that adds them couldn''t tell, so the history''s totals count a minute twice where saves at different intervals hold it (F35).' -Remediation 'Run ./scripts/deploy.ps1: its Fabric track adds the columns and works the history out, then deploys the kept form.' -Evidence ([ordered]@{ form = 'Release' })
+        }
+        $script:formSettled = 'Snapshot Value reads the kept values in telemetry_snapshots (F35): this run''s end deployed that form after its history snapshot, once every row''s kept value was worked out (DEPLOY.FABRIC.KEPTVALUE.END).'
+        $script:nextDeployFix = 'Nothing to do now: the next ./scripts/deploy.ps1 works out the history''s kept values and deploys the history model in their form by itself.'
     }
 
     BeforeEach {
@@ -710,37 +720,57 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         Mock -ModuleName DbHubDemo -CommandName Get-DemoKeptValueCode -MockWith { $fakeModule }
         # This checkout's configure-powerbi.ps1 has the kept form, as it does once the notebook and model's work is merged.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoKeptFormDeployable -MockWith { $true }
-        # The Fabric track's own model step: what it was asked for, and its records.
+        # The Fabric track's own model step: what it was asked for, and its records, the kept form's as configure-powerbi.ps1
+        # gives them.
         $script:deployed = [System.Collections.Generic.List[object]]::new()
         $script:modelRecords = @(
+            New-DemoResult -CheckId 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Imported the semantic model.'
+            New-FormRecord 'Kept'
             New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Refreshed the semantic model (Direct Lake framing) in about 5 seconds.'
             New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DATA' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every measure of the history model returned a value.'
         )
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $deployed.Add(('{0}|{1}' -f $PesterBoundParameters['SnapshotValueForm'], $PesterBoundParameters['ConfigPath'])); $modelRecords }
     }
 
-    It 'deploys the model in the kept form when the Fabric track found no history yet, by the track''s own step, a Pass' {
+    It 'deploys the model in the kept form when the Fabric track found no history yet, by the track''s own step, a Pass, and settles what the track''s model step said of the release''s form' {
         $track = New-TrackRecord 'NoTable'
-        $end = Invoke-TestEnd $track
+        $form = New-FormRecord 'Release'
+        $formBefore = [string]$form.message
+        $end = Invoke-TestEnd $track -Extra @($form)
         $end.checkId | Should -Be 'DEPLOY.FABRIC.KEPTVALUE.END'
         $end.status | Should -Be 'Pass'
         $end.evidence.outcome | Should -Be 'Switched'
         $end.message | Should -BeExactly 'Worked out the history''s kept values: 29,840 rows this time; it added grain_minutes, kept_value, resolved_at_utc to telemetry_snapshots, none left, and deployed the history model in their form (this run''s Fabric track had deployed the release''s).'
         $end.evidence.form | Should -Be 'Kept'
         $end.evidence.modelSwitch.switched | Should -BeTrue
-        $end.evidence.modelSwitch.records | Should -Be 2
+        $end.evidence.modelSwitch.keptDeployed | Should -BeTrue
+        $end.evidence.modelSwitch.records | Should -Be 4
         @($deployed) | Should -Be @('Kept|demo.config.json') -Because 'the Fabric track''s step, once, with the run''s configuration'
         $track.status | Should -Be 'Not selected'
         @($rows | Where-Object Id -EQ 'Fabric.HistoryKept' | ForEach-Object { $_.State }) | Should -Be @('Running', 'Running', 'Done')
         @($rows | Where-Object Id -EQ 'Fabric.HistoryKept')[1].Message | Should -BeExactly 'Deploying the history model in the kept values'' form, by the Fabric track''s own step (configure-powerbi.ps1). It doesn''t block DONE.'
+        # configure-powerbi.ps1's Warning of the release's form, whose fix was deploy.ps1 again, is settled, and the history
+        # report's row shows the kept form's deployment (the re-check of 32e39e6a).
+        $form.status | Should -Be 'Pass'
+        $form.message | Should -BeExactly $script:formSettled
+        $form.remediation | Should -BeExactly ''
+        $form.evidence.earlierMessage | Should -BeExactly $formBefore
+        $form.evidence.form | Should -Be 'Kept'
+        $report = @($rows | Where-Object Id -EQ 'Fabric.Report')
+        $report.Count | Should -Be 1
+        $report[0].State | Should -Be 'Done'
+        $report[0].Status | Should -Be 'Pass'
+        $report[0].Message | Should -BeExactly ''
     }
 
-    It 'deploys the model in the kept form when a busy capacity refused the Fabric track''s session, and settles that step''s Warning' {
+    It 'deploys the model in the kept form when a busy capacity refused the Fabric track''s session, and settles that step''s Warning, and each of its model steps'' Warning of the release''s form' {
         $track = New-TrackRecord 'Busy'
         $track.status | Should -Be 'Warning'
         $track.evidence.outcome | Should -Be 'SessionFailed'
         $before = [string]$track.message
-        $end = Invoke-TestEnd $track
+        # The track's model step, and #68's follow-up's, each said the release's form.
+        $forms = @((New-FormRecord 'Release'), (New-FormRecord 'Release'))
+        $end = Invoke-TestEnd $track -Extra $forms
         $end.evidence.outcome | Should -Be 'Switched'
         $track.status | Should -Be 'Pass'
         $track.message | Should -BeExactly 'This step didn''t work out the history''s kept values (SessionFailed), but this run''s end did, after its history snapshot, and deployed the history model in their form (DEPLOY.FABRIC.KEPTVALUE.END).'
@@ -750,21 +780,27 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         $rows[-1].State | Should -Be 'Done'
         $rows[-1].Status | Should -Be 'Pass'
         $rows[-1].Message | Should -BeExactly $track.message
+        @($forms | ForEach-Object { [string]$_.status }) | Should -Be @('Pass', 'Pass')
+        @($forms | ForEach-Object { [string]$_.message }) | Should -Be @($script:formSettled, $script:formSettled)
     }
 
     It 'is one Warning, never a Fail and never in DONE''s way, when deploying the kept form doesn''t work' {
         $track = New-TrackRecord 'Busy'
+        $form = New-FormRecord 'Release'
         $script:modelRecords = @(
             New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh ended with status Failed.'
             New-DemoResult -CheckId 'FABRIC.REPORT' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed the history report.'
         )
-        $end = Invoke-TestEnd $track
+        $end = Invoke-TestEnd $track -Extra @($form)
         $end.status | Should -Be 'Warning'
         $end.evidence.outcome | Should -Be 'SwitchFailed'
         $end.message | Should -BeExactly ('The history''s kept values are worked out, 29,840 rows this time; it added grain_minutes, kept_value, resolved_at_utc to telemetry_snapshots, with none left, but deploying the history model in their form didn''t work: FABRIC.SEMANTICMODEL.REFRESH (Fail): The refresh ended with status Failed. {0}' -f $script:modelBefore)
         $end.remediation | Should -BeExactly ('Run {0}; if it fails the same way, it''s a bug: open an issue with this record.' -f $script:trackAgain)
         @($end.evidence.modelSwitch.notPassed) | Should -Be @('FABRIC.SEMANTICMODEL.REFRESH Fail')
+        $end.evidence.modelSwitch.keptDeployed | Should -BeFalse -Because 'the kept form''s import didn''t say it passed'
         $track.status | Should -Be 'Warning' -Because 'the model still waits for the kept form'
+        $form.status | Should -Be 'Warning'
+        @($rows | Where-Object Id -EQ 'Fabric.Report').Count | Should -Be 0
         InModuleScope DbHubDemo -Parameters @{ E = $end } { Test-DemoNonBlockingResult -Result $E } | Should -BeTrue
         (InModuleScope DbHubDemo -Parameters @{ R = @($track, $end) } { Get-DemoKeptValueItem -Result $R }).howTo | Should -BeExactly $end.remediation
 
@@ -773,6 +809,33 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         $end = Invoke-TestEnd (New-TrackRecord 'NoTable')
         $end.evidence.outcome | Should -Be 'SwitchFailed'
         $end.message | Should -Match 'didn''t work: The model step broke\. This run''s history model reads the release''s form'
+    }
+
+    It 'says the history model reads the kept values when a switch''s import passed and what followed it didn''t, and settles what said the release''s form (the re-check of 32e39e6a)' {
+        $track = New-TrackRecord 'Busy'
+        $form = New-FormRecord 'Release'
+        $script:modelRecords = @(
+            New-DemoResult -CheckId 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Imported the semantic model.'
+            New-FormRecord 'Kept'
+            New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh ended with status Failed.'
+            New-DemoResult -CheckId 'FABRIC.REPORT' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed the history report.'
+        )
+        $end = Invoke-TestEnd $track -Extra @($form)
+        $end.status | Should -Be 'Warning'
+        $end.evidence.outcome | Should -Be 'SwitchFailed'
+        $end.message | Should -BeExactly 'The history''s kept values are worked out, 29,840 rows this time; it added grain_minutes, kept_value, resolved_at_utc to telemetry_snapshots, with none left, and the history model is deployed in their form, but what followed didn''t work: FABRIC.SEMANTICMODEL.REFRESH (Fail): The refresh ended with status Failed.'
+        $end.remediation | Should -BeExactly ('Run {0}; if it fails the same way, it''s a bug: open an issue with this record.' -f $script:trackAgain)
+        $end.evidence.modelSwitch.switched | Should -BeFalse
+        $end.evidence.modelSwitch.keptDeployed | Should -BeTrue
+        $track.status | Should -Be 'Pass'
+        $form.status | Should -Be 'Pass'
+        $form.message | Should -BeExactly $script:formSettled
+        $report = @($rows | Where-Object Id -EQ 'Fabric.Report')
+        $report.Count | Should -Be 1
+        $report[0].Status | Should -Be 'Warning' -Because 'the switch never fails the run'
+        $report[0].State | Should -Be 'Done'
+        $report[0].Message | Should -BeExactly 'The refresh ended with status Failed.'
+        (InModuleScope DbHubDemo -Parameters @{ R = @($track, $form, $end) } { Get-DemoKeptValueItem -Result $R }).howTo | Should -BeExactly $end.remediation
     }
 
     It 'notes, never warns, when there''s still no history at the end, and says that the next deploy.ps1 deploys the kept form by itself' {
@@ -788,6 +851,26 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         $deployed.Count | Should -Be 0
     }
 
+    It 'gives a busy capacity''s Warning at the Fabric track the end''s fix when the end had no rows to work out: <Name> (the re-check of 32e39e6a)' -TestCases @(
+        @{ Name = 'nothing saved at the end'; Snapshot = 'CapacityPaused'; NoTable = $false }
+        @{ Name = 'a snapshot without a table'; Snapshot = 'Saved'; NoTable = $true }
+    ) {
+        param($Name, $Snapshot, $NoTable)
+        $track = New-TrackRecord 'Busy'
+        $track.remediation | Should -Match '-FromStage Fabric in a few minutes' -Because 'what the track''s step says by itself'
+        $end = Invoke-TestEnd $track -Snapshot $Snapshot -NoTable:$NoTable
+        $end.status | Should -Be 'Not selected' -Because $Name
+        $end.message | Should -Match ([regex]::Escape($script:nextDeploy) + '$')
+        $track.status | Should -Be 'Warning' -Because 'Fabric did refuse its session'
+        $track.remediation | Should -BeExactly $script:nextDeployFix -Because $Name
+        (InModuleScope DbHubDemo -Parameters @{ R = @($track, $end) } { Get-DemoKeptValueItem -Result $R }).howTo | Should -BeExactly $script:nextDeployFix
+        $row = @($rows | Where-Object Id -EQ 'Fabric.KeptValues')[-1]
+        $row.State | Should -Be 'Action needed'
+        $row.Status | Should -Be 'Warning'
+        $row.Message | Should -BeExactly ('{0} {1}' -f $track.message, $script:nextDeployFix)
+        $deployed.Count | Should -Be 0
+    }
+
     It 'ends no first deployment with a kept-value Warning: <Name>' -TestCases @(
         @{ Name = 'the first history run saved rows in time'; Track = 'Kept'; Snapshot = 'Saved'; NoTable = $false; Switch = 0 }
         @{ Name = 'no history at the track, rows at the end'; Track = 'NoTable'; Snapshot = 'Saved'; NoTable = $false; Switch = 1 }
@@ -799,10 +882,21 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         # failures on the status page); these are the paths a first deployment's timing takes.
         param($Name, $Track, $Snapshot, $NoTable, $Switch)
         $trackRecord = New-TrackRecord $Track
-        $end = Invoke-TestEnd $trackRecord -Snapshot $Snapshot -NoTable:$NoTable
+        # What the track's model step said of the form it deployed (configure-powerbi.ps1).
+        $form = New-FormRecord $(if ($Track -eq 'Kept') { 'Kept' } else { 'Release' })
+        $end = Invoke-TestEnd $trackRecord -Snapshot $Snapshot -NoTable:$NoTable -Extra @($form)
         @(@($trackRecord, $end) | Where-Object { [string]$_.status -in 'Warning', 'Fail', 'Manual action required' }).Count | Should -Be 0 -Because $Name
-        InModuleScope DbHubDemo -Parameters @{ R = @($trackRecord, $end) } { Get-DemoKeptValueItem -Result $R } | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo -Parameters @{ R = @($trackRecord, $form, $end) } { Get-DemoKeptValueItem -Result $R } | Should -BeNullOrEmpty
         $deployed.Count | Should -Be $Switch
+        # Once the end deployed the kept form, nothing says the release's form (the re-check of 32e39e6a). Without rows at the
+        # end, the model's own record of the release's form stays, with the same fix as the end's note: a plain deploy.ps1.
+        if ($Track -eq 'Kept' -or $Switch) {
+            $form.status | Should -Be 'Pass' -Because $Name
+        }
+        else {
+            $form.status | Should -Be 'Warning' -Because $Name
+            $form.remediation | Should -Match '^Run \./scripts/deploy\.ps1: '
+        }
     }
 
     It 'neither deploys the model nor waits for the kept form when this checkout''s configure-powerbi.ps1 has only the release''s' {

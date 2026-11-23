@@ -891,6 +891,9 @@ function Invoke-DemoDeploymentTrack {
     $recordState = -not [bool](& $option 'NoState' $false)
     # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
     $fabricPublished = ''
+    # Cleared with the step instead, while its history model waits for the kept form (F35, design A): tags merge, so a key
+    # left out keeps an earlier run's record of the same content, and a resume would skip the step (the re-check of 32e39e6a).
+    $fabricUnpublished = $false
     # What the Insights app's Manage has, recorded with the Fabric step when it deployed the app (2026-11-19); @{} otherwise.
     $appManageRecord = @{}
     $handoff = [string](& $option 'HandoffPath' '')
@@ -1912,6 +1915,7 @@ function Invoke-DemoDeploymentTrack {
                         }
                         if ($keptFormPending) {
                             $fabricPublished = ''
+                            $fabricUnpublished = $true
                         }
                     }
                 }
@@ -2025,6 +2029,11 @@ function Invoke-DemoDeploymentTrack {
                 if ($fabricPublished) {
                     $record['FabricSha256'] = $fabricPublished
                     $fabricPublished = ''
+                }
+                elseif ($fabricUnpublished) {
+                    # An empty value clears the tag (Set-DemoDeploymentState).
+                    $record['FabricSha256'] = ''
+                    $fabricUnpublished = $false
                 }
                 foreach ($key in @($appManageRecord.Keys)) {
                     $record[$key] = $appManageRecord[$key]

@@ -1302,16 +1302,18 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $record[0].Contains('FabricSha256') | Should -BeFalse
     }
 
-    It 'doesn''t record the Fabric step''s content as published while the history model went out in the release''s form although this checkout has the kept one, so the next deploy.ps1 runs it again (F35, design A)' {
+    It 'clears the Fabric step''s record of its content while the history model went out in the release''s form although this checkout has the kept one, so the next deploy.ps1 runs it again (F35, design A; the re-check of 32e39e6a)' {
         $script:recorded = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'FABRIC.APP.DEPLOY Pass' }
+        # Cleared, not left out: tags merge, so an earlier run's record of the same content would keep a resume from running
+        # the step again.
         foreach ($case in @(
-                @{ Name = 'no history yet, the kept form in this checkout'; Form = ''; Deployable = $true; Recorded = $false }
-                @{ Name = 'the kept form deployed'; Form = 'Kept'; Deployable = $true; Recorded = $true }
-                @{ Name = 'no kept form in this checkout'; Form = ''; Deployable = $false; Recorded = $true }
+                @{ Name = 'no history yet, the kept form in this checkout'; Form = ''; Deployable = $true; Expected = '' }
+                @{ Name = 'the kept form deployed'; Form = 'Kept'; Deployable = $true; Expected = ('f' * 64) }
+                @{ Name = 'no kept form in this checkout'; Form = ''; Deployable = $false; Expected = ('f' * 64) }
             )) {
             $script:recorded.Clear()
             $script:keptForm = $case.Form
@@ -1321,7 +1323,8 @@ Describe 'Invoke-DemoDeploymentTrack' {
             $outcome.Status | Should -Be 'Pass' -Because $case.Name
             $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
             $record.Count | Should -Be 1 -Because 'the step is finished either way'
-            $record[0].Contains('FabricSha256') | Should -Be $case.Recorded -Because $case.Name
+            $record[0].Contains('FabricSha256') | Should -BeTrue -Because $case.Name
+            $record[0]['FabricSha256'] | Should -BeExactly $case.Expected -Because $case.Name
         }
     }
 

@@ -980,10 +980,11 @@ function Invoke-DemoDeployment {
                 if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
                     $published['FabricSha256'] = $fabricContent
                 }
-                # F35, design A, as in the parallel Fabric track: not recorded while the model went out in the release's form
-                # although this checkout has the kept one, so the next deploy.ps1, a resume included, runs the stage again.
+                # F35, design A, as in the parallel Fabric track: cleared while the model went out in the release's form although
+                # this checkout has the kept one, so the next deploy.ps1, a resume included, runs the stage again. Cleared, not
+                # left out: tags merge, so an earlier run's record of the same content would stay (the re-check of 32e39e6a).
                 if (Test-DemoKeptFormPending -Result $keptValue) {
-                    $published.Remove('FabricSha256')
+                    $published['FabricSha256'] = ''
                 }
                 & $recordStage 'Fabric' $published
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
