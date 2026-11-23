@@ -1,11 +1,11 @@
 // F35's rule for the history model's overlapping saves, as one value per series and bin: each interval from its finest
-// save, by the rows each save holds, as finestPerInterval keeps it, but for two known differences (snapshotValues'
-// notes). It's the reference for a fix of the model, with its tests: the model's 'Snapshot Value' still takes each bin
-// from its newest save, because taking this rule in its DAX, at query time, was too slow (ADR 0014's amendment of
-// 2026-11-22). Not used by the app's views.
+// save, by the rows each save holds, as finestPerInterval keeps it. It's design (i)'s reference: when history is saved,
+// fabric/history/kept_value.py reduces it to a kept value per row, which the model's kept form of 'Snapshot Value' reads
+// per bin, and the shared cases (kept-value-cases.test.ts) hold the two to the same values. Taking the rule in the
+// model's DAX, at query time, was too slow (ADR 0014's amendment of 2026-11-22). Not used by the app's views.
 
 import { toDate } from "@/lib/format";
-import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, finestPerInterval, HOURLY_METRICS, OFF_GRID_ANALYSES } from "./finest-per-interval";
+import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, declaredGrain, finestPerInterval, gapsIn, HOURLY_METRICS, insert, OFF_GRID_ANALYSES, overlapping, shares, type Span } from "./finest-per-interval";
 
 type Row = Record<string, unknown>;
 
@@ -27,22 +27,12 @@ interface Save {
     dense: boolean;
 }
 
-/** A finer save's row in a coarser point's interval: its span, its save's rank there, and what it keeps and leaves taken. */
+/** A finer save's row in a coarser point's interval: its span, its value, and its save's rank there. */
 interface Piece {
-    save: Save;
     value: number;
     from: number;
     to: number;
     rank: number;
-    kept: number;
-    taken: number | null;
-}
-
-/** The spans cover [from, to): no gap point, the start or a span's end inside it, lies outside every span. */
-function covers(spans: ReadonlyArray<{ from: number; to: number }>, from: number, to: number): boolean {
-    if (spans.length === 0) return false;
-    const points = [from, ...spans.filter((s) => s.to < to - EPSILON).map((s) => s.to)];
-    return points.every((x) => spans.some((s) => s.from <= x + EPSILON && s.to > x + EPSILON));
 }
 
 const text = (value: unknown) => (value === null || value === undefined ? "" : String(value));
@@ -74,26 +64,23 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
 
 /**
  * The value for each target, analysis, metric, and bin (the model's 'Snapshot Value' groups), by key `target|analysis|metric|bin`
- * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there, as finestPerInterval keeps it,
- * but for the known differences after the list:
+ * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there, as finestPerInterval keeps it:
  * - No finer save's rows reach its interval: it stays whole. A finer save is a finer grain, or the same grain and newer.
  * - One finer save has a row in every one of its intervals across it: it's covered, and left out.
- * - Otherwise, from the finer saves whose rows reach any part of its interval, the part its window cuts off too, ranked
- *   by save (the finest first, then the newest), each of their rows in its interval keeps what the shared function keeps
- *   (all of it with nothing earlier under it, nothing when earlier rows cover it, or else what's left of it), against
- *   every earlier save's rows, as finestPerInterval takes each point against every one it kept before. Then a point that
- *   those rows cover where its window keeps it is left out; a total stays as what's left of it, and a maximum or an
- *   average only when it's higher than every one of them that wasn't covered itself.
+ * - Otherwise, the finer saves' rows in its interval, the part its window cuts off too, are taken in finestPerInterval's
+ *   order (the finest save first, then the newest), each against the stretches that every earlier one kept: a row with
+ *   none under it keeps its whole span; one they cover keeps nothing; and otherwise it keeps each stretch they leave
+ *   uncovered, a total splitting what's left of it across them by length, in whole numbers when it's one (shares), and
+ *   a maximum or an average its value on each. Then a point whose window's part those stretches cover is left out; a
+ *   total stays as what's left of it after the stretches that overlap that part, and a maximum or an average only when
+ *   it's higher than every one of them.
  * Totals add, and maxima and averages take the highest; a remainder shows at its own bin's start. Off the bin grid, the
  * newest capture. A row with no bin is a save only, a marker with its rows' extent in First, Last, and Count.
  *
- * The known differences, which design (i)'s build aligns (the reviews of 4944e22d and 67f08e7d):
- * - A SQL save's step comes from its window (sqlGrain), where finestPerInterval reads a capture's from its bins. So a
- *   capture whose bins don't show its step, with scattered activity for example, can read coarser there.
- * - A finer row keeps what's left of it as one piece over its whole span, where finestPerInterval splits it across the
- *   row's uncovered stretches by length. So where a coarser point's window cuts through such a row, and part of what's
- *   left of it is in the part cut off, this rule counts all of it against the part the window keeps. The tests pin two
- *   cases, one where each rule gives the data's answer.
+ * A save's step is the grain its rows declare (declaredGrain). A save written before that keeps today's reading: a SQL
+ * save's from its window (sqlGrain), and an Azure Monitor save's from its window and bins (monitorGrain). That's the one
+ * known difference left from finestPerInterval, which reads such a capture's step from its bins: a SQL capture whose bins
+ * don't show its step, with scattered activity for example, can read coarser there (the shared cases pin random 11).
  */
 export function snapshotValues(rows: readonly Row[]): Map<string, number> {
     const bySeries = new Map<string, Row[]>();
@@ -152,13 +139,20 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
         }
 
         const saves = new Map<number, Save>();
+        // A save's declared grain, from the first of its rows of the series that has one.
+        const declared = new Map<number, number>();
+        for (const r of list) {
+            const captured = time(r.CapturedAt);
+            const grain = declaredGrain(r);
+            if (captured !== null && grain !== null && !declared.has(captured)) declared.set(captured, grain);
+        }
         for (const r of list) {
             const captured = time(r.CapturedAt);
             const from = time(r.WindowStart);
             const to = time(r.WindowEnd);
             const extent = captured === null ? undefined : extents.get(captured);
             if (captured === null || from === null || to === null || !extent || saves.has(captured)) continue;
-            const step = monitor ? monitorGrain(from, to, monitorBins.get(`${target}|${analysis}|${captured}`) ?? []) : sqlGrain(from, to);
+            const step = declared.get(captured) ?? (monitor ? monitorGrain(from, to, monitorBins.get(`${target}|${analysis}|${captured}`) ?? []) : sqlGrain(from, to));
             const grain = hourly ? Math.max(60, step) : step;
             saves.set(captured, {
                 captured,
@@ -202,28 +196,34 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
                 let from = Math.max(at, s.from);
                 let to = Math.min(at + s.grain * MINUTE, s.to);
                 if (from >= to) [from, to] = [at, at + s.grain * MINUTE];
-                pieces.push({ save: s, value: v, from, to, rank: 1 + finer.filter((q) => finerThan(q, s)).length, kept: v, taken: v });
+                pieces.push({ value: v, from, to, rank: 1 + finer.filter((q) => finerThan(q, s)).length });
             }
-            // The first save's rows keep all they hold; each later save's, what finestPerInterval keeps of them against
-            // every earlier save's rows.
-            let earlier = pieces.filter((p) => p.rank === 1);
-            const levels = [...new Set(pieces.map((p) => p.rank))].filter((level) => level > 1).sort((a, b) => a - b);
-            for (const level of levels) {
-                const rows = pieces.filter((p) => p.rank === level);
-                for (const r of rows) {
-                    const under = earlier.filter((u) => u.from < r.to && u.to > r.from);
-                    const covered = covers(under, r.from, r.to);
-                    r.kept = under.length === 0 ? r.value : covered ? 0 : Math.max(0, r.value - under.reduce((a, u) => a + u.kept, 0));
-                    r.taken = covered ? null : r.value;
+            // What finestPerInterval keeps of each, against the stretches every earlier one kept: its whole span with
+            // nothing under it, nothing when they cover it, and otherwise each stretch they leave uncovered, with a total's
+            // remainder split across them by length and a maximum's or an average's value on each.
+            pieces.sort((a, b) => a.rank - b.rank);
+            const taken: Span[] = [];
+            for (const p of pieces) {
+                const under = overlapping(taken, p.from, p.to);
+                if (under.length === 0) {
+                    insert(taken, { start: p.from, end: p.to, value: p.value });
+                    continue;
                 }
-                earlier = [...earlier, ...rows];
+                const gaps = gapsIn(under, p.from, p.to);
+                if (gaps.length === 0) continue;
+                if (adds) {
+                    const left = Math.max(0, p.value - under.reduce((a, u) => a + (u.value ?? 0), 0));
+                    const parts = shares(left, gaps.map(([from, to]) => to - from));
+                    gaps.forEach(([from, to], i) => insert(taken, { start: from, end: to, value: parts[i] }));
+                } else {
+                    for (const [from, to] of gaps) insert(taken, { start: from, end: to, value: p.value });
+                }
             }
-            const under = earlier.filter((u) => u.from < end && u.to > start);
+            const under = overlapping(taken, start, end);
             if (under.length === 0) return value;
-            if (covers(under, start, end)) return null;
-            if (adds) return Math.max(0, value - under.reduce((a, u) => a + u.kept, 0));
-            const taken = under.map((u) => u.taken).filter((t): t is number => t !== null);
-            return taken.length === 0 || value > Math.max(...taken) ? value : null;
+            if (gapsIn(under, start, end).length === 0) return null;
+            if (adds) return Math.max(0, value - under.reduce((a, u) => a + (u.value ?? 0), 0));
+            return value > Math.max(...under.map((u) => u.value ?? -Infinity)) ? value : null;
         };
 
         for (const [binKey, group] of byBin) {
@@ -244,6 +244,56 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
             }
             if (owns.length > 0) out.set(`${seriesKey}|${binKey}`, adds ? owns.reduce((a, b) => a + b, 0) : Math.max(...owns));
         }
+    }
+    return out;
+}
+
+/**
+ * The kept form of the model's 'Snapshot Value' per target, analysis, metric, and bin, by snapshotValues' keys, from rows
+ * with the kept values that fabric/history/kept_value.py wrote (KeptValue, and ResolvedAt, when it worked the row out):
+ * - a bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid: the release's rule, the
+ *   newest capture's sum;
+ * - every bin, with savesFiltered: the release's rule among the rows given. A query sets it by filtering a column that
+ *   tells a bin's saves apart (Run ID, Source Notebook, Captured At UTC, Window Start UTC, Window End UTC, Value, Kept
+ *   Value, or Resolved At UTC), as Ask reads T5's latest run: a kept value is a row's share against every save, so the
+ *   rows of some saves alone read as those saves wrote them (the review of f2298b18);
+ * - otherwise a total's kept values summed, and for a maximum or an average the highest of each capture's sum.
+ * A bin whose kept values are all null isn't there. It's the DAX measure's reference
+ * (fabric/powerbi/kept-value/Snapshot Value.tmdl), and F35's live proof compares it with snapshotValues on the same rows.
+ */
+export function keptFormValues(rows: readonly Row[], options: { savesFiltered?: boolean } = {}): Map<string, number> {
+    const groups = new Map<string, Row[]>();
+    for (const r of rows) {
+        const at = time(r.Bucket);
+        const key = `${text(r.TargetKey)}|${text(r.AnalysisKey)}|${text(r.Metric)}|${at === null ? "" : String(at)}`;
+        const group = groups.get(key) ?? [];
+        group.push(r);
+        groups.set(key, group);
+    }
+    const out = new Map<string, number>();
+    const numberOf = (value: unknown) => (value === null || value === undefined || value === "" ? null : Number(value));
+    for (const [key, group] of groups) {
+        const [, analysis, metric, binText] = key.split("|");
+        const sums = new Map<number | null, number | null>();
+        const kept = !options.savesFiltered && binText !== "" && !OFF_GRID_ANALYSES.has(analysis) && group.every((r) => time(r.ResolvedAt) !== null);
+        for (const r of group) {
+            const captured = time(r.CapturedAt);
+            const value = numberOf(kept ? r.KeptValue : r.Value);
+            const before = sums.has(captured) ? (sums.get(captured) ?? null) : null;
+            sums.set(captured, value === null ? before : (before ?? 0) + value);
+        }
+        let value: number | null = null;
+        if (!kept) {
+            const times = [...sums.keys()].filter((t): t is number => t !== null);
+            value = sums.get(times.length > 0 ? Math.max(...times) : null) ?? null;
+        } else if (ADDITIVE_ANALYSES.has(analysis) || ADDITIVE_METRICS.has(metric)) {
+            const parts = [...sums.values()].filter((v): v is number => v !== null);
+            value = parts.length > 0 ? parts.reduce((a, b) => a + b, 0) : null;
+        } else {
+            const parts = [...sums.values()].filter((v): v is number => v !== null);
+            value = parts.length > 0 ? Math.max(...parts) : null;
+        }
+        if (value !== null) out.set(key, value);
     }
     return out;
 }
@@ -272,9 +322,9 @@ export interface F35Check {
     /**
      * Each target's window measures: by this rule per bin (model) and by finestPerInterval (finest). Over a window
      * whose edges fall on every save's bin grid (whole hours, when no save in it is coarser than an hour), they agree
-     * but for the known differences in snapshotValues' notes, which design (i)'s build aligns. An edge inside a coarser
-     * bin can set them apart, and no build changes that: this rule shows a remainder at its own bin's start, as any
-     * per-bin model does, and finestPerInterval at the start of each uncovered stretch.
+     * but for the known difference in snapshotValues' notes, an older save's step. An edge inside a coarser bin can set
+     * them apart, and no build changes that: this rule shows a remainder at its own bin's start, as any per-bin model
+     * does, and finestPerInterval at the start of each uncovered stretch.
      */
     measures: Record<string, Record<string, { model: number | null; finest: number | null }>>;
 }
@@ -283,7 +333,7 @@ export interface F35Check {
  * F35's check from a history's rows, as the model holds them (one per save, series, and bin, and a marker per save and
  * series): the rule's per-bin values, and each target's window totals and peaks by the rule and by finestPerInterval.
  * Over a window whose edges fall on every save's bin grid (whole hours, when no save in it is coarser than an hour),
- * they agree but for the known differences in snapshotValues' notes; an edge inside a coarser bin can set them apart
+ * they agree but for the known difference in snapshotValues' notes; an edge inside a coarser bin can set them apart
  * (F35Check's measures). Bins in [from, to), by their own start, as a DAX filter takes them.
  */
 export function f35Check(rows: readonly Row[], from: Date, to: Date): F35Check {

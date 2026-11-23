@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { f35Check, monitorGrain, snapshotValues, sqlGrain } from "./snapshot-value";
+import { f35Check, keptFormValues, monitorGrain, snapshotValues, sqlGrain } from "./snapshot-value";
 
 type Row = Record<string, unknown>;
 
@@ -300,46 +300,129 @@ describe("F35's per-bin rule in TypeScript, the reference for a fix of the histo
     });
 });
 
-// The review of 67f08e7d: known differences from finestPerInterval, older than 67f08e7d, which design (i)'s build aligns.
-// A finer row straddles a coarser point's window cut, and part of what's left of it is in the part cut off.
-// finestPerInterval splits what's left across the row's uncovered stretches by length, and the coarser point takes only
-// the stretches that overlap the part its window keeps; this rule takes all of it there. Neither is always the data's
-// answer, so each case pins both rules' and names the closer. Background load is 4 a minute; stop-demo.ps1 -SaveHistory
-// at 15:24 cuts its 15:20 bin to 15:20 to 15:24; and the next day's update at 15:22 cuts its day save's 15:15 bin to 15:22
-// to 15:30.
-describe("known differences from finestPerInterval, where a window cuts through what's left of a finer row", () => {
+// The review of 67f08e7d: a finer row straddles a coarser point's window cut, and part of what's left of it is in the
+// part cut off. Both rules split what's left across the row's uncovered stretches by length, and the coarser point takes
+// only the stretches that overlap the part its window keeps: design (i)'s build aligned this rule with finestPerInterval,
+// which before it took all of what was left there. Neither is always the data's answer, so each case names it. Background
+// load is 4 a minute; stop-demo.ps1 -SaveHistory at 15:24 cuts its 15:20 bin to 15:20 to 15:24; and the next day's update
+// at 15:22 cuts its day save's 15:15 bin to 15:22 to 15:30.
+describe("a finer row that a coarser save's window cuts through, split as finestPerInterval splits it", () => {
     const STOP = save("2026-11-21T15:24:30", "2026-11-21T03:24:00", "2026-11-21T15:24:00");
     const NEXT_DAY = save("2026-11-22T15:33:00", "2026-11-21T15:22:00", "2026-11-22T15:22:00");
 
-    it("with a quiet minute in the straddling row, the data hold 86 from 15:15 to 15:30: this rule's answer, where finestPerInterval gives 89", () => {
+    it("with a quiet minute in the straddling row, gives 89 from 15:15 to 15:30, where the data hold 86", () => {
         // A session from 15:16 to 15:22 with 10 a minute of Lock waits, and none at 15:20, a bin WAITS_KQL leaves out
-        // (WaitMs > 0). The stop save's 15:20 holds 18: 10 at 15:21, beside the session's, and 8 from 15:22 to 15:24.
-        // finestPerInterval gives the quiet 15:20 3 of the 8, by length, so the day keeps 27 for 15:24 to 15:30, where 24
-        // is right; this rule takes all 8 from the day's part, as the data do. 76 before 67f08e7d.
+        // (WaitMs > 0). The stop save's 15:20 holds 18: 10 at 15:21, beside the session's, and 8 from 15:22 to 15:24. The
+        // split gives the quiet 15:20 3 of the 8, by length, so the day keeps 27 for 15:24 to 15:30, where 24 is right;
+        // taking all 8 from the day's part, as this rule did before, gave the data's 86.
         const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
         const rows = [
             ...([["15:16", 10], ["15:17", 10], ["15:18", 10], ["15:19", 10], ["15:21", 10]] as const).map(lock(save("2026-11-21T15:23:00", "2026-11-21T15:16:00", "2026-11-21T15:22:00"))),
             ...every("15:15", 5, [44, 18]).map(lock(STOP)),
             ...every("15:15", 15, [32, 60]).map(lock(NEXT_DAY)),
         ];
-        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(28);
+        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(31);
         const { model, finest } = f35Check(rows, at("15:15"), at("15:30")).measures.T1.LockWaitS;
-        expect(model).toBeCloseTo(0.086, 9);
+        expect(model).toBeCloseTo(0.089, 9);
         expect(finest).toBeCloseTo(0.089, 9);
     });
 
-    it("with what's left of the straddling row on both sides of the cut, the data hold 72 from 15:15 to 15:30: finestPerInterval's answer, where this rule gives 68", () => {
+    it("with what's left of the straddling row on both sides of the cut, gives 72 from 15:15 to 15:30, the data's answer", () => {
         // A session from 15:21 to 15:23 with 10 a minute. The stop save's 15:20 holds 28, 8 of it beside the session's
-        // minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. finestPerInterval gives each 4, so the day
-        // keeps 24 of its 38, as the data do; this rule takes all 8 from the day's part, which keeps 20. The same before
-        // 67f08e7d.
+        // minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The split gives each 4, so the day keeps 24
+        // of its 38, as the data do; taking all 8 from the day's part, as this rule did before, kept 20, and 68.
         const batch = (s: Record<string, string>) => row(s, "T1", "counter_deltas", "Batch Requests/sec");
         const rows = [
             ...minutes("15:21", [10, 10]).map(batch(save("2026-11-21T15:23:30", "2026-11-21T15:21:00", "2026-11-21T15:23:00"))),
             ...every("15:15", 5, [20, 28]).map(batch(STOP)),
             ...every("15:15", 15, [38, 60]).map(batch(NEXT_DAY)),
         ];
-        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(40);
-        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 68, finest: 72 });
+        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(44);
+        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 72, finest: 72 });
+    });
+});
+
+// F35's declared grain: since design (i)'s build, the notebook writes each save's step with its rows (grain_minutes), and
+// both rules read it; a save written before keeps today's reading. random 11's shape: a newer 900-minute save of T2's
+// sessions has three rows 30 minutes apart, and an older one a row every 15 minutes.
+describe("a save's declared grain", () => {
+    const older = save("2026-11-21T16:30:00", "2026-11-21T01:30:00", "2026-11-21T16:30:00");
+    const newer = save("2026-11-21T17:00:00", "2026-11-21T02:00:00", "2026-11-21T17:00:00");
+    const sessions = (s: Record<string, string>, grain?: unknown) => (point: readonly [string, number]): Row => ({ ...row(s, "T2", "sessions", "MaxSessions")(point), ...(grain === undefined ? {} : { GrainMinutes: grain }) });
+    const rows = (grain?: unknown) => [...every("15:00", 15, [5, 7, 6, 4]).map(sessions(older, grain)), ...every("15:00", 30, [10, 43, 8]).map(sessions(newer, grain))];
+
+    it("sets each save's step in both rules, so a save whose bins don't show its step is the finer one in both", () => {
+        // Declared, both take the newer save as the finer: its 43 is 15:00 to 16:00's peak.
+        expect(f35Check(rows(15), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 43 });
+        expect(f35Check(rows("15"), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 43 });
+        // Without one, as an older save, finestPerInterval reads the newer save's step from its bins, 30 minutes, and keeps
+        // the older save's 7; the window's reading, 15, keeps the 43.
+        for (const grain of [undefined, null, 0, 2.5, 1441]) {
+            expect(f35Check(rows(grain), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 7 });
+        }
+    });
+});
+
+// F35 design (i): the model's kept form reads the kept values that fabric/history/kept_value.py wrote, and the release's
+// rule where they aren't all there. keptFormValues is the DAX measure's reference.
+describe("the kept form of 'Snapshot Value' (keptFormValues)", () => {
+    const SESSION = save("2026-11-21T16:00:00", "2026-11-21T15:00:00", "2026-11-21T15:40:00");
+    const DAY = save("2026-11-21T21:30:00", "2026-11-20T21:26:00", "2026-11-21T21:26:00");
+    const worked = (s: Record<string, string>, analysis: string, metric: string, kept: number | null, resolved: string | null = "2026-11-21T22:00:00") =>
+        (point: readonly [string, number]): Row => ({ ...row(s, "T1", analysis, metric)(point), KeptValue: kept, ResolvedAt: resolved });
+
+    it("sums a total's kept values, and takes the highest capture's sum of a peak's, where every row is worked out", () => {
+        const values = keptFormValues([
+            worked(SESSION, "wait_deltas", "Lock", 60)(["15:15", 60]),
+            worked(DAY, "wait_deltas", "Lock", 840)(["15:15", 900]),
+            worked(SESSION, "cpu", "MaxCPU", 40)(["15:15", 40]),
+            worked(DAY, "cpu", "MaxCPU", 70)(["15:15", 70]),
+            { ...worked(DAY, "cpu", "MaxCPU", 5)(["15:15", 5]), ResourceName: "a second instance" },
+        ]);
+        expect(values.get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(900);
+        expect(values.get(key("T1", "cpu", "MaxCPU", "15:15"))).toBe(75);
+    });
+
+    it("reads a bin with a row not worked out yet, a row without a bin, and an analysis off the grid by the release's rule", () => {
+        const values = keptFormValues([
+            worked(SESSION, "wait_deltas", "Lock", 60)(["15:15", 60]),
+            worked(DAY, "wait_deltas", "Lock", null, null)(["15:15", 900]),
+            { ...worked(SESSION, "wait_profile", "Lock", null, null)(["15:15", 5]), Bucket: null },
+            { ...worked(DAY, "wait_profile", "Lock", null)(["15:15", 7]), Bucket: null },
+            worked(SESSION, "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", 2048)(["15:20", 2048]),
+            worked(DAY, "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", null)(["15:20", 4096]),
+        ]);
+        // The day save's row isn't worked out, so its newest capture's 900 counts alone, as before F35.
+        expect(values.get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(900);
+        expect(values.get("T1|wait_profile|Lock|")).toBe(7);
+        expect(values.get(key("T1", "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", "15:20"))).toBe(4096);
+    });
+
+    it("leaves out a bin whose kept values are all null, as a chart leaves it blank", () => {
+        const values = keptFormValues([worked(SESSION, "cpu", "MaxCPU", null)(["15:30", 30]), worked(DAY, "cpu", "MaxCPU", null)(["15:30", 25])]);
+        expect(values.has(key("T1", "cpu", "MaxCPU", "15:30"))).toBe(false);
+    });
+
+    it("reads the rows that a query's filter on the saves leaves, as Ask's latest T5 run, by the release's rule (the review of f2298b18)", () => {
+        // T5's storm: the session's minutes are all of the day save's 15:15 and 15:30 intervals, so those two points keep
+        // nothing, and every other row keeps its value. The whole history reads as the rule does.
+        const covered = new Set(["2026-11-21T15:15:00", "2026-11-21T15:30:00"]);
+        const requests = T5_ROWS.filter((r) => r.Metric === "TotalRequests").map((r) => ({
+            ...r,
+            KeptValue: r.CapturedAt === T5_DAY.CapturedAt && covered.has(String(r.Bucket)) ? null : r.Value,
+            ResolvedAt: "2026-11-21T22:00:00",
+        }));
+        expect(keptFormValues(requests)).toEqual(snapshotValues(requests));
+        const total = (values: Map<string, number>) => [...values.values()].reduce((a, b) => a + b, 0);
+        // Ask's T5 rule reads the latest run, the day save, alone: its kept values leave out the minutes the session holds.
+        const latestRun = requests.filter((r) => r.CapturedAt === T5_DAY.CapturedAt);
+        const shares = keptFormValues(latestRun);
+        expect(shares.has(key("T5", "cosmosdb", "TotalRequests", "15:15"))).toBe(false);
+        expect(shares.has(key("T5", "cosmosdb", "TotalRequests", "15:30"))).toBe(false);
+        expect(total(shares)).toBe(50428);
+        // With the filter on its saves, the run reads as it saved them.
+        const run = keptFormValues(latestRun, { savesFiltered: true });
+        expect(run.get(key("T5", "cosmosdb", "TotalRequests", "15:30"))).toBe(27630);
+        expect(total(run)).toBe(78161);
     });
 });
