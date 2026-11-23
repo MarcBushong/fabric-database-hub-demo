@@ -12,7 +12,7 @@ import { INVESTIGATION_PLAYBOOK } from "./playbook";
 import { QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
-import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
+import { bounded, createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
 import { during, emptyEvidence, fromTo, openCountWords, type EventRow, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
@@ -918,6 +918,18 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         // An interval that starts at the instant holds it: start_time <= the instant.
         expect(instant?.text).toContain("WHERE q.end_time > '2026-11-20 15:45:00' AND q.start_time <= '2026-11-20 15:45:00'");
         expect(instant?.text).toContain("on T4 at 15:45:00 UTC");
+    });
+
+    // The chat's result cut to fit one answer (bounded, the review of 90e9d914) keeps the queries the playbook says to give.
+    it("keeps the next steps' queries when the chat's result is cut to fit", async () => {
+        const r = await incidentOn("T1", "cpu");
+        const queries = r.details?.queryStoreQueries as QueryStoreQuery[];
+        expect(queries).toHaveLength(1);
+        const big: InvestigationResult = { ...r, details: { ...r.details, parts: [{ tool: "explain_locking", details: { trees: "x".repeat(70_000) } }] } };
+        const cut = JSON.parse(bounded(big)) as InvestigationResult;
+        expect(cut.details?.cut).toEqual(expect.any(String));
+        expect(cut.details?.parts).toBeUndefined();
+        expect(cut.details?.queryStoreQueries).toEqual(queries);
     });
 
     it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {

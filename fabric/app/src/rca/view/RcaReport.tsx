@@ -9,6 +9,7 @@ import type { InvestigationResult, Recommendation } from "../types";
 import { ChainTree } from "./ChainTree";
 import { episodeOf, errorClassCells, errorsWindowNote, type ErrorClassRow } from "./facts";
 import { SeverityMark } from "./IncidentList";
+import { QueryStoreQueries } from "./QueryStoreQueries";
 
 interface Tree {
     target: string;
@@ -241,6 +242,7 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
                             <li key={s}>{s}</li>
                         ))}
                     </ol>
+                    <QueryStoreQueries incident={incident} timeZone={timeZone} />
                 </section>
             ) : null}
 

@@ -5728,3 +5728,24 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 **Validation.** `npm run verify`'s steps, one at a time on a PC at 100 % CPU: the typecheck, lint, license check, and build pass, and the tests (vitest with two workers) 686 of 687; the one failure is a `waitFor` timeout in `pages/mission.test.tsx`'s Session replay, which this change doesn't touch, and it passes run alone (3 of 3). `rca/tools.test.ts` alone, after blank lines between its tests: 42 of 42; ESLint on the four files: clean. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123; `Repo.NeutralWording.Tests.ps1` and `Repo.Gitleaks.Tests.ps1`, 10 passed, and the 3 that need gitleaks installed skipped. The leak check prints nothing.
 
 **What its live check needs.** The query, copied from a CPU incident's next step on T1 and on T4 in a live history, runs in SQL Server Management Studio on ContosoCare and in `azure_sys` (from T1, as the runner signs in), and lists those minutes' queries.
+
+### The ready-to-run query's Copy button in the Root cause view (2026-11-23, for the release after the RCA's)
+
+**Why.** The coordinator's item for Wednesday's release: the app shows the next step's ready-to-run query with a copy button. It builds on the Root cause page's reorganization and its review fix (62e5a18f), merged into this branch (cfd529b6), as the coordinator asked.
+
+- **The view** (`rca/view/QueryStoreQueries.tsx`, under the next steps in `RcaReport.tsx`): each of `explain_incident`'s `details.queryStoreQueries` as the tools built it, in a code block, under a line that names the target's Query Store, its database, and the minutes in the viewer's time and UTC (`bothTimes`, as the rest of the report gives them), with **Copy**. Copy uses the app's `copyText`, says "Query copied: run it in ContosoCare on T1", and reads **Copied** for two seconds; when the Fabric portal's frame blocks the clipboard, it asks the viewer to select the query and press Ctrl+C, as the Database Agent prompts do. The view adds no fact of its own: it shows only entries with the tools' fields (a target, T-SQL or PostgreSQL, a database, two times that parse, and a text), and nothing in place of anything else.
+- **A result cut to fit the chat's answer keeps them:** `bounded` (62e5a18f) keeps `details.queryStoreQueries` among the details it keeps however it cuts (`KEPT_DETAILS`), since the playbook's step 3 tells the chat to give them as they are.
+- **Its CSS** is layout only, at the end of `rca.css` (`.rca-query`, `.rca-query-head`): no color, so the theme's tokens stay the theme's.
+- **Tests** (`rca/view/next-step-query.test.tsx`, and one in `rca/tools.test.ts`):
+  - the queries shown exactly as built, in their order, each with its target, database, and times in the viewer's zone and UTC, and one instant "at" it;
+  - Copy writes exactly that query, says so, and reads **Copied**, while the other still reads **Copy**;
+  - a blocked clipboard asks for a copy by hand;
+  - entries that aren't the tools' queries show nothing, and the next steps stay;
+  - no scenario's name in the section;
+  - a result cut to fit keeps the queries, which fails without `KEPT_DETAILS`' entry.
+
+**Changed files.** `fabric/app/src/rca/view/QueryStoreQueries.tsx` (new), `rca/view/RcaReport.tsx`, `rca/view/rca.css`, `rca/view/next-step-query.test.tsx` (new), `rca/tools.ts` (`KEPT_DETAILS` and `bounded`'s comment), and `rca/tools.test.ts`; ADR 0031, `CHANGELOG.md`, `fabric/app/README.md`, and this report.
+
+**Validation.** On a PC at 100 % CPU, where Wednesday's work runs targeted tests until 2 PM: the typecheck passes; ESLint on the five changed files: clean; the tests under `src/rca` (vitest with two workers): 264 of 264, the new file's 4 among them; the bounded test fails with `KEPT_DETAILS`' entry taken out. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123. The leak check prints nothing.
+
+**What its live check needs.** In the Root cause view on a live history, a CPU incident's next steps on T1 and on T4 show their queries, and **Copy** puts each on the clipboard inside the Fabric portal's frame, or says to copy it by hand.

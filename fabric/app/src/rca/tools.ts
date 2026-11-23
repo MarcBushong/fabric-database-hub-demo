@@ -307,8 +307,8 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     };
 }
 
-/** What a result's details keep however it's cut: the verdicts, where a read stopped, the servers, and the filters with what they left out. */
-const KEPT_DETAILS = ["nothingAbnormal", "nothingAbnormalUpTo", "quiet", "quietUpTo", "readStoppedAt", "servers", "filters", "leftOut"] as const;
+/** What a result's details keep however it's cut: the verdicts, where a read stopped, the servers, the filters with what they left out, and the next steps' Query Store queries. */
+const KEPT_DETAILS = ["nothingAbnormal", "nothingAbnormalUpTo", "quiet", "quietUpTo", "readStoppedAt", "servers", "filters", "leftOut", "queryStoreQueries"] as const;
 
 const SEVERITY_ORDER: Readonly<Record<string, number>> = { high: 0, medium: 1, low: 2 };
 
@@ -326,9 +326,9 @@ function withoutReasons(list: unknown): unknown {
 /**
  * A result as the text Copilot reads: within `limit` characters, and always JSON that parses (the review of 90e9d914: a
  * 24-hour list ended " [cut]", invalid, with notCaptured and nextSteps gone, yet answered ok). Past the limit it leaves out,
- * in turn: each episode's severityReason; the details but the verdicts, the servers, and the filters with what they left
- * out (KEPT_DETAILS) and triage's hypotheses; then the least severe episodes, and the last findings and hypotheses, saying
- * how many more there were. notCaptured, nextSteps, and the root cause are always kept.
+ * in turn: each episode's severityReason; the details but the verdicts, the servers, the filters with what they left out,
+ * and the next steps' Query Store queries (KEPT_DETAILS) and triage's hypotheses; then the least severe episodes, and the
+ * last findings and hypotheses, saying how many more there were. notCaptured, nextSteps, and the root cause are always kept.
  */
 export function bounded(result: InvestigationResult, limit = RESULT_CHARS): string {
     const fit = (r: unknown) => {
