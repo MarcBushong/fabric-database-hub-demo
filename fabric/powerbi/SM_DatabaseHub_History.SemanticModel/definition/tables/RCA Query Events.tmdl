@@ -63,7 +63,7 @@ table 'RCA Query Events'
         dataType: string
         sourceColumn: state
 
-    /// The state the read before saw.
+    /// The state the read before saw; null when a recommendation first appears.
     column 'Previous State'
         dataType: string
         sourceColumn: previous_state

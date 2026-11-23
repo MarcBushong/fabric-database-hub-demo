@@ -2782,8 +2782,11 @@ def blind_facts(lake):
         number(plans[58]["estimated_cost"]), "parallel" if plans[58]["is_parallel"] else "serial", at(plans[58]["compiled_utc"]),
         number(plans[31]["estimated_cost"]), plans[31]["forcing_type"] if plans[31]["is_forced_plan"] else "no", at(plans[31]["last_compiled_utc"])))
     for row in sorted(pick("rca_query_events", T3), key=lambda row: row["event_time_utc"]):
-        facts.append("T3 %s %s %d/%d: %s to %s, from %s" % (at(row["event_time_utc"]), " ".join(filter(None, (row["kind"], row["forcing_type"]))),
-                                                            row["query_id"], row["plan_id"], row["previous_state"], row["state"], at(row["time_from_utc"])))
+        # A recommendation's first read has no state before it: it appeared, with its detail.
+        change = "appeared, " + row["state"] if row["previous_state"] is None else "%s to %s" % (row["previous_state"], row["state"])
+        facts.append("T3 %s %s %d/%d: %s, from %s%s" % (
+            at(row["event_time_utc"]), " ".join(filter(None, (row["kind"], row["forcing_type"]))), row["query_id"], row["plan_id"],
+            change, at(row["time_from_utc"]), " (%s)" % row["detail"].split(";")[0] if row["previous_state"] is None else ""))
     last = pick("rca_query_stats", T3, interval_start_utc="17:15:00.000", query_id=412)
     facts.append("T3 17:15, read at %s: 412/%s%s at %s ms of CPU each" % (
         "/".join(sorted({at(row["captured_at_utc"]) for row in last})), "/".join("%d" % row["plan_id"] for row in last), " alone" if len(last) == 1 else "",
@@ -3147,7 +3150,9 @@ print(json.dumps(report, default=str))
         @($decode['documents']) | Should -Be $fixtureIds
         @($decode['skipped']) | Should -BeNullOrEmpty
         @($decode['evidenceDocuments']) | Should -BeNullOrEmpty
-        $decode['evidenceSkipped'][0][1] | Should -Match '^3 part line\(s\) that part format 1 doesn''t describe'
+        # Part 4 counts every sidecar part line in the file as one it can't read.
+        $parts = @((Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-sidecar.parameter.json') -Raw | ConvertFrom-Json).parts)
+        $decode['evidenceSkipped'][0][1] | Should -Match ('^{0} part line\(s\) that part format 1 doesn''t describe' -f $parts.Count)
     }
 
     It 'writes the fixtures'' rows once to the six tables, each sidecar under its own session''s run, acknowledges each by its ID, and deletes the file' {
@@ -3190,6 +3195,7 @@ print(json.dumps(report, default=str))
             'T3 412/58 at 17:00: 524 executions to 17:09:40.215 at 176 ms of CPU each (92224 ms), 4100 logical reads each, DOP 4, 31440 ms of waits: Buffer IO 920, CPU 18900, Parallelism 11620'
             'T3 at 17:00: 412/31 ran 668 times (1403 ms); 412/58 used 92224 of 95644 ms of CPU'
             'T3 412/58: cost 38.6, parallel, compiled 17:03:11.870; 412/31: cost 0.0331, forced AUTO, last compiled 17:09:41.120'
+            'T3 17:06:00.000 tuning 412/31: appeared, Active, from 17:05:30.000 (FORCE_LAST_GOOD_PLAN for query 412: plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms)'
             'T3 17:09:30.000 tuning 412/31: Active to Executing, from 17:09:00.000'
             'T3 17:10:00.000 forced AUTO 412/31: not forced to forced, from 17:09:00.000'
             'T3 17:10:30.000 tuning 412/31: Executing to Verifying, from 17:10:00.000'
