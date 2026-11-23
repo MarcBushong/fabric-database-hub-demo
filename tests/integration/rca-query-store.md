@@ -2,7 +2,7 @@
 
 For the live proof of the Incident RCA's Query Store sidecar. The rehearsal, then the final proof, run these against a session's window.
 
-- They're the live proof's steps S7, S10, S11, and S12, for [ADR 0031's amendment](../../docs/adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar).
+- They're the live proof's steps S7, S10, S11, S12, and S13, for [ADR 0031's amendment](../../docs/adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar).
 - [rca/README.md](../../rca/README.md#the-sidecar) is the contract they check.
 - They run only with the owner's go-ahead, through the Final tests session's read paths.
 
@@ -239,7 +239,10 @@ SUMMARIZECOLUMNS(
    - L0's probe reads with `NoTypeLoading` too, so its own type loading never lands in Query Store under the workload's role.
 10. **RCA-PG-14 on shared rows:** a text that both the observer and the workload sent under the same role stays as evidence, unless it's one of the observer's own specific statements: the catalog's blocks and its snapshot clear. The probe reports each such shared row's `query_id` and whether it was kept.
 11. **Before the rehearsal, on a local PostgreSQL 18** (A2's re-check): Phase 1's T4 connections now carry the startup packet's `-c` options and `NoTypeLoading` too. So run the opt-in `RcaIntegrationTests` (PostgreSQL), and `PostgresTests`, at the integration's head against a disposable local PostgreSQL 18, as T2b did on 18.7. Pass: every case passes, none skipped for want of a server.
-12. **One connection to T4 and one to its replica,** before the rehearsal's first session, with the runner's own connection code: each accepts the startup packet's `options` with `NoTypeLoading`, and `current_setting('search_path')` ends in `dbhubdemo_rca_observer` on the observer's connection only.
+    - **The standby's `max_standby_streaming_delay`** must be at least 60 s, as on T4's replica (600 s). The default, 30 s, cancels the replica test's 45-second hold, and the test then fails at `RcaIntegrationTests.cs`:140 with no replica escalation. Passed at 58a2af2c on 18.7 with 600 s: `PostgresTests` 43 of 43, and the PostgreSQL integration test.
+12. **One connection to T4 and one to its replica,** before the rehearsal's first session, with the runner's own connection code: each accepts the startup packet's `options` with `NoTypeLoading`.
+    - **`current_setting('search_path')`** ends in `dbhubdemo_rca_observer` on every runner connection that isn't a workload session: the observer's, the answer-key recorder's, and the harness's control connections (a run's control and reset, status, warmup, and stop; A2's e8558a9a and dc485240). It never does on a workload session's.
+    - **The stop path** now needs T4 to accept `options` too: a run's stop, with the startup packet's options, reaches T4. Final tests runs it at L0c.
 
 ## The scripts' transport's live checks (S12)
 
@@ -251,3 +254,15 @@ From T2a's review (9ca9f8ab..8e2ada18). They run on the rehearsal's environment,
 4. **R871 on the golden guard:** when the guest's `RcaSidecars` check starts, an `RcaAck` Run Command still being deleted on the host doesn't make the check fail or run beside it.
 5. **The acknowledgement through OneLake:** the notebook's `Files/rca/acks/<payload>.ack.json`, read back by the scripts as UTF-8, names exactly the payload and its documents.
 6. **A golden capture after T2 activity:** the first `capture-t2-golden.ps1` is refused while the guest holds unsealed or unacknowledged sidecars, saying why. Then a scripts' save takes them, and the next capture succeeds.
+
+## Run all's path's live checks (S13)
+
+From the contract's review (53d0272e..45f947b7, fixed in 83c87de2). They need T2c, and run in the rehearsal's Run all sessions, S1 and S2.
+
+1. **S2's start acknowledges S1's sidecars, a T2 one included:** its status's `rcaAcks` lists every ID S1's `-runall-` acknowledgement says is `written` or `already` as `sent`, with `left` empty.
+   - T2's IDs, which name the guest, went to the T2 host.
+   - `RCA.SIDECAR.ACK` says so.
+   - S2's own sidecar fetch offers none of S1's again.
+   - The notebook deleted S1's acknowledgement file after S2's start.
+2. **A second save gets only `already`:** a scripts' save after S1's own (`./scripts/stop-demo.ps1 -SaveHistory`, or `deploy.ps1`'s snapshot) that's offered S1's sidecars again writes nothing. Its acknowledgement says `already` for each, and no table holds a second copy of any document's rows.
+3. **Both paths save at once:** a scripts' save that runs while Run all's control notebook saves the same session. Each path reads only its own acknowledgements (`-script-` or `-runall-`), every document is written once, and each path acknowledges what its own file says.
