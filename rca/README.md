@@ -156,7 +156,7 @@ What the observer captures beyond the evidence document, in documents of their o
 |---|---|
 | `kind`, `version` | `ContosoCare.RcaSidecar`, 1 |
 | `documentId` | The evidence document's form with `-sidecar` after it: `20261120T165000Z-sqlvm01-0001-sidecar`. Unique; the notebook writes a sidecar once |
-| Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
+| Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row. The header's times carry milliseconds, as the evidence document's do, and sidecar.schema.json requires them |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
 - **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.rows` (`RcaContract.SidecarRowsFile`), beside its evidence files. Never `.jsonl`: every evidence export, an older runner's included, reads each `*.jsonl` in a span as a target's file, so sidecar rows there would end up in an evidence document.
@@ -262,7 +262,7 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 |---|---|
 | `ContosoCare.Workload rca export --session <sessionId or none> [--final]` | Reduces what's been captured since the previous export into documents and prints `DBHUBDEMO-RCA-INDEX <json>`: `{"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"...","parts":n,"sha256":"..."}],"status":"Pass","message":"..."}` (transport.schema.json), at most 3,400 characters. Status is ADR 0012's. Exit code 0, or 2 when there's nothing to export |
 | `ContosoCare.Workload rca part --document <documentId> --part <index>` | That part's line, an evidence document's or a sidecar's. Exit code 0, or 1 when the document or part doesn't exist |
-| `ContosoCare.Workload rca sidecar-export --session <sessionId or none> [--final] [--page <n>]` | Makes a sidecar for each span with new sidecar rows and prints `DBHUBDEMO-RCAS-INDEX <json>` (transport.schema.json, `sidecarIndex`): one page of at most 8 sidecars, new and pending, at most 3,400 characters. Exit code 0, or 2 when there's nothing to fetch |
+| `ContosoCare.Workload rca sidecar-export --session <sessionId or none> [--final] [--page <n>]` | Makes a sidecar for each span with new sidecar rows and prints `DBHUBDEMO-RCAS-INDEX <json>` (transport.schema.json, `sidecarIndex`): one page of at most 8 sidecars, new and pending, at most 3,400 characters. Exit code 2 only when nothing is offerable, new or pending; otherwise 0, and a page past the last is empty, with the true `pages`. The line is printed either way and its status stands: a **Warning** that counts sidecars expired unread is reported with exit code 2 too |
 | `ContosoCare.Workload rca ack --document <documentId>[,<documentId>...]` | Marks sidecars as written into the history, so the runner stops offering them and may delete them. Exit code 0 |
 
 - **The sidecar's Run Command actions:** the VM's control script runs the two sidecar commands as `RcaSidecarExport` and `RcaAck`. An older VM bundle answers "Unknown action", the scripts' `OldBundle` outcome: a Warning naming `./scripts/deploy.ps1`, and the evidence document goes on as before.
@@ -312,10 +312,20 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | `RCA_EVIDENCE_FILE` | 262,144 bytes: one `RCA_EVIDENCE` document of 64 parts is about 218 KB | What the notebook passes to `notebookutils.fs.head`, whose default is 100 KB |
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
-| A sidecar | 64 KiB of gzip (at most 28 parts), as a document | The reducer cuts waits past each plan's first three, then plan summaries, then the lowest-ranked queries, each cut a gap in `rca_query_coverage` |
+| A sidecar | 64 KiB of gzip (at most 28 parts), as a document, and at least 2 KiB | The reducer cuts in the order below, each cut a gap in `rca_query_coverage`. The 2 KiB are the evidence export's minimum, so a sidecar's coverage travels even when its host's session budget is spent |
 | A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
 | `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
+
+**A sidecar's cuts.** The reducer fits a sidecar to the smaller of 64 KiB and what's left of its host's session budget, never less than 2 KiB. It cuts in this order, each step only as far as it must, and each cut is a line in its target's `rca_query_coverage` gaps:
+
+1. **Waits:** each plan's wait categories past its three largest (on T4, events), by time waited summed across the sidecar's intervals. Every interval's rows of those three stay, so a plan's baseline intervals keep the waits the rules compare against.
+2. **Plan summaries,** set to null plan by plan: the lowest-ranked queries' plans first, and within a query its lowest-ranked plans. A forced plan, or a plan an event names, keeps its summary until every other plan's is cut.
+3. **The lowest-ranked queries,** one interval at a time: all of a query's rows in that interval. A query's plans go once it has no rows left, unless a plan is forced or an event names it.
+4. **Connection samples:** each target's thinned, its first, its peak (the most connections), and its last always kept.
+5. **Everything but `rca_query_coverage`,** which is never cut.
+
+A query's rank is its best place in the reads' top lists ([Query Store](#query-store)), from the latest read of each plan, with ties to the lower `plan_id`.
 
 ## Versioning
 

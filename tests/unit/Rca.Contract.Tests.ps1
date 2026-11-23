@@ -182,12 +182,17 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
             }
         }
     }
-    It 'accepts a minimal sidecar, and refuses one with an evidence document''s ID, an evidence table, the answer key, or no coverage' {
+    It 'accepts a minimal sidecar, and refuses one with an evidence document''s ID, an evidence table, the answer key, no coverage, or a header time without milliseconds' {
         $evidence = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/t1-blocking-chain.evidence.json') -Raw
-        # A fresh copy of the evidence fixture's header each time, as a sidecar with one coverage row.
+        $headerTimes = 'exportedUtc', 'windowStartUtc', 'windowEndUtc', 'epochUtc'
+        # A fresh copy of the evidence fixture's header each time, as a sidecar with one coverage row. ConvertFrom-Json
+        # reads the header's times as dates, so they're written back as the runner writes them, with milliseconds.
         $sidecar = {
             $document = $evidence | ConvertFrom-Json -AsHashtable
             $document.Remove('answerKey')
+            foreach ($field in $headerTimes) {
+                $document[$field] = ([datetime]$document[$field]).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            }
             $document['kind'] = 'ContosoCare.RcaSidecar'
             $document['documentId'] = $document['documentId'] + '-sidecar'
             $document['targets'] = @('T1')
@@ -209,9 +214,16 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
         $noCoverage = & $sidecar
         $noCoverage['tables'] = [ordered]@{}
         & $valid $noCoverage | Should -BeFalse
+        foreach ($field in $headerTimes) {
+            $seconds = & $sidecar
+            $seconds[$field] = $seconds[$field] -replace '\.[0-9]{3}Z$', 'Z'
+            & $valid $seconds | Should -BeFalse -Because "$field without milliseconds: $($seconds[$field])"
+            $ticks = & $sidecar
+            $ticks[$field] = $ticks[$field] -replace 'Z$', '0000Z'
+            & $valid $ticks | Should -BeFalse -Because "$field with seven digits: $($ticks[$field])"
+        }
     }
 }
-
 Describe 'The Incident RCA contract: document fixtures (ADR 0031)' {
     It '<Name> validates against its kind''s schema' -ForEach $documentFixtures {
         $schemaErrors = $null
