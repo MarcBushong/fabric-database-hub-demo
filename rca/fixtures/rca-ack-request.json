@@ -1,0 +1,9 @@
+{
+  "kind": "ContosoCare.RcaAckRequest",
+  "version": 1,
+  "documents": [
+    "20261119T143000Z-arcsql01-0004-sidecar",
+    "20261120T165000Z-sqlvm01-0001-sidecar",
+    "20261120T170000Z-sqlvm01-0002-sidecar"
+  ]
+}
