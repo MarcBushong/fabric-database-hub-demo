@@ -126,6 +126,12 @@ describe("themes", () => {
             // A target's mark is an inline background, and Ask's text the brand's with !important: only !important replaces them.
             if (/target-chip i$|^\.ask-/.test(selector)) expect(body, selector).toMatch(/!important\s*;/);
         }
+        // A bar chart's hovered category: the cyan band would sit under high contrast's bright bars (1.03:1 to 1.36:1), so
+        // it's an outline with no fill, at 3:1 or more on the chart's black.
+        const band = rule(".chart-cursor-band rect");
+        expect(band, "the band's fill").toMatch(/(?:^|[;\s])fill:\s*none\s*;/);
+        const stroke = band.match(/(?:^|[;\s])stroke:\s*var\(--(\w+)\)/)?.[1] ?? "missing";
+        expect(contrastRatio(hc[stroke] ?? `no ${stroke}`, hc.colorNeutralBackground1), `the band's outline, ${stroke}`).toBeGreaterThanOrEqual(3);
     });
 
     it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {

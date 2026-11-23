@@ -1945,3 +1945,12 @@ button.kpi-main:hover {
 [data-theme="contrast"] .copilot-account:active .copilot-account-plan {
     color: var(--colorNeutralForeground2BrandPressed) !important;
 }
+
+/* A bar chart's hovered category: the cyan band would sit under high contrast's bright bars, so it's a dashed outline,
+   as a line chart's cursor is. */
+[data-theme="contrast"] .chart-cursor-band rect {
+    fill: none;
+    stroke: var(--colorNeutralStrokeAccessible);
+    stroke-width: 1.5;
+    stroke-dasharray: 3 3;
+}

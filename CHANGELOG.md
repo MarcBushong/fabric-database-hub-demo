@@ -42,6 +42,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Fixed
 
 - **High contrast in the Insights app: what the app colors on a hovered or pressed row, button, or menu item.** Fluent's high contrast fills them in cyan under black, but the app's own colors didn't switch with it, so a table row's status words, target marks, **Open** link, and captions, the target filter's marks, a KPI tile's text, the **Ask Copilot** and **Ask why** buttons, and the Copilot account's plan were 1.03:1 to 1.53:1 on the hover. Each now takes the black Fluent pairs with the fill ([ADR 0030](docs/adr/0030-insights-app-mission-control.md#the-look-earth-tones)). Windows forced colors are unchanged. This was so before the earth tones.
+- **A bar chart's hovered bars stay in view** in the Insights app. The chart drew the hovered category's band over its bars, opaque, so the bars you pointed at disappeared behind it while the tooltip showed their values. It now draws the band under them, and in high contrast as a dashed outline. This was so before the earth tones.
 
 ### Security
 

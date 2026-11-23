@@ -5609,7 +5609,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - and the Copilot account button's plan (`.copilot-account-plan`, white), 1.46:1.
 - **The fix:** a `[data-theme="contrast"]` group at the end of `styles/app.css` gives each of those, on a hovered or pressed row, button, or menu item, the foreground Fluent pairs with that fill: `colorNeutralForeground1Hover` and `Pressed` in a row and a KPI tile, `colorNeutralForeground2Hover` and `Pressed` in a menu item and a subtle button, and `colorNeutralForeground2BrandHover` and `Pressed` in a transparent button, all black, 14.37:1 on the cyan. A target's mark takes it as its background, with `!important` over the inline color, and Ask's buttons with `!important` over their own. The rest of the row, button, or menu item already took it from Fluent. Light and dark don't match `[data-theme="contrast"]`, and the forced-colors blocks are untouched.
 - **What's left as it was:** a KPI tile's status rail, at its edge, keeps its color beside the cyan, as the tile's status is also its word; and Fluent's components keep their own high contrast pairs.
-- **Found, not changed: a bar chart's hover hides its bar.** `ChartView` draws its cursor's band (`.chart-cursor rect`, `colorSubtleBackgroundHover`) over a bar chart's bars, not under them, and the fill is opaque, so the hovered band's bars disappear while the tooltip shows their values: in every theme, and in high contrast as a cyan band. It isn't a contrast pair, and it's older than the earth tones. A dashed outline, as a line chart's cursor is, or drawing the band before the bars, would fix it.
+- **Found with it: a bar chart's hover hides its bar.** `ChartView` drew its cursor's band (`.chart-cursor rect`, `colorSubtleBackgroundHover`) over a bar chart's bars, not under them, and the fill is opaque, so the hovered band's bars disappeared while the tooltip showed their values: in every theme, and in high contrast as a cyan band. It's older than the earth tones. Fixed in a commit of its own: [its entry](#a-bar-charts-hovered-bars-stay-in-view-2026-11-23).
 
 **Changed files.** `fabric/app/src/styles/app.css` (the group), `theme/fluent.ts` (the comment on high contrast's `states`), and `lib/app.test.ts`; ADR 0030, the CHANGELOG, the app's README, and this report: this entry, and a line in the review's entry.
 
@@ -5622,3 +5622,22 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **Pending:** a check in the browser that each rule wins over Fluent's and the inline colors, in the sample preview's high contrast theme, after 2 PM.
 
 **What its live check needs.** The deployed app in its **High contrast** theme, not Windows forced colors: hover and press a row on the Findings and Readiness pages, the target filter's items, a KPI tile on Findings, **Ask Copilot** on a card and **Ask why** on the Estate page, and the Copilot account in the dock.
+
+### A bar chart's hovered bars stay in view (2026-11-23)
+
+**Why.** Found with [the high contrast fix](#high-contrast-the-apps-colors-on-a-hovered-or-pressed-fill-2026-11-23): `ChartView`, the one chart component every page and the Copilot dock use, drew a bar chart's hovered category, a band in `colorSubtleBackgroundHover`, after the bars, and the fill is opaque, so the bars you pointed at disappeared while the tooltip showed their values. In every theme, since the chart was written; in high contrast, as a cyan band. The coordinator put the fix in the same release, as a commit of its own on the high contrast branch, after cc1fe148.
+
+- **The fix:** `ChartView` draws the band first, under the incident bands, the grid, and the bars (`chart-cursor chart-cursor-band`), so every bar is painted over it. A line chart's cursor, a dashed line with a dot on each series, stays on top of its lines. In light and dark, the bars keep 3:1 on the band, as on any hovered fill ([the review of 2b0e46b0](#the-review-of-2b0e46b0-2026-11-23)): its fill is the hovered row's.
+- **High contrast:** a cyan band under high contrast's bright bars would leave them at 1.03:1 to 1.36:1, so there the band has no fill and a dashed outline in `colorNeutralStrokeAccessible`, white on the chart's black, as a line chart's cursor is: one rule in the high contrast group of `styles/app.css`. The forced-colors blocks are untouched.
+- **Tests:** `src/visuals/ChartView.test.tsx` draws a grouped and a stacked bar chart, moves to a category with the keyboard, and finds every bar after the band in the document, so painted over it; `src/lib/app.test.ts`'s high contrast test finds the band's outline, with no fill, at 3:1 or more on black. Each fails without its fix: with the band drawn after the bars again, and without the high contrast rule.
+
+**Changed files.** `fabric/app/src/visuals/ChartView.tsx`, `visuals/chart-view.css` (a comment), and `styles/app.css`, with `visuals/ChartView.test.tsx` and `lib/app.test.ts`; the CHANGELOG, and this report: this entry, and a line in the high contrast entry.
+
+**Validation.** On cc1fe148 with this commit, targeted runs only until 2 PM:
+
+- `src/visuals/ChartView.test.tsx`: 15 passed; `src/lib/app.test.ts`, its themes: 23 passed.
+- **Each fix, reverted alone, fails a test:** the band drawn after the bars, and no high contrast outline: 2 of 2.
+- `tsc` found no error, and ESLint none in the three TypeScript files this commit changes; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+- **Pending:** the browser check of a hovered bar in light, dark, and high contrast, and the full `npm run verify`, after 2 PM.
+
+**What its live check needs.** The deployed app: hover a bar on the Estate page's "Where the wait time went" and the scoreboard's "Times per engine", in light, dark, and high contrast.
