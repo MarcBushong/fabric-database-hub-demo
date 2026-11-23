@@ -18,6 +18,14 @@ internal sealed record SpanInfo(string Directory, SpanFile Span, SpanExport Expo
     public bool Orphaned => Span.ClosedUtc is null && !EvidenceStore.IsAlive(Span.ProcessId, Span.ProcessStartedUtc);
 
     public bool Finished => Span.ClosedUtc is not null || Orphaned;
+
+    /// <summary>
+    /// Where the span's evidence ends, which its sidecar's window shares: its close, at the evidence's own end even when a
+    /// sidecar's last reads came after it; for a span whose process is gone, its targets' last interval end or watermark;
+    /// null while it's open.
+    /// </summary>
+    public DateTimeOffset? EvidenceEndUtc =>
+        Span.ClosedUtc ?? (Orphaned ? Span.Targets.Values.Select(t => t.Intervals.LastOrDefault()?.To ?? t.WatermarkUtc).Max() : null);
 }
 
 /// <summary>
@@ -25,13 +33,16 @@ internal sealed record SpanInfo(string Directory, SpanFile Span, SpanExport Expo
 /// per observation span with a JSON-lines file per target (at most 20 MB each), the span's answer key, and what the
 /// export took; the exported documents' gzip in <c>exports\</c>; and the capture's end that the last session's stop
 /// recorded (<c>capture-end.json</c>). A span is deleted 7 days after its export took all of it, and one never exported
-/// after 30 days; an exported document after 7 days.
+/// after 30 days, but never while it holds sidecar rows not sealed yet; an exported document after 7 days.
 /// </summary>
 internal sealed class EvidenceStore : ICaptureStore
 {
     public const string AnswerKeyFile = "answer-key.jsonl";
 
     public const long DefaultTargetCap = 20L * 1024 * 1024;
+
+    /// <summary>A span's files of sidecar rows not sealed yet, a taken-aside one's included (rca/README.md, The sidecar).</summary>
+    public const string UnsealedRowsPattern = "sidecar-*" + RcaContract.SidecarRowsExtension;
 
     public static readonly TimeSpan Retention = TimeSpan.FromDays(7);
 
@@ -228,7 +239,9 @@ internal sealed class EvidenceStore : ICaptureStore
 
     /// <summary>
     /// Retention: a span the export took all of goes 7 days after that export; a span never exported, 30 days after it
-    /// started; an exported document's gzip, 7 days after the export wrote it.
+    /// started; an exported document's gzip, 7 days after the export wrote it. A span that still holds sidecar rows not
+    /// sealed yet stays until they are, whoever runs this: an export after its sealing, or a span's opening, which takes no
+    /// lock and seals nothing.
     /// </summary>
     public int Cleanup(DateTimeOffset now, RunnerLog log)
     {
@@ -240,6 +253,12 @@ internal sealed class EvidenceStore : ICaptureStore
                 : span.Export.LastExportUtc is null && span.Finished && now - span.Span.StartedUtc >= UnexportedRetention;
             if (!expired)
             {
+                continue;
+            }
+
+            if (HoldsUnsealedRows(span.Directory))
+            {
+                log.Info("rca.retention-held", "Kept an expired observation span: its sidecar rows aren't sealed yet.", ("span", span.Id));
                 continue;
             }
 
@@ -279,6 +298,37 @@ internal sealed class EvidenceStore : ICaptureStore
     public SessionLedger ReadLedger() => ReadJson(LedgerPath, RcaStoreJsonContext.Default.SessionLedger) ?? new SessionLedger();
 
     public void WriteLedger(SessionLedger ledger) => WriteJson(LedgerPath, ledger, RcaStoreJsonContext.Default.SessionLedger);
+
+    /// <summary>
+    /// True when a span's folder holds sidecar rows not sealed yet: a <c>sidecar-&lt;target&gt;.rows</c>, or one the sealer
+    /// took aside (<c>sidecar-&lt;target&gt;.&lt;tag&gt;.rows</c>), since the sealer deletes what it sealed.
+    /// </summary>
+    public static bool HoldsUnsealedRows(string spanDirectory) =>
+        Directory.Exists(spanDirectory) && Directory.EnumerateFiles(spanDirectory, UnsealedRowsPattern).Any();
+
+    /// <summary>
+    /// Waits until every span is exported whole or finished (closed, or its process gone), at most
+    /// <paramref name="wait"/>; false when one is still open. A target's capture ends with the observer's last reads, its
+    /// sidecar's included, so a final export of either kind takes them.
+    /// </summary>
+    public bool WaitForSpans(TimeSpan wait)
+    {
+        var deadline = Time.GetUtcNow() + wait;
+        while (true)
+        {
+            if (Spans().All(s => s.Export.Complete || s.Finished))
+            {
+                return true;
+            }
+
+            if (Time.GetUtcNow() >= deadline)
+            {
+                return false;
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(500));
+        }
+    }
 
     /// <summary>
     /// Records the capture's end (rca export --end-capture, a session's stop): the observer lane of 'profile run' reads it
