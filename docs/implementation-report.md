@@ -8555,13 +8555,16 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **Low: the kept form's measure count couldn't fail.**
   - **The cause:** `DbHubDemo.PowerBI.Tests.ps1` compared the two forms' `Evidence.measures`, which `Get-DemoFabricSemanticModelDefinition` counts from the model's folder, the same for both.
   - **The fix:** the test counts the `measure` lines in the table parts actually sent, with `Get-DemoTmdlMeasure`'s pattern. It holds the release form's count to `Evidence.measures`, and the kept form's to the release form's.
+- **Optional, test-only: a check that failed about 1 in 6 under load.** `CosmosRunnerTests.RuStormAlternatesWavesAndCalmsCountsIts429sAndDeletesItsDocuments` (unchanged since edd01c86) took each storm write's time from the fake account's receipt, with 2 seconds' allowance after a wave, on a clock 40 times real time: 50 ms of real time. A busy machine delays a write's arrival longer, so it fell in a calm ("A storm write at 33.7 s fell in a calm."). The test now takes each write's start from its document's `at`, the run's time at which the runner checked the phase, to the millisecond.
 
 **Changed files.**
 
 - **High:** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, the CHANGELOG, `rca/README.md`, ADR 0026, ADR 0031, and this report.
 - **Low:** `tests/unit/DbHubDemo.PowerBI.Tests.ps1`, and this report.
+- **The flaky check:** `workload-generator/tests/ContosoCare.Workload.Tests/CosmosRunnerTests.cs`, and this report.
 
 **Validation.** Pester with StrictMode and the Azure CLI guard, targeted, with 0 az calls; PSScriptAnalyzer found nothing on the changed files, and markdownlint is clean.
 
 - **High:** on `Automation.Runbooks.Tests.ps1`, the takeover flow's test passed, and all 29 of the capture's tests (`*capture*`), the stop's own `endCapture` among them. With only the runbook's change stashed, the takeover flow's test fails: both of its exports carry `endCapture`.
 - **Low:** `DbHubDemo.PowerBI.Tests.ps1`, 32 passed. With an extra measure inside the kept fragment's measure block, which every other assertion lets through to the parts sent, the new count fails (121 expected, 122 sent), and the test as it was passes.
+- **The flaky check:** `dotnet test`, the `CosmosRunnerTests` class, 51 passed. With each storm write's arrival delayed 120 ms of real time, about 5 seconds on the run's clock, as a busy machine can, the test as it was fails as the review saw it ("A storm write at 34.0 s fell in a calm."), and the fixed test passes.

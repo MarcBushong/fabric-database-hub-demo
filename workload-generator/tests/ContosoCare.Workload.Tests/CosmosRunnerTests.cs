@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using ContosoCare.Workload.Catalog;
@@ -97,10 +98,12 @@ public sealed class CosmosRunnerTests : IDisposable
         var tag = SessionNames.ForRun("patient-events-ingest", result.RunId);
         foreach (var write in writes)
         {
-            // A write starts only in a wave; one that started just before the calm may arrive a moment later.
-            var elapsed = write.At - result.StartedAt!.Value;
-            var phase = RuStorm.PhaseAt(elapsed, 30, 30);
-            Assert.True(phase.Storm || RuStorm.PhaseAt(elapsed - TimeSpan.FromSeconds(2), 30, 30).Storm, $"A storm write at {elapsed.TotalSeconds:0.0} s fell in a calm.");
+            // A write starts only in a wave. The runner checks the phase at the time it puts in the document, on the run's
+            // clock, to the millisecond. The account gets it a moment later, which on a clock 40 times real time can be
+            // seconds when the machine is busy, so its arrival would fall in a calm.
+            var at = DateTimeOffset.Parse(FakeCosmosAccount.Body(write)["at"]!.GetValue<string>(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+            var elapsed = at - result.StartedAt!.Value;
+            Assert.True(RuStorm.PhaseAt(elapsed, 30, 30).Storm || RuStorm.PhaseAt(elapsed + TimeSpan.FromMilliseconds(1), 30, 30).Storm, $"A storm write started at {elapsed.TotalSeconds:0.000} s, in a calm.");
             Assert.Equal("p-storm-01", write.PartitionKey);
             Assert.Matches("^storm-01-0[0-9]{2}$", FakeCosmosAccount.Body(write)["id"]!.GetValue<string>());
             Assert.Equal(RuStorm.Kind, FakeCosmosAccount.Body(write)["kind"]!.GetValue<string>());
