@@ -412,7 +412,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         var coverage = current.Coverage;
         if (result.Rows is not { } rows)
         {
-            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{PgQueryStoreRows.Settings} couldn't be read on {Target} at {now:HH:mm} UTC, so Query Store's settings are as last read: {result.Message}"));
+            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{PgQueryStoreRows.Settings} couldn't be read on {Target} at {now:HH:mm} UTC, so Query Store's settings are as last read: {PgQueryStoreRows.Why(Target, PgQueryStoreRows.Settings, result)}"));
             return;
         }
 
@@ -462,7 +462,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         }
         else if (harness is null)
         {
-            coverage.Gaps.Add($"{PgQueryStoreRows.Harness} couldn't be read on {Target}, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again: {result.Message}");
+            coverage.Gaps.Add($"{PgQueryStoreRows.Harness} couldn't be read on {Target}, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again: {PgQueryStoreRows.Why(Target, PgQueryStoreRows.Harness, result)}");
         }
     }
 

@@ -317,6 +317,33 @@ internal static class PgQueryStoreRows
     public static string ReplicaGap(string target) => $"{target} is a read replica, which records nothing in Query Store.";
 
     /// <summary>
+    /// Why a quiet block on the observer's connection didn't return rows: its failure in its own words, and for a refusal,
+    /// what the block reads and who may (<see cref="RefusalFix"/>), rather than the observer's general fix.
+    /// </summary>
+    public static string Why(string target, string block, QuietResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return result.Failure == CaptureFailureKind.Permission
+            ? $"{result.Error ?? result.Message} {RefusalFix(target, block)}"
+            : result.Message ?? "the block failed.";
+    }
+
+    /// <summary>A quiet block's own fix when T4, or its replica, refuses it a permission.</summary>
+    public static string RefusalFix(string target, string block)
+    {
+        var again = target == "T4-replica"
+            ? "./scripts/deploy.ps1 sets T4's runner role up again, and the replica copies T4's roles."
+            : "./scripts/deploy.ps1 sets T4's runner role up again.";
+        return block switch
+        {
+            Settings => $"{Settings} reads pg_settings, pg_is_in_recovery(), and pg_postmaster_start_time(), which every role may: {again}",
+            Harness => $"{Harness} reads pg_proc, pg_class, pg_namespace, and the functions' descriptions, which every role may: {again}",
+            ConnectionHolders.Block => $"{ConnectionHolders.Block} reads pg_stat_activity, where another role's connections show their state only to a member of pg_read_all_stats, which T4's setup grants T4's runner role: {again}",
+            _ => again,
+        };
+    }
+
+    /// <summary>
     /// T4's read replica's RCA Query Coverage row from RCA-PG-13 (null when it failed, and <paramref name="failure"/> says
     /// why): a server in recovery records nothing in Query Store, and the observer reads Query Store on T4 alone.
     /// </summary>

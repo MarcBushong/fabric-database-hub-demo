@@ -699,6 +699,50 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         {
             Assert.Contains(Gaps(with.Sidecar!), g => g.Contains(block == "open" ? "RCA-PG-14" : block, StringComparison.Ordinal));
         }
+
+        // A refusal on the observer's connection names the block's own permission and fix, not the observer's.
+        if (failure == "refused" && block is "RCA-PG-13" or "RCA-PG-16" or "RCA-PG-17")
+        {
+            Assert.Contains(Gaps(with.Sidecar!), g => g.EndsWith("permission denied for view qs_view " + PgQueryStoreRows.RefusalFix("T4", block), StringComparison.Ordinal));
+            Assert.DoesNotContain(Gaps(with.Sidecar!), g => g.Contains("The fix: ", StringComparison.Ordinal));
+        }
+
+        Assert.Equal(without.Ended, with.Ended);
+        Assert.Equal(without.Membership, with.Membership);
+    }
+
+    [Theory]
+    [InlineData("RCA-PG-13", 4)]
+    [InlineData("RCA-PG-13", 9)]
+    [InlineData("RCA-PG-16", 4)]
+    [InlineData("RCA-PG-14", 8)]
+    [InlineData("RCA-PG-14", 40)]
+    [InlineData("RCA-PG-15", 8)]
+    [InlineData("open", 4)]
+    public async Task SlowEndReadsLeaveTheSpansEndAndTheEvidenceAsWithoutASink(string block, int seconds)
+    {
+        // Only the end's reads are slow: they follow the evidence's end, whose time, watermark, and rows stay its own.
+        var without = await RunT4Async(sink: false);
+        var with = await RunT4Async(sink: true, (observer, azure) =>
+        {
+            TimeSpan Cost(string b) => b == block && observer.Now >= RcaSimulation.T4To ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero;
+            observer.Cost = Cost;
+            azure.Cost = Cost;
+            azure.OpenCost = TimeSpan.Zero;
+            azure.OpenCostAt = now => block == "open" && now >= RcaSimulation.T4To ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero;
+        });
+
+        Assert.Equal(RcaSimulation.T4To, without.Ended);
+        Assert.Equal(without.Ended, with.Ended);
+        Assert.Equal(without.Membership, with.Membership);
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        Assert.Equal(without.Marks, with.Marks);
+        Assert.Equal(without.Final, with.Final);
+
+        // The end's reads did run, after the evidence's end, and took their time.
+        Assert.True(with.Observer.Now >= RcaSimulation.T4To.AddSeconds(Math.Min(seconds, 4)), $"The clock stopped at {with.Observer.Now:HH:mm:ss.fff}.");
+        Assert.Contains(with.Observer.Calls.Concat(with.Store.Calls), c => c.At >= RcaSimulation.T4To && c.BlockId is "RCA-PG-13" or "RCA-PG-14");
     }
 
     [Theory]
@@ -765,7 +809,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [InlineData(null, 9)]
     public async Task TheReplicasQueryStoreBlockLeavesItsEvidenceAsWithoutASink(string? failure, int seconds)
     {
-        async Task<(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, TimedT4 Replica, MemorySidecar? Sidecar)> RunAsync(bool sink)
+        async Task<(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, DateTimeOffset Ended, TimedT4 Replica, MemorySidecar? Sidecar)> RunAsync(bool sink)
         {
             var clock = new ManualTime(RcaSimulation.T4From);
             var replica = new TimedT4(clock, RcaSimulation.T4Replica(clock), b => b == "RCA-PG-13" ? Settings(clock.Now, inRecovery: true) : null)
@@ -780,13 +824,16 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             };
             var sidecar = sink ? new MemorySidecar() : null;
             var span = new MarkLog(new MemorySink());
-            await LaneAsync(new PgReplicaObserver(replica, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, null, new PgSidecarOptions { Clock = new TickClock(clock) }), span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
-            return (Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), replica, sidecar);
+            var ended = await LaneAsync(new PgReplicaObserver(replica, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, null, new PgSidecarOptions { Clock = new TickClock(clock) }), span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
+            return (Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), ended, replica, sidecar);
         }
 
         var without = await RunAsync(sink: false);
         var with = await RunAsync(sink: true);
 
+        // The replica's last read follows its evidence's end, which keeps its time: the span ends as without a sink.
+        Assert.Equal(without.Ended, with.Ended);
+        Assert.Equal(RcaSimulation.T4To, with.Ended);
         Assert.Equal(without.Rows, with.Rows);
         Assert.Equal(without.Notes, with.Notes);
         if (seconds == 0)
@@ -1397,16 +1444,17 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             ? new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink())
             : new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, source, timings);
 
-        await LaneAsync(primary, span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
+        var ended = await LaneAsync(primary, span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
 
-        return new T4Run(Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), span.Inner.Watermarks["T4"], observer, azure, sidecar);
+        return new T4Run(Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), span.Inner.Watermarks["T4"], ended, span.Inner.Membership, observer, azure, sidecar);
     }
 
     /// <summary>
     /// Drives one observer as ObserverLane does, by a clock a slow block moves: begins it at <paramref name="from"/>, ticks it
-    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>.
+    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>. The span's end is the
+    /// time EndAsync's hook ran, when the evidence's own end was done, as the lane takes it. Returns that time.
     /// </summary>
-    private static async Task LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
+    private static async Task<DateTimeOffset> LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
     {
         var token = TestContext.Current.CancellationToken;
         clock.Set(from);
@@ -1421,8 +1469,11 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             clock.Set(after + delay);
         }
 
-        await observer.EndAsync(to, token);
-        span.Ended(observer.Target, to);
+        DateTimeOffset? ended = null;
+        await observer.EndAsync(to, token, () => ended = clock.Now);
+        Assert.NotNull(ended);
+        span.Ended(observer.Target, ended.Value);
+        return ended.Value;
     }
 
     private static CaptureValues With(CaptureValues row, string column, object? value)
@@ -1569,8 +1620,8 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         private static partial Regex UnsureRule();
     }
 
-    /// <summary>One identity run: the evidence as the store writes it, its notes and watermarks, the connectors, and the sidecar.</summary>
-    private sealed record T4Run(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, DateTimeOffset Final, TimedT4 Observer, TimedStore Store, MemorySidecar? Sidecar);
+    /// <summary>One identity run: the evidence as the store writes it, its notes and watermarks, the span's end, the connectors, and the sidecar.</summary>
+    private sealed record T4Run(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, DateTimeOffset Final, DateTimeOffset Ended, List<(string Target, DateTimeOffset At, bool Began)> Membership, TimedT4 Observer, TimedStore Store, MemorySidecar? Sidecar);
 
     /// <summary>A clock whose timestamps follow a <see cref="ManualTime"/>, so the sidecar's room and budget measure what the test's blocks cost.</summary>
     private sealed class TickClock(ManualTime time) : TimeProvider
@@ -1634,6 +1685,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         public (DateTimeOffset From, DateTimeOffset To)? Surge { get; set; }
 
         public string Description => "timed";
+
+        /// <summary>The test's clock now, so a cost can start at a moment (the end's reads).</summary>
+        public DateTimeOffset Now => clock.Now;
 
         public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
         {
@@ -1717,6 +1771,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         public TimeSpan OpenCost { get; set; }
 
+        /// <summary>When set, an open's cost at the moment it starts, in place of <see cref="OpenCost"/>.</summary>
+        public Func<DateTimeOffset, TimeSpan>? OpenCostAt { get; set; }
+
         public Exception? OpenFailure { get; set; }
 
         public string Description => "timed azure_sys";
@@ -1724,8 +1781,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
         {
             var at = clock.Now;
-            clock.Advance(OpenCost > openTimeout ? openTimeout : OpenCost);
-            if (OpenCost > openTimeout)
+            var cost = OpenCostAt?.Invoke(at) ?? OpenCost;
+            clock.Advance(cost > openTimeout ? openTimeout : cost);
+            if (cost > openTimeout)
             {
                 Failures.Add((at, "open"));
                 throw new OperationCanceledException("The open's own bound ran out (a test's).");

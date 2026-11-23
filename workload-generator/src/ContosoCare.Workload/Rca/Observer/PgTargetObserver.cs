@@ -138,6 +138,9 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         Close(lockWaits, now);
         Close(connections, now);
         holdersDue = false;
+
+        // The evidence's own end is done: its last watermark, and the lane's end time, before the sidecar's end reads.
+        EvidenceEnded(now);
         if (queryStoreCapture is { } queryStoreReads)
         {
             // After the evidence capture's end, so its last reads come first; bounded by the reads' own budget.
@@ -291,7 +294,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
         var result = await SidecarAccess.RunAsync(ConnectionHolders.Block, now, CaptureParameters.None, timings.LightTimeout, cancellationToken).ConfigureAwait(false);
         if (result.Rows is not { } rows)
         {
-            var gap = $"Who holds {Target}'s connections ({ConnectionHolders.Block}) wasn't read during a connection episode: {result.Message}";
+            var gap = $"Who holds {Target}'s connections ({ConnectionHolders.Block}) wasn't read during a connection episode: {PgQueryStoreRows.Why(Target, ConnectionHolders.Block, result)}";
             if (queryStoreCapture is { } queryStoreReads)
             {
                 queryStoreReads.Note(null, gap);
@@ -521,6 +524,9 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
     {
         Close(stall, now);
         link.StalledSince = null;
+
+        // The evidence's own end is done: its last watermark, and the lane's end time, before the sidecar's end read.
+        EvidenceEnded(now);
         if (sidecarSink is not null)
         {
             await QueryStoreAsync(now, timings.LightTimeout < timings.EndBudget ? timings.LightTimeout : timings.EndBudget, cancellationToken).ConfigureAwait(false);
@@ -536,7 +542,7 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
         try
         {
             var result = await SidecarAccess.RunAsync(PgQueryStoreRows.Settings, now, CaptureParameters.None, timeout, cancellationToken).ConfigureAwait(false);
-            sidecarSink!.Write(PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, result.Rows, result.Message));
+            sidecarSink!.Write(PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, result.Rows, result.Rows is null ? PgQueryStoreRows.Why(Target, PgQueryStoreRows.Settings, result) : null));
         }
         catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
         {
