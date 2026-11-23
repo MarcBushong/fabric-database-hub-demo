@@ -315,6 +315,40 @@ public sealed class RcaSidecarSealerTests : IDisposable
         Assert.Contains("only its coverage rows were kept after that", lines[^1], StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void SealingRecordsOnlySpansThatHaveSidecarRows()
+    {
+        var rig = new SidecarRig(root, T0);
+        var evidenceOnly = rig.Open(T0, "T2");
+        evidenceOnly.Write(new CaptureRow(RcaContract.Resource, "T2", T0, "RCA-SQL-09", sentinel: true).Set("at_utc", T0).Set("target", "T2").Set("source", "RCA-SQL-09").Set("metric", "processes_blocked").Set("value", 0.0).Set("unit", "count"));
+        evidenceOnly.Close(T0.AddMinutes(10));
+        var withRows = rig.Capture(T0.AddHours(1), T0.AddHours(2), "T2");
+
+        rig.Sealer.SealAll();
+
+        Assert.Equal([withRows.Id], rig.Store.ReadLedger().Spans.Keys);
+    }
+
+    [Fact]
+    public void ABackfillsRowsTakeTheStoresTypesAsASpansRowsDo()
+    {
+        // A span's rows reach the reducer through the store's lines; a backfill's go there too, so the same rows seal to
+        // the same bytes by either path: a decimal is a double, and an int a long, as the lines read them back.
+        var rig = new SidecarRig(root, T0);
+        var gone = rig.Bind(rig.Capture(T0, T0.AddMinutes(30), "T4"), SidecarRig.Session);
+        rig.Sealer.SealAll();
+        Directory.Delete(gone.Directory, recursive: true);
+        rig.Open(T0.AddDays(8), "T4");
+        var backfill = rig.Sink.ForSpan(gone.Id)!;
+
+        backfill.Write(SidecarRig.Stats("T4", T0.AddMinutes(30), 7, 5).Set("logical_reads", 1250.5m));
+        backfill.Write(SidecarRig.Coverage("T4", T0.AddMinutes(30), T0.AddMinutes(45), "RCA-PG-14", backfill: true));
+
+        var draft = rig.Reducer.Calls[^1].Draft;
+        Assert.IsType<double>(Assert.Single(draft.Tables[RcaContract.QueryStats]).Get("logical_reads"));
+        Assert.IsType<long>(Assert.Single(draft.Tables[RcaContract.QueryCoverage]).Get("interval_minutes"));
+    }
+
     private static List<CaptureValues> T4Settings(DateTimeOffset now) =>
     [
         Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.interval_length_minutes"), ("setting", "15"), ("unit", "min")),

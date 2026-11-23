@@ -171,11 +171,13 @@ internal sealed class SidecarSealer
 
     /// <summary>
     /// Seals a backfill's rows straight into <c>sidecars\</c> for a span whose folder is gone, with the span's session
-    /// and targets from the ledger: T4's pending time read after the span's 7-day retention.
+    /// and targets from the ledger: T4's pending time read after the span's 7-day retention. The rows go through the
+    /// store's line format first, as a span's rows do, so the same rows seal to the same bytes by either path.
     /// </summary>
     internal SealedSidecar? SealBackfill(string spanId, IReadOnlyList<CaptureRow> rows)
     {
         ArgumentNullException.ThrowIfNull(rows);
+        var stored = rows.Select(r => StoredLines.Parse(System.Text.Encoding.UTF8.GetString(StoredLines.Row(r)).TrimEnd('\n'), r.Target)).OfType<CaptureRow>().ToList();
         using var exclusive = Store.Lock();
         var ledger = Store.ReadLedger();
         if (!ledger.Spans.TryGetValue(spanId, out var span))
@@ -183,7 +185,7 @@ internal sealed class SidecarSealer
             throw new InvalidOperationException($"The sidecar ledger doesn't know span {spanId}.");
         }
 
-        var sealedSidecar = rows.Count == 0 ? null : Write(ledger, spanId, rows, span.Bound ? span.SessionId : null, provisional: !span.Bound, final: true, backfill: true, span.Targets, Store.Time.GetUtcNow());
+        var sealedSidecar = stored.Count == 0 ? null : Write(ledger, spanId, stored, span.Bound ? span.SessionId : null, provisional: !span.Bound, final: true, backfill: true, span.Targets, Store.Time.GetUtcNow());
         Store.WriteLedger(ledger);
         return sealedSidecar;
     }
@@ -193,13 +195,18 @@ internal sealed class SidecarSealer
     {
         var now = Store.Time.GetUtcNow();
         DeleteSealed(ledger, span.Directory);
+        var files = TakeAside(ledger, span.Directory);
+        if (files.Count == 0 && !ledger.Spans.ContainsKey(span.Id))
+        {
+            return null;
+        }
+
         RecordSpan(ledger, span, now);
         if (span.Export.Bound)
         {
             Store.Bind(ledger, span.Id, span.Export.SessionId);
         }
 
-        var files = TakeAside(ledger, span.Directory);
         if (files.Count == 0)
         {
             return null;
