@@ -3,8 +3,9 @@
 // Detection reads only the detection tables and the telemetry: never the answer key (rca/blind-detection.json).
 
 import { isMissingInModel, retryHint } from "@/data/retry";
-import { ROW_MAPPERS, toDate } from "./rows";
-import { PHASE_1_TABLES, RCA_SPEC, TARGET_KEY, type RcaTableKey } from "./spec";
+import { ROW_MAPPERS, toDate, type Get } from "./rows";
+import { emptySidecar, SIDECAR_MAPPERS, SIDECAR_MEMBER, type SidecarEvidence } from "./sidecar";
+import { PHASE_1_TABLES, RCA_SPEC, SIDECAR_SPEC, SIDECAR_TABLES, TARGET_KEY, type RcaTableKey, type SidecarTableKey, type TableSpec } from "./spec";
 import { emptyEvidence, type Evidence, type RcaTarget } from "./types";
 
 /** Rows of one DAX query, keyed by the model's column names (src/data/query-client.ts normalizes them). */
@@ -56,25 +57,39 @@ export interface DaxLog {
 const daxTime = (d: Date) =>
     `DATE ( ${d.getUTCFullYear()}, ${d.getUTCMonth() + 1}, ${d.getUTCDate()} ) + TIME ( ${d.getUTCHours()}, ${d.getUTCMinutes()}, ${d.getUTCSeconds()} )`;
 
-/** One table's rows for the window and targets, oldest first. A table of intervals (RCA Coverage, RCA Waits) keeps every
- *  interval that overlaps the window: a session exported once has one coverage row from its start to its end. */
-export function rcaDax(key: RcaTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
-    const spec = RCA_SPEC[key];
-    const fields = spec.fields as Record<string, { model: string }>;
-    const time = fields[spec.time].model;
-    const t = `'${spec.model}'[${time}]`;
-    const end = spec.time === "from" && fields.to ? `'${spec.model}'[${fields.to.model}]` : null;
+/**
+ * One table's rows for the window and targets, oldest first. A table of intervals (its spec's `end`: RCA Coverage, RCA
+ * Waits, RCA Query Stats) keeps every interval that overlaps the window: a session exported once has one coverage row from
+ * its start to its end; a table with more spans (RCA Query Coverage) keeps a row when any of them does. A table with
+ * 64-bit IDs (spec.ts's id) returns them as text, converted in DAX ([CONVERT](https://learn.microsoft.com/dax/convert-function-dax)),
+ * since the connector's JSON would round them to a JavaScript number.
+ */
+export function tableDax(spec: TableSpec, from: Date, to: Date, targets: readonly RcaTarget[]): string {
+    const col = (field: string) => `'${spec.model}'[${spec.fields[field].model}]`;
+    const t = col(spec.time);
     const list = targets.map((target) => `"${target}"`).join(", ");
-    return [
-        "EVALUATE",
-        "CALCULATETABLE (",
-        `    '${spec.model}',`,
-        end ? `    ${end} >= ${daxTime(from)},` : `    ${t} >= ${daxTime(from)},`,
-        `    ${t} <= ${daxTime(to)},`,
-        `    TREATAS ( { ${list} }, '${TARGET_KEY.table}'[${TARGET_KEY.column}] )`,
-        ")",
-        `ORDER BY ${t}`,
-    ].join("\n");
+    const overlaps = (start: string, end: string) => `( ${col(end)} >= ${daxTime(from)} && ${col(start)} <= ${daxTime(to)} )`;
+    const bounds = spec.spans?.length
+        ? [`    FILTER ( '${spec.model}', ${[[spec.time, spec.end ?? spec.time] as const, ...spec.spans].map(([start, end]) => overlaps(start, end)).join(" || ")} ),`]
+        : [spec.end ? `    ${col(spec.end)} >= ${daxTime(from)},` : `    ${t} >= ${daxTime(from)},`, `    ${t} <= ${daxTime(to)},`];
+    const table = ["CALCULATETABLE (", `    '${spec.model}',`, ...bounds, `    TREATAS ( { ${list} }, '${TARGET_KEY.table}'[${TARGET_KEY.column}] )`, ")"];
+    const fields = Object.values(spec.fields);
+    if (!fields.some((field) => field.kind === "id")) return ["EVALUATE", ...table, `ORDER BY ${t}`].join("\n");
+    const columns = fields.map((field, i) => {
+        const ref = `'${spec.model}'[${field.model}]`;
+        return `    "${field.model}", ${field.kind === "id" ? `CONVERT ( ${ref}, STRING )` : ref}${i < fields.length - 1 ? "," : ""}`;
+    });
+    return ["EVALUATE", "SELECTCOLUMNS (", ...table.map((line, i) => `    ${line}${i === table.length - 1 ? "," : ""}`), ...columns, ")", `ORDER BY [${spec.fields[spec.time].model}]`].join("\n");
+}
+
+/** One RCA table's rows for the window and targets, oldest first (tableDax). */
+export function rcaDax(key: RcaTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
+    return tableDax(RCA_SPEC[key], from, to, targets);
+}
+
+/** One sidecar table's rows for the window and targets, oldest first (tableDax). */
+export function sidecarDax(key: SidecarTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
+    return tableDax(SIDECAR_SPEC[key], from, to, targets);
 }
 
 /** Whether the model has the RCA tables: the app offers the RCA view and its tools only when it does. */
@@ -155,7 +170,7 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
             const started = Date.now();
             try {
                 const rows = await runDax(query, limit);
-                const map = ROW_MAPPERS[key] as (get: (field: string) => unknown) => unknown;
+                const map = ROW_MAPPERS[key] as (get: Get) => unknown;
                 const mapped = rows.map((row) => map((field) => (fields[field] ? row[fields[field].model] : undefined))).filter((r) => r !== null);
                 (evidence[key] as unknown[]).push(...mapped);
                 // Rows come oldest first: one at the limit read up to its last row's time, whose rows may be only some of them
@@ -170,4 +185,52 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
     );
     if (failed.length > 0) throw new RcaReadError(failed);
     return evidence;
+}
+
+/**
+ * How long after a window its plans are read: RCA-SQL-14 reads the plans of the queries each read of RCA-SQL-10 returned,
+ * at that read's time, which is up to an interval and 2 minutes after the interval it read (rca/README.md, Query Store).
+ */
+export const PLAN_LAG_MINUTES = 30;
+
+export interface SidecarLoadOptions {
+    tables?: readonly SidecarTableKey[];
+    onDax?: (log: DaxLog) => void;
+}
+
+/**
+ * The window's sidecar rows from the history model: Query Store's statistics and waits of every interval that overlaps the
+ * window, its plans as the window's reads saw them (to PLAN_LAG_MINUTES past it), its events, the coverage rows whose
+ * window, intervals read, or pending publication overlap it, and T4's connection groups. As loadEvidence: a table the
+ * model doesn't have is left empty and named in `missing` (a model from before the sidecar, which is never "none"); any
+ * other read that fails fails the load (RcaReadError).
+ */
+export async function loadSidecar(runDax: RunDax, from: Date, to: Date, targets: readonly RcaTarget[], options: SidecarLoadOptions = {}): Promise<SidecarEvidence> {
+    const sidecar = emptySidecar();
+    const failed: Array<{ table: string; error: unknown }> = [];
+    await Promise.all(
+        (options.tables ?? SIDECAR_TABLES).map(async (key) => {
+            const spec = SIDECAR_SPEC[key];
+            const end = key === "queryPlans" ? new Date(to.getTime() + PLAN_LAG_MINUTES * 60_000) : to;
+            const limit = rcaRowLimit(from, end);
+            const query = sidecarDax(key, from, end, targets);
+            const fields = spec.fields as Record<string, { model: string }>;
+            const started = Date.now();
+            try {
+                const rows = await runDax(query, limit);
+                const map = SIDECAR_MAPPERS[key] as (get: Get) => unknown;
+                const mapped = rows.map((row) => map((field) => (fields[field] ? row[fields[field].model] : undefined))).filter((r) => r !== null);
+                (sidecar[SIDECAR_MEMBER[key]] as unknown[]).push(...mapped);
+                if (rows.length >= limit) (sidecar.cut ??= []).push({ table: spec.model, until: toDate(rows[rows.length - 1][fields[spec.time].model]) ?? end });
+                options.onDax?.({ table: spec.model, query, rows: rows.length, ms: Date.now() - started });
+            } catch (err) {
+                options.onDax?.({ table: spec.model, query, rows: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
+                if (isMissingInModel(err)) sidecar.missing.push(spec.model);
+                else failed.push({ table: spec.model, error: err });
+            }
+        }),
+    );
+    if (failed.length > 0) throw new RcaReadError(failed);
+    sidecar.missing.sort();
+    return sidecar;
 }
