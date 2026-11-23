@@ -1996,10 +1996,11 @@ button.kpi-main:hover {
 }
 
 /* Under Windows forced colors, the browser leaves a chart's own colors as they are, but the card under it takes the
-   system's Canvas, which a light palette makes white, where high contrast's white outline was 1:1. It takes CanvasText
-   there, the system's pair for Canvas; after the rule above, so it wins. */
+   system's Canvas, which a light palette makes white, where high contrast's white outline was 1:1, and its line chart's
+   cursor too. They take CanvasText there, the system's pair for Canvas; after the outline's rule above, so it wins. */
 @media (forced-colors: active) {
-    [data-theme="contrast"] .chart-cursor-band rect {
+    [data-theme="contrast"] .chart-cursor-band rect,
+    [data-theme="contrast"] .chart-cursor line {
         stroke: CanvasText;
     }
 }
