@@ -2971,8 +2971,11 @@ def blind_facts(lake):
         number(plans[58]["estimated_cost"]), "parallel" if plans[58]["is_parallel"] else "serial", at(plans[58]["compiled_utc"]),
         number(plans[31]["estimated_cost"]), plans[31]["forcing_type"] if plans[31]["is_forced_plan"] else "no", at(plans[31]["last_compiled_utc"])))
     for row in sorted(pick("rca_query_events", T3), key=lambda row: row["event_time_utc"]):
-        facts.append("T3 %s %s %d/%d: %s to %s, from %s" % (at(row["event_time_utc"]), " ".join(filter(None, (row["kind"], row["forcing_type"]))),
-                                                            row["query_id"], row["plan_id"], row["previous_state"], row["state"], at(row["time_from_utc"])))
+        # A recommendation's first read has no state before it: it appeared, with its detail.
+        change = "appeared, " + row["state"] if row["previous_state"] is None else "%s to %s" % (row["previous_state"], row["state"])
+        facts.append("T3 %s %s %d/%d: %s, from %s%s" % (
+            at(row["event_time_utc"]), " ".join(filter(None, (row["kind"], row["forcing_type"]))), row["query_id"], row["plan_id"],
+            change, at(row["time_from_utc"]), " (%s)" % row["detail"].split(";")[0] if row["previous_state"] is None else ""))
     last = pick("rca_query_stats", T3, interval_start_utc="17:15:00.000", query_id=412)
     facts.append("T3 17:15, read at %s: 412/%s%s at %s ms of CPU each" % (
         "/".join(sorted({at(row["captured_at_utc"]) for row in last})), "/".join("%d" % row["plan_id"] for row in last), " alone" if len(last) == 1 else "",
@@ -3178,9 +3181,21 @@ others = encode(DOCUMENTS[T4]) + encode(DOCUMENTS[SURGE])
 newer = copy.deepcopy(DOCUMENTS[T3])
 newer["version"] = 2
 evidence_line = open(repo + "/rca/fixtures/t1-blocking-chain.parts.txt", encoding="utf-8").read().splitlines()[0]
+
+
+def retimed(**times):
+    """T3's sidecar with other header times."""
+    return dict(copy.deepcopy(DOCUMENTS[T3]), **times)
+
+
+# Header times the contract's utc doesn't take, or the notebook can't parse (review of 87e01af5): a fourth fractional digit
+# in epochUtc moves every row off the millisecond grid, and a date that doesn't exist failed the run (as one past 2262 does
+# on pandas 1.x, whose OutOfBoundsDatetime is the same ValueError; pandas 2.x reads it).
 for case, parts in (("missing", [part for part in t3_parts if " 2/" not in part] + others),
                     ("corrupt", [re.sub(r" ([0-9a-f]{64}) ", " " + "0" * 64 + " ", part) for part in t3_parts] + others),
                     ("newerDocument", encode(newer) + others), ("newerFormat", encode(DOCUMENTS[T3], marker="DBHUBDEMO-RCAS 2") + others),
+                    ("epochMicros", encode(retimed(epochUtc="2026-11-20T16:50:00.0001Z")) + others),
+                    ("impossibleStart", encode(retimed(windowStartUtc="2026-02-30T16:50:00.000Z")) + others),
                     ("evidenceLine", PARAMETER["parts"] + [evidence_line])):
     files = Files()
     name = stage(files, parameter(parts))
@@ -3215,7 +3230,8 @@ only, _ = run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)), ses
 report["rcaOnly"] = dict(only, telemetry=len(lake.tables.get("telemetry_snapshots", [])))
 
 # The sweep, in a run with nothing passed: a kept file goes once later runs have written every sidecar in it, or after 30
-# days; an acknowledgement a day after its file is gone, or after 30 days. Part 4's day-old sweep never takes a sidecar file.
+# days; an acknowledgement a day after its file is gone, or after 30 days, and a -runall- one, which waits for the next Run
+# all start, only after 30 days. Part 4's day-old sweep never takes a sidecar file.
 lake, files = Lake(), Files()
 run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)))
 names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(days=31), suffix="-ancient"),
@@ -3223,12 +3239,18 @@ names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta
          "written": stage(files, json.dumps(PARAMETER), delta=dt.timedelta(hours=2), suffix="-written"),
          "pending": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(hours=3), suffix="-pending"),
          "dayOld": stage(files, parameter(encode(T4_LATER)), delta=dt.timedelta(days=2), suffix="-dayold"),
-         "evidence": "Files/rca/inbox/%s-script-1234abcd.json" % stamp(dt.timedelta(days=2)), "notes": "Files/rca/inbox/notes.txt"}
+         "evidence": "Files/rca/inbox/%s-script-1234abcd.json" % stamp(dt.timedelta(days=2)), "notes": "Files/rca/inbox/notes.txt",
+         # A name whose time doesn't exist, which sorts before the others (review of 87e01af5): left for the purge, and the
+         # sweep goes past it.
+         "badTime": "Files/rca/inbox/sidecar-20260230T000000Z-badtime.json"}
 acks = {"gone": "Files/rca/acks/sidecar-%s-gone.ack.json" % stamp(dt.timedelta(days=2)),
         "kept": "Files/rca/acks/sidecar-%s-dayold.ack.json" % stamp(dt.timedelta(days=2)),
         "ancient": "Files/rca/acks/sidecar-%s-old.ack.json" % stamp(dt.timedelta(days=31)),
-        "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json"}
-for name in [names["evidence"], names["notes"]] + list(acks.values()):
+        "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json",
+        "runallWaiting": "Files/rca/acks/sidecar-%s-runall-1a2b3c4d.ack.json" % stamp(dt.timedelta(days=2)),
+        "runallAncient": "Files/rca/acks/sidecar-%s-runall-5e6f7a8b.ack.json" % stamp(dt.timedelta(days=31)),
+        "badTime": "Files/rca/acks/sidecar-20260230T000000Z-runall-9f8e7d6c.ack.json"}
+for name in [names["evidence"], names["notes"], names["badTime"]] + list(acks.values()):
     files.add(name, "{}")
 report["sweep"] = dict(run(lake, files)[0], names=names, acks=acks)
 
@@ -3333,8 +3355,9 @@ print(json.dumps(report, default=str))
         @($decode['documents']) | Should -Be $fixtureIds
         @($decode['skipped']) | Should -BeNullOrEmpty
         @($decode['evidenceDocuments']) | Should -BeNullOrEmpty
-        # The fixtures' sidecar part lines: T3's sidecar is two parts since 27c14daa (plan 40's row, the recommendation's appearance).
-        $decode['evidenceSkipped'][0][1] | Should -Match '^4 part line\(s\) that part format 1 doesn''t describe'
+        # Part 4 counts every sidecar part line in the file as one it can't read.
+        $parts = @((Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-sidecar.parameter.json') -Raw | ConvertFrom-Json).parts)
+        $decode['evidenceSkipped'][0][1] | Should -Match ('^{0} part line\(s\) that part format 1 doesn''t describe' -f $parts.Count)
     }
 
     It 'writes the fixtures'' rows once to the six tables, each sidecar under its own session''s run, acknowledges each by its ID, and deletes the file' {
@@ -3377,7 +3400,7 @@ print(json.dumps(report, default=str))
             'T3 412/58 at 17:00: 524 executions to 17:09:40.215 at 176 ms of CPU each (92224 ms), 4100 logical reads each, DOP 4, 31440 ms of waits: Buffer IO 920, CPU 18900, Parallelism 11620'
             'T3 at 17:00: 412/31 ran 668 times (1403 ms); 412/58 used 92224 of 95644 ms of CPU'
             'T3 412/58: cost 38.6, parallel, compiled 17:03:11.870; 412/31: cost 0.0331, forced AUTO, last compiled 17:09:41.120'
-            'T3 17:06:00.000 tuning 412/31: None to Active, from 17:05:30.000'
+            'T3 17:06:00.000 tuning 412/31: appeared, Active, from 17:05:30.000 (FORCE_LAST_GOOD_PLAN for query 412: plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms)'
             'T3 17:09:30.000 tuning 412/31: Active to Executing, from 17:09:00.000'
             'T3 17:10:00.000 forced AUTO 412/31: not forced to forced, from 17:09:00.000'
             'T3 17:10:30.000 tuning 412/31: Executing to Verifying, from 17:10:00.000'
@@ -3568,6 +3591,8 @@ print(json.dumps(report, default=str))
         @{ Case = 'corrupt'; Why = 'its SHA-256 doesn''t match its parts' }
         @{ Case = 'newerDocument'; Why = 'its version 2 is newer than this notebook''s 1 \(\./scripts/deploy\.ps1 updates the notebook\)' }
         @{ Case = 'newerFormat'; Why = 'its part lines are in a part format this notebook doesn''t read' }
+        @{ Case = 'epochMicros'; Why = 'its epochUtc isn''t a UTC time with milliseconds' }
+        @{ Case = 'impossibleStart'; Why = 'its windowStartUtc isn''t a time this notebook can read' }
     ) {
         if ($sidecarSkip) {
             Set-ItResult -Skipped -Because $sidecarSkip
@@ -3655,7 +3680,7 @@ print(json.dumps(report, default=str))
         @($only['exits']) | Should -Be @('RCA.EVIDENCE Not selected: No RCA evidence was passed (RCA_EVIDENCE and RCA_EVIDENCE_FILE are empty), so no RCA rows were written.')
     }
 
-    It 'sweeps a kept file once later runs wrote its sidecars, or after 30 days, and an acknowledgement a day after its file; part 4''s day-old sweep never takes a sidecar file' {
+    It 'sweeps a kept file once later runs wrote its sidecars, or after 30 days, and an acknowledgement a day after its file, but a -runall- one only after 30 days; part 4''s day-old sweep never takes a sidecar file' {
         if ($sidecarSkip) {
             Set-ItResult -Skipped -Because $sidecarSkip
             return
@@ -3674,6 +3699,15 @@ print(json.dumps(report, default=str))
         $left | Should -Contain $sweep['acks']['kept']
         $left | Should -Contain $sweep['acks']['fresh']
         $left | Should -Contain $sweep['acks']['other']
+        # A -runall- acknowledgement waits for the next Run all start to send its IDs, however long that takes, and the
+        # control notebook deletes it then; only 30 days take it here (rca/README.md, Acknowledgement).
+        $left | Should -Contain $sweep['acks']['runallWaiting'] -Because 'its file is gone, but the next Run all start still has to send its IDs'
+        $left | Should -Not -Contain $sweep['acks']['runallAncient']
+        # A 30th of February in a name, sorted first: the sweep leaves those files for the purge and deletes the others
+        # above, with no cleanup warning.
+        $left | Should -Contain $sweep['names']['badTime']
+        $left | Should -Contain $sweep['acks']['badTime']
+        @($sweep['cleanup']) | Should -BeNullOrEmpty
     }
 
     It 'redacts a value that looks like a secret' {
