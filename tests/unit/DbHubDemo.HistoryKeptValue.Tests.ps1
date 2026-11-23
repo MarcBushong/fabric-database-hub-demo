@@ -678,20 +678,29 @@ Describe 'deploy.ps1''s kept-value steps (F35, 2026-11-23)' {
 Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''t (F35, design A, 2026-11-23)' {
     BeforeAll {
         # The Fabric track's step in this run (-DecidesModelForm), through the mocked Livy API: the first history run's rows
-        # in time (Kept), none yet (NoTable), or a busy capacity that refused the session (Busy: interactive Spark isn't
-        # queued, so Fabric answers HTTP 430).
+        # in time (Kept), none yet (NoTable), a busy capacity that refused the session (Busy: interactive Spark isn't
+        # queued, so Fabric answers HTTP 430), the columns still missing (NoColumns), a refused session (Refused, HTTP 403),
+        # a paused capacity (Paused), or kept_value_step raising (StepFailed).
         function New-TrackRecord([string] $Kind) {
             switch ($Kind) {
                 'Kept' { Set-KeptValueRoute }
                 'NoTable' { Set-KeptValueRoute -Step (New-StatementAnswer 1 (New-StepLine @{ exists = $false; missing = @(); added = @(); form = 'Release'; read = 0; resolved = 0 })) }
                 'Busy' { Set-LivyRoute @(@{ Method = 'Post'; Match = 'sessions$'; Responses = @(New-LivyResponse 430 @{ errorCode = 'TooManyRequestsForCapacity'; message = 'All the available capacity is in use.' }) }) }
+                'NoColumns' { Set-KeptValueRoute -Step (New-StatementAnswer 1 (New-StepLine @{ form = 'Release'; added = @(); missing = @('kept_value'); resolved = 0 })) }
+                'Refused' { Set-LivyRoute @(@{ Method = 'Post'; Match = 'sessions$'; Responses = @(New-LivyResponse 403 @{ errorCode = 'Forbidden'; message = 'No access.' }) }) }
+                'Paused' { Set-LivyRoute @(@{ Method = 'Post'; Match = 'sessions$'; Responses = @(New-LivyResponse 404 @{ errorCode = 'CapacityNotActive'; message = 'The capacity is not active.' }) }) }
+                'StepFailed' { Set-KeptValueRoute -Step (New-StatementAnswer 1 '' 'error' 'Py4JJavaError' 'An error occurred while calling o123.sql.') }
             }
             Invoke-DemoHistoryKeptValue -Config (New-TestConfig) -Token $script:token -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -RunAgain $script:trackAgain -DecidesModelForm -ProgressPath 'progress.json' -ProgressId 'Fabric.KeptValues'
         }
         # deploy.ps1's end after its history snapshot (-Snapshot, DEPLOY.FABRIC.HISTORY's outcome), whose own session works out
-        # every row, or finds no history table (-NoTable). -Extra: the track's other records, before the snapshot's.
-        function Invoke-TestEnd([object] $Track, [string] $Snapshot = 'Saved', [switch] $NoTable, [object[]] $Extra = @()) {
-            if ($NoTable) {
+        # every row, finds no history table (-NoTable), or is refused by a busy capacity (-Busy). -Extra: the track's other
+        # records, before the snapshot's.
+        function Invoke-TestEnd([object] $Track, [string] $Snapshot = 'Saved', [switch] $NoTable, [switch] $Busy, [object[]] $Extra = @()) {
+            if ($Busy) {
+                Set-LivyRoute @(@{ Method = 'Post'; Match = 'sessions$'; Responses = @(New-LivyResponse 430 @{ errorCode = 'TooManyRequestsForCapacity'; message = 'All the available capacity is in use.' }) })
+            }
+            elseif ($NoTable) {
                 Set-KeptValueRoute -Step (New-StatementAnswer 1 (New-StepLine @{ exists = $false; missing = @(); added = @(); form = 'Release'; read = 0; resolved = 0 }))
             }
             else {
@@ -710,6 +719,7 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         }
         $script:formSettled = 'Snapshot Value reads the kept values in telemetry_snapshots (F35): this run''s end deployed that form after its history snapshot, once every row''s kept value was worked out (DEPLOY.FABRIC.KEPTVALUE.END).'
         $script:nextDeployFix = 'Nothing to do now: the next ./scripts/deploy.ps1 works out the history''s kept values and deploys the history model in their form by itself.'
+        $script:formWaits = 'Snapshot Value has the release''s form for now: this run''s end had no rows whose kept values to work out (DEPLOY.FABRIC.KEPTVALUE.END), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
     }
 
     BeforeEach {
@@ -851,51 +861,109 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         $deployed.Count | Should -Be 0
     }
 
-    It 'gives a busy capacity''s Warning at the Fabric track the end''s fix when the end had no rows to work out: <Name> (the re-check of 32e39e6a)' -TestCases @(
-        @{ Name = 'nothing saved at the end'; Snapshot = 'CapacityPaused'; NoTable = $false }
-        @{ Name = 'a snapshot without a table'; Snapshot = 'Saved'; NoTable = $true }
+    It 'settles the track''s and the release''s form''s Warnings when the end had no rows to work out, only for what a later run fixes by itself: <Name> (the re-checks of 32e39e6a and 5411cca1)' -TestCases @(
+        @{ Name = 'a busy capacity at the track, nothing saved at the end'; Track = 'Busy'; Outcome = 'SessionFailed'; Snapshot = 'CapacityPaused'; NoTable = $false; Settled = $true }
+        @{ Name = 'a busy capacity at the track, a snapshot without a table'; Track = 'Busy'; Outcome = 'SessionFailed'; Snapshot = 'Saved'; NoTable = $true; Settled = $true }
+        @{ Name = 'the columns still missing at the track'; Track = 'NoColumns'; Outcome = 'NoColumns'; Snapshot = 'CapacityPaused'; NoTable = $false; Settled = $true }
+        @{ Name = 'a refused session at the track'; Track = 'Refused'; Outcome = 'Refused'; Snapshot = 'CapacityPaused'; NoTable = $false; Settled = $false }
+        @{ Name = 'a paused capacity at the track'; Track = 'Paused'; Outcome = 'CapacityPaused'; Snapshot = 'CapacityPaused'; NoTable = $false; Settled = $false }
+        @{ Name = 'kept_value_step raising at the track'; Track = 'StepFailed'; Outcome = 'StepFailed'; Snapshot = 'CapacityPaused'; NoTable = $false; Settled = $false }
     ) {
-        param($Name, $Snapshot, $NoTable)
-        $track = New-TrackRecord 'Busy'
-        $track.remediation | Should -Match '-FromStage Fabric in a few minutes' -Because 'what the track''s step says by itself'
-        $end = Invoke-TestEnd $track -Snapshot $Snapshot -NoTable:$NoTable
+        param($Name, $Track, $Outcome, $Snapshot, $NoTable, $Settled)
+        $track = New-TrackRecord $Track
+        $track.status | Should -Be 'Warning'
+        $track.evidence.outcome | Should -Be $Outcome
+        $trackBefore = [string]$track.message
+        $trackFix = [string]$track.remediation
+        # The track's model step: the model's import, and its record of the release's form.
+        $import = New-DemoResult -CheckId 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Imported the semantic model.'
+        $form = New-FormRecord 'Release'
+        $formBefore = [string]$form.message
+        $formFix = [string]$form.remediation
+        $end = Invoke-TestEnd $track -Snapshot $Snapshot -NoTable:$NoTable -Extra @($import, $form)
         $end.status | Should -Be 'Not selected' -Because $Name
         $end.message | Should -Match ([regex]::Escape($script:nextDeploy) + '$')
-        $track.status | Should -Be 'Warning' -Because 'Fabric did refuse its session'
-        $track.remediation | Should -BeExactly $script:nextDeployFix -Because $Name
-        (InModuleScope DbHubDemo -Parameters @{ R = @($track, $end) } { Get-DemoKeptValueItem -Result $R }).howTo | Should -BeExactly $script:nextDeployFix
-        $row = @($rows | Where-Object Id -EQ 'Fabric.KeptValues')[-1]
-        $row.State | Should -Be 'Action needed'
-        $row.Status | Should -Be 'Warning'
-        $row.Message | Should -BeExactly ('{0} {1}' -f $track.message, $script:nextDeployFix)
+        $item = InModuleScope DbHubDemo -Parameters @{ R = @($track, $import, $form, $end) } { Get-DemoKeptValueItem -Result $R }
+        if ($Settled) {
+            $track.status | Should -Be 'Not selected' -Because $Name
+            $track.message | Should -BeExactly ('This step didn''t work out the history''s kept values ({0}), and this run''s end had none to work out, so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $Outcome)
+            $track.remediation | Should -BeExactly $script:nextDeployFix
+            $track.evidence.earlierMessage | Should -BeExactly $trackBefore
+            $form.status | Should -Be 'Not selected'
+            $form.message | Should -BeExactly $script:formWaits
+            $form.remediation | Should -BeExactly $script:nextDeployFix
+            $form.evidence.earlierMessage | Should -BeExactly $formBefore
+            $form.evidence.form | Should -Be 'Release' -Because 'the model does read the release''s form'
+            $item | Should -BeNullOrEmpty
+            $row = @($rows | Where-Object Id -EQ 'Fabric.KeptValues')[-1]
+            $row.State | Should -Be 'Skipped'
+            $row.Status | Should -Be 'Not selected'
+            $row.Message | Should -BeExactly ('{0} {1}' -f $track.message, $script:nextDeployFix)
+            $report = @($rows | Where-Object Id -EQ 'Fabric.Report')
+            $report.Count | Should -Be 1
+            $report[0].State | Should -Be 'Done'
+            $report[0].Status | Should -Be 'Pass'
+            $report[0].Message | Should -BeExactly ('{0} {1}' -f $script:formWaits, $script:nextDeployFix)
+        }
+        else {
+            # A refusal, a paused capacity, or a bug: no later run fixes it by itself, so the track keeps its own fix and
+            # stays a Warning, and so does the release's form (the re-check of 5411cca1).
+            $track.status | Should -Be 'Warning' -Because $Name
+            $track.message | Should -BeExactly $trackBefore
+            $track.remediation | Should -BeExactly $trackFix
+            $track.remediation | Should -Not -Match '^Nothing to do now'
+            $form.status | Should -Be 'Warning'
+            $form.message | Should -BeExactly $formBefore
+            $form.remediation | Should -BeExactly $formFix
+            $item.howTo | Should -BeExactly $trackFix
+            @($rows | Where-Object { $_.Id -eq 'Fabric.KeptValues' -and $_.State -eq 'Skipped' }).Count | Should -Be 0
+            @($rows | Where-Object Id -EQ 'Fabric.Report').Count | Should -Be 0
+        }
         $deployed.Count | Should -Be 0
     }
 
-    It 'ends no first deployment with a kept-value Warning: <Name>' -TestCases @(
-        @{ Name = 'the first history run saved rows in time'; Track = 'Kept'; Snapshot = 'Saved'; NoTable = $false; Switch = 0 }
-        @{ Name = 'no history at the track, rows at the end'; Track = 'NoTable'; Snapshot = 'Saved'; NoTable = $false; Switch = 1 }
-        @{ Name = 'no history at the track, nothing saved at the end'; Track = 'NoTable'; Snapshot = 'NotSelected'; NoTable = $false; Switch = 0 }
-        @{ Name = 'no history at the track, a snapshot without a table'; Track = 'NoTable'; Snapshot = 'Saved'; NoTable = $true; Switch = 0 }
-        @{ Name = 'a busy capacity at the track, rows at the end'; Track = 'Busy'; Snapshot = 'Saved'; NoTable = $false; Switch = 1 }
+    It 'ends a first deployment with a kept-value or form Warning only for an honest failure: <Name>' -TestCases @(
+        @{ Name = 'the first history run saved rows in time'; Track = 'Kept'; End = 'Rows'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 0; Warnings = @() }
+        @{ Name = 'no history at the track, rows at the end'; Track = 'NoTable'; End = 'Rows'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 1; Warnings = @() }
+        @{ Name = 'no history at the track, nothing saved at the end'; Track = 'NoTable'; End = 'Rows'; Snapshot = 'NotSelected'; SwitchFails = $false; Switch = 0; Warnings = @() }
+        @{ Name = 'no history at the track, a snapshot without a table'; Track = 'NoTable'; End = 'NoTable'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 0; Warnings = @() }
+        @{ Name = 'a busy capacity at the track, rows at the end'; Track = 'Busy'; End = 'Rows'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 1; Warnings = @() }
+        @{ Name = 'a busy capacity at the track, nothing saved at the end'; Track = 'Busy'; End = 'Rows'; Snapshot = 'CapacityPaused'; SwitchFails = $false; Switch = 0; Warnings = @() }
+        @{ Name = 'a busy capacity at the track, a snapshot without a table'; Track = 'Busy'; End = 'NoTable'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 0; Warnings = @() }
+        @{ Name = 'a busy capacity at the track and at the end'; Track = 'Busy'; End = 'Busy'; Snapshot = 'Saved'; SwitchFails = $false; Switch = 0; Warnings = @('DEPLOY.FABRIC.KEPTVALUE', 'DEPLOY.FABRIC.KEPTVALUE.END', 'FABRIC.SEMANTICMODEL.FORM') }
+        @{ Name = 'a switch that doesn''t work'; Track = 'NoTable'; End = 'Rows'; Snapshot = 'Saved'; SwitchFails = $true; Switch = 1; Warnings = @('DEPLOY.FABRIC.KEPTVALUE.END', 'FABRIC.SEMANTICMODEL.FORM') }
+        @{ Name = 'a refused session at the track, nothing saved at the end'; Track = 'Refused'; End = 'Rows'; Snapshot = 'CapacityPaused'; SwitchFails = $false; Switch = 0; Warnings = @('DEPLOY.FABRIC.KEPTVALUE', 'FABRIC.SEMANTICMODEL.FORM') }
+        @{ Name = 'a paused capacity at the track, nothing saved at the end'; Track = 'Paused'; End = 'Rows'; Snapshot = 'CapacityPaused'; SwitchFails = $false; Switch = 0; Warnings = @('DEPLOY.FABRIC.KEPTVALUE', 'FABRIC.SEMANTICMODEL.FORM') }
     ) {
-        # A Livy failure at both the track and the end stays a Warning, on a first deployment as on an update (the owner wants
-        # failures on the status page); these are the paths a first deployment's timing takes.
-        param($Name, $Track, $Snapshot, $NoTable, $Switch)
+        # No path leaves a Warning that asks for a step the next deploy.ps1 takes by itself (design A). A Livy failure at both
+        # the track and the end, a switch that doesn't work, and what no later run fixes by itself (a refused session, a
+        # paused capacity) stay Warnings, on a first deployment as on an update (the owner wants failures on the status page);
+        # these are the paths a first deployment's timing takes.
+        param($Name, $Track, $End, $Snapshot, $SwitchFails, $Switch, $Warnings)
+        if ($SwitchFails) {
+            $script:modelRecords = @(
+                New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The import of the semantic model failed.'
+            )
+        }
         $trackRecord = New-TrackRecord $Track
         # What the track's model step said of the form it deployed (configure-powerbi.ps1).
         $form = New-FormRecord $(if ($Track -eq 'Kept') { 'Kept' } else { 'Release' })
-        $end = Invoke-TestEnd $trackRecord -Snapshot $Snapshot -NoTable:$NoTable -Extra @($form)
-        @(@($trackRecord, $end) | Where-Object { [string]$_.status -in 'Warning', 'Fail', 'Manual action required' }).Count | Should -Be 0 -Because $Name
-        InModuleScope DbHubDemo -Parameters @{ R = @($trackRecord, $form, $end) } { Get-DemoKeptValueItem -Result $R } | Should -BeNullOrEmpty
-        $deployed.Count | Should -Be $Switch
-        # Once the end deployed the kept form, nothing says the release's form (the re-check of 32e39e6a). Without rows at the
-        # end, the model's own record of the release's form stays, with the same fix as the end's note: a plain deploy.ps1.
-        if ($Track -eq 'Kept' -or $Switch) {
-            $form.status | Should -Be 'Pass' -Because $Name
+        $end = Invoke-TestEnd $trackRecord -Snapshot $Snapshot -NoTable:($End -eq 'NoTable') -Busy:($End -eq 'Busy') -Extra @($form)
+        $open = @(@($trackRecord, $form, $end) | Where-Object { [string]$_.status -in 'Warning', 'Fail', 'Manual action required' } | ForEach-Object { [string]$_.checkId } | Sort-Object)
+        ($open -join ', ') | Should -BeExactly (@($Warnings) -join ', ') -Because $Name
+        @(@($trackRecord, $form, $end) | Where-Object { [string]$_.status -in 'Fail', 'Manual action required' }).Count | Should -Be 0 -Because 'never in DONE''s way'
+        $item = InModuleScope DbHubDemo -Parameters @{ R = @($trackRecord, $form, $end) } { Get-DemoKeptValueItem -Result $R }
+        if (@($Warnings | Where-Object { $_ -like 'DEPLOY.FABRIC.KEPTVALUE*' }).Count -gt 0) {
+            $item | Should -Not -BeNullOrEmpty -Because $Name
         }
         else {
-            $form.status | Should -Be 'Warning' -Because $Name
-            $form.remediation | Should -Match '^Run \./scripts/deploy\.ps1: '
+            $item | Should -BeNullOrEmpty -Because $Name
+        }
+        $deployed.Count | Should -Be $Switch
+        # Once the end deployed the kept form, nothing says the release's form (the re-check of 32e39e6a); without rows at the
+        # end, nothing says it as a Warning (the re-check of 5411cca1).
+        if ($Track -eq 'Kept' -or ($Switch -and -not $SwitchFails)) {
+            $form.status | Should -Be 'Pass' -Because $Name
         }
     }
 

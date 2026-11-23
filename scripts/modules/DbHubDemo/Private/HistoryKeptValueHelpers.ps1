@@ -27,6 +27,16 @@ $script:KeptValueNextDeployFix = 'Nothing to do now: the next ./scripts/deploy.p
 $script:KeptValueFormCheckId = 'FABRIC.SEMANTICMODEL.FORM'
 $script:KeptValueReportRowId = 'Fabric.Report'
 $script:KeptValueFormSettled = 'Snapshot Value reads the kept values in telemetry_snapshots (F35): this run''s end deployed that form after its history snapshot, once every row''s kept value was worked out (DEPLOY.FABRIC.KEPTVALUE.END).'
+# What that Warning says instead, Not selected with the next-deploy fix, when deploy.ps1's end had no rows to work out: no
+# Warning asks for a step that the next deploy.ps1 takes by itself (design A, the re-check of 5411cca1).
+$script:KeptValueFormWaits = 'Snapshot Value has the release''s form for now: this run''s end had no rows whose kept values to work out (DEPLOY.FABRIC.KEPTVALUE.END), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
+# The history model and report's records (configure-powerbi.ps1 through Invoke-DemoPowerBIStage), which the history report's
+# row shows, as the Fabric track's step sets it.
+$script:KeptValueReportRecordPattern = '^(FABRIC\.(SEMANTICMODEL|REPORT)\.|FABRIC\.(IMPORT|READBACK)\.(SM|RPT)_|DEPLOY\.POWERBI$)'
+# What the Fabric track's step can answer that a later deploy.ps1 fixes by itself: no history yet, or a session, a step, or the
+# columns that a busy or slow capacity kept from working out. Only these point to the next deploy.ps1 when the end had no
+# rows to work out; a refusal, a paused capacity, no token, or a bug keeps its own fix (the re-check of 5411cca1).
+$script:KeptValueRerunOutcomes = @('NoTable', 'SessionFailed', 'TimedOut', 'Failed', 'NoColumns')
 $script:KeptValueDeployCheckId = 'DEPLOY.FABRIC.KEPTVALUE'
 $script:KeptValueEndCheckId = 'DEPLOY.FABRIC.KEPTVALUE.END'
 $script:KeptValueTrackRowId = 'Fabric.KeptValues'
@@ -261,8 +271,13 @@ function Invoke-DemoKeptValueEndStep {
     - With no rows to work out (a snapshot that saved nothing, or still no history table), it's Not selected, never a
       Warning, and says that the next ./scripts/deploy.ps1 deploys the model in the kept form by itself: a full run after
       one whose tracks all finished, or a resume, which runs the Fabric step again since it cleared its record of the
-      content it published. A Warning from the track's step then gets that as its fix, in place of the Fabric track again,
-      so the run's last lines say the same (the re-check of 32e39e6a).
+      content it published. Nothing else then says Warning about it either, when the track's step answered what a later run
+      fixes by itself (NoTable, SessionFailed, TimedOut, Failed, or NoColumns; the re-check of 5411cca1): a Warning from
+      the track's step and every FABRIC.SEMANTICMODEL.FORM Warning of the release's form become Not selected, each with
+      that as its fix and what it said kept in its evidence (earlierMessage), on their rows too: the track's step's, and the
+      history report's (Fabric.Report). A refusal, a paused capacity, no token, or a bug at the track (Refused,
+      CapacityPaused, NoToken, StepFailed, NoAnswer) keeps its own fix, and those Warnings stay. So do a Livy failure at
+      both the track and the end, and a switch that doesn't work.
     A run whose Fabric track didn't run its step (a resume) keeps the model its earlier run deployed. -ConfigPath goes to
     configure-powerbi.ps1 for the switch.
     #>
@@ -302,17 +317,34 @@ function Invoke-DemoKeptValueEndStep {
     }
     $track = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $script:KeptValueDeployCheckId }) | Select-Object -Last 1
     $waits = $null -ne $track -and (Test-DemoKeptFormPending -Result $track)
-    # With no rows to work out, the Fabric track's Warning gets the end's note as its fix: the next ./scripts/deploy.ps1
-    # does it by itself, not the Fabric track in a few minutes (the re-check of 32e39e6a).
-    $pointToNextDeploy = {
-        if ($waits -and [string]$track.status -eq 'Warning') {
-            if ($track -is [System.Collections.IDictionary]) {
-                $track['remediation'] = $script:KeptValueNextDeployFix
-            }
-            else {
-                Add-Member -InputObject $track -NotePropertyName 'remediation' -NotePropertyValue $script:KeptValueNextDeployFix -Force
-            }
-            Set-DemoProgressStep -Path $ProgressPath -Id $script:KeptValueTrackRowId -State 'Action needed' -Status 'Warning' -Message ('{0} {1}' -f [string]$track.message, $script:KeptValueNextDeployFix) -MaxLength 1200
+    # With no rows to work out, nothing that waits for the kept form stays a Warning when a later run fixes it by itself: the
+    # next ./scripts/deploy.ps1 deploys it (design A; the re-checks of 32e39e6a and 5411cca1). The Fabric track's Warning,
+    # and configure-powerbi.ps1's of the release's form, become Not selected with that as their fix, keeping what they said.
+    # Any other answer at the track keeps its own fix, as a Warning, and so does the release's form.
+    $settleNoRows = {
+        if (-not $waits) {
+            return
+        }
+        $trackOutcome = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $track -Name 'evidence') -Name 'outcome')
+        if ($trackOutcome -notin $script:KeptValueRerunOutcomes) {
+            return
+        }
+        if ([string]$track.status -eq 'Warning') {
+            Set-DemoHistoryResultText -Result $track -Status 'Not selected' -Message ('This step didn''t work out the history''s kept values ({0}), and this run''s end had none to work out, so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $trackOutcome) -Remediation $script:KeptValueNextDeployFix
+            Set-DemoProgressStep -Path $ProgressPath -Id $script:KeptValueTrackRowId -State 'Skipped' -Status 'Not selected' -Message ('{0} {1}' -f [string]$track.message, $script:KeptValueNextDeployFix) -MaxLength 1200
+        }
+        $forms = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $script:KeptValueFormCheckId -and [string]$_.status -eq 'Warning' })
+        foreach ($form in $forms) {
+            Set-DemoHistoryResultText -Result $form -Status 'Not selected' -Message $script:KeptValueFormWaits -Remediation $script:KeptValueNextDeployFix
+        }
+        if ($forms.Count -gt 0) {
+            # The history report's row, from the history model and report's records as the track's step sets it; a form
+            # record means the model's import passed.
+            $report = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -match $script:KeptValueReportRecordPattern })
+            $worst = Get-DemoWorstStatus -Status (@('Pass') + @($report | ForEach-Object { [string]$_.status }))
+            $firstOpen = @($report | Where-Object { [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
+            $text = if ($firstOpen.Count -gt 0) { [string]$firstOpen[0].message } else { '{0} {1}' -f $script:KeptValueFormWaits, $script:KeptValueNextDeployFix }
+            Set-DemoProgressStep -Path $ProgressPath -Id $script:KeptValueReportRowId -State (ConvertTo-DemoProgressState -Status $worst) -Status $worst -Message $text -MaxLength 1200
         }
     }
     $snapshot = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'DEPLOY.FABRIC.HISTORY' }) | Select-Object -Last 1
@@ -321,7 +353,7 @@ function Invoke-DemoKeptValueEndStep {
         $message = 'The history snapshot saved nothing in this run (DEPLOY.FABRIC.HISTORY says why), so there were no new rows whose kept values to work out.'
         if ($waits) {
             $message = '{0} {1}' -f $message, $script:KeptValueNextDeployNote
-            & $pointToNextDeploy
+            & $settleNoRows
         }
         return (& $skip $message)
     }
@@ -329,7 +361,7 @@ function Invoke-DemoKeptValueEndStep {
     $kept = Invoke-DemoHistoryKeptValue -Config $Config -CheckId $script:KeptValueEndCheckId -TimeoutMinutes $TimeoutMinutes -ProgressPath $ProgressPath -ProgressId $script:KeptValueEndRowId -RunAgain $runAgain -ModelOnRelease:$waits -SwitchModelForm:$waits -ConfigPath $ConfigPath
     $keptEvidence = Get-DemoMemberValue -InputObject $kept -Name 'evidence'
     if ($waits -and [string](Get-DemoMemberValue -InputObject $keptEvidence -Name 'outcome') -eq 'NoTable') {
-        & $pointToNextDeploy
+        & $settleNoRows
     }
     $readsKept = $waits -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $keptEvidence -Name 'modelSwitch') -Name 'keptDeployed')
     if ($readsKept) {
