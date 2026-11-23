@@ -3026,7 +3026,8 @@ only, _ = run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)), ses
 report["rcaOnly"] = dict(only, telemetry=len(lake.tables.get("telemetry_snapshots", [])))
 
 # The sweep, in a run with nothing passed: a kept file goes once later runs have written every sidecar in it, or after 30
-# days; an acknowledgement a day after its file is gone, or after 30 days. Part 4's day-old sweep never takes a sidecar file.
+# days; an acknowledgement a day after its file is gone, or after 30 days, and a -runall- one, which waits for the next Run
+# all start, only after 30 days. Part 4's day-old sweep never takes a sidecar file.
 lake, files = Lake(), Files()
 run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)))
 names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(days=31), suffix="-ancient"),
@@ -3038,7 +3039,9 @@ names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta
 acks = {"gone": "Files/rca/acks/sidecar-%s-gone.ack.json" % stamp(dt.timedelta(days=2)),
         "kept": "Files/rca/acks/sidecar-%s-dayold.ack.json" % stamp(dt.timedelta(days=2)),
         "ancient": "Files/rca/acks/sidecar-%s-old.ack.json" % stamp(dt.timedelta(days=31)),
-        "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json"}
+        "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json",
+        "runallWaiting": "Files/rca/acks/sidecar-%s-runall-1a2b3c4d.ack.json" % stamp(dt.timedelta(days=2)),
+        "runallAncient": "Files/rca/acks/sidecar-%s-runall-5e6f7a8b.ack.json" % stamp(dt.timedelta(days=31))}
 for name in [names["evidence"], names["notes"]] + list(acks.values()):
     files.add(name, "{}")
 report["sweep"] = dict(run(lake, files)[0], names=names, acks=acks)
@@ -3464,7 +3467,7 @@ print(json.dumps(report, default=str))
         @($only['exits']) | Should -Be @('RCA.EVIDENCE Not selected: No RCA evidence was passed (RCA_EVIDENCE and RCA_EVIDENCE_FILE are empty), so no RCA rows were written.')
     }
 
-    It 'sweeps a kept file once later runs wrote its sidecars, or after 30 days, and an acknowledgement a day after its file; part 4''s day-old sweep never takes a sidecar file' {
+    It 'sweeps a kept file once later runs wrote its sidecars, or after 30 days, and an acknowledgement a day after its file, but a -runall- one only after 30 days; part 4''s day-old sweep never takes a sidecar file' {
         if ($sidecarSkip) {
             Set-ItResult -Skipped -Because $sidecarSkip
             return
@@ -3483,6 +3486,10 @@ print(json.dumps(report, default=str))
         $left | Should -Contain $sweep['acks']['kept']
         $left | Should -Contain $sweep['acks']['fresh']
         $left | Should -Contain $sweep['acks']['other']
+        # A -runall- acknowledgement waits for the next Run all start to send its IDs, however long that takes, and the
+        # control notebook deletes it then; only 30 days take it here (rca/README.md, Acknowledgement).
+        $left | Should -Contain $sweep['acks']['runallWaiting'] -Because 'its file is gone, but the next Run all start still has to send its IDs'
+        $left | Should -Not -Contain $sweep['acks']['runallAncient']
     }
 
     It 'redacts a value that looks like a secret' {
