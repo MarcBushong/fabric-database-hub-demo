@@ -210,6 +210,7 @@ What the observer captures beyond the evidence document, in documents of their o
   Each is timed within its read's period (`time_from_utc` to `event_time_utc`).
 - **Coverage:** `rca_query_coverage` holds one row per target per sidecar: Query Store's state and capture mode as read, the intervals read, PostgreSQL's pending publication, and the gaps:
   - Query Store off or read-only, a permission (the gap names the grant that fixes it: for example RCA-PG-17's `pg_read_all_stats`, which T4's read replica has once T4 does, since a replica copies its primary's roles; or RCA-AZ-04's server role), a timeout, an expired pending range, the sidecar's budget;
+  - a session's sidecars past their budget when a span is bound to it, with nothing cut ([Limits](#limits));
   - on a Burstable T4: Query Store is off, as Learn advises there;
   - on T2's kept PaygWizard guest: not captured, because its runner identity has no `VIEW DATABASE STATE`, with `RCA.CAPTURE.T2`'s fix.
 
@@ -285,6 +286,36 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 - **Only in the runbook's copy:** a stop marks itself begun with `stopBegunUtc`, and a re-check that ran during the stop hands what it found to the stop in `rcaHandoff`. Both live only in the status's copy, the Automation variable `DbHubSessionStatus`, never in the vault's `dbhub-session-status`. A re-check sends no Run Command and writes no bundle once the stop has begun; what it found goes into the stopped status as documents still to export, which the next session's start exports from every VM that holds one.
 - **When a tenant's policy encrypts the copy:** some tenants re-create Automation variables encrypted, for example every night. The runbooks still read and write the copy (`Get-AutomationVariable` and `Set-AutomationVariable`), so nothing above changes, but the portal and Azure Resource Manager can't read its value then ([variables](https://learn.microsoft.com/azure/automation/shared-resources/variables)). `capture-t2-golden.ps1`, which reads the copy's lists through Azure Resource Manager before it deletes T2's capture, then captures nothing (`GOLDEN.CAPTURE.RCA`). Since 2026-11-23, `./scripts/deploy.ps1` creates the copy only when it's missing, so an update keeps it, encrypted or not, and a start after an update still has the earlier status's lists; before, every update wrote it again, unencrypted and empty ([ADR 0031's risks](../docs/adr/0031-incident-rca.md#risks)).
 
+### Run all's path for the sidecars
+
+Run all takes a session's sidecars the way it takes its evidence: the runbooks fetch them from the VMs and write them as earlier versions of `dbhub-session-metrics`, and the control notebook stages them for the activity notebook. Nothing needs a new secret, grant, or resource.
+
+- **The fetch:** at each export (a re-check's, the stop's, and a start's for an earlier session), after the evidence, within the same bound (`rca.recheckMinutes`, `rca.stopMinutes`, `rca.startMinutes`).
+  - It reads `RcaSidecarExport`'s pages, then each part through the `Rca` action's `part`, one Run Command at a time on the T2 host.
+  - Sidecars never delay the evidence. What a bound cuts stays pending on the VM, which offers it again at the next export.
+  - A sidecar the session's exports already bundled isn't fetched again.
+- **Sidecar bundles:** earlier versions of `dbhub-session-metrics`, `{"kind":"ContosoCare.RcaSidecarBundle","version":1,"sessionId":...,"parts":[...]}`. Each holds at most 6 `DBHUBDEMO-RCAS` lines and 24,000 bytes of UTF-8, and never an evidence line ([fixture](fixtures/sidecar-bundle.json)).
+- **The sidecar bundle index:** a version of its own, which the stop writes after the session's last sidecar bundle and before the metrics' final version: `{"kind":"ContosoCare.RcaSidecarBundleIndex","version":1,"sessionId":...,"bundles":["<version>"],"documents":[{"documentId","sessionId","parts","sha256","state"}],"status":...,"message":...}` ([fixture](fixtures/sidecar-bundle-index.json)).
+  - It lists every sidecar bundle the session's exports wrote, a re-check's included, and whole sidecars only.
+  - Its limits are 16 bundles, 64 parts (`RCA_SIDECAR_FILE`'s limit), and 24,000 bytes. The rest wait on the VMs.
+- **The pointer:** the metrics document's `rcaSidecars` member, `{"kind":"ContosoCare.RcaSidecarPointer","version":1,"index":"<version>","documents":n,"status":...,"message":...}`, at most 300 bytes, out of T5's share ([fixture](fixtures/metrics-rca-sidecars-member.json)).
+  - The `rca` member's 4,000 bytes don't change.
+  - With no sidecar, `index` is null, and the status is **Not selected**.
+- **The control notebook** reads the pointer from the metrics' final version, by its ID (`metrics.version`), then the index and its bundles.
+  - It stages `Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>-runall-<8 hex>.json`, and passes it as `RCA_SIDECAR_FILE` only when the activity notebook declares that parameter.
+  - Otherwise it stages nothing, the sidecars stay pending, and a **Warning** names `./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity`.
+  - After the run, it reads the payload's acknowledgement and deletes the payload by [the acknowledgement's rules](#acknowledgement).
+- **Acknowledgement at the next start:** Run all saves after the stop deallocates the VMs, so the next start's request carries the acknowledgements.
+  - **The request:** the IDs a `-runall-` acknowledgement says are `written` or `already` ride on it as `rcaAcks`: `{"kind":"ContosoCare.RcaAckRequest","version":1,"documents":[...]}`, at most 64 ([fixture](fixtures/rca-ack-request.json)).
+  - **The start:** before any export, the runbook sends `RcaAck` to the VM each ID names (its host segment), one Run Command at a time on the T2 host. It records what it sent in the status's `rcaAcks`: `{"kind":"ContosoCare.RcaAckResult","version":1,"sent":[...],"left":[...],"status":...,"message":...}` ([fixture](fixtures/rca-ack-result.json)).
+  - **Cleanup:** the notebook deletes a `-runall-` acknowledgement once every ID in it is sent.
+  - **Without a start,** the sidecars stay pending, and a later save answers `already`.
+  - **Each path reads only its own acknowledgements:** `-runall-` for Run all, and `-script-` for the scripts.
+- **Its lines:** `RCA.SIDECAR.EXPORT` (each export's fetch, beside `RCA.EXPORT`), `RCA.SIDECAR` (the activity notebook's write), and `RCA.SIDECAR.ACK` (the start's acknowledgements).
+- **Older pieces:**
+  - an older VM bundle answers "Unknown action" (`OldBundle`, a **Warning**), and the evidence goes on;
+  - an older control notebook ignores the pointer, so the sidecars stay pending until the scripts' next save takes them.
+
 ### `RCA_EVIDENCE`
 
 `NB_DatabaseHub_LiveActivity`'s new parameter: compact JSON, `{"kind":"ContosoCare.RcaEvidenceParts","version":1,"sessionId":...,"parts":[...],"status":...,"message":...}` with every part line of the session's documents in any order, at most 64 ([fixture](fixtures/rca-evidence.parameter.json)). Empty means none was passed. The notebook:
@@ -321,7 +352,8 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
 | A sidecar | 64 KiB of gzip (at most 28 parts), as a document, and at least 2 KiB | The reducer cuts in the order below, each cut a gap in `rca_query_coverage`. The 2 KiB are the evidence export's minimum, so a sidecar's coverage travels even when its host's session budget is spent |
-| A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
+| A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority. It's soft at a bind: a span sealed before its first export bound it to a session keeps every row, and when that takes the session past its budget, the bind adds a gap line and a **Warning**; nothing is refused or dropped |
+| A lost sidecar ledger | Rebuilt from the sealed files | If `sidecars\ledger.json` goes missing between `rca ack` and the next cleanup, the rebuild offers the acknowledged sidecars again as pending, and a sidecar bound after its sealing comes back without its session. It takes two faults in a row, and the notebook answers `already`, so it matters only if the history was purged in between: then they're written again, those without their session under the reading run |
 | `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
 | An open span's evidence window | Ends up to one Query Store block's length early: about 5 s, or 20 s for an `azure_sys` block | `rca export` of an open span (the runbook's re-check, or a mid-session save) ends each target's window at `span.json`'s persisted watermark, which a running sidecar block holds back, as a slow evidence block already does. The next document starts there, so no row is lost or doubled, and a closed span's final export is unaffected. Accepted as timing variance, not a version change (the coordinator's decision, 2026-11-23) |
@@ -360,7 +392,7 @@ A query's rank is its best place in the reads' top lists ([Query Store](#query-s
 
 ## Who builds what for the sidecar
 
-The scripts' path first; Run all's path (the runbook's bundles and the control notebook) follows in a later release.
+Both paths ship together (the coordinator's decision of 2026-11-23, since the owner runs demos only through Run all): the scripts' (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, and `configure-fabric.ps1 -RunLiveActivity`) and Run all's ([Run all's path for the sidecars](#run-alls-path-for-the-sidecars)).
 
 | Unit | Builds | Owns | Tests against this contract |
 |---|---|---|---|
@@ -371,6 +403,8 @@ The scripts' path first; Run all's path (the runbook's bundles and the control n
 | T1b, the runner's wiring | `rca sidecar-export`, `rca part` for sidecars, `rca ack`; sealing at each export, a span's end, and the observer's start | `Cli/CommandLine.Rca.cs`, `Rca/Export/Exporter.cs`, `Rca/Store/EvidenceStore.cs`, after the stop tail's changes land | As T1a's |
 | T2a, the scripts' transport | The fetch, staging `RCA_SIDECAR_FILE`, reading the acknowledgement, `rca ack` at once or deferred, the PC's lists, and the golden capture's guard | `scripts/modules/DbHubDemo/Private/RcaExportHelpers.ps1`, the save paths, and the golden capture's files | The sidecar fixtures' parts and the acknowledgement fixture; the mixed-version combinations |
 | T2b, the VM's control script | `RcaSidecarExport` and `RcaAck`, and the sidecar's part lines through T2's relay | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, after the stop tail's changes land | As T2a's |
+| T2c-1, Run all's runbooks | The sidecars' fetch at each export within its bound, their bundles, the sidecar bundle index, the metrics' `rcaSidecars` pointer, and the start's `RcaAck` from `rcaAcks` | `automation/runbooks/DbHubControl.Common.ps1`'s sidecar functions and `DbHub-Control.ps1`'s request field, on O1's d06899f6; their tests in `Automation.Runbooks` | The Run all fixtures validate against transport.schema.json; the bundles' lines decode to the sidecar fixtures; the evidence's bounds hold |
+| T2c-2, Run all's control notebook | Staging `RCA_SIDECAR_FILE` from the pointer, the index, and the bundles; reading the acknowledgement; `rcaAcks` in the next start's request | `fabric/control/NB_DatabaseHub_Control.ipynb`'s RCA cells (4 and 5), on d06899f6; their tests | As T2c-1's; a payload is deleted only by the acknowledgement's rules |
 | B, the notebook and the model | The sidecar's decoder, its six tables, the latest read per interval, the acknowledgement file and the cleanup rule, `RCA.SIDECAR`; the model's six tables and measures | `NB_DatabaseHub_LiveActivity`'s RCA cells, the semantic model's RCA tables, `OneLakeHelpers.ps1`'s RCA functions | The notebook's tables and the model's TMDL match history-tables.json; the sidecar fixtures decode and write once |
 | C, the app | The Query Store rules and claims, the tool for a window's top queries and a query's plans, "pending publication" | `fabric/app/src/rca/` (not the page, its view, or its CSS) | Its loader's names match history-tables.json; its rules find the sidecar fixtures' facts |
 | D, the report | The Root cause report's Query Store sections | The report's components, after the reorganized page | The sidecar fixtures' facts as the report shows them |
