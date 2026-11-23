@@ -616,7 +616,7 @@ Describe 'Get-DemoFabricContentSha256 and Get-DemoFabricContentReopen: what the 
         $module = Get-Module -Name DbHubDemo
         $current = 'ab' * 32
         & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = $current.ToUpperInvariant() }) $current | Should -Be ''
-        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = '' }) $current | Should -Be 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, or a run whose Insights app wasn''t deployed).'
+        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = '' }) $current | Should -Be 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, a run whose Insights app wasn''t deployed, or one that deployed the history model in the release''s form while this version has the kept values'' one).'
         & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ TrackFabric = 'Fabric' }) $current | Should -Match '^no record says' -Because 'a state from before 2026-11-16 has no such property'
         & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = ('cd' * 32) }) $current | Should -Be 'this copy of the scripts has other notebooks, history model, report, dashboard, or Insights app than the ones it published (abababababab, not cdcdcdcdcdcd).'
     }

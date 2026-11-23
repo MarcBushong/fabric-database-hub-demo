@@ -596,6 +596,10 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:keptForm = 'Kept'
         $script:keptStatus = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -MockWith { $script:calls.Add('kept values'); New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $script:keptStatus -Message ('kept values {0}' -f $script:keptStatus) -Evidence @{ nonBlocking = 'keptValue'; form = $script:keptForm } }
+        # Whether this checkout's configure-powerbi.ps1 has the kept form (F35, design A): not unless a test says so, so what
+        # the Fabric step records doesn't depend on that script's version.
+        $script:keptDeployable = $false
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoKeptFormDeployable -MockWith { $script:keptDeployable }
     }
 
     It 'says on the console and the status page why a resumed run sends a VM''s artifacts again (live finding, 2026-11-06)' {
@@ -1268,6 +1272,9 @@ Describe 'Invoke-DemoDeploymentTrack' {
         @($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' } | ForEach-Object { [string]$_.status }) | Should -Be @('Pass')
         ($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' }).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { $HistoryRunWaitMinutes -eq 45 }
+        # The follow-up's model step deploys the form the kept-value step allowed, as the first one did (F35): the release's
+        # form there would undo the kept one, unseen by deploy.ps1's end.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 2 -Exactly -ParameterFilter { $SnapshotValueForm -eq 'Kept' }
     }
 
     It 'records what the Fabric step published with the step once the notebooks, the model, and the Insights app are this version''s, and not while the app isn''t (2026-11-16)' {
@@ -1293,6 +1300,29 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
         $record.Count | Should -Be 1
         $record[0].Contains('FabricSha256') | Should -BeFalse
+    }
+
+    It 'doesn''t record the Fabric step''s content as published while the history model went out in the release''s form although this checkout has the kept one, so the next deploy.ps1 runs it again (F35, design A)' {
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'FABRIC.APP.DEPLOY Pass' }
+        foreach ($case in @(
+                @{ Name = 'no history yet, the kept form in this checkout'; Form = ''; Deployable = $true; Recorded = $false }
+                @{ Name = 'the kept form deployed'; Form = 'Kept'; Deployable = $true; Recorded = $true }
+                @{ Name = 'no kept form in this checkout'; Form = ''; Deployable = $false; Recorded = $true }
+            )) {
+            $script:recorded.Clear()
+            $script:keptForm = $case.Form
+            $script:keptStatus = $(if ($case.Form) { 'Pass' } else { 'Not selected' })
+            $script:keptDeployable = $case.Deployable
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+            $outcome.Status | Should -Be 'Pass' -Because $case.Name
+            $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
+            $record.Count | Should -Be 1 -Because 'the step is finished either way'
+            $record[0].Contains('FabricSha256') | Should -Be $case.Recorded -Because $case.Name
+        }
     }
 
     It 'records with the Fabric step which control notebook the Insights app''s Manage was deployed with, none included, so a resume can deploy it once more (2026-11-19)' {

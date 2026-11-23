@@ -362,7 +362,8 @@ function Invoke-DemoParallelDeployment {
        selected. The status page's Fabric.History row shows it. Right after it, the kept values of the rows it saved are
        worked out through Livy with this checkout's code (F35, 2026-11-23; Invoke-DemoKeptValueEndStep,
        DEPLOY.FABRIC.KEPTVALUE.END, the Fabric.HistoryKept row): never a Fail, and Not selected when the snapshot saved
-       nothing. The Fabric track works them out before the history model's step too (DEPLOY.FABRIC.KEPTVALUE).
+       nothing. The Fabric track works them out before the history model's step too (DEPLOY.FABRIC.KEPTVALUE); when that
+       step didn't allow the kept form, the end deploys the model in it once every row is worked out (design A).
     8. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END): after the
        history snapshot and the session control's notebook, it's deleted, so the run leaves nothing new billing between
        sessions, unless a session uses it now (the control's pending auto-stop, or a start-demo.ps1 session's mark on the
@@ -1471,9 +1472,10 @@ function Invoke-DemoParallelDeployment {
     # reaches its validation, a resumed one with nothing left to do included; never a Fail, and never in DONE's way.
     if ($plan.Validation) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
-        # 8a. F35 (i): the kept values of the rows the snapshot saved, worked out through Livy with this checkout's code
-        # (Invoke-DemoKeptValueEndStep): never a Fail, and never in DONE's way.
-        $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -Result $results.ToArray() -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
+        # 8a. F35 (i): the kept values of the rows the snapshot saved, worked out through Livy with this checkout's code, and
+        # the history model in their form when the Fabric track couldn't deploy it so (Invoke-DemoKeptValueEndStep, design A):
+        # never a Fail, and never in DONE's way.
+        $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -Result $results.ToArray() -SkipFabric:$SkipFabric -ProgressPath $ProgressPath -ConfigPath $ConfigPath))
     }
     # 9. The session control's notebook (ADR 0026), once the Fabric track has the demo's workspace: never a Fail, and never
     # in DONE's way. Without the Fabric track finished (a paused capacity, for example), the next deploy.ps1 does it.
